@@ -10,7 +10,7 @@
 # If /lmchol/home/holuser/hol/testing exists, skip git clone/pull operations
 # This allows local testing without overwriting changes
 # IMPORTANT: Delete this file before capturing the lab to the catalog!
-TESTING_FLAG_FILE="/lmchol/home/holuser/hol/testing"
+TESTING_FLAG_FILE="/lmchol/hol/testing"
 
 check_testing_mode() {
     if [ -f "${TESTING_FLAG_FILE}" ]; then
@@ -41,7 +41,7 @@ git_pull() {
             break
         fi
         git checkout $branch >> ${logfile} 2>&1
-        git pull origin $branch >> ${logfile} 2>&1
+        GIT_TERMINAL_PROMPT=0 git pull origin $branch >> ${logfile} 2>&1
         if [ $? = 0 ]; then
             break
         else
@@ -96,15 +96,17 @@ runlabstartup() {
     # 
     # We redirect stderr to the local log to catch any Python errors/exceptions
     # Console output from write_output is disabled to avoid duplicates
+    local mode="${1:-startup}"
+    
     if ! pgrep -f "labstartup.py"; then
-        echo "[$(date)] Starting ${holroot}/labstartup.py $1" >> ${logfile}
-        echo "[$(date)] Starting ${holroot}/labstartup.py $1" >> "${holroot}/labstartup.log"
-        echo "[$(date)] Starting ${holroot}/labstartup.py $1" >> "${lmcholroot}/labstartup.log"
+        echo "[$(date)] Starting ${holroot}/labstartup.py ${mode}" >> ${logfile}
+        echo "[$(date)] Starting ${holroot}/labstartup.py ${mode}" >> "${holroot}/labstartup.log"
+        echo "[$(date)] Starting ${holroot}/labstartup.py ${mode}" >> "${lmcholroot}/labstartup.log"
         
         # Run Python with unbuffered output (-u)
         # Redirect stderr to local log to capture any errors/exceptions
         # write_output() handles writing to both log files directly
-        /usr/bin/python3 -u ${holroot}/labstartup.py "$1" 2>> "${holroot}/labstartup.log" &
+        /usr/bin/python3 -u ${holroot}/labstartup.py "${mode}" 2>> "${holroot}/labstartup.log" &
     fi
 }
 
