@@ -7,7 +7,7 @@
 #==============================================================================
 # TESTING FLAG FILE
 #==============================================================================
-# If /lmchol/home/holuser/hol/testing exists, skip git clone/pull operations
+# If /lmchol/hol/testing exists, skip git clone/pull operations
 # This allows local testing without overwriting changes
 # IMPORTANT: Delete this file before capturing the lab to the catalog!
 TESTING_FLAG_FILE="/lmchol/hol/testing"
@@ -19,6 +19,39 @@ check_testing_mode() {
         return 0  # True - testing mode enabled
     fi
     return 1  # False - normal mode
+}
+
+is_hol_sku() {
+    # Check if the vPod_SKU starts with "HOL-"
+    # Returns 0 (true) if it's an HOL SKU, 1 (false) otherwise
+    local sku="$1"
+    case "$sku" in
+        HOL-*)
+            return 0  # True - is HOL SKU
+            ;;
+        *)
+            return 1  # False - not HOL SKU
+            ;;
+    esac
+}
+
+use_local_holodeck_ini() {
+    # Fallback to using local holodeck/*.ini file when git repo not available
+    # For non-HOL SKUs only
+    local sku="$1"
+    local ini_file="${holroot}/holodeck/${sku}.ini"
+    
+    if [ -f "${ini_file}" ]; then
+        echo "Using local holodeck config: ${ini_file}" >> ${logfile}
+        cp "${ini_file}" ${configini}
+        return 0  # Success
+    else
+        echo "No local holodeck config found at ${ini_file}" >> ${logfile}
+        # Fall back to defaultconfig.ini with SKU substitution
+        echo "Using defaultconfig.ini with SKU substitution" >> ${logfile}
+        cat ${holroot}/holodeck/defaultconfig.ini | sed s/HOL-BADSKU/"${sku}"/ > ${configini}
+        return 0  # Still success - we have a config
+    fi
 }
 
 #==============================================================================
@@ -63,17 +96,39 @@ git_clone() {
     cd "$1" || exit
     ctr=0
     while true; do
-        if [ "$ctr" -gt 30 ]; then
-            echo "Could not perform git clone. failing vpod." >> ${logfile}
-            echo "FAIL - Could not clone GIT Project" > "$startupstatus"
-            exit 1
+        if [ "$ctr" -gt 10 ]; then
+            echo "Could not perform git clone after 10 attempts." >> ${logfile}
+            # For non-HOL SKUs, return failure status instead of exiting
+            # The caller will handle the fallback to local holodeck/*.ini
+            if is_hol_sku "$vPod_SKU"; then
+                echo "HOL SKU requires git repo. Failing vpod." >> ${logfile}
+                echo "FAIL - Could not clone GIT Project" > "$startupstatus"
+                exit 1
+            else
+                echo "Non-HOL SKU: Will attempt fallback to local config." >> ${logfile}
+                return 1  # Return failure, let caller handle fallback
+            fi
         fi
         echo "Performing git clone for repo ${vpodgit}" >> ${logfile}
         echo "git clone -b $branch $gitproject $vpodgitdir" >> ${logfile}
-        git clone -b $branch "$gitproject" "$vpodgitdir" >> ${logfile} 2>&1
+        GIT_TERMINAL_PROMPT=0 git clone -b $branch "$gitproject" "$vpodgitdir" >> ${logfile} 2>&1
         if [ $? = 0 ]; then
-            break
+            return 0  # Success
         else
+            # Check for permanent failures (repo not found)
+            gitresult=$(grep -E 'Repository not found|remote: Not Found|fatal: repository.*not found' ${logfile} 2>/dev/null)
+            if [ $? = 0 ]; then
+                echo "Git repository does not exist: ${gitproject}" >> ${logfile}
+                if is_hol_sku "$vPod_SKU"; then
+                    echo "HOL SKU requires git repo. Failing vpod." >> ${logfile}
+                    echo "FAIL - No GIT Project" > "$startupstatus"
+                    exit 1
+                else
+                    echo "Non-HOL SKU: Will attempt fallback to local config." >> ${logfile}
+                    return 1  # Return failure, let caller handle fallback
+                fi
+            fi
+            # Check for DNS issues (temporary, retry)
             gitresult=$(grep 'Could not resolve host' ${logfile})
             if [ $? = 0 ]; then
                 echo "DNS did not resolve, will try again" >> ${logfile}
@@ -268,6 +323,7 @@ if [ "$1" = "labcheck" ]; then
     exit 0
 else
     echo "Main Console mount is present. Clearing labstartup logs." >> ${logfile}
+    echo "" > /lmchhol/home/holuser/startup-status.htm
     echo "" > "${holroot}"/labstartup.log
     chmod 666 "${holroot}"/labstartup.log 2>/dev/null || true
     echo "" > "${lmcholroot}"/labstartup.log
@@ -346,7 +402,7 @@ done
 # GIT OPERATIONS
 #==============================================================================
 
-ubuntu=$(grep DISTRIB_RELEASE /etc/lsb-release | cut -f2 -d '=')
+# ubuntu=$(grep DISTRIB_RELEASE /etc/lsb-release | cut -f2 -d '=')
 
 if [ -f ${configini} ]; then
     [ "${labtype}" = "" ] && labtype="HOL"
@@ -362,7 +418,7 @@ echo "$vPod_SKU" > /tmp/vPod_SKU.txt
 # Check for BAD SKU
 if [ "$vPod_SKU" = "HOL-BADSKU" ]; then
     echo "LabStartup not implemented." >> ${logfile}
-    echo "$(date)" > ${holorouterdir}/gitdone
+    date > ${holorouterdir}/gitdone
     runlabstartup
     exit 0
 fi
@@ -382,37 +438,53 @@ get_git_project_info
 
 # Perform git operations for all lab types (unless in testing mode)
 # Supports: HOL, ATE, VXP, EDU, Discovery
+# For non-HOL SKUs, if git repo doesn't exist, fall back to local holodeck/*.ini
+git_success=false
+
 if check_testing_mode; then
     echo "TESTING MODE: Skipping git operations for ${vPod_SKU}" >> ${logfile}
+    git_success=true  # Consider testing mode as success (use existing files)
 else
     echo "Ready to pull updates for ${vPod_SKU} from ${gitproject}." >> ${logfile}
     
     if [ ! -e "${yearrepo}" ] || [ ! -e "${vpodgitdir}" ]; then
         echo "Creating new git repo for ${vPod_SKU}..." >> ${logfile}
         mkdir -p "$yearrepo" > /dev/null 2>&1
-        git_clone "$yearrepo" > /dev/null 2>&1
+        git_clone "$yearrepo"
         # shellcheck disable=SC2181
-        if [ $? != 0 ]; then
-            echo "The git project ${vpodgit} does not exist." >> ${logfile}
-            echo "FAIL - No GIT Project" > "$startupstatus"
-            exit 1
+        if [ $? = 0 ]; then
+            git_success=true
+            echo "${vPod_SKU} git clone was successful." >> ${logfile}
+        else
+            # git_clone already handles HOL SKU failure (exits)
+            # If we reach here, it's a non-HOL SKU that needs fallback
+            echo "Git clone failed for non-HOL SKU ${vPod_SKU}. Using local config fallback." >> ${logfile}
+            git_success=false
         fi
     else
         echo "Performing git pull for repo ${vpodgit}" >> ${logfile}
         git_pull "$vpodgitdir"
-    fi
-    
-    # shellcheck disable=SC2181
-    if [ $? = 0 ]; then
-        echo "${vPod_SKU} git operations were successful." >> ${logfile}
-    else
-        echo "Could not complete ${vPod_SKU} git operations." >> ${logfile}
+        git_success=true
+        echo "${vPod_SKU} git pull completed." >> ${logfile}
     fi
 fi
 
-# Copy config.ini from vpodrepo if present
-if [ -f "${vpodgitdir}"/config.ini ]; then
+# Copy config.ini from vpodrepo if present and git succeeded
+# Otherwise, for non-HOL SKUs, use local holodeck/*.ini fallback
+if [ "$git_success" = true ] && [ -f "${vpodgitdir}"/config.ini ]; then
+    echo "Using config.ini from git repo: ${vpodgitdir}/config.ini" >> ${logfile}
     cp "${vpodgitdir}"/config.ini ${configini}
+elif [ "$git_success" = false ]; then
+    # Fallback for non-HOL SKUs when git repo doesn't exist
+    echo "Git operations failed. Attempting local holodeck config fallback for ${vPod_SKU}..." >> ${logfile}
+    use_local_holodeck_ini "$vPod_SKU"
+    if [ $? = 0 ]; then
+        echo "Successfully loaded local holodeck config for ${vPod_SKU}" >> ${logfile}
+    else
+        echo "Failed to load local holodeck config for ${vPod_SKU}" >> ${logfile}
+        echo "FAIL - No Config Available" > "$startupstatus"
+        exit 1
+    fi
 fi
 
 #==============================================================================
@@ -426,10 +498,10 @@ else
     mkdir -p ${holorouterdir}
     cp ${holroot}/${router}/nofirewall.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
     cp ${holroot}/${router}/allowall ${holorouterdir}/allowlist 2>/dev/null
-    echo "$(date)" > ${holorouterdir}/gitdone
+    date > ${holorouterdir}/gitdone
 fi
 
-echo "$(date)" > /tmp/gitdone
+date > /tmp/gitdone
 
 #==============================================================================
 # RUN LABSTARTUP
