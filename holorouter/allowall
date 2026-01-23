@@ -1,0 +1,7 @@
+# allowall - HOLFY27 Permissive Domain List
+# Version 1.0 - January 2026
+# This file is used for non-HOL lab types
+# It allows ALL domains through the proxy
+
+# Match everything
+.

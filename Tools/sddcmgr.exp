@@ -1,0 +1,20 @@
+#!/usr/bin/expect
+
+set SM [lindex $argv 0]
+set PW [lindex $argv 1]
+spawn /usr/bin/sshpass -p $PW ssh -o StrictHostKeyChecking=accept-new vcf@$SM
+expect " ]$"
+send -- "su -\r"
+expect "Password: "
+send -- "$PW\r"
+expect " ]#"
+send -- "chage -M -1 vcf\r"
+expect " ]#"
+send -- "chage -M -1 root\r"
+expect " ]#"
+send -- "chage -M -1 backup\r"
+expect " ]#"
+send -- "exit\r"
+expect " ]$"
+send -- "exit\r"
+expect eof

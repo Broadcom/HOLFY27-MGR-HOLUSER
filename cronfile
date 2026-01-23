@@ -1,0 +1,9 @@
+# HOLFY27 Manager holuser Cron Configuration
+# This file is installed via: crontab /home/holuser/hol/cronfile
+#
+# At boot:
+#   1. Execute gitpull.sh to update Core Team repository
+#   2. Execute labstartup.sh to begin lab initialization
+#   3. Start VLP Agent in background (if in production)
+
+@reboot export PATH=/home/holuser/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/holuser/ovftool:/usr/lib/jvm/jdk-17//bin; export PYTHONPATH=/usr/lib/python3/dist-packages:/home/holuser/hol; /home/holuser/hol/gitpull.sh; /home/holuser/hol/labstartup.sh; /home/holuser/hol/Tools/VLPagent.sh &

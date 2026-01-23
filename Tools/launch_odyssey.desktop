@@ -1,0 +1,11 @@
+
+[Desktop Entry]
+Version=1.0
+Type=Application
+Terminal=false
+Exec= /usr/bin/gnome-terminal --title="Odyssey DO NOT EXIT" -- /home/holuser/desktop-hol/odyssey-launch.sh
+Name=Launch Odyssey
+Comment=Odyssey Game
+Categories=Application;
+Icon= /home/holuser/desktop-hol/images/icon-256.png
+    

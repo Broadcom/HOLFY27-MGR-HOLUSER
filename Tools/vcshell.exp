@@ -1,0 +1,16 @@
+#!/usr/bin/expect
+
+set VC [lindex $argv 0]
+set PW [lindex $argv 1]
+spawn /usr/bin/sshpass -p $PW ssh -o StrictHostKeyChecking=accept-new root@$VC
+expect "Command>"
+send -- "shell\r"
+expect " ]#"
+send -- "chsh -s /bin/bash root\r"
+expect " ]#"
+send -- "exit\r"
+expect "Command>"
+send -- "exit\r"
+expect eof
+
+
