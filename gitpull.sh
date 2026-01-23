@@ -77,5 +77,6 @@ if [ -d "${HOLROOT}/.git" ]; then
 else
     log_message "No git repository found at ${HOLROOT}"
 fi
-
+# The holorouter waits for the gitdone file to be created in /tmp/holorouter (mounted on holorouter as /mnt/manager/gitdone)
+touch /tmp/holorouter/gitdone
 log_message "holuser gitpull.sh completed"
