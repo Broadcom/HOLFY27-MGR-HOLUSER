@@ -76,19 +76,31 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.generate_html()
     
     #==========================================================================
-    # TASK 2: Prevent Update Manager Banners
+    # TASK 2: Prevent Update Manager Banners (on Console via SSH)
     #==========================================================================
     
-    lsf.write_output('Preventing update manager popups...')
+    lsf.write_output('Preventing update manager popups on console...')
     
-    # Disable Ubuntu update notifications
-    update_notifier = '/lmchol/etc/xdg/autostart/update-notifier.desktop'
-    if os.path.isfile(update_notifier) and not dry_run:
-        try:
-            os.rename(update_notifier, f'{update_notifier}.disabled')
-            lsf.write_output('Disabled update-notifier autostart')
-        except Exception as e:
-            lsf.write_output(f'Could not disable update-notifier: {e}')
+    if not dry_run:
+        # Disable Ubuntu update notifications and apt-daily timers on the console via SSH
+        console_host = 'root@console.site-a.vcf.lab'
+        
+        # Disable update-notifier autostart
+        update_notifier = '/etc/xdg/autostart/update-notifier.desktop'
+        disable_notifier_cmd = f'test -f {update_notifier} && mv {update_notifier} {update_notifier}.disabled || true'
+        result = lsf.ssh(disable_notifier_cmd, console_host)
+        if result.returncode == 0:
+            lsf.write_output('Disabled update-notifier autostart on console')
+        else:
+            lsf.write_output(f'Could not disable update-notifier on console: {result.stderr}')
+        
+        # Disable apt-daily timers to prevent automatic updates
+        disable_timers_cmd = 'systemctl disable --now apt-daily.timer apt-daily-upgrade.timer'
+        result = lsf.ssh(disable_timers_cmd, console_host)
+        if result.returncode == 0:
+            lsf.write_output('Disabled apt-daily timers on console')
+        else:
+            lsf.write_output(f'Could not disable apt-daily timers on console: {result.stderr}')
     
     #==========================================================================
     # TASK 3: Firewall Verification (HOL labs only)

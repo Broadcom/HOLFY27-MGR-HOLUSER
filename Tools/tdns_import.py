@@ -304,8 +304,17 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
     """
     # Check if tdns-mgr is available
     if not check_tdns_mgr_available():
-        write_output('tdns-mgr not found - skipping DNS import')
-        return None
+        write_output('ERROR: tdns-mgr not found - DNS import FAILED')
+        # Update status dashboard to show failure instead of skipped
+        try:
+            from Tools.status_dashboard import StatusDashboard
+            import lsfunctions as lsf
+            dashboard = StatusDashboard(lsf.lab_sku)
+            dashboard.update_task('final', 'dns_import', 'failed', 'tdns-mgr command not found')
+            dashboard.generate_html()
+        except Exception:
+            pass
+        return {'Message': 'tdns-mgr not found', 'New Records': 0, 'Errors': 1}
     
     # PRIORITY 1: Check config.ini for inline DNS records
     config_records = get_dns_records_from_config()
