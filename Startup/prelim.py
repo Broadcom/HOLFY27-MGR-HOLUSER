@@ -35,6 +35,10 @@ def main(lsf=None, standalone=False, dry_run=False):
         if not standalone:
             lsf.init(router=False)
     
+    ##=========================================================================
+    ## Core Team code - do not modify - place custom code in the CUSTOM section
+    ##=========================================================================
+    
     lsf.write_output(f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
     
     # Update status dashboard
@@ -161,6 +165,190 @@ def main(lsf=None, standalone=False, dry_run=False):
     if dashboard:
         dashboard.update_task('prelim', 'odyssey_cleanup', 'complete')
         dashboard.generate_html()
+    
+    ##=========================================================================
+    ## End Core Team code
+    ##=========================================================================
+    
+    ##=========================================================================
+    ## CUSTOM - Insert your code here using the file in your vPod_repo
+    ## 
+    ## To customize this module for your lab:
+    ## 1. Copy this file to your vpodrepo/Startup/ folder
+    ## 2. Uncomment and modify the examples below as needed
+    ## 3. Add your custom code in this section
+    ##
+    ## The examples below demonstrate common operations. Uncomment and modify
+    ## as needed for your specific lab requirements.
+    ##=========================================================================
+    
+    ## Example 1: Check URL accessibility
+    ## ----------------------------------
+    ## Check if a web interface is accessible, optionally verify expected content
+    #
+    # url_to_check = 'https://vcsa.site-a.vcf.lab/ui/'
+    # expected_text = 'VMware vSphere'  # Optional: verify this text appears
+    # 
+    # if lsf.test_url(url_to_check, expected_text=expected_text, verify_ssl=False, timeout=30):
+    #     lsf.write_output(f'URL is accessible: {url_to_check}')
+    # else:
+    #     lsf.write_output(f'URL check failed: {url_to_check}')
+    #     # Optionally fail the lab:
+    #     # lsf.labfail(f'Required URL not accessible: {url_to_check}')
+    
+    ## Example 2: Check for expired password on SSH host and reset
+    ## -----------------------------------------------------------
+    ## Detect expired password and reset it on a remote Linux system
+    #
+    # target_host = 'root@gitlab.site-a.vcf.lab'
+    # new_password = lsf.get_password()  # Or specify a different password
+    # 
+    # # Check if password is expired
+    # result = lsf.ssh('chage -l root | grep "Password expires"', target_host)
+    # if hasattr(result, 'stdout') and 'password must be changed' in result.stdout.lower():
+    #     lsf.write_output(f'Password expired on {target_host}, resetting...')
+    #     
+    #     # Reset password using chpasswd
+    #     reset_cmd = f'echo "root:{new_password}" | chpasswd'
+    #     reset_result = lsf.ssh(reset_cmd, target_host)
+    #     
+    #     if reset_result.returncode == 0:
+    #         lsf.write_output(f'Password reset successful on {target_host}')
+    #     else:
+    #         lsf.write_output(f'Password reset failed on {target_host}: {reset_result.stderr}')
+    # else:
+    #     lsf.write_output(f'Password is valid on {target_host}')
+    
+    ## Example 3: Copy a file to a remote system over SCP
+    ## ---------------------------------------------------
+    ## Copy configuration files or scripts to remote systems
+    #
+    # local_file = f'{lsf.vpod_repo}/files/custom-config.conf'
+    # remote_dest = 'root@web-server.site-a.vcf.lab:/etc/myapp/config.conf'
+    # 
+    # if os.path.isfile(local_file):
+    #     result = lsf.scp(local_file, remote_dest, recursive=False)
+    #     if result.returncode == 0:
+    #         lsf.write_output(f'Successfully copied {local_file} to {remote_dest}')
+    #     else:
+    #         lsf.write_output(f'SCP failed: {result.stderr}')
+    # else:
+    #     lsf.write_output(f'Source file not found: {local_file}')
+    #
+    # # For copying directories recursively:
+    # # result = lsf.scp(local_dir, remote_dest, recursive=True)
+    
+    ## Example 4: Confirm if a service is running
+    ## ------------------------------------------
+    ## Check if a systemd service is running on a remote host
+    #
+    # target_host = 'root@harbor.site-a.vcf.lab'
+    # service_name = 'docker'
+    # 
+    # result = lsf.ssh(f'systemctl is-active {service_name}', target_host)
+    # if hasattr(result, 'stdout') and 'active' in result.stdout.strip():
+    #     lsf.write_output(f'Service {service_name} is running on {target_host}')
+    # else:
+    #     lsf.write_output(f'Service {service_name} is NOT running on {target_host}')
+    #     
+    #     # Optionally start the service:
+    #     # start_result = lsf.ssh(f'systemctl start {service_name}', target_host)
+    #     # if start_result.returncode == 0:
+    #     #     lsf.write_output(f'Started {service_name} on {target_host}')
+    
+    ## Example 5: Execute remote command over SSH, capture output, and process
+    ## ------------------------------------------------------------------------
+    ## Run a command remotely and process the output
+    #
+    # target_host = 'root@k8s-master.site-a.vcf.lab'
+    # command = 'kubectl get nodes -o wide'
+    # 
+    # result = lsf.ssh(command, target_host)
+    # if result.returncode == 0 and hasattr(result, 'stdout'):
+    #     lsf.write_output(f'Command output from {target_host}:')
+    #     
+    #     # Process output line by line
+    #     for line in result.stdout.split('\n'):
+    #         if line.strip():
+    #             lsf.write_output(f'  {line}')
+    #             
+    #             # Example: Check for specific conditions
+    #             if 'NotReady' in line:
+    #                 node_name = line.split()[0]
+    #                 lsf.write_output(f'WARNING: Node {node_name} is not ready!')
+    # else:
+    #     lsf.write_output(f'Command failed on {target_host}: {result.stderr}')
+    
+    ## Example 6: Run Ansible Playbook
+    ## --------------------------------
+    ## Execute an Ansible playbook from the vpodrepo
+    #
+    # playbook_path = f'{lsf.vpod_repo}/ansible/site.yml'
+    # inventory = f'{lsf.vpod_repo}/ansible/inventory.ini'
+    # extra_vars = {'lab_sku': lsf.lab_sku, 'password': lsf.get_password()}
+    # 
+    # if os.path.isfile(playbook_path):
+    #     result = lsf.run_ansible_playbook(
+    #         playbook_path,
+    #         inventory=inventory,
+    #         extra_vars=extra_vars
+    #     )
+    #     if result.returncode == 0:
+    #         lsf.write_output('Ansible playbook completed successfully')
+    #     else:
+    #         lsf.write_output(f'Ansible playbook failed: {result.stderr}')
+    # 
+    # # Alternatively, use the helper to search in standard locations:
+    # # result = lsf.run_ansible_from_repo('site.yml')
+    
+    ## Example 7: Run Salt Configuration
+    ## ----------------------------------
+    ## Execute a Salt state from the vpodrepo
+    #
+    # state_name = 'webserver'  # Will look for webserver.sls in vpodrepo/salt/
+    # 
+    # try:
+    #     result = lsf.run_salt_from_repo(state_name, test_mode=False)
+    #     if result.returncode == 0:
+    #         lsf.write_output(f'Salt state {state_name} applied successfully')
+    #     else:
+    #         lsf.write_output(f'Salt state {state_name} failed: {result.stderr}')
+    # except FileNotFoundError as e:
+    #     lsf.write_output(f'Salt state not found: {e}')
+    # 
+    # # Or run with test mode to see what would change:
+    # # result = lsf.run_salt_from_repo('webserver', test_mode=True)
+    
+    ## Example 8: Run Custom Script
+    ## ----------------------------
+    ## Execute a custom script from the vpodrepo (auto-detects type by extension)
+    #
+    # # Run a bash script
+    # script_name = 'setup.sh'
+    # script_path = f'{lsf.vpod_repo}/scripts/{script_name}'
+    # 
+    # if os.path.isfile(script_path):
+    #     result = lsf.run_command(f'/bin/bash {script_path}')
+    #     if result.returncode == 0:
+    #         lsf.write_output(f'Script {script_name} completed successfully')
+    #         if result.stdout:
+    #             lsf.write_output(f'Output: {result.stdout}')
+    #     else:
+    #         lsf.write_output(f'Script {script_name} failed: {result.stderr}')
+    # 
+    # # Or use the universal script runner (auto-detects: .sh, .py, .yml, .sls):
+    # # result = lsf.run_repo_script('configure.sh')
+    # # result = lsf.run_repo_script('setup.py', script_type='python')
+    # # result = lsf.run_repo_script('playbook.yml', script_type='ansible')
+    
+    ## Example: Fail the lab if critical condition not met
+    ## ----------------------------------------------------
+    # lsf.labfail('PRELIM ISSUE - Critical check failed')
+    # exit(1)
+    
+    ##=========================================================================
+    ## End CUSTOM section
+    ##=========================================================================
     
     #==========================================================================
     # COMPLETE

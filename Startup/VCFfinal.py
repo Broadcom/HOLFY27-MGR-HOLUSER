@@ -77,6 +77,10 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output('No VCFFINAL section in config.ini - skipping')
         return
     
+    ##=========================================================================
+    ## Core Team code - do not modify - place custom code in the CUSTOM section
+    ##=========================================================================
+    
     lsf.write_output(f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
     
     # Update status dashboard
@@ -281,6 +285,21 @@ def main(lsf=None, standalone=False, dry_run=False):
                 connect.Disconnect(si)
             except Exception:
                 pass
+    
+    ##=========================================================================
+    ## End Core Team code
+    ##=========================================================================
+    
+    ##=========================================================================
+    ## CUSTOM - Insert your code here using the file in your vPod_repo
+    ##=========================================================================
+    
+    # Example: Add custom VCF final configuration or checks here
+    # See prelim.py for detailed examples of common operations
+    
+    ##=========================================================================
+    ## End CUSTOM section
+    ##=========================================================================
     
     lsf.write_output(f'{MODULE_NAME} completed')
 

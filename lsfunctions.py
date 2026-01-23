@@ -99,6 +99,9 @@ config = ConfigParser()
 # Password property
 _password = None
 
+# Console output flag (set to False when running via labstartup.sh to avoid double-logging)
+console_output = True
+
 #==============================================================================
 # INITIALIZATION
 #==============================================================================
@@ -142,11 +145,9 @@ def init(router=True, **kwargs):
         if config.has_option('VPOD', 'maxminutes'):
             max_minutes_before_fail = config.getint('VPOD', 'maxminutes')
     
-    # Calculate vpod_repo path
+    # Calculate vpod_repo path using labtype-aware function
     if lab_sku != bad_sku:
-        year = lab_sku[4:6]
-        index = lab_sku[6:8]
-        vpod_repo = f'/vpodrepo/20{year}-labs/{year}{index}'
+        _, vpod_repo, _ = get_repo_info(lab_sku, labtype)
     
     # Load password
     if os.path.isfile(creds):
@@ -193,12 +194,20 @@ def write_output(msg, **kwargs):
     Write output to log files and optionally to console
     
     :param msg: Message to write
-    :param kwargs: logfile - specific logfile path
+    :param kwargs: 
+        logfile - specific logfile path
+        console - override console output setting (True/False)
+    
+    Output is written to:
+    - /home/holuser/hol/labstartup.log (Manager)
+    - /lmchol/hol/labstartup.log (Main Console via NFS)
+    - Console (if console_output is True or console kwarg is True)
     """
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     formatted_msg = f'[{timestamp}] {msg}'
     
     lfile = kwargs.get('logfile', None)
+    print_to_console = kwargs.get('console', console_output)
     
     if lfile:
         try:
@@ -216,8 +225,11 @@ def write_output(msg, **kwargs):
             except Exception:
                 pass
     
-    # Also print to console
-    print(formatted_msg)
+    # Print to console if enabled
+    # When running via labstartup.sh, console output is captured by tee and would
+    # cause duplicate lines in log files. Set console_output=False in that case.
+    if print_to_console:
+        print(formatted_msg)
 
 def write_vpodprogress(message, status, **kwargs):
     """
@@ -654,6 +666,68 @@ def run_repo_script(script_name, script_type='auto', **kwargs):
 # VPODREPO HELPERS
 #==============================================================================
 
+def get_repo_info(sku: str, lab_type: str = 'HOL') -> tuple:
+    """
+    Parse SKU and return repository information based on lab type.
+    
+    Supports multiple SKU patterns:
+    - Standard (HOL, ATE, VXP, EDU): PREFIX-XXYY format (e.g., HOL-2701, ATE-2705)
+      Returns year-based directory structure: /vpodrepo/20XX-labs/XXYY
+    - Named (Discovery): PREFIX-Name format (e.g., Discovery-Demo)
+      Returns name-based directory structure: /vpodrepo/Discovery-labs/Name
+    
+    :param sku: Lab SKU string (e.g., 'HOL-2701', 'ATE-2705', 'Discovery-Demo')
+    :param lab_type: Lab type string (HOL, ATE, VXP, EDU, Discovery)
+    :return: Tuple of (year_dir, repo_dir, git_url)
+    
+    Examples:
+        >>> get_repo_info('HOL-2701', 'HOL')
+        ('/vpodrepo/2027-labs', '/vpodrepo/2027-labs/2701', 'https://github.com/Broadcom/HOL-2701.git')
+        
+        >>> get_repo_info('ATE-2705', 'ATE')
+        ('/vpodrepo/2027-labs', '/vpodrepo/2027-labs/2705', 'https://github.com/Broadcom/ATE-2705.git')
+        
+        >>> get_repo_info('Discovery-Demo', 'Discovery')
+        ('/vpodrepo/Discovery-labs', '/vpodrepo/Discovery-labs/Demo', 'https://github.com/Broadcom/Discovery-Demo.git')
+    """
+    if not sku or sku == bad_sku:
+        return ('', '', '')
+    
+    # Split SKU into prefix and suffix
+    parts = sku.split('-', 1)
+    if len(parts) < 2:
+        # Invalid format, return empty
+        return ('', '', '')
+    
+    prefix = parts[0]
+    suffix = parts[1]
+    
+    # Normalize lab_type for comparison
+    lab_type_upper = lab_type.upper() if lab_type else 'HOL'
+    
+    if lab_type_upper == 'DISCOVERY':
+        # Discovery uses name-based pattern (no year extraction)
+        year_dir = '/vpodrepo/Discovery-labs'
+        repo_dir = f'{year_dir}/{suffix}'
+        git_url = f'https://github.com/Broadcom/{sku}.git'
+    else:
+        # Standard pattern: PREFIX-XXYY where XX=year, YY=index
+        # Supports HOL, ATE, VXP, EDU
+        if len(suffix) >= 4:
+            year = suffix[:2]
+            index = suffix[2:4]
+            year_dir = f'/vpodrepo/20{year}-labs'
+            repo_dir = f'{year_dir}/{year}{index}'
+            git_url = f'https://github.com/Broadcom/{prefix}-{year}{index}.git'
+        else:
+            # Fallback for short suffixes - treat as named
+            year_dir = f'/vpodrepo/{prefix}-labs'
+            repo_dir = f'{year_dir}/{suffix}'
+            git_url = f'https://github.com/Broadcom/{sku}.git'
+    
+    return (year_dir, repo_dir, git_url)
+
+
 def get_vpodrepo_file(filename):
     """
     Find a file in vpodrepo, checking multiple locations
@@ -882,21 +956,29 @@ def signal_router_ready():
 # PARSE LAB SKU
 #==============================================================================
 
-def parse_labsku(sku):
+def parse_labsku(sku, lab_type_override: str = None):
     """
-    Parse the lab SKU and set related variables
+    Parse the lab SKU and set related variables.
     
-    :param sku: Lab SKU (e.g., HOL-2701)
+    Supports multiple SKU patterns based on lab type:
+    - Standard (HOL, ATE, VXP, EDU): PREFIX-XXYY format
+    - Named (Discovery): PREFIX-Name format
+    
+    :param sku: Lab SKU (e.g., HOL-2701, ATE-2705, Discovery-Demo)
+    :param lab_type_override: Optional lab type override (defaults to global labtype)
     """
     global lab_sku, vpod_repo
     
     lab_sku = sku
     
-    if sku != bad_sku and len(sku) >= 8:
-        year = sku[4:6]
-        index = sku[6:8]
-        vpod_repo = f'/vpodrepo/20{year}-labs/{year}{index}'
-        write_output(f'VPodRepo path: {vpod_repo}')
+    # Use override or global labtype
+    lt = lab_type_override if lab_type_override else labtype
+    
+    if sku != bad_sku:
+        _, vpod_repo, git_url = get_repo_info(sku, lt)
+        if vpod_repo:
+            write_output(f'VPodRepo path: {vpod_repo}')
+            write_output(f'Git URL: {git_url}')
 
 #==============================================================================
 # MISC HELPERS

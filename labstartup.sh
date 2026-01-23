@@ -89,14 +89,19 @@ git_clone() {
 runlabstartup() {
     # start the Python labstartup.py script with optional "labcheck" argument
     # we only want one labstartup.py running
+    # 
+    # The Python scripts use lsf.write_output() which writes directly to the
+    # labstartup.log files in holroot and mcholroot. However, any print() 
+    # statements, logging output, or errors would be lost without this capture.
+    # We use tee to write to both log files simultaneously.
     if ! pgrep -f "labstartup.py"; then
-        if [ -n "$1" ]; then
-            echo "Starting ${holroot}/labstartup.py $1" >> ${logfile}
-            /usr/bin/python3 -u ${holroot}/labstartup.py "$1" >> ${logfile} 2>&1 &
-        else
-            echo "Starting ${holroot}/labstartup.py" >> ${logfile}
-            /usr/bin/python3 -u ${holroot}/labstartup.py >> ${logfile} 2>&1 &
-        fi
+        echo "Starting ${holroot}/labstartup.py $1" >> ${logfile}
+        echo "[$(date)] Starting ${holroot}/labstartup.py $1" >> "${holroot}/labstartup.log"
+        echo "[$(date)] Starting ${holroot}/labstartup.py $1" >> "${mcholroot}/labstartup.log"
+        
+        # Run Python with unbuffered output (-u) and write to both log files
+        # Using tee with multiple output files to capture stdout/stderr
+        /usr/bin/python3 -u ${holroot}/labstartup.py "$1" 2>&1 | tee -a "${holroot}/labstartup.log" "${mcholroot}/labstartup.log" &
     fi
 }
 
@@ -108,8 +113,57 @@ get_vpod_repo() {
     vpodgitdir="${yearrepo}/${year}${index}"
 }
 
+get_git_project_info() {
+    # Calculate git repository URL and local path based on labtype and SKU
+    # Supports multiple SKU patterns:
+    # - Standard (HOL, ATE, VXP, EDU): PREFIX-XXYY format
+    # - Named (Discovery): PREFIX-Name format
+    #
+    # Input: vPod_SKU, labtype (global variables)
+    # Output: gitproject, yearrepo, vpodgitdir (global variables)
+    
+    local prefix=$(echo "${vPod_SKU}" | cut -f1 -d'-')
+    local suffix=$(echo "${vPod_SKU}" | cut -f2- -d'-')
+    
+    case "$labtype" in
+        Discovery)
+            # Discovery uses name-based pattern (no year extraction)
+            # e.g., Discovery-Demo -> /vpodrepo/Discovery-labs/Demo
+            yearrepo="${gitdrive}/Discovery-labs"
+            vpodgitdir="${yearrepo}/${suffix}"
+            gitproject="https://github.com/Broadcom/${vPod_SKU}.git"
+            echo "Using Discovery naming pattern for ${vPod_SKU}" >> ${logfile}
+            ;;
+        HOL|ATE|VXP|EDU)
+            # Standard format: PREFIX-XXYY where XX=year, YY=index
+            # e.g., ATE-2701 -> /vpodrepo/2027-labs/2701
+            year=$(echo "${suffix}" | cut -c1-2)
+            index=$(echo "${suffix}" | cut -c3-4)
+            yearrepo="${gitdrive}/20${year}-labs"
+            vpodgitdir="${yearrepo}/${year}${index}"
+            gitproject="https://github.com/Broadcom/${prefix}-${year}${index}.git"
+            echo "Using standard naming pattern for ${vPod_SKU} (prefix: ${prefix})" >> ${logfile}
+            ;;
+        *)
+            # Fallback to HOL pattern for unknown lab types
+            year=$(echo "${vPod_SKU}" | cut -c5-6)
+            index=$(echo "${vPod_SKU}" | cut -c7-8)
+            yearrepo="${gitdrive}/20${year}-labs"
+            vpodgitdir="${yearrepo}/${year}${index}"
+            gitproject="https://github.com/Broadcom/HOL-${year}${index}.git"
+            echo "Using fallback HOL pattern for unknown labtype: ${labtype}" >> ${logfile}
+            ;;
+    esac
+    
+    vpodgit="${vpodgitdir}/.git"
+    echo "Git project: ${gitproject}" >> ${logfile}
+    echo "Year repo: ${yearrepo}" >> ${logfile}
+    echo "VPod git dir: ${vpodgitdir}" >> ${logfile}
+}
+
 push_router_files_nfs() {
     # Push router files via NFS instead of SCP
+    # Note: vpodgitdir must be set before calling this function
     echo "Pushing router files via NFS to ${holorouterdir}..." >> ${logfile}
     
     # Ensure NFS export directory exists
@@ -122,7 +176,8 @@ push_router_files_nfs() {
     fi
     
     # Merge lab-specific router files if present
-    skurouterfiles="${yearrepo}/${year}${index}/${router}"
+    # Use vpodgitdir which is set by get_git_project_info()
+    skurouterfiles="${vpodgitdir}/${router}"
     if [ -d "${skurouterfiles}" ]; then
         echo "Merging lab-specific router files from ${skurouterfiles}" >> ${logfile}
         
@@ -308,10 +363,6 @@ if [ "$vPod_SKU" = "HOL-BADSKU" ]; then
     exit 0
 fi
 
-# Calculate git repos from vPod_SKU
-year=$(echo "${vPod_SKU}" | cut -c5-6)
-index=$(echo "${vPod_SKU}" | cut -c7-8)
-
 # Determine branch
 cloud=$(/usr/bin/vmtoolsd --cmd 'info-get guestinfo.ovfEnv' 2>&1)
 holdev=$(echo "${cloud}" | grep -i hol-dev)
@@ -321,39 +372,37 @@ else
     branch="main"
 fi
 
-gitproject="https://github.com/Broadcom/HOL-${year}${index}.git"
-yearrepo="${gitdrive}/20${year}-labs"
-vpodgitdir="${yearrepo}/${year}${index}"
-vpodgit="${vpodgitdir}/.git"
+# Calculate git repos from vPod_SKU using labtype-aware function
+# This sets: gitproject, yearrepo, vpodgitdir, vpodgit
+get_git_project_info
 
-# Perform git operations for HOL labs (unless in testing mode)
-if [ "$labtype" = "HOL" ]; then
-    if check_testing_mode; then
-        echo "TESTING MODE: Skipping git operations for ${vPod_SKU}" >> ${logfile}
-    else
-        echo "Ready to pull updates for ${vPod_SKU} from ${gitproject}." >> ${logfile}
-        
-        if [ ! -e "${yearrepo}" ] || [ ! -e "${vpodgitdir}" ]; then
-            echo "Creating new git repo for ${vPod_SKU}..." >> ${logfile}
-            mkdir "$yearrepo" > /dev/null 2>&1
-            git_clone "$yearrepo" > /dev/null 2>&1
-            # shellcheck disable=SC2181
-            if [ $? != 0 ]; then
-                echo "The git project ${vpodgit} does not exist." >> ${logfile}
-                echo "FAIL - No GIT Project" > "$startupstatus"
-                exit 1
-            fi
-        else
-            echo "Performing git pull for repo ${vpodgit}" >> ${logfile}
-            git_pull "$vpodgitdir"
-        fi
-        
+# Perform git operations for all lab types (unless in testing mode)
+# Supports: HOL, ATE, VXP, EDU, Discovery
+if check_testing_mode; then
+    echo "TESTING MODE: Skipping git operations for ${vPod_SKU}" >> ${logfile}
+else
+    echo "Ready to pull updates for ${vPod_SKU} from ${gitproject}." >> ${logfile}
+    
+    if [ ! -e "${yearrepo}" ] || [ ! -e "${vpodgitdir}" ]; then
+        echo "Creating new git repo for ${vPod_SKU}..." >> ${logfile}
+        mkdir -p "$yearrepo" > /dev/null 2>&1
+        git_clone "$yearrepo" > /dev/null 2>&1
         # shellcheck disable=SC2181
-        if [ $? = 0 ]; then
-            echo "${vPod_SKU} git operations were successful." >> ${logfile}
-        else
-            echo "Could not complete ${vPod_SKU} git operations." >> ${logfile}
+        if [ $? != 0 ]; then
+            echo "The git project ${vpodgit} does not exist." >> ${logfile}
+            echo "FAIL - No GIT Project" > "$startupstatus"
+            exit 1
         fi
+    else
+        echo "Performing git pull for repo ${vpodgit}" >> ${logfile}
+        git_pull "$vpodgitdir"
+    fi
+    
+    # shellcheck disable=SC2181
+    if [ $? = 0 ]; then
+        echo "${vPod_SKU} git operations were successful." >> ${logfile}
+    else
+        echo "Could not complete ${vPod_SKU} git operations." >> ${logfile}
     fi
 fi
 

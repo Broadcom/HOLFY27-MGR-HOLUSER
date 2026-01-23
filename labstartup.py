@@ -75,6 +75,12 @@ def main():
     args = parse_args()
     color = 'red'
     
+    # Disable console output when running normally (not standalone)
+    # The bash script captures stdout via tee and appends to log files,
+    # so printing to console would cause duplicate log entries
+    if not args.verbose:
+        lsf.console_output = False
+    
     # Initialize lsfunctions (without router check initially)
     lsf.init(router=False)
     lsf.write_output(f'labtype is {lsf.labtype}')
