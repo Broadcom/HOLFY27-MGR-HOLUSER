@@ -148,8 +148,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('Cleaning previous Odyssey files...')
     
     odyssey_cleanup = [
-        f'{lsf.mcholroot}/odyssey_installed',
-        f'{lsf.mcholroot}/odyssey_error',
+        f'{lsf.lmcholroot}/odyssey_installed',
+        f'{lsf.lmcholroot}/odyssey_error',
         '/tmp/odyssey.tar.gz'
     ]
     

@@ -87,21 +87,24 @@ git_clone() {
 }
 
 runlabstartup() {
-    # start the Python labstartup.py script with optional "labcheck" argument
-    # we only want one labstartup.py running
+    # Start the Python labstartup.py script with optional "labcheck" argument
+    # We only want one labstartup.py running at a time
     # 
-    # The Python scripts use lsf.write_output() which writes directly to the
-    # labstartup.log files in holroot and mcholroot. However, any print() 
-    # statements, logging output, or errors would be lost without this capture.
-    # We use tee to write to both log files simultaneously.
+    # Python lsf.write_output() writes directly to BOTH log files:
+    #   - /home/holuser/hol/labstartup.log (Manager local)
+    #   - /lmchol/hol/labstartup.log (Main Console via NFS)
+    # 
+    # We redirect stderr to the local log to catch any Python errors/exceptions
+    # Console output from write_output is disabled to avoid duplicates
     if ! pgrep -f "labstartup.py"; then
-        echo "Starting ${holroot}/labstartup.py $1" >> ${logfile}
+        echo "[$(date)] Starting ${holroot}/labstartup.py $1" >> ${logfile}
         echo "[$(date)] Starting ${holroot}/labstartup.py $1" >> "${holroot}/labstartup.log"
-        echo "[$(date)] Starting ${holroot}/labstartup.py $1" >> "${mcholroot}/labstartup.log"
+        echo "[$(date)] Starting ${holroot}/labstartup.py $1" >> "${lmcholroot}/labstartup.log"
         
-        # Run Python with unbuffered output (-u) and write to both log files
-        # Using tee with multiple output files to capture stdout/stderr
-        /usr/bin/python3 -u ${holroot}/labstartup.py "$1" 2>&1 | tee -a "${holroot}/labstartup.log" "${mcholroot}/labstartup.log" &
+        # Run Python with unbuffered output (-u)
+        # Redirect stderr to local log to capture any errors/exceptions
+        # write_output() handles writing to both log files directly
+        /usr/bin/python3 -u ${holroot}/labstartup.py "$1" 2>> "${holroot}/labstartup.log" &
     fi
 }
 
@@ -246,7 +249,6 @@ echo "[$(date)] Starting labstartup.sh" >> ${logfile}
 while true; do
     if [ -d ${lmcholroot} ]; then
         echo "LMC detected." >> ${logfile}
-        mcholroot=${lmcholroot}
         desktopfile=/lmchol/home/holuser/desktop-hol/VMware.config
         [ "$1" != "labcheck" ] && cp /home/holuser/hol/Tools/VMware.config $desktopfile 2>/dev/null
         LMC=true
@@ -256,7 +258,7 @@ while true; do
     sleep 5
 done
 
-startupstatus=${mcholroot}/startup_status.txt
+startupstatus=${lmcholroot}/startup_status.txt
 
 # Handle labcheck mode
 if [ "$1" = "labcheck" ]; then
@@ -266,8 +268,8 @@ else
     echo "Main Console mount is present. Clearing labstartup logs." >> ${logfile}
     echo "" > "${holroot}"/labstartup.log
     chmod 666 "${holroot}"/labstartup.log 2>/dev/null || true
-    echo "" > "${mcholroot}"/labstartup.log
-    chmod 666 "${mcholroot}"/labstartup.log 2>/dev/null || true
+    echo "" > "${lmcholroot}"/labstartup.log
+    chmod 666 "${lmcholroot}"/labstartup.log 2>/dev/null || true
     if [ -f ${holorouterdir}/gitdone ]; then
         rm ${holorouterdir}/gitdone
     fi
@@ -277,9 +279,9 @@ fi
 # COPY VPOD.TXT AND DETERMINE LAB TYPE
 #==============================================================================
 
-if [ -f "${mcholroot}"/vPod.txt ]; then
-    echo "Copying ${mcholroot}/vPod.txt to /tmp/vPod.txt..." >> ${logfile}
-    cp "${mcholroot}"/vPod.txt /tmp/vPod.txt
+if [ -f "${lmcholroot}"/vPod.txt ]; then
+    echo "Copying ${lmcholroot}/vPod.txt to /tmp/vPod.txt..." >> ${logfile}
+    cp "${lmcholroot}"/vPod.txt /tmp/vPod.txt
     labtype=$(grep labtype /tmp/vPod.txt | cut -f2 -d '=' | sed 's/\r$//' | xargs)
     
     if [ "$labtype" != "HOL" ]; then

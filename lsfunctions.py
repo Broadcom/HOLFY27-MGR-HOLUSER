@@ -53,20 +53,22 @@ router = 'router.site-a.vcf.lab'
 proxy = 'proxy.site-a.vcf.lab'
 holorouter_dir = '/tmp/holorouter'  # NFS exported directory for router communication
 
-# Write to both holroot and mcholroot from the Manager
+# Log file name
 logfile = 'labstartup.log'
 
 socket.setdefaulttimeout(300)
 
-# LMC only in HOLFY27 (WMC removed)
+# Linux Main Console (LMC) - only option in HOLFY27 (WMC removed)
 LMC = False
-lmcholroot = '/lmchol/hol'  # NFS mount from LMC
+lmcholroot = '/lmchol/hol'  # NFS mount from Linux Main Console
 mc = '/lmchol'
-mcholroot = lmcholroot
-mctemp = f'{mc}/tmp'
 mcdesktop = f'{mc}/home/holuser/Desktop'
 desktop_config = '/lmchol/home/holuser/desktop-hol/VMware.config'
-logfiles = [f'{holroot}/{logfile}', f'{mcholroot}/{logfile}']
+
+# Log files - write to both local and LMC locations
+# - /home/holuser/hol/labstartup.log (Manager local)
+# - /lmchol/hol/labstartup.log (Main Console via NFS)
+logfiles = [f'{holroot}/{logfile}', f'{lmcholroot}/{logfile}']
 red = '${color red}Lab Status'
 green = '${color green}Lab Status'
 
@@ -75,11 +77,10 @@ status_dashboard_path = '/lmchol/home/holuser/startup-status.htm'
 
 resource_file_dir = f'{holroot}/Resources'
 startup_file_dir = f'{holroot}/Startup'
-lab_status = f'{mcholroot}/startup_status.txt'
-mcversionfile = f'{mcholroot}/version.txt'
+lab_status = f'{lmcholroot}/startup_status.txt'
 versiontxt = ''
 max_minutes_before_fail = 60
-ready_time_file = f'{mcholroot}/readyTime.txt'
+ready_time_file = f'{lmcholroot}/readyTime.txt'
 start_time = datetime.datetime.now()
 vc_boot_minutes = datetime.timedelta(seconds=(10 * 60))
 vcuser = 'administrator@vsphere.local'
@@ -113,19 +114,17 @@ def init(router=True, **kwargs):
     :param router: Whether to check router connectivity
     :param kwargs: Additional options
     """
-    global LMC, mc, mcholroot, mctemp, mcdesktop, desktop_config, logfiles
+    global LMC, mc, mcdesktop, desktop_config, logfiles
     global config, lab_sku, labtype, vpod_repo, max_minutes_before_fail, _password
     
-    # Wait for LMC mount
+    # Wait for LMC (Linux Main Console) mount
     while True:
         if os.path.isdir(lmcholroot):
             LMC = True
             mc = '/lmchol'
-            mcholroot = lmcholroot
-            mctemp = f'{mc}/tmp'
             mcdesktop = f'{mc}/home/holuser/Desktop'
             desktop_config = '/lmchol/home/holuser/desktop-hol/VMware.config'
-            logfiles = [f'{holroot}/{logfile}', f'{mcholroot}/{logfile}']
+            logfiles = [f'{holroot}/{logfile}', f'{lmcholroot}/{logfile}']
             break
         time.sleep(5)
     
@@ -991,7 +990,7 @@ def postmanfix():
 
 def start_autolab():
     """Check for and start autolab if present"""
-    autolab_file = f'{mcholroot}/autolab.py'
+    autolab_file = f'{lmcholroot}/autolab.py'
     if os.path.isfile(autolab_file):
         write_output('Autolab detected, executing...')
         result = run_command(f'/usr/bin/python3 {autolab_file}')
