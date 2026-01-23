@@ -323,7 +323,8 @@ if [ "$1" = "labcheck" ]; then
     exit 0
 else
     echo "Main Console mount is present. Clearing labstartup logs." >> ${logfile}
-    echo "" > /lmchhol/home/holuser/startup-status.htm
+    # Initialize the status dashboard to clear previous run info
+    /usr/bin/python3 ${holroot}/Tools/status_dashboard.py --clear >> ${logfile} 2>&1
     echo "" > "${holroot}"/labstartup.log
     chmod 666 "${holroot}"/labstartup.log 2>/dev/null || true
     echo "" > "${lmcholroot}"/labstartup.log

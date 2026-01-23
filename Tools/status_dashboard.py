@@ -671,6 +671,106 @@ class StatusDashboard:
 
 
 #==============================================================================
+# INITIALIZATION FUNCTIONS
+#==============================================================================
+
+def init_dashboard(lab_sku: str = "INITIALIZING") -> 'StatusDashboard':
+    """
+    Initialize/reset the dashboard to a clean state.
+    Clears previous lab run information and creates a fresh dashboard.
+    
+    :param lab_sku: The lab SKU to display (default: "INITIALIZING")
+    """
+    # Remove existing state file
+    try:
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+    except Exception:
+        pass
+    
+    # Create a fresh dashboard
+    dashboard = StatusDashboard(lab_sku)
+    dashboard.generate_html()
+    
+    return dashboard
+
+
+def clear_dashboard() -> None:
+    """
+    Clear the dashboard completely, removing both the HTML and state files.
+    Creates an empty/minimal HTML file to indicate waiting state.
+    """
+    # Remove existing files
+    try:
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+    except Exception:
+        pass
+    
+    # Write a minimal "waiting" page
+    waiting_html = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="10">
+    <title>Lab Startup - Initializing</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: #0f172a;
+            color: #f8fafc;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+        }
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 1rem;
+            color: #3b82f6;
+        }
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid #334155;
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 2rem auto;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        p {
+            color: #94a3b8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Lab Startup Initializing</h1>
+        <div class="spinner"></div>
+        <p>Waiting for lab startup to begin...</p>
+        <p style="font-size: 0.8rem;">Auto-refreshing every 10 seconds</p>
+    </div>
+</body>
+</html>
+'''
+    
+    try:
+        os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+        with open(STATUS_FILE, 'w') as f:
+            f.write(waiting_html)
+    except Exception as e:
+        print(f'Error clearing dashboard: {e}')
+
+
+#==============================================================================
 # STANDALONE EXECUTION
 #==============================================================================
 
@@ -680,17 +780,30 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='HOLFY27 Status Dashboard')
     parser.add_argument('--sku', default='HOL-2701', help='Lab SKU')
     parser.add_argument('--demo', action='store_true', help='Generate demo dashboard')
+    parser.add_argument('--init', action='store_true', 
+                        help='Initialize/reset dashboard to clean state')
+    parser.add_argument('--clear', action='store_true',
+                        help='Clear dashboard completely (minimal waiting page)')
     
     args = parser.parse_args()
     
-    dashboard = StatusDashboard(args.sku)
-    
-    if args.demo:
-        # Simulate some progress
-        dashboard.update_task('prelim', 'dns', 'complete')
-        dashboard.update_task('prelim', 'readme', 'complete')
-        dashboard.update_task('prelim', 'firewall', 'running', 'Checking firewall status...')
-        dashboard.update_task('infrastructure', 'esxi', 'running')
-    
-    dashboard.generate_html()
-    print(f'Dashboard generated at: {STATUS_FILE}')
+    if args.clear:
+        # Clear completely - show waiting page
+        clear_dashboard()
+        print(f'Dashboard cleared at: {STATUS_FILE}')
+    elif args.init:
+        # Initialize with fresh state
+        dashboard = init_dashboard(args.sku)
+        print(f'Dashboard initialized for {args.sku} at: {STATUS_FILE}')
+    else:
+        dashboard = StatusDashboard(args.sku)
+        
+        if args.demo:
+            # Simulate some progress
+            dashboard.update_task('prelim', 'dns', 'complete')
+            dashboard.update_task('prelim', 'readme', 'complete')
+            dashboard.update_task('prelim', 'firewall', 'running', 'Checking firewall status...')
+            dashboard.update_task('infrastructure', 'esxi', 'running')
+        
+        dashboard.generate_html()
+        print(f'Dashboard generated at: {STATUS_FILE}')
