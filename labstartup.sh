@@ -90,8 +90,13 @@ runlabstartup() {
     # start the Python labstartup.py script with optional "labcheck" argument
     # we only want one labstartup.py running
     if ! pgrep -f "labstartup.py"; then
-        echo "Starting ${holroot}/labstartup.py $1" >> ${logfile}
-        /usr/bin/python3 -u ${holroot}/labstartup.py "$1" >> ${logfile} 2>&1 &
+        if [ -n "$1" ]; then
+            echo "Starting ${holroot}/labstartup.py $1" >> ${logfile}
+            /usr/bin/python3 -u ${holroot}/labstartup.py "$1" >> ${logfile} 2>&1 &
+        else
+            echo "Starting ${holroot}/labstartup.py" >> ${logfile}
+            /usr/bin/python3 -u ${holroot}/labstartup.py >> ${logfile} 2>&1 &
+        fi
     fi
 }
 
