@@ -256,20 +256,34 @@ def update_desktop_status(message, color='red'):
         if os.path.isfile(desktop_config):
             # Read current content
             with open(desktop_config, 'r') as f:
-                content = f.read()
+                lines = f.readlines()
             
             # Get conky_title from config or use lab_sku
             conky_title = lab_sku
             if config.has_option('VPOD', 'conky_title'):
                 conky_title = config.get('VPOD', 'conky_title')
             
-            # Replace status line
-            color_tag = green if color == 'green' else red
-            new_status = f'{color_tag}: {message}'
+            # Determine color tag for status line
+            color_tag = '${color green}' if color == 'green' else '${color red}'
+            
+            # Update the lines
+            updated_lines = []
+            for line in lines:
+                # Update the lab title line (contains HOL-#### or similar placeholder)
+                # This is the line after "# labstartup sets the labname"
+                if line.strip().startswith('${font weight:bold}${color0}${alignc}'):
+                    updated_lines.append(f'${{font weight:bold}}${{color0}}${{alignc}}{conky_title}\n')
+                # Update the status line at the bottom
+                elif 'Lab Status' in line and '${exec cat' in line:
+                    updated_lines.append(f'${{font weight:bold}}{color_tag}Lab Status ${{alignr}}${{font weight:bold}}${{exec cat /hol/startup_status.txt}}\n')
+                else:
+                    updated_lines.append(line)
             
             # Write updated content
             with open(desktop_config, 'w') as f:
-                f.write(content)  # Simplified - actual implementation would parse and update
+                f.writelines(updated_lines)
+            
+            write_output(f'Updated desktop config: title="{conky_title}", status="{message}"')
     except Exception as e:
         write_output(f'Error updating desktop status: {e}')
 

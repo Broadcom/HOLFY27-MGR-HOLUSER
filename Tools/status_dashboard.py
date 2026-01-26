@@ -88,13 +88,17 @@ class StatusDashboard:
         TaskStatus.SKIPPED: ('⏭️', '#8b5cf6', 'Skipped - Not required')
     }
     
-    def __init__(self, lab_sku: str):
+    def __init__(self, lab_sku: str, load_state: bool = True):
         self.lab_sku = lab_sku
         self.start_time = datetime.datetime.now()
         self.groups: Dict[str, TaskGroup] = {}
         self.failed = False
         self.failure_reason = ""
         self._init_default_groups()
+        
+        # Try to load existing state to preserve progress across module calls
+        if load_state:
+            self._load_state()
     
     def _init_default_groups(self):
         """Initialize default task groups based on startup sequence"""
@@ -186,6 +190,38 @@ class StatusDashboard:
                     task.status = TaskStatus.SKIPPED
         self.generate_html()
     
+    def _load_state(self):
+        """Load state from JSON file if it exists and matches current lab_sku"""
+        try:
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, 'r') as f:
+                    state = json.load(f)
+                
+                # Only load state if it's for the same lab SKU
+                if state.get('lab_sku') == self.lab_sku:
+                    # Restore start time
+                    if 'start_time' in state:
+                        self.start_time = datetime.datetime.fromisoformat(state['start_time'])
+                    
+                    # Restore failure state
+                    self.failed = state.get('failed', False)
+                    self.failure_reason = state.get('failure_reason', '')
+                    
+                    # Restore task statuses
+                    if 'groups' in state:
+                        for gid, group_state in state['groups'].items():
+                            if gid in self.groups:
+                                for task_state in group_state.get('tasks', []):
+                                    task_id = task_state.get('id', '')
+                                    for task in self.groups[gid].tasks:
+                                        if task.id == task_id:
+                                            task.status = TaskStatus(task_state.get('status', 'pending'))
+                                            task.message = task_state.get('message', '')
+                                            break
+        except Exception:
+            # If loading fails, continue with fresh state
+            pass
+    
     def _save_state(self):
         """Save current state to JSON file"""
         state = {
@@ -249,8 +285,24 @@ class StatusDashboard:
             overall_status = "READY"
             status_color = "#22c55e"
         else:
-            overall_status = "STARTING"
-            status_color = "#3b82f6"
+            # Check if any task is currently running or has completed
+            has_running = any(
+                t.status == TaskStatus.RUNNING 
+                for g in self.groups.values() 
+                for t in g.tasks
+            )
+            has_completed = any(
+                t.status in [TaskStatus.COMPLETE, TaskStatus.FAILED, TaskStatus.SKIPPED]
+                for g in self.groups.values() 
+                for t in g.tasks
+            )
+            
+            if has_running or has_completed:
+                overall_status = "RUNNING"
+                status_color = "#f59e0b"  # Amber/orange for running
+            else:
+                overall_status = "STARTING"
+                status_color = "#3b82f6"
         
         html = f'''<!DOCTYPE html>
 <html lang="en">

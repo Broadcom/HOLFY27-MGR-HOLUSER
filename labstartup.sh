@@ -510,7 +510,15 @@ if [ "${labtype}" = "HOL" ]; then
 else
     echo "Pushing $labtype router files via NFS..." >> ${logfile}
     mkdir -p ${holorouterdir}
-    cp ${holroot}/${router}/nofirewall.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
+    # In dev environment, keep the default iptablescfg.sh from git
+    # In prod environment, use nofirewall.sh for non-HOL labs
+    if [ "$branch" = "dev" ]; then
+        echo "Dev environment: keeping default iptablescfg.sh from holorouter" >> ${logfile}
+        cp ${holroot}/${router}/iptablescfg.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
+    else
+        echo "Prod environment: using nofirewall.sh for non-HOL labtype" >> ${logfile}
+        cp ${holroot}/${router}/nofirewall.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
+    fi
     cp ${holroot}/${router}/allowall ${holorouterdir}/allowlist 2>/dev/null
     date > ${holorouterdir}/gitdone
 fi
