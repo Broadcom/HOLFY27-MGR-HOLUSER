@@ -200,12 +200,17 @@ def tdns_show_config():
         write_output(f'tdns-mgr config error: {e}')
 
 
-def tdns_login() -> bool:
+def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
     """
     Login to tdns-mgr using password from creds.txt
+    Retries up to max_retries times with retry_delay seconds between attempts
     
+    :param max_retries: Maximum number of login attempts (default: 10)
+    :param retry_delay: Seconds to wait between retries (default: 15)
     :return: True if login successful
     """
+    import time
+    
     # Show config before login attempt for debugging
     tdns_show_config()
     
@@ -215,29 +220,36 @@ def tdns_login() -> bool:
         write_output('ERROR: No password available for tdns-mgr login')
         return False
     
-    write_output('Logging into tdns-mgr...')
-    
-    try:
-        result = subprocess.run(
-            [TDNS_MGR_PATH, 'login', '-p', password],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+    for attempt in range(1, max_retries + 1):
+        write_output(f'Logging into tdns-mgr (attempt {attempt}/{max_retries})...')
         
-        if result.returncode == 0:
-            write_output('tdns-mgr login successful')
-            return True
-        else:
-            write_output(f'tdns-mgr login failed: {result.stderr}')
-            return False
+        try:
+            result = subprocess.run(
+                [TDNS_MGR_PATH, 'login', '-p', password],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
             
-    except subprocess.TimeoutExpired:
-        write_output('tdns-mgr login timed out')
-        return False
-    except Exception as e:
-        write_output(f'tdns-mgr login error: {e}')
-        return False
+            if result.returncode == 0:
+                write_output('tdns-mgr login successful')
+                return True
+            else:
+                error_msg = result.stderr.strip() if result.stderr else 'Unknown error'
+                write_output(f'tdns-mgr login failed: {error_msg}')
+                
+        except subprocess.TimeoutExpired:
+            write_output('tdns-mgr login timed out')
+        except Exception as e:
+            write_output(f'tdns-mgr login error: {e}')
+        
+        # If not the last attempt, wait before retrying
+        if attempt < max_retries:
+            write_output(f'Waiting {retry_delay} seconds before retry...')
+            time.sleep(retry_delay)
+    
+    write_output(f'ERROR: tdns-mgr login failed after {max_retries} attempts')
+    return False
 
 
 def import_records_from_file(csv_path: str) -> Dict[str, Any]:
