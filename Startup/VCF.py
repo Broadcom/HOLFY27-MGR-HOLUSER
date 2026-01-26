@@ -270,6 +270,9 @@ def main(lsf=None, standalone=False, dry_run=False):
                 connect.Disconnect(si)
             except Exception:
                 pass
+        # Clear the session lists so subsequent modules start fresh
+        lsf.sis.clear()
+        lsf.sisvc.clear()
     
     ##=========================================================================
     ## End Core Team code

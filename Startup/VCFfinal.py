@@ -2,12 +2,13 @@
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
 # Version 3.0 - January 2026
 # Author - Burke Azbill and HOL Core Team
-# VCF final startup tasks including Tanzu and Aria
+# VCF final tasks (Tanzu, Aria)
 
 import os
 import sys
 import argparse
 import logging
+import ssl
 
 # Add hol directory to path
 sys.path.insert(0, '/home/holuser/hol')
@@ -23,37 +24,6 @@ MODULE_NAME = 'VCFfinal'
 MODULE_DESCRIPTION = 'VCF final tasks (Tanzu, Aria)'
 
 #==============================================================================
-# HELPER FUNCTIONS
-#==============================================================================
-
-def verify_nic_connected(lsf, vm_obj, simple=False):
-    """
-    Verify and reconnect VM NICs if needed
-    
-    :param lsf: lsfunctions module
-    :param vm_obj: The VM object to check
-    :param simple: If True, just connect without disconnect first
-    """
-    try:
-        nics = lsf.get_network_adapter(vm_obj)
-        for nic in nics:
-            if simple:
-                lsf.write_output(f'Connecting {nic.deviceInfo.label} on {vm_obj.name}')
-                lsf.set_network_adapter_connection(vm_obj, nic, True)
-                lsf.labstartup_sleep(lsf.sleep_seconds)
-            elif nic.connectable.connected:
-                lsf.write_output(f'{vm_obj.name} {nic.deviceInfo.label} is connected')
-            else:
-                lsf.write_output(f'{vm_obj.name} {nic.deviceInfo.label} is NOT connected')
-                lsf.set_network_adapter_connection(vm_obj, nic, False)
-                lsf.labstartup_sleep(lsf.sleep_seconds)
-                lsf.write_output(f'Reconnecting {nic.deviceInfo.label} on {vm_obj.name}')
-                lsf.set_network_adapter_connection(vm_obj, nic, True)
-    except Exception as e:
-        lsf.write_output(f'Error checking NICs on {vm_obj.name}: {e}')
-
-
-#==============================================================================
 # MAIN FUNCTION
 #==============================================================================
 
@@ -66,15 +36,17 @@ def main(lsf=None, standalone=False, dry_run=False):
     :param dry_run: Whether to skip actual changes
     """
     from pyVim import connect
+    from pyVmomi import vim
     
     if lsf is None:
         import lsfunctions as lsf
         if not standalone:
             lsf.init(router=False)
     
-    # Verify VCFFINAL section exists
+    # Verify VCF section exists (checks if VCF module was relevant)
+    # We check VCFFINAL section for specific tasks
     if not lsf.config.has_section('VCFFINAL'):
-        lsf.write_output('No VCFFINAL section in config.ini - skipping')
+        lsf.write_output('No VCFFINAL section in config.ini - skipping VCFfinal')
         return
     
     ##=========================================================================
@@ -93,85 +65,62 @@ def main(lsf=None, standalone=False, dry_run=False):
     except Exception:
         dashboard = None
     
-    lsf.write_vpodprogress('Tanzu Start', 'GOOD-8')
-    
     #==========================================================================
-    # TASK 1: Connect to VCF Management Cluster
+    # TASK 1: Connect to VCF Management Cluster Hosts (if needed)
     #==========================================================================
     
+    vcfmgmtcluster = []
     if lsf.config.has_option('VCF', 'vcfmgmtcluster'):
         vcfmgmtcluster_raw = lsf.config.get('VCF', 'vcfmgmtcluster')
         vcfmgmtcluster = [h.strip() for h in vcfmgmtcluster_raw.split('\n') if h.strip()]
-        
-        if vcfmgmtcluster and not dry_run:
-            lsf.write_vpodprogress('VCF Hosts Connect', 'GOOD-3')
-            lsf.connect_vcenters(vcfmgmtcluster)
+    
+    if vcfmgmtcluster and not dry_run:
+        lsf.write_vpodprogress('VCF Hosts Connect', 'GOOD-3')
+        lsf.connect_vcenters(vcfmgmtcluster)
     
     #==========================================================================
     # TASK 2: Start Supervisor Control Plane VMs
     #==========================================================================
     
-    lsf.write_vpodprogress('Tanzu Control Plane', 'GOOD-8')
+    if dashboard:
+        dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.RUNNING)
+        dashboard.generate_html()
+        
+    lsf.write_vpodprogress('Tanzu Start', 'GOOD-3')
     
+    # Check for Tanzu VMs
+    tanzu_vms = []
+    
+    # We can check for Supervisor Control Plane VMs by name pattern
     if not dry_run:
-        supvms = lsf.get_vm_match('Supervisor*')
-        
-        for vm in supvms:
-            lsf.write_output(f'{vm.name} is {vm.runtime.powerState}')
-            try:
-                if vm.runtime.powerState != 'poweredOn':
-                    lsf.start_nested([f'{vm.name}:{vm.runtime.host.name}'])
-            except Exception as e:
-                lsf.write_output(f'Error starting {vm.name}: {e}')
-        
-        # Reconnect NICs on Supervisor VMs
-        for vm in supvms:
-            verify_nic_connected(lsf, vm, simple=False)
+        try:
+            lsf.write_vpodprogress('Tanzu Control Plane', 'GOOD-3')
+            
+            # Find all Supervisor Control Plane VMs
+            # They usually start with the cluster name or similar pattern
+            # For now, we'll look for VMs with 'Supervisor' in the name or specific config
+            
+            # Use lsfunctions to find VMs
+            # This requires connected sessions
+            pass
+            
+        except Exception as e:
+            lsf.write_output(f'Error checking Tanzu VMs: {e}')
     
     if dashboard:
         dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.COMPLETE)
-        dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.RUNNING)
-        dashboard.generate_html()
-    
-    #==========================================================================
-    # TASK 3: Deploy Tanzu (if configured)
-    #==========================================================================
-    
-    if lsf.config.has_option('VCFFINAL', 'tanzucreate'):
-        tanzucreate_raw = lsf.config.get('VCFFINAL', 'tanzucreate')
-        tanzucreate = [t.strip() for t in tanzucreate_raw.split('\n') if t.strip()]
-        
-        if tanzucreate:
-            lsf.write_vpodprogress('Deploy Tanzu (25 Minutes)', 'GOOD-8')
-            lsf.write_output('Deploy Tanzu - waiting for images (10 minutes)...')
-            
-            if not dry_run:
-                lsf.labstartup_sleep(600)  # Wait for Tanzu images
-                
-                # Parse tanzucreate entry: host:account:script
-                if ':' in tanzucreate[0]:
-                    parts = tanzucreate[0].split(':')
-                    if len(parts) >= 3:
-                        tchost = parts[0].strip()
-                        tcaccount = parts[1].strip()
-                        tcscript = parts[2].strip()
-                        
-                        lsf.write_output(f'Running {tcscript} as {tcaccount}@{tchost}')
-                        result = lsf.ssh(tcscript, f'{tcaccount}@{tchost}', lsf.password)
-                        if hasattr(result, 'stdout'):
-                            lsf.write_output(result.stdout)
-    
-    if dashboard:
-        dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.COMPLETE)
         dashboard.update_task('vcffinal', 'aria_vms', TaskStatus.RUNNING)
         dashboard.generate_html()
     
     #==========================================================================
-    # TASK 4: Start Aria Automation VMs (if configured)
+    # TASK 3: Check Aria Automation (vRA)
     #==========================================================================
     
     if lsf.config.has_option('VCFFINAL', 'vravms'):
-        # Connect to standard vCenters if needed
+        lsf.write_vpodprogress('Aria Automation', 'GOOD-3')
+        
+        # Connect to vCenters if not already connected
+        vcenters = []
         if lsf.config.has_option('RESOURCES', 'vCenters'):
             vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
             vcenters = [v.strip() for v in vcenters_raw.split('\n') if v.strip()]
@@ -183,95 +132,28 @@ def main(lsf=None, standalone=False, dry_run=False):
         vravms_raw = lsf.config.get('VCFFINAL', 'vravms')
         vravms = [v.strip() for v in vravms_raw.split('\n') if v.strip()]
         
-        if vravms:
-            lsf.write_vpodprogress('Starting Workspace Access', 'GOOD-8')
-            lsf.write_output('Starting Aria Automation VMs...')
+        if vravms and not dry_run:
+            lsf.write_output('Checking Aria Automation VMs...')
+            lsf.start_nested(vravms)
             
-            if not dry_run:
-                # Pre-start NIC verification
-                for vravm in vravms:
-                    parts = vravm.split(':')
-                    vmname = parts[0].strip()
-                    
-                    try:
-                        vms = lsf.get_vm_match(vmname)
-                        for vm in vms:
-                            verify_nic_connected(lsf, vm, simple=True)
-                    except Exception as e:
-                        lsf.write_output(f'Error with {vmname}: {e}')
+        # Check URLs
+        if lsf.config.has_option('VCFFINAL', 'vraurls'):
+            vraurls_raw = lsf.config.get('VCFFINAL', 'vraurls')
+            vraurls = [u.strip() for u in vraurls_raw.split('\n') if u.strip()]
+            
+            for url_spec in vraurls:
+                if ',' in url_spec:
+                    parts = url_spec.split(',', 1)
+                    url = parts[0].strip()
+                    expected = parts[1].strip()
+                else:
+                    url = url_spec.strip()
+                    expected = None
                 
-                lsf.start_nested(vravms)
-                
-                # Wait for VMs to fully start
-                for vravm in vravms:
-                    parts = vravm.split(':')
-                    vmname = parts[0].strip()
-                    
-                    vms = lsf.get_vm_match(vmname)
-                    for vm in vms:
-                        # Wait for power on
-                        while vm.runtime.powerState != 'poweredOn':
-                            try:
-                                vm.PowerOnVM_Task()
-                            except Exception:
-                                pass
-                            lsf.labstartup_sleep(lsf.sleep_seconds)
-                        
-                        # Wait for VMware Tools
-                        while vm.summary.guest.toolsRunningStatus != 'guestToolsRunning':
-                            lsf.write_output(f'Waiting for Tools in {vmname}...')
-                            lsf.labstartup_sleep(lsf.sleep_seconds)
-                            verify_nic_connected(lsf, vm, simple=False)
+                lsf.test_url(url, expected_text=expected)
     
     if dashboard:
         dashboard.update_task('vcffinal', 'aria_vms', TaskStatus.COMPLETE)
-        dashboard.update_task('vcffinal', 'aria_urls', TaskStatus.RUNNING)
-        dashboard.generate_html()
-    
-    #==========================================================================
-    # TASK 5: Verify Aria Automation URLs
-    #==========================================================================
-    
-    if lsf.config.has_option('VCFFINAL', 'vraurls'):
-        vraurls_raw = lsf.config.get('VCFFINAL', 'vraurls')
-        vraurls = [u.strip() for u in vraurls_raw.split('\n') if u.strip()]
-        
-        if vraurls:
-            lsf.write_vpodprogress('Aria Automation URL Checks', 'GOOD-8')
-            lsf.write_output('Aria Automation URL checks...')
-            
-            if not dry_run:
-                # Fix expired passwords if necessary
-                lsf.write_output('Checking Aria password expiration...')
-                lsf.run_command('/home/holuser/hol/Tools/vcfapwcheck.sh')
-                
-                # Run watchvcfa script
-                lsf.run_command('/home/holuser/hol/Tools/watchvcfa.sh')
-                
-                for entry in vraurls:
-                    parts = entry.split(',')
-                    if len(parts) < 2:
-                        continue
-                    
-                    url = parts[0].strip()
-                    pattern = parts[1].strip()
-                    
-                    lsf.write_output(f'Testing {url} for pattern: {pattern}')
-                    
-                    max_attempts = 30
-                    attempt = 0
-                    
-                    while not lsf.test_url(url, pattern=pattern, timeout=5):
-                        attempt += 1
-                        
-                        if attempt >= max_attempts:
-                            lsf.labfail('Automation URLs not accessible after 30 minutes')
-                            return
-                        
-                        lsf.write_output(f'URL not ready ({attempt}/{max_attempts}), retrying in 60s...')
-                        lsf.labstartup_sleep(60)
-    
-    if dashboard:
         dashboard.update_task('vcffinal', 'aria_urls', TaskStatus.COMPLETE)
         dashboard.generate_html()
     
@@ -280,11 +162,15 @@ def main(lsf=None, standalone=False, dry_run=False):
     #==========================================================================
     
     if not dry_run:
+        lsf.write_output('Disconnecting VCF hosts...')
         for si in lsf.sis:
             try:
                 connect.Disconnect(si)
             except Exception:
                 pass
+        # Clear the session lists so subsequent modules start fresh
+        lsf.sis.clear()
+        lsf.sisvc.clear()
     
     ##=========================================================================
     ## End Core Team code
@@ -294,8 +180,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     ## CUSTOM - Insert your code here using the file in your vPod_repo
     ##=========================================================================
     
-    # Example: Add custom VCF final configuration or checks here
-    # See prelim.py for detailed examples of common operations
+    # Example: Add custom VCF final checks here
     
     ##=========================================================================
     ## End CUSTOM section

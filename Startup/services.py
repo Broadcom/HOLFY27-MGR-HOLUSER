@@ -140,7 +140,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                 continue
             
             host = parts[0].strip()
-            port = parts[1].strip()
+            port = int(parts[1].strip())
             
             while not lsf.test_tcp_port(host, port):
                 lsf.write_output(f'Waiting for {host}:{port}...')

@@ -88,6 +88,7 @@ linuxuser = 'root'
 vsphereaccount = 'administrator@vsphere.local'
 sis = []  # all vCenter session instances
 sisvc = {}  # dictionary to hold all vCenter/ESXi session instances indexed by host name
+mm = ''  # colon-delimited list of ESXi hosts to keep in maintenance mode
 sshpass = '/usr/bin/sshpass'
 
 # VPodRepo path (set during init)
@@ -634,6 +635,61 @@ def reboot_hosts():
         while not test_tcp_port(host.name, 22, timeout=5):
             write_output(f'Waiting for {host.name} to respond...')
             labstartup_sleep(sleep_seconds)
+
+
+def exit_maintenance():
+    """
+    Take all ESXi hosts out of Maintenance Mode.
+    """
+    hosts = get_all_hosts()
+    for host in hosts:
+        if host.runtime.inMaintenanceMode:
+            host.ExitMaintenanceMode_Task(0)
+
+
+def check_maintenance():
+    """
+    Verify that all ESXi hosts are not in Maintenance Mode.
+    Hosts listed in the global 'mm' variable are excluded from this check.
+    
+    :return: True if all hosts (except excluded) are out of maintenance mode, False otherwise
+    """
+    maint = 0
+    hosts = get_all_hosts()
+    
+    # First pass: log which hosts are still in maintenance mode
+    for host in hosts:
+        if host.name in mm:  # leave this one in MM
+            continue
+        elif host.runtime.inMaintenanceMode:
+            write_output(f'{host.name} is still in Maintenance Mode.')
+    
+    # Second pass: count hosts still in maintenance mode
+    hosts = get_all_hosts()
+    for host in hosts:
+        if host.name in mm:  # leave this one in MM
+            continue
+        elif host.runtime.inMaintenanceMode:
+            maint += 1
+    
+    if maint == 0:
+        return True
+    else:
+        return False
+
+
+def clear_host_alarms():
+    """
+    Clear all triggered alarms across all connected vCenter sessions.
+    """
+    filter_spec = vim.alarm.AlarmFilterSpec(
+        status=[],
+        typeEntity='entityTypeAll',
+        typeTrigger='triggerTypeAll'
+    )
+    for si in sis:
+        alarm_mgr = si.content.alarmManager
+        alarm_mgr.ClearTriggeredAlarms(filter_spec)
 
 
 def check_datastore(entry):
@@ -1412,19 +1468,30 @@ def push_vpodrepo_router_files():
     
     return True
 
+def signal_router(state: str):
+    """
+    Signal to router with the specified state.
+    
+    Creates a file in the holorouter NFS share directory that the router
+    monitors to know the current lab startup state.
+    
+    :param state: State to signal (e.g., 'gitdone', 'ready', or any custom state)
+    """
+    state_file = os.path.join(holorouter_dir, state)
+    try:
+        with open(state_file, 'w') as f:
+            f.write(str(datetime.datetime.now()))
+        write_output(f'Signaled router: {state}')
+    except Exception as e:
+        write_output(f'Failed to signal router ({state}): {e}')
+
 def signal_router_gitdone():
     """Signal to router that git pull is complete"""
-    gitdone_file = os.path.join(holorouter_dir, 'gitdone')
-    with open(gitdone_file, 'w') as f:
-        f.write(str(datetime.datetime.now()))
-    write_output('Signaled router: gitdone')
+    signal_router('gitdone')
 
 def signal_router_ready():
     """Signal to router that lab is ready"""
-    ready_file = os.path.join(holorouter_dir, 'ready')
-    with open(ready_file, 'w') as f:
-        f.write(str(datetime.datetime.now()))
-    write_output('Signaled router: ready')
+    signal_router('ready')
 
 #==============================================================================
 # PARSE LAB SKU
