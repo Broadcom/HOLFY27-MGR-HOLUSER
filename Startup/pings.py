@@ -59,6 +59,11 @@ def main(lsf=None, standalone=False, dry_run=False):
     if lsf.config.has_option('RESOURCES', 'Pings'):
         pings_raw = lsf.config.get('RESOURCES', 'Pings')
         ping_targets = [p.strip() for p in pings_raw.split(',') if p.strip()]
+        # Handle both newline-separated and comma-separated formats
+        if '\n' in pings_raw:
+            ping_targets = [p.strip() for p in pings_raw.split('\n') if p.strip()]
+        else:
+            ping_targets = [p.strip() for p in pings_raw.split(',') if p.strip()]
     
     if not ping_targets:
         lsf.write_output('No ping targets configured')
