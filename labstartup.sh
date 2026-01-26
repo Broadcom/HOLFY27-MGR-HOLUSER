@@ -114,7 +114,7 @@ git_clone() {
         git ls-remote $gitproject > /dev/null 2>&1
         if [ $? != 0 ]; then
             echo "Git repository does not exist: ${gitproject}" >> ${logfile}
-            echo "FAIL - No GIT Project" > "$startupstatus"
+            echo "No GIT Project Available, will attempt fallback to local config." >> ${logfile}
             exit 1
         fi
         echo "git clone -b $branch $gitproject $vpodgitdir" >> ${logfile}
