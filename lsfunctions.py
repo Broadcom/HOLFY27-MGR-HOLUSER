@@ -429,7 +429,7 @@ def connect_vc(host, user, password=None, **kwargs):
     :param host: vCenter/ESXi hostname
     :param user: Username
     :param password: Password
-    :return: ServiceInstance
+    :return: ServiceInstance or True on success, None/False on failure
     """
     if password is None:
         password = get_password()
@@ -437,12 +437,24 @@ def connect_vc(host, user, password=None, **kwargs):
     port = kwargs.get('port', 443)
     
     try:
-        si = connect.SmartConnectNoSSL(
-            host=host,
-            user=user,
-            pwd=password,
-            port=port
-        )
+        # Try pyVmomi 7.0 method first
+        try:
+            si = connect.SmartConnectNoSSL(
+                host=host,
+                user=user,
+                pwd=password,
+                port=port
+            )
+        except AttributeError:
+            # pyVmomi 8.0+ uses SmartConnect with disableSslCertValidation
+            si = connect.SmartConnect(
+                host=host,
+                user=user,
+                pwd=password,
+                port=port,
+                disableSslCertValidation=True
+            )
+        
         sisvc[host] = si
         sis.append(si)
         write_output(f'Connected to {host}')
@@ -494,6 +506,332 @@ def start_vm(vm):
             write_output(f'Failed to power on {vm.name}: {e}')
             return False
     return True
+
+
+#==============================================================================
+# VSPHERE HELPER FUNCTIONS (from legacy lsfunctions.py)
+#==============================================================================
+
+def get_all_objs(si_content, vimtype):
+    """
+    Method that populates objects of type vimtype such as
+    vim.VirtualMachine, vim.HostSystem, vim.Datacenter, vim.Datastore, vim.ClusterComputeResource
+    :param si_content: serviceinstance.content
+    :param vimtype: VIM object type name (list)
+    :return: dict of {object: name}
+    """
+    obj = {}
+    container = si_content.viewManager.CreateContainerView(si_content.rootFolder, vimtype, True)
+    for managed_object_ref in container.view:
+        obj.update({managed_object_ref: managed_object_ref.name})
+    container.Destroy()
+    return obj
+
+
+def connect_vcenters(entries):
+    """
+    Connect to multiple vCenters or ESXi hosts from a config list
+    :param entries: list of vCenter entries from config.ini in format "hostname:type:user"
+    """
+    pwd = get_password()
+    
+    for entry in entries:
+        # Skip comments and empty lines
+        if not entry or entry.strip().startswith('#'):
+            continue
+        
+        vc = entry.split(':')
+        hostname = vc[0].strip()
+        vc_type = vc[1].strip() if len(vc) > 1 else 'esx'
+        
+        if len(vc) >= 3:
+            login_user = vc[2].strip()
+        else:
+            login_user = vcuser
+        
+        write_output(f'Connecting to {hostname}...')
+        test_ping(hostname)
+        
+        if vc_type == 'esx':
+            login_user = 'root'
+        
+        # Keep trying to connect until successful
+        max_attempts = 10
+        attempt = 0
+        while not connect_vc(hostname, login_user, pwd):
+            attempt += 1
+            if attempt >= max_attempts:
+                write_output(f'Failed to connect to {hostname} after {max_attempts} attempts')
+                break
+            labstartup_sleep(sleep_seconds)
+        
+        if vc_type == 'linux':
+            write_output('Connected to linux vCenter')
+
+
+def get_host(name):
+    """
+    Convenience function to retrieve an ESXi host by name from all session content
+    :param name: string the name of the host to retrieve
+    :return: vim.HostSystem or None
+    """
+    for si in sis:
+        hosts = get_all_objs(si.content, [vim.HostSystem])
+        for host in hosts:
+            if host.name == name:
+                return host
+    return None
+
+
+def get_all_hosts():
+    """
+    Convenience function to retrieve all ESX host systems
+    :return: list of vim.HostSystem
+    """
+    all_hosts = []
+    for si in sis:
+        hosts = get_all_objs(si.content, [vim.HostSystem])
+        all_hosts.extend(hosts.keys())
+    return all_hosts
+
+
+def get_datastore(ds_name):
+    """
+    Convenience function to retrieve a datastore by name
+    :param ds_name: string - the name of the datastore to return
+    :return: vim.Datastore or None
+    """
+    for si in sis:
+        datastores = get_all_objs(si.content, [vim.Datastore])
+        for datastore in datastores:
+            if datastore.name == ds_name:
+                return datastore
+    return None
+
+
+def get_vm_by_name(name, **kwargs):
+    """
+    Convenience function to retrieve VMs by name from a specific session or all sessions
+    :param name: string the name of the VM to retrieve
+    :param vc: optional - the specific vCenter hostname to search
+    :return: list of matching VMs
+    """
+    vc = kwargs.get('vc', '')
+    vmlist = []
+    
+    if vc and vc in sisvc:
+        vms = get_all_objs(sisvc[vc].content, [vim.VirtualMachine])
+        for vm in vms:
+            if vm.name == name:
+                vmlist.append(vm)
+    else:
+        for si in sis:
+            vms = get_all_objs(si.content, [vim.VirtualMachine])
+            for vm in vms:
+                if vm.name == name:
+                    vmlist.append(vm)
+    return vmlist
+
+
+def get_vm_match(name):
+    """
+    Convenience function to retrieve VMs matching a pattern from all session content
+    :param name: string the name pattern of the VMs to retrieve (regex)
+    :return: list of matching VMs
+    """
+    pattern = re.compile(name, re.IGNORECASE)
+    vmsreturn = []
+    for si in sis:
+        vms = get_all_objs(si.content, [vim.VirtualMachine])
+        for vm in vms:
+            match = pattern.match(vm.name)
+            if match:
+                vmsreturn.append(vm)
+    return vmsreturn
+
+
+def get_vapp(name, **kwargs):
+    """
+    Convenience function to retrieve the vApp named from all session content
+    :param name: string the name of the vApp to retrieve
+    :param vc: optional - the specific vCenter hostname to search
+    :return: list of matching vApps
+    """
+    vc = kwargs.get('vc', '')
+    valist = []
+    
+    if vc and vc in sisvc:
+        vapps = get_all_objs(sisvc[vc].content, [vim.VirtualApp])
+        for vapp in vapps:
+            if vapp.name == name:
+                valist.append(vapp)
+    else:
+        for si in sis:
+            vapps = get_all_objs(si.content, [vim.VirtualApp])
+            for vapp in vapps:
+                if vapp.name == name:
+                    valist.append(vapp)
+    return valist
+
+
+def start_nested(records):
+    """
+    Start all the nested vApps or VMs in the records list passed in
+    :param records: list of vApps or VMs to start. Format: "vmname:vcenter" or "Pause:seconds"
+    """
+    if not len(records):
+        write_output('no records')
+        return
+
+    for record in records:
+        # Skip comments and empty lines
+        if not record or record.strip().startswith('#'):
+            continue
+        
+        p = record.split(':')
+        e_name = p[0].strip()
+        vc_name = p[1].strip() if len(p) > 1 else ''
+        
+        # Handle pause entries
+        if 'pause' in e_name.lower():
+            if labcheck:
+                continue
+            write_output(f'Pausing {p[1]} seconds...')
+            labstartup_sleep(int(p[1]))
+            continue
+
+        # Try to find as vApp first, then as VM
+        va = get_vapp(e_name, vc=vc_name)
+        vms = get_vm_by_name(e_name, vc=vc_name)
+        
+        if not vms:
+            vms = get_vm_match(e_name)
+        
+        if not vms and not va:
+            write_output(f'Unable to find entity {e_name}')
+            continue
+        
+        # Process vApps
+        if va:
+            for vapp in va:
+                if vapp.summary.vAppState == 'started':
+                    write_output(f'{vapp.name} already powered on.')
+                    continue
+                write_output(f'Attempting to power on vApp {vapp.name}...')
+                try:
+                    task = vapp.PowerOnVApp_Task()
+                    WaitForTask(task)
+                    write_output(f'Powered on vApp: {vapp.name}')
+                except Exception as e:
+                    write_output(f'Failed to power on vApp {vapp.name}: {e}')
+        
+        # Process VMs
+        for vm in vms:
+            if vm.runtime.powerState == 'poweredOn':
+                write_output(f'{vm.name} already powered on.')
+                continue
+            
+            write_output(f'Attempting to power on VM {vm.name}...')
+            
+            # Wait for VM to be connected
+            max_wait = 60
+            waited = 0
+            while vm.runtime.connectionState != 'connected' and waited < max_wait:
+                write_output(f'VM {vm.name} connection state: {vm.runtime.connectionState}, waiting...')
+                labstartup_sleep(5)
+                waited += 5
+            
+            if vm.runtime.connectionState != 'connected':
+                write_output(f'VM {vm.name} not connected after {max_wait}s, skipping')
+                continue
+            
+            try:
+                task = vm.PowerOnVM_Task()
+                WaitForTask(task)
+                write_output(f'Powered on VM: {vm.name}')
+            except Exception as e:
+                write_output(f'Failed to power on {vm.name}: {e}')
+
+
+def get_cluster(cluster_name):
+    """
+    Get a cluster object by name from any connected vCenter
+    :param cluster_name: Cluster name
+    :return: ClusterComputeResource object or None
+    """
+    for si in sis:
+        clusters = get_all_objs(si.content, [vim.ClusterComputeResource])
+        for cluster in clusters:
+            if cluster.name == cluster_name:
+                return cluster
+    return None
+
+
+def wait_for_vcenter(hostname, timeout=600, interval=10):
+    """
+    Wait for vCenter to be fully available (API responding)
+    :param hostname: vCenter hostname
+    :param timeout: Maximum time to wait in seconds
+    :param interval: Check interval in seconds
+    :return: True if vCenter is available, False if timeout
+    """
+    start = datetime.datetime.now()
+    pwd = get_password()
+    
+    while (datetime.datetime.now() - start).total_seconds() < timeout:
+        write_output(f'Waiting for vCenter {hostname}...')
+        
+        # First check if TCP port is responding
+        if test_tcp_port(hostname, 443, timeout=5):
+            # Try to connect via API
+            try:
+                # Try pyVmomi 7.0 method first
+                try:
+                    si = connect.SmartConnectNoSSL(
+                        host=hostname,
+                        user='administrator@vsphere.local',
+                        pwd=pwd,
+                        port=443
+                    )
+                except AttributeError:
+                    # pyVmomi 8.0+ uses SmartConnect with disableSslCertValidation
+                    si = connect.SmartConnect(
+                        host=hostname,
+                        user='administrator@vsphere.local',
+                        pwd=pwd,
+                        port=443,
+                        disableSslCertValidation=True
+                    )
+                
+                if si:
+                    # Disconnect this test connection
+                    connect.Disconnect(si)
+                    write_output(f'vCenter {hostname} is ready')
+                    return True
+            except Exception as e:
+                write_output(f'vCenter {hostname} not ready yet: {e}')
+        
+        labstartup_sleep(interval)
+    
+    write_output(f'Timeout waiting for vCenter {hostname}')
+    return False
+
+
+def get_all_vms(si=None):
+    """
+    Get all VMs from a ServiceInstance (or all connected SIs)
+    :param si: Optional specific ServiceInstance
+    :return: List of VM objects
+    """
+    vms = []
+    search_list = [si] if si else sis
+    
+    for service_instance in search_list:
+        vm_objs = get_all_objs(service_instance.content, [vim.VirtualMachine])
+        vms.extend(vm_objs.keys())
+    
+    return vms
+
 
 #==============================================================================
 # AUTOMATION FRAMEWORK SUPPORT
