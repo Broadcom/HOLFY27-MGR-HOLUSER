@@ -114,8 +114,14 @@ git_clone() {
         git ls-remote $gitproject > /dev/null 2>&1
         if [ $? != 0 ]; then
             echo "Git repository does not exist: ${gitproject}" >> ${logfile}
-            echo "No GIT Project Available, will attempt fallback to local config." >> ${logfile}
-            exit 1
+            if is_hol_sku "$vPod_SKU"; then
+                echo "HOL SKU requires git repo. Failing vpod." >> ${logfile}
+                echo "FAIL - No GIT Project" > "$startupstatus"
+                exit 1
+            else
+                echo "Non-HOL SKU: Will attempt fallback to local config." >> ${logfile}
+                return 1  # Return failure, let caller handle fallback
+            fi
         fi
         echo "git clone -b $branch $gitproject $vpodgitdir" >> ${logfile}
         GIT_TERMINAL_PROMPT=0 git clone -b $branch "$gitproject" "$vpodgitdir" >> ${logfile} 2>&1
