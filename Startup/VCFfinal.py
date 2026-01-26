@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 3.0 - January 2026
+# Version 3.1 - January 2026
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, Aria)
 
@@ -22,6 +22,41 @@ logging.basicConfig(level=logging.WARNING)
 
 MODULE_NAME = 'VCFfinal'
 MODULE_DESCRIPTION = 'VCF final tasks (Tanzu, Aria)'
+
+# Aria URL check configuration
+ARIA_URL_MAX_RETRIES = 30  # Maximum attempts (30 minutes total)
+ARIA_URL_RETRY_DELAY = 60  # Seconds between retries
+
+#==============================================================================
+# HELPER FUNCTIONS
+#==============================================================================
+
+def verify_nic_connected(lsf, vm_obj, simple=False):
+    """
+    Loop through the NICs and verify connection.
+    
+    :param lsf: lsfunctions module reference
+    :param vm_obj: the VM object to check
+    :param simple: if True, just connect; if False, disconnect then reconnect if not connected
+    """
+    try:
+        nics = lsf.get_network_adapter(vm_obj)
+        for nic in nics:
+            if simple:
+                lsf.write_output(f'Connecting {nic.deviceInfo.label} on {vm_obj.name}')
+                lsf.set_network_adapter_connection(vm_obj, nic, True)
+                lsf.labstartup_sleep(lsf.sleep_seconds)
+            elif nic.connectable.connected:
+                lsf.write_output(f'{vm_obj.name} {nic.deviceInfo.label} is connected.')
+            else:
+                lsf.write_output(f'{vm_obj.name} {nic.deviceInfo.label} is NOT connected.')
+                lsf.set_network_adapter_connection(vm_obj, nic, False)
+                lsf.labstartup_sleep(lsf.sleep_seconds)
+                lsf.write_output(f'Connecting {nic.deviceInfo.label} on {vm_obj.name}')
+                lsf.set_network_adapter_connection(vm_obj, nic, True)
+    except Exception as e:
+        lsf.write_output(f'Error verifying NIC connection for {vm_obj.name}: {e}')
+
 
 #==============================================================================
 # MAIN FUNCTION
@@ -155,25 +190,79 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if aria_vms_configured:
         lsf.write_output('Checking Aria Automation VMs...')
-        lsf.write_vpodprogress('Aria Automation', 'GOOD-3')
+        lsf.write_vpodprogress('Aria Automation', 'GOOD-8')
         
         # Connect to vCenters if not already connected
         vcenters = []
         if lsf.config.has_option('RESOURCES', 'vCenters'):
             vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
-            vcenters = [v.strip() for v in vcenters_raw.split('\n') if v.strip()]
+            vcenters = [v.strip() for v in vcenters_raw.split('\n') if v.strip() and not v.strip().startswith('#')]
             
             if vcenters and not dry_run:
                 lsf.write_vpodprogress('Connecting vCenters', 'GOOD-3')
                 lsf.connect_vcenters(vcenters)
         
         vravms_raw = lsf.config.get('VCFFINAL', 'vravms')
-        vravms = [v.strip() for v in vravms_raw.split('\n') if v.strip()]
+        vravms = [v.strip() for v in vravms_raw.split('\n') if v.strip() and not v.strip().startswith('#')]
         
         if vravms and not dry_run:
             lsf.write_output(f'Starting {len(vravms)} Aria Automation VMs...')
+            lsf.write_vpodprogress('Starting Aria VMs', 'GOOD-8')
+            
+            # Before starting, verify NICs are set to start connected
+            for vravm in vravms:
+                parts = vravm.split(':')
+                vmname = parts[0].strip()
+                try:
+                    vms = lsf.get_vm_match(vmname)
+                    for vm in vms:
+                        verify_nic_connected(lsf, vm, simple=True)  # Just make sure connected at start
+                except Exception as e:
+                    lsf.write_output(f'Error checking NICs for {vmname}: {e}')
+            
+            # Start the VMs
             lsf.start_nested(vravms)
-            lsf.write_output('Aria Automation VMs started')
+            
+            # After starting, verify VMs are actually powered on and tools running
+            for vravm in vravms:
+                parts = vravm.split(':')
+                vmname = parts[0].strip()
+                try:
+                    vms = lsf.get_vm_match(vmname)
+                    for vm in vms:
+                        # Ensure VM is powered on
+                        max_power_attempts = 10
+                        power_attempt = 0
+                        while vm.runtime.powerState != 'poweredOn' and power_attempt < max_power_attempts:
+                            lsf.write_output(f'Waiting for {vm.name} to power on...')
+                            try:
+                                vm.PowerOnVM_Task()
+                            except Exception:
+                                pass
+                            lsf.labstartup_sleep(lsf.sleep_seconds)
+                            power_attempt += 1
+                        
+                        # Wait for VMware Tools to be running
+                        max_tools_attempts = 30
+                        tools_attempt = 0
+                        while tools_attempt < max_tools_attempts:
+                            try:
+                                if vm.summary.guest.toolsRunningStatus == 'guestToolsRunning':
+                                    lsf.write_output(f'VMware Tools running in {vm.name}')
+                                    break
+                            except Exception:
+                                pass
+                            lsf.write_output(f'Waiting for Tools in {vmname}...')
+                            lsf.labstartup_sleep(lsf.sleep_seconds)
+                            tools_attempt += 1
+                        
+                        # Verify NIC is connected after tools are running
+                        verify_nic_connected(lsf, vm, simple=False)  # Disconnect and reconnect if not connected
+                        
+                except Exception as e:
+                    lsf.write_output(f'Error waiting for {vmname}: {e}')
+            
+            lsf.write_output('Aria Automation VMs started and verified')
     else:
         lsf.write_output('No Aria Automation VMs configured')
     
@@ -193,9 +282,22 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if aria_urls_configured:
         lsf.write_output('Checking Aria Automation URLs...')
+        lsf.write_vpodprogress('Aria Automation URL Checks', 'GOOD-8')
+        
+        # Run remediation scripts before URL checks
+        # Check VCF Automation ssh for password expiration and fix if expired
+        lsf.write_output('Fixing expired automation password if necessary...')
+        vcfapwcheck_script = '/home/holuser/hol/Tools/vcfapwcheck.sh'
+        if os.path.isfile(vcfapwcheck_script) and not dry_run:
+            lsf.run_command(vcfapwcheck_script)
+        
+        # Run the watchvcfa script to make sure the seaweedfs-master-0 pod is not stale
+        watchvcfa_script = '/home/holuser/hol/Tools/watchvcfa.sh'
+        if os.path.isfile(watchvcfa_script) and not dry_run:
+            lsf.run_command(watchvcfa_script)
         
         vraurls_raw = lsf.config.get('VCFFINAL', 'vraurls')
-        vraurls = [u.strip() for u in vraurls_raw.split('\n') if u.strip()]
+        vraurls = [u.strip() for u in vraurls_raw.split('\n') if u.strip() and not u.strip().startswith('#')]
         
         for url_spec in vraurls:
             if ',' in url_spec:
@@ -212,13 +314,24 @@ def main(lsf=None, standalone=False, dry_run=False):
                 if expected:
                     lsf.write_output(f'  Expected text: {expected}')
                 
-                result = lsf.test_url(url, expected_text=expected, verify_ssl=False, timeout=30)
-                if result:
-                    lsf.write_output(f'  [SUCCESS] {url}')
-                    urls_passed += 1
-                else:
-                    lsf.write_output(f'  [FAILED] {url}')
-                    urls_failed += 1
+                # Retry loop - wait up to ARIA_URL_MAX_RETRIES minutes for URL to become available
+                url_success = False
+                for attempt in range(1, ARIA_URL_MAX_RETRIES + 1):
+                    result = lsf.test_url(url, expected_text=expected, verify_ssl=False, timeout=30)
+                    if result:
+                        lsf.write_output(f'  [SUCCESS] {url} (attempt {attempt})')
+                        url_success = True
+                        urls_passed += 1
+                        break
+                    else:
+                        if attempt == ARIA_URL_MAX_RETRIES:
+                            # Final attempt failed - fail the lab
+                            lsf.write_output(f'  [FAILED] {url} after {ARIA_URL_MAX_RETRIES} attempts')
+                            urls_failed += 1
+                            lsf.labfail(f'Aria URL {url} not accessible after {ARIA_URL_MAX_RETRIES} minutes - should be reached in under 8 minutes')
+                        else:
+                            lsf.write_output(f'  Sleeping and will try again... {attempt} / {ARIA_URL_MAX_RETRIES}')
+                            lsf.labstartup_sleep(ARIA_URL_RETRY_DELAY)
         
         lsf.write_output(f'Aria URL check complete: {urls_passed}/{urls_checked} passed')
     else:

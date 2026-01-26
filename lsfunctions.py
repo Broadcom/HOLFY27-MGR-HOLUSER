@@ -1012,6 +1012,47 @@ def get_all_vms(si=None):
     return vms
 
 
+def get_network_adapter(vm_obj):
+    """
+    Return a list of network adapters for the VM
+    :param vm_obj: the VM to use
+    :return: list of VirtualEthernetCard devices
+    """
+    net_adapters = []
+    for dev in vm_obj.config.hardware.device:
+        if isinstance(dev, vim.vm.device.VirtualEthernetCard):
+            net_adapters.append(dev)
+    return net_adapters
+
+
+def set_network_adapter_connection(vm_obj, adapter, connect):
+    """
+    Function to connect or disconnect a VM network adapter
+    :param vm_obj: the VM object
+    :param adapter: the VM virtual network adapter
+    :param connect: True or False the desired connection state
+    """
+    adapter_spec = vim.vm.device.VirtualDeviceSpec()
+    adapter_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+    adapter_spec.device = adapter
+    adapter_spec.device.key = adapter.key
+    adapter_spec.device.macAddress = adapter.macAddress
+    adapter_spec.device.backing = adapter.backing
+    adapter_spec.device.wakeOnLanEnabled = adapter.wakeOnLanEnabled
+    connectable = vim.vm.device.VirtualDevice.ConnectInfo()
+    connectable.connected = connect
+    connectable.startConnected = connect
+    adapter_spec.device.connectable = connectable
+    dev_changes = [adapter_spec]
+    spec = vim.vm.ConfigSpec()
+    spec.deviceChange = dev_changes
+    try:
+        task = vm_obj.ReconfigVM_Task(spec=spec)
+        WaitForTask(task)
+    except Exception:
+        pass  # Best-effort NIC state change
+
+
 #==============================================================================
 # AUTOMATION FRAMEWORK SUPPORT
 #==============================================================================
@@ -1383,9 +1424,12 @@ def startup(module_name, timeout=120, labcheck_mode=False):
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
         
-        # Call main if it exists
+        # Call main if it exists, passing the current lsfunctions module
+        # This ensures the startup module uses the already-initialized state
         if hasattr(module, 'main'):
-            module.main()
+            # Get reference to this module (lsfunctions) to pass to main()
+            import lsfunctions as lsf_module
+            module.main(lsf=lsf_module)
         
         write_output(f'Completed module: {module_name}')
         return True
