@@ -609,6 +609,129 @@ def get_datastore(ds_name):
     return None
 
 
+def reboot_hosts():
+    """
+    To deal with NFS mount timing issues, reboot all ESXi hosts.
+    """
+    hosts = get_all_hosts()
+    for host in hosts:
+        write_output(f'Rebooting host {host.name}...')
+        try:
+            task = host.RebootHost_Task(True)
+            labstartup_sleep(1)
+        except Exception as e:
+            write_output(f'Failed to reboot {host.name}: {e}')
+    
+    # Wait for hosts to stop responding
+    write_output('Waiting for hosts to stop responding...')
+    for host in hosts:
+        while test_tcp_port(host.name, 22, timeout=2):
+            labstartup_sleep(sleep_seconds)
+    
+    # Wait for hosts to start responding again
+    write_output('Waiting for hosts to begin responding...')
+    for host in hosts:
+        while not test_tcp_port(host.name, 22, timeout=5):
+            write_output(f'Waiting for {host.name} to respond...')
+            labstartup_sleep(sleep_seconds)
+
+
+def check_datastore(entry):
+    """
+    For the Datastores.txt entry, checks accessible and counts the files
+    if VMFS (typical) has all ESX host systems rescan their HBAs
+    if NFS verify accessible and if not reboot ESXi hosts to work around timing issues
+    :param entry: string colon-delimited entry from Datastores in config.ini (server:datastore_name)
+    :return: True or False
+    """
+    parts = entry.split(':')
+    if len(parts) < 2:
+        write_output(f'Invalid datastore entry: {entry}')
+        return False
+    
+    server = parts[0].strip()
+    datastore_name = parts[1].strip()
+    write_output(f'Checking {datastore_name}...')
+    
+    max_attempts = 30
+    attempt = 0
+    ds = None
+    
+    while attempt < max_attempts:
+        try:
+            ds = get_datastore(datastore_name)
+            if ds and (ds.summary.type == 'VMFS' or 'NFS' in ds.summary.type or ds.summary.type == 'vsan'):
+                break
+        except Exception as e:
+            write_output(f'Exception checking datastore {datastore_name}: {e}')
+        attempt += 1
+        labstartup_sleep(sleep_seconds)
+    
+    if ds is None:
+        write_output(f'Datastore {datastore_name} not found after {max_attempts} attempts')
+        return False
+    
+    # Handle VMFS datastores - rescan HBAs
+    if ds.summary.type == 'VMFS':
+        try:
+            hosts = get_all_hosts()
+            for host in hosts:
+                write_output(f'Rescanning HBAs on {host.name}...')
+                try:
+                    host_ss = host.configManager.storageSystem
+                    host_ss.RescanAllHba()
+                except Exception as e:
+                    if 'Licenses' in str(e):
+                        write_output(f'Waiting for License Service before datastore check on {host.name}')
+                        labstartup_sleep(sleep_seconds)
+                    else:
+                        write_output(f'Exception rescanning HBAs on {host.name}: {e}')
+        except Exception as e:
+            write_output(f'Exception getting hosts: {e}')
+    
+    # Handle NFS datastores - check for inaccessible VMs
+    elif 'NFS' in ds.summary.type:
+        vms = get_all_vms()
+        for vm in vms:
+            try:
+                check = False
+                for dsuse in vm.storage.perDatastoreUsage:
+                    if dsuse.datastore.name == ds.name:
+                        check = True
+                        break
+                if vm.runtime.connectionState == 'inaccessible' and check:
+                    write_output(f'{vm.name} is inaccessible on NFS datastore.')
+                    reboot_hosts()
+                    break
+            except Exception:
+                pass
+        
+        # Wait for NFS datastore to be accessible
+        while not ds.summary.accessible:
+            write_output('Waiting for NFS datastore to mount...')
+            labstartup_sleep(sleep_seconds)
+    
+    # Verify datastore is accessible
+    if ds.summary.accessible:
+        try:
+            ds_browser = ds.browser
+            spec = vim.host.DatastoreBrowser.SearchSpec(query=[vim.host.DatastoreBrowser.FolderQuery()])
+            task = ds_browser.SearchDatastore_Task("[%s]" % ds.name, spec)
+            WaitForTask(task)
+            if len(task.info.result.file):
+                write_output(f'Datastore {datastore_name} on {server} looks ok.')
+                return True
+            else:
+                write_output(f'Datastore {datastore_name} on {server} has no files but is accessible.')
+                return True
+        except Exception as e:
+            write_output(f'Error browsing datastore {datastore_name}: {e}')
+            return True  # Still accessible, just can't browse
+    else:
+        write_output(f'Datastore {datastore_name} on {server} is unavailable.')
+        return False
+
+
 def get_vm_by_name(name, **kwargs):
     """
     Convenience function to retrieve VMs by name from a specific session or all sessions

@@ -204,16 +204,32 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if lsf.config.has_option('VCF', 'vcfnsxedges'):
         vcfnsxedges_raw = lsf.config.get('VCF', 'vcfnsxedges')
-        vcfnsxedges = [e.strip() for e in vcfnsxedges_raw.split('\n') if e.strip()]
+        vcfnsxedges = [e.strip() for e in vcfnsxedges_raw.split('\n') if e.strip() and not e.strip().startswith('#')]
         
         if vcfnsxedges:
             lsf.write_vpodprogress('VCF NSX Edges start', 'GOOD-3')
             lsf.write_output('Starting VCF NSX Edges...')
             
             if not dry_run:
-                lsf.start_nested(vcfnsxedges)
-                lsf.write_output('Waiting 5 minutes for NSX Edges to start...')
-                lsf.labstartup_sleep(300)
+                # Check if any NSX Edge VMs need to be started
+                edges_need_start = False
+                for entry in vcfnsxedges:
+                    parts = entry.split(':')
+                    edge_name = parts[0].strip()
+                    vms = lsf.get_vm_by_name(edge_name)
+                    for vm in vms:
+                        if vm.runtime.powerState != 'poweredOn':
+                            edges_need_start = True
+                            break
+                    if edges_need_start:
+                        break
+                
+                if edges_need_start:
+                    lsf.start_nested(vcfnsxedges)
+                    lsf.write_output('Waiting 5 minutes for NSX Edges to start...')
+                    lsf.labstartup_sleep(300)
+                else:
+                    lsf.write_output('All NSX Edge VMs already powered on, skipping wait')
             else:
                 lsf.write_output(f'Would start NSX Edges: {vcfnsxedges}')
     

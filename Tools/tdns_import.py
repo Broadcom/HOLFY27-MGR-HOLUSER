@@ -389,14 +389,31 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
         
         # Log summary and update dashboard
         new_records = result.get('New Records', 0)
+        existing_records = result.get('Existing Records', 0)
         errors = result.get('Errors', 0)
+        message = result.get('Message', '')
         
-        if errors == 0:
-            write_output(f'DNS import from config.ini completed: {new_records} new records added')
-            update_dashboard_status('complete', f'{new_records} records imported')
+        # Check if all records already existed (this is a success, not a failure)
+        # tdns-mgr may return "already exists" messages or Existing Records count
+        records_already_exist = (
+            existing_records > 0 or 
+            'already exist' in message.lower() or
+            'exists' in message.lower()
+        )
+        
+        if errors == 0 or records_already_exist:
+            if new_records > 0:
+                write_output(f'DNS import from config.ini completed: {new_records} new records added')
+                update_dashboard_status('complete', f'{new_records} records imported')
+            elif records_already_exist:
+                write_output(f'DNS import from config.ini: all {len(config_records)} records already exist')
+                update_dashboard_status('complete', f'All records already exist')
+            else:
+                write_output(f'DNS import from config.ini completed: no new records needed')
+                update_dashboard_status('complete', 'No new records needed')
         else:
-            write_output(f'DNS import from config.ini had errors: {result.get("Message", "")}')
-            update_dashboard_status('failed', result.get('Message', 'Import errors'))
+            write_output(f'DNS import from config.ini had errors: {message}')
+            update_dashboard_status('failed', message or 'Import errors')
         
         return result
     
@@ -417,14 +434,30 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
         
         # Log summary and update dashboard
         new_records = result.get('New Records', 0)
+        existing_records = result.get('Existing Records', 0)
         errors = result.get('Errors', 0)
+        message = result.get('Message', '')
         
-        if errors == 0:
-            write_output(f'DNS import from file completed: {new_records} new records added')
-            update_dashboard_status('complete', f'{new_records} records imported')
+        # Check if all records already existed (this is a success, not a failure)
+        records_already_exist = (
+            existing_records > 0 or 
+            'already exist' in message.lower() or
+            'exists' in message.lower()
+        )
+        
+        if errors == 0 or records_already_exist:
+            if new_records > 0:
+                write_output(f'DNS import from file completed: {new_records} new records added')
+                update_dashboard_status('complete', f'{new_records} records imported')
+            elif records_already_exist:
+                write_output(f'DNS import from file: all records already exist')
+                update_dashboard_status('complete', 'All records already exist')
+            else:
+                write_output(f'DNS import from file completed: no new records needed')
+                update_dashboard_status('complete', 'No new records needed')
         else:
-            write_output(f'DNS import from file had errors: {result.get("Message", "")}')
-            update_dashboard_status('failed', result.get('Message', 'Import errors'))
+            write_output(f'DNS import from file had errors: {message}')
+            update_dashboard_status('failed', message or 'Import errors')
         
         return result
     
