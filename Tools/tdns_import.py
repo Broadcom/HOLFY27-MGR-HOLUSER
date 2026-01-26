@@ -224,8 +224,10 @@ def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
         write_output(f'Logging into tdns-mgr (attempt {attempt}/{max_retries})...')
         
         try:
+            # Pipe password to tdns-mgr login via stdin (echo password | tdns-mgr login)
             result = subprocess.run(
-                [TDNS_MGR_PATH, 'login', '-p', password],
+                [TDNS_MGR_PATH, 'login'],
+                input=password + '\n',
                 capture_output=True,
                 text=True,
                 timeout=30
@@ -235,7 +237,7 @@ def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
                 write_output('tdns-mgr login successful')
                 return True
             else:
-                error_msg = result.stderr.strip() if result.stderr else 'Unknown error'
+                error_msg = result.stderr.strip() if result.stderr else result.stdout.strip() if result.stdout else 'Unknown error'
                 write_output(f'tdns-mgr login failed: {error_msg}')
                 
         except subprocess.TimeoutExpired:
