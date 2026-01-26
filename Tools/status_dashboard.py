@@ -109,17 +109,31 @@ class StatusDashboard:
                 ('firewall', 'Firewall Verification', 'Confirm firewall is active'),
                 ('odyssey_cleanup', 'Odyssey Cleanup', 'Remove existing Odyssey files')
             ]),
-            ('infrastructure', 'Infrastructure Startup', [
-                ('esxi', 'ESXi Hosts', 'Verify nested ESXi hosts are responding'),
-                ('vcf', 'VCF Components', 'Start VCF management components'),
-                ('nsx', 'NSX Managers', 'Start and verify NSX managers'),
-                ('vcenter', 'vCenter Servers', 'Start and connect vCenter servers')
+            ('esxi', 'ESXi Hosts', [
+                ('host_check', 'Host Verification', 'Verify nested ESXi hosts are responding')
+            ]),
+            ('vcf', 'VCF Startup', [
+                ('mgmt_cluster', 'Management Cluster', 'Connect to VCF management cluster hosts'),
+                ('datastore', 'Datastore Verification', 'Verify VCF management datastore'),
+                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager'),
+                ('nsx_edges', 'NSX Edge VMs', 'Start NSX Edge virtual machines'),
+                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server')
+            ]),
+            ('vvf', 'VVF Startup', [
+                ('mgmt_cluster', 'Management Cluster', 'Connect to VVF management cluster hosts'),
+                ('datastore', 'Datastore Verification', 'Verify VVF management datastore'),
+                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager'),
+                ('nsx_edges', 'NSX Edge VMs', 'Start NSX Edge virtual machines'),
+                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server')
             ]),
             ('vsphere', 'vSphere Configuration', [
+                ('vcenter_connect', 'vCenter Connection', 'Connect to vCenter servers'),
                 ('datastores', 'Datastore Verification', 'Verify all datastores are accessible'),
                 ('maintenance', 'Maintenance Mode', 'Exit hosts from maintenance mode'),
                 ('vcls', 'vCLS Verification', 'Verify vCLS VMs are running'),
                 ('drs', 'DRS Configuration', 'Configure DRS settings'),
+                ('shell_warning', 'Shell Warning', 'Suppress ESXi shell warnings'),
+                ('vcenter_ready', 'vCenter Ready', 'Wait for vCenter to be ready'),
                 ('nested_vms', 'Nested VMs', 'Power on nested virtual machines')
             ]),
             ('services', 'Service Verification', [
@@ -127,16 +141,22 @@ class StatusDashboard:
                 ('tcp_ports', 'TCP Port Checks', 'Verify service ports are responding'),
                 ('linux_services', 'Linux Services', 'Start and verify Linux services')
             ]),
-            ('tanzu', 'Tanzu & Automation', [
-                ('supervisor', 'Supervisor VMs', 'Start Supervisor Control Plane VMs'),
+            ('kubernetes', 'Kubernetes', [
+                ('cert_check', 'Certificate Renewal', 'Check and renew Kubernetes certificates')
+            ]),
+            ('vcffinal', 'VCF Final', [
+                ('tanzu_control', 'Tanzu Control Plane', 'Start Tanzu Supervisor control plane VMs'),
                 ('tanzu_deploy', 'Tanzu Deployment', 'Deploy Tanzu components'),
-                ('aria', 'Aria Automation', 'Start and verify Aria Automation')
+                ('aria_vms', 'Aria VMs', 'Start Aria Automation virtual machines'),
+                ('aria_urls', 'Aria URLs', 'Verify Aria Automation URLs')
+            ]),
+            ('odyssey', 'Odyssey', [
+                ('install', 'Odyssey Installation', 'Install Odyssey client if enabled')
             ]),
             ('final', 'Final Checks', [
                 ('url_checks', 'URL Verification', 'Verify all web interfaces'),
                 ('dns_import', 'DNS Record Import', 'Import custom DNS records'),
-                ('custom', 'Custom Checks', 'Lab-specific final checks'),
-                ('odyssey', 'Odyssey Installation', 'Install Odyssey client if enabled')
+                ('custom', 'Custom Checks', 'Lab-specific final checks')
             ])
         ]
         
@@ -147,19 +167,24 @@ class StatusDashboard:
             ]
             self.groups[group_id] = TaskGroup(id=group_id, name=group_name, tasks=task_list)
     
-    def update_task(self, group_id: str, task_id: str, status: str, message: str = ""):
+    def update_task(self, group_id: str, task_id: str, status, message: str = ""):
         """
         Update a specific task status
         
         :param group_id: Group identifier
         :param task_id: Task identifier (without group prefix)
-        :param status: Status string (pending, running, complete, failed, skipped)
+        :param status: Status string (pending, running, complete, failed, skipped) or TaskStatus enum
         :param message: Optional status message
         """
         if group_id not in self.groups:
             return
         
-        status_enum = TaskStatus(status.lower())
+        # Handle both string and TaskStatus enum
+        if isinstance(status, TaskStatus):
+            status_enum = status
+        else:
+            status_enum = TaskStatus(status.lower())
+        
         full_task_id = f'{group_id}_{task_id}'
         
         for task in self.groups[group_id].tasks:
