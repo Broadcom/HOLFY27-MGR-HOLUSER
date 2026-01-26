@@ -110,6 +110,13 @@ git_clone() {
             fi
         fi
         echo "Performing git clone for repo ${vpodgit}" >> ${logfile}
+        # Confirm that $gitproject url is valid
+        git ls-remote $gitproject > /dev/null 2>&1
+        if [ $? != 0 ]; then
+            echo "Git repository does not exist: ${gitproject}" >> ${logfile}
+            echo "FAIL - No GIT Project" > "$startupstatus"
+            exit 1
+        fi
         echo "git clone -b $branch $gitproject $vpodgitdir" >> ${logfile}
         GIT_TERMINAL_PROMPT=0 git clone -b $branch "$gitproject" "$vpodgitdir" >> ${logfile} 2>&1
         if [ $? = 0 ]; then
