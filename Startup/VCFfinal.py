@@ -79,7 +79,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.connect_vcenters(vcfmgmtcluster)
     
     #==========================================================================
-    # TASK 2: Start Supervisor Control Plane VMs
+    # TASK 2: Start Supervisor Control Plane VMs (Tanzu)
     #==========================================================================
     
     if dashboard:
@@ -88,35 +88,73 @@ def main(lsf=None, standalone=False, dry_run=False):
         
     lsf.write_vpodprogress('Tanzu Start', 'GOOD-3')
     
-    # Check for Tanzu VMs
-    tanzu_vms = []
+    # Check for Tanzu Control Plane VMs
+    tanzu_control_configured = lsf.config.has_option('VCFFINAL', 'tanzucontrol')
     
-    # We can check for Supervisor Control Plane VMs by name pattern
-    if not dry_run:
+    if tanzu_control_configured and not dry_run:
         try:
+            lsf.write_output('Starting Tanzu Control Plane VMs...')
             lsf.write_vpodprogress('Tanzu Control Plane', 'GOOD-3')
             
-            # Find all Supervisor Control Plane VMs
-            # They usually start with the cluster name or similar pattern
-            # For now, we'll look for VMs with 'Supervisor' in the name or specific config
+            tanzu_control_raw = lsf.config.get('VCFFINAL', 'tanzucontrol')
+            tanzu_control_vms = [v.strip() for v in tanzu_control_raw.split('\n') if v.strip()]
             
-            # Use lsfunctions to find VMs
-            # This requires connected sessions
-            pass
+            if tanzu_control_vms:
+                lsf.start_nested(tanzu_control_vms)
+                lsf.write_output(f'Tanzu Control Plane VMs started: {len(tanzu_control_vms)}')
             
         except Exception as e:
-            lsf.write_output(f'Error checking Tanzu VMs: {e}')
+            lsf.write_output(f'Error starting Tanzu Control Plane VMs: {e}')
+    else:
+        lsf.write_output('No Tanzu Control Plane VMs configured')
     
     if dashboard:
         dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.COMPLETE)
+        dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 3: Tanzu Deployment
+    #==========================================================================
+    
+    tanzu_deploy_configured = lsf.config.has_option('VCFFINAL', 'tanzudeploy')
+    
+    if tanzu_deploy_configured and not dry_run:
+        try:
+            lsf.write_output('Running Tanzu Deployment...')
+            lsf.write_vpodprogress('Tanzu Deploy', 'GOOD-3')
+            
+            # Tanzu deployment scripts can be specified as host:account:script
+            tanzu_deploy_raw = lsf.config.get('VCFFINAL', 'tanzudeploy')
+            tanzu_deploy_items = [t.strip() for t in tanzu_deploy_raw.split('\n') if t.strip()]
+            
+            for item in tanzu_deploy_items:
+                parts = item.split(':')
+                if len(parts) >= 3:
+                    host = parts[0]
+                    account = parts[1]
+                    script = ':'.join(parts[2:])  # Handle scripts with colons in path
+                    lsf.write_output(f'Running Tanzu script on {host}: {script}')
+                    lsf.ssh(script, f'{account}@{host}', lsf.password)
+                    
+        except Exception as e:
+            lsf.write_output(f'Error during Tanzu Deployment: {e}')
+    else:
+        lsf.write_output('No Tanzu Deployment configured')
+    
+    if dashboard:
+        dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.COMPLETE)
         dashboard.update_task('vcffinal', 'aria_vms', TaskStatus.RUNNING)
         dashboard.generate_html()
     
     #==========================================================================
-    # TASK 3: Check Aria Automation (vRA)
+    # TASK 4: Check Aria Automation VMs (vRA)
     #==========================================================================
     
-    if lsf.config.has_option('VCFFINAL', 'vravms'):
+    aria_vms_configured = lsf.config.has_option('VCFFINAL', 'vravms')
+    
+    if aria_vms_configured:
+        lsf.write_output('Checking Aria Automation VMs...')
         lsf.write_vpodprogress('Aria Automation', 'GOOD-3')
         
         # Connect to vCenters if not already connected
@@ -133,28 +171,66 @@ def main(lsf=None, standalone=False, dry_run=False):
         vravms = [v.strip() for v in vravms_raw.split('\n') if v.strip()]
         
         if vravms and not dry_run:
-            lsf.write_output('Checking Aria Automation VMs...')
+            lsf.write_output(f'Starting {len(vravms)} Aria Automation VMs...')
             lsf.start_nested(vravms)
-            
-        # Check URLs
-        if lsf.config.has_option('VCFFINAL', 'vraurls'):
-            vraurls_raw = lsf.config.get('VCFFINAL', 'vraurls')
-            vraurls = [u.strip() for u in vraurls_raw.split('\n') if u.strip()]
-            
-            for url_spec in vraurls:
-                if ',' in url_spec:
-                    parts = url_spec.split(',', 1)
-                    url = parts[0].strip()
-                    expected = parts[1].strip()
-                else:
-                    url = url_spec.strip()
-                    expected = None
-                
-                lsf.test_url(url, expected_text=expected)
+            lsf.write_output('Aria Automation VMs started')
+    else:
+        lsf.write_output('No Aria Automation VMs configured')
     
     if dashboard:
         dashboard.update_task('vcffinal', 'aria_vms', TaskStatus.COMPLETE)
-        dashboard.update_task('vcffinal', 'aria_urls', TaskStatus.COMPLETE)
+        dashboard.update_task('vcffinal', 'aria_urls', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 5: Check Aria Automation URLs
+    #==========================================================================
+    
+    aria_urls_configured = lsf.config.has_option('VCFFINAL', 'vraurls')
+    urls_checked = 0
+    urls_passed = 0
+    urls_failed = 0
+    
+    if aria_urls_configured:
+        lsf.write_output('Checking Aria Automation URLs...')
+        
+        vraurls_raw = lsf.config.get('VCFFINAL', 'vraurls')
+        vraurls = [u.strip() for u in vraurls_raw.split('\n') if u.strip()]
+        
+        for url_spec in vraurls:
+            if ',' in url_spec:
+                parts = url_spec.split(',', 1)
+                url = parts[0].strip()
+                expected = parts[1].strip()
+            else:
+                url = url_spec.strip()
+                expected = None
+            
+            if url and not dry_run:
+                urls_checked += 1
+                lsf.write_output(f'Testing Aria URL: {url}')
+                if expected:
+                    lsf.write_output(f'  Expected text: {expected}')
+                
+                result = lsf.test_url(url, expected_text=expected, verify_ssl=False, timeout=30)
+                if result:
+                    lsf.write_output(f'  [SUCCESS] {url}')
+                    urls_passed += 1
+                else:
+                    lsf.write_output(f'  [FAILED] {url}')
+                    urls_failed += 1
+        
+        lsf.write_output(f'Aria URL check complete: {urls_passed}/{urls_checked} passed')
+    else:
+        lsf.write_output('No Aria Automation URLs configured')
+    
+    if dashboard:
+        if urls_failed > 0:
+            dashboard.update_task('vcffinal', 'aria_urls', TaskStatus.FAILED, 
+                                  f'{urls_failed}/{urls_checked} URLs failed')
+        else:
+            dashboard.update_task('vcffinal', 'aria_urls', TaskStatus.COMPLETE,
+                                  f'{urls_passed} URLs verified' if urls_checked > 0 else '')
         dashboard.generate_html()
     
     #==========================================================================

@@ -105,6 +105,7 @@ class StatusDashboard:
         default_groups = [
             ('prelim', 'Preliminary Checks', [
                 ('dns', 'DNS Health Checks', 'Verify DNS resolution for all sites'),
+                ('dns_import', 'DNS Record Import', 'Import custom DNS records'),
                 ('readme', 'README Sync', 'Synchronize README to console'),
                 ('firewall', 'Firewall Verification', 'Confirm firewall is active'),
                 ('odyssey_cleanup', 'Odyssey Cleanup', 'Remove existing Odyssey files')
@@ -155,7 +156,6 @@ class StatusDashboard:
             ]),
             ('final', 'Final Checks', [
                 ('url_checks', 'URL Verification', 'Verify all web interfaces'),
-                ('dns_import', 'DNS Record Import', 'Import custom DNS records'),
                 ('custom', 'Custom Checks', 'Lab-specific final checks')
             ])
         ]
@@ -207,12 +207,34 @@ class StatusDashboard:
         self.failure_reason = reason
         self.generate_html()
     
+    def skip_group(self, group_id: str, message: str = "Not applicable"):
+        """
+        Skip all tasks in a group.
+        
+        Use this to mark an entire group as skipped when it doesn't apply
+        to the current lab type (e.g., skip VVF when running VCF).
+        
+        :param group_id: Group identifier to skip
+        :param message: Optional message explaining why skipped
+        """
+        if group_id not in self.groups:
+            return
+        
+        for task in self.groups[group_id].tasks:
+            if task.status == TaskStatus.PENDING:
+                task.status = TaskStatus.SKIPPED
+                task.message = message
+        
+        self._save_state()
+        self.generate_html()
+    
     def set_complete(self):
         """Mark the entire startup as complete"""
         for group in self.groups.values():
             for task in group.tasks:
                 if task.status == TaskStatus.PENDING:
                     task.status = TaskStatus.SKIPPED
+        self._save_state()
         self.generate_html()
     
     def _load_state(self):
@@ -638,6 +660,7 @@ class StatusDashboard:
             group_class = ""
             group_status_icon = "🔄"
             is_complete = group.status == TaskStatus.COMPLETE
+            is_skipped = group.status == TaskStatus.SKIPPED
             
             if group.status == TaskStatus.COMPLETE:
                 group_class = "complete"
@@ -648,12 +671,15 @@ class StatusDashboard:
             elif group.status == TaskStatus.RUNNING:
                 group_class = "running"
                 group_status_icon = "🔄"
+            elif group.status == TaskStatus.SKIPPED:
+                group_class = "complete"  # Use complete style (collapsed, muted)
+                group_status_icon = "⏭️"
             else:
                 group_status_icon = "⏳"
             
-            # Complete groups are collapsed by default
-            tasks_class = "collapsed" if is_complete else "expanded"
-            toggle_class = "collapsed" if is_complete else ""
+            # Complete and skipped groups are collapsed by default
+            tasks_class = "collapsed" if (is_complete or is_skipped) else "expanded"
+            toggle_class = "collapsed" if (is_complete or is_skipped) else ""
             
             html += f'''
             <div class="task-group {group_class}">

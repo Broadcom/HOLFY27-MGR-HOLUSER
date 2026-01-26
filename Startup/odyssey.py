@@ -177,15 +177,32 @@ def main(lsf=None, standalone=False, dry_run=False):
         if not standalone:
             lsf.init(router=False)
     
+    # Initialize dashboard early so we can update it for skip cases
+    dashboard = None
+    TaskStatus = None
+    try:
+        sys.path.insert(0, '/home/holuser/hol/Tools')
+        from status_dashboard import StatusDashboard, TaskStatus as TS
+        TaskStatus = TS
+        dashboard = StatusDashboard(lsf.lab_sku)
+    except Exception:
+        pass
+    
     # Check if Odyssey is enabled
     odyssey_enabled = getattr(lsf, 'odyssey', False)
     if not odyssey_enabled:
-        lsf.write_output('Odyssey not enabled in config.ini')
+        lsf.write_output('Odyssey not enabled in config.ini - skipping')
+        if dashboard and TaskStatus:
+            dashboard.update_task('odyssey', 'install', TaskStatus.SKIPPED, 'Not enabled in config')
+            dashboard.generate_html()
         return
     
     # Skip during labcheck
     if lsf.labcheck:
         lsf.write_output('Labcheck active - skipping Odyssey install')
+        if dashboard and TaskStatus:
+            dashboard.update_task('odyssey', 'install', TaskStatus.SKIPPED, 'Labcheck mode')
+            dashboard.generate_html()
         return
     
     ##=========================================================================
@@ -194,18 +211,10 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     lsf.write_output(f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
     
-    # Update status dashboard
-    dashboard = None
-    TaskStatus = None
-    try:
-        sys.path.insert(0, '/home/holuser/hol/Tools')
-        from status_dashboard import StatusDashboard, TaskStatus as TS
-        TaskStatus = TS
-        dashboard = StatusDashboard(lsf.lab_sku)
+    # Update status dashboard - running
+    if dashboard and TaskStatus:
         dashboard.update_task('odyssey', 'install', TaskStatus.RUNNING)
         dashboard.generate_html()
-    except Exception:
-        pass
     
     lsf.write_vpodprogress('Odyssey Install', 'GOOD-8')
     
@@ -214,7 +223,10 @@ def main(lsf=None, standalone=False, dry_run=False):
     #==========================================================================
     
     if not lsf.LMC:
-        lsf.write_output('Odyssey only supported on Linux Main Console')
+        lsf.write_output('Odyssey only supported on Linux Main Console - skipping')
+        if dashboard and TaskStatus:
+            dashboard.update_task('odyssey', 'install', TaskStatus.SKIPPED, 'Not Linux Main Console')
+            dashboard.generate_html()
         return
     
     mc = lsf.mc

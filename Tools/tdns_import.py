@@ -355,7 +355,7 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
             from Tools.status_dashboard import StatusDashboard
             import lsfunctions as lsf
             dashboard = StatusDashboard(lsf.lab_sku)
-            dashboard.update_task('final', 'dns_import', 'failed', 'tdns-mgr command not found')
+            dashboard.update_task('prelim', 'dns_import', 'failed', 'tdns-mgr command not found')
             dashboard.generate_html()
         except Exception:
             pass
@@ -367,7 +367,7 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
             from Tools.status_dashboard import StatusDashboard
             import lsfunctions as lsf
             dashboard = StatusDashboard(lsf.lab_sku)
-            dashboard.update_task('final', 'dns_import', status, message)
+            dashboard.update_task('prelim', 'dns_import', status, message)
             dashboard.generate_html()
         except Exception:
             pass

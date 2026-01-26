@@ -125,7 +125,7 @@ def main():
     
     if dashboard:
         dashboard.update_task('prelim', 'dns', 'complete')
-        dashboard.update_task('final', 'dns_import', 'running')
+        dashboard.update_task('prelim', 'dns_import', 'running')
         dashboard.generate_html()
     
     # Run DNS record import immediately after DNS checks

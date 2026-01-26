@@ -57,6 +57,9 @@ def main(lsf=None, standalone=False, dry_run=False):
         sys.path.insert(0, '/home/holuser/hol/Tools')
         from status_dashboard import StatusDashboard, TaskStatus
         dashboard = StatusDashboard(lsf.lab_sku)
+        # Skip VCF and VCF Final groups since we're running VVF
+        dashboard.skip_group('vcf', 'VVF lab - VCF not applicable')
+        dashboard.skip_group('vcffinal', 'VVF lab - VCF Final not applicable')
         dashboard.update_task('vvf', 'mgmt_cluster', TaskStatus.RUNNING)
         dashboard.generate_html()
     except Exception:
