@@ -130,14 +130,14 @@ def main():
     
     # Run DNS record import immediately after DNS checks
     # This ensures custom FQDNs are available for URL checks in startup modules
+    # Note: tdns_import.py handles its own dashboard status updates based on result
     lsf.write_output('Checking for DNS record import...')
     dns_result = run_dns_import()
     if dns_result:
         lsf.write_output(f'DNS import result: {dns_result}')
     
-    if dashboard:
-        dashboard.update_task('final', 'dns_import', 'complete')
-        dashboard.generate_html()
+    # Note: Dashboard status for dns_import is now set by tdns_import.py itself
+    # based on success/failure/skipped status - no need to override here
     
     # Create LabType loader
     loader = LabTypeLoader(

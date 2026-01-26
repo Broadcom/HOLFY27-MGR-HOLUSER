@@ -172,12 +172,43 @@ def find_dns_records_file() -> Optional[str]:
     return None
 
 
+def tdns_show_config():
+    """
+    Show tdns-mgr configuration for debugging
+    Logs the output of 'tdns-mgr config' to help diagnose connection issues
+    """
+    write_output('Checking tdns-mgr configuration...')
+    
+    try:
+        result = subprocess.run(
+            [TDNS_MGR_PATH, 'config'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            write_output(f'tdns-mgr config: {result.stdout.strip()}')
+        elif result.stderr.strip():
+            write_output(f'tdns-mgr config error: {result.stderr.strip()}')
+        else:
+            write_output('tdns-mgr config returned no output')
+            
+    except subprocess.TimeoutExpired:
+        write_output('tdns-mgr config timed out')
+    except Exception as e:
+        write_output(f'tdns-mgr config error: {e}')
+
+
 def tdns_login() -> bool:
     """
     Login to tdns-mgr using password from creds.txt
     
     :return: True if login successful
     """
+    # Show config before login attempt for debugging
+    tdns_show_config()
+    
     password = get_password()
     
     if not password:
@@ -316,6 +347,17 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
             pass
         return {'Message': 'tdns-mgr not found', 'New Records': 0, 'Errors': 1}
     
+    # Helper function to update dashboard status
+    def update_dashboard_status(status: str, message: str = ""):
+        try:
+            from Tools.status_dashboard import StatusDashboard
+            import lsfunctions as lsf
+            dashboard = StatusDashboard(lsf.lab_sku)
+            dashboard.update_task('final', 'dns_import', status, message)
+            dashboard.generate_html()
+        except Exception:
+            pass
+    
     # PRIORITY 1: Check config.ini for inline DNS records
     config_records = get_dns_records_from_config()
     
@@ -324,20 +366,23 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
         
         # Login to tdns-mgr
         if not tdns_login():
-            write_output('WARNING: Could not login to tdns-mgr - skipping DNS import')
+            write_output('ERROR: Could not login to tdns-mgr - DNS import FAILED')
+            update_dashboard_status('failed', 'Login to DNS server failed')
             return {'Message': 'Login failed', 'New Records': 0, 'Errors': 1}
         
         # Import from config values
         result = import_records_from_config(config_records)
         
-        # Log summary
+        # Log summary and update dashboard
         new_records = result.get('New Records', 0)
         errors = result.get('Errors', 0)
         
         if errors == 0:
             write_output(f'DNS import from config.ini completed: {new_records} new records added')
+            update_dashboard_status('complete', f'{new_records} records imported')
         else:
             write_output(f'DNS import from config.ini had errors: {result.get("Message", "")}')
+            update_dashboard_status('failed', result.get('Message', 'Import errors'))
         
         return result
     
@@ -349,25 +394,29 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
         
         # Login to tdns-mgr
         if not tdns_login():
-            write_output('WARNING: Could not login to tdns-mgr - skipping DNS import')
+            write_output('ERROR: Could not login to tdns-mgr - DNS import FAILED')
+            update_dashboard_status('failed', 'Login to DNS server failed')
             return {'Message': 'Login failed', 'New Records': 0, 'Errors': 1}
         
         # Import from file
         result = import_records_from_file(csv_path)
         
-        # Log summary
+        # Log summary and update dashboard
         new_records = result.get('New Records', 0)
         errors = result.get('Errors', 0)
         
         if errors == 0:
             write_output(f'DNS import from file completed: {new_records} new records added')
+            update_dashboard_status('complete', f'{new_records} records imported')
         else:
             write_output(f'DNS import from file had errors: {result.get("Message", "")}')
+            update_dashboard_status('failed', result.get('Message', 'Import errors'))
         
         return result
     
     # No DNS records to import
     write_output('No DNS records configured in config.ini or new-dns-records.csv')
+    update_dashboard_status('skipped', 'No records to import')
     return None
 
 
