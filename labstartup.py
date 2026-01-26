@@ -192,9 +192,15 @@ def main():
         pass
     
     # Update dashboard - complete
-    if dashboard:
-        dashboard.set_complete()
-        dashboard.generate_html()
+    # Create a fresh dashboard instance to load the latest state from JSON
+    # (other modules like tdns_import.py have updated the state independently)
+    try:
+        from Tools.status_dashboard import StatusDashboard
+        final_dashboard = StatusDashboard(lsf.lab_sku)
+        final_dashboard.set_complete()
+        final_dashboard.generate_html()
+    except Exception:
+        pass
     
     # AutoCheck support
     if lsf.start_autocheck():
