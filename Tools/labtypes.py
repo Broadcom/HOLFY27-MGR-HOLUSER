@@ -233,10 +233,14 @@ class LabTypeLoader:
         Execute the complete startup sequence for the labtype
         
         :param lsf: lsfunctions module reference
+        :raises Exception: If a critical module fails
         """
         sequence = self.get_startup_sequence()
         
         lsf.write_output(f'Starting {self.labtype} startup sequence: {sequence}')
+        
+        # Define which modules are critical (failure should stop the sequence)
+        critical_modules = ['prelim', 'ESXi', 'VCF', 'VCFfinal']
         
         for module_name in sequence:
             module_path = self.get_module_path(module_name)
@@ -245,11 +249,18 @@ class LabTypeLoader:
                 lsf.write_output(f'Running {module_name} from {module_path}')
                 
                 try:
-                    lsf.startup(module_name)
+                    result = lsf.startup(module_name)
+                    
+                    # Check if module reported failure
+                    if result is False:
+                        lsf.write_output(f'Module {module_name} returned failure status')
+                        if module_name in critical_modules:
+                            raise RuntimeError(f'Critical module {module_name} failed')
+                        
                 except Exception as e:
                     lsf.write_output(f'Module {module_name} failed: {e}')
                     # Continue with next module unless it's a critical failure
-                    if module_name in ['prelim', 'ESXi']:
+                    if module_name in critical_modules:
                         raise
             else:
                 lsf.write_output(f'Skipping {module_name} - not found')

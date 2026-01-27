@@ -1403,6 +1403,7 @@ def startup(module_name, timeout=120, labcheck_mode=False):
     :param module_name: Name of the startup module (without .py)
     :param timeout: Maximum execution time in seconds
     :param labcheck_mode: Whether running in labcheck mode
+    :return: True if module succeeded, False if failed
     """
     global labcheck
     labcheck = labcheck_mode
@@ -1426,13 +1427,21 @@ def startup(module_name, timeout=120, labcheck_mode=False):
         
         # Call main if it exists, passing the current lsfunctions module
         # This ensures the startup module uses the already-initialized state
+        result = True
         if hasattr(module, 'main'):
             # Get reference to this module (lsfunctions) to pass to main()
             import lsfunctions as lsf_module
-            module.main(lsf=lsf_module)
+            result = module.main(lsf=lsf_module)
+            # If main() returns None (no explicit return), treat as success
+            if result is None:
+                result = True
         
-        write_output(f'Completed module: {module_name}')
-        return True
+        if result:
+            write_output(f'Completed module: {module_name}')
+        else:
+            write_output(f'Module {module_name} reported failure')
+        
+        return result
         
     except Exception as e:
         write_output(f'Module {module_name} failed: {e}')
