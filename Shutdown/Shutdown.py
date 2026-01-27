@@ -67,6 +67,9 @@ SCRIPT_DESCRIPTION = 'HOLFY27 Lab Shutdown Orchestration'
 SHUTDOWN_LOG = '/home/holuser/hol/shutdown.log'
 LABSTARTUP_LOG = '/home/holuser/hol/labstartup.log'
 
+# Status file for console display
+STATUS_FILE = '/lmchol/hol/startup_status.txt'
+
 # Valid lab types that use VCF shutdown procedure
 VCF_LAB_TYPES = ['VCF', 'HOL', 'DISCOVERY', 'ATE', 'VXP', 'EDU', 'NINJA']
 
@@ -102,6 +105,29 @@ def init_shutdown_log(dry_run: bool = False):
             f.write('=' * 70 + '\n')
     except Exception as e:
         print(f'Warning: Could not initialize {SHUTDOWN_LOG}: {e}')
+
+
+def update_status(status: str, dry_run: bool = False):
+    """
+    Update the startup_status.txt file with current shutdown status.
+    This is displayed on the console desktop widget.
+    
+    :param status: Status text to write
+    :param dry_run: If True, skip status update
+    """
+    if dry_run:
+        return
+    
+    try:
+        # Ensure directory exists
+        status_dir = os.path.dirname(STATUS_FILE)
+        if status_dir and not os.path.exists(status_dir):
+            os.makedirs(status_dir, exist_ok=True)
+        
+        with open(STATUS_FILE, 'w') as f:
+            f.write(status)
+    except Exception as e:
+        print(f'Warning: Could not update status file: {e}')
 
 
 def write_shutdown_output(msg: str, lsf=None):
@@ -151,12 +177,15 @@ def print_banner(lsf):
     write_shutdown_output(banner, lsf)
 
 
-def print_phase_header(lsf, phase_num: int, phase_name: str):
-    """Print a phase header"""
+def print_phase_header(lsf, phase_num: int, phase_name: str, dry_run: bool = False):
+    """Print a phase header and update status file"""
     write_shutdown_output('', lsf)
     write_shutdown_output('=' * 70, lsf)
     write_shutdown_output(f'PHASE {phase_num}: {phase_name}', lsf)
     write_shutdown_output('=' * 70, lsf)
+    
+    # Update status file for console display
+    update_status(f'Shutdown Phase {phase_num}: {phase_name}', dry_run)
 
 
 def import_shutdown_module(module_name: str, lsf):
@@ -281,6 +310,9 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     # Enable console output for real-time feedback during shutdown
     lsf.console_output = True
     
+    # Set initial status
+    update_status('Shutting Down', dry_run)
+    
     print_banner(lsf)
     
     write_shutdown_output(f'Shutdown started at: {start_time.strftime("%Y-%m-%d %H:%M:%S")}', lsf)
@@ -296,7 +328,7 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     # Phase 0: Pre-shutdown checks
     #==========================================================================
     
-    print_phase_header(lsf, 0, 'Pre-Shutdown Checks')
+    print_phase_header(lsf, 0, 'Pre-Shutdown Checks', dry_run)
     
     # Check if config.ini exists
     if not os.path.isfile(lsf.configini):
@@ -315,7 +347,7 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     # Phase 1: Docker Containers (Optional)
     #==========================================================================
     
-    print_phase_header(lsf, 1, 'Docker Containers')
+    print_phase_header(lsf, 1, 'Docker Containers', dry_run)
     
     if lsf.config.has_option('SHUTDOWN', 'shutdown_docker'):
         if lsf.config.getboolean('SHUTDOWN', 'shutdown_docker'):
@@ -337,7 +369,7 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     # Phase 2: VCF Shutdown (Main)
     #==========================================================================
     
-    print_phase_header(lsf, 2, 'VCF Environment Shutdown')
+    print_phase_header(lsf, 2, 'VCF Environment Shutdown', dry_run)
     
     # Check if lab type uses VCF shutdown procedure
     # VCF_LAB_TYPES includes: VCF, HOL, DISCOVERY, ATE, VXP, EDU, NINJA
@@ -369,7 +401,7 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     # Phase 3: Final Cleanup
     #==========================================================================
     
-    print_phase_header(lsf, 3, 'Final Cleanup')
+    print_phase_header(lsf, 3, 'Final Cleanup', dry_run)
     
     # Disconnect any remaining vSphere sessions
     write_shutdown_output('Disconnecting vSphere sessions...', lsf)
@@ -403,6 +435,8 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
         write_shutdown_output('*** DRY RUN COMPLETE - No changes were made ***', lsf)
     else:
         write_shutdown_output('Lab environment has been shut down.', lsf)
+        # Set final status
+        update_status('Shutdown Complete', dry_run)
         write_shutdown_output('ESXi hosts may still be powering off.', lsf)
     
     return True

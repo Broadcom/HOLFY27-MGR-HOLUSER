@@ -57,6 +57,9 @@ logger = logging.getLogger(__name__)
 MODULE_NAME = 'VCFshutdown'
 MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown'
 
+# Status file for console display
+STATUS_FILE = '/lmchol/hol/startup_status.txt'
+
 # vSAN elevator timeout (45 minutes recommended by VMware)
 VSAN_ELEVATOR_TIMEOUT = 2700  # 45 minutes in seconds
 VSAN_ELEVATOR_CHECK_INTERVAL = 60  # Check every minute
@@ -71,6 +74,27 @@ HOST_SHUTDOWN_TIMEOUT = 600  # 10 minutes per host
 #==============================================================================
 # HELPER FUNCTIONS
 #==============================================================================
+
+def update_shutdown_status(phase_num: int, phase_name: str, dry_run: bool = False):
+    """
+    Update the startup_status.txt file with current shutdown phase.
+    
+    :param phase_num: Phase number
+    :param phase_name: Phase description
+    :param dry_run: If True, skip status update
+    """
+    if dry_run:
+        return
+    
+    try:
+        status_dir = os.path.dirname(STATUS_FILE)
+        if status_dir and not os.path.exists(status_dir):
+            os.makedirs(status_dir, exist_ok=True)
+        
+        with open(STATUS_FILE, 'w') as f:
+            f.write(f'Shutdown Phase {phase_num}: {phase_name}')
+    except Exception:
+        pass  # Don't fail shutdown if status file can't be written
 
 def get_vms_by_regex(lsf, pattern: str) -> list:
     """
@@ -345,6 +369,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     lsf.write_output('PHASE 1: Fleet Operations (Aria Suite) Shutdown')
     lsf.write_output('='*60)
+    update_shutdown_status(1, 'Fleet Operations (Aria Suite)', dry_run)
     
     fleet_fqdn = None
     fleet_username = 'admin@local'
@@ -400,6 +425,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     lsf.write_output('PHASE 2: Connect to Management Infrastructure')
     lsf.write_output('='*60)
+    update_shutdown_status(2, 'Connect to Infrastructure', dry_run)
     
     # Get list of vCenters
     vcenters = []
@@ -433,6 +459,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     lsf.write_output('PHASE 3: Stop Workload Control Plane (WCP)')
     lsf.write_output('='*60)
+    update_shutdown_status(3, 'Stop WCP Services', dry_run)
     
     wcp_vcenters = []
     if lsf.config.has_option('SHUTDOWN', 'wcp_vcenters'):
@@ -467,6 +494,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     lsf.write_output('PHASE 4: Shutdown Workload VMs')
     lsf.write_output('='*60)
+    update_shutdown_status(4, 'Shutdown Workload VMs', dry_run)
     
     # VM regex patterns to find and shutdown (Tanzu, K8s, etc.)
     vm_patterns = [
@@ -535,6 +563,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     lsf.write_output('PHASE 5: Shutdown Management VMs')
     lsf.write_output('='*60)
+    update_shutdown_status(5, 'Shutdown Management VMs', dry_run)
     
     # Management VMs (in shutdown order - reverse of startup)
     mgmt_vms = [
@@ -587,6 +616,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     lsf.write_output('PHASE 6: Shutdown NSX Edges')
     lsf.write_output('='*60)
+    update_shutdown_status(6, 'Shutdown NSX Edges', dry_run)
     
     nsx_edges = []
     if lsf.config.has_option('SHUTDOWN', 'nsx_edges'):
@@ -627,6 +657,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     lsf.write_output('PHASE 7: Shutdown NSX Manager')
     lsf.write_output('='*60)
+    update_shutdown_status(7, 'Shutdown NSX Manager', dry_run)
     
     nsx_mgr = []
     if lsf.config.has_option('SHUTDOWN', 'nsx_mgr'):
@@ -667,6 +698,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     lsf.write_output('PHASE 8: Set Host Advanced Settings')
     lsf.write_output('='*60)
+    update_shutdown_status(8, 'Host Advanced Settings', dry_run)
     
     # Get list of hosts for vSAN operations
     esx_hosts = []
@@ -712,6 +744,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     lsf.write_output('PHASE 9: vSAN Elevator Operations')
     lsf.write_output('='*60)
+    update_shutdown_status(9, 'vSAN Elevator Operations', dry_run)
     
     vsan_enabled = True
     if lsf.config.has_option('SHUTDOWN', 'vsan_enabled'):
@@ -776,6 +809,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     lsf.write_output('PHASE 10: Shutdown ESXi Hosts')
     lsf.write_output('='*60)
+    update_shutdown_status(10, 'Shutdown ESXi Hosts', dry_run)
     
     shutdown_hosts = True
     if lsf.config.has_option('SHUTDOWN', 'shutdown_hosts'):
