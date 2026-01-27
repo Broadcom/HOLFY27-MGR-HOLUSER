@@ -278,8 +278,8 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
         import lsfunctions as lsf
         lsf.init(router=False)
     
-    # Configure console output - we handle it ourselves via write_shutdown_output
-    lsf.console_output = False
+    # Enable console output for real-time feedback during shutdown
+    lsf.console_output = True
     
     print_banner(lsf)
     

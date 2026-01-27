@@ -245,26 +245,34 @@ def wait_for_request(fqdn: str, token: str, request_id: str,
     :return: True if request completed successfully, False otherwise
     """
     start_time = time.time()
+    check_count = 0
     
     while (time.time() - start_time) < max_wait:
+        check_count += 1
+        elapsed = int(time.time() - start_time)
         status = get_request_status(fqdn, token, request_id, verify)
         
         if write_output:
-            write_output(f'Request {request_id} status: {status}')
+            write_output(f'  [Check {check_count}] Request {request_id[:8]}... status: {status} (elapsed: {elapsed}s)')
         else:
-            print(f'INFO: Request {request_id} status: {status}')
+            print(f'INFO: [Check {check_count}] Request {request_id[:8]}... status: {status} (elapsed: {elapsed}s)')
         
         if status == "COMPLETED":
+            if write_output:
+                write_output(f'  Request completed successfully in {elapsed}s')
             return True
         elif status == "FAILED":
+            if write_output:
+                write_output(f'  Request FAILED after {elapsed}s')
             return False
         
         time.sleep(poll_interval)
     
+    elapsed = int(time.time() - start_time)
     if write_output:
-        write_output(f'Request {request_id} timed out after {max_wait}s')
+        write_output(f'  Request {request_id[:8]}... timed out after {elapsed}s (max: {max_wait}s)')
     else:
-        print(f'WARNING: Request {request_id} timed out after {max_wait}s')
+        print(f'WARNING: Request {request_id[:8]}... timed out after {elapsed}s')
     
     return False
 

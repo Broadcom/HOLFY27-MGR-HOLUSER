@@ -418,8 +418,13 @@ def main(lsf=None, standalone=False, dry_run=False):
     if not dry_run:
         # Connect to management cluster hosts first (for VM operations)
         if mgmt_hosts:
-            lsf.write_output(f'Connecting to {len(mgmt_hosts)} management host(s)')
+            lsf.write_output(f'Connecting to {len(mgmt_hosts)} management host(s):')
+            for host in mgmt_hosts:
+                lsf.write_output(f'  - {host}')
             lsf.connect_vcenters(mgmt_hosts)
+            lsf.write_output(f'Connected to {len(lsf.sis)} vSphere endpoint(s)')
+        else:
+            lsf.write_output('No management hosts configured in VCF section')
     
     #==========================================================================
     # TASK 3: Stop WCP on vCenters
@@ -443,13 +448,17 @@ def main(lsf=None, standalone=False, dry_run=False):
                 wcp_vcenters.append(parts[0].strip())
     
     if wcp_vcenters and not dry_run:
+        lsf.write_output(f'Found {len(wcp_vcenters)} vCenter(s) with WCP to stop')
         for vc in wcp_vcenters:
+            lsf.write_output(f'Checking WCP on {vc}...')
             if lsf.test_tcp_port(vc, 443, timeout=10):
                 shutdown_wcp_service(lsf, vc, password)
             else:
                 lsf.write_output(f'{vc} not reachable, skipping WCP stop')
     elif dry_run:
         lsf.write_output(f'Would stop WCP on: {wcp_vcenters}')
+    else:
+        lsf.write_output('No WCP vCenters configured - skipping')
     
     #==========================================================================
     # TASK 4: Shutdown Workload VMs
@@ -480,20 +489,41 @@ def main(lsf=None, standalone=False, dry_run=False):
                        if v.strip() and not v.strip().startswith('#')]
     
     if not dry_run:
+        total_workload_vms = 0
+        
         # Find VMs by pattern
+        lsf.write_output(f'Searching for VMs matching {len(vm_patterns)} pattern(s)...')
         for pattern in vm_patterns:
-            lsf.write_output(f'Finding VMs matching: {pattern}')
+            lsf.write_output(f'  Pattern: {pattern}')
             vms = get_vms_by_regex(lsf, pattern)
-            for vm in vms:
-                shutdown_vm_gracefully(lsf, vm)
-                time.sleep(2)  # Brief pause between shutdowns
+            if vms:
+                lsf.write_output(f'  Found {len(vms)} VM(s) matching pattern')
+                for vm in vms:
+                    total_workload_vms += 1
+                    lsf.write_output(f'  [{total_workload_vms}] Shutting down: {vm.name}')
+                    shutdown_vm_gracefully(lsf, vm)
+                    time.sleep(2)  # Brief pause between shutdowns
+            else:
+                lsf.write_output(f'  No VMs found matching this pattern')
         
         # Shutdown static VM list
-        for vm_name in workload_vms:
-            vms = lsf.get_vm_by_name(vm_name)
-            for vm in vms:
-                shutdown_vm_gracefully(lsf, vm)
-                time.sleep(2)
+        if workload_vms:
+            lsf.write_output(f'Processing {len(workload_vms)} static workload VM(s)...')
+            for vm_name in workload_vms:
+                lsf.write_output(f'  Looking for VM: {vm_name}')
+                vms = lsf.get_vm_by_name(vm_name)
+                if vms:
+                    for vm in vms:
+                        total_workload_vms += 1
+                        lsf.write_output(f'  [{total_workload_vms}] Shutting down: {vm.name}')
+                        shutdown_vm_gracefully(lsf, vm)
+                        time.sleep(2)
+                else:
+                    lsf.write_output(f'  VM not found: {vm_name}')
+        else:
+            lsf.write_output('No static workload VMs configured')
+        
+        lsf.write_output(f'Workload VM shutdown complete: {total_workload_vms} VM(s) processed')
     else:
         lsf.write_output(f'Would shutdown VMs matching patterns: {vm_patterns}')
         lsf.write_output(f'Would shutdown VMs: {workload_vms}')
@@ -532,11 +562,21 @@ def main(lsf=None, standalone=False, dry_run=False):
                    if v.strip() and not v.strip().startswith('#')]
     
     if not dry_run:
+        lsf.write_output(f'Processing {len(mgmt_vms)} management VM(s) in shutdown order...')
+        mgmt_count = 0
+        mgmt_found = 0
         for vm_name in mgmt_vms:
+            mgmt_count += 1
+            lsf.write_output(f'  [{mgmt_count}/{len(mgmt_vms)}] Looking for: {vm_name}')
             vms = lsf.get_vm_by_name(vm_name)
-            for vm in vms:
-                shutdown_vm_gracefully(lsf, vm)
-                time.sleep(5)  # Longer pause for management VMs
+            if vms:
+                for vm in vms:
+                    mgmt_found += 1
+                    shutdown_vm_gracefully(lsf, vm)
+                    time.sleep(5)  # Longer pause for management VMs
+            else:
+                lsf.write_output(f'    VM not found (may not exist in this lab)')
+        lsf.write_output(f'Management VM shutdown complete: {mgmt_found} VM(s) found and processed')
     else:
         lsf.write_output(f'Would shutdown management VMs: {mgmt_vms}')
     
@@ -561,11 +601,22 @@ def main(lsf=None, standalone=False, dry_run=False):
                 nsx_edges.append(parts[0].strip())
     
     if not dry_run:
-        for edge_name in nsx_edges:
-            vms = lsf.get_vm_by_name(edge_name)
-            for vm in vms:
-                shutdown_vm_gracefully(lsf, vm)
-                time.sleep(2)
+        if nsx_edges:
+            lsf.write_output(f'Processing {len(nsx_edges)} NSX Edge VM(s)...')
+            edge_count = 0
+            for edge_name in nsx_edges:
+                edge_count += 1
+                lsf.write_output(f'  [{edge_count}/{len(nsx_edges)}] Looking for: {edge_name}')
+                vms = lsf.get_vm_by_name(edge_name)
+                if vms:
+                    for vm in vms:
+                        shutdown_vm_gracefully(lsf, vm)
+                        time.sleep(2)
+                else:
+                    lsf.write_output(f'    NSX Edge VM not found')
+            lsf.write_output('NSX Edge shutdown complete')
+        else:
+            lsf.write_output('No NSX Edge VMs configured - skipping')
     else:
         lsf.write_output(f'Would shutdown NSX Edges: {nsx_edges}')
     
@@ -590,11 +641,22 @@ def main(lsf=None, standalone=False, dry_run=False):
                 nsx_mgr.append(parts[0].strip())
     
     if not dry_run:
-        for mgr_name in nsx_mgr:
-            vms = lsf.get_vm_by_name(mgr_name)
-            for vm in vms:
-                shutdown_vm_gracefully(lsf, vm)
-                time.sleep(5)
+        if nsx_mgr:
+            lsf.write_output(f'Processing {len(nsx_mgr)} NSX Manager VM(s)...')
+            mgr_count = 0
+            for mgr_name in nsx_mgr:
+                mgr_count += 1
+                lsf.write_output(f'  [{mgr_count}/{len(nsx_mgr)}] Looking for: {mgr_name}')
+                vms = lsf.get_vm_by_name(mgr_name)
+                if vms:
+                    for vm in vms:
+                        shutdown_vm_gracefully(lsf, vm)
+                        time.sleep(5)
+                else:
+                    lsf.write_output(f'    NSX Manager VM not found')
+            lsf.write_output('NSX Manager shutdown complete')
+        else:
+            lsf.write_output('No NSX Manager VMs configured - skipping')
     else:
         lsf.write_output(f'Would shutdown NSX Manager: {nsx_mgr}')
     
@@ -625,13 +687,21 @@ def main(lsf=None, standalone=False, dry_run=False):
         esx_username = lsf.config.get('SHUTDOWN', 'esx_username')
     
     if not dry_run:
-        for host in esx_hosts:
-            lsf.write_output(f'Setting advanced settings on {host}')
-            try:
-                cmd = 'esxcli system settings advanced set -o /Mem/AllocGuestLargePage -i 1'
-                lsf.ssh(cmd, f'{esx_username}@{host}', password)
-            except Exception as e:
-                lsf.write_output(f'Warning: Failed to set advanced settings on {host}: {e}')
+        if esx_hosts:
+            lsf.write_output(f'Configuring {len(esx_hosts)} ESXi host(s)...')
+            host_count = 0
+            for host in esx_hosts:
+                host_count += 1
+                lsf.write_output(f'  [{host_count}/{len(esx_hosts)}] Setting advanced settings on {host}')
+                try:
+                    cmd = 'esxcli system settings advanced set -o /Mem/AllocGuestLargePage -i 1'
+                    lsf.ssh(cmd, f'{esx_username}@{host}', password)
+                    lsf.write_output(f'    Settings applied successfully')
+                except Exception as e:
+                    lsf.write_output(f'    Warning: Failed to set advanced settings: {e}')
+            lsf.write_output('Host advanced settings complete')
+        else:
+            lsf.write_output('No ESXi hosts configured - skipping')
     else:
         lsf.write_output(f'Would set advanced settings on: {esx_hosts}')
     
@@ -658,31 +728,46 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_output(f'Invalid vsan_timeout value: {vsan_timeout_raw}, using default {VSAN_ELEVATOR_TIMEOUT}')
             vsan_timeout = VSAN_ELEVATOR_TIMEOUT
     
+    lsf.write_output(f'vSAN enabled: {vsan_enabled}, ESXi hosts: {len(esx_hosts)}, Timeout: {vsan_timeout}s ({vsan_timeout/60:.0f}min)')
+    
     if vsan_enabled and esx_hosts and not dry_run:
         # Enable vSAN elevator on all hosts
-        lsf.write_output('Enabling vSAN elevator on all hosts')
+        lsf.write_output(f'Enabling vSAN elevator on {len(esx_hosts)} host(s)...')
+        host_count = 0
         for host in esx_hosts:
+            host_count += 1
+            lsf.write_output(f'  [{host_count}/{len(esx_hosts)}] Enabling elevator on {host}')
             set_vsan_elevator(lsf, host, esx_username, password, enable=True)
         
         # Wait for vSAN I/O to complete
-        lsf.write_output(f'Waiting {vsan_timeout/60:.0f} minutes for vSAN I/O to complete')
+        lsf.write_output(f'Starting vSAN I/O flush wait ({vsan_timeout/60:.0f} minutes)...')
+        lsf.write_output('  This ensures all pending writes are committed to disk')
         
         elapsed = 0
         while elapsed < vsan_timeout:
             remaining = (vsan_timeout - elapsed) / 60
-            lsf.write_output(f'vSAN wait: {remaining:.1f} minutes remaining')
+            elapsed_min = elapsed / 60
+            lsf.write_output(f'  vSAN wait: {elapsed_min:.0f}m elapsed, {remaining:.1f}m remaining')
             time.sleep(VSAN_ELEVATOR_CHECK_INTERVAL)
             elapsed += VSAN_ELEVATOR_CHECK_INTERVAL
         
+        lsf.write_output('vSAN I/O flush wait complete')
+        
         # Disable vSAN elevator on all hosts
-        lsf.write_output('Disabling vSAN elevator on all hosts')
+        lsf.write_output(f'Disabling vSAN elevator on {len(esx_hosts)} host(s)...')
+        host_count = 0
         for host in esx_hosts:
+            host_count += 1
+            lsf.write_output(f'  [{host_count}/{len(esx_hosts)}] Disabling elevator on {host}')
             set_vsan_elevator(lsf, host, esx_username, password, enable=False)
+        lsf.write_output('vSAN elevator operations complete')
     elif dry_run:
         lsf.write_output(f'Would run vSAN elevator on: {esx_hosts}')
         lsf.write_output(f'vSAN timeout: {vsan_timeout} seconds')
+    elif not vsan_enabled:
+        lsf.write_output('vSAN elevator skipped (vsan_enabled=false in config)')
     else:
-        lsf.write_output('vSAN elevator skipped (disabled or no hosts)')
+        lsf.write_output('vSAN elevator skipped (no ESXi hosts configured)')
     
     #==========================================================================
     # TASK 10: Shutdown ESXi Hosts
@@ -696,14 +781,24 @@ def main(lsf=None, standalone=False, dry_run=False):
     if lsf.config.has_option('SHUTDOWN', 'shutdown_hosts'):
         shutdown_hosts = lsf.config.getboolean('SHUTDOWN', 'shutdown_hosts')
     
+    lsf.write_output(f'Host shutdown enabled: {shutdown_hosts}, ESXi hosts: {len(esx_hosts)}')
+    
     if shutdown_hosts and esx_hosts and not dry_run:
+        lsf.write_output(f'Shutting down {len(esx_hosts)} ESXi host(s)...')
+        host_count = 0
         for host in esx_hosts:
+            host_count += 1
+            lsf.write_output(f'  [{host_count}/{len(esx_hosts)}] Initiating shutdown: {host}')
             shutdown_host(lsf, host, esx_username, password)
             time.sleep(5)  # Stagger host shutdowns
+        lsf.write_output('ESXi host shutdown commands sent')
+        lsf.write_output('  Note: Hosts may take several minutes to fully power off')
     elif dry_run:
         lsf.write_output(f'Would shutdown hosts: {esx_hosts}')
+    elif not shutdown_hosts:
+        lsf.write_output('Host shutdown skipped (shutdown_hosts=false in config)')
     else:
-        lsf.write_output('Host shutdown skipped (disabled or no hosts)')
+        lsf.write_output('Host shutdown skipped (no ESXi hosts configured)')
     
     #==========================================================================
     # Cleanup
