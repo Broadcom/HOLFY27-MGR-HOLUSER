@@ -345,7 +345,8 @@ def trigger_inventory_sync(fqdn: str, token: str, env_name: str,
 #==============================================================================
 
 def power_state_product(fqdn: str, token: str, env_id: str, product_id: str,
-                        power_state: str, verify: bool = SSL_VERIFY) -> str:
+                        power_state: str, verify: bool = SSL_VERIFY,
+                        write_output=None) -> str:
     """
     Trigger a power state change for a product.
     
@@ -355,8 +356,11 @@ def power_state_product(fqdn: str, token: str, env_id: str, product_id: str,
     :param product_id: Product ID
     :param power_state: Power state (power-on, power-off)
     :param verify: SSL verification
+    :param write_output: Optional logging function
     :return: Request ID or None on failure
     """
+    _log = write_output if write_output else lambda x: logger.error(x)
+    
     if DEBUG:
         logger.debug(f"In: power_state_product({env_id}, {product_id}, {power_state})")
     
@@ -366,8 +370,20 @@ def power_state_product(fqdn: str, token: str, env_id: str, product_id: str,
         response = _make_request('POST', url, token, payload={}, verify=verify)
         return response.get("requestId")
         
+    except requests.exceptions.HTTPError as e:
+        error_detail = ""
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_json = e.response.json()
+                error_detail = error_json.get('message', e.response.text)
+            except:
+                error_detail = e.response.text
+        _log(f"HTTP Error triggering {power_state} for {product_id}: {e}")
+        if error_detail:
+            _log(f"  Detail: {error_detail}")
+        return None
     except Exception as e:
-        logger.error(f"Failed to trigger power state: {e}")
+        _log(f"Failed to trigger power state for {product_id}: {e}")
         return None
 
 def trigger_power_event(fqdn: str, token: str, env_name: str, product_id: str,
@@ -397,7 +413,7 @@ def trigger_power_event(fqdn: str, token: str, env_name: str, product_id: str,
     
     _log(f'Triggering {power_state} for {product_id} in {env_name}')
     request_id = power_state_product(fqdn, token, env_id, product_id, 
-                                     power_state, verify)
+                                     power_state, verify, write_output)
     
     if not request_id:
         _log(f'ERROR: Failed to trigger {power_state} for {product_id}')
@@ -412,13 +428,14 @@ def trigger_power_event(fqdn: str, token: str, env_name: str, product_id: str,
 
 def shutdown_products(fqdn: str, token: str, products: list, 
                       verify: bool = SSL_VERIFY,
-                      write_output=None) -> bool:
+                      write_output=None,
+                      skip_inventory_sync: bool = False) -> bool:
     """
     Shutdown multiple products across all environments.
     
     This function will:
     1. Get all environments from Fleet Management
-    2. Trigger inventory sync for each environment
+    2. Optionally trigger inventory sync for each environment
     3. Shutdown each product in the specified order
     
     :param fqdn: Fleet Management FQDN
@@ -426,9 +443,13 @@ def shutdown_products(fqdn: str, token: str, products: list,
     :param products: List of product IDs to shutdown (in order)
     :param verify: SSL verification
     :param write_output: Optional logging function
+    :param skip_inventory_sync: Skip inventory sync (useful when vCenter is down)
     :return: True if all shutdowns succeeded, False otherwise
     """
     _log = write_output if write_output else lambda x: print(f'INFO: {x}')
+    
+    # Products that don't support power-off via Fleet Operations API
+    unsupported_products = ['vrops', 'vrli']
     
     _log('Getting all environments from Fleet Management')
     env_list = get_all_environments(fqdn, token, verify)
@@ -439,27 +460,41 @@ def shutdown_products(fqdn: str, token: str, products: list,
     
     _log(f'Found {len(env_list)} environment(s)')
     
-    # Step 1: Sync inventory for all environments
-    _log('Synchronizing inventory for all environments')
-    for env_name, details in env_list.items():
-        product_ids = details.get('products', [])
-        if product_ids:
-            trigger_inventory_sync(fqdn, token, env_name, product_ids, 
-                                  verify, write_output)
+    # Step 1: Sync inventory for all environments (optional)
+    if not skip_inventory_sync:
+        _log('Synchronizing inventory for all environments')
+        _log('(Inventory sync may fail if vCenter is unavailable - this is expected during shutdown)')
+        for env_name, details in env_list.items():
+            product_ids = details.get('products', [])
+            if product_ids:
+                trigger_inventory_sync(fqdn, token, env_name, product_ids, 
+                                      verify, write_output)
+    else:
+        _log('Skipping inventory sync')
     
     # Step 2: Shutdown products in order
     all_success = True
     for product in products:
+        # Skip products that don't support power-off
+        if product in unsupported_products:
+            _log(f'Skipping {product} - power-off not supported via Fleet API (will be shut down via VM)')
+            continue
+            
         _log(f'Shutting down {product}...')
         
+        product_found = False
         for env_name, details in env_list.items():
             if product in details.get('products', []):
+                product_found = True
                 success = trigger_power_event(fqdn, token, env_name, product,
                                              'power-off', verify, write_output)
                 if not success:
                     _log(f'WARNING: Failed to shutdown {product} in {env_name}')
                     all_success = False
                 break
+        
+        if not product_found:
+            _log(f'{product} not found in any environment')
     
     return all_success
 

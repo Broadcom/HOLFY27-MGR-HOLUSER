@@ -362,7 +362,10 @@ def main(lsf=None, standalone=False, dry_run=False):
         fleet_username = lsf.config.get('SHUTDOWN', 'fleet_username')
     
     # Products to shutdown via Fleet Operations (reverse order from startup)
-    fleet_products = ['vra', 'vrni', 'vrops', 'vrli']
+    # NOTE: Only vra and vrni support power-off via Fleet Operations API
+    # vrops and vrli return "Shut Down Operation is not supported" - their VMs
+    # are handled directly in PHASE 5 (Management VMs) instead
+    fleet_products = ['vra', 'vrni']
     if lsf.config.has_option('SHUTDOWN', 'fleet_products'):
         fleet_products_raw = lsf.config.get('SHUTDOWN', 'fleet_products')
         fleet_products = [p.strip() for p in fleet_products_raw.split(',')]
@@ -373,12 +376,16 @@ def main(lsf=None, standalone=False, dry_run=False):
         if not dry_run:
             try:
                 token = fleet.get_encoded_token(fleet_username, password)
+                # Skip inventory sync during shutdown - it often fails when vCenter
+                # is slow or already being shut down, and isn't required for power-off
                 success = fleet.shutdown_products(fleet_fqdn, token, fleet_products,
-                                                  write_output=lsf.write_output)
+                                                  write_output=lsf.write_output,
+                                                  skip_inventory_sync=True)
                 if success:
                     lsf.write_output('Fleet Operations products shutdown complete')
                 else:
                     lsf.write_output('WARNING: Some Fleet Operations products may not have shutdown cleanly')
+                    lsf.write_output('(Products will be shut down via VM power-off in later phases)')
             except Exception as e:
                 lsf.write_output(f'Fleet Operations shutdown error: {e}')
         else:
