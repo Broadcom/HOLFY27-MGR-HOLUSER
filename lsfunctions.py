@@ -559,15 +559,24 @@ def connect_vcenters(entries):
         # Keep trying to connect until successful
         max_attempts = 10
         attempt = 0
+        connected = False
         while not connect_vc(hostname, login_user, pwd):
             attempt += 1
             if attempt >= max_attempts:
                 write_output(f'Failed to connect to {hostname} after {max_attempts} attempts')
                 break
             labstartup_sleep(sleep_seconds)
+        else:
+            # while loop completed without break - connection succeeded
+            connected = True
         
-        if vc_type == 'linux':
-            write_output('Connected to linux vCenter')
+        if connected:
+            if vc_type == 'linux':
+                write_output(f'Connected to linux vCenter: {hostname}')
+            elif vc_type == 'esx':
+                write_output(f'Connected to ESXi host: {hostname}')
+            else:
+                write_output(f'Connected to {hostname}')
 
 
 def get_host(name):
@@ -602,11 +611,18 @@ def get_datastore(ds_name):
     :param ds_name: string - the name of the datastore to return
     :return: vim.Datastore or None
     """
+    if not sis:
+        write_output(f'WARNING: No vCenter/ESXi connections available to search for datastore {ds_name}')
+        return None
+    
     for si in sis:
-        datastores = get_all_objs(si.content, [vim.Datastore])
-        for datastore in datastores:
-            if datastore.name == ds_name:
-                return datastore
+        try:
+            datastores = get_all_objs(si.content, [vim.Datastore])
+            for datastore in datastores:
+                if datastore.name == ds_name:
+                    return datastore
+        except Exception as e:
+            write_output(f'Error searching datastores in session: {e}')
     return None
 
 
@@ -709,6 +725,15 @@ def check_datastore(entry):
     datastore_name = parts[1].strip()
     write_output(f'Checking {datastore_name}...')
     
+    # Check if we have any vCenter/ESXi connections
+    if not sis:
+        write_output(f'ERROR: No vCenter/ESXi connections available - cannot check datastore {datastore_name}')
+        write_output('Please ensure vCenter is connected before checking datastores')
+        return False
+    
+    # Log available connections for debugging
+    write_output(f'Searching {len(sis)} connected session(s) for datastore {datastore_name}')
+    
     max_attempts = 30
     attempt = 0
     ds = None
@@ -717,14 +742,17 @@ def check_datastore(entry):
         try:
             ds = get_datastore(datastore_name)
             if ds and (ds.summary.type == 'VMFS' or 'NFS' in ds.summary.type or ds.summary.type == 'vsan'):
+                write_output(f'Datastore {datastore_name} found (type: {ds.summary.type})')
                 break
         except Exception as e:
             write_output(f'Exception checking datastore {datastore_name}: {e}')
         attempt += 1
-        labstartup_sleep(sleep_seconds)
+        if attempt < max_attempts:
+            labstartup_sleep(sleep_seconds)
     
     if ds is None:
         write_output(f'Datastore {datastore_name} not found after {max_attempts} attempts')
+        write_output(f'Connected sessions: {len(sis)} - verify vCenter connection is established')
         return False
     
     # Handle VMFS datastores - rescan HBAs

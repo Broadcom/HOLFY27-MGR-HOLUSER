@@ -23,10 +23,10 @@ sys.path.insert(0, '/home/holuser/hol')
 
 MODULE_NAME = 'urls'
 MODULE_DESCRIPTION = 'URL accessibility verification'
-MAX_RETRIES = 10
-RETRY_DELAY = 10
+MAX_RETRIES = 20
+RETRY_DELAY = 20
 REQUEST_TIMEOUT = 15
-MAX_WORKERS = 5
+MAX_WORKERS = 8
 
 #==============================================================================
 # URL CHECK FUNCTION
