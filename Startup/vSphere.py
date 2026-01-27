@@ -62,6 +62,10 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 1: Connect to vCenters
     #==========================================================================
     
+    # Maximum time to wait for vCenter to become available (10 minutes)
+    VCENTER_WAIT_TIMEOUT = 600  # seconds
+    VCENTER_CHECK_INTERVAL = 20  # seconds between checks
+    
     vcenters = []
     if lsf.config.has_option('RESOURCES', 'vCenters'):
         vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
@@ -77,6 +81,51 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_vpodprogress('Connecting vCenters', 'GOOD-3')
     
     if not dry_run:
+        import time
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        # Wait for each vCenter to become available before attempting connection
+        for entry in vcenters:
+            if not entry or entry.strip().startswith('#'):
+                continue
+            
+            # Extract hostname from entry (format: hostname:type:user)
+            vc_hostname = entry.split(':')[0].strip()
+            
+            lsf.write_output(f'Waiting for vCenter {vc_hostname} to become available (max {VCENTER_WAIT_TIMEOUT // 60} minutes)...')
+            
+            start_wait = time.time()
+            vcenter_available = False
+            
+            while (time.time() - start_wait) < VCENTER_WAIT_TIMEOUT:
+                # Check if vCenter port 443 is responding
+                if lsf.test_tcp_port(vc_hostname, 443, timeout=10):
+                    # Also verify the API endpoint is responding
+                    try:
+                        # Try to reach the vCenter API - this indicates services are up
+                        api_url = f'https://{vc_hostname}/api'
+                        response = requests.get(api_url, verify=False, timeout=10)
+                        # Any response (even 401) means vCenter is responding
+                        if response.status_code in [200, 401, 403]:
+                            vcenter_available = True
+                            elapsed = int(time.time() - start_wait)
+                            lsf.write_output(f'vCenter {vc_hostname} is available after {elapsed} seconds')
+                            break
+                    except requests.exceptions.RequestException:
+                        pass
+                
+                elapsed = int(time.time() - start_wait)
+                remaining = VCENTER_WAIT_TIMEOUT - elapsed
+                lsf.write_output(f'vCenter {vc_hostname} not ready yet, waiting... ({remaining}s remaining)')
+                time.sleep(VCENTER_CHECK_INTERVAL)
+            
+            if not vcenter_available:
+                lsf.write_output(f'WARNING: vCenter {vc_hostname} did not become available within {VCENTER_WAIT_TIMEOUT // 60} minutes')
+                lsf.write_output(f'Continuing with connection attempt anyway...')
+        
+        # Now connect to all vCenters
         lsf.connect_vcenters(vcenters)
     else:
         lsf.write_output(f'Would connect to vCenters: {vcenters}')
