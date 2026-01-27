@@ -196,46 +196,55 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_output('Checking Aria Automation VMs...')
             lsf.write_vpodprogress('Aria Automation', 'GOOD-8')
             
-            # Connect to vCenters if not already connected
+            #------------------------------------------------------------------
+            # Clear existing sessions and establish fresh vCenter connection
+            # Previous tasks may have connected to ESXi hosts directly, but
+            # Aria VM operations must be done through vCenter
+            #------------------------------------------------------------------
+            lsf.write_output('Clearing existing sessions for fresh vCenter connection...')
+            for si in lsf.sis:
+                try:
+                    connect.Disconnect(si)
+                except Exception:
+                    pass
+            lsf.sis.clear()
+            lsf.sisvc.clear()
+            
+            # Connect to vCenter(s) - required for Aria VM operations
             vcenters = []
             if lsf.config.has_option('RESOURCES', 'vCenters'):
                 vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
                 vcenters = [v.strip() for v in vcenters_raw.split('\n') if v.strip() and not v.strip().startswith('#')]
-                
-                if vcenters and not dry_run:
-                    lsf.write_vpodprogress('Connecting vCenters', 'GOOD-3')
-                    lsf.connect_vcenters(vcenters)
+            
+            if not vcenters:
+                lsf.write_output('ERROR: No vCenters configured in RESOURCES section')
+                aria_vms_errors.append('No vCenters configured')
+            elif not dry_run:
+                lsf.write_vpodprogress('Connecting vCenters', 'GOOD-3')
+                lsf.write_output(f'Connecting to vCenter(s): {vcenters}')
+                lsf.connect_vcenters(vcenters)
+                lsf.write_output(f'vCenter sessions established: {len(lsf.sis)}')
             
             vravms_raw = lsf.config.get('VCFFINAL', 'vravms')
             vravms = [v.strip() for v in vravms_raw.split('\n') if v.strip() and not v.strip().startswith('#')]
             
-            if vravms and not dry_run:
-                lsf.write_output(f'Starting {len(vravms)} Aria Automation VMs...')
+            if vravms and not dry_run and not aria_vms_errors:
+                lsf.write_output(f'Processing {len(vravms)} Aria Automation VMs...')
                 lsf.write_vpodprogress('Starting Aria VMs', 'GOOD-8')
                 
                 # Before starting, verify NICs are set to start connected
-                # NIC verification is best-effort - don't fail the lab if it errors
                 for vravm in vravms:
                     parts = vravm.split(':')
                     vmname = parts[0].strip()
                     try:
                         vms = lsf.get_vm_match(vmname)
                         for vm in vms:
-                            verify_nic_connected(lsf, vm, simple=True)  # Just make sure connected at start
+                            verify_nic_connected(lsf, vm, simple=True)
                     except Exception as e:
                         error_msg = str(e)
                         lsf.write_output(f'Warning: Error checking NICs for {vmname}: {error_msg}')
-                        # Check for authentication errors - these indicate session issues
-                        if 'not authenticated' in error_msg.lower() or 'session' in error_msg.lower():
-                            lsf.write_output(f'Session error detected - attempting to reconnect to vCenters')
-                            # Try to reconnect
-                            try:
-                                if vcenters:
-                                    lsf.connect_vcenters(vcenters)
-                            except Exception as reconnect_err:
-                                lsf.write_output(f'Warning: Reconnection failed: {reconnect_err}')
                 
-                # Start the VMs - this is the critical operation
+                # Start the VMs
                 try:
                     lsf.start_nested(vravms)
                 except Exception as e:
@@ -244,7 +253,6 @@ def main(lsf=None, standalone=False, dry_run=False):
                     aria_vms_errors.append(error_msg)
                 
                 # After starting, verify VMs are actually powered on and tools running
-                # These checks are best-effort - the URL checks will ultimately determine success
                 for vravm in vravms:
                     parts = vravm.split(':')
                     vmname = parts[0].strip()
@@ -278,16 +286,14 @@ def main(lsf=None, standalone=False, dry_run=False):
                                 tools_attempt += 1
                             
                             # Verify NIC is connected after tools are running
-                            # This is best-effort - don't fail if it errors
                             try:
-                                verify_nic_connected(lsf, vm, simple=False)  # Disconnect and reconnect if not connected
+                                verify_nic_connected(lsf, vm, simple=False)
                             except Exception as nic_err:
-                                lsf.write_output(f'Warning: NIC verification failed for {vm.name}: {nic_err}')
+                                lsf.write_output(f'Warning: Post-start NIC verification failed for {vm.name}: {nic_err}')
                             
                     except Exception as e:
                         error_msg = str(e)
                         lsf.write_output(f'Warning: Error waiting for {vmname}: {error_msg}')
-                        # Don't add to errors - URL checks will determine if VMs are actually working
                 
                 lsf.write_output('Aria Automation VMs processing complete')
         else:
@@ -300,8 +306,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         aria_vms_errors.append(error_msg)
         aria_vms_task_failed = True
     
-    # Update dashboard - mark as complete with warnings if there were non-fatal errors
-    # This ALWAYS runs, even if the task had exceptions
+    # Update dashboard based on task results
     if dashboard:
         if aria_vms_task_failed or aria_vms_errors:
             dashboard.update_task('vcffinal', 'aria_vms', TaskStatus.FAILED,
