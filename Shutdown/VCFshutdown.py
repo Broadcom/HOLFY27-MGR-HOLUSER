@@ -867,7 +867,12 @@ def main(lsf=None, standalone=False, dry_run=False):
     ##=========================================================================
     
     lsf.write_output(f'{MODULE_NAME} completed')
-    return True
+    
+    # Return success status and list of ESXi hosts that were shut down
+    # This allows the caller to wait for hosts to fully power off
+    # esx_hosts is defined in Phase 8 so should always exist at this point
+    hosts_to_return = esx_hosts if 'esx_hosts' in locals() else []
+    return {'success': True, 'esx_hosts': hosts_to_return}
 
 
 #==============================================================================

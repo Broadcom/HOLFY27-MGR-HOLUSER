@@ -263,25 +263,101 @@ def shutdown_docker_containers(lsf, dry_run: bool = False) -> bool:
     return True
 
 
-def run_vcf_shutdown(lsf, dry_run: bool = False) -> bool:
+def run_vcf_shutdown(lsf, dry_run: bool = False) -> dict:
     """
     Run the VCF shutdown module
     
     :param lsf: lsfunctions module
     :param dry_run: Preview mode
-    :return: Success status
+    :return: Dictionary with 'success' status and 'esx_hosts' list
     """
     module = import_shutdown_module('VCFshutdown', lsf)
     
     if module is None:
         lsf.write_output('VCFshutdown module not available')
-        return False
+        return {'success': False, 'esx_hosts': []}
     
     try:
-        return module.main(lsf=lsf, dry_run=dry_run)
+        result = module.main(lsf=lsf, dry_run=dry_run)
+        # Handle both old (bool) and new (dict) return types
+        if isinstance(result, dict):
+            return result
+        else:
+            return {'success': result, 'esx_hosts': []}
     except Exception as e:
         lsf.write_output(f'VCFshutdown failed: {e}')
-        return False
+        return {'success': False, 'esx_hosts': []}
+
+
+def wait_for_hosts_poweroff(lsf, hosts: list, dry_run: bool = False,
+                            max_wait: int = 1800, poll_interval: int = 15):
+    """
+    Wait for ESXi hosts to stop responding to pings (fully powered off)
+    
+    :param lsf: lsfunctions module
+    :param hosts: List of host FQDNs/IPs to monitor
+    :param dry_run: Preview mode
+    :param max_wait: Maximum wait time in seconds (default 30 minutes)
+    :param poll_interval: Time between ping attempts in seconds (default 15)
+    :return: True if all hosts are offline, False if timeout
+    """
+    import time
+    
+    if not hosts:
+        write_shutdown_output('No ESXi hosts to monitor for power off', lsf)
+        return True
+    
+    if dry_run:
+        write_shutdown_output(f'Would wait for {len(hosts)} host(s) to power off: {hosts}', lsf)
+        return True
+    
+    write_shutdown_output('', lsf)
+    write_shutdown_output('ESXi hosts are powering off...', lsf)
+    write_shutdown_output(f'Monitoring {len(hosts)} host(s) for up to {max_wait // 60} minutes', lsf)
+    update_status('Waiting for ESXi Hosts to Power Off', dry_run)
+    
+    start_time = time.time()
+    hosts_remaining = set(hosts)
+    
+    while (time.time() - start_time) < max_wait:
+        elapsed = int(time.time() - start_time)
+        hosts_still_up = set()
+        
+        for host in hosts_remaining:
+            # Extract hostname if it contains additional info (like user:pass)
+            hostname = host.split(':')[0] if ':' in host else host
+            
+            if lsf.test_ping(hostname, count=1, timeout=5):
+                hosts_still_up.add(host)
+        
+        # Report any newly offline hosts
+        newly_offline = hosts_remaining - hosts_still_up
+        for host in newly_offline:
+            hostname = host.split(':')[0] if ':' in host else host
+            write_shutdown_output(f'  {hostname}: Powered off (elapsed: {elapsed}s)', lsf)
+        
+        hosts_remaining = hosts_still_up
+        
+        if not hosts_remaining:
+            elapsed = int(time.time() - start_time)
+            write_shutdown_output(f'All ESXi hosts powered off after {elapsed} seconds', lsf)
+            return True
+        
+        # Show status
+        remaining_time = max_wait - elapsed
+        write_shutdown_output(f'  {len(hosts_remaining)} host(s) still running... '
+                            f'(elapsed: {elapsed}s, remaining: {remaining_time}s)', lsf)
+        
+        time.sleep(poll_interval)
+    
+    # Timeout - report which hosts are still up
+    elapsed = int(time.time() - start_time)
+    write_shutdown_output(f'Timeout after {elapsed}s - {len(hosts_remaining)} host(s) still responding:', lsf)
+    for host in hosts_remaining:
+        hostname = host.split(':')[0] if ':' in host else host
+        write_shutdown_output(f'  - {hostname}', lsf)
+    
+    return False
 
 
 #==============================================================================
@@ -371,6 +447,10 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     
     print_phase_header(lsf, 2, 'VCF Environment Shutdown', dry_run)
     
+    # Track ESXi hosts for power-off monitoring
+    esx_hosts = []
+    vcf_result = {'success': False, 'esx_hosts': []}
+    
     # Check if lab type uses VCF shutdown procedure
     # VCF_LAB_TYPES includes: VCF, HOL, DISCOVERY, ATE, VXP, EDU, NINJA
     if lab_type.upper() in VCF_LAB_TYPES:
@@ -387,15 +467,18 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
                 lsf.config.add_section('SHUTDOWN')
             lsf.config.set('SHUTDOWN', 'shutdown_hosts', 'false')
         
-        run_vcf_shutdown(lsf, dry_run)
+        vcf_result = run_vcf_shutdown(lsf, dry_run)
     elif lab_type.upper() == 'VVF':
         write_shutdown_output('VVF lab type - using VVF shutdown procedure', lsf)
         # VVF shutdown would be similar but without VCF-specific components
-        run_vcf_shutdown(lsf, dry_run)
+        vcf_result = run_vcf_shutdown(lsf, dry_run)
     else:
         # Default to VCF shutdown for any unknown type
         write_shutdown_output(f'Lab type {lab_type} - using default VCF shutdown procedure', lsf)
-        run_vcf_shutdown(lsf, dry_run)
+        vcf_result = run_vcf_shutdown(lsf, dry_run)
+    
+    # Extract ESXi hosts list from VCF shutdown result
+    esx_hosts = vcf_result.get('esx_hosts', [])
     
     #==========================================================================
     # Phase 3: Final Cleanup
@@ -414,6 +497,14 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
                 pass
         lsf.sis.clear()
         lsf.sisvc.clear()
+    
+    #==========================================================================
+    # Phase 4: Wait for ESXi Hosts to Power Off
+    #==========================================================================
+    
+    if esx_hosts and not skip_host_shutdown:
+        print_phase_header(lsf, 4, 'Wait for ESXi Host Power Off', dry_run)
+        wait_for_hosts_poweroff(lsf, esx_hosts, dry_run)
     
     #==========================================================================
     # Summary
@@ -435,9 +526,9 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
         write_shutdown_output('*** DRY RUN COMPLETE - No changes were made ***', lsf)
     else:
         write_shutdown_output('Lab environment has been shut down.', lsf)
+        write_shutdown_output('Please manually shutdown your manager, router, and console.', lsf)
         # Set final status
         update_status('Shutdown Complete', dry_run)
-        write_shutdown_output('ESXi hosts may still be powering off.', lsf)
     
     return True
 
