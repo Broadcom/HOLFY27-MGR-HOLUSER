@@ -284,7 +284,8 @@ lmcholroot=/lmchol/hol
 configini=/tmp/config.ini
 logfile=/tmp/labstartupsh.log
 touch ${logfile} && chmod 666 ${logfile} 2>/dev/null || true
-sshoptions='StrictHostKeyChecking=accept-new'
+# Lab environment: disable strict host key checking to handle key changes
+sshoptions='StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
 LMC=false
 router='holorouter'
 holorouterdir=/tmp/holorouter

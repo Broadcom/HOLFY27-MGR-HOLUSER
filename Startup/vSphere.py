@@ -102,19 +102,45 @@ def main(lsf=None, standalone=False, dry_run=False):
             while (time.time() - start_wait) < VCENTER_WAIT_TIMEOUT:
                 # Check if vCenter port 443 is responding
                 if lsf.test_tcp_port(vc_hostname, 443, timeout=10):
-                    # Also verify the API endpoint is responding
+                    # Verify vCenter is responding via multiple endpoints
+                    # Some endpoints may respond before others during startup
                     try:
-                        # Try to reach the vCenter API - this indicates services are up
+                        session = requests.Session()
+                        session.trust_env = False  # Ignore proxy environment vars
+                        
+                        # Try the API endpoint first
                         api_url = f'https://{vc_hostname}/api'
-                        response = requests.get(api_url, verify=False, timeout=10)
-                        # Any response (even 401) means vCenter is responding
-                        if response.status_code in [200, 401, 403]:
+                        api_response = None
+                        try:
+                            api_response = session.get(api_url, verify=False, timeout=10, proxies=None)
+                        except requests.exceptions.RequestException as e:
+                            lsf.write_output(f'  API endpoint check failed: {e}')
+                        
+                        # Also try the UI endpoint as a fallback
+                        ui_url = f'https://{vc_hostname}/ui/'
+                        ui_response = None
+                        try:
+                            ui_response = session.get(ui_url, verify=False, timeout=10, proxies=None)
+                        except requests.exceptions.RequestException as e:
+                            lsf.write_output(f'  UI endpoint check failed: {e}')
+                        
+                        # Consider vCenter available if either endpoint responds
+                        api_ok = api_response and api_response.status_code in [200, 401, 403]
+                        ui_ok = ui_response and ui_response.status_code == 200
+                        
+                        if api_ok or ui_ok:
                             vcenter_available = True
                             elapsed = int(time.time() - start_wait)
-                            lsf.write_output(f'vCenter {vc_hostname} is available after {elapsed} seconds')
+                            which_endpoint = 'API' if api_ok else 'UI'
+                            lsf.write_output(f'vCenter {vc_hostname} is available after {elapsed} seconds (detected via {which_endpoint} endpoint)')
                             break
-                    except requests.exceptions.RequestException:
-                        pass
+                        else:
+                            # Log what we got for debugging
+                            api_status = api_response.status_code if api_response else 'no response'
+                            ui_status = ui_response.status_code if ui_response else 'no response'
+                            lsf.write_output(f'  Endpoint status - API: {api_status}, UI: {ui_status}')
+                    except Exception as e:
+                        lsf.write_output(f'  vCenter check error: {e}')
                 
                 elapsed = int(time.time() - start_wait)
                 remaining = VCENTER_WAIT_TIMEOUT - elapsed
@@ -122,8 +148,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                 time.sleep(VCENTER_CHECK_INTERVAL)
             
             if not vcenter_available:
-                lsf.write_output(f'WARNING: vCenter {vc_hostname} did not become available within {VCENTER_WAIT_TIMEOUT // 60} minutes')
-                lsf.write_output(f'Continuing with connection attempt anyway...')
+                lsf.labfail(f'vCenter {vc_hostname} did not become available within {VCENTER_WAIT_TIMEOUT // 60} minutes')
         
         # Now connect to all vCenters
         lsf.connect_vcenters(vcenters)
@@ -301,7 +326,7 @@ def main(lsf=None, standalone=False, dry_run=False):
             vc_urls.append(f'https://{vc}/ui/')
         
         for url in vc_urls:
-            while not lsf.test_url(url, pattern='loading-container', timeout=5):
+            while not lsf.test_url(url, expected_text='loading-container', timeout=5):
                 lsf.write_output(f'Waiting for vCenter UI: {url}')
                 lsf.labstartup_sleep(lsf.sleep_seconds)
     

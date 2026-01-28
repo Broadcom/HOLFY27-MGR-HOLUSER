@@ -400,9 +400,11 @@ def verify_passwordless_ssh(hostname: str, username: str) -> bool:
         import subprocess
         
         # Try SSH without password using the key
+        # Lab environment: disable strict host key checking to handle key changes
         result = subprocess.run(
-            ['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
-             '-o', 'ConnectTimeout=10', f'{username}@{hostname}', 'hostname'],
+            ['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no',
+             '-o', 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=10',
+             f'{username}@{hostname}', 'hostname'],
             capture_output=True,
             text=True,
             timeout=15

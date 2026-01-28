@@ -196,7 +196,7 @@ class TestCommandExecution:
         target = 'root@esx-01a.site-a.vcf.lab'
         command = 'hostname'
         
-        cmd = f'/usr/bin/sshpass -p {password} ssh -o StrictHostKeyChecking=accept-new {target} "{command}"'
+        cmd = f'/usr/bin/sshpass -p {password} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {target} "{command}"'
         
         result = mock_subprocess(cmd, shell=True)
         

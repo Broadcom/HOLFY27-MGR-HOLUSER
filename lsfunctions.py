@@ -332,9 +332,14 @@ def ssh(command, target, password=None, **kwargs):
     if password is None:
         password = get_password()
     
-    ssh_options = kwargs.get('options', 'StrictHostKeyChecking=accept-new')
+    # Lab environment: disable strict host key checking to handle key changes
+    ssh_options = kwargs.get('options', None)
+    if ssh_options:
+        options_str = f'-o {ssh_options}'
+    else:
+        options_str = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
     
-    cmd = f'{sshpass} -p {password} ssh -o {ssh_options} {target} "{command}"'
+    cmd = f'{sshpass} -p {password} ssh {options_str} {target} "{command}"'
     return run_command(cmd)
 
 def scp(source, destination, password=None, **kwargs):
@@ -349,10 +354,16 @@ def scp(source, destination, password=None, **kwargs):
     if password is None:
         password = get_password()
     
-    ssh_options = kwargs.get('options', 'StrictHostKeyChecking=accept-new')
+    # Lab environment: disable strict host key checking to handle key changes
+    ssh_options = kwargs.get('options', None)
+    if ssh_options:
+        options_str = f'-o {ssh_options}'
+    else:
+        options_str = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+    
     recursive = '-r' if kwargs.get('recursive', False) else ''
     
-    cmd = f'{sshpass} -p {password} scp {recursive} -o {ssh_options} {source} {destination}'
+    cmd = f'{sshpass} -p {password} scp {recursive} {options_str} {source} {destination}'
     return run_command(cmd)
 
 #==============================================================================
