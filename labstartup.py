@@ -75,6 +75,11 @@ def main():
     args = parse_args()
     color = 'red'
     
+    # Disable console output - write_output() handles writing to both log files directly
+    # This avoids duplicate entries since labstartup.sh redirects stdout to the log
+    # Use --verbose flag to enable console output for debugging
+    lsf.console_output = args.verbose
+    
     # Initialize lsfunctions (without router check initially)
     lsf.init(router=False)
     lsf.write_output(f'labtype is {lsf.labtype}')
@@ -120,19 +125,19 @@ def main():
     
     if dashboard:
         dashboard.update_task('prelim', 'dns', 'complete')
-        dashboard.update_task('final', 'dns_import', 'running')
+        dashboard.update_task('prelim', 'dns_import', 'running')
         dashboard.generate_html()
     
     # Run DNS record import immediately after DNS checks
     # This ensures custom FQDNs are available for URL checks in startup modules
+    # Note: tdns_import.py handles its own dashboard status updates based on result
     lsf.write_output('Checking for DNS record import...')
     dns_result = run_dns_import()
     if dns_result:
         lsf.write_output(f'DNS import result: {dns_result}')
     
-    if dashboard:
-        dashboard.update_task('final', 'dns_import', 'complete')
-        dashboard.generate_html()
+    # Note: Dashboard status for dns_import is now set by tdns_import.py itself
+    # based on success/failure/skipped status - no need to override here
     
     # Create LabType loader
     loader = LabTypeLoader(
@@ -187,9 +192,15 @@ def main():
         pass
     
     # Update dashboard - complete
-    if dashboard:
-        dashboard.set_complete()
-        dashboard.generate_html()
+    # Create a fresh dashboard instance to load the latest state from JSON
+    # (other modules like tdns_import.py have updated the state independently)
+    try:
+        from Tools.status_dashboard import StatusDashboard
+        final_dashboard = StatusDashboard(lsf.lab_sku)
+        final_dashboard.set_complete()
+        final_dashboard.generate_html()
+    except Exception:
+        pass
     
     # AutoCheck support
     if lsf.start_autocheck():

@@ -30,7 +30,7 @@ def mock_lsf():
     mock.labtype = 'HOL'
     mock.holroot = '/home/holuser/hol'
     mock.vpod_repo = '/vpodrepo/2027-labs/2705'
-    mock.mcholroot = '/lmchol/hol'
+    mock.lmcholroot = '/lmchol/hol'
     mock.mcdesktop = '/lmchol/home/holuser/Desktop'
     mock.holorouter_dir = '/tmp/holorouter'
     

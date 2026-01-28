@@ -46,6 +46,10 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output('No VVF section in config.ini - skipping VVF startup')
         return
     
+    ##=========================================================================
+    ## Core Team code - do not modify - place custom code in the CUSTOM section
+    ##=========================================================================
+    
     lsf.write_output(f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
     
     # Update status dashboard
@@ -53,6 +57,9 @@ def main(lsf=None, standalone=False, dry_run=False):
         sys.path.insert(0, '/home/holuser/hol/Tools')
         from status_dashboard import StatusDashboard, TaskStatus
         dashboard = StatusDashboard(lsf.lab_sku)
+        # Skip VCF and VCF Final groups since we're running VVF
+        dashboard.skip_group('vcf', 'VVF lab - VCF not applicable')
+        dashboard.skip_group('vcffinal', 'VVF lab - VCF Final not applicable')
         dashboard.update_task('vvf', 'mgmt_cluster', TaskStatus.RUNNING)
         dashboard.generate_html()
     except Exception:
@@ -198,16 +205,32 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if lsf.config.has_option('VVF', 'vvfnsxedges'):
         vvfnsxedges_raw = lsf.config.get('VVF', 'vvfnsxedges')
-        vvfnsxedges = [e.strip() for e in vvfnsxedges_raw.split('\n') if e.strip()]
+        vvfnsxedges = [e.strip() for e in vvfnsxedges_raw.split('\n') if e.strip() and not e.strip().startswith('#')]
         
         if vvfnsxedges:
             lsf.write_vpodprogress('VVF NSX Edges start', 'GOOD-3')
             lsf.write_output('Starting VVF NSX Edges...')
             
             if not dry_run:
-                lsf.start_nested(vvfnsxedges)
-                lsf.write_output('Waiting 5 minutes for NSX Edges to start...')
-                lsf.labstartup_sleep(300)
+                # Check if any NSX Edge VMs need to be started
+                edges_need_start = False
+                for entry in vvfnsxedges:
+                    parts = entry.split(':')
+                    edge_name = parts[0].strip()
+                    vms = lsf.get_vm_by_name(edge_name)
+                    for vm in vms:
+                        if vm.runtime.powerState != 'poweredOn':
+                            edges_need_start = True
+                            break
+                    if edges_need_start:
+                        break
+                
+                if edges_need_start:
+                    lsf.start_nested(vvfnsxedges)
+                    lsf.write_output('Waiting 5 minutes for NSX Edges to start...')
+                    lsf.labstartup_sleep(300)
+                else:
+                    lsf.write_output('All NSX Edge VMs already powered on, skipping wait')
             else:
                 lsf.write_output(f'Would start NSX Edges: {vvfnsxedges}')
     
@@ -248,6 +271,21 @@ def main(lsf=None, standalone=False, dry_run=False):
                 connect.Disconnect(si)
             except Exception:
                 pass
+    
+    ##=========================================================================
+    ## End Core Team code
+    ##=========================================================================
+    
+    ##=========================================================================
+    ## CUSTOM - Insert your code here using the file in your vPod_repo
+    ##=========================================================================
+    
+    # Example: Add custom VVF configuration or checks here
+    # See prelim.py for detailed examples of common operations
+    
+    ##=========================================================================
+    ## End CUSTOM section
+    ##=========================================================================
     
     lsf.write_vpodprogress('VVF Finished', 'GOOD-3')
     lsf.write_output(f'{MODULE_NAME} completed')

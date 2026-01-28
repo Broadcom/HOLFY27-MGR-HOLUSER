@@ -177,20 +177,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         if not standalone:
             lsf.init(router=False)
     
-    # Check if Odyssey is enabled
-    odyssey_enabled = getattr(lsf, 'odyssey', False)
-    if not odyssey_enabled:
-        lsf.write_output('Odyssey not enabled in config.ini')
-        return
-    
-    # Skip during labcheck
-    if lsf.labcheck:
-        lsf.write_output('Labcheck active - skipping Odyssey install')
-        return
-    
-    lsf.write_output(f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
-    
-    # Update status dashboard
+    # Initialize dashboard early so we can update it for skip cases
     dashboard = None
     TaskStatus = None
     try:
@@ -198,10 +185,36 @@ def main(lsf=None, standalone=False, dry_run=False):
         from status_dashboard import StatusDashboard, TaskStatus as TS
         TaskStatus = TS
         dashboard = StatusDashboard(lsf.lab_sku)
-        dashboard.update_task('odyssey', 'install', TaskStatus.RUNNING)
-        dashboard.generate_html()
     except Exception:
         pass
+    
+    # Check if Odyssey is enabled
+    odyssey_enabled = getattr(lsf, 'odyssey', False)
+    if not odyssey_enabled:
+        lsf.write_output('Odyssey not enabled in config.ini - skipping')
+        if dashboard and TaskStatus:
+            dashboard.update_task('odyssey', 'install', TaskStatus.SKIPPED, 'Not enabled in config')
+            dashboard.generate_html()
+        return
+    
+    # Skip during labcheck
+    if lsf.labcheck:
+        lsf.write_output('Labcheck active - skipping Odyssey install')
+        if dashboard and TaskStatus:
+            dashboard.update_task('odyssey', 'install', TaskStatus.SKIPPED, 'Labcheck mode')
+            dashboard.generate_html()
+        return
+    
+    ##=========================================================================
+    ## Core Team code - do not modify - place custom code in the CUSTOM section
+    ##=========================================================================
+    
+    lsf.write_output(f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
+    
+    # Update status dashboard - running
+    if dashboard and TaskStatus:
+        dashboard.update_task('odyssey', 'install', TaskStatus.RUNNING)
+        dashboard.generate_html()
     
     lsf.write_vpodprogress('Odyssey Install', 'GOOD-8')
     
@@ -210,7 +223,10 @@ def main(lsf=None, standalone=False, dry_run=False):
     #==========================================================================
     
     if not lsf.LMC:
-        lsf.write_output('Odyssey only supported on Linux Main Console')
+        lsf.write_output('Odyssey only supported on Linux Main Console - skipping')
+        if dashboard and TaskStatus:
+            dashboard.update_task('odyssey', 'install', TaskStatus.SKIPPED, 'Not Linux Main Console')
+            dashboard.generate_html()
         return
     
     mc = lsf.mc
@@ -278,6 +294,21 @@ def main(lsf=None, standalone=False, dry_run=False):
         if dashboard and TaskStatus:
             dashboard.update_task('odyssey', 'install', TaskStatus.FAILED, 'Shortcut not created')
             dashboard.generate_html()
+    
+    ##=========================================================================
+    ## End Core Team code
+    ##=========================================================================
+    
+    ##=========================================================================
+    ## CUSTOM - Insert your code here using the file in your vPod_repo
+    ##=========================================================================
+    
+    # Example: Add custom Odyssey configuration here
+    # See prelim.py for detailed examples of common operations
+    
+    ##=========================================================================
+    ## End CUSTOM section
+    ##=========================================================================
     
     lsf.write_output(f'{MODULE_NAME} completed')
 

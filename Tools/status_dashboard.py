@@ -88,34 +88,53 @@ class StatusDashboard:
         TaskStatus.SKIPPED: ('⏭️', '#8b5cf6', 'Skipped - Not required')
     }
     
-    def __init__(self, lab_sku: str):
+    def __init__(self, lab_sku: str, load_state: bool = True):
         self.lab_sku = lab_sku
         self.start_time = datetime.datetime.now()
         self.groups: Dict[str, TaskGroup] = {}
         self.failed = False
         self.failure_reason = ""
         self._init_default_groups()
+        
+        # Try to load existing state to preserve progress across module calls
+        if load_state:
+            self._load_state()
     
     def _init_default_groups(self):
         """Initialize default task groups based on startup sequence"""
         default_groups = [
             ('prelim', 'Preliminary Checks', [
                 ('dns', 'DNS Health Checks', 'Verify DNS resolution for all sites'),
+                ('dns_import', 'DNS Record Import', 'Import custom DNS records'),
                 ('readme', 'README Sync', 'Synchronize README to console'),
                 ('firewall', 'Firewall Verification', 'Confirm firewall is active'),
                 ('odyssey_cleanup', 'Odyssey Cleanup', 'Remove existing Odyssey files')
             ]),
-            ('infrastructure', 'Infrastructure Startup', [
-                ('esxi', 'ESXi Hosts', 'Verify nested ESXi hosts are responding'),
-                ('vcf', 'VCF Components', 'Start VCF management components'),
-                ('nsx', 'NSX Managers', 'Start and verify NSX managers'),
-                ('vcenter', 'vCenter Servers', 'Start and connect vCenter servers')
+            ('esxi', 'ESXi Hosts', [
+                ('host_check', 'Host Verification', 'Verify nested ESXi hosts are responding')
+            ]),
+            ('vcf', 'VCF Startup', [
+                ('mgmt_cluster', 'Management Cluster', 'Connect to VCF management cluster hosts'),
+                ('datastore', 'Datastore Verification', 'Verify VCF management datastore'),
+                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager'),
+                ('nsx_edges', 'NSX Edge VMs', 'Start NSX Edge virtual machines'),
+                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server')
+            ]),
+            ('vvf', 'VVF Startup', [
+                ('mgmt_cluster', 'Management Cluster', 'Connect to VVF management cluster hosts'),
+                ('datastore', 'Datastore Verification', 'Verify VVF management datastore'),
+                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager'),
+                ('nsx_edges', 'NSX Edge VMs', 'Start NSX Edge virtual machines'),
+                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server')
             ]),
             ('vsphere', 'vSphere Configuration', [
+                ('vcenter_connect', 'vCenter Connection', 'Connect to vCenter servers'),
                 ('datastores', 'Datastore Verification', 'Verify all datastores are accessible'),
                 ('maintenance', 'Maintenance Mode', 'Exit hosts from maintenance mode'),
                 ('vcls', 'vCLS Verification', 'Verify vCLS VMs are running'),
                 ('drs', 'DRS Configuration', 'Configure DRS settings'),
+                ('shell_warning', 'Shell Warning', 'Suppress ESXi shell warnings'),
+                ('vcenter_ready', 'vCenter Ready', 'Wait for vCenter to be ready'),
                 ('nested_vms', 'Nested VMs', 'Power on nested virtual machines')
             ]),
             ('services', 'Service Verification', [
@@ -123,16 +142,21 @@ class StatusDashboard:
                 ('tcp_ports', 'TCP Port Checks', 'Verify service ports are responding'),
                 ('linux_services', 'Linux Services', 'Start and verify Linux services')
             ]),
-            ('tanzu', 'Tanzu & Automation', [
-                ('supervisor', 'Supervisor VMs', 'Start Supervisor Control Plane VMs'),
+            ('kubernetes', 'Kubernetes', [
+                ('cert_check', 'Certificate Renewal', 'Check and renew Kubernetes certificates')
+            ]),
+            ('vcffinal', 'VCF Final', [
+                ('tanzu_control', 'Tanzu Control Plane', 'Start Tanzu Supervisor control plane VMs'),
                 ('tanzu_deploy', 'Tanzu Deployment', 'Deploy Tanzu components'),
-                ('aria', 'Aria Automation', 'Start and verify Aria Automation')
+                ('aria_vms', 'Aria VMs', 'Start Aria Automation virtual machines'),
+                ('aria_urls', 'Aria URLs', 'Verify Aria Automation URLs')
+            ]),
+            ('odyssey', 'Odyssey', [
+                ('install', 'Odyssey Installation', 'Install Odyssey client if enabled')
             ]),
             ('final', 'Final Checks', [
                 ('url_checks', 'URL Verification', 'Verify all web interfaces'),
-                ('dns_import', 'DNS Record Import', 'Import custom DNS records'),
-                ('custom', 'Custom Checks', 'Lab-specific final checks'),
-                ('odyssey', 'Odyssey Installation', 'Install Odyssey client if enabled')
+                ('custom', 'Custom Checks', 'Lab-specific final checks')
             ])
         ]
         
@@ -143,19 +167,24 @@ class StatusDashboard:
             ]
             self.groups[group_id] = TaskGroup(id=group_id, name=group_name, tasks=task_list)
     
-    def update_task(self, group_id: str, task_id: str, status: str, message: str = ""):
+    def update_task(self, group_id: str, task_id: str, status, message: str = ""):
         """
         Update a specific task status
         
         :param group_id: Group identifier
         :param task_id: Task identifier (without group prefix)
-        :param status: Status string (pending, running, complete, failed, skipped)
+        :param status: Status string (pending, running, complete, failed, skipped) or TaskStatus enum
         :param message: Optional status message
         """
         if group_id not in self.groups:
             return
         
-        status_enum = TaskStatus(status.lower())
+        # Handle both string and TaskStatus enum
+        if isinstance(status, TaskStatus):
+            status_enum = status
+        else:
+            status_enum = TaskStatus(status.lower())
+        
         full_task_id = f'{group_id}_{task_id}'
         
         for task in self.groups[group_id].tasks:
@@ -178,13 +207,67 @@ class StatusDashboard:
         self.failure_reason = reason
         self.generate_html()
     
+    def skip_group(self, group_id: str, message: str = "Not applicable"):
+        """
+        Skip all tasks in a group.
+        
+        Use this to mark an entire group as skipped when it doesn't apply
+        to the current lab type (e.g., skip VVF when running VCF).
+        
+        :param group_id: Group identifier to skip
+        :param message: Optional message explaining why skipped
+        """
+        if group_id not in self.groups:
+            return
+        
+        for task in self.groups[group_id].tasks:
+            if task.status == TaskStatus.PENDING:
+                task.status = TaskStatus.SKIPPED
+                task.message = message
+        
+        self._save_state()
+        self.generate_html()
+    
     def set_complete(self):
         """Mark the entire startup as complete"""
         for group in self.groups.values():
             for task in group.tasks:
                 if task.status == TaskStatus.PENDING:
                     task.status = TaskStatus.SKIPPED
+        self._save_state()
         self.generate_html()
+    
+    def _load_state(self):
+        """Load state from JSON file if it exists and matches current lab_sku"""
+        try:
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, 'r') as f:
+                    state = json.load(f)
+                
+                # Only load state if it's for the same lab SKU
+                if state.get('lab_sku') == self.lab_sku:
+                    # Restore start time
+                    if 'start_time' in state:
+                        self.start_time = datetime.datetime.fromisoformat(state['start_time'])
+                    
+                    # Restore failure state
+                    self.failed = state.get('failed', False)
+                    self.failure_reason = state.get('failure_reason', '')
+                    
+                    # Restore task statuses
+                    if 'groups' in state:
+                        for gid, group_state in state['groups'].items():
+                            if gid in self.groups:
+                                for task_state in group_state.get('tasks', []):
+                                    task_id = task_state.get('id', '')
+                                    for task in self.groups[gid].tasks:
+                                        if task.id == task_id:
+                                            task.status = TaskStatus(task_state.get('status', 'pending'))
+                                            task.message = task_state.get('message', '')
+                                            break
+        except Exception:
+            # If loading fails, continue with fresh state
+            pass
     
     def _save_state(self):
         """Save current state to JSON file"""
@@ -249,8 +332,24 @@ class StatusDashboard:
             overall_status = "READY"
             status_color = "#22c55e"
         else:
-            overall_status = "STARTING"
-            status_color = "#3b82f6"
+            # Check if any task is currently running or has completed
+            has_running = any(
+                t.status == TaskStatus.RUNNING 
+                for g in self.groups.values() 
+                for t in g.tasks
+            )
+            has_completed = any(
+                t.status in [TaskStatus.COMPLETE, TaskStatus.FAILED, TaskStatus.SKIPPED]
+                for g in self.groups.values() 
+                for t in g.tasks
+            )
+            
+            if has_running or has_completed:
+                overall_status = "RUNNING"
+                status_color = "#f59e0b"  # Amber/orange for running
+            else:
+                overall_status = "STARTING"
+                status_color = "#3b82f6"
         
         html = f'''<!DOCTYPE html>
 <html lang="en">
@@ -561,6 +660,7 @@ class StatusDashboard:
             group_class = ""
             group_status_icon = "🔄"
             is_complete = group.status == TaskStatus.COMPLETE
+            is_skipped = group.status == TaskStatus.SKIPPED
             
             if group.status == TaskStatus.COMPLETE:
                 group_class = "complete"
@@ -571,12 +671,15 @@ class StatusDashboard:
             elif group.status == TaskStatus.RUNNING:
                 group_class = "running"
                 group_status_icon = "🔄"
+            elif group.status == TaskStatus.SKIPPED:
+                group_class = "complete"  # Use complete style (collapsed, muted)
+                group_status_icon = "⏭️"
             else:
                 group_status_icon = "⏳"
             
-            # Complete groups are collapsed by default
-            tasks_class = "collapsed" if is_complete else "expanded"
-            toggle_class = "collapsed" if is_complete else ""
+            # Complete and skipped groups are collapsed by default
+            tasks_class = "collapsed" if (is_complete or is_skipped) else "expanded"
+            toggle_class = "collapsed" if (is_complete or is_skipped) else ""
             
             html += f'''
             <div class="task-group {group_class}">
@@ -671,6 +774,106 @@ class StatusDashboard:
 
 
 #==============================================================================
+# INITIALIZATION FUNCTIONS
+#==============================================================================
+
+def init_dashboard(lab_sku: str = "INITIALIZING") -> 'StatusDashboard':
+    """
+    Initialize/reset the dashboard to a clean state.
+    Clears previous lab run information and creates a fresh dashboard.
+    
+    :param lab_sku: The lab SKU to display (default: "INITIALIZING")
+    """
+    # Remove existing state file
+    try:
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+    except Exception:
+        pass
+    
+    # Create a fresh dashboard
+    dashboard = StatusDashboard(lab_sku)
+    dashboard.generate_html()
+    
+    return dashboard
+
+
+def clear_dashboard() -> None:
+    """
+    Clear the dashboard completely, removing both the HTML and state files.
+    Creates an empty/minimal HTML file to indicate waiting state.
+    """
+    # Remove existing files
+    try:
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+    except Exception:
+        pass
+    
+    # Write a minimal "waiting" page
+    waiting_html = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="10">
+    <title>Lab Startup - Initializing</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: #0f172a;
+            color: #f8fafc;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+        }
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 1rem;
+            color: #3b82f6;
+        }
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid #334155;
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 2rem auto;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        p {
+            color: #94a3b8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Lab Startup Initializing</h1>
+        <div class="spinner"></div>
+        <p>Waiting for lab startup to begin...</p>
+        <p style="font-size: 0.8rem;">Auto-refreshing every 10 seconds</p>
+    </div>
+</body>
+</html>
+'''
+    
+    try:
+        os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+        with open(STATUS_FILE, 'w') as f:
+            f.write(waiting_html)
+    except Exception as e:
+        print(f'Error clearing dashboard: {e}')
+
+
+#==============================================================================
 # STANDALONE EXECUTION
 #==============================================================================
 
@@ -680,17 +883,30 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='HOLFY27 Status Dashboard')
     parser.add_argument('--sku', default='HOL-2701', help='Lab SKU')
     parser.add_argument('--demo', action='store_true', help='Generate demo dashboard')
+    parser.add_argument('--init', action='store_true', 
+                        help='Initialize/reset dashboard to clean state')
+    parser.add_argument('--clear', action='store_true',
+                        help='Clear dashboard completely (minimal waiting page)')
     
     args = parser.parse_args()
     
-    dashboard = StatusDashboard(args.sku)
-    
-    if args.demo:
-        # Simulate some progress
-        dashboard.update_task('prelim', 'dns', 'complete')
-        dashboard.update_task('prelim', 'readme', 'complete')
-        dashboard.update_task('prelim', 'firewall', 'running', 'Checking firewall status...')
-        dashboard.update_task('infrastructure', 'esxi', 'running')
-    
-    dashboard.generate_html()
-    print(f'Dashboard generated at: {STATUS_FILE}')
+    if args.clear:
+        # Clear completely - show waiting page
+        clear_dashboard()
+        print(f'Dashboard cleared at: {STATUS_FILE}')
+    elif args.init:
+        # Initialize with fresh state
+        dashboard = init_dashboard(args.sku)
+        print(f'Dashboard initialized for {args.sku} at: {STATUS_FILE}')
+    else:
+        dashboard = StatusDashboard(args.sku)
+        
+        if args.demo:
+            # Simulate some progress
+            dashboard.update_task('prelim', 'dns', 'complete')
+            dashboard.update_task('prelim', 'readme', 'complete')
+            dashboard.update_task('prelim', 'firewall', 'running', 'Checking firewall status...')
+            dashboard.update_task('infrastructure', 'esxi', 'running')
+        
+        dashboard.generate_html()
+        print(f'Dashboard generated at: {STATUS_FILE}')

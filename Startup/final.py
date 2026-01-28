@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# final.py - HOLFY27 Core Final Tasks Module
+# final.py - HOLFY27 Core Final Lab Checks
 # Version 3.0 - January 2026
 # Author - Burke Azbill and HOL Core Team
 # Final lab startup checks and cleanup
@@ -7,10 +7,17 @@
 import os
 import sys
 import argparse
-import datetime
+import logging
+import urllib3
+
+# Suppress SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Add hol directory to path
 sys.path.insert(0, '/home/holuser/hol')
+
+# Default logging level
+logging.basicConfig(level=logging.WARNING)
 
 #==============================================================================
 # MODULE CONFIGURATION
@@ -27,7 +34,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     """
     Main entry point for final module
     
-    :param lsf: lsfunctions module
+    :param lsf: lsfunctions module (will be imported if None)
     :param standalone: Whether running in standalone test mode
     :param dry_run: Whether to skip actual changes
     """
@@ -36,114 +43,152 @@ def main(lsf=None, standalone=False, dry_run=False):
         if not standalone:
             lsf.init(router=False)
     
+    ##=========================================================================
+    ## Core Team code - do not modify - place custom code in the CUSTOM section
+    ##=========================================================================
+    
     lsf.write_output(f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
     
     # Update status dashboard
     try:
+        sys.path.insert(0, '/home/holuser/hol/Tools')
         from status_dashboard import StatusDashboard, TaskStatus
         dashboard = StatusDashboard(lsf.lab_sku)
-        dashboard.update_task('final', 'custom', 'running')
+        dashboard.update_task('final', 'custom', TaskStatus.RUNNING)
         dashboard.generate_html()
     except Exception:
         dashboard = None
     
     #==========================================================================
-    # TASK 1: Run Lab-Specific Final Script
+    # TASK 1: Check for lab-specific final script
     #==========================================================================
     
     lsf.write_output('Checking for lab-specific final script...')
     
-    final_scripts = [
-        f'{lsf.vpod_repo}/scripts/final.sh',
-        f'{lsf.vpod_repo}/final.sh'
-    ]
+    # Check for final script in vPod repo
+    repo_final = os.path.join(lsf.vpod_repo, 'final_custom.py')
+    if os.path.exists(repo_final):
+        lsf.write_output(f'Running custom final script: {repo_final}')
+        if not dry_run:
+            try:
+                # Import and run the custom script
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("final_custom", repo_final)
+                custom_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(custom_module)
+                if hasattr(custom_module, 'main'):
+                    custom_module.main(lsf)
+            except Exception as e:
+                lsf.write_output(f'Error running custom final script: {e}')
+    
+    #==========================================================================
+    # TASK 2: Final Verification (Pings and URLs)
+    #==========================================================================
     
     if not dry_run:
-        for script in final_scripts:
-            if os.path.isfile(script):
-                lsf.write_output(f'Running final script: {script}')
-                result = lsf.run_command(f'/bin/bash {script}')
-                if result.returncode != 0:
-                    lsf.write_output(f'Final script returned: {result.returncode}')
-                break
-    
-    #==========================================================================
-    # TASK 2: Verify All Resources Are Accessible
-    #==========================================================================
-    
-    lsf.write_output('Running final resource verification...')
-    
-    # Re-check critical pings
-    if lsf.config.has_option('RESOURCES', 'Pings'):
-        pings = lsf.config.get('RESOURCES', 'Pings').split(',')
-        for ping in pings:
-            ping = ping.strip()
-            if ping and not dry_run:
-                if lsf.test_ping(ping):
-                    lsf.write_output(f'Final ping OK: {ping}')
-                else:
-                    lsf.write_output(f'Final ping FAIL: {ping}')
-    
-    # Re-check critical URLs
-    if lsf.config.has_option('RESOURCES', 'URLs'):
-        urls = lsf.config.get('RESOURCES', 'URLs').split(',')
-        for url in urls:
-            url = url.strip()
-            if url and not dry_run:
-                # Handle url:expected_text format
-                if ':' in url and not url.startswith('http'):
-                    url_parts = url.split(':', 1)
-                    url = url_parts[0]
-                    expected = url_parts[1] if len(url_parts) > 1 else None
-                else:
-                    expected = None
-                
-                if lsf.test_url(url, expected_text=expected, verify_ssl=False):
-                    lsf.write_output(f'Final URL OK: {url}')
-                else:
-                    lsf.write_output(f'Final URL FAIL: {url}')
-    
-    #==========================================================================
-    # TASK 3: Write Ready Time
-    #==========================================================================
-    
-    lsf.write_output('Recording ready time...')
-    
-    if not dry_run:
-        delta = datetime.datetime.now() - lsf.start_time
-        run_mins = "{0:.2f}".format(delta.seconds / 60)
+        lsf.write_output('Running final resource verification...')
         
+        # Check Pings one last time
+        if lsf.config.has_option('RESOURCES', 'Pings'):
+            pings_raw = lsf.config.get('RESOURCES', 'Pings')
+            if '\n' in pings_raw:
+                pings = [p.strip() for p in pings_raw.split('\n') if p.strip()]
+            else:
+                pings = [p.strip() for p in pings_raw.split(',') if p.strip()]
+            
+            for host in pings:
+                if lsf.test_ping(host, count=1, timeout=2):
+                    # Quiet success
+                    pass
+                else:
+                    lsf.write_output(f'Final ping FAIL: {host}')
+        
+        # Check URLs one last time
+        if lsf.config.has_option('RESOURCES', 'URLS'):
+            urls_raw = lsf.config.get('RESOURCES', 'URLS')
+            url_targets = []
+            
+            # Parse properly like in urls.py
+            for line in urls_raw.split('\n'):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                url_targets.append(line)
+            
+            for url_spec in url_targets:
+                if ',' in url_spec:
+                    parts = url_spec.split(',', 1)
+                    url = parts[0].strip()
+                    expected_text = parts[1].strip() if len(parts) > 1 else None
+                else:
+                    url = url_spec.strip()
+                    expected_text = None
+                
+                if url:
+                    # Quick check, 5 second timeout, ignore SSL
+                    if lsf.test_url(url, expected_text=expected_text, verify_ssl=False, timeout=5):
+                        lsf.write_output(f'Final URL OK: {url}')
+                    else:
+                        lsf.write_output(f'Final URL FAIL: {url}')
+                        if expected_text:
+                             lsf.write_output(f'  Expected: {expected_text}')
+
+    #==========================================================================
+    # TASK 3: Lab Ready Recording
+    #==========================================================================
+    
+    if not dry_run:
+        lsf.write_output('Recording ready time...')
         try:
+            # Calculate total runtime
+            import datetime
+            now = datetime.datetime.now()
+            runtime = now - lsf.start_time
+            minutes = runtime.total_seconds() / 60
+            
+            lsf.write_output(f'Lab ready after {minutes:.2f} minutes')
+            
+            # Write ready time to file
             with open(lsf.ready_time_file, 'w') as f:
-                f.write(f'{run_mins} minutes')
-            lsf.write_output(f'Lab ready after {run_mins} minutes')
+                f.write(f'{minutes:.2f}\n')
+                
         except Exception as e:
-            lsf.write_output(f'Could not write ready time: {e}')
+            lsf.write_output(f'Error recording ready time: {e}')
     
     #==========================================================================
-    # TASK 4: Signal Router Ready
+    # TASK 4: Signal Router
     #==========================================================================
     
     lsf.write_output('Signaling router that lab is ready...')
-    
     if not dry_run:
-        lsf.signal_router_ready()
-    
-    #==========================================================================
-    # TASK 5: Update Dashboard
-    #==========================================================================
+        lsf.signal_router('ready')
     
     if dashboard:
-        dashboard.update_task('final', 'custom', 'complete')
-        dashboard.set_complete()
+        dashboard.update_task('final', 'custom', TaskStatus.COMPLETE)
         dashboard.generate_html()
     
-    #==========================================================================
-    # COMPLETE
-    #==========================================================================
+    ##=========================================================================
+    ## End Core Team code
+    ##=========================================================================
+    
+    ##=========================================================================
+    ## CUSTOM - Insert your code here using the file in your vPod_repo
+    ##=========================================================================
+    
+    # Example: Add custom final checks here
+    
+    ##=========================================================================
+    ## End CUSTOM section
+    ##=========================================================================
     
     lsf.write_output(f'{MODULE_NAME} completed successfully')
-    lsf.write_vpodprogress('Ready', 'READY', color='green')
+    
+    # Update desktop background if needed
+    if not dry_run:
+        try:
+            lsf.update_desktop_config('Ready')
+        except:
+            pass
 
 
 #==============================================================================
@@ -158,6 +203,10 @@ if __name__ == '__main__':
                         help='Show what would be done without making changes')
     parser.add_argument('--skip-init', action='store_true',
                         help='Skip lsf.init() call')
+    parser.add_argument('run_seconds', nargs='?', type=int, default=0,
+                        help='Seconds already elapsed (for labstartup integration)')
+    parser.add_argument('labcheck', nargs='?', default='False',
+                        help='Whether this is a labcheck run')
     
     args = parser.parse_args()
     
@@ -166,9 +215,18 @@ if __name__ == '__main__':
     if not args.skip_init:
         lsf.init(router=False)
     
-    print(f'Running {MODULE_NAME} in standalone mode')
-    print(f'Lab SKU: {lsf.lab_sku}')
-    print(f'Dry run: {args.dry_run}')
-    print()
+    # Handle legacy arguments
+    if args.run_seconds > 0:
+        import datetime
+        lsf.start_time = datetime.datetime.now() - datetime.timedelta(seconds=args.run_seconds)
     
-    main(lsf=lsf, standalone=True, dry_run=args.dry_run)
+    if args.labcheck == 'True':
+        lsf.labcheck = True
+    
+    if args.standalone:
+        print(f'Running {MODULE_NAME} in standalone mode')
+        print(f'Lab SKU: {lsf.lab_sku}')
+        print(f'Dry run: {args.dry_run}')
+        print()
+    
+    main(lsf=lsf, standalone=args.standalone, dry_run=args.dry_run)

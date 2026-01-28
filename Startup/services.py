@@ -39,6 +39,10 @@ def main(lsf=None, standalone=False, dry_run=False):
         if not standalone:
             lsf.init(router=False)
     
+    ##=========================================================================
+    ## Core Team code - do not modify - place custom code in the CUSTOM section
+    ##=========================================================================
+    
     lsf.write_output(f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
     
     # Update status dashboard
@@ -136,7 +140,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                 continue
             
             host = parts[0].strip()
-            port = parts[1].strip()
+            port = int(parts[1].strip())
             
             while not lsf.test_tcp_port(host, port):
                 lsf.write_output(f'Waiting for {host}:{port}...')
@@ -149,6 +153,21 @@ def main(lsf=None, standalone=False, dry_run=False):
     if dashboard:
         dashboard.update_task('services', 'tcp_ports', TaskStatus.COMPLETE)
         dashboard.generate_html()
+    
+    ##=========================================================================
+    ## End Core Team code
+    ##=========================================================================
+    
+    ##=========================================================================
+    ## CUSTOM - Insert your code here using the file in your vPod_repo
+    ##=========================================================================
+    
+    # Example: Add custom service management or checks here
+    # See prelim.py for detailed examples of common operations
+    
+    ##=========================================================================
+    ## End CUSTOM section
+    ##=========================================================================
     
     lsf.write_output(f'{MODULE_NAME} completed')
 

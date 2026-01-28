@@ -20,6 +20,7 @@ class LabTypeLoader:
     """
     
     # Define startup sequences for each lab type
+    # Keys are UPPERCASE to match the normalization in __init__
     STARTUP_SEQUENCE: Dict[str, List[str]] = {
         'HOL': [
             'prelim',
@@ -35,7 +36,7 @@ class LabTypeLoader:
             'final',
             'odyssey'
         ],
-        'Discovery': [
+        'DISCOVERY': [
             'prelim',
             'ESXi',
             'VCF',
@@ -93,37 +94,44 @@ class LabTypeLoader:
         ]
     }
     
-    # Lab type descriptions
+    # Lab type descriptions and configuration
+    # Keys are UPPERCASE to match the normalization in __init__
+    # repo_pattern: 'standard' = PREFIX-XXYY (year-based), 'named' = PREFIX-Name (no year extraction)
     LABTYPE_INFO: Dict[str, Dict[str, Any]] = {
         'HOL': {
             'name': 'Hands-on Labs',
             'description': 'Full production labs with firewall, proxy filtering',
             'firewall': True,
-            'proxy_filter': True
+            'proxy_filter': True,
+            'repo_pattern': 'standard'
         },
-        'Discovery': {
+        'DISCOVERY': {
             'name': 'Discovery Labs',
             'description': 'Simplified labs, no firewall restrictions',
             'firewall': False,
-            'proxy_filter': False
+            'proxy_filter': False,
+            'repo_pattern': 'named'
         },
         'VXP': {
             'name': 'VCF Experience Program',
             'description': 'Demo environments for VCF Experience',
             'firewall': True,
-            'proxy_filter': True
+            'proxy_filter': True,
+            'repo_pattern': 'standard'
         },
         'ATE': {
             'name': 'Advanced Technical Enablement',
             'description': 'Advanced instructor-led Livefire labs',
             'firewall': True,
-            'proxy_filter': False
+            'proxy_filter': False,
+            'repo_pattern': 'standard'
         },
         'EDU': {
             'name': 'Education',
             'description': 'Training environments',
             'firewall': True,
-            'proxy_filter': True
+            'proxy_filter': True,
+            'repo_pattern': 'standard'
         }
     }
     
@@ -155,6 +163,16 @@ class LabTypeLoader:
     def requires_proxy_filter(self) -> bool:
         """Check if this lab type requires proxy filtering"""
         return self.get_labtype_info().get('proxy_filter', True)
+    
+    def get_repo_pattern(self) -> str:
+        """
+        Get the repository naming pattern for this lab type.
+        
+        Returns:
+            'standard': PREFIX-XXYY format (year-based, e.g., HOL-2701, ATE-2705)
+            'named': PREFIX-Name format (no year extraction, e.g., Discovery-Demo)
+        """
+        return self.get_labtype_info().get('repo_pattern', 'standard')
     
     def get_module_path(self, module_name: str) -> Optional[str]:
         """
@@ -215,10 +233,14 @@ class LabTypeLoader:
         Execute the complete startup sequence for the labtype
         
         :param lsf: lsfunctions module reference
+        :raises Exception: If a critical module fails
         """
         sequence = self.get_startup_sequence()
         
         lsf.write_output(f'Starting {self.labtype} startup sequence: {sequence}')
+        
+        # Define which modules are critical (failure should stop the sequence)
+        critical_modules = ['prelim', 'ESXi', 'VCF', 'VCFfinal']
         
         for module_name in sequence:
             module_path = self.get_module_path(module_name)
@@ -227,11 +249,18 @@ class LabTypeLoader:
                 lsf.write_output(f'Running {module_name} from {module_path}')
                 
                 try:
-                    lsf.startup(module_name)
+                    result = lsf.startup(module_name)
+                    
+                    # Check if module reported failure
+                    if result is False:
+                        lsf.write_output(f'Module {module_name} returned failure status')
+                        if module_name in critical_modules:
+                            raise RuntimeError(f'Critical module {module_name} failed')
+                        
                 except Exception as e:
                     lsf.write_output(f'Module {module_name} failed: {e}')
                     # Continue with next module unless it's a critical failure
-                    if module_name in ['prelim', 'ESXi']:
+                    if module_name in critical_modules:
                         raise
             else:
                 lsf.write_output(f'Skipping {module_name} - not found')

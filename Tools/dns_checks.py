@@ -227,6 +227,7 @@ def run_single_check(check_name: str) -> bool:
 
 def main():
     """Main entry point for standalone execution"""
+    global DNS_SERVER
     import argparse
     
     parser = argparse.ArgumentParser(description='HOLFY27 DNS Health Checks')
@@ -242,7 +243,6 @@ def main():
     args = parser.parse_args()
     
     # Override DNS server if specified
-    global DNS_SERVER
     DNS_SERVER = args.dns_server
     
     if args.check == 'all':

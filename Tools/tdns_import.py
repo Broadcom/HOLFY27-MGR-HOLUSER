@@ -172,41 +172,86 @@ def find_dns_records_file() -> Optional[str]:
     return None
 
 
-def tdns_login() -> bool:
+def tdns_show_config():
+    """
+    Show tdns-mgr configuration for debugging
+    Logs the output of 'tdns-mgr config' to help diagnose connection issues
+    """
+    write_output('Checking tdns-mgr configuration...')
+    
+    try:
+        result = subprocess.run(
+            [TDNS_MGR_PATH, 'config'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            write_output(f'tdns-mgr config: {result.stdout.strip()}')
+        elif result.stderr.strip():
+            write_output(f'tdns-mgr config error: {result.stderr.strip()}')
+        else:
+            write_output('tdns-mgr config returned no output')
+            
+    except subprocess.TimeoutExpired:
+        write_output('tdns-mgr config timed out')
+    except Exception as e:
+        write_output(f'tdns-mgr config error: {e}')
+
+
+def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
     """
     Login to tdns-mgr using password from creds.txt
+    Retries up to max_retries times with retry_delay seconds between attempts
     
+    :param max_retries: Maximum number of login attempts (default: 10)
+    :param retry_delay: Seconds to wait between retries (default: 15)
     :return: True if login successful
     """
+    import time
+    
+    # Show config before login attempt for debugging
+    tdns_show_config()
+    
     password = get_password()
     
     if not password:
         write_output('ERROR: No password available for tdns-mgr login')
         return False
     
-    write_output('Logging into tdns-mgr...')
-    
-    try:
-        result = subprocess.run(
-            [TDNS_MGR_PATH, 'login', '-p', password],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+    for attempt in range(1, max_retries + 1):
+        write_output(f'Logging into tdns-mgr (attempt {attempt}/{max_retries})...')
         
-        if result.returncode == 0:
-            write_output('tdns-mgr login successful')
-            return True
-        else:
-            write_output(f'tdns-mgr login failed: {result.stderr}')
-            return False
+        try:
+            # Pipe password to tdns-mgr login via stdin (echo password | tdns-mgr login)
+            result = subprocess.run(
+                [TDNS_MGR_PATH, 'login'],
+                input=password + '\n',
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
             
-    except subprocess.TimeoutExpired:
-        write_output('tdns-mgr login timed out')
-        return False
-    except Exception as e:
-        write_output(f'tdns-mgr login error: {e}')
-        return False
+            if result.returncode == 0:
+                write_output('tdns-mgr login successful')
+                return True
+            else:
+                error_msg = result.stderr.strip() if result.stderr else result.stdout.strip() if result.stdout else 'Unknown error'
+                write_output(f'tdns-mgr login failed: {error_msg}')
+                
+        except subprocess.TimeoutExpired:
+            write_output('tdns-mgr login timed out')
+        except Exception as e:
+            write_output(f'tdns-mgr login error: {e}')
+        
+        # If not the last attempt, wait before retrying
+        if attempt < max_retries:
+            write_output(f'Waiting {retry_delay} seconds before retry...')
+            time.sleep(retry_delay)
+    
+    write_output(f'ERROR: tdns-mgr login failed after {max_retries} attempts')
+    return False
 
 
 def import_records_from_file(csv_path: str) -> Dict[str, Any]:
@@ -304,8 +349,28 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
     """
     # Check if tdns-mgr is available
     if not check_tdns_mgr_available():
-        write_output('tdns-mgr not found - skipping DNS import')
-        return None
+        write_output('ERROR: tdns-mgr not found - DNS import FAILED')
+        # Update status dashboard to show failure instead of skipped
+        try:
+            from Tools.status_dashboard import StatusDashboard
+            import lsfunctions as lsf
+            dashboard = StatusDashboard(lsf.lab_sku)
+            dashboard.update_task('prelim', 'dns_import', 'failed', 'tdns-mgr command not found')
+            dashboard.generate_html()
+        except Exception:
+            pass
+        return {'Message': 'tdns-mgr not found', 'New Records': 0, 'Errors': 1}
+    
+    # Helper function to update dashboard status
+    def update_dashboard_status(status: str, message: str = ""):
+        try:
+            from Tools.status_dashboard import StatusDashboard
+            import lsfunctions as lsf
+            dashboard = StatusDashboard(lsf.lab_sku)
+            dashboard.update_task('prelim', 'dns_import', status, message)
+            dashboard.generate_html()
+        except Exception:
+            pass
     
     # PRIORITY 1: Check config.ini for inline DNS records
     config_records = get_dns_records_from_config()
@@ -315,20 +380,40 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
         
         # Login to tdns-mgr
         if not tdns_login():
-            write_output('WARNING: Could not login to tdns-mgr - skipping DNS import')
+            write_output('ERROR: Could not login to tdns-mgr - DNS import FAILED')
+            update_dashboard_status('failed', 'Login to DNS server failed')
             return {'Message': 'Login failed', 'New Records': 0, 'Errors': 1}
         
         # Import from config values
         result = import_records_from_config(config_records)
         
-        # Log summary
+        # Log summary and update dashboard
         new_records = result.get('New Records', 0)
+        existing_records = result.get('Existing Records', 0)
         errors = result.get('Errors', 0)
+        message = result.get('Message', '')
         
-        if errors == 0:
-            write_output(f'DNS import from config.ini completed: {new_records} new records added')
+        # Check if all records already existed (this is a success, not a failure)
+        # tdns-mgr may return "already exists" messages or Existing Records count
+        records_already_exist = (
+            existing_records > 0 or 
+            'already exist' in message.lower() or
+            'exists' in message.lower()
+        )
+        
+        if errors == 0 or records_already_exist:
+            if new_records > 0:
+                write_output(f'DNS import from config.ini completed: {new_records} new records added')
+                update_dashboard_status('complete', f'{new_records} records imported')
+            elif records_already_exist:
+                write_output(f'DNS import from config.ini: all {len(config_records)} records already exist')
+                update_dashboard_status('complete', f'All records already exist')
+            else:
+                write_output(f'DNS import from config.ini completed: no new records needed')
+                update_dashboard_status('complete', 'No new records needed')
         else:
-            write_output(f'DNS import from config.ini had errors: {result.get("Message", "")}')
+            write_output(f'DNS import from config.ini had errors: {message}')
+            update_dashboard_status('failed', message or 'Import errors')
         
         return result
     
@@ -340,25 +425,45 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
         
         # Login to tdns-mgr
         if not tdns_login():
-            write_output('WARNING: Could not login to tdns-mgr - skipping DNS import')
+            write_output('ERROR: Could not login to tdns-mgr - DNS import FAILED')
+            update_dashboard_status('failed', 'Login to DNS server failed')
             return {'Message': 'Login failed', 'New Records': 0, 'Errors': 1}
         
         # Import from file
         result = import_records_from_file(csv_path)
         
-        # Log summary
+        # Log summary and update dashboard
         new_records = result.get('New Records', 0)
+        existing_records = result.get('Existing Records', 0)
         errors = result.get('Errors', 0)
+        message = result.get('Message', '')
         
-        if errors == 0:
-            write_output(f'DNS import from file completed: {new_records} new records added')
+        # Check if all records already existed (this is a success, not a failure)
+        records_already_exist = (
+            existing_records > 0 or 
+            'already exist' in message.lower() or
+            'exists' in message.lower()
+        )
+        
+        if errors == 0 or records_already_exist:
+            if new_records > 0:
+                write_output(f'DNS import from file completed: {new_records} new records added')
+                update_dashboard_status('complete', f'{new_records} records imported')
+            elif records_already_exist:
+                write_output(f'DNS import from file: all records already exist')
+                update_dashboard_status('complete', 'All records already exist')
+            else:
+                write_output(f'DNS import from file completed: no new records needed')
+                update_dashboard_status('complete', 'No new records needed')
         else:
-            write_output(f'DNS import from file had errors: {result.get("Message", "")}')
+            write_output(f'DNS import from file had errors: {message}')
+            update_dashboard_status('failed', message or 'Import errors')
         
         return result
     
     # No DNS records to import
     write_output('No DNS records configured in config.ini or new-dns-records.csv')
+    update_dashboard_status('skipped', 'No records to import')
     return None
 
 

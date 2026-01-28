@@ -53,20 +53,22 @@ router = 'router.site-a.vcf.lab'
 proxy = 'proxy.site-a.vcf.lab'
 holorouter_dir = '/tmp/holorouter'  # NFS exported directory for router communication
 
-# Write to both holroot and mcholroot from the Manager
+# Log file name
 logfile = 'labstartup.log'
 
 socket.setdefaulttimeout(300)
 
-# LMC only in HOLFY27 (WMC removed)
+# Linux Main Console (LMC) - only option in HOLFY27 (WMC removed)
 LMC = False
-lmcholroot = '/lmchol/hol'  # NFS mount from LMC
+lmcholroot = '/lmchol/hol'  # NFS mount from Linux Main Console
 mc = '/lmchol'
-mcholroot = lmcholroot
-mctemp = f'{mc}/tmp'
 mcdesktop = f'{mc}/home/holuser/Desktop'
 desktop_config = '/lmchol/home/holuser/desktop-hol/VMware.config'
-logfiles = [f'{holroot}/{logfile}', f'{mcholroot}/{logfile}']
+
+# Log files - write to both local and LMC locations
+# - /home/holuser/hol/labstartup.log (Manager local)
+# - /lmchol/hol/labstartup.log (Main Console via NFS)
+logfiles = [f'{holroot}/{logfile}', f'{lmcholroot}/{logfile}']
 red = '${color red}Lab Status'
 green = '${color green}Lab Status'
 
@@ -75,11 +77,10 @@ status_dashboard_path = '/lmchol/home/holuser/startup-status.htm'
 
 resource_file_dir = f'{holroot}/Resources'
 startup_file_dir = f'{holroot}/Startup'
-lab_status = f'{mcholroot}/startup_status.txt'
-mcversionfile = f'{mcholroot}/version.txt'
+lab_status = f'{lmcholroot}/startup_status.txt'
 versiontxt = ''
 max_minutes_before_fail = 60
-ready_time_file = f'{mcholroot}/readyTime.txt'
+ready_time_file = f'{lmcholroot}/readyTime.txt'
 start_time = datetime.datetime.now()
 vc_boot_minutes = datetime.timedelta(seconds=(10 * 60))
 vcuser = 'administrator@vsphere.local'
@@ -87,6 +88,7 @@ linuxuser = 'root'
 vsphereaccount = 'administrator@vsphere.local'
 sis = []  # all vCenter session instances
 sisvc = {}  # dictionary to hold all vCenter/ESXi session instances indexed by host name
+mm = ''  # colon-delimited list of ESXi hosts to keep in maintenance mode
 sshpass = '/usr/bin/sshpass'
 
 # VPodRepo path (set during init)
@@ -99,6 +101,9 @@ config = ConfigParser()
 # Password property
 _password = None
 
+# Console output flag (set to False when running via labstartup.sh to avoid double-logging)
+console_output = True
+
 #==============================================================================
 # INITIALIZATION
 #==============================================================================
@@ -110,19 +115,17 @@ def init(router=True, **kwargs):
     :param router: Whether to check router connectivity
     :param kwargs: Additional options
     """
-    global LMC, mc, mcholroot, mctemp, mcdesktop, desktop_config, logfiles
+    global LMC, mc, mcdesktop, desktop_config, logfiles
     global config, lab_sku, labtype, vpod_repo, max_minutes_before_fail, _password
     
-    # Wait for LMC mount
+    # Wait for LMC (Linux Main Console) mount
     while True:
         if os.path.isdir(lmcholroot):
             LMC = True
             mc = '/lmchol'
-            mcholroot = lmcholroot
-            mctemp = f'{mc}/tmp'
             mcdesktop = f'{mc}/home/holuser/Desktop'
             desktop_config = '/lmchol/home/holuser/desktop-hol/VMware.config'
-            logfiles = [f'{holroot}/{logfile}', f'{mcholroot}/{logfile}']
+            logfiles = [f'{holroot}/{logfile}', f'{lmcholroot}/{logfile}']
             break
         time.sleep(5)
     
@@ -142,11 +145,9 @@ def init(router=True, **kwargs):
         if config.has_option('VPOD', 'maxminutes'):
             max_minutes_before_fail = config.getint('VPOD', 'maxminutes')
     
-    # Calculate vpod_repo path
+    # Calculate vpod_repo path using labtype-aware function
     if lab_sku != bad_sku:
-        year = lab_sku[4:6]
-        index = lab_sku[6:8]
-        vpod_repo = f'/vpodrepo/20{year}-labs/{year}{index}'
+        _, vpod_repo, _ = get_repo_info(lab_sku, labtype)
     
     # Load password
     if os.path.isfile(creds):
@@ -193,12 +194,20 @@ def write_output(msg, **kwargs):
     Write output to log files and optionally to console
     
     :param msg: Message to write
-    :param kwargs: logfile - specific logfile path
+    :param kwargs: 
+        logfile - specific logfile path
+        console - override console output setting (True/False)
+    
+    Output is written to:
+    - /home/holuser/hol/labstartup.log (Manager)
+    - /lmchol/hol/labstartup.log (Main Console via NFS)
+    - Console (if console_output is True or console kwarg is True)
     """
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     formatted_msg = f'[{timestamp}] {msg}'
     
     lfile = kwargs.get('logfile', None)
+    print_to_console = kwargs.get('console', console_output)
     
     if lfile:
         try:
@@ -216,8 +225,11 @@ def write_output(msg, **kwargs):
             except Exception:
                 pass
     
-    # Also print to console
-    print(formatted_msg)
+    # Print to console if enabled
+    # When running via labstartup.sh, console output is captured by tee and would
+    # cause duplicate lines in log files. Set console_output=False in that case.
+    if print_to_console:
+        print(formatted_msg)
 
 def write_vpodprogress(message, status, **kwargs):
     """
@@ -245,20 +257,34 @@ def update_desktop_status(message, color='red'):
         if os.path.isfile(desktop_config):
             # Read current content
             with open(desktop_config, 'r') as f:
-                content = f.read()
+                lines = f.readlines()
             
             # Get conky_title from config or use lab_sku
             conky_title = lab_sku
             if config.has_option('VPOD', 'conky_title'):
                 conky_title = config.get('VPOD', 'conky_title')
             
-            # Replace status line
-            color_tag = green if color == 'green' else red
-            new_status = f'{color_tag}: {message}'
+            # Determine color tag for status line
+            color_tag = '${color green}' if color == 'green' else '${color red}'
+            
+            # Update the lines
+            updated_lines = []
+            for line in lines:
+                # Update the lab title line (contains HOL-#### or similar placeholder)
+                # This is the line after "# labstartup sets the labname"
+                if line.strip().startswith('${font weight:bold}${color0}${alignc}'):
+                    updated_lines.append(f'${{font weight:bold}}${{color0}}${{alignc}}{conky_title}\n')
+                # Update the status line at the bottom
+                elif 'Lab Status' in line and '${exec cat' in line:
+                    updated_lines.append(f'${{font weight:bold}}{color_tag}Lab Status ${{alignr}}${{font weight:bold}}${{exec cat /hol/startup_status.txt}}\n')
+                else:
+                    updated_lines.append(line)
             
             # Write updated content
             with open(desktop_config, 'w') as f:
-                f.write(content)  # Simplified - actual implementation would parse and update
+                f.writelines(updated_lines)
+            
+            write_output(f'Updated desktop config: title="{conky_title}", status="{message}"')
     except Exception as e:
         write_output(f'Error updating desktop status: {e}')
 
@@ -306,9 +332,14 @@ def ssh(command, target, password=None, **kwargs):
     if password is None:
         password = get_password()
     
-    ssh_options = kwargs.get('options', 'StrictHostKeyChecking=accept-new')
+    # Lab environment: disable strict host key checking to handle key changes
+    ssh_options = kwargs.get('options', None)
+    if ssh_options:
+        options_str = f'-o {ssh_options}'
+    else:
+        options_str = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
     
-    cmd = f'{sshpass} -p {password} ssh -o {ssh_options} {target} "{command}"'
+    cmd = f'{sshpass} -p {password} ssh {options_str} {target} "{command}"'
     return run_command(cmd)
 
 def scp(source, destination, password=None, **kwargs):
@@ -323,10 +354,16 @@ def scp(source, destination, password=None, **kwargs):
     if password is None:
         password = get_password()
     
-    ssh_options = kwargs.get('options', 'StrictHostKeyChecking=accept-new')
+    # Lab environment: disable strict host key checking to handle key changes
+    ssh_options = kwargs.get('options', None)
+    if ssh_options:
+        options_str = f'-o {ssh_options}'
+    else:
+        options_str = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+    
     recursive = '-r' if kwargs.get('recursive', False) else ''
     
-    cmd = f'{sshpass} -p {password} scp {recursive} -o {ssh_options} {source} {destination}'
+    cmd = f'{sshpass} -p {password} scp {recursive} {options_str} {source} {destination}'
     return run_command(cmd)
 
 #==============================================================================
@@ -404,7 +441,7 @@ def connect_vc(host, user, password=None, **kwargs):
     :param host: vCenter/ESXi hostname
     :param user: Username
     :param password: Password
-    :return: ServiceInstance
+    :return: ServiceInstance or True on success, None/False on failure
     """
     if password is None:
         password = get_password()
@@ -412,12 +449,24 @@ def connect_vc(host, user, password=None, **kwargs):
     port = kwargs.get('port', 443)
     
     try:
-        si = connect.SmartConnectNoSSL(
-            host=host,
-            user=user,
-            pwd=password,
-            port=port
-        )
+        # Try pyVmomi 7.0 method first
+        try:
+            si = connect.SmartConnectNoSSL(
+                host=host,
+                user=user,
+                pwd=password,
+                port=port
+            )
+        except AttributeError:
+            # pyVmomi 8.0+ uses SmartConnect with disableSslCertValidation
+            si = connect.SmartConnect(
+                host=host,
+                user=user,
+                pwd=password,
+                port=port,
+                disableSslCertValidation=True
+            )
+        
         sisvc[host] = si
         sis.append(si)
         write_output(f'Connected to {host}')
@@ -469,6 +518,579 @@ def start_vm(vm):
             write_output(f'Failed to power on {vm.name}: {e}')
             return False
     return True
+
+
+#==============================================================================
+# VSPHERE HELPER FUNCTIONS (from legacy lsfunctions.py)
+#==============================================================================
+
+def get_all_objs(si_content, vimtype):
+    """
+    Method that populates objects of type vimtype such as
+    vim.VirtualMachine, vim.HostSystem, vim.Datacenter, vim.Datastore, vim.ClusterComputeResource
+    :param si_content: serviceinstance.content
+    :param vimtype: VIM object type name (list)
+    :return: dict of {object: name}
+    """
+    obj = {}
+    container = si_content.viewManager.CreateContainerView(si_content.rootFolder, vimtype, True)
+    for managed_object_ref in container.view:
+        obj.update({managed_object_ref: managed_object_ref.name})
+    container.Destroy()
+    return obj
+
+
+def connect_vcenters(entries):
+    """
+    Connect to multiple vCenters or ESXi hosts from a config list
+    :param entries: list of vCenter entries from config.ini in format "hostname:type:user"
+    """
+    pwd = get_password()
+    
+    for entry in entries:
+        # Skip comments and empty lines
+        if not entry or entry.strip().startswith('#'):
+            continue
+        
+        vc = entry.split(':')
+        hostname = vc[0].strip()
+        vc_type = vc[1].strip() if len(vc) > 1 else 'esx'
+        
+        if len(vc) >= 3:
+            login_user = vc[2].strip()
+        else:
+            login_user = vcuser
+        
+        write_output(f'Connecting to {hostname}...')
+        test_ping(hostname)
+        
+        if vc_type == 'esx':
+            login_user = 'root'
+        
+        # Keep trying to connect until successful
+        max_attempts = 10
+        attempt = 0
+        connected = False
+        while not connect_vc(hostname, login_user, pwd):
+            attempt += 1
+            if attempt >= max_attempts:
+                write_output(f'Failed to connect to {hostname} after {max_attempts} attempts')
+                break
+            labstartup_sleep(sleep_seconds)
+        else:
+            # while loop completed without break - connection succeeded
+            connected = True
+        
+        if connected:
+            if vc_type == 'linux':
+                write_output(f'Connected to linux vCenter: {hostname}')
+            elif vc_type == 'esx':
+                write_output(f'Connected to ESXi host: {hostname}')
+            else:
+                write_output(f'Connected to {hostname}')
+
+
+def get_host(name):
+    """
+    Convenience function to retrieve an ESXi host by name from all session content
+    :param name: string the name of the host to retrieve
+    :return: vim.HostSystem or None
+    """
+    for si in sis:
+        hosts = get_all_objs(si.content, [vim.HostSystem])
+        for host in hosts:
+            if host.name == name:
+                return host
+    return None
+
+
+def get_all_hosts():
+    """
+    Convenience function to retrieve all ESX host systems
+    :return: list of vim.HostSystem
+    """
+    all_hosts = []
+    for si in sis:
+        hosts = get_all_objs(si.content, [vim.HostSystem])
+        all_hosts.extend(hosts.keys())
+    return all_hosts
+
+
+def get_datastore(ds_name):
+    """
+    Convenience function to retrieve a datastore by name
+    :param ds_name: string - the name of the datastore to return
+    :return: vim.Datastore or None
+    """
+    if not sis:
+        write_output(f'WARNING: No vCenter/ESXi connections available to search for datastore {ds_name}')
+        return None
+    
+    for si in sis:
+        try:
+            datastores = get_all_objs(si.content, [vim.Datastore])
+            for datastore in datastores:
+                if datastore.name == ds_name:
+                    return datastore
+        except Exception as e:
+            write_output(f'Error searching datastores in session: {e}')
+    return None
+
+
+def reboot_hosts():
+    """
+    To deal with NFS mount timing issues, reboot all ESXi hosts.
+    """
+    hosts = get_all_hosts()
+    for host in hosts:
+        write_output(f'Rebooting host {host.name}...')
+        try:
+            task = host.RebootHost_Task(True)
+            labstartup_sleep(1)
+        except Exception as e:
+            write_output(f'Failed to reboot {host.name}: {e}')
+    
+    # Wait for hosts to stop responding
+    write_output('Waiting for hosts to stop responding...')
+    for host in hosts:
+        while test_tcp_port(host.name, 22, timeout=2):
+            labstartup_sleep(sleep_seconds)
+    
+    # Wait for hosts to start responding again
+    write_output('Waiting for hosts to begin responding...')
+    for host in hosts:
+        while not test_tcp_port(host.name, 22, timeout=5):
+            write_output(f'Waiting for {host.name} to respond...')
+            labstartup_sleep(sleep_seconds)
+
+
+def exit_maintenance():
+    """
+    Take all ESXi hosts out of Maintenance Mode.
+    """
+    hosts = get_all_hosts()
+    for host in hosts:
+        if host.runtime.inMaintenanceMode:
+            host.ExitMaintenanceMode_Task(0)
+
+
+def check_maintenance():
+    """
+    Verify that all ESXi hosts are not in Maintenance Mode.
+    Hosts listed in the global 'mm' variable are excluded from this check.
+    
+    :return: True if all hosts (except excluded) are out of maintenance mode, False otherwise
+    """
+    maint = 0
+    hosts = get_all_hosts()
+    
+    # First pass: log which hosts are still in maintenance mode
+    for host in hosts:
+        if host.name in mm:  # leave this one in MM
+            continue
+        elif host.runtime.inMaintenanceMode:
+            write_output(f'{host.name} is still in Maintenance Mode.')
+    
+    # Second pass: count hosts still in maintenance mode
+    hosts = get_all_hosts()
+    for host in hosts:
+        if host.name in mm:  # leave this one in MM
+            continue
+        elif host.runtime.inMaintenanceMode:
+            maint += 1
+    
+    if maint == 0:
+        return True
+    else:
+        return False
+
+
+def clear_host_alarms():
+    """
+    Clear all triggered alarms across all connected vCenter sessions.
+    """
+    filter_spec = vim.alarm.AlarmFilterSpec(
+        status=[],
+        typeEntity='entityTypeAll',
+        typeTrigger='triggerTypeAll'
+    )
+    for si in sis:
+        alarm_mgr = si.content.alarmManager
+        alarm_mgr.ClearTriggeredAlarms(filter_spec)
+
+
+def check_datastore(entry):
+    """
+    For the Datastores.txt entry, checks accessible and counts the files
+    if VMFS (typical) has all ESX host systems rescan their HBAs
+    if NFS verify accessible and if not reboot ESXi hosts to work around timing issues
+    :param entry: string colon-delimited entry from Datastores in config.ini (server:datastore_name)
+    :return: True or False
+    """
+    parts = entry.split(':')
+    if len(parts) < 2:
+        write_output(f'Invalid datastore entry: {entry}')
+        return False
+    
+    server = parts[0].strip()
+    datastore_name = parts[1].strip()
+    write_output(f'Checking {datastore_name}...')
+    
+    # Check if we have any vCenter/ESXi connections
+    if not sis:
+        write_output(f'ERROR: No vCenter/ESXi connections available - cannot check datastore {datastore_name}')
+        write_output('Please ensure vCenter is connected before checking datastores')
+        return False
+    
+    # Log available connections for debugging
+    write_output(f'Searching {len(sis)} connected session(s) for datastore {datastore_name}')
+    
+    max_attempts = 30
+    attempt = 0
+    ds = None
+    
+    while attempt < max_attempts:
+        try:
+            ds = get_datastore(datastore_name)
+            if ds and (ds.summary.type == 'VMFS' or 'NFS' in ds.summary.type or ds.summary.type == 'vsan'):
+                write_output(f'Datastore {datastore_name} found (type: {ds.summary.type})')
+                break
+        except Exception as e:
+            write_output(f'Exception checking datastore {datastore_name}: {e}')
+        attempt += 1
+        if attempt < max_attempts:
+            labstartup_sleep(sleep_seconds)
+    
+    if ds is None:
+        write_output(f'Datastore {datastore_name} not found after {max_attempts} attempts')
+        write_output(f'Connected sessions: {len(sis)} - verify vCenter connection is established')
+        return False
+    
+    # Handle VMFS datastores - rescan HBAs
+    if ds.summary.type == 'VMFS':
+        try:
+            hosts = get_all_hosts()
+            for host in hosts:
+                write_output(f'Rescanning HBAs on {host.name}...')
+                try:
+                    host_ss = host.configManager.storageSystem
+                    host_ss.RescanAllHba()
+                except Exception as e:
+                    if 'Licenses' in str(e):
+                        write_output(f'Waiting for License Service before datastore check on {host.name}')
+                        labstartup_sleep(sleep_seconds)
+                    else:
+                        write_output(f'Exception rescanning HBAs on {host.name}: {e}')
+        except Exception as e:
+            write_output(f'Exception getting hosts: {e}')
+    
+    # Handle NFS datastores - check for inaccessible VMs
+    elif 'NFS' in ds.summary.type:
+        vms = get_all_vms()
+        for vm in vms:
+            try:
+                check = False
+                for dsuse in vm.storage.perDatastoreUsage:
+                    if dsuse.datastore.name == ds.name:
+                        check = True
+                        break
+                if vm.runtime.connectionState == 'inaccessible' and check:
+                    write_output(f'{vm.name} is inaccessible on NFS datastore.')
+                    reboot_hosts()
+                    break
+            except Exception:
+                pass
+        
+        # Wait for NFS datastore to be accessible
+        while not ds.summary.accessible:
+            write_output('Waiting for NFS datastore to mount...')
+            labstartup_sleep(sleep_seconds)
+    
+    # Verify datastore is accessible
+    if ds.summary.accessible:
+        try:
+            ds_browser = ds.browser
+            spec = vim.host.DatastoreBrowser.SearchSpec(query=[vim.host.DatastoreBrowser.FolderQuery()])
+            task = ds_browser.SearchDatastore_Task("[%s]" % ds.name, spec)
+            WaitForTask(task)
+            if len(task.info.result.file):
+                write_output(f'Datastore {datastore_name} on {server} looks ok.')
+                return True
+            else:
+                write_output(f'Datastore {datastore_name} on {server} has no files but is accessible.')
+                return True
+        except Exception as e:
+            write_output(f'Error browsing datastore {datastore_name}: {e}')
+            return True  # Still accessible, just can't browse
+    else:
+        write_output(f'Datastore {datastore_name} on {server} is unavailable.')
+        return False
+
+
+def get_vm_by_name(name, **kwargs):
+    """
+    Convenience function to retrieve VMs by name from a specific session or all sessions
+    :param name: string the name of the VM to retrieve
+    :param vc: optional - the specific vCenter hostname to search
+    :return: list of matching VMs
+    """
+    vc = kwargs.get('vc', '')
+    vmlist = []
+    
+    if vc and vc in sisvc:
+        vms = get_all_objs(sisvc[vc].content, [vim.VirtualMachine])
+        for vm in vms:
+            if vm.name == name:
+                vmlist.append(vm)
+    else:
+        for si in sis:
+            vms = get_all_objs(si.content, [vim.VirtualMachine])
+            for vm in vms:
+                if vm.name == name:
+                    vmlist.append(vm)
+    return vmlist
+
+
+def get_vm_match(name):
+    """
+    Convenience function to retrieve VMs matching a pattern from all session content
+    :param name: string the name pattern of the VMs to retrieve (regex)
+    :return: list of matching VMs
+    """
+    pattern = re.compile(name, re.IGNORECASE)
+    vmsreturn = []
+    for si in sis:
+        vms = get_all_objs(si.content, [vim.VirtualMachine])
+        for vm in vms:
+            match = pattern.match(vm.name)
+            if match:
+                vmsreturn.append(vm)
+    return vmsreturn
+
+
+def get_vapp(name, **kwargs):
+    """
+    Convenience function to retrieve the vApp named from all session content
+    :param name: string the name of the vApp to retrieve
+    :param vc: optional - the specific vCenter hostname to search
+    :return: list of matching vApps
+    """
+    vc = kwargs.get('vc', '')
+    valist = []
+    
+    if vc and vc in sisvc:
+        vapps = get_all_objs(sisvc[vc].content, [vim.VirtualApp])
+        for vapp in vapps:
+            if vapp.name == name:
+                valist.append(vapp)
+    else:
+        for si in sis:
+            vapps = get_all_objs(si.content, [vim.VirtualApp])
+            for vapp in vapps:
+                if vapp.name == name:
+                    valist.append(vapp)
+    return valist
+
+
+def start_nested(records):
+    """
+    Start all the nested vApps or VMs in the records list passed in
+    :param records: list of vApps or VMs to start. Format: "vmname:vcenter" or "Pause:seconds"
+    """
+    if not len(records):
+        write_output('no records')
+        return
+
+    for record in records:
+        # Skip comments and empty lines
+        if not record or record.strip().startswith('#'):
+            continue
+        
+        p = record.split(':')
+        e_name = p[0].strip()
+        vc_name = p[1].strip() if len(p) > 1 else ''
+        
+        # Handle pause entries
+        if 'pause' in e_name.lower():
+            if labcheck:
+                continue
+            write_output(f'Pausing {p[1]} seconds...')
+            labstartup_sleep(int(p[1]))
+            continue
+
+        # Try to find as vApp first, then as VM
+        va = get_vapp(e_name, vc=vc_name)
+        vms = get_vm_by_name(e_name, vc=vc_name)
+        
+        if not vms:
+            vms = get_vm_match(e_name)
+        
+        if not vms and not va:
+            write_output(f'Unable to find entity {e_name}')
+            continue
+        
+        # Process vApps
+        if va:
+            for vapp in va:
+                if vapp.summary.vAppState == 'started':
+                    write_output(f'{vapp.name} already powered on.')
+                    continue
+                write_output(f'Attempting to power on vApp {vapp.name}...')
+                try:
+                    task = vapp.PowerOnVApp_Task()
+                    WaitForTask(task)
+                    write_output(f'Powered on vApp: {vapp.name}')
+                except Exception as e:
+                    write_output(f'Failed to power on vApp {vapp.name}: {e}')
+        
+        # Process VMs
+        for vm in vms:
+            if vm.runtime.powerState == 'poweredOn':
+                write_output(f'{vm.name} already powered on.')
+                continue
+            
+            write_output(f'Attempting to power on VM {vm.name}...')
+            
+            # Wait for VM to be connected
+            max_wait = 60
+            waited = 0
+            while vm.runtime.connectionState != 'connected' and waited < max_wait:
+                write_output(f'VM {vm.name} connection state: {vm.runtime.connectionState}, waiting...')
+                labstartup_sleep(5)
+                waited += 5
+            
+            if vm.runtime.connectionState != 'connected':
+                write_output(f'VM {vm.name} not connected after {max_wait}s, skipping')
+                continue
+            
+            try:
+                task = vm.PowerOnVM_Task()
+                WaitForTask(task)
+                write_output(f'Powered on VM: {vm.name}')
+            except Exception as e:
+                write_output(f'Failed to power on {vm.name}: {e}')
+
+
+def get_cluster(cluster_name):
+    """
+    Get a cluster object by name from any connected vCenter
+    :param cluster_name: Cluster name
+    :return: ClusterComputeResource object or None
+    """
+    for si in sis:
+        clusters = get_all_objs(si.content, [vim.ClusterComputeResource])
+        for cluster in clusters:
+            if cluster.name == cluster_name:
+                return cluster
+    return None
+
+
+def wait_for_vcenter(hostname, timeout=600, interval=10):
+    """
+    Wait for vCenter to be fully available (API responding)
+    :param hostname: vCenter hostname
+    :param timeout: Maximum time to wait in seconds
+    :param interval: Check interval in seconds
+    :return: True if vCenter is available, False if timeout
+    """
+    start = datetime.datetime.now()
+    pwd = get_password()
+    
+    while (datetime.datetime.now() - start).total_seconds() < timeout:
+        write_output(f'Waiting for vCenter {hostname}...')
+        
+        # First check if TCP port is responding
+        if test_tcp_port(hostname, 443, timeout=5):
+            # Try to connect via API
+            try:
+                # Try pyVmomi 7.0 method first
+                try:
+                    si = connect.SmartConnectNoSSL(
+                        host=hostname,
+                        user='administrator@vsphere.local',
+                        pwd=pwd,
+                        port=443
+                    )
+                except AttributeError:
+                    # pyVmomi 8.0+ uses SmartConnect with disableSslCertValidation
+                    si = connect.SmartConnect(
+                        host=hostname,
+                        user='administrator@vsphere.local',
+                        pwd=pwd,
+                        port=443,
+                        disableSslCertValidation=True
+                    )
+                
+                if si:
+                    # Disconnect this test connection
+                    connect.Disconnect(si)
+                    write_output(f'vCenter {hostname} is ready')
+                    return True
+            except Exception as e:
+                write_output(f'vCenter {hostname} not ready yet: {e}')
+        
+        labstartup_sleep(interval)
+    
+    write_output(f'Timeout waiting for vCenter {hostname}')
+    return False
+
+
+def get_all_vms(si=None):
+    """
+    Get all VMs from a ServiceInstance (or all connected SIs)
+    :param si: Optional specific ServiceInstance
+    :return: List of VM objects
+    """
+    vms = []
+    search_list = [si] if si else sis
+    
+    for service_instance in search_list:
+        vm_objs = get_all_objs(service_instance.content, [vim.VirtualMachine])
+        vms.extend(vm_objs.keys())
+    
+    return vms
+
+
+def get_network_adapter(vm_obj):
+    """
+    Return a list of network adapters for the VM
+    :param vm_obj: the VM to use
+    :return: list of VirtualEthernetCard devices
+    """
+    net_adapters = []
+    for dev in vm_obj.config.hardware.device:
+        if isinstance(dev, vim.vm.device.VirtualEthernetCard):
+            net_adapters.append(dev)
+    return net_adapters
+
+
+def set_network_adapter_connection(vm_obj, adapter, connect):
+    """
+    Function to connect or disconnect a VM network adapter
+    :param vm_obj: the VM object
+    :param adapter: the VM virtual network adapter
+    :param connect: True or False the desired connection state
+    """
+    adapter_spec = vim.vm.device.VirtualDeviceSpec()
+    adapter_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+    adapter_spec.device = adapter
+    adapter_spec.device.key = adapter.key
+    adapter_spec.device.macAddress = adapter.macAddress
+    adapter_spec.device.backing = adapter.backing
+    adapter_spec.device.wakeOnLanEnabled = adapter.wakeOnLanEnabled
+    connectable = vim.vm.device.VirtualDevice.ConnectInfo()
+    connectable.connected = connect
+    connectable.startConnected = connect
+    adapter_spec.device.connectable = connectable
+    dev_changes = [adapter_spec]
+    spec = vim.vm.ConfigSpec()
+    spec.deviceChange = dev_changes
+    try:
+        task = vm_obj.ReconfigVM_Task(spec=spec)
+        WaitForTask(task)
+    except Exception:
+        pass  # Best-effort NIC state change
+
 
 #==============================================================================
 # AUTOMATION FRAMEWORK SUPPORT
@@ -654,6 +1276,68 @@ def run_repo_script(script_name, script_type='auto', **kwargs):
 # VPODREPO HELPERS
 #==============================================================================
 
+def get_repo_info(sku: str, lab_type: str = 'HOL') -> tuple:
+    """
+    Parse SKU and return repository information based on lab type.
+    
+    Supports multiple SKU patterns:
+    - Standard (HOL, ATE, VXP, EDU): PREFIX-XXYY format (e.g., HOL-2701, ATE-2705)
+      Returns year-based directory structure: /vpodrepo/20XX-labs/XXYY
+    - Named (Discovery): PREFIX-Name format (e.g., Discovery-Demo)
+      Returns name-based directory structure: /vpodrepo/Discovery-labs/Name
+    
+    :param sku: Lab SKU string (e.g., 'HOL-2701', 'ATE-2705', 'Discovery-Demo')
+    :param lab_type: Lab type string (HOL, ATE, VXP, EDU, Discovery)
+    :return: Tuple of (year_dir, repo_dir, git_url)
+    
+    Examples:
+        >>> get_repo_info('HOL-2701', 'HOL')
+        ('/vpodrepo/2027-labs', '/vpodrepo/2027-labs/2701', 'https://github.com/Broadcom/HOL-2701.git')
+        
+        >>> get_repo_info('ATE-2705', 'ATE')
+        ('/vpodrepo/2027-labs', '/vpodrepo/2027-labs/2705', 'https://github.com/Broadcom/ATE-2705.git')
+        
+        >>> get_repo_info('Discovery-Demo', 'Discovery')
+        ('/vpodrepo/Discovery-labs', '/vpodrepo/Discovery-labs/Demo', 'https://github.com/Broadcom/Discovery-Demo.git')
+    """
+    if not sku or sku == bad_sku:
+        return ('', '', '')
+    
+    # Split SKU into prefix and suffix
+    parts = sku.split('-', 1)
+    if len(parts) < 2:
+        # Invalid format, return empty
+        return ('', '', '')
+    
+    prefix = parts[0]
+    suffix = parts[1]
+    
+    # Normalize lab_type for comparison
+    lab_type_upper = lab_type.upper() if lab_type else 'HOL'
+    
+    if lab_type_upper == 'DISCOVERY':
+        # Discovery uses name-based pattern (no year extraction)
+        year_dir = '/vpodrepo/Discovery-labs'
+        repo_dir = f'{year_dir}/{suffix}'
+        git_url = f'https://github.com/Broadcom/{sku}.git'
+    else:
+        # Standard pattern: PREFIX-XXYY where XX=year, YY=index
+        # Supports HOL, ATE, VXP, EDU
+        if len(suffix) >= 4:
+            year = suffix[:2]
+            index = suffix[2:4]
+            year_dir = f'/vpodrepo/20{year}-labs'
+            repo_dir = f'{year_dir}/{year}{index}'
+            git_url = f'https://github.com/Broadcom/{prefix}-{year}{index}.git'
+        else:
+            # Fallback for short suffixes - treat as named
+            year_dir = f'/vpodrepo/{prefix}-labs'
+            repo_dir = f'{year_dir}/{suffix}'
+            git_url = f'https://github.com/Broadcom/{sku}.git'
+    
+    return (year_dir, repo_dir, git_url)
+
+
 def get_vpodrepo_file(filename):
     """
     Find a file in vpodrepo, checking multiple locations
@@ -758,6 +1442,7 @@ def startup(module_name, timeout=120, labcheck_mode=False):
     :param module_name: Name of the startup module (without .py)
     :param timeout: Maximum execution time in seconds
     :param labcheck_mode: Whether running in labcheck mode
+    :return: True if module succeeded, False if failed
     """
     global labcheck
     labcheck = labcheck_mode
@@ -779,12 +1464,23 @@ def startup(module_name, timeout=120, labcheck_mode=False):
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
         
-        # Call main if it exists
+        # Call main if it exists, passing the current lsfunctions module
+        # This ensures the startup module uses the already-initialized state
+        result = True
         if hasattr(module, 'main'):
-            module.main()
+            # Get reference to this module (lsfunctions) to pass to main()
+            import lsfunctions as lsf_module
+            result = module.main(lsf=lsf_module)
+            # If main() returns None (no explicit return), treat as success
+            if result is None:
+                result = True
         
-        write_output(f'Completed module: {module_name}')
-        return True
+        if result:
+            write_output(f'Completed module: {module_name}')
+        else:
+            write_output(f'Module {module_name} reported failure')
+        
+        return result
         
     except Exception as e:
         write_output(f'Module {module_name} failed: {e}')
@@ -864,39 +1560,58 @@ def push_vpodrepo_router_files():
     
     return True
 
+def signal_router(state: str):
+    """
+    Signal to router with the specified state.
+    
+    Creates a file in the holorouter NFS share directory that the router
+    monitors to know the current lab startup state.
+    
+    :param state: State to signal (e.g., 'gitdone', 'ready', or any custom state)
+    """
+    state_file = os.path.join(holorouter_dir, state)
+    try:
+        with open(state_file, 'w') as f:
+            f.write(str(datetime.datetime.now()))
+        write_output(f'Signaled router: {state}')
+    except Exception as e:
+        write_output(f'Failed to signal router ({state}): {e}')
+
 def signal_router_gitdone():
     """Signal to router that git pull is complete"""
-    gitdone_file = os.path.join(holorouter_dir, 'gitdone')
-    with open(gitdone_file, 'w') as f:
-        f.write(str(datetime.datetime.now()))
-    write_output('Signaled router: gitdone')
+    signal_router('gitdone')
 
 def signal_router_ready():
     """Signal to router that lab is ready"""
-    ready_file = os.path.join(holorouter_dir, 'ready')
-    with open(ready_file, 'w') as f:
-        f.write(str(datetime.datetime.now()))
-    write_output('Signaled router: ready')
+    signal_router('ready')
 
 #==============================================================================
 # PARSE LAB SKU
 #==============================================================================
 
-def parse_labsku(sku):
+def parse_labsku(sku, lab_type_override: str = None):
     """
-    Parse the lab SKU and set related variables
+    Parse the lab SKU and set related variables.
     
-    :param sku: Lab SKU (e.g., HOL-2701)
+    Supports multiple SKU patterns based on lab type:
+    - Standard (HOL, ATE, VXP, EDU): PREFIX-XXYY format
+    - Named (Discovery): PREFIX-Name format
+    
+    :param sku: Lab SKU (e.g., HOL-2701, ATE-2705, Discovery-Demo)
+    :param lab_type_override: Optional lab type override (defaults to global labtype)
     """
     global lab_sku, vpod_repo
     
     lab_sku = sku
     
-    if sku != bad_sku and len(sku) >= 8:
-        year = sku[4:6]
-        index = sku[6:8]
-        vpod_repo = f'/vpodrepo/20{year}-labs/{year}{index}'
-        write_output(f'VPodRepo path: {vpod_repo}')
+    # Use override or global labtype
+    lt = lab_type_override if lab_type_override else labtype
+    
+    if sku != bad_sku:
+        _, vpod_repo, git_url = get_repo_info(sku, lt)
+        if vpod_repo:
+            write_output(f'VPodRepo path: {vpod_repo}')
+            write_output(f'Git URL: {git_url}')
 
 #==============================================================================
 # MISC HELPERS
@@ -909,7 +1624,7 @@ def postmanfix():
 
 def start_autolab():
     """Check for and start autolab if present"""
-    autolab_file = f'{mcholroot}/autolab.py'
+    autolab_file = f'{lmcholroot}/autolab.py'
     if os.path.isfile(autolab_file):
         write_output('Autolab detected, executing...')
         result = run_command(f'/usr/bin/python3 {autolab_file}')
