@@ -9,7 +9,7 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
 ## Table of Contents
 
 - [Python Scripts](#python-scripts)
-  - [esx-config.py](#esx-configpy)
+  - [confighol.py](#configholpy)
   - [checkfw.py](#checkfwpy)
   - [dns_checks.py](#dns_checkspy)
   - [labtypes.py](#labtypespy)
@@ -39,43 +39,77 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
 
 ## Python Scripts
 
-### esx-config.py
+### confighol.py
 
-**ESXi Host Configuration Tool**
+**vApp HOLification Tool**
 
-Configures ESXi hosts for lab operations by enabling SSH and setting up passwordless authentication. This is required before capturing the vApp as a template and is critical for the shutdown process which requires SSH access for vSAN elevator operations.
+Comprehensive automation tool for "HOLifying" vApp templates after the Holodeck factory build process. This script consolidates and replaces the previous `esx-config.py` and `configvsphere.ps1` scripts into a single, unified tool.
 
 **Features:**
-- Enables SSH service on each ESXi host via the vSphere API
-- Configures SSH to auto-start when the host boots (policy: "on")
-- Copies the holuser public key to `/etc/ssh/keys-root/authorized_keys`
-- Verifies passwordless SSH works after configuration
-- Removes stale SSH host keys from `known_hosts` to prevent connection errors
+
+1. **ESXi Host Configuration:**
+   - Enables SSH service via vSphere API
+   - Configures SSH to auto-start on boot
+   - Copies holuser public keys for passwordless SSH access
+   - Sets non-expiring passwords (9999 days)
+   - Disables session timeout
+
+2. **vCenter Configuration:**
+   - Enables bash shell for root user
+   - Configures SSH authorized_keys
+   - Enables browser support and MOB (Managed Object Browser)
+   - Sets password policies (9999 days expiration)
+   - Disables HA Admission Control
+   - Configures DRS to PartiallyAutomated
+   - Clears ARP cache
+
+3. **NSX Configuration:**
+   - Enables SSH via REST API on NSX Managers
+   - Configures SSH start-on-boot
+   - Removes password expiration for admin, root, audit users
+
+4. **SDDC Manager Configuration:**
+   - Configures SSH authorized_keys
+   - Sets non-expiring passwords for vcf, backup, root accounts
+
+5. **Operations VMs Configuration:**
+   - Sets non-expiring passwords
+   - Configures SSH authorized_keys
 
 **Usage:**
 
 ```bash
-# Configure all hosts from config.ini
-python3 esx-config.py
+# Full interactive HOLification
+python3 confighol.py
 
-# Configure specific hosts
-python3 esx-config.py --hosts esx-01a.site-a.vcf.lab esx-02a.site-a.vcf.lab
+# Preview what would be done (no changes)
+python3 confighol.py --dry-run
 
-# Check SSH status only (no changes)
-python3 esx-config.py --check
+# Skip vCenter shell configuration
+python3 confighol.py --skip-vcshell
 
-# Preview mode (show what would be done)
-python3 esx-config.py --dry-run
+# Skip NSX configuration
+python3 confighol.py --skip-nsx
+
+# Only configure ESXi hosts
+python3 confighol.py --esx-only
 ```
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
-| `--hosts` | Specific ESXi hosts to configure |
-| `--dry-run` | Show what would be done without making changes |
-| `--check` | Check SSH status only, no changes |
-| `--password` | Root password (defaults to creds.txt) |
+| `--dry-run` | Preview what would be done without making changes |
+| `--skip-vcshell` | Skip vCenter shell configuration |
+| `--skip-nsx` | Skip NSX configuration |
+| `--esx-only` | Only configure ESXi hosts |
+
+**Prerequisites:**
+- Complete successful LabStartup reaching Ready state
+- Valid `/tmp/config.ini` with all resources defined
+- `expect` utility installed (`/usr/bin/expect`)
+
+**Note:** Some NSX operations require manual steps first. See `HOLIFICATION.md` for complete instructions.
 
 ---
 
