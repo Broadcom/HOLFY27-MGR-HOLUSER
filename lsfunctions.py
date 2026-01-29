@@ -38,7 +38,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # STATIC VARIABLES
 #==============================================================================
 
-sleep_seconds = 5
+sleep_seconds = 30
 labcheck = False
 
 home = '/home/holuser'
@@ -98,8 +98,10 @@ labtype = 'HOL'
 # Config parser
 config = ConfigParser()
 
-# Password property
+# Password variable - stores the lab password from creds.txt
+# After init() is called, access via lsf.password or lsf.get_password()
 _password = None
+password = None  # Public alias for backward compatibility
 
 # Console output flag (set to False when running via labstartup.sh to avoid double-logging)
 console_output = True
@@ -116,7 +118,7 @@ def init(router=True, **kwargs):
     :param kwargs: Additional options
     """
     global LMC, mc, mcdesktop, desktop_config, logfiles
-    global config, lab_sku, labtype, vpod_repo, max_minutes_before_fail, _password
+    global config, lab_sku, labtype, vpod_repo, max_minutes_before_fail, _password, password
     
     # Wait for LMC (Linux Main Console) mount
     while True:
@@ -153,6 +155,7 @@ def init(router=True, **kwargs):
     if os.path.isfile(creds):
         with open(creds, 'r') as f:
             _password = f.read().strip()
+            password = _password  # Update public alias
     
     # Check router if requested and labtype is HOL
     if router and labtype == 'HOL':
@@ -168,22 +171,31 @@ def check_router():
         write_output('WARNING: Router not reachable')
 
 #==============================================================================
-# PASSWORD PROPERTY
+# PASSWORD FUNCTIONS
 #==============================================================================
 
-@property
-def pw():
-    """Get the password from creds.txt"""
-    return get_password()
-
-def get_password():
-    """Get the password from creds.txt"""
-    global _password
+def get_password() -> str:
+    """
+    Get the lab password from creds.txt.
+    
+    The password is cached in _password after first read for efficiency.
+    This is the primary function for retrieving the lab password.
+    
+    :return: Password string, or empty string if not found
+    """
+    global _password, password
     if _password is None:
         if os.path.isfile(creds):
             with open(creds, 'r') as f:
                 _password = f.read().strip()
-    return _password
+                password = _password  # Update public alias
+    return _password if _password else ''
+
+
+# Password access methods (for backward compatibility):
+#   - lsf.password        - module variable, set after init() is called
+#   - lsf.get_password()  - function call, reads from creds.txt if needed
+# Both return the same value after init() has been called.
 
 #==============================================================================
 # OUTPUT AND LOGGING
@@ -568,7 +580,7 @@ def connect_vcenters(entries):
             login_user = 'root'
         
         # Keep trying to connect until successful
-        max_attempts = 10
+        max_attempts = 20
         attempt = 0
         connected = False
         while not connect_vc(hostname, login_user, pwd):
@@ -1612,6 +1624,139 @@ def parse_labsku(sku, lab_type_override: str = None):
         if vpod_repo:
             write_output(f'VPodRepo path: {vpod_repo}')
             write_output(f'Git URL: {git_url}')
+
+#==============================================================================
+# MISC HELPERS
+#==============================================================================
+
+#==============================================================================
+# FILE OPERATIONS
+#==============================================================================
+
+def getfilecontents(filepath: str) -> str:
+    """
+    Read and return the contents of a file.
+    
+    This is a convenience function for reading file contents, commonly used
+    for reading SSH public keys and configuration files.
+    
+    :param filepath: Full path to the file to read
+    :return: File contents as string, or empty string if file not found/error
+    """
+    if not os.path.isfile(filepath):
+        write_output(f'WARNING: File not found: {filepath}')
+        return ''
+    
+    try:
+        with open(filepath, 'r') as f:
+            return f.read().strip()
+    except Exception as e:
+        write_output(f'ERROR: Failed to read {filepath}: {e}')
+        return ''
+
+
+#==============================================================================
+# ESXI HOST CONFIGURATION
+#==============================================================================
+
+# SSH service name on ESXi
+SSH_SERVICE_NAME = 'TSM-SSH'  # Technical Support Mode - SSH
+
+
+def enable_ssh_on_esx(hostname: str, dry_run: bool = False) -> bool:
+    """
+    Enable SSH service on an ESXi host via the vSphere API.
+    
+    This function:
+    1. Starts the SSH service if not running
+    2. Sets the service policy to 'on' (auto-start with host)
+    
+    The host must be connected via connect_vc() or connect_vcenters() first,
+    and must be available in the sisvc dictionary.
+    
+    :param hostname: ESXi hostname (must match key in sisvc dict or be found via get_host)
+    :param dry_run: If True, show what would be done without making changes
+    :return: True if successful, False otherwise
+    """
+    # Get the host system object
+    host_system = get_host(hostname)
+    
+    if host_system is None:
+        write_output(f'{hostname}: Host not found in connected sessions')
+        return False
+    
+    try:
+        service_system = host_system.configManager.serviceSystem
+        services = service_system.serviceInfo.service
+        
+        # Find SSH service
+        ssh_service = None
+        for service in services:
+            if service.key == SSH_SERVICE_NAME:
+                ssh_service = service
+                break
+        
+        if ssh_service is None:
+            write_output(f'{hostname}: SSH service not found')
+            return False
+        
+        # Start SSH service if not running
+        if ssh_service.running:
+            write_output(f'{hostname}: SSH service already running')
+        else:
+            if dry_run:
+                write_output(f'{hostname}: Would start SSH service')
+            else:
+                write_output(f'{hostname}: Starting SSH service')
+                service_system.StartService(SSH_SERVICE_NAME)
+        
+        # Set SSH to start automatically with host (policy: on)
+        if ssh_service.policy != 'on':
+            if dry_run:
+                write_output(f'{hostname}: Would set SSH to auto-start')
+            else:
+                write_output(f'{hostname}: Setting SSH to auto-start on boot')
+                service_system.UpdateServicePolicy(SSH_SERVICE_NAME, 'on')
+        else:
+            write_output(f'{hostname}: SSH already configured to auto-start')
+        
+        return True
+        
+    except Exception as e:
+        write_output(f'{hostname}: Error enabling SSH - {e}')
+        return False
+
+
+def update_session_timeout(hostname: str, timeout: int = 0, dry_run: bool = False) -> bool:
+    """
+    Update the shell session timeout on an ESXi host.
+    
+    Setting timeout to 0 disables the session timeout, which is useful for
+    lab environments where sessions should not time out during debugging.
+    
+    This uses the esxcli command via SSH to modify the 
+    /UserVars/ESXiShellInteractiveTimeOut advanced setting.
+    
+    :param hostname: ESXi host FQDN
+    :param timeout: Timeout in seconds (0 = no timeout, default is 0)
+    :param dry_run: If True, show what would be done without making changes
+    :return: True if successful
+    """
+    if dry_run:
+        write_output(f'{hostname}: Would set session timeout to {timeout}')
+        return True
+    
+    # ESXi stores timeout in an advanced setting
+    cmd = f'esxcli system settings advanced set -o /UserVars/ESXiShellInteractiveTimeOut -i {timeout}'
+    result = ssh(cmd, f'root@{hostname}', get_password())
+    
+    if result.returncode == 0:
+        write_output(f'{hostname}: Set session timeout to {timeout}')
+        return True
+    else:
+        write_output(f'{hostname}: Failed to set session timeout')
+        return False
+
 
 #==============================================================================
 # MISC HELPERS
