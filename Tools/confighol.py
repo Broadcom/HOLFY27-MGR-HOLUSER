@@ -20,10 +20,16 @@
 # - SSH access to all target systems using lab password
 #
 # CAPABILITIES:
-# 0. Vault Root CA Import (runs first with SKIP/RETRY/FAIL options):
+# 0a. Vault Root CA Import (runs first with SKIP/RETRY/FAIL options):
 #    - Checks if HashiCorp Vault PKI is accessible
 #    - Downloads root CA certificate from Vault
 #    - Imports CA as trusted authority in Firefox on console VM
+#    - Requires: libnss3-tools package (provides certutil)
+#
+# 0b. vCenter CA Import (runs after Vault CA, with SKIP/RETRY/FAIL options):
+#    - Reads vCenter list from /tmp/config.ini
+#    - Downloads CA certificates from each vCenter's /certs/download.zip endpoint
+#    - Imports each CA as trusted authority in Firefox on console VM
 #    - Requires: libnss3-tools package (provides certutil)
 #
 # 1. ESXi Host Configuration:
@@ -92,6 +98,8 @@ import json
 import shutil
 import subprocess
 import tempfile
+import zipfile
+import io
 import xml.etree.ElementTree as ET
 from typing import Optional, Tuple
 
@@ -1866,6 +1874,307 @@ def configure_vault_ca_for_firefox(dry_run: bool = False,
 
 
 #==============================================================================
+# VCENTER CA CERTIFICATE IMPORT
+#==============================================================================
+
+VCENTER_CERTS_ENDPOINT = '/certs/download.zip'
+
+
+def get_vcenters_from_config() -> list:
+    """
+    Get list of vCenter hostnames from the config.ini file.
+    
+    Parses the [RESOURCES] vCenters section to extract vCenter FQDNs.
+    Format in config.ini: hostname:type:user
+    
+    :return: List of vCenter hostnames (FQDNs)
+    """
+    vcenters = []
+    
+    if 'RESOURCES' not in lsf.config:
+        lsf.write_output('WARNING: No RESOURCES section in config.ini')
+        return vcenters
+    
+    if 'vCenters' not in lsf.config['RESOURCES']:
+        lsf.write_output('WARNING: No vCenters defined in config.ini')
+        return vcenters
+    
+    vcenter_entries = lsf.config.get('RESOURCES', 'vCenters').split('\n')
+    
+    for entry in vcenter_entries:
+        entry = entry.strip()
+        # Skip empty lines and comments
+        if not entry or entry.startswith('#'):
+            continue
+        
+        # Parse format: hostname:type:user
+        parts = entry.split(':')
+        if parts:
+            hostname = parts[0].strip()
+            if hostname:
+                vcenters.append(hostname)
+    
+    return vcenters
+
+
+def check_vcenter_accessible(vcenter_hostname: str, timeout: int = 5) -> Tuple[bool, str]:
+    """
+    Check if a vCenter's certificate endpoint is accessible.
+    
+    :param vcenter_hostname: vCenter FQDN
+    :param timeout: Connection timeout in seconds
+    :return: Tuple of (accessible: bool, message: str)
+    """
+    url = f"https://{vcenter_hostname}{VCENTER_CERTS_ENDPOINT}"
+    
+    try:
+        response = requests.get(url, timeout=timeout, verify=False)
+        
+        if response.status_code == 200:
+            # Check if we got a valid zip file (starts with PK)
+            if response.content[:2] == b'PK':
+                return True, f"vCenter {vcenter_hostname} certificate endpoint is accessible"
+            else:
+                return False, f"vCenter {vcenter_hostname} responded but did not return a valid zip file"
+        else:
+            return False, f"vCenter {vcenter_hostname} responded with HTTP {response.status_code}"
+            
+    except requests.exceptions.ConnectTimeout:
+        return False, f"Connection timeout - vCenter {vcenter_hostname} not responding"
+    except requests.exceptions.ConnectionError:
+        return False, f"Connection error - Cannot reach vCenter {vcenter_hostname}"
+    except Exception as e:
+        return False, f"Error checking vCenter {vcenter_hostname}: {e}"
+
+
+def download_vcenter_ca_certificates(vcenter_hostname: str) -> Optional[list]:
+    """
+    Download CA certificates from a vCenter server.
+    
+    vCenter exposes its CA certificates at /certs/download.zip which contains
+    certificates in different formats for Linux, Mac, and Windows.
+    
+    :param vcenter_hostname: vCenter FQDN
+    :return: List of tuples (cert_name, cert_pem) or None on failure
+    """
+    import zipfile
+    import io
+    
+    url = f"https://{vcenter_hostname}{VCENTER_CERTS_ENDPOINT}"
+    lsf.write_output(f'Downloading CA certificates from: {url}')
+    
+    try:
+        response = requests.get(url, timeout=30, verify=False)
+        
+        if response.status_code != 200:
+            lsf.write_output(f'ERROR: Failed to download certificates: HTTP {response.status_code}')
+            return None
+        
+        # Extract certificates from zip
+        certificates = []
+        
+        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+            # Look for .crt files in the win folder (or .0 files in lin folder)
+            for filename in zf.namelist():
+                # Prefer Windows format (.crt) or Linux format (.0)
+                if filename.endswith('.crt') or (filename.endswith('.0') and '/lin/' in filename):
+                    # Skip CRL files
+                    if '.r0' in filename or '.crl' in filename:
+                        continue
+                    
+                    cert_data = zf.read(filename)
+                    cert_pem = cert_data.decode('utf-8')
+                    
+                    # Verify it's a valid certificate
+                    if '-----BEGIN CERTIFICATE-----' in cert_pem:
+                        # Extract a friendly name from the certificate
+                        try:
+                            result = subprocess.run(
+                                ['openssl', 'x509', '-noout', '-subject'],
+                                input=cert_pem,
+                                capture_output=True,
+                                text=True
+                            )
+                            if result.returncode == 0:
+                                subject = result.stdout.strip()
+                                # Extract CN or O from subject
+                                cert_name = f"{vcenter_hostname} CA"
+                                if 'O = ' in subject:
+                                    # Extract organization
+                                    org = subject.split('O = ')[1].split(',')[0].strip()
+                                    cert_name = f"{org} CA"
+                            else:
+                                cert_name = f"{vcenter_hostname} CA"
+                        except:
+                            cert_name = f"{vcenter_hostname} CA"
+                        
+                        certificates.append((cert_name, cert_pem))
+                        lsf.write_output(f'  Found certificate: {cert_name}')
+                        # Only take the first valid certificate per format
+                        break
+        
+        if not certificates:
+            lsf.write_output('ERROR: No valid CA certificates found in download')
+            return None
+        
+        lsf.write_output(f'Successfully extracted {len(certificates)} CA certificate(s)')
+        return certificates
+        
+    except Exception as e:
+        lsf.write_output(f'ERROR: Failed to download/extract certificates: {e}')
+        return None
+
+
+def prompt_vcenter_unavailable(vcenter_hostname: str, message: str) -> str:
+    """
+    Prompt user for action when a vCenter CA is not accessible.
+    
+    :param vcenter_hostname: The vCenter that is not accessible
+    :param message: Error message describing the issue
+    :return: User's choice: 'skip', 'retry', or 'fail'
+    """
+    print('')
+    print('!' * 60)
+    print(f'  WARNING: vCenter CA Certificate Not Accessible')
+    print('!' * 60)
+    print('')
+    print(f'  vCenter: {vcenter_hostname}')
+    print(f'  {message}')
+    print('')
+    print('  Options:')
+    print('    [S]kip  - Skip this vCenter and continue')
+    print('    [R]etry - Check this vCenter again')
+    print('    [F]ail  - Exit the script with an error')
+    print('')
+    
+    while True:
+        choice = input('  Enter choice [S/R/F]: ').strip().upper()
+        if choice in ['S', 'SKIP']:
+            return 'skip'
+        elif choice in ['R', 'RETRY']:
+            return 'retry'
+        elif choice in ['F', 'FAIL']:
+            return 'fail'
+        else:
+            print('  Invalid choice. Please enter S, R, or F.')
+
+
+def configure_vcenter_ca_for_firefox(dry_run: bool = False) -> bool:
+    """
+    Download CA certificates from all vCenters and import into Firefox.
+    
+    This function:
+    1. Reads vCenter list from /tmp/config.ini
+    2. For each vCenter, checks accessibility (with SKIP/RETRY/FAIL options)
+    3. Downloads CA certificates from the vCenter's /certs/download.zip endpoint
+    4. Imports each CA as a trusted authority in Firefox on the console VM
+    
+    After running this function, Firefox on the console VM will trust
+    certificates from all vCenters without showing security warnings.
+    
+    PREREQUISITES:
+    - libnss3-tools package must be installed (provides certutil)
+    - vCenter servers must be accessible
+    - Firefox profile must exist on the console VM
+    
+    :param dry_run: If True, preview what would be done
+    :return: True if successful (or all failures were skipped)
+    """
+    lsf.write_output('')
+    lsf.write_output('=' * 60)
+    lsf.write_output('vCenter CA Certificate Import for Firefox')
+    lsf.write_output('=' * 60)
+    
+    # Step 1: Get vCenters from config
+    vcenters = get_vcenters_from_config()
+    
+    if not vcenters:
+        lsf.write_output('No vCenters found in config.ini - skipping vCenter CA import')
+        return True
+    
+    lsf.write_output(f'Found {len(vcenters)} vCenter(s) in config.ini: {", ".join(vcenters)}')
+    
+    # Step 2: Ensure certutil is installed
+    if not dry_run:
+        if not check_certutil_installed():
+            if not install_certutil(dry_run):
+                lsf.write_output('ERROR: Cannot proceed without certutil')
+                return False
+    
+    # Step 3: Find Firefox profiles
+    profiles = find_firefox_profiles()
+    
+    if not profiles:
+        lsf.write_output('WARNING: No Firefox profiles found on console VM')
+        return False
+    
+    lsf.write_output(f'Found {len(profiles)} Firefox profile(s)')
+    
+    # Step 4: Process each vCenter
+    overall_success = True
+    imported_count = 0
+    
+    for vcenter in vcenters:
+        lsf.write_output('')
+        lsf.write_output(f'Processing vCenter: {vcenter}')
+        lsf.write_output('-' * 40)
+        
+        if dry_run:
+            lsf.write_output(f'  Would check accessibility of {vcenter}')
+            lsf.write_output(f'  Would download CA from https://{vcenter}{VCENTER_CERTS_ENDPOINT}')
+            lsf.write_output(f'  Would import CA to {len(profiles)} Firefox profile(s)')
+            imported_count += 1
+            continue
+        
+        # Check accessibility with retry loop
+        while True:
+            lsf.write_output(f'Checking vCenter accessibility...')
+            accessible, message = check_vcenter_accessible(vcenter)
+            
+            if accessible:
+                lsf.write_output(f'✓ {message}')
+                break
+            else:
+                choice = prompt_vcenter_unavailable(vcenter, message)
+                
+                if choice == 'skip':
+                    lsf.write_output(f'Skipping vCenter {vcenter} (user choice)')
+                    break
+                elif choice == 'retry':
+                    lsf.write_output('Retrying...')
+                    continue
+                elif choice == 'fail':
+                    lsf.write_output(f'Exiting due to vCenter unavailability (user choice)')
+                    return False
+        
+        if not accessible:
+            continue  # Skip this vCenter
+        
+        # Download CA certificates
+        certificates = download_vcenter_ca_certificates(vcenter)
+        
+        if not certificates:
+            lsf.write_output(f'WARNING: Could not get CA certificates from {vcenter}')
+            continue
+        
+        # Import each certificate to Firefox profiles
+        for cert_name, cert_pem in certificates:
+            for profile_path in profiles:
+                if import_ca_to_firefox_profile(cert_pem, profile_path, cert_name, dry_run):
+                    imported_count += 1
+    
+    # Summary
+    lsf.write_output('')
+    if imported_count > 0:
+        lsf.write_output(f'Successfully imported CA certificates from {len(vcenters)} vCenter(s)')
+        lsf.write_output('Firefox will now trust vCenter-signed certificates')
+        return True
+    else:
+        lsf.write_output('WARNING: No vCenter CA certificates were imported')
+        return overall_success
+
+
+#==============================================================================
 # FINAL CLEANUP
 #==============================================================================
 
@@ -1918,7 +2227,8 @@ def main():
     Main entry point for HOLification tool.
     
     Orchestrates all HOLification steps in the correct order:
-    0. Vault root CA import to Firefox on console VM (with SKIP/RETRY/FAIL options)
+    0a. Vault root CA import to Firefox on console VM (with SKIP/RETRY/FAIL options)
+    0b. vCenter CA certificates import to Firefox on console VM (with SKIP/RETRY/FAIL options)
     1. Pre-checks and environment setup
     2. ESXi host configuration
     3. vCenter configuration
@@ -1988,10 +2298,16 @@ NOTE: Some NSX operations require manual steps first.
     
     lsf.write_output("Pre-check: 'expect' utility is present")
     
-    # Step 0: Import Vault root CA to Firefox on console VM (at the beginning)
+    # Step 0a: Import Vault root CA to Firefox on console VM (at the beginning)
     # This allows the user to skip/retry/fail early if Vault is not accessible
     if not configure_vault_ca_for_firefox(args.dry_run):
         lsf.write_output('ERROR: Failed to configure Vault CA for Firefox')
+        sys.exit(1)
+    
+    # Step 0b: Import vCenter CA certificates to Firefox on console VM
+    # This reads vCenters from config.ini and imports their CA certificates
+    if not configure_vcenter_ca_for_firefox(args.dry_run):
+        lsf.write_output('ERROR: Failed to configure vCenter CA certificates for Firefox')
         sys.exit(1)
     
     # Setup SSH environment
