@@ -237,6 +237,50 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if dashboard:
         dashboard.update_task('vcf', 'nsx_edges', TaskStatus.COMPLETE)
+        dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 4b: Start Post-Edge VMs (e.g., Aria Automation appliances)
+    #==========================================================================
+    # These VMs need to boot after NSX Edges are up but before vCenter
+    # to allow maximum boot time. Aria Automation (auto-a) is a typical
+    # example that benefits from early boot.
+    
+    if lsf.config.has_option('VCF', 'vcfpostedgevms'):
+        vcfpostedgevms_raw = lsf.config.get('VCF', 'vcfpostedgevms')
+        vcfpostedgevms = [v.strip() for v in vcfpostedgevms_raw.split('\n') 
+                         if v.strip() and not v.strip().startswith('#')]
+        
+        if vcfpostedgevms:
+            lsf.write_vpodprogress('VCF Post-Edge VMs start', 'GOOD-3')
+            lsf.write_output('Starting post-edge VMs (Aria Automation, etc.)...')
+            
+            if not dry_run:
+                # Check if any post-edge VMs need to be started
+                postedge_need_start = False
+                for entry in vcfpostedgevms:
+                    parts = entry.split(':')
+                    vm_name = parts[0].strip()
+                    vms = lsf.get_vm_by_name(vm_name)
+                    for vm in vms:
+                        if vm.runtime.powerState != 'poweredOn':
+                            postedge_need_start = True
+                            break
+                    if postedge_need_start:
+                        break
+                
+                if postedge_need_start:
+                    lsf.start_nested(vcfpostedgevms)
+                    # Short wait - these VMs will continue booting in parallel
+                    # with subsequent startup tasks
+                    lsf.write_output('Post-edge VMs started, continuing with startup...')
+                    lsf.labstartup_sleep(30)
+                else:
+                    lsf.write_output('All post-edge VMs already powered on')
+            else:
+                lsf.write_output(f'Would start post-edge VMs: {vcfpostedgevms}')
+    
+    if dashboard:
         dashboard.update_task('vcf', 'vcenter', TaskStatus.RUNNING)
         dashboard.generate_html()
     

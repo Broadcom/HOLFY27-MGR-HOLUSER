@@ -5,10 +5,10 @@ download.java.net
 odyssey.vmware.com
 odyssey-dev.vmware.com
 odyssey-stage.vmware.com
-s3-us-west-1.amazonaws.com
 archive.ubuntu.com
 security.ubuntu.com
 packages.microsoft.com
+s3-us-west-1.amazonaws.com
 q1uk5yfspf.execute-api.us-east-2.amazonaws.com
 cjguvz7527.execute-api.us-west-1.amazonaws.com
 auyrv6ve2i.execute-api.us-west-2.amazonaws.com

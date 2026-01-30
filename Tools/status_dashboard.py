@@ -101,63 +101,121 @@ class StatusDashboard:
             self._load_state()
     
     def _init_default_groups(self):
-        """Initialize default task groups based on startup sequence"""
+        """
+        Initialize default task groups based on startup module sequence.
+        
+        Groups are ordered top-to-bottom matching the actual execution order
+        from labstartup.py. Each group corresponds to a Startup/ module.
+        
+        Execution order:
+        1. prelim.py    - Preliminary checks (DNS, README, firewall)
+        2. ESXi.py      - ESXi host verification
+        3. VCF.py       - VCF startup (management cluster, NSX, vCenter)
+        4. VVF.py       - VVF startup (alternative to VCF)
+        5. vSphere.py   - vSphere configuration (clusters, VMs)
+        6. pings.py     - Network connectivity verification
+        7. services.py  - Linux services and TCP port verification
+        8. Kubernetes.py - Kubernetes certificate checks
+        9. VCFfinal.py  - VCF final tasks (Tanzu, Aria)
+        10. urls.py     - URL verification
+        11. odyssey.py  - Odyssey client installation
+        12. final.py    - Final checks and cleanup
+        """
+        # Define groups in execution order (top-to-bottom)
         default_groups = [
-            ('prelim', 'Preliminary Checks', [
+            # Group 1: prelim.py - Preliminary Checks
+            ('prelim', '1. Preliminary Checks (prelim.py)', [
+                ('readme', 'README Sync', 'Copy README to console desktop'),
+                ('update_manager', 'Update Manager', 'Disable Ubuntu update popups'),
                 ('dns', 'DNS Health Checks', 'Verify DNS resolution for all sites'),
                 ('dns_import', 'DNS Record Import', 'Import custom DNS records'),
-                ('readme', 'README Sync', 'Synchronize README to console'),
                 ('firewall', 'Firewall Verification', 'Confirm firewall is active'),
-                ('odyssey_cleanup', 'Odyssey Cleanup', 'Remove existing Odyssey files')
+                ('proxy_filter', 'Proxy Filter', 'Verify proxy filtering is active'),
             ]),
-            ('esxi', 'ESXi Hosts', [
-                ('host_check', 'Host Verification', 'Verify nested ESXi hosts are responding')
+            
+            # Group 2: ESXi.py - ESXi Host Verification
+            ('esxi', '2. ESXi Host Verification (ESXi.py)', [
+                ('host_check', 'Host Connectivity', 'Ping and verify ESXi hosts are responding'),
+                ('host_ports', 'Host Port Checks', 'Verify ESXi management ports (443, 902)'),
             ]),
-            ('vcf', 'VCF Startup', [
+            
+            # Group 3: VCF.py - VCF Startup (skipped for VVF labs)
+            ('vcf', '3. VCF Startup (VCF.py)', [
                 ('mgmt_cluster', 'Management Cluster', 'Connect to VCF management cluster hosts'),
+                ('exit_maintenance', 'Exit Maintenance Mode', 'Remove hosts from maintenance mode'),
                 ('datastore', 'Datastore Verification', 'Verify VCF management datastore'),
-                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager'),
+                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager VM'),
                 ('nsx_edges', 'NSX Edge VMs', 'Start NSX Edge virtual machines'),
-                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server')
+                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server'),
             ]),
-            ('vvf', 'VVF Startup', [
+            
+            # Group 4: VVF.py - VVF Startup (skipped for VCF labs)
+            ('vvf', '4. VVF Startup (VVF.py)', [
                 ('mgmt_cluster', 'Management Cluster', 'Connect to VVF management cluster hosts'),
+                ('exit_maintenance', 'Exit Maintenance Mode', 'Remove hosts from maintenance mode'),
                 ('datastore', 'Datastore Verification', 'Verify VVF management datastore'),
-                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager'),
+                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager VM'),
                 ('nsx_edges', 'NSX Edge VMs', 'Start NSX Edge virtual machines'),
-                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server')
+                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server'),
             ]),
-            ('vsphere', 'vSphere Configuration', [
+            
+            # Group 5: vSphere.py - vSphere Configuration
+            ('vsphere', '5. vSphere Configuration (vSphere.py)', [
+                ('vcenter_wait', 'Wait for vCenter', 'Wait for vCenter to become available'),
                 ('vcenter_connect', 'vCenter Connection', 'Connect to vCenter servers'),
                 ('datastores', 'Datastore Verification', 'Verify all datastores are accessible'),
-                ('maintenance', 'Maintenance Mode', 'Exit hosts from maintenance mode'),
+                ('maintenance', 'Exit Maintenance Mode', 'Exit hosts from maintenance mode'),
                 ('vcls', 'vCLS Verification', 'Verify vCLS VMs are running'),
                 ('drs', 'DRS Configuration', 'Configure DRS settings'),
-                ('shell_warning', 'Shell Warning', 'Suppress ESXi shell warnings'),
-                ('vcenter_ready', 'vCenter Ready', 'Wait for vCenter to be ready'),
-                ('nested_vms', 'Nested VMs', 'Power on nested virtual machines')
+                ('shell_warning', 'Shell Warning Suppress', 'Suppress ESXi shell warnings'),
+                ('power_on_vms', 'Power On VMs', 'Power on configured virtual machines'),
+                ('power_on_vapps', 'Power On vApps', 'Power on configured vApps'),
             ]),
-            ('services', 'Service Verification', [
-                ('pings', 'Network Connectivity', 'Verify IP connectivity'),
+            
+            # Group 6: pings.py - Network Connectivity
+            ('pings', '6. Network Connectivity (pings.py)', [
+                ('ping_targets', 'Ping Targets', 'Verify IP connectivity to configured hosts'),
+            ]),
+            
+            # Group 7: services.py - Service Verification
+            ('services', '7. Service Verification (services.py)', [
+                ('linux_services', 'Linux Services', 'Start and verify Linux services'),
                 ('tcp_ports', 'TCP Port Checks', 'Verify service ports are responding'),
-                ('linux_services', 'Linux Services', 'Start and verify Linux services')
             ]),
-            ('kubernetes', 'Kubernetes', [
-                ('cert_check', 'Certificate Renewal', 'Check and renew Kubernetes certificates')
+            
+            # Group 8: Kubernetes.py - Kubernetes Certificates
+            ('kubernetes', '8. Kubernetes Certificates (Kubernetes.py)', [
+                ('cert_check', 'Certificate Check', 'Check Kubernetes certificate expiration'),
+                ('cert_renew', 'Certificate Renewal', 'Renew expired certificates if needed'),
             ]),
-            ('vcffinal', 'VCF Final', [
-                ('tanzu_control', 'Tanzu Control Plane', 'Start Tanzu Supervisor control plane VMs'),
-                ('tanzu_deploy', 'Tanzu Deployment', 'Deploy Tanzu components'),
+            
+            # Group 9: VCFfinal.py - VCF Final Tasks
+            ('vcffinal', '9. VCF Final Tasks (VCFfinal.py)', [
+                ('tanzu_control', 'Tanzu Control Plane', 'Start Supervisor control plane VMs'),
+                ('tanzu_workload', 'Tanzu Workload Cluster', 'Start workload cluster VMs'),
                 ('aria_vms', 'Aria VMs', 'Start Aria Automation virtual machines'),
-                ('aria_urls', 'Aria URLs', 'Verify Aria Automation URLs')
+                ('aria_urls', 'Aria URL Verification', 'Verify Aria Automation URLs'),
             ]),
-            ('odyssey', 'Odyssey', [
-                ('install', 'Odyssey Installation', 'Install Odyssey client if enabled')
+            
+            # Group 10: urls.py - URL Verification
+            ('urls', '10. URL Verification (urls.py)', [
+                ('url_checks', 'URL Checks', 'Verify all configured web interfaces'),
             ]),
-            ('final', 'Final Checks', [
-                ('url_checks', 'URL Verification', 'Verify all web interfaces'),
-                ('custom', 'Custom Checks', 'Lab-specific final checks')
-            ])
+            
+            # Group 11: odyssey.py - Odyssey Installation
+            ('odyssey', '11. Odyssey Installation (odyssey.py)', [
+                ('cleanup', 'Odyssey Cleanup', 'Remove existing Odyssey files'),
+                ('install', 'Odyssey Install', 'Download and install Odyssey client'),
+                ('shortcut', 'Desktop Shortcut', 'Create desktop shortcut'),
+            ]),
+            
+            # Group 12: final.py - Final Checks
+            ('final', '12. Final Checks (final.py)', [
+                ('custom', 'Custom Checks', 'Lab-specific final checks'),
+                ('labcheck', 'LabCheck Schedule', 'Configure labcheck scheduled task'),
+                ('holuser_lock', 'HolUser Lock', 'Lock holuser account if configured'),
+                ('ready', 'Lab Ready', 'Mark lab as ready'),
+            ]),
         ]
         
         for group_id, group_name, tasks in default_groups:
@@ -902,11 +960,27 @@ if __name__ == '__main__':
         dashboard = StatusDashboard(args.sku)
         
         if args.demo:
-            # Simulate some progress
-            dashboard.update_task('prelim', 'dns', 'complete')
+            # Simulate some progress through the startup sequence
+            # Group 1: prelim - some complete, one running
             dashboard.update_task('prelim', 'readme', 'complete')
-            dashboard.update_task('prelim', 'firewall', 'running', 'Checking firewall status...')
-            dashboard.update_task('infrastructure', 'esxi', 'running')
+            dashboard.update_task('prelim', 'update_manager', 'complete')
+            dashboard.update_task('prelim', 'dns', 'complete')
+            dashboard.update_task('prelim', 'dns_import', 'complete')
+            dashboard.update_task('prelim', 'firewall', 'complete')
+            dashboard.update_task('prelim', 'proxy_filter', 'complete')
+            
+            # Group 2: esxi - complete
+            dashboard.update_task('esxi', 'host_check', 'complete')
+            dashboard.update_task('esxi', 'host_ports', 'complete')
+            
+            # Group 3: vcf - running
+            dashboard.update_task('vcf', 'mgmt_cluster', 'complete')
+            dashboard.update_task('vcf', 'exit_maintenance', 'complete')
+            dashboard.update_task('vcf', 'datastore', 'complete')
+            dashboard.update_task('vcf', 'nsx_mgr', 'running', 'Waiting for NSX Manager to start...')
+            
+            # Group 4: vvf - skipped (VCF lab)
+            dashboard.skip_group('vvf', 'VCF lab - VVF not applicable')
         
         dashboard.generate_html()
         print(f'Dashboard generated at: {STATUS_FILE}')
