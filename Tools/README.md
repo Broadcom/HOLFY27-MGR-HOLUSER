@@ -8,32 +8,36 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
 
 ## Table of Contents
 
-- [Python Scripts](#python-scripts)
-  - [confighol.py](#configholpy)
-  - [checkfw.py](#checkfwpy)
-  - [dns_checks.py](#dns_checkspy)
-  - [labtypes.py](#labtypespy)
-  - [status_dashboard.py](#status_dashboardpy)
-  - [tdns_import.py](#tdns_importpy)
-  - [vpodchecker.py](#vpodcheckerpy)
-- [Shell Scripts](#shell-scripts)
-  - [fwoff.sh / fwon.sh](#fwoffsh--fwonsh)
-  - [proxyfilteroff.sh / proxyfilteron.sh](#proxyfilteroffsh--proxyfilteronsh)
-  - [holpwgen.sh](#holpwgensh)
-  - [lkill.sh](#lkillsh)
-  - [odyssey-launch.sh](#odyssey-launchsh)
-  - [restart_k8s_webhooks.sh](#restart_k8s_webhookssh)
-  - [runautocheck.sh](#runautochecksh)
-  - [VLPagent.sh](#vlpagentsh)
-  - [watchvcfa.sh](#watchvcfash)
-  - [vcfapwcheck.sh](#vcfapwchecksh)
-- [Expect Scripts](#expect-scripts)
-  - [sddcmgr.exp](#sddcmgrexp)
-  - [vcfapass.sh](#vcfapasssh)
-  - [vcshell.exp](#vcshellexp)
-- [Configuration Files](#configuration-files)
-  - [VMware.config](#vmwareconfig)
-  - [launch_odyssey.desktop](#launch_odysseydesktop)
+- [HOLFY27 Tools](#holfy27-tools)
+  - [Table of Contents](#table-of-contents)
+  - [Python Scripts](#python-scripts)
+    - [confighol.py](#configholpy)
+    - [checkfw.py](#checkfwpy)
+    - [dns\_checks.py](#dns_checkspy)
+    - [labtypes.py](#labtypespy)
+    - [status\_dashboard.py](#status_dashboardpy)
+    - [tdns\_import.py](#tdns_importpy)
+    - [vpodchecker.py](#vpodcheckerpy)
+  - [Shell Scripts](#shell-scripts)
+    - [fwoff.sh / fwon.sh](#fwoffsh--fwonsh)
+    - [proxyfilteroff.sh / proxyfilteron.sh](#proxyfilteroffsh--proxyfilteronsh)
+    - [holpwgen.sh](#holpwgensh)
+    - [lkill.sh](#lkillsh)
+    - [odyssey-launch.sh](#odyssey-launchsh)
+    - [restart\_k8s\_webhooks.sh](#restart_k8s_webhookssh)
+    - [runautocheck.sh](#runautochecksh)
+    - [VLPagent.sh](#vlpagentsh)
+    - [watchvcfa.sh](#watchvcfash)
+    - [vcfapwcheck.sh](#vcfapwchecksh)
+  - [Expect Scripts](#expect-scripts)
+    - [sddcmgr.exp](#sddcmgrexp)
+    - [vcfapass.sh](#vcfapasssh)
+    - [vcshell.exp](#vcshellexp)
+  - [Configuration Files](#configuration-files)
+    - [VMware.config](#vmwareconfig)
+    - [launch\_odyssey.desktop](#launch_odysseydesktop)
+  - [Dependencies](#dependencies)
+  - [Support](#support)
 
 ---
 
@@ -41,40 +45,97 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
 
 ### confighol.py
 
-**vApp HOLification Tool**
+**vApp HOLification Tool:**
 
 Comprehensive automation tool for "HOLifying" vApp templates after the Holodeck factory build process. This script consolidates and replaces the previous `esx-config.py` and `configvsphere.ps1` scripts into a single, unified tool.
 
+**Execution Order:**
+
+0. **Vault Root CA Import** (with SKIP/RETRY/FAIL options)
+1. Pre-checks and environment setup
+2. ESXi host configuration
+3. vCenter configuration
+4. NSX configuration
+5. SDDC Manager configuration
+6. Operations VMs configuration
+7. Final cleanup
+
 **Features:**
 
-1. **ESXi Host Configuration:**
+1. **Vault CA Import (Step 0):**
+   - Runs first, before any other configuration steps
+   - Checks if Vault is accessible with a 5-second timeout
+   - Downloads and imports the Vault root CA certificate
+   - Interactive options when Vault is unavailable:
+     - **[S]kip** - Continue without importing (Firefox will show certificate warnings)
+     - **[R]etry** - Check Vault again after fixing the issue
+     - **[F]ail** - Exit the script with an error
+   - Imports the CA into Firefox's certificate store on the console VM
+
+2. **ESXi Host Configuration:**
    - Enables SSH service via vSphere API
    - Configures SSH to auto-start on boot
    - Copies holuser public keys for passwordless SSH access
-   - Sets non-expiring passwords (9999 days)
    - Disables session timeout
+   - Detailed success/failure logging for each operation
+   - **Note:** Password expiration is not configured on ESXi (chage command not valid)
 
-2. **vCenter Configuration:**
+3. **vCenter Configuration:**
    - Enables bash shell for root user
    - Configures SSH authorized_keys
    - Enables browser support and MOB (Managed Object Browser)
    - Sets password policies (9999 days expiration)
    - Disables HA Admission Control
    - Configures DRS to PartiallyAutomated
+   - Creates new vSphere connection if session is invalid
    - Clears ARP cache
 
-3. **NSX Configuration:**
+4. **NSX Configuration:**
    - Enables SSH via REST API on NSX Managers
    - Configures SSH start-on-boot
    - Removes password expiration for admin, root, audit users
 
-4. **SDDC Manager Configuration:**
+5. **SDDC Manager Configuration:**
    - Configures SSH authorized_keys
    - Sets non-expiring passwords for vcf, backup, root accounts
 
-5. **Operations VMs Configuration:**
-   - Sets non-expiring passwords
+6. **Operations VMs Configuration:**
+   - Checks host reachability (ping) before attempting SSH
+   - Checks if SSH port 22 is open
+   - Sets non-expiring passwords for root
    - Configures SSH authorized_keys
+   - Detailed success/failure logging with error messages
+   - Reports authentication failures with username/password info
+
+**Vault Accessibility Check:**
+
+When Vault is not accessible, users see:
+
+```bash
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+WARNING: Vault PKI CA Certificate Not Accessible
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+Connection timeout - Vault server not responding at http://10.1.1.1:32000
+
+The Vault root CA certificate is used to establish trust
+for VCF component certificates in Firefox on the console VM.
+
+Options:
+  [S]kip  - Continue without importing Vault CA
+            (Firefox will show certificate warnings)
+  [R]etry - Check Vault again (if you have fixed the issue)
+  [F]ail  - Exit the script with an error
+
+Enter choice [S/R/F]:
+```
+
+**New Functions:**
+
+| Function | Description |
+| ---------- | ------------- |
+| `check_vault_accessible(vault_url, ca_path, timeout)` | Returns (bool, str) tuple indicating if Vault is reachable |
+| `prompt_vault_unavailable(message)` | Interactive prompt for user choice when Vault is unavailable |
 
 **Usage:**
 
@@ -98,13 +159,14 @@ python3 confighol.py --esx-only
 **Options:**
 
 | Option | Description |
-|--------|-------------|
+| -------- | ------------- |
 | `--dry-run` | Preview what would be done without making changes |
 | `--skip-vcshell` | Skip vCenter shell configuration |
 | `--skip-nsx` | Skip NSX configuration |
 | `--esx-only` | Only configure ESXi hosts |
 
 **Prerequisites:**
+
 - Complete successful LabStartup reaching Ready state
 - Valid `/tmp/config.ini` with all resources defined
 - `expect` utility installed (`/usr/bin/expect`)
@@ -115,7 +177,7 @@ python3 confighol.py --esx-only
 
 ### checkfw.py
 
-**Firewall Connectivity Check**
+**Firewall Connectivity Check:**
 
 A simple utility to test if the firewall is blocking external connectivity. Tests TCP connection to `www.broadcom.com` on port 443.
 
@@ -126,6 +188,7 @@ python3 checkfw.py
 ```
 
 **Output:**
+
 - `Good` - Firewall is blocking external access (expected in production)
 - `Bad` - External access is available (unexpected in production)
 
@@ -133,11 +196,12 @@ python3 checkfw.py
 
 ### dns_checks.py
 
-**DNS Health Check Module**
+**DNS Health Check Module:**
 
 Performs DNS resolution checks for Site A, Site B, and external DNS to verify the lab's DNS infrastructure is working correctly.
 
 **Features:**
+
 - Checks DNS resolution against the Holorouter DNS server (10.1.10.129)
 - Validates Site A, Site B, and external DNS resolution
 - Retries with timeout for lab startup integration
@@ -162,7 +226,7 @@ python3 dns_checks.py --dns-server 10.1.10.130
 **Options:**
 
 | Option | Description |
-|--------|-------------|
+| -------- | ------------- |
 | `-c, --check` | Which check to run: `site_a`, `site_b`, `external`, or `all` |
 | `-t, --timeout` | Timeout in minutes (default: 5) |
 | `-s, --dns-server` | DNS server to use |
@@ -172,7 +236,7 @@ python3 dns_checks.py --dns-server 10.1.10.130
 
 ### labtypes.py
 
-**Lab Type Execution Path Manager**
+**Lab Type Execution Path Manager:**
 
 Manages different startup sequences for different lab types (HOL, Discovery, VXP, ATE, EDU). Handles module loading priority and lab-type specific configurations.
 
@@ -187,6 +251,7 @@ Manages different startup sequences for different lab types (HOL, Discovery, VXP
 | EDU | Education | Yes | Yes | Training environments |
 
 **Module Loading Priority:**
+
 1. `/vpodrepo/20XX-labs/XXXX/Startup/{module}.py` (vpodrepo Startup override)
 2. `/vpodrepo/20XX-labs/XXXX/{module}.py` (vpodrepo root override)
 3. `/home/holuser/hol/Startup.{labtype}/{module}.py` (LabType-specific core)
@@ -216,11 +281,12 @@ if loader.requires_firewall():
 
 ### status_dashboard.py
 
-**Lab Startup Status Dashboard**
+**Lab Startup Status Dashboard:**
 
 Generates an auto-refreshing HTML status page for monitoring lab startup progress. Provides real-time visibility into which startup phases are complete, running, or pending.
 
 **Features:**
+
 - Auto-refreshing HTML dashboard (every 30 seconds)
 - Color-coded status indicators (pending, running, complete, failed, skipped)
 - Progress bars for overall and per-group progress
@@ -268,11 +334,12 @@ dashboard.generate_html()
 
 ### tdns_import.py
 
-**DNS Record Import Module**
+**DNS Record Import Module:**
 
 Imports custom DNS records into the lab's DNS server using the `tdns-mgr` command-line tool. Supports both inline config.ini records and CSV file imports.
 
 **Features:**
+
 - Reads DNS records from config.ini `[VPOD] new-dns-records`
 - Supports CSV file import (`new-dns-records.csv`)
 - Automatic PTR record creation with `--ptr` flag
@@ -317,16 +384,33 @@ python3 tdns_import.py --show-config
 
 ### vpodchecker.py
 
-**Lab Validation Tool**
+**Lab Validation Tool:**
 
 Validates lab configuration against HOL standards. Checks SSL certificates, vSphere licenses, NTP configuration, and VM settings.
 
 **Checks Performed:**
-- **SSL Certificates:** Expiration dates for all HTTPS endpoints
-- **vSphere Licenses:** Validity and expiration within lab window
+
+- **SSL Certificates:** Expiration dates for all HTTPS endpoints, including:
+  - URLs from `[RESOURCES]` section
+  - ESXi hosts from `[RESOURCES] ESXiHosts` (extracts FQDN before `:`)
+  - NSX Managers from `[VCF] vcfnsxmgr`
+  - VRA URLs from `[VCFFINAL] vraurls`
+- **vSphere Licenses:** Validity and expiration with time-based status:
+  - ✅ Green checkmark: License expires >= 9 months from now
+  - ⚠️ Warning: License expires < 9 months but >= 3 months from now
+  - ❌ Red X: License expires < 3 months from now
+  - All status messages include the expiration date
 - **NTP Configuration:** ESXi host NTP service and server settings
 - **VM Configuration:** `uuid.action`, `typematicMinDelay`, `autolock` settings
 - **VM Resources:** Reservations and shares (optional)
+
+**Skipped System VMs:**
+
+The following system VMs are automatically skipped for VM configuration checks (they cannot be modified):
+
+- `vCLS-*` - vSphere Cluster Services VMs
+- `vcf-services-platform-template-*` - VCF Services Platform Template VMs
+- `SupervisorControlPlaneVM*` - Tanzu Supervisor Control Plane VMs
 
 **Usage:**
 
@@ -350,7 +434,7 @@ python3 vpodchecker.py --verbose
 **Options:**
 
 | Option | Description |
-|--------|-------------|
+| -------- | ------------- |
 | `--report-only` | Don't fix issues, just report |
 | `--json` | Output as JSON |
 | `--html FILE` | Generate HTML report to specified file |
@@ -362,7 +446,7 @@ python3 vpodchecker.py --verbose
 
 ### fwoff.sh / fwon.sh
 
-**Firewall Control (Development Only)**
+**Firewall Control (Development Only):**
 
 Toggle the lab firewall on or off. **Only works in development cloud environments** - blocked in production.
 
@@ -377,6 +461,7 @@ Toggle the lab firewall on or off. **Only works in development cloud environment
 ```
 
 **How it Works:**
+
 - Creates a flag file in `/tmp/holorouter/` that the router watcher processes
 - The firewall change is applied on the next router watcher cycle
 - Firewall is automatically re-enabled on router reboot
@@ -385,7 +470,7 @@ Toggle the lab firewall on or off. **Only works in development cloud environment
 
 ### proxyfilteroff.sh / proxyfilteron.sh
 
-**Proxy Filter Control (Development Only)**
+**Proxy Filter Control (Development Only):**
 
 Toggle the proxy filter on or off. **Only works in development cloud environments** - blocked in production.
 
@@ -400,6 +485,7 @@ Toggle the proxy filter on or off. **Only works in development cloud environment
 ```
 
 **How it Works:**
+
 - Creates a flag file in `/tmp/holorouter/` that the router watcher processes
 - Works similar to firewall control scripts
 
@@ -407,11 +493,12 @@ Toggle the proxy filter on or off. **Only works in development cloud environment
 
 ### holpwgen.sh
 
-**HOL Password Generator**
+**HOL Password Generator:**
 
 Generates a strong, random password that meets HOL complexity requirements.
 
 **Password Requirements:**
+
 - 16 characters long
 - At least one lowercase letter
 - At least one uppercase letter
@@ -430,7 +517,7 @@ Generates a strong, random password that meets HOL complexity requirements.
 
 ### lkill.sh
 
-**LabStartup Kill Script**
+**LabStartup Kill Script:**
 
 Terminates running labstartup.py processes. Useful for stopping a lab startup in progress.
 
@@ -441,6 +528,7 @@ Terminates running labstartup.py processes. Useful for stopping a lab startup in
 ```
 
 **What it Does:**
+
 1. Finds and kills the parent `labstartup.py` process
 2. Finds and kills any child Startup module processes
 
@@ -448,7 +536,7 @@ Terminates running labstartup.py processes. Useful for stopping a lab startup in
 
 ### odyssey-launch.sh
 
-**Odyssey Client Launcher**
+**Odyssey Client Launcher:**
 
 Launches the Odyssey desktop client in the background.
 
@@ -462,11 +550,12 @@ Launches the Odyssey desktop client in the background.
 
 ### restart_k8s_webhooks.sh
 
-**Kubernetes Webhook Restart Script**
+**Kubernetes Webhook Restart Script:**
 
 Deletes expired certificates and restarts Kubernetes webhooks on Supervisor clusters. Required for labs with Tanzu/vSphere with Kubernetes when certificates have expired.
 
 **What it Does:**
+
 1. SSH to vCenter and extract Supervisor credentials using `decryptK8Pwd.py`
 2. Delete expired certificate secrets
 3. Restart webhook deployments
@@ -486,11 +575,12 @@ Deletes expired certificates and restarts Kubernetes webhooks on Supervisor clus
 
 ### runautocheck.sh
 
-**AutoCheck Runner**
+**AutoCheck Runner:**
 
 Executes the lab's AutoCheck validation suite. Searches for AutoCheck scripts in multiple locations.
 
 **Search Order:**
+
 1. `${VPOD_REPO}/autocheck.py` (Python, preferred)
 2. `${VPOD_REPO}/autocheck.ps1` (PowerShell)
 3. `/media/cdrom0/autocheck.ps1` (Legacy CD-based)
@@ -507,11 +597,12 @@ Executes the lab's AutoCheck validation suite. Searches for AutoCheck scripts in
 
 ### VLPagent.sh
 
-**VLP Agent Management**
+**VLP Agent Management:**
 
 Manages the VLP VM Agent installation and event handling. The VLP Agent enables communication with the lab platform.
 
 **Features:**
+
 - Installs VLP Agent (version 1.0.10)
 - Cleans up old agent versions
 - Handles prepop and lab start events
@@ -524,6 +615,7 @@ Manages the VLP VM Agent installation and event handling. The VLP Agent enables 
 ```
 
 **Event Triggers:**
+
 - `/tmp/prepop.txt` - Prepop start notification
 - `/tmp/labstart.txt` - Lab start notification
 
@@ -531,11 +623,12 @@ Manages the VLP VM Agent installation and event handling. The VLP Agent enables 
 
 ### watchvcfa.sh
 
-**VCF Automation Watcher**
+**VCF Automation Watcher:**
 
 Monitors and remediates VCF Automation appliance issues during lab startup. Fixes common problems with containerd, kube-scheduler, and seaweedfs pods.
 
 **Issues Remediated:**
+
 - Stale containerd nodes with `Ready,SchedulingDisabled` status
 - Stuck `kube-scheduler` pods (0/1 Running)
 - Old `seaweedfs-master-0` pods (over 1 hour old)
@@ -550,11 +643,12 @@ Monitors and remediates VCF Automation appliance issues during lab startup. Fixe
 
 ### vcfapwcheck.sh
 
-**VCF Automation Password Check**
+**VCF Automation Password Check:**
 
 Checks if the VCF Automation appliance password has expired and resets it if necessary.
 
 **Features:**
+
 - Attempts SSH connection up to 10 times (5 minutes total)
 - Detects password expiration prompt
 - Automatically runs password reset script if needed
@@ -571,7 +665,7 @@ Checks if the VCF Automation appliance password has expired and resets it if nec
 
 ### sddcmgr.exp
 
-**SDDC Manager Password Expiration Reset**
+**SDDC Manager Password Expiration Reset:**
 
 Expect script to disable password expiration on SDDC Manager accounts.
 
@@ -582,6 +676,7 @@ Expect script to disable password expiration on SDDC Manager accounts.
 ```
 
 **What it Does:**
+
 - SSH to SDDC Manager as `vcf` user
 - Switch to root
 - Set password max age to -1 (never expire) for: `vcf`, `root`, `backup`
@@ -590,7 +685,7 @@ Expect script to disable password expiration on SDDC Manager accounts.
 
 ### vcfapass.sh
 
-**VCF Automation Password Reset**
+**VCF Automation Password Reset:**
 
 Expect script to reset the VCF Automation appliance password when it expires.
 
@@ -604,7 +699,7 @@ Expect script to reset the VCF Automation appliance password when it expires.
 
 ### vcshell.exp
 
-**vCenter Shell Configuration**
+**vCenter Shell Configuration:**
 
 Expect script to enable bash shell for the root user on vCenter Server.
 
@@ -615,6 +710,7 @@ Expect script to enable bash shell for the root user on vCenter Server.
 ```
 
 **What it Does:**
+
 - SSH to vCenter as root
 - Enter shell from Command prompt
 - Change root's shell to `/bin/bash`
@@ -625,11 +721,12 @@ Expect script to enable bash shell for the root user on vCenter Server.
 
 ### VMware.config
 
-**Conky Desktop Widget Configuration**
+**Conky Desktop Widget Configuration:**
 
 Configuration file for the Conky desktop widget that displays lab status on the main console.
 
 **Displays:**
+
 - Lab name (HOL-####)
 - Hostname and username
 - IP address
@@ -641,7 +738,7 @@ Configuration file for the Conky desktop widget that displays lab status on the 
 
 ### launch_odyssey.desktop
 
-**Odyssey Desktop Launcher**
+**Odyssey Desktop Launcher:**
 
 Desktop entry file for launching the Odyssey client from the desktop environment.
 
@@ -650,6 +747,7 @@ Desktop entry file for launching the Odyssey client from the desktop environment
 ## Dependencies
 
 Most tools require:
+
 - Python 3.x
 - `lsfunctions.py` - Core lab functions
 - `pyVmomi` - VMware vSphere API

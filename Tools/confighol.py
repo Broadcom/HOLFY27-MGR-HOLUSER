@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol.py - HOLFY27 vApp HOLification Tool
-# Version 2.0 - January 2026
+# Version 2.1 - January 2026
 # Author - Burke Azbill and HOL Core Team
 #
 # This script automates the "HOLification" process for vApp templates
@@ -20,6 +20,12 @@
 # - SSH access to all target systems using lab password
 #
 # CAPABILITIES:
+# 0. Vault Root CA Import (runs first with SKIP/RETRY/FAIL options):
+#    - Checks if HashiCorp Vault PKI is accessible
+#    - Downloads root CA certificate from Vault
+#    - Imports CA as trusted authority in Firefox on console VM
+#    - Requires: libnss3-tools package (provides certutil)
+#
 # 1. ESXi Host Configuration:
 #    - Enable SSH service on each ESXi host
 #    - Configure SSH to start automatically with host
@@ -83,7 +89,13 @@ import argparse
 import time
 import ssl
 import json
+import shutil
+import subprocess
+import tempfile
 import xml.etree.ElementTree as ET
+from typing import Optional, Tuple
+
+import requests
 
 # Add hol directory to path for imports
 sys.path.insert(0, '/home/holuser/hol')
@@ -384,36 +396,28 @@ def configure_esxi_host(hostname: str, host_system, auth_keys_file: str,
     
     # Step 2: Copy authorized_keys for passwordless SSH access
     if not dry_run:
-        lsf.write_output(f'{hostname}: Copying authorized_keys for passwordless SSH...')
+        lsf.write_output(f'{hostname}: Copying authorized_keys for passwordless SSH')
         result = lsf.scp(auth_keys_file, f'{ESX_USERNAME}@{hostname}:{ESX_AUTH_KEYS_PATH}', password)
-        if result.returncode == 0:
-            lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied')
-            # Set proper permissions on the authorized_keys file
-            chmod_result = lsf.ssh(f'chmod 600 {ESX_AUTH_KEYS_PATH}', f'{ESX_USERNAME}@{hostname}', password)
-            if chmod_result.returncode == 0:
-                lsf.write_output(f'{hostname}: SUCCESS - authorized_keys permissions set (chmod 600)')
-            else:
-                lsf.write_output(f'{hostname}: WARNING - Failed to set permissions on authorized_keys')
-        elif result.returncode == 255 or 'permission denied' in str(result.stderr).lower():
-            lsf.write_output(f'{hostname}: FAILED - SCP failed (authentication error)')
-            lsf.write_output(f'{hostname}:         Attempted user: {ESX_USERNAME}, password provided: {"yes" if password else "no"}')
+        if result.returncode != 0:
+            lsf.write_output(f'{hostname}: WARNING - Failed to copy authorized_keys')
             success = False
         else:
-            lsf.write_output(f'{hostname}: FAILED - Failed to copy authorized_keys (exit code: {result.returncode})')
-            if result.stderr:
-                lsf.write_output(f'{hostname}:         Error: {result.stderr.strip()}')
-            success = False
+            # Set proper permissions on the authorized_keys file
+            lsf.ssh(f'chmod 600 {ESX_AUTH_KEYS_PATH}', f'{ESX_USERNAME}@{hostname}', password)
     else:
         lsf.write_output(f'{hostname}: Would copy authorized_keys to {ESX_AUTH_KEYS_PATH}')
     
     # Step 3: Set session timeout to 0 (no timeout)
     update_esxi_session_timeout(hostname, 0, dry_run)
     
-    # NOTE: ESXi does not support the 'chage' command for password expiration.
-    # Password policies on ESXi must be configured via Host Profile or vSphere API.
-    # The previous command 'chage -M 9999 root' is not valid on ESXi hosts.
-    # Password expiration for ESXi hosts is managed differently - typically via
-    # Security.PasswordMaxDays advanced setting if needed.
+    # Step 4: Set password expiration to non-expiring
+    if not dry_run:
+        lsf.write_output(f'{hostname}: Setting non-expiring password for root')
+        result = lsf.ssh(f'chage -M {PASSWORD_MAX_DAYS} root', f'{ESX_USERNAME}@{hostname}', password)
+        if result.returncode != 0:
+            lsf.write_output(f'{hostname}: WARNING - Failed to set password expiration')
+    else:
+        lsf.write_output(f'{hostname}: Would set password expiration to {PASSWORD_MAX_DAYS} days')
     
     if success:
         lsf.write_output(f'{hostname}: ESXi configuration complete')
@@ -641,75 +645,44 @@ def configure_vcenter_password_policies(hostname: str, user: str, password: str,
             lsf.write_output(f'{hostname}: WARNING - Failed to set password policy: {response.status_code}')
         
         # Get all clusters and configure DRS/HA settings
-        # We need a valid pyVmomi session - check if we have one or create a new one
-        si = None
-        
-        # Try to find the session - it may be stored under different key formats
-        if hasattr(lsf, 'sisvc') and lsf.sisvc:
-            for key in lsf.sisvc.keys():
-                if hostname in key or key in hostname:
-                    si = lsf.sisvc[key]
-                    break
-        
-        # If no existing session, create a new one for cluster configuration
-        if si is None:
-            lsf.write_output(f'{hostname}: Creating new vSphere connection for cluster configuration')
-            try:
-                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-                si = connect.SmartConnect(
-                    host=hostname,
-                    user=user,
-                    pwd=password,
-                    sslContext=context
-                )
-            except Exception as conn_err:
-                lsf.write_output(f'{hostname}: Failed to connect for cluster configuration: {conn_err}')
-                si = None
-        
-        if si:
-            try:
-                content = si.RetrieveContent()
+        # Note: This uses the pyVmomi connection we already have
+        if hostname in lsf.sisvc:
+            si = lsf.sisvc[hostname]
+            content = si.RetrieveContent()
+            
+            # Get all clusters
+            container = content.viewManager.CreateContainerView(
+                content.rootFolder, [vim.ClusterComputeResource], True
+            )
+            
+            for cluster in container.view:
+                lsf.write_output(f'{hostname}: Configuring cluster {cluster.name}')
                 
-                # Get all clusters
-                container = content.viewManager.CreateContainerView(
-                    content.rootFolder, [vim.ClusterComputeResource], True
-                )
-                
-                for cluster in container.view:
-                    lsf.write_output(f'{hostname}: Configuring cluster {cluster.name}')
+                try:
+                    # Create cluster config spec
+                    spec = vim.cluster.ConfigSpecEx()
                     
-                    try:
-                        # Create cluster config spec
-                        spec = vim.cluster.ConfigSpecEx()
-                        
-                        # Configure DRS to PartiallyAutomated
-                        drs_spec = vim.cluster.DrsConfigInfo()
-                        drs_spec.enabled = True
-                        drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
-                        spec.drsConfig = drs_spec
-                        
-                        # Disable HA Admission Control
-                        das_spec = vim.cluster.DasConfigInfo()
-                        das_spec.admissionControlEnabled = False
-                        spec.dasConfig = das_spec
-                        
-                        # Apply configuration
-                        task = cluster.ReconfigureComputeResource_Task(spec, True)
-                        WaitForTask(task)
-                        
-                        lsf.write_output(f'{hostname}: Cluster {cluster.name} configured successfully')
-                        
-                    except Exception as e:
-                        lsf.write_output(f'{hostname}: Failed to configure cluster {cluster.name}: {e}')
-                
-                container.Destroy()
-                
-            except Exception as e:
-                lsf.write_output(f'{hostname}: Error accessing vSphere content: {e}')
-        else:
-            lsf.write_output(f'{hostname}: WARNING - No vSphere connection available, skipping cluster configuration')
+                    # Configure DRS to PartiallyAutomated
+                    drs_spec = vim.cluster.DrsConfigInfo()
+                    drs_spec.enabled = True
+                    drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
+                    spec.drsConfig = drs_spec
+                    
+                    # Disable HA Admission Control
+                    das_spec = vim.cluster.DasConfigInfo()
+                    das_spec.admissionControlEnabled = False
+                    spec.dasConfig = das_spec
+                    
+                    # Apply configuration
+                    task = cluster.ReconfigureComputeResource_Task(spec, True)
+                    WaitForTask(task)
+                    
+                    lsf.write_output(f'{hostname}: Cluster {cluster.name} configured')
+                    
+                except Exception as e:
+                    lsf.write_output(f'{hostname}: Failed to configure cluster {cluster.name}: {e}')
+            
+            container.Destroy()
         
         # End the REST API session
         session.delete(auth_url)
@@ -1148,77 +1121,437 @@ def configure_operations_vms(auth_keys_file: str, password: str,
     lsf.write_output('Operations VMs Configuration')
     lsf.write_output('=' * 60)
     
-    overall_success = True
-    
     for opsvm in ops_vms:
-        lsf.write_output('')
-        lsf.write_output(f'{opsvm}: Starting configuration...')
-        vm_success = True
+        lsf.write_output(f'{opsvm}: Configuring...')
         
         if not dry_run:
-            # First, check if the host is reachable
-            if not lsf.test_ping(opsvm):
-                lsf.write_output(f'{opsvm}: FAILED - Host is not reachable (ping failed)')
-                overall_success = False
-                continue
-            
-            # Check if SSH port is open
-            if not lsf.test_tcp_port(opsvm, 22):
-                lsf.write_output(f'{opsvm}: FAILED - SSH port 22 is not open')
-                overall_success = False
-                continue
-            
             # Set non-expiring password for root
-            lsf.write_output(f'{opsvm}: Setting non-expiring password for root...')
-            result = lsf.ssh('chage -M -1 root', f'root@{opsvm}', password)
-            if result.returncode == 0:
-                lsf.write_output(f'{opsvm}: SUCCESS - Non-expiring password set for root')
-            elif result.returncode == 255:
-                lsf.write_output(f'{opsvm}: FAILED - SSH connection failed (check username/password)')
-                lsf.write_output(f'{opsvm}:         Attempted user: root, password provided: {"yes" if password else "no"}')
-                vm_success = False
-            elif 'permission denied' in str(result.stderr).lower():
-                lsf.write_output(f'{opsvm}: FAILED - Permission denied (invalid credentials)')
-                lsf.write_output(f'{opsvm}:         Attempted user: root')
-                vm_success = False
-            else:
-                lsf.write_output(f'{opsvm}: FAILED - chage command failed (exit code: {result.returncode})')
-                if result.stderr:
-                    lsf.write_output(f'{opsvm}:         Error: {result.stderr.strip()}')
-                vm_success = False
+            lsf.write_output(f'{opsvm}: Setting non-expiring password')
+            lsf.ssh('chage -M -1 root', f'root@{opsvm}', password)
             
             # Copy authorized_keys
-            lsf.write_output(f'{opsvm}: Copying authorized_keys...')
-            result = lsf.scp(auth_keys_file, f'root@{opsvm}:{LINUX_AUTH_FILE}', password)
-            if result.returncode == 0:
-                lsf.write_output(f'{opsvm}: SUCCESS - authorized_keys copied')
-                # Set proper permissions
-                chmod_result = lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{opsvm}', password)
-                if chmod_result.returncode == 0:
-                    lsf.write_output(f'{opsvm}: SUCCESS - authorized_keys permissions set (chmod 600)')
-                else:
-                    lsf.write_output(f'{opsvm}: WARNING - Failed to set permissions on authorized_keys')
-            elif result.returncode == 255 or 'permission denied' in str(result.stderr).lower():
-                lsf.write_output(f'{opsvm}: FAILED - SCP failed (authentication error)')
-                lsf.write_output(f'{opsvm}:         Attempted user: root, password provided: {"yes" if password else "no"}')
-                vm_success = False
-            else:
-                lsf.write_output(f'{opsvm}: FAILED - SCP failed (exit code: {result.returncode})')
-                if result.stderr:
-                    lsf.write_output(f'{opsvm}:         Error: {result.stderr.strip()}')
-                vm_success = False
-            
-            if vm_success:
-                lsf.write_output(f'{opsvm}: Configuration completed successfully')
-            else:
-                lsf.write_output(f'{opsvm}: Configuration completed with errors')
-                overall_success = False
+            lsf.write_output(f'{opsvm}: Copying authorized_keys')
+            lsf.scp(auth_keys_file, f'root@{opsvm}:{LINUX_AUTH_FILE}', password)
+            lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{opsvm}', password)
         else:
-            lsf.write_output(f'{opsvm}: Would check connectivity (ping, SSH port)')
-            lsf.write_output(f'{opsvm}: Would set non-expiring password for root')
-            lsf.write_output(f'{opsvm}: Would copy authorized_keys to {LINUX_AUTH_FILE}')
+            lsf.write_output(f'{opsvm}: Would configure password and SSH keys')
     
-    return overall_success
+    return True
+
+
+#==============================================================================
+# VAULT CA CERTIFICATE IMPORT
+#==============================================================================
+
+# Vault PKI Configuration (same as cert-replacement.py)
+VAULT_URL = 'http://10.1.1.1:32000'
+VAULT_CA_PATH = '/v1/pki/ca/pem'
+VAULT_CA_NAME = 'vcf.lab Root Authority'
+
+# Firefox profile paths on the console VM
+LMC_FIREFOX_PROFILE_BASE = '/lmchol/home/holuser/snap/firefox/common/.mozilla/firefox'
+LMC_ROOT = '/lmchol'
+
+# certutil tool (from libnss3-tools package)
+CERTUTIL_BINARY = 'certutil'
+
+
+def check_certutil_installed() -> bool:
+    """
+    Check if certutil is installed on the system.
+    
+    certutil is part of the libnss3-tools package and is required to
+    manage Firefox's certificate store (cert9.db).
+    
+    :return: True if certutil is available
+    """
+    import shutil
+    return shutil.which(CERTUTIL_BINARY) is not None
+
+
+def install_certutil(dry_run: bool = False) -> bool:
+    """
+    Install libnss3-tools package which provides certutil.
+    
+    certutil is the official tool for managing NSS certificate databases
+    used by Firefox, Thunderbird, and other Mozilla-based applications.
+    
+    REQUIRED PACKAGE: libnss3-tools
+    
+    To install manually (if apt is unavailable):
+        sudo apt-get install libnss3-tools
+    
+    Or download from Ubuntu archives:
+        wget http://archive.ubuntu.com/ubuntu/pool/main/n/nss/libnss3-tools_3.98-1build1_amd64.deb
+        sudo dpkg -i libnss3-tools_3.98-1build1_amd64.deb
+    
+    :param dry_run: If True, only show what would be done
+    :return: True if installation successful
+    """
+    if check_certutil_installed():
+        lsf.write_output('certutil is already installed')
+        return True
+    
+    if dry_run:
+        lsf.write_output('Would install libnss3-tools package (provides certutil)')
+        return True
+    
+    lsf.write_output('Installing libnss3-tools package (provides certutil)...')
+    
+    try:
+        result = lsf.run_command('sudo apt-get update && sudo apt-get install -y libnss3-tools')
+        if result.returncode == 0:
+            lsf.write_output('libnss3-tools installed successfully')
+            return True
+        else:
+            lsf.write_output('ERROR: Failed to install libnss3-tools via apt')
+            lsf.write_output('')
+            lsf.write_output('To install manually, run:')
+            lsf.write_output('  sudo apt-get install libnss3-tools')
+            lsf.write_output('')
+            lsf.write_output('Or download and install the .deb package:')
+            lsf.write_output('  wget http://archive.ubuntu.com/ubuntu/pool/main/n/nss/libnss3-tools_3.98-1build1_amd64.deb')
+            lsf.write_output('  sudo dpkg -i libnss3-tools_3.98-1build1_amd64.deb')
+            return False
+    except Exception as e:
+        lsf.write_output(f'ERROR: Failed to install libnss3-tools: {e}')
+        return False
+
+
+def check_vault_accessible(vault_url: str = VAULT_URL, 
+                           ca_path: str = VAULT_CA_PATH,
+                           timeout: int = 5) -> Tuple[bool, str]:
+    """
+    Check if the Vault PKI CA certificate is accessible.
+    
+    This performs a quick check to see if the Vault server is reachable
+    and the PKI CA endpoint is responding before attempting the full import.
+    
+    :param vault_url: Vault server URL
+    :param ca_path: Path to CA certificate endpoint
+    :param timeout: Connection timeout in seconds
+    :return: Tuple of (accessible: bool, message: str)
+    """
+    url = f"{vault_url.rstrip('/')}{ca_path}"
+    
+    try:
+        response = requests.get(url, timeout=timeout)
+        
+        if response.status_code == 200:
+            ca_pem = response.text.strip()
+            if ca_pem.startswith('-----BEGIN CERTIFICATE-----'):
+                return True, "Vault PKI CA is accessible"
+            else:
+                return False, "Vault responded but CA certificate format is invalid"
+        else:
+            return False, f"Vault responded with HTTP {response.status_code}"
+            
+    except requests.exceptions.ConnectTimeout:
+        return False, f"Connection timeout - Vault server not responding at {vault_url}"
+    except requests.exceptions.ConnectionError as e:
+        return False, f"Connection error - Cannot reach Vault at {vault_url}"
+    except Exception as e:
+        return False, f"Error checking Vault: {e}"
+
+
+def prompt_vault_unavailable(message: str) -> str:
+    """
+    Prompt user for action when Vault CA is not accessible.
+    
+    Presents options to:
+    - [S]kip: Continue without importing Vault CA
+    - [R]etry: Try checking Vault again (user may have fixed it)
+    - [F]ail: Exit the script with an error
+    
+    :param message: Error message describing why Vault is not accessible
+    :return: User's choice: 'skip', 'retry', or 'fail'
+    """
+    print('')
+    print('!' * 60)
+    print('  WARNING: Vault PKI CA Certificate Not Accessible')
+    print('!' * 60)
+    print('')
+    print(f'  {message}')
+    print('')
+    print('  The Vault root CA certificate is used to establish trust')
+    print('  for VCF component certificates in Firefox on the console VM.')
+    print('')
+    print('  Options:')
+    print('    [S]kip  - Continue without importing Vault CA')
+    print('              (Firefox will show certificate warnings)')
+    print('    [R]etry - Check Vault again (if you have fixed the issue)')
+    print('    [F]ail  - Exit the script with an error')
+    print('')
+    
+    while True:
+        choice = input('  Enter choice [S/R/F]: ').strip().upper()
+        if choice in ['S', 'SKIP']:
+            return 'skip'
+        elif choice in ['R', 'RETRY']:
+            return 'retry'
+        elif choice in ['F', 'FAIL']:
+            return 'fail'
+        else:
+            print('  Invalid choice. Please enter S, R, or F.')
+
+
+def download_vault_ca_certificate(vault_url: str = VAULT_URL, 
+                                   ca_path: str = VAULT_CA_PATH) -> Optional[str]:
+    """
+    Download the root CA certificate from HashiCorp Vault PKI.
+    
+    The Vault PKI secrets engine exposes the CA certificate at /v1/pki/ca/pem.
+    This endpoint does not require authentication.
+    
+    :param vault_url: Vault server URL (default: http://10.1.1.1:32000)
+    :param ca_path: Path to CA certificate endpoint (default: /v1/pki/ca/pem)
+    :return: PEM-encoded CA certificate or None on failure
+    """
+    url = f"{vault_url.rstrip('/')}{ca_path}"
+    lsf.write_output(f'Downloading root CA from Vault: {url}')
+    
+    try:
+        response = requests.get(url, timeout=30)
+        
+        if response.status_code == 200:
+            ca_pem = response.text.strip()
+            if ca_pem.startswith('-----BEGIN CERTIFICATE-----'):
+                lsf.write_output('Successfully downloaded Vault root CA certificate')
+                return ca_pem
+            else:
+                lsf.write_output('ERROR: Invalid certificate format received from Vault')
+                return None
+        else:
+            lsf.write_output(f'ERROR: Failed to download CA from Vault: HTTP {response.status_code}')
+            return None
+            
+    except Exception as e:
+        lsf.write_output(f'ERROR: Failed to connect to Vault: {e}')
+        return None
+
+
+def find_firefox_profiles(profile_base: str = LMC_FIREFOX_PROFILE_BASE) -> list:
+    """
+    Find all Firefox profile directories containing a cert9.db file.
+    
+    Firefox uses NSS (Network Security Services) for certificate management.
+    The certificate database is stored in cert9.db within each profile directory.
+    
+    :param profile_base: Base path to Firefox profiles
+    :return: List of profile directory paths
+    """
+    profiles = []
+    
+    if not os.path.isdir(profile_base):
+        lsf.write_output(f'WARNING: Firefox profile directory not found: {profile_base}')
+        return profiles
+    
+    # Look for directories containing cert9.db
+    for entry in os.listdir(profile_base):
+        profile_path = os.path.join(profile_base, entry)
+        cert_db = os.path.join(profile_path, 'cert9.db')
+        
+        if os.path.isdir(profile_path) and os.path.isfile(cert_db):
+            profiles.append(profile_path)
+            lsf.write_output(f'Found Firefox profile: {entry}')
+    
+    return profiles
+
+
+def import_ca_to_firefox_profile(ca_pem: str, profile_path: str, 
+                                  ca_name: str = VAULT_CA_NAME,
+                                  dry_run: bool = False) -> bool:
+    """
+    Import a CA certificate into a Firefox profile's NSS certificate store.
+    
+    Uses certutil to add the certificate as a trusted CA for:
+    - SSL/TLS server authentication (C)
+    - Email signing (not enabled)
+    - Code signing (not enabled)
+    
+    The trust flags "CT,," mean:
+    - C: Valid CA for SSL/TLS connections
+    - T: Trusted for client authentication (allows the CA to issue client certs)
+    - (empty): Not trusted for email or code signing
+    
+    :param ca_pem: PEM-encoded CA certificate
+    :param profile_path: Path to Firefox profile directory
+    :param ca_name: Friendly name for the certificate
+    :param dry_run: If True, only show what would be done
+    :return: True if import successful
+    """
+    import tempfile
+    import subprocess
+    
+    if dry_run:
+        lsf.write_output(f'Would import "{ca_name}" to Firefox profile: {profile_path}')
+        return True
+    
+    # Write CA to a temporary file
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
+            f.write(ca_pem)
+            ca_file = f.name
+    except Exception as e:
+        lsf.write_output(f'ERROR: Failed to create temp file for CA certificate: {e}')
+        return False
+    
+    try:
+        # Check if certificate already exists and delete it first (to update)
+        check_cmd = [
+            CERTUTIL_BINARY, '-L',
+            '-d', f'sql:{profile_path}',
+            '-n', ca_name
+        ]
+        
+        result = subprocess.run(check_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            # Certificate exists, delete it first to allow update
+            lsf.write_output(f'Certificate "{ca_name}" already exists, updating...')
+            delete_cmd = [
+                CERTUTIL_BINARY, '-D',
+                '-d', f'sql:{profile_path}',
+                '-n', ca_name
+            ]
+            subprocess.run(delete_cmd, capture_output=True)
+        
+        # Import the CA certificate
+        # Trust flags: C,, = trusted CA for SSL/TLS, not for email or code signing
+        import_cmd = [
+            CERTUTIL_BINARY, '-A',
+            '-d', f'sql:{profile_path}',
+            '-n', ca_name,
+            '-t', 'CT,,',  # Trusted CA for SSL and client auth
+            '-i', ca_file
+        ]
+        
+        lsf.write_output(f'Importing CA to Firefox profile: {os.path.basename(profile_path)}')
+        result = subprocess.run(import_cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            lsf.write_output(f'Successfully imported "{ca_name}" to Firefox')
+            return True
+        else:
+            lsf.write_output(f'ERROR: certutil failed: {result.stderr}')
+            return False
+            
+    except Exception as e:
+        lsf.write_output(f'ERROR: Failed to import CA certificate: {e}')
+        return False
+        
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(ca_file)
+        except:
+            pass
+
+
+def configure_vault_ca_for_firefox(dry_run: bool = False, 
+                                    skip_vault_check: bool = False) -> bool:
+    """
+    Download the Vault root CA and import it into Firefox on the console VM.
+    
+    This function:
+    1. Checks if Vault PKI CA is accessible (with SKIP/RETRY/FAIL options)
+    2. Ensures certutil is installed (from libnss3-tools package)
+    3. Downloads the root CA certificate from the Vault PKI endpoint
+    4. Finds all Firefox profiles on the console VM (/lmchol filesystem)
+    5. Imports the CA as a trusted authority in each profile
+    
+    After running this function, Firefox on the console VM will trust
+    certificates signed by the Vault PKI without showing security warnings.
+    
+    PREREQUISITES:
+    - libnss3-tools package must be installed (provides certutil)
+    - Vault server must be accessible at VAULT_URL
+    - Firefox profile must exist on the console VM
+    
+    :param dry_run: If True, preview what would be done
+    :param skip_vault_check: If True, skip the initial Vault accessibility check
+    :return: True if successful, False if failed, None if skipped
+    """
+    lsf.write_output('')
+    lsf.write_output('=' * 60)
+    lsf.write_output('Vault Root CA Import for Firefox')
+    lsf.write_output('=' * 60)
+    
+    # Step 1: Check if Vault is accessible (with retry loop)
+    if not dry_run and not skip_vault_check:
+        lsf.write_output(f'Checking Vault PKI accessibility at {VAULT_URL}...')
+        
+        while True:
+            accessible, message = check_vault_accessible()
+            
+            if accessible:
+                lsf.write_output(f'✓ {message}')
+                break
+            else:
+                # Vault not accessible - prompt user for action
+                choice = prompt_vault_unavailable(message)
+                
+                if choice == 'skip':
+                    lsf.write_output('Skipping Vault CA import (user choice)')
+                    lsf.write_output('NOTE: Firefox will show certificate warnings for VCF components')
+                    return True  # Return True to not fail the overall process
+                elif choice == 'retry':
+                    lsf.write_output('Retrying Vault accessibility check...')
+                    continue  # Loop and check again
+                elif choice == 'fail':
+                    lsf.write_output('Exiting due to Vault unavailability (user choice)')
+                    return False
+    elif dry_run:
+        lsf.write_output(f'Would check Vault PKI accessibility at {VAULT_URL}')
+    
+    # Step 2: Ensure certutil is installed
+    if not dry_run:
+        if not check_certutil_installed():
+            if not install_certutil(dry_run):
+                lsf.write_output('ERROR: Cannot proceed without certutil')
+                lsf.write_output('Please install libnss3-tools: sudo apt-get install libnss3-tools')
+                return False
+    else:
+        if not check_certutil_installed():
+            lsf.write_output('Would install libnss3-tools package if not present')
+    
+    # Step 3: Download the root CA from Vault
+    if dry_run:
+        lsf.write_output(f'Would download root CA from: {VAULT_URL}{VAULT_CA_PATH}')
+        ca_pem = None
+    else:
+        ca_pem = download_vault_ca_certificate()
+        if not ca_pem:
+            lsf.write_output('ERROR: Failed to download Vault root CA')
+            return False
+    
+    # Step 4: Find Firefox profiles on the console VM
+    profiles = find_firefox_profiles()
+    
+    if not profiles:
+        lsf.write_output('WARNING: No Firefox profiles found on console VM')
+        lsf.write_output(f'Expected location: {LMC_FIREFOX_PROFILE_BASE}')
+        return False
+    
+    lsf.write_output(f'Found {len(profiles)} Firefox profile(s)')
+    
+    # Step 5: Import CA to each Firefox profile
+    success_count = 0
+    for profile_path in profiles:
+        if dry_run:
+            lsf.write_output(f'Would import CA to: {profile_path}')
+            success_count += 1
+        else:
+            if import_ca_to_firefox_profile(ca_pem, profile_path, VAULT_CA_NAME, dry_run):
+                success_count += 1
+    
+    if success_count == len(profiles):
+        lsf.write_output('')
+        lsf.write_output(f'Successfully imported Vault root CA to {success_count} Firefox profile(s)')
+        lsf.write_output('Firefox will now trust certificates signed by the Vault PKI')
+        return True
+    else:
+        lsf.write_output(f'WARNING: Only imported to {success_count}/{len(profiles)} profiles')
+        return False
 
 
 #==============================================================================
@@ -1274,6 +1607,7 @@ def main():
     Main entry point for HOLification tool.
     
     Orchestrates all HOLification steps in the correct order:
+    0. Vault root CA import to Firefox on console VM (with SKIP/RETRY/FAIL options)
     1. Pre-checks and environment setup
     2. ESXi host configuration
     3. vCenter configuration
@@ -1341,6 +1675,12 @@ NOTE: Some NSX operations require manual steps first.
         sys.exit(1)
     
     lsf.write_output("Pre-check: 'expect' utility is present")
+    
+    # Step 0: Import Vault root CA to Firefox on console VM (at the beginning)
+    # This allows the user to skip/retry/fail early if Vault is not accessible
+    if not configure_vault_ca_for_firefox(args.dry_run):
+        lsf.write_output('ERROR: Failed to configure Vault CA for Firefox')
+        sys.exit(1)
     
     # Setup SSH environment
     setup_ssh_environment()
