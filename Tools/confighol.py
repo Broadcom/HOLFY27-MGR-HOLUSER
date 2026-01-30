@@ -645,44 +645,75 @@ def configure_vcenter_password_policies(hostname: str, user: str, password: str,
             lsf.write_output(f'{hostname}: WARNING - Failed to set password policy: {response.status_code}')
         
         # Get all clusters and configure DRS/HA settings
-        # Note: This uses the pyVmomi connection we already have
-        if hostname in lsf.sisvc:
-            si = lsf.sisvc[hostname]
-            content = si.RetrieveContent()
-            
-            # Get all clusters
-            container = content.viewManager.CreateContainerView(
-                content.rootFolder, [vim.ClusterComputeResource], True
+        # Create a fresh pyVmomi connection to ensure we're authenticated
+        lsf.write_output(f'{hostname}: Connecting to vSphere API for cluster configuration...')
+        
+        si = None
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            si = connect.SmartConnect(
+                host=hostname,
+                user=user,
+                pwd=password,
+                sslContext=context
             )
-            
-            for cluster in container.view:
-                lsf.write_output(f'{hostname}: Configuring cluster {cluster.name}')
+            lsf.write_output(f'{hostname}: SUCCESS - Connected to vSphere API')
+        except Exception as conn_err:
+            lsf.write_output(f'{hostname}: FAILED - Could not connect to vSphere API: {conn_err}')
+            si = None
+        
+        if si:
+            try:
+                content = si.RetrieveContent()
                 
-                try:
-                    # Create cluster config spec
-                    spec = vim.cluster.ConfigSpecEx()
+                # Get all clusters
+                container = content.viewManager.CreateContainerView(
+                    content.rootFolder, [vim.ClusterComputeResource], True
+                )
+                
+                for cluster in container.view:
+                    lsf.write_output(f'{hostname}: Configuring cluster {cluster.name}...')
                     
-                    # Configure DRS to PartiallyAutomated
-                    drs_spec = vim.cluster.DrsConfigInfo()
-                    drs_spec.enabled = True
-                    drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
-                    spec.drsConfig = drs_spec
-                    
-                    # Disable HA Admission Control
-                    das_spec = vim.cluster.DasConfigInfo()
-                    das_spec.admissionControlEnabled = False
-                    spec.dasConfig = das_spec
-                    
-                    # Apply configuration
-                    task = cluster.ReconfigureComputeResource_Task(spec, True)
-                    WaitForTask(task)
-                    
-                    lsf.write_output(f'{hostname}: Cluster {cluster.name} configured')
-                    
-                except Exception as e:
-                    lsf.write_output(f'{hostname}: Failed to configure cluster {cluster.name}: {e}')
-            
-            container.Destroy()
+                    try:
+                        # Create cluster config spec
+                        spec = vim.cluster.ConfigSpecEx()
+                        
+                        # Configure DRS to PartiallyAutomated
+                        drs_spec = vim.cluster.DrsConfigInfo()
+                        drs_spec.enabled = True
+                        drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
+                        spec.drsConfig = drs_spec
+                        
+                        # Disable HA Admission Control
+                        das_spec = vim.cluster.DasConfigInfo()
+                        das_spec.admissionControlEnabled = False
+                        spec.dasConfig = das_spec
+                        
+                        # Apply configuration
+                        task = cluster.ReconfigureComputeResource_Task(spec, True)
+                        WaitForTask(task)
+                        
+                        lsf.write_output(f'{hostname}: SUCCESS - Cluster {cluster.name} configured')
+                        
+                    except Exception as e:
+                        lsf.write_output(f'{hostname}: FAILED - Could not configure cluster {cluster.name}: {e}')
+                
+                container.Destroy()
+                
+                # Disconnect from vSphere
+                connect.Disconnect(si)
+                
+            except Exception as e:
+                lsf.write_output(f'{hostname}: ERROR - vSphere API error: {e}')
+                if si:
+                    try:
+                        connect.Disconnect(si)
+                    except Exception:
+                        pass
+        else:
+            lsf.write_output(f'{hostname}: WARNING - Skipping cluster configuration (no vSphere connection)')
         
         # End the REST API session
         session.delete(auth_url)
@@ -879,31 +910,28 @@ def configure_nsx_ssh_start_on_boot(hostname: str, password: str,
         return False
 
 
-def configure_nsx_node(hostname: str, auth_keys_file: str, password: str,
-                       dry_run: bool = False) -> bool:
+def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
+                          dry_run: bool = False) -> bool:
     """
-    Configure an NSX Manager or Edge node for HOLification.
+    Configure an NSX Manager node for HOLification.
     
     This function:
-    1. Attempts to enable SSH via API (if not already enabled)
+    1. Attempts to enable SSH via API (NSX Managers support this)
     2. Copies authorized_keys for passwordless SSH access
     3. Configures SSH to start on boot
     4. Removes password expiration for admin, root, audit users
     
-    NOTE: If SSH is not already enabled, the API call will work but SSH
-    access is still required for start-on-boot and password configuration.
-    
-    :param hostname: NSX node hostname
+    :param hostname: NSX Manager hostname
     :param auth_keys_file: Path to authorized_keys file
     :param password: Admin/root password
     :param dry_run: If True, preview only
     :return: True if successful
     """
-    lsf.write_output(f'{hostname}: Configuring NSX node...')
+    lsf.write_output(f'{hostname}: Configuring NSX Manager...')
     
     success = True
     
-    # Step 1: Try to enable SSH via API
+    # Step 1: Try to enable SSH via API (only NSX Managers support this)
     enable_nsx_ssh_via_api(hostname, 'admin', password, dry_run)
     
     if not dry_run:
@@ -911,28 +939,208 @@ def configure_nsx_node(hostname: str, auth_keys_file: str, password: str,
         time.sleep(3)
         
         # Step 2: Copy authorized_keys for root user
-        lsf.write_output(f'{hostname}: Copying authorized_keys')
+        lsf.write_output(f'{hostname}: Copying authorized_keys...')
         result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', password)
-        if result.returncode != 0:
-            lsf.write_output(f'{hostname}: WARNING - Failed to copy authorized_keys')
-            success = False
-        else:
+        if result.returncode == 0:
+            lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied')
             lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{hostname}', password)
+        else:
+            lsf.write_output(f'{hostname}: FAILED - Could not copy authorized_keys')
+            success = False
         
         # Step 3: Configure SSH to start on boot
         configure_nsx_ssh_start_on_boot(hostname, password, dry_run)
         
         # Step 4: Remove password expiration for NSX users
         for user in NSX_USERS:
-            lsf.write_output(f'{hostname}: Removing password expiration for {user}')
+            lsf.write_output(f'{hostname}: Removing password expiration for {user}...')
             result = lsf.ssh(f'clear user {user} password-expiration', f'admin@{hostname}', password)
-            if result.returncode != 0:
-                lsf.write_output(f'{hostname}: WARNING - Failed for {user}')
+            if result.returncode == 0:
+                lsf.write_output(f'{hostname}: SUCCESS - Password expiration cleared for {user}')
+            else:
+                lsf.write_output(f'{hostname}: WARNING - Failed to clear password expiration for {user}')
     else:
+        lsf.write_output(f'{hostname}: Would enable SSH via API')
         lsf.write_output(f'{hostname}: Would copy authorized_keys')
         lsf.write_output(f'{hostname}: Would configure SSH start-on-boot')
         for user in NSX_USERS:
             lsf.write_output(f'{hostname}: Would remove password expiration for {user}')
+    
+    return success
+
+
+def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
+                       dry_run: bool = False) -> bool:
+    """
+    Configure an NSX Edge node for HOLification.
+    
+    NSX Edges do NOT support enabling SSH via API - SSH must be enabled
+    manually via the vSphere console before running this function.
+    
+    This function:
+    1. Copies authorized_keys for root user (SSH must already be enabled)
+    2. Configures SSH to start on boot
+    3. Removes password expiration for admin, root, audit users
+    
+    :param hostname: NSX Edge hostname
+    :param auth_keys_file: Path to authorized_keys file
+    :param password: Admin/root password
+    :param dry_run: If True, preview only
+    :return: True if successful
+    """
+    lsf.write_output(f'{hostname}: Configuring NSX Edge...')
+    lsf.write_output(f'{hostname}: NOTE - NSX Edges do not support SSH enable via API')
+    
+    success = True
+    
+    if not dry_run:
+        # Step 1: Copy authorized_keys for root user
+        # NSX Edges use root for SSH access
+        lsf.write_output(f'{hostname}: Copying authorized_keys for root...')
+        result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', password)
+        if result.returncode == 0:
+            lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied')
+            chmod_result = lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{hostname}', password)
+            if chmod_result.returncode == 0:
+                lsf.write_output(f'{hostname}: SUCCESS - Permissions set on authorized_keys')
+            else:
+                lsf.write_output(f'{hostname}: WARNING - Failed to set permissions')
+        else:
+            lsf.write_output(f'{hostname}: FAILED - Could not copy authorized_keys')
+            if result.returncode == 255:
+                lsf.write_output(f'{hostname}:         SSH connection failed - is SSH enabled on this Edge?')
+            success = False
+        
+        # Step 2: Configure SSH to start on boot
+        configure_nsx_ssh_start_on_boot(hostname, password, dry_run)
+        
+        # Step 3: Remove password expiration for NSX users
+        for user in NSX_USERS:
+            lsf.write_output(f'{hostname}: Removing password expiration for {user}...')
+            result = lsf.ssh(f'clear user {user} password-expiration', f'admin@{hostname}', password)
+            if result.returncode == 0:
+                lsf.write_output(f'{hostname}: SUCCESS - Password expiration cleared for {user}')
+            else:
+                lsf.write_output(f'{hostname}: WARNING - Failed to clear password expiration for {user}')
+    else:
+        lsf.write_output(f'{hostname}: Would copy authorized_keys for root')
+        lsf.write_output(f'{hostname}: Would configure SSH start-on-boot')
+        for user in NSX_USERS:
+            lsf.write_output(f'{hostname}: Would remove password expiration for {user}')
+    
+    return success
+
+
+def configure_aria_automation_vms(auth_keys_file: str, password: str,
+                                   dry_run: bool = False) -> bool:
+    """
+    Configure all Aria Automation VMs from config.ini.
+    
+    Processes VMs defined in the [VCFFINAL] vravms section.
+    These are VCF Automation appliances that use 'vmware-system-user' for SSH.
+    
+    :param auth_keys_file: Path to authorized_keys file
+    :param password: vmware-system-user password
+    :param dry_run: If True, preview only
+    :return: True if successful
+    """
+    if 'VCFFINAL' not in lsf.config.sections():
+        lsf.write_output('No VCFFINAL section in config.ini, skipping Aria Automation')
+        return True
+    
+    if 'vravms' not in lsf.config['VCFFINAL']:
+        lsf.write_output('No vravms defined in VCFFINAL section')
+        return True
+    
+    vravms_raw = lsf.config.get('VCFFINAL', 'vravms').strip()
+    if not vravms_raw:
+        lsf.write_output('No Aria Automation VMs defined')
+        return True
+    
+    vravms = [vm.strip() for vm in vravms_raw.split('\n') if vm.strip() and not vm.strip().startswith('#')]
+    
+    if not vravms:
+        lsf.write_output('No Aria Automation VMs found in config')
+        return True
+    
+    lsf.write_output('')
+    lsf.write_output('=' * 60)
+    lsf.write_output('Aria Automation VMs Configuration')
+    lsf.write_output('=' * 60)
+    lsf.write_output('NOTE: These VMs use vmware-system-user for SSH access')
+    lsf.write_output('      SSH is always available on Aria Automation appliances')
+    
+    success = True
+    
+    for vravm in vravms:
+        # VMs may have format: vmname:vcenter
+        parts = vravm.split(':')
+        hostname = parts[0].strip()
+        
+        if not configure_aria_automation(hostname, auth_keys_file, password, dry_run):
+            success = False
+    
+    return success
+
+
+def configure_aria_automation(hostname: str, auth_keys_file: str, password: str,
+                               dry_run: bool = False) -> bool:
+    """
+    Configure Aria Automation (VCF Automation) appliance for HOLification.
+    
+    The Aria Automation appliance uses 'vmware-system-user' for SSH access
+    with sudo NOPASSWD privileges. SSH is always available on this appliance.
+    
+    :param hostname: Aria Automation hostname (e.g., auto-a.site-a.vcf.lab)
+    :param auth_keys_file: Path to authorized_keys file
+    :param password: vmware-system-user password
+    :param dry_run: If True, preview only
+    :return: True if successful
+    """
+    ssh_user = 'vmware-system-user'
+    
+    lsf.write_output(f'{hostname}: Configuring Aria Automation appliance...')
+    lsf.write_output(f'{hostname}: Using SSH user: {ssh_user}')
+    
+    success = True
+    
+    if not dry_run:
+        # Step 1: Copy authorized_keys for vmware-system-user
+        lsf.write_output(f'{hostname}: Copying authorized_keys for {ssh_user}...')
+        
+        # vmware-system-user home directory
+        user_auth_file = f'/home/{ssh_user}/.ssh/authorized_keys'
+        
+        result = lsf.scp(auth_keys_file, f'{ssh_user}@{hostname}:{user_auth_file}', password)
+        if result.returncode == 0:
+            lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied for {ssh_user}')
+            # Set proper permissions
+            chmod_result = lsf.ssh(f'chmod 600 {user_auth_file}', f'{ssh_user}@{hostname}', password)
+            if chmod_result.returncode == 0:
+                lsf.write_output(f'{hostname}: SUCCESS - Permissions set on authorized_keys')
+            else:
+                lsf.write_output(f'{hostname}: WARNING - Failed to set permissions')
+        else:
+            lsf.write_output(f'{hostname}: FAILED - Could not copy authorized_keys')
+            if result.returncode == 255:
+                lsf.write_output(f'{hostname}:         SSH connection failed')
+                lsf.write_output(f'{hostname}:         User: {ssh_user}, Password provided: {"yes" if password else "no"}')
+            success = False
+        
+        # Step 2: Copy authorized_keys for root using sudo
+        lsf.write_output(f'{hostname}: Copying authorized_keys for root via sudo...')
+        
+        # Use sudo to copy keys to root's authorized_keys
+        # vmware-system-user has sudo NOPASSWD access
+        sudo_cmd = f'sudo mkdir -p /root/.ssh && sudo cp {user_auth_file} /root/.ssh/authorized_keys && sudo chmod 600 /root/.ssh/authorized_keys'
+        result = lsf.ssh(sudo_cmd, f'{ssh_user}@{hostname}', password)
+        if result.returncode == 0:
+            lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied for root')
+        else:
+            lsf.write_output(f'{hostname}: WARNING - Failed to copy authorized_keys for root')
+    else:
+        lsf.write_output(f'{hostname}: Would copy authorized_keys for {ssh_user}')
+        lsf.write_output(f'{hostname}: Would copy authorized_keys for root via sudo')
     
     return success
 
@@ -942,12 +1150,11 @@ def configure_nsx_components(auth_keys_file: str, password: str,
     """
     Configure all NSX components from config.ini.
     
-    Processes both NSX Managers (vcfnsxmgr) and NSX Edges (vcfnsxedges)
+    Processes NSX Managers (vcfnsxmgr) and NSX Edges (vcfnsxedges)
     defined in the [VCF] section of config.ini.
     
-    NOTE: SSH must be manually enabled first on each NSX component via
-    the vSphere console before this function can configure them.
-    See HOLIFICATION.md for the manual steps required.
+    NOTE: SSH must be manually enabled on NSX Edges via the vSphere console.
+    NSX Managers support enabling SSH via API.
     
     :param auth_keys_file: Path to authorized_keys file
     :param password: Admin password
@@ -972,6 +1179,7 @@ def configure_nsx_components(auth_keys_file: str, password: str,
     
     # Process NSX Managers
     if 'vcfnsxmgr' in lsf.config['VCF']:
+        lsf.write_output('')
         lsf.write_output('Processing NSX Managers...')
         vcfnsxmgrs = lsf.config.get('VCF', 'vcfnsxmgr').split('\n')
         
@@ -984,18 +1192,21 @@ def configure_nsx_components(auth_keys_file: str, password: str,
             nsxmgr = parts[0].strip()
             
             if not dry_run:
-                # Interactive prompt - SSH must be enabled manually first
-                answer = input(f'Is SSH enabled on {nsxmgr}? (y/n): ')
+                # Interactive prompt - SSH can be enabled via API for NSX Managers
+                answer = input(f'Configure NSX Manager {nsxmgr}? (y/n): ')
                 if not answer.lower().startswith('y'):
-                    lsf.write_output(f'{nsxmgr}: Skipping - SSH not enabled')
+                    lsf.write_output(f'{nsxmgr}: Skipping')
                     continue
             
-            if not configure_nsx_node(nsxmgr, auth_keys_file, password, dry_run):
+            if not configure_nsx_manager(nsxmgr, auth_keys_file, password, dry_run):
                 success = False
     
     # Process NSX Edges
     if 'vcfnsxedges' in lsf.config['VCF']:
+        lsf.write_output('')
         lsf.write_output('Processing NSX Edges...')
+        lsf.write_output('NOTE: NSX Edges do NOT support enabling SSH via API.')
+        lsf.write_output('      SSH must be enabled manually via vSphere console first.')
         vcfnsxedges = lsf.config.get('VCF', 'vcfnsxedges').split('\n')
         
         for entry in vcfnsxedges:
@@ -1007,13 +1218,13 @@ def configure_nsx_components(auth_keys_file: str, password: str,
             nsxedge = parts[0].strip()
             
             if not dry_run:
-                # Interactive prompt - SSH must be enabled manually first
-                answer = input(f'Is SSH enabled on {nsxedge}? (y/n): ')
+                # Interactive prompt - SSH must be enabled manually first for Edges
+                answer = input(f'Is SSH enabled on NSX Edge {nsxedge}? (y/n): ')
                 if not answer.lower().startswith('y'):
                     lsf.write_output(f'{nsxedge}: Skipping - SSH not enabled')
                     continue
             
-            if not configure_nsx_node(nsxedge, auth_keys_file, password, dry_run):
+            if not configure_nsx_edge(nsxedge, auth_keys_file, password, dry_run):
                 success = False
     
     return success
@@ -1029,38 +1240,71 @@ def configure_sddc_manager(auth_keys_file: str, password: str,
     Configure SDDC Manager for HOLification.
     
     This function:
-    1. Copies authorized_keys for the vcf user
+    1. Copies authorized_keys for the vcf user using ssh-copy-id
     2. Sets non-expiring passwords for vcf, root, backup accounts
     
     The expect script sddcmgr.exp is used to handle the interactive su command
     required to modify root account settings.
     
-    :param auth_keys_file: Path to authorized_keys file (LMC key only)
+    :param auth_keys_file: Path to authorized_keys file
     :param password: VCF password
     :param dry_run: If True, preview only
     :return: True if successful
     """
     sddcmgr = 'sddcmanager-a.site-a.vcf.lab'
+    vcf_user = 'vcf'
     
     lsf.write_output('')
     lsf.write_output(f'Configuring SDDC Manager: {sddcmgr}')
     lsf.write_output('-' * 50)
+    lsf.write_output(f'{sddcmgr}: Using SSH user: {vcf_user}')
     
     if dry_run:
-        lsf.write_output(f'{sddcmgr}: Would configure authorized_keys')
+        lsf.write_output(f'{sddcmgr}: Would copy authorized_keys using ssh-copy-id')
         lsf.write_output(f'{sddcmgr}: Would set non-expiring passwords')
         return True
     
-    # Copy authorized_keys for vcf user
-    # Note: Only the LMC key works for SDDC Manager, not the Manager key
-    lmc_key_file = '/lmchol/home/holuser/.ssh/id_rsa.pub'
-    lsf.write_output(f'{sddcmgr}: Copying LMC authorized_keys for vcf user')
+    success = True
     
-    result = lsf.scp(lmc_key_file, f'vcf@{sddcmgr}:{LINUX_AUTH_FILE}', password)
-    if result.returncode != 0:
-        lsf.write_output(f'{sddcmgr}: WARNING - Failed to copy authorized_keys')
-    else:
-        lsf.ssh(f'chmod 600 ~/.ssh/authorized_keys', f'vcf@{sddcmgr}', password)
+    # First check if the host is reachable
+    if not lsf.test_ping(sddcmgr):
+        lsf.write_output(f'{sddcmgr}: FAILED - Host is not reachable (ping failed)')
+        return False
+    
+    # Check if SSH port is open
+    if not lsf.test_tcp_port(sddcmgr, 22):
+        lsf.write_output(f'{sddcmgr}: FAILED - SSH port 22 is not open')
+        return False
+    
+    # Copy authorized_keys for vcf user using ssh-copy-id
+    # This is the preferred method as it handles key format and permissions
+    lsf.write_output(f'{sddcmgr}: Copying SSH keys for {vcf_user} user using ssh-copy-id...')
+    
+    # Try Manager key first
+    manager_key = PUBLIC_KEY_FILE
+    if os.path.isfile(manager_key):
+        # Use sshpass with ssh-copy-id
+        cmd = f'sshpass -p "{password}" ssh-copy-id -o StrictHostKeyChecking=no -i {manager_key} {vcf_user}@{sddcmgr}'
+        result = lsf.run_command(cmd)
+        if result.returncode == 0:
+            lsf.write_output(f'{sddcmgr}: SUCCESS - Manager SSH key copied for {vcf_user}')
+        else:
+            lsf.write_output(f'{sddcmgr}: FAILED - Could not copy Manager SSH key')
+            lsf.write_output(f'{sddcmgr}:         User: {vcf_user}, Password provided: {"yes" if password else "no"}')
+            if result.stderr:
+                lsf.write_output(f'{sddcmgr}:         Error: {result.stderr.strip()[:100]}')
+            success = False
+    
+    # Also copy LMC key if available
+    lmc_key_file = '/lmchol/home/holuser/.ssh/id_rsa.pub'
+    if os.path.isfile(lmc_key_file):
+        lsf.write_output(f'{sddcmgr}: Copying LMC SSH key for {vcf_user} user...')
+        cmd = f'sshpass -p "{password}" ssh-copy-id -o StrictHostKeyChecking=no -i {lmc_key_file} {vcf_user}@{sddcmgr}'
+        result = lsf.run_command(cmd)
+        if result.returncode == 0:
+            lsf.write_output(f'{sddcmgr}: SUCCESS - LMC SSH key copied for {vcf_user}')
+        else:
+            lsf.write_output(f'{sddcmgr}: WARNING - Could not copy LMC SSH key')
     
     # Run expect script to configure password expiration
     # This handles the interactive su command needed to modify root settings
@@ -1069,13 +1313,20 @@ def configure_sddc_manager(auth_keys_file: str, password: str,
         lsf.write_output(f'{sddcmgr}: Configuring non-expiring passwords...')
         result = lsf.run_command(f'/usr/bin/expect {expect_script} {sddcmgr} {password}')
         if result.returncode == 0:
-            lsf.write_output(f'{sddcmgr}: Password expiration configured')
+            lsf.write_output(f'{sddcmgr}: SUCCESS - Password expiration configured')
         else:
             lsf.write_output(f'{sddcmgr}: WARNING - Password config may have failed')
+            if result.stderr:
+                lsf.write_output(f'{sddcmgr}:         Error: {result.stderr.strip()[:100]}')
     else:
-        lsf.write_output(f'{sddcmgr}: WARNING - sddcmgr.exp not found')
+        lsf.write_output(f'{sddcmgr}: WARNING - sddcmgr.exp not found at {expect_script}')
     
-    return True
+    if success:
+        lsf.write_output(f'{sddcmgr}: SDDC Manager configuration completed')
+    else:
+        lsf.write_output(f'{sddcmgr}: SDDC Manager configuration completed with errors')
+    
+    return success
 
 
 #==============================================================================
@@ -1121,22 +1372,82 @@ def configure_operations_vms(auth_keys_file: str, password: str,
     lsf.write_output('Operations VMs Configuration')
     lsf.write_output('=' * 60)
     
+    overall_success = True
+    
     for opsvm in ops_vms:
-        lsf.write_output(f'{opsvm}: Configuring...')
+        lsf.write_output('')
+        lsf.write_output(f'{opsvm}: Starting configuration...')
+        vm_success = True
         
         if not dry_run:
+            # First, check if the host is reachable
+            lsf.write_output(f'{opsvm}: Checking connectivity...')
+            if not lsf.test_ping(opsvm):
+                lsf.write_output(f'{opsvm}: FAILED - Host is not reachable (ping failed)')
+                overall_success = False
+                continue
+            lsf.write_output(f'{opsvm}: SUCCESS - Host is reachable')
+            
+            # Check if SSH port is open
+            if not lsf.test_tcp_port(opsvm, 22):
+                lsf.write_output(f'{opsvm}: FAILED - SSH port 22 is not open')
+                overall_success = False
+                continue
+            lsf.write_output(f'{opsvm}: SUCCESS - SSH port 22 is open')
+            
             # Set non-expiring password for root
-            lsf.write_output(f'{opsvm}: Setting non-expiring password')
-            lsf.ssh('chage -M -1 root', f'root@{opsvm}', password)
+            lsf.write_output(f'{opsvm}: Setting non-expiring password for root...')
+            result = lsf.ssh('chage -M -1 root', f'root@{opsvm}', password)
+            if result.returncode == 0:
+                lsf.write_output(f'{opsvm}: SUCCESS - Non-expiring password set for root')
+            elif result.returncode == 255:
+                lsf.write_output(f'{opsvm}: FAILED - SSH connection failed')
+                lsf.write_output(f'{opsvm}:         User: root, Password provided: {"yes" if password else "no"}')
+                lsf.write_output(f'{opsvm}:         This may indicate invalid credentials')
+                vm_success = False
+            elif 'permission denied' in str(result.stderr).lower():
+                lsf.write_output(f'{opsvm}: FAILED - Permission denied (invalid credentials)')
+                lsf.write_output(f'{opsvm}:         User: root')
+                vm_success = False
+            else:
+                lsf.write_output(f'{opsvm}: FAILED - chage command failed (exit code: {result.returncode})')
+                if result.stderr:
+                    lsf.write_output(f'{opsvm}:         Error: {str(result.stderr).strip()[:100]}')
+                vm_success = False
             
             # Copy authorized_keys
-            lsf.write_output(f'{opsvm}: Copying authorized_keys')
-            lsf.scp(auth_keys_file, f'root@{opsvm}:{LINUX_AUTH_FILE}', password)
-            lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{opsvm}', password)
+            lsf.write_output(f'{opsvm}: Copying authorized_keys...')
+            result = lsf.scp(auth_keys_file, f'root@{opsvm}:{LINUX_AUTH_FILE}', password)
+            if result.returncode == 0:
+                lsf.write_output(f'{opsvm}: SUCCESS - authorized_keys copied')
+                # Set proper permissions
+                chmod_result = lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{opsvm}', password)
+                if chmod_result.returncode == 0:
+                    lsf.write_output(f'{opsvm}: SUCCESS - authorized_keys permissions set (chmod 600)')
+                else:
+                    lsf.write_output(f'{opsvm}: WARNING - Failed to set permissions on authorized_keys')
+            elif result.returncode == 255 or 'permission denied' in str(result.stderr).lower():
+                lsf.write_output(f'{opsvm}: FAILED - SCP failed (authentication error)')
+                lsf.write_output(f'{opsvm}:         User: root, Password provided: {"yes" if password else "no"}')
+                vm_success = False
+            else:
+                lsf.write_output(f'{opsvm}: FAILED - SCP failed (exit code: {result.returncode})')
+                if result.stderr:
+                    lsf.write_output(f'{opsvm}:         Error: {str(result.stderr).strip()[:100]}')
+                vm_success = False
+            
+            # Summary for this VM
+            if vm_success:
+                lsf.write_output(f'{opsvm}: Configuration completed successfully')
+            else:
+                lsf.write_output(f'{opsvm}: Configuration completed with errors')
+                overall_success = False
         else:
-            lsf.write_output(f'{opsvm}: Would configure password and SSH keys')
+            lsf.write_output(f'{opsvm}: Would check connectivity (ping, SSH port)')
+            lsf.write_output(f'{opsvm}: Would set non-expiring password for root')
+            lsf.write_output(f'{opsvm}: Would copy authorized_keys to {LINUX_AUTH_FILE}')
     
-    return True
+    return overall_success
 
 
 #==============================================================================
@@ -1611,10 +1922,11 @@ def main():
     1. Pre-checks and environment setup
     2. ESXi host configuration
     3. vCenter configuration
-    4. NSX configuration
+    4. NSX configuration (Managers and Edges)
     5. SDDC Manager configuration
-    6. Operations VMs configuration
-    7. Final cleanup
+    6. Aria Automation VMs configuration (uses vmware-system-user)
+    7. Operations VMs configuration
+    8. Final cleanup
     """
     parser = argparse.ArgumentParser(
         description='HOLFY27 vApp HOLification Tool',
@@ -1735,10 +2047,13 @@ NOTE: Some NSX operations require manual steps first.
     # Step 4: Configure SDDC Manager
     configure_sddc_manager(auth_keys_file, password, args.dry_run)
     
-    # Step 5: Configure Operations VMs
+    # Step 5: Configure Aria Automation VMs
+    configure_aria_automation_vms(auth_keys_file, password, args.dry_run)
+    
+    # Step 6: Configure Operations VMs
     configure_operations_vms(auth_keys_file, password, args.dry_run)
     
-    # Step 6: Final cleanup
+    # Step 7: Final cleanup
     perform_final_cleanup(args.dry_run)
     
     # Print summary
