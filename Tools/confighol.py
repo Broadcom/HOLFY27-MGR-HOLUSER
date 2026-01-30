@@ -384,28 +384,36 @@ def configure_esxi_host(hostname: str, host_system, auth_keys_file: str,
     
     # Step 2: Copy authorized_keys for passwordless SSH access
     if not dry_run:
-        lsf.write_output(f'{hostname}: Copying authorized_keys for passwordless SSH')
+        lsf.write_output(f'{hostname}: Copying authorized_keys for passwordless SSH...')
         result = lsf.scp(auth_keys_file, f'{ESX_USERNAME}@{hostname}:{ESX_AUTH_KEYS_PATH}', password)
-        if result.returncode != 0:
-            lsf.write_output(f'{hostname}: WARNING - Failed to copy authorized_keys')
+        if result.returncode == 0:
+            lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied')
+            # Set proper permissions on the authorized_keys file
+            chmod_result = lsf.ssh(f'chmod 600 {ESX_AUTH_KEYS_PATH}', f'{ESX_USERNAME}@{hostname}', password)
+            if chmod_result.returncode == 0:
+                lsf.write_output(f'{hostname}: SUCCESS - authorized_keys permissions set (chmod 600)')
+            else:
+                lsf.write_output(f'{hostname}: WARNING - Failed to set permissions on authorized_keys')
+        elif result.returncode == 255 or 'permission denied' in str(result.stderr).lower():
+            lsf.write_output(f'{hostname}: FAILED - SCP failed (authentication error)')
+            lsf.write_output(f'{hostname}:         Attempted user: {ESX_USERNAME}, password provided: {"yes" if password else "no"}')
             success = False
         else:
-            # Set proper permissions on the authorized_keys file
-            lsf.ssh(f'chmod 600 {ESX_AUTH_KEYS_PATH}', f'{ESX_USERNAME}@{hostname}', password)
+            lsf.write_output(f'{hostname}: FAILED - Failed to copy authorized_keys (exit code: {result.returncode})')
+            if result.stderr:
+                lsf.write_output(f'{hostname}:         Error: {result.stderr.strip()}')
+            success = False
     else:
         lsf.write_output(f'{hostname}: Would copy authorized_keys to {ESX_AUTH_KEYS_PATH}')
     
     # Step 3: Set session timeout to 0 (no timeout)
     update_esxi_session_timeout(hostname, 0, dry_run)
     
-    # Step 4: Set password expiration to non-expiring
-    if not dry_run:
-        lsf.write_output(f'{hostname}: Setting non-expiring password for root')
-        result = lsf.ssh(f'chage -M {PASSWORD_MAX_DAYS} root', f'{ESX_USERNAME}@{hostname}', password)
-        if result.returncode != 0:
-            lsf.write_output(f'{hostname}: WARNING - Failed to set password expiration')
-    else:
-        lsf.write_output(f'{hostname}: Would set password expiration to {PASSWORD_MAX_DAYS} days')
+    # NOTE: ESXi does not support the 'chage' command for password expiration.
+    # Password policies on ESXi must be configured via Host Profile or vSphere API.
+    # The previous command 'chage -M 9999 root' is not valid on ESXi hosts.
+    # Password expiration for ESXi hosts is managed differently - typically via
+    # Security.PasswordMaxDays advanced setting if needed.
     
     if success:
         lsf.write_output(f'{hostname}: ESXi configuration complete')
@@ -633,44 +641,75 @@ def configure_vcenter_password_policies(hostname: str, user: str, password: str,
             lsf.write_output(f'{hostname}: WARNING - Failed to set password policy: {response.status_code}')
         
         # Get all clusters and configure DRS/HA settings
-        # Note: This uses the pyVmomi connection we already have
-        if hostname in lsf.sisvc:
-            si = lsf.sisvc[hostname]
-            content = si.RetrieveContent()
-            
-            # Get all clusters
-            container = content.viewManager.CreateContainerView(
-                content.rootFolder, [vim.ClusterComputeResource], True
-            )
-            
-            for cluster in container.view:
-                lsf.write_output(f'{hostname}: Configuring cluster {cluster.name}')
+        # We need a valid pyVmomi session - check if we have one or create a new one
+        si = None
+        
+        # Try to find the session - it may be stored under different key formats
+        if hasattr(lsf, 'sisvc') and lsf.sisvc:
+            for key in lsf.sisvc.keys():
+                if hostname in key or key in hostname:
+                    si = lsf.sisvc[key]
+                    break
+        
+        # If no existing session, create a new one for cluster configuration
+        if si is None:
+            lsf.write_output(f'{hostname}: Creating new vSphere connection for cluster configuration')
+            try:
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                si = connect.SmartConnect(
+                    host=hostname,
+                    user=user,
+                    pwd=password,
+                    sslContext=context
+                )
+            except Exception as conn_err:
+                lsf.write_output(f'{hostname}: Failed to connect for cluster configuration: {conn_err}')
+                si = None
+        
+        if si:
+            try:
+                content = si.RetrieveContent()
                 
-                try:
-                    # Create cluster config spec
-                    spec = vim.cluster.ConfigSpecEx()
+                # Get all clusters
+                container = content.viewManager.CreateContainerView(
+                    content.rootFolder, [vim.ClusterComputeResource], True
+                )
+                
+                for cluster in container.view:
+                    lsf.write_output(f'{hostname}: Configuring cluster {cluster.name}')
                     
-                    # Configure DRS to PartiallyAutomated
-                    drs_spec = vim.cluster.DrsConfigInfo()
-                    drs_spec.enabled = True
-                    drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
-                    spec.drsConfig = drs_spec
-                    
-                    # Disable HA Admission Control
-                    das_spec = vim.cluster.DasConfigInfo()
-                    das_spec.admissionControlEnabled = False
-                    spec.dasConfig = das_spec
-                    
-                    # Apply configuration
-                    task = cluster.ReconfigureComputeResource_Task(spec, True)
-                    WaitForTask(task)
-                    
-                    lsf.write_output(f'{hostname}: Cluster {cluster.name} configured')
-                    
-                except Exception as e:
-                    lsf.write_output(f'{hostname}: Failed to configure cluster {cluster.name}: {e}')
-            
-            container.Destroy()
+                    try:
+                        # Create cluster config spec
+                        spec = vim.cluster.ConfigSpecEx()
+                        
+                        # Configure DRS to PartiallyAutomated
+                        drs_spec = vim.cluster.DrsConfigInfo()
+                        drs_spec.enabled = True
+                        drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
+                        spec.drsConfig = drs_spec
+                        
+                        # Disable HA Admission Control
+                        das_spec = vim.cluster.DasConfigInfo()
+                        das_spec.admissionControlEnabled = False
+                        spec.dasConfig = das_spec
+                        
+                        # Apply configuration
+                        task = cluster.ReconfigureComputeResource_Task(spec, True)
+                        WaitForTask(task)
+                        
+                        lsf.write_output(f'{hostname}: Cluster {cluster.name} configured successfully')
+                        
+                    except Exception as e:
+                        lsf.write_output(f'{hostname}: Failed to configure cluster {cluster.name}: {e}')
+                
+                container.Destroy()
+                
+            except Exception as e:
+                lsf.write_output(f'{hostname}: Error accessing vSphere content: {e}')
+        else:
+            lsf.write_output(f'{hostname}: WARNING - No vSphere connection available, skipping cluster configuration')
         
         # End the REST API session
         session.delete(auth_url)
@@ -1109,22 +1148,77 @@ def configure_operations_vms(auth_keys_file: str, password: str,
     lsf.write_output('Operations VMs Configuration')
     lsf.write_output('=' * 60)
     
+    overall_success = True
+    
     for opsvm in ops_vms:
-        lsf.write_output(f'{opsvm}: Configuring...')
+        lsf.write_output('')
+        lsf.write_output(f'{opsvm}: Starting configuration...')
+        vm_success = True
         
         if not dry_run:
+            # First, check if the host is reachable
+            if not lsf.test_ping(opsvm):
+                lsf.write_output(f'{opsvm}: FAILED - Host is not reachable (ping failed)')
+                overall_success = False
+                continue
+            
+            # Check if SSH port is open
+            if not lsf.test_tcp_port(opsvm, 22):
+                lsf.write_output(f'{opsvm}: FAILED - SSH port 22 is not open')
+                overall_success = False
+                continue
+            
             # Set non-expiring password for root
-            lsf.write_output(f'{opsvm}: Setting non-expiring password')
-            lsf.ssh('chage -M -1 root', f'root@{opsvm}', password)
+            lsf.write_output(f'{opsvm}: Setting non-expiring password for root...')
+            result = lsf.ssh('chage -M -1 root', f'root@{opsvm}', password)
+            if result.returncode == 0:
+                lsf.write_output(f'{opsvm}: SUCCESS - Non-expiring password set for root')
+            elif result.returncode == 255:
+                lsf.write_output(f'{opsvm}: FAILED - SSH connection failed (check username/password)')
+                lsf.write_output(f'{opsvm}:         Attempted user: root, password provided: {"yes" if password else "no"}')
+                vm_success = False
+            elif 'permission denied' in str(result.stderr).lower():
+                lsf.write_output(f'{opsvm}: FAILED - Permission denied (invalid credentials)')
+                lsf.write_output(f'{opsvm}:         Attempted user: root')
+                vm_success = False
+            else:
+                lsf.write_output(f'{opsvm}: FAILED - chage command failed (exit code: {result.returncode})')
+                if result.stderr:
+                    lsf.write_output(f'{opsvm}:         Error: {result.stderr.strip()}')
+                vm_success = False
             
             # Copy authorized_keys
-            lsf.write_output(f'{opsvm}: Copying authorized_keys')
-            lsf.scp(auth_keys_file, f'root@{opsvm}:{LINUX_AUTH_FILE}', password)
-            lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{opsvm}', password)
+            lsf.write_output(f'{opsvm}: Copying authorized_keys...')
+            result = lsf.scp(auth_keys_file, f'root@{opsvm}:{LINUX_AUTH_FILE}', password)
+            if result.returncode == 0:
+                lsf.write_output(f'{opsvm}: SUCCESS - authorized_keys copied')
+                # Set proper permissions
+                chmod_result = lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{opsvm}', password)
+                if chmod_result.returncode == 0:
+                    lsf.write_output(f'{opsvm}: SUCCESS - authorized_keys permissions set (chmod 600)')
+                else:
+                    lsf.write_output(f'{opsvm}: WARNING - Failed to set permissions on authorized_keys')
+            elif result.returncode == 255 or 'permission denied' in str(result.stderr).lower():
+                lsf.write_output(f'{opsvm}: FAILED - SCP failed (authentication error)')
+                lsf.write_output(f'{opsvm}:         Attempted user: root, password provided: {"yes" if password else "no"}')
+                vm_success = False
+            else:
+                lsf.write_output(f'{opsvm}: FAILED - SCP failed (exit code: {result.returncode})')
+                if result.stderr:
+                    lsf.write_output(f'{opsvm}:         Error: {result.stderr.strip()}')
+                vm_success = False
+            
+            if vm_success:
+                lsf.write_output(f'{opsvm}: Configuration completed successfully')
+            else:
+                lsf.write_output(f'{opsvm}: Configuration completed with errors')
+                overall_success = False
         else:
-            lsf.write_output(f'{opsvm}: Would configure password and SSH keys')
+            lsf.write_output(f'{opsvm}: Would check connectivity (ping, SSH port)')
+            lsf.write_output(f'{opsvm}: Would set non-expiring password for root')
+            lsf.write_output(f'{opsvm}: Would copy authorized_keys to {LINUX_AUTH_FILE}')
     
-    return True
+    return overall_success
 
 
 #==============================================================================

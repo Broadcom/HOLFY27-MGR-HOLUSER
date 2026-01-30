@@ -318,9 +318,22 @@ def check_vm_configuration(vms: List, fix_issues: bool = True) -> List[CheckResu
     """Check and optionally fix VM configuration"""
     results = []
     
+    # System VMs that should be skipped - these cannot be modified
+    SKIP_VM_PATTERNS = [
+        'vCLS-',                              # vSphere Cluster Services VMs
+        'vcf-services-platform-template-',    # VCF Services Platform Template VMs
+        'SupervisorControlPlaneVM',           # Tanzu Supervisor Control Plane VMs
+    ]
+    
     for vm in vms:
-        # Skip vCLS VMs
-        if 'vCLS-' in vm.name:
+        # Skip system VMs that cannot be modified
+        skip_vm = False
+        for pattern in SKIP_VM_PATTERNS:
+            if pattern in vm.name:
+                skip_vm = True
+                break
+        
+        if skip_vm:
             continue
         
         issues = []
@@ -397,6 +410,41 @@ def check_vm_configuration(vms: List, fix_issues: bool = True) -> List[CheckResu
 # LICENSE CHECKS
 #==============================================================================
 
+def get_months_until_expiration(exp_date: datetime.date) -> float:
+    """Calculate months until expiration from today's date"""
+    today = datetime.date.today()
+    days_until = (exp_date - today).days
+    # Approximate months (30.44 days per month on average)
+    return days_until / 30.44
+
+
+def get_license_expiration_status(exp_date: datetime.date) -> tuple:
+    """
+    Determine license status based on months until expiration.
+    
+    Returns:
+        tuple: (status, message) where status is PASS/WARN/FAIL
+        
+    Status rules:
+        - PASS (green checkmark): >= 9 months from now
+        - WARN (warning icon): < 9 months but >= 3 months from now
+        - FAIL (red X): < 3 months from now
+    """
+    months_until = get_months_until_expiration(exp_date)
+    
+    if months_until >= 9:
+        status = "PASS"
+        message = f"License valid - expires {exp_date} (>= 9 months)"
+    elif months_until >= 3:
+        status = "WARN"
+        message = f"License expiring soon - expires {exp_date} (< 9 months)"
+    else:
+        status = "FAIL"
+        message = f"License expiring critically soon - expires {exp_date} (< 3 months)"
+    
+    return status, message
+
+
 def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetime.date) -> List[CheckResult]:
     """Check vSphere licenses"""
     results = []
@@ -422,7 +470,7 @@ def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetim
                     results.append(CheckResult(
                         name=f"License: {entity_name}",
                         status="FAIL",
-                        message="Evaluation license detected",
+                        message="Evaluation license detected - no expiration date",
                         details={"license_key": license_key, "entity": entity_name}
                     ))
                     continue
@@ -435,22 +483,15 @@ def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetim
                         break
                 
                 if exp_date:
-                    if exp_date.date() < min_exp_date:
-                        status = "FAIL"
-                        message = f"License expires too soon ({exp_date.date()})"
-                    elif exp_date.date() > max_exp_date:
-                        status = "FAIL"
-                        message = f"License expires too late ({exp_date.date()})"
-                    else:
-                        status = "PASS"
-                        message = f"License expires {exp_date.date()}"
+                    # Use the new expiration status logic based on months from today
+                    status, message = get_license_expiration_status(exp_date.date())
                 else:
                     if 'NSX for vShield Endpoint' in license_name:
                         status = "WARN"
-                        message = "Non-expiring license (expected for vShield Endpoint)"
+                        message = "Non-expiring license (expected for vShield Endpoint) - no expiration date"
                     else:
                         status = "FAIL"
-                        message = "Non-expiring license detected"
+                        message = "Non-expiring license detected - no expiration date"
                 
                 results.append(CheckResult(
                     name=f"License: {license_name}",
@@ -466,10 +507,22 @@ def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetim
             # Check for unassigned licenses
             for lic in lic_mgr.licenses:
                 if not lic.used and lic.licenseKey != '00000-00000-00000-00000-00000':
+                    # Get expiration date for unassigned license
+                    exp_date = None
+                    for prop in lic.properties:
+                        if prop.key == 'expirationDate':
+                            exp_date = prop.value
+                            break
+                    
+                    if exp_date:
+                        exp_msg = f" - expires {exp_date.date()}"
+                    else:
+                        exp_msg = " - no expiration date"
+                    
                     results.append(CheckResult(
                         name=f"License: {lic.name}",
                         status="WARN",
-                        message="Unassigned license - should be removed",
+                        message=f"Unassigned license - should be removed{exp_msg}",
                         details={"license_key": lic.licenseKey[:5] + "-****"}
                     ))
         
@@ -617,19 +670,76 @@ def main():
     
     # Get URLs from config
     urls = []
+    esxi_hosts = []
     if lsf and hasattr(lsf, 'config'):
         try:
+            # Get URLs from RESOURCES section
             if 'URLs' in lsf.config['RESOURCES'].keys():
                 urls_raw = lsf.config.get('RESOURCES', 'URLs').split('\n')
                 for entry in urls_raw:
-                    url = entry.split(',')[0]
-                    urls.append(url)
+                    url = entry.split(',')[0].strip()
+                    if url:
+                        urls.append(url)
+            
+            # Get ESXi hosts from RESOURCES section
+            if 'ESXiHosts' in lsf.config['RESOURCES'].keys():
+                hosts_raw = lsf.config.get('RESOURCES', 'ESXiHosts').split('\n')
+                for entry in hosts_raw:
+                    if not entry or entry.strip().startswith('#'):
+                        continue
+                    # ESXi entries have format: hostname:maintenance_mode_flag
+                    # Only the content to the left of : is the FQDN
+                    hostname = entry.split(':')[0].strip()
+                    if hostname:
+                        esxi_hosts.append(f'https://{hostname}')
+        except Exception:
+            pass
+        
+        try:
+            # Get URLs from VCF section (vcfnsxmgr)
+            if 'VCF' in lsf.config.sections():
+                if 'vcfnsxmgr' in lsf.config['VCF'].keys():
+                    nsxmgrs_raw = lsf.config.get('VCF', 'vcfnsxmgr').split('\n')
+                    for entry in nsxmgrs_raw:
+                        if not entry or entry.strip().startswith('#'):
+                            continue
+                        # NSX Manager entries may have format: hostname:esxhost
+                        hostname = entry.split(':')[0].strip()
+                        if hostname:
+                            urls.append(f'https://{hostname}')
+                
+                # Also check VCF urls if present
+                if 'urls' in lsf.config['VCF'].keys():
+                    vcf_urls_raw = lsf.config.get('VCF', 'urls').split('\n')
+                    for entry in vcf_urls_raw:
+                        url = entry.split(',')[0].strip()
+                        if url:
+                            urls.append(url)
+        except Exception:
+            pass
+        
+        try:
+            # Get vraurls from VCFFINAL section
+            if 'VCFFINAL' in lsf.config.sections():
+                if 'vraurls' in lsf.config['VCFFINAL'].keys():
+                    vra_urls_raw = lsf.config.get('VCFFINAL', 'vraurls').split('\n')
+                    for entry in vra_urls_raw:
+                        url = entry.split(',')[0].strip()
+                        if url:
+                            urls.append(url)
         except Exception:
             pass
     
-    # Run SSL checks
+    # Run SSL checks for URLs
     print("\nChecking SSL certificates...")
     report.ssl_checks = check_ssl_certificates(urls, min_exp_date)
+    
+    # Run SSL checks for ESXi hosts
+    if esxi_hosts:
+        print("\nChecking ESXi host SSL certificates...")
+        esxi_ssl_checks = check_ssl_certificates(esxi_hosts, min_exp_date)
+        report.ssl_checks.extend(esxi_ssl_checks)
+    
     print_results_table("SSL CERTIFICATES", report.ssl_checks)
     
     # Connect to vCenters and run vSphere checks
