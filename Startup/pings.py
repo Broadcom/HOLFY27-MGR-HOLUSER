@@ -68,8 +68,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     if not ping_targets:
         lsf.write_output('No ping targets configured')
         if dashboard:
-            dashboard.update_task('pings', 'ping_targets', 'skipped', 'No ping targets defined in config')
-            dashboard.generate_html()
+            dashboard.update_task('pings', 'ping_targets', 'skipped', 'No ping targets defined in config',
+                                  total=0, success=0, failed=0, skipped=0)
         return
     
     lsf.write_output(f'Ping targets: {ping_targets}')
@@ -118,11 +118,16 @@ def main(lsf=None, standalone=False, dry_run=False):
             # Note: We log failures but don't fail the lab - adjust as needed
     
     if dashboard:
+        total_targets = len(ping_targets)
         if failed:
-            dashboard.update_task('pings', 'ping_targets', 'failed', f'{len(failed)} target(s) failed: {", ".join(failed[:3])}{"..." if len(failed) > 3 else ""}')
+            # Show up to 3 failed targets in the message
+            failed_preview = ", ".join(failed[:3]) + ("..." if len(failed) > 3 else "")
+            dashboard.update_task('pings', 'ping_targets', 'failed', 
+                                  f'Failed: {failed_preview}',
+                                  total=total_targets, success=len(succeeded), failed=len(failed))
         else:
-            dashboard.update_task('pings', 'ping_targets', 'complete')
-        dashboard.generate_html()
+            dashboard.update_task('pings', 'ping_targets', 'complete',
+                                  total=total_targets, success=len(succeeded), failed=0)
     
     ##=========================================================================
     ## End Core Team code

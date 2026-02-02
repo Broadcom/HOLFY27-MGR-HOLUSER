@@ -71,8 +71,10 @@ def main(lsf=None, standalone=False, dry_run=False):
     if not esx_hosts:
         lsf.write_output('No ESXi hosts configured in config.ini')
         if dashboard:
-            dashboard.update_task('esxi', 'host_check', TaskStatus.SKIPPED, 'No hosts configured')
-            dashboard.generate_html()
+            dashboard.update_task('esxi', 'host_check', TaskStatus.SKIPPED, 'No hosts configured',
+                                  total=0, success=0, failed=0, skipped=0)
+            dashboard.update_task('esxi', 'host_ports', TaskStatus.SKIPPED, 'No hosts configured',
+                                  total=0, success=0, failed=0, skipped=0)
         return
     
     lsf.write_output(f'ESXi hosts to check: {len(esx_hosts)}')
@@ -144,13 +146,83 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_output(f'Hosts staying in maintenance mode: {maintenance_mode_hosts}')
     
     if dashboard:
+        total_hosts = len(esx_hosts)
         if failed_hosts:
             dashboard.update_task('esxi', 'host_check', TaskStatus.FAILED, 
-                                  f'{len(failed_hosts)} hosts failed')
+                                  f'{len(failed_hosts)} host(s) not responding',
+                                  total=total_hosts, success=len(successful_hosts), failed=len(failed_hosts))
         else:
             dashboard.update_task('esxi', 'host_check', TaskStatus.COMPLETE,
-                                  f'{len(successful_hosts)} hosts OK')
+                                  total=total_hosts, success=len(successful_hosts), failed=0)
+    
+    #==========================================================================
+    # Check ESXi Management Ports
+    #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('esxi', 'host_ports', TaskStatus.RUNNING)
         dashboard.generate_html()
+    
+    if not esx_hosts:
+        if dashboard:
+            dashboard.update_task('esxi', 'host_ports', TaskStatus.SKIPPED, 'No hosts configured',
+                                  total=0, success=0, failed=0, skipped=0)
+    elif failed_hosts:
+        # Skip port checks if hosts failed connectivity
+        if dashboard:
+            dashboard.update_task('esxi', 'host_ports', TaskStatus.SKIPPED, 
+                                  'Skipped due to host connectivity failures',
+                                  total=len(esx_hosts), success=0, failed=0, skipped=len(esx_hosts))
+    else:
+        lsf.write_output('Checking ESXi management ports (443, 902)...')
+        
+        port_failed_hosts = []
+        port_successful_hosts = []
+        
+        for entry in esx_hosts:
+            # Parse host:maintenance_mode format
+            if ':' in entry:
+                parts = entry.split(':')
+                host = parts[0].strip()
+            else:
+                host = entry.strip()
+            
+            if dry_run:
+                lsf.write_output(f'Would check ports on: {host}')
+                continue
+            
+            # Check port 443 (HTTPS/vSphere Client)
+            port_443_ok = lsf.test_tcp_port(host, 443, timeout=10)
+            # Check port 902 (vSphere Management)
+            port_902_ok = lsf.test_tcp_port(host, 902, timeout=10)
+            
+            if port_443_ok and port_902_ok:
+                lsf.write_output(f'ESXi management ports OK: {host} (443, 902)')
+                port_successful_hosts.append(host)
+            else:
+                failed_ports = []
+                if not port_443_ok:
+                    failed_ports.append('443')
+                if not port_902_ok:
+                    failed_ports.append('902')
+                lsf.write_output(f'ESXi port check FAILED: {host} (ports {", ".join(failed_ports)} not responding)')
+                port_failed_hosts.append(host)
+        
+        # Report port check results
+        if not dry_run:
+            lsf.write_output(f'Port check results: {len(port_successful_hosts)} OK, {len(port_failed_hosts)} failed')
+        
+        if dashboard:
+            total_port_hosts = len(port_successful_hosts) + len(port_failed_hosts)
+            if port_failed_hosts:
+                dashboard.update_task('esxi', 'host_ports', TaskStatus.FAILED,
+                                      f'{len(port_failed_hosts)} host(s) have port issues',
+                                      total=total_port_hosts, success=len(port_successful_hosts), 
+                                      failed=len(port_failed_hosts))
+            else:
+                dashboard.update_task('esxi', 'host_ports', TaskStatus.COMPLETE,
+                                      total=total_port_hosts, success=len(port_successful_hosts), 
+                                      failed=0)
     
     ##=========================================================================
     ## End Core Team code
