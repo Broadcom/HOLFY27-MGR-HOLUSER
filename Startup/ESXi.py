@@ -178,6 +178,12 @@ def main(lsf=None, standalone=False, dry_run=False):
         
         port_failed_hosts = []
         port_successful_hosts = []
+        port_failure_details = {}  # Track which ports failed for each host
+        
+        # Port check configuration
+        ports_to_check = [443, 902]  # HTTPS/vSphere Client, vSphere Management
+        max_port_retries = 10
+        port_retry_delay = 30
         
         for entry in esx_hosts:
             # Parse host:maintenance_mode format
@@ -191,38 +197,56 @@ def main(lsf=None, standalone=False, dry_run=False):
                 lsf.write_output(f'Would check ports on: {host}')
                 continue
             
-            # Check port 443 (HTTPS/vSphere Client)
-            port_443_ok = lsf.test_tcp_port(host, 443, timeout=10)
-            # Check port 902 (vSphere Management)
-            port_902_ok = lsf.test_tcp_port(host, 902, timeout=10)
+            lsf.write_output(f'Checking management ports on {host}...')
             
-            if port_443_ok and port_902_ok:
-                lsf.write_output(f'ESXi management ports OK: {host} (443, 902)')
+            # Check each port with retry logic
+            failed_ports = []
+            for port in ports_to_check:
+                port_ok = False
+                
+                for attempt in range(max_port_retries):
+                    if lsf.test_tcp_port(host, port, timeout=10):
+                        port_ok = True
+                        break
+                    else:
+                        if attempt < max_port_retries - 1:
+                            lsf.write_output(f'  Port {port} not responding (attempt {attempt + 1}/{max_port_retries}), retrying...')
+                            lsf.labstartup_sleep(port_retry_delay)
+                
+                if not port_ok:
+                    failed_ports.append(str(port))
+                    lsf.write_output(f'  Port {port} FAILED after {max_port_retries} attempts')
+                else:
+                    lsf.write_output(f'  Port {port} OK')
+            
+            # Determine overall result for this host
+            if not failed_ports:
+                lsf.write_output(f'ESXi management ports OK: {host} (all ports responding)')
                 port_successful_hosts.append(host)
             else:
-                failed_ports = []
-                if not port_443_ok:
-                    failed_ports.append('443')
-                if not port_902_ok:
-                    failed_ports.append('902')
-                lsf.write_output(f'ESXi port check FAILED: {host} (ports {", ".join(failed_ports)} not responding)')
+                port_failure_details[host] = failed_ports
+                lsf.write_output(f'ESXi port check FAILED: {host} (ports {", ".join(failed_ports)} not responding after {max_port_retries} attempts)')
                 port_failed_hosts.append(host)
         
         # Report port check results
         if not dry_run:
             lsf.write_output(f'Port check results: {len(port_successful_hosts)} OK, {len(port_failed_hosts)} failed')
+            if port_failed_hosts:
+                lsf.write_output('Failed hosts and ports:')
+                for host in port_failed_hosts:
+                    lsf.write_output(f'  {host}: ports {", ".join(port_failure_details[host])}')
         
         if dashboard:
-            total_port_hosts = len(port_successful_hosts) + len(port_failed_hosts)
             if port_failed_hosts:
+                # Create detailed message showing which hosts and ports failed
+                failure_summary = '; '.join([f'{host} (ports {", ".join(port_failure_details[host])})' 
+                                             for host in port_failed_hosts])
                 dashboard.update_task('esxi', 'host_ports', TaskStatus.FAILED,
-                                      f'{len(port_failed_hosts)} host(s) have port issues',
-                                      total=total_port_hosts, success=len(port_successful_hosts), 
-                                      failed=len(port_failed_hosts))
+                                      f'{len(port_failed_hosts)} host(s) failed: {failure_summary}')
             else:
                 dashboard.update_task('esxi', 'host_ports', TaskStatus.COMPLETE,
-                                      total=total_port_hosts, success=len(port_successful_hosts), 
-                                      failed=0)
+                                      f'{len(port_successful_hosts)} hosts OK')
+            dashboard.generate_html()
     
     ##=========================================================================
     ## End Core Team code
