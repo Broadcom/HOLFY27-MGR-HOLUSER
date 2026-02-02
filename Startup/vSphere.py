@@ -76,7 +76,15 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if not vcenters:
         lsf.write_output('No vCenters configured - skipping vSphere startup')
+        if dashboard:
+            dashboard.update_task('vsphere', 'vcenter_wait', TaskStatus.SKIPPED, 'No vCenters configured')
+            dashboard.generate_html()
         return
+    
+    # Update dashboard - waiting for vCenter
+    if dashboard:
+        dashboard.update_task('vsphere', 'vcenter_wait', TaskStatus.RUNNING)
+        dashboard.generate_html()
     
     lsf.write_vpodprogress('Connecting vCenters', 'GOOD-3')
     
@@ -156,6 +164,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output(f'Would connect to vCenters: {vcenters}')
     
     if dashboard:
+        dashboard.update_task('vsphere', 'vcenter_wait', TaskStatus.COMPLETE)
         dashboard.update_task('vsphere', 'vcenter_connect', TaskStatus.COMPLETE)
         dashboard.update_task('vsphere', 'datastores', TaskStatus.RUNNING)
         dashboard.generate_html()
@@ -332,7 +341,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if dashboard:
         dashboard.update_task('vsphere', 'vcenter_ready', TaskStatus.COMPLETE)
-        dashboard.update_task('vsphere', 'nested_vms', TaskStatus.RUNNING)
+        dashboard.update_task('vsphere', 'power_on_vms', TaskStatus.RUNNING)
         dashboard.generate_html()
     
     #==========================================================================
@@ -359,10 +368,23 @@ def main(lsf=None, standalone=False, dry_run=False):
                 except Exception as e:
                     lsf.write_output(f'VM startup error: {e}')
                 lsf.labstartup_sleep(lsf.sleep_seconds)
+        
+        if dashboard:
+            dashboard.update_task('vsphere', 'power_on_vms', TaskStatus.COMPLETE)
+            dashboard.generate_html()
+    else:
+        lsf.write_output('No VMs configured to start')
+        if dashboard:
+            dashboard.update_task('vsphere', 'power_on_vms', TaskStatus.SKIPPED, 'No VMs defined in config')
+            dashboard.generate_html()
     
     #==========================================================================
     # TASK 9: Start vApps
     #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('vsphere', 'power_on_vapps', TaskStatus.RUNNING)
+        dashboard.generate_html()
     
     vapps = []
     if lsf.config.has_option('RESOURCES', 'vApps'):
@@ -383,6 +405,15 @@ def main(lsf=None, standalone=False, dry_run=False):
                 except Exception as e:
                     lsf.write_output(f'vApp startup error: {e}')
                 lsf.labstartup_sleep(lsf.sleep_seconds)
+        
+        if dashboard:
+            dashboard.update_task('vsphere', 'power_on_vapps', TaskStatus.COMPLETE)
+            dashboard.generate_html()
+    else:
+        lsf.write_output('No vApps configured to start')
+        if dashboard:
+            dashboard.update_task('vsphere', 'power_on_vapps', TaskStatus.SKIPPED, 'No vApps defined in config')
+            dashboard.generate_html()
     
     if dashboard:
         dashboard.update_task('vsphere', 'nested_vms', TaskStatus.COMPLETE)

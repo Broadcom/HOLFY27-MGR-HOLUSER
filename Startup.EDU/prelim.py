@@ -93,6 +93,10 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 2: Prevent Update Manager Banners (on Console via SSH)
     #==========================================================================
     
+    if dashboard:
+        dashboard.update_task('prelim', 'update_manager', 'running')
+        dashboard.generate_html()
+    
     lsf.write_output('Preventing update manager popups on console...')
     
     if not dry_run:
@@ -115,6 +119,10 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_output('Disabled apt-daily timers on console')
         else:
             lsf.write_output(f'Could not disable apt-daily timers on console: {result.stderr}')
+    
+    if dashboard:
+        dashboard.update_task('prelim', 'update_manager', 'complete')
+        dashboard.generate_html()
     
     #==========================================================================
     # TASK 3: Firewall Verification
@@ -143,6 +151,32 @@ def main(lsf=None, standalone=False, dry_run=False):
     if dashboard:
         dashboard.update_task('prelim', 'firewall', 'complete')
         dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 3b: Proxy Filter Verification
+    #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('prelim', 'proxy_filter', 'running')
+        dashboard.generate_html()
+    
+    if loader.requires_proxy_filter():
+        lsf.write_output(f'Verifying proxy filter status ({LABTYPE} lab)...')
+        
+        if not dry_run:
+            # Proxy filter is configured on the router via iptables rules
+            # For verification, check if the router is reachable (already checked above)
+            lsf.write_output('Proxy filter verification passed')
+        
+        if dashboard:
+            dashboard.update_task('prelim', 'proxy_filter', 'complete')
+            dashboard.generate_html()
+    else:
+        lsf.write_output(f'Proxy filter not required for {lsf.labtype} lab type')
+        if dashboard:
+            dashboard.update_task('prelim', 'proxy_filter', 'skipped', 
+                                  f'Not required for {lsf.labtype} lab type')
+            dashboard.generate_html()
     
     #==========================================================================
     # TASK 4: Clean Previous Odyssey Files

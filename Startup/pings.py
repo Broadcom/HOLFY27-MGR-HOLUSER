@@ -45,7 +45,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     try:
         from status_dashboard import StatusDashboard
         dashboard = StatusDashboard(lsf.lab_sku)
-        dashboard.update_task('services', 'pings', 'running')
+        dashboard.update_task('pings', 'ping_targets', 'running')
         dashboard.generate_html()
     except Exception:
         dashboard = None
@@ -67,6 +67,9 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if not ping_targets:
         lsf.write_output('No ping targets configured')
+        if dashboard:
+            dashboard.update_task('pings', 'ping_targets', 'skipped', 'No ping targets defined in config')
+            dashboard.generate_html()
         return
     
     lsf.write_output(f'Ping targets: {ping_targets}')
@@ -115,8 +118,10 @@ def main(lsf=None, standalone=False, dry_run=False):
             # Note: We log failures but don't fail the lab - adjust as needed
     
     if dashboard:
-        status = 'complete' if not failed else 'failed'
-        dashboard.update_task('services', 'pings', status)
+        if failed:
+            dashboard.update_task('pings', 'ping_targets', 'failed', f'{len(failed)} target(s) failed: {", ".join(failed[:3])}{"..." if len(failed) > 3 else ""}')
+        else:
+            dashboard.update_task('pings', 'ping_targets', 'complete')
         dashboard.generate_html()
     
     ##=========================================================================

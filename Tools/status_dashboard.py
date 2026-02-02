@@ -168,8 +168,10 @@ class StatusDashboard:
                 ('vcls', 'vCLS Verification', 'Verify vCLS VMs are running'),
                 ('drs', 'DRS Configuration', 'Configure DRS settings'),
                 ('shell_warning', 'Shell Warning Suppress', 'Suppress ESXi shell warnings'),
+                ('vcenter_ready', 'vCenter Ready', 'Verify vCenter UI is accessible'),
                 ('power_on_vms', 'Power On VMs', 'Power on configured virtual machines'),
                 ('power_on_vapps', 'Power On vApps', 'Power on configured vApps'),
+                ('nested_vms', 'Nested VMs Complete', 'All VM startup tasks completed'),
             ]),
             
             # Group 6: pings.py - Network Connectivity
@@ -213,7 +215,7 @@ class StatusDashboard:
             ('final', '12. Final Checks (final.py)', [
                 ('custom', 'Custom Checks', 'Lab-specific final checks'),
                 ('labcheck', 'LabCheck Schedule', 'Configure labcheck scheduled task'),
-                ('holuser_lock', 'HolUser Lock', 'Lock holuser account if configured'),
+                ('holuser_lock', 'holuser lock', 'Lock holuser account if configured'),
                 ('ready', 'Lab Ready', 'Mark lab as ready'),
             ]),
         ]

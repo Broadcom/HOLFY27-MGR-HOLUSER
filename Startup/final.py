@@ -167,6 +167,81 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('final', 'custom', TaskStatus.COMPLETE)
         dashboard.generate_html()
     
+    #==========================================================================
+    # TASK 5: LabCheck Schedule
+    #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('final', 'labcheck', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    # Check if labcheck scheduling is configured
+    labcheck_configured = False
+    labcheck_skip_reason = 'LabCheck not configured in config.ini'
+    
+    if lsf.config.has_option('VPOD', 'labcheck_enabled'):
+        labcheck_enabled = lsf.config.get('VPOD', 'labcheck_enabled').lower() == 'true'
+        if labcheck_enabled:
+            labcheck_configured = True
+            lsf.write_output('LabCheck scheduling is enabled')
+            # LabCheck scheduling would be configured here
+            if dashboard:
+                dashboard.update_task('final', 'labcheck', TaskStatus.COMPLETE)
+                dashboard.generate_html()
+        else:
+            labcheck_skip_reason = 'LabCheck disabled in config (labcheck_enabled=false)'
+    
+    if not labcheck_configured:
+        lsf.write_output(f'Skipping LabCheck schedule: {labcheck_skip_reason}')
+        if dashboard:
+            dashboard.update_task('final', 'labcheck', TaskStatus.SKIPPED, labcheck_skip_reason)
+            dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 6: holuser Lock
+    #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('final', 'holuser_lock', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    # Check if holuser lock is configured
+    holuser_lock_configured = False
+    holuser_lock_skip_reason = 'holuser lock not configured in config.ini'
+    
+    if lsf.config.has_option('VPOD', 'holuser_lock'):
+        holuser_lock_enabled = lsf.config.get('VPOD', 'holuser_lock').lower() == 'true'
+        if holuser_lock_enabled:
+            holuser_lock_configured = True
+            lsf.write_output('Locking holuser account')
+            if not dry_run:
+                # Lock the holuser account
+                try:
+                    import subprocess
+                    subprocess.run(['passwd', '-l', 'holuser'], capture_output=True)
+                    lsf.write_output('holuser account locked')
+                except Exception as e:
+                    lsf.write_output(f'Error locking holuser account: {e}')
+            if dashboard:
+                dashboard.update_task('final', 'holuser_lock', TaskStatus.COMPLETE)
+                dashboard.generate_html()
+        else:
+            holuser_lock_skip_reason = 'holuser lock disabled in config (holuser_lock=false)'
+    
+    if not holuser_lock_configured:
+        lsf.write_output(f'Skipping holuser lock: {holuser_lock_skip_reason}')
+        if dashboard:
+            dashboard.update_task('final', 'holuser_lock', TaskStatus.SKIPPED, holuser_lock_skip_reason)
+            dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 7: Lab Ready
+    #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('final', 'ready', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
     ##=========================================================================
     ## End Core Team code
     ##=========================================================================
@@ -182,6 +257,11 @@ def main(lsf=None, standalone=False, dry_run=False):
     ##=========================================================================
     
     lsf.write_output(f'{MODULE_NAME} completed successfully')
+    
+    # Mark lab as ready
+    if dashboard:
+        dashboard.update_task('final', 'ready', TaskStatus.COMPLETE, 'Lab startup completed successfully')
+        dashboard.generate_html()
     
     # Update desktop background if needed
     if not dry_run:

@@ -82,6 +82,10 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.connect_vcenters(vcfmgmtcluster)
             
             # Exit maintenance mode for each host
+            if dashboard:
+                dashboard.update_task('vcf', 'exit_maintenance', TaskStatus.RUNNING)
+                dashboard.generate_html()
+            
             for entry in vcfmgmtcluster:
                 parts = entry.split(':')
                 hostname = parts[0].strip()
@@ -101,8 +105,19 @@ def main(lsf=None, standalone=False, dry_run=False):
                     lsf.labstartup_sleep(lsf.sleep_seconds)
                 except Exception as e:
                     lsf.write_output(f'Error processing host {hostname}: {e}')
+            
+            if dashboard:
+                dashboard.update_task('vcf', 'exit_maintenance', TaskStatus.COMPLETE)
+                dashboard.generate_html()
         else:
             lsf.write_output(f'Would connect to VCF hosts: {vcfmgmtcluster}')
+            if dashboard:
+                dashboard.update_task('vcf', 'exit_maintenance', TaskStatus.SKIPPED, 'Dry run mode')
+                dashboard.generate_html()
+    else:
+        if dashboard:
+            dashboard.update_task('vcf', 'exit_maintenance', TaskStatus.SKIPPED, 'No VCF management cluster hosts configured')
+            dashboard.generate_html()
     
     if dashboard:
         dashboard.update_task('vcf', 'mgmt_cluster', TaskStatus.COMPLETE)
