@@ -97,6 +97,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                 parts = entry.split(':')
                 hostname = parts[0].strip()
                 
+                lsf.write_output(f'Checking host status: {hostname}')
                 try:
                     host = lsf.get_host(hostname)
                     if host is None:
@@ -108,13 +109,12 @@ def main(lsf=None, standalone=False, dry_run=False):
                         lsf.write_output(f'Removing {hostname} from Maintenance Mode')
                         host.ExitMaintenanceMode_Task(0)
                         hosts_exited_mm += 1
+                        lsf.labstartup_sleep(lsf.sleep_seconds)
                     elif host.runtime.connectionState != 'connected':
                         lsf.write_output(f'Host {hostname} in error state: {host.runtime.connectionState}')
                         hosts_mm_failed += 1
                     else:
                         hosts_exited_mm += 1  # Already out of maintenance
-                    
-                    lsf.labstartup_sleep(lsf.sleep_seconds)
                 except Exception as e:
                     lsf.write_output(f'Error processing host {hostname}: {e}')
                     hosts_mm_failed += 1
