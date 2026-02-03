@@ -1,6 +1,6 @@
 # HOLFY27 Tools
 
-Version 2.0 - January 2026
+Version 2.1 - January 2026
 
 This folder contains utility scripts and tools for managing HOLFY27 lab environments. These tools support lab development, debugging, automation, and operational tasks.
 
@@ -11,6 +11,7 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
 - [HOLFY27 Tools](#holfy27-tools)
   - [Table of Contents](#table-of-contents)
   - [Python Scripts](#python-scripts)
+    - [cert-replacement.py](#cert-replacementpy)
     - [confighol.py](#configholpy)
     - [checkfw.py](#checkfwpy)
     - [dns\_checks.py](#dns_checkspy)
@@ -43,6 +44,94 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
 
 ## Python Scripts
 
+### cert-replacement.py
+
+**VCF Certificate Management Script:**
+
+Manages SSL certificates for VCF infrastructure components using HashiCorp Vault PKI as the Certificate Authority. This tool automates CSR generation, certificate signing, and replacement across VCF components. This is only applicable to vPods using an updated holorouter with vault installed.
+
+**Certificate Replacement Workflow:**
+
+For SDDC Manager-managed resources (SDDC Manager, vCenter, NSX Manager):
+
+1. Generate CSR on the component via SDDC Manager API
+2. Retrieve CSR from SDDC Manager
+3. Sign CSR with HashiCorp Vault PKI (2-year TTL by default)
+4. Upload signed certificate chain via SDDC Manager API
+5. SDDC Manager applies the certificate to the component
+
+For non-SDDC-managed resources (VCF Operations, VCF Automation):
+
+1. Generate CSR locally
+2. Sign CSR with HashiCorp Vault PKI
+3. Replace certificate via component-specific method (SSH/API)
+
+**VCF Components Managed:**
+
+| Component | FQDN | Method | Status |
+| ----------- | ------ | -------- | -------- |
+| SDDC Manager | sddcmanager-a.site-a.vcf.lab | SDDC Manager API | Automated |
+| vCenter | vc-mgmt-a.site-a.vcf.lab | SDDC Manager API | Automated |
+| NSX Manager | nsx-mgmt-a.site-a.vcf.lab | SDDC Manager API | Automated |
+| VCF Operations | ops-a.site-a.vcf.lab | SSH replacement | Manual |
+| VCF Automation | auto-a.site-a.vcf.lab | Aria Suite Lifecycle | Manual |
+| VCF Operations for Networks | opsnet-a.site-a.vcf.lab | SSH (TBD) | Manual |
+
+**Default Credentials by Component:**
+
+| Target | API User | SSH User |
+| -------- | ---------- | ---------- |
+| sddcmanager-a | <administrator@vsphere.local> | vcf / root |
+| vc-mgmt-a | <administrator@vsphere.local> | root |
+| nsx-mgmt-a | admin | admin |
+| ops-a | admin | root |
+| auto-a | admin | vmware-system-user |
+
+**Usage:**
+
+```bash
+# Replace certificates on all components
+python3 cert-replacement.py
+
+# Replace certificate on specific component
+python3 cert-replacement.py --target sddcmanager-a.site-a.vcf.lab
+
+# Check certificate expiration only
+python3 cert-replacement.py --check-only
+
+# Use custom Vault server
+python3 cert-replacement.py --vault-url http://vault.example.com:8200
+
+# Dry run - show what would be done
+python3 cert-replacement.py --dry-run
+```
+
+**Options:**
+
+| Option | Description |
+| -------- | ------------- |
+| `--target HOST` | Replace certificate on specific component only |
+| `--check-only` | Check certificate expiration without replacing |
+| `--dry-run` | Show what would be done without making changes |
+| `--vault-url URL` | HashiCorp Vault server URL |
+| `--ttl DAYS` | Certificate TTL in days (default: 730 = 2 years) |
+| `-v, --verbose` | Verbose output |
+
+**Environment Variables:**
+
+| Variable | Description |
+| ---------- | ------------- |
+| `VCF_PASS` | VCF password (fallback: `/home/holuser/creds.txt`) |
+| `VAULT_TOKEN` | Vault authentication token |
+
+**Prerequisites:**
+
+- HashiCorp Vault PKI engine configured with intermediate CA
+- Network connectivity to Vault server
+- Valid credentials for VCF components
+
+---
+
 ### confighol.py
 
 **vApp HOLification Tool:**
@@ -51,18 +140,21 @@ Comprehensive automation tool for "HOLifying" vApp templates after the Holodeck 
 
 **Execution Order:**
 
-0. **Vault Root CA Import** (with SKIP/RETRY/FAIL options)
+0a. **Vault Root CA Import** (with SKIP/RETRY/FAIL options)
+
+0b. **vCenter CA Import** (with SKIP/RETRY/FAIL options)
+
 1. Pre-checks and environment setup
 2. ESXi host configuration
 3. vCenter configuration
 4. NSX configuration
 5. SDDC Manager configuration
 6. Operations VMs configuration
-7. Final cleanup
+7. Final cleanup (vpodchecker)
 
 **Features:**
 
-1. **Vault CA Import (Step 0):**
+1. **Vault CA Import (Step 0a):**
    - Runs first, before any other configuration steps
    - Checks if Vault is accessible with a 5-second timeout
    - Downloads and imports the Vault root CA certificate
@@ -72,7 +164,15 @@ Comprehensive automation tool for "HOLifying" vApp templates after the Holodeck 
      - **[F]ail** - Exit the script with an error
    - Imports the CA into Firefox's certificate store on the console VM
 
-2. **ESXi Host Configuration:**
+2. **vCenter CA Import (Step 0b):**
+   - Runs after Vault CA import
+   - Reads vCenter list from `/tmp/config.ini` `[RESOURCES] vCenters`
+   - Downloads CA certificates from each vCenter's `/certs/download.zip` endpoint
+   - Extracts and imports each CA into Firefox's certificate store
+   - Interactive options when vCenter is unavailable (same as Vault)
+   - Requires: `libnss3-tools` package (provides `certutil`)
+
+3. **ESXi Host Configuration:**
    - Enables SSH service via vSphere API
    - Configures SSH to auto-start on boot
    - Copies holuser public keys for passwordless SSH access
@@ -80,7 +180,7 @@ Comprehensive automation tool for "HOLifying" vApp templates after the Holodeck 
    - Detailed success/failure logging for each operation
    - **Note:** Password expiration is not configured on ESXi (chage command not valid)
 
-3. **vCenter Configuration:**
+4. **vCenter Configuration:**
    - Enables bash shell for root user
    - Configures SSH authorized_keys
    - Enables browser support and MOB (Managed Object Browser)
@@ -90,22 +190,27 @@ Comprehensive automation tool for "HOLifying" vApp templates after the Holodeck 
    - Creates new vSphere connection if session is invalid
    - Clears ARP cache
 
-4. **NSX Configuration:**
+5. **NSX Configuration:**
    - Enables SSH via REST API on NSX Managers
    - Configures SSH start-on-boot
    - Removes password expiration for admin, root, audit users
 
-5. **SDDC Manager Configuration:**
+6. **SDDC Manager Configuration:**
    - Configures SSH authorized_keys
    - Sets non-expiring passwords for vcf, backup, root accounts
 
-6. **Operations VMs Configuration:**
+7. **Operations VMs Configuration:**
    - Checks host reachability (ping) before attempting SSH
    - Checks if SSH port 22 is open
    - Sets non-expiring passwords for root
    - Configures SSH authorized_keys
    - Detailed success/failure logging with error messages
    - Reports authentication failures with username/password info
+
+8. **Final Steps (vpodchecker):**
+   - Runs `vpodchecker.py` to configure L2 VMs
+   - Sets `uuid.action`, `typematicMinDelay`, `autolock` settings
+   - Clears ARP cache on console and router
 
 **Vault Accessibility Check:**
 
@@ -243,12 +348,12 @@ Manages different startup sequences for different lab types (HOL, Discovery, VXP
 **Lab Types:**
 
 | Type | Name | Firewall | Proxy Filter | Description |
-|------|------|----------|--------------|-------------|
+| ------ | ------ | ---------- | -------------- | ------------- |
 | HOL | Hands-on Labs | Yes | Yes | Full production labs |
-| DISCOVERY | Discovery Labs | No | No | Simplified labs, no firewall restrictions |
 | VXP | VCF Experience | Yes | Yes | Demo environments |
 | ATE | Advanced Technical Enablement | Yes | No | Instructor-led Livefire labs |
 | EDU | Education | Yes | Yes | Training environments |
+| DISCOVERY | Discovery Labs | No | No | Simplified labs, no firewall restrictions |
 
 **Module Loading Priority:**
 
@@ -290,9 +395,29 @@ Generates an auto-refreshing HTML status page for monitoring lab startup progres
 - Auto-refreshing HTML dashboard (every 30 seconds)
 - Color-coded status indicators (pending, running, complete, failed, skipped)
 - Progress bars for overall and per-group progress
-- Collapsible task groups
+- Collapsible task groups (auto-collapse completed groups)
 - State persistence across module calls
 - Failure banner for critical errors
+- **Item count tracking** with success/failure breakdown for array-based checks
+
+**Item Count Tracking:**
+
+Tasks can now display detailed counts for operations involving multiple items (VMs, URLs, services, etc.):
+
+```bash
+URL Checks ✅
+Verify all configured web interfaces
+8 items: 8 succeeded
+```
+
+```bash
+Ping Targets ❌
+Verify IP connectivity to configured hosts
+12 items: 11 succeeded, 1 failed
+Failed: 10.1.10.99
+```
+
+Counts are color-coded: green for success, red for failures, purple for skipped.
 
 **Usage:**
 
@@ -318,6 +443,15 @@ dashboard = StatusDashboard('HOL-2701')
 dashboard.update_task('prelim', 'dns', TaskStatus.RUNNING)
 dashboard.update_task('prelim', 'dns', TaskStatus.COMPLETE)
 
+# Update with item counts
+dashboard.update_task('urls', 'url_checks', TaskStatus.COMPLETE,
+                      total=8, success=8, failed=0)
+
+# Update with partial failures
+dashboard.update_task('pings', 'ping_targets', TaskStatus.FAILED,
+                      message='Some targets unreachable',
+                      total=12, success=11, failed=1)
+
 # Skip an entire group
 dashboard.skip_group('vvf', 'VCF lab - VVF not applicable')
 
@@ -328,6 +462,19 @@ dashboard.set_failed('DNS resolution failed')
 dashboard.generate_html()
 ```
 
+**update_task() Parameters:**
+
+| Parameter | Type | Description |
+| ----------- | ------ | ------------- |
+| `group_id` | str | Group identifier (e.g., 'urls', 'pings') |
+| `task_id` | str | Task identifier within group |
+| `status` | TaskStatus/str | Task status |
+| `message` | str | Optional status message |
+| `total` | int | Total items processed |
+| `success` | int | Items that succeeded |
+| `failed` | int | Items that failed |
+| `skipped` | int | Items that were skipped |
+
 **Output Location:** `/lmchol/home/holuser/startup-status.htm`
 
 ---
@@ -336,27 +483,18 @@ dashboard.generate_html()
 
 **DNS Record Import Module:**
 
-Imports custom DNS records into the lab's DNS server using the `tdns-mgr` command-line tool. Supports both inline config.ini records and CSV file imports.
+Imports custom DNS records into the lab's DNS server using the `tdns-mgr` command-line tool. Supports both inline config.ini records.
 
 **Features:**
 
 - Reads DNS records from config.ini `[VPOD] new-dns-records`
-- Supports CSV file import (`new-dns-records.csv`)
 - Automatic PTR record creation with `--ptr` flag
 - Login retry logic with configurable attempts
-
-**CSV Format:**
-
-```csv
-zone,name,type,value
-site-a.vcf.lab,gitlab,A,10.1.10.210
-site-a.vcf.lab,harbor,A,10.1.10.212
-site-a.vcf.lab,registry,CNAME,gitlab.site-a.vcf.lab
-```
 
 **Config.ini Format:**
 
 ```ini
+# zone,hostname,record_type,content(IP for A record, FQDN for CNAME record)
 [VPOD]
 new-dns-records = site-a.vcf.lab,gitlab,A,10.1.10.211
     site-a.vcf.lab,harbor,A,10.1.10.212
@@ -386,7 +524,7 @@ python3 tdns_import.py --show-config
 
 **Lab Validation Tool:**
 
-Validates lab configuration against HOL standards. Checks SSL certificates, vSphere licenses, NTP configuration, and VM settings.
+Validates lab configuration against HOL standards. Checks SSL certificates, vSphere licenses, NTP configuration, VM settings, and password expirations.
 
 **Checks Performed:**
 
@@ -403,6 +541,42 @@ Validates lab configuration against HOL standards. Checks SSL certificates, vSph
 - **NTP Configuration:** ESXi host NTP service and server settings
 - **VM Configuration:** `uuid.action`, `typematicMinDelay`, `autolock` settings
 - **VM Resources:** Reservations and shares (optional)
+- **Password Expiration:** User account password expiration for all lab components
+
+**Password Expiration Checks:**
+
+Checks password expiration for user accounts on all lab infrastructure:
+
+| Component | Users Checked | Method |
+| ----------- | --------------- | -------- |
+| ESXi Hosts | root | `chage -l` via SSH |
+| vCenter | root (Linux), administrator@vsphere.local | SSH + REST API |
+| NSX Manager | admin, root, audit | REST API |
+| SDDC Manager | vcf, root, backup | `chage -l` via SSH |
+| VCF Automation | vmware-system-user, root | `chage -l` via SSH |
+| VCF Operations | admin, root | `chage -l` via SSH |
+
+**Password Expiration Status:**
+
+| Status | Condition |
+| -------- | ----------- |
+| ✅ PASS | Password never expires, or expires in > 3 years (1095+ days) |
+| ✅ PASS | Password expires in > 2 years (730+ days) |
+| ❌ FAIL | Password expires in < 2 years (< 730 days) |
+| ❌ FAIL | Password already expired |
+| ⚠️ WARN | Could not check (connection/auth issues) |
+
+**Lab Year Extraction:**
+
+The tool uses robust pattern matching to extract the lab year from various SKU formats for license expiration validation:
+
+| SKU Format | Example | Extracted Year |
+| ------------ | --------- | ---------------- |
+| Standard | HOL-2701, ATE-2705 | 27 |
+| BETA/Testing | BETA-901-TNDNS | 27 (default) |
+| Named | Discovery-Demo | 27 (default) |
+
+The license expiration window is calculated as December 30 of the lab year through January 31 of the following year (e.g., 2027-12-30 to 2028-01-31 for HOLFY27 labs).
 
 **Skipped System VMs:**
 
