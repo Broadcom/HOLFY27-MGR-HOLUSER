@@ -312,10 +312,48 @@ class StatusDashboard:
         self._save_state()
         self.generate_html()
     
-    def set_failed(self, reason: str):
-        """Mark the entire startup as failed"""
+    def set_failed(self, reason: str, group_id: str = None, task_id: str = None):
+        """
+        Mark the entire startup as failed.
+        
+        When a failure occurs, this method:
+        1. Sets the overall failed state and reason
+        2. Marks the specific failing task as FAILED (if provided)
+        3. If no specific task is provided, finds any RUNNING task and marks it as FAILED
+        
+        This ensures the dashboard shows both:
+        - The failure banner at the top with the error message
+        - The specific task and group that failed with FAILED status
+        
+        :param reason: Failure reason message
+        :param group_id: Optional group ID of the failing task
+        :param task_id: Optional task ID (without group prefix) of the failing task
+        """
         self.failed = True
         self.failure_reason = reason
+        
+        # If specific task was provided, mark it as failed
+        if group_id and task_id:
+            self.update_task(group_id, task_id, TaskStatus.FAILED, reason)
+        else:
+            # Find any currently RUNNING task and mark it as FAILED
+            # This handles the case where labfail() is called without task context
+            for gid, group in self.groups.items():
+                for task in group.tasks:
+                    if task.status == TaskStatus.RUNNING:
+                        task.status = TaskStatus.FAILED
+                        task.message = reason
+                        task.end_time = datetime.datetime.now()
+                        # Only mark the first running task as failed
+                        # (there should typically only be one)
+                        break
+                else:
+                    # Continue to next group if no running task found in this group
+                    continue
+                # Break outer loop if we found and marked a running task
+                break
+        
+        self._save_state()
         self.generate_html()
     
     def skip_group(self, group_id: str, message: str = "Not applicable"):
