@@ -197,17 +197,26 @@ def check_ssl_certificates(urls: List[str], min_exp_date: datetime.date) -> List
                 host.issuer = "Self-Signed"
             
             host.ssl_exp_date = get_cert_expiration(x509)
-            host.days_to_expire = (host.ssl_exp_date - min_exp_date).days
             
-            if host.days_to_expire < 0:
-                status = "FAIL"
-                message = f"Certificate expires before lab expiration! ({host.ssl_exp_date})"
-            elif host.days_to_expire < 30:
-                status = "WARN"
-                message = f"Certificate expires soon ({host.ssl_exp_date})"
-            else:
+            # Calculate months until expiration (matching License check logic)
+            today = datetime.date.today()
+            days_until = (host.ssl_exp_date - today).days
+            host.days_to_expire = days_until
+            months_until = days_until / 30.44
+            
+            if months_until >= 9:
                 status = "PASS"
-                message = f"Certificate valid until {host.ssl_exp_date}"
+                message = f"Certificate valid - expires {host.ssl_exp_date} (>= 9 months)"
+            elif months_until >= 3:
+                status = "WARN"
+                message = f"Certificate expires soon - expires {host.ssl_exp_date} (< 9 months)"
+            else:
+                if host.name == 'www.vmware.com':
+                    status = "WARN"
+                    message = f"External certificate expires soon/past - expires {host.ssl_exp_date}"
+                else:
+                    status = "FAIL"
+                    message = f"Certificate expires critically soon - expires {host.ssl_exp_date} (< 3 months)"
             
             results.append(CheckResult(
                 name=f"SSL: {host.name}:{host.port}",
@@ -224,10 +233,17 @@ def check_ssl_certificates(urls: List[str], min_exp_date: datetime.date) -> List
             ))
             
         except Exception as e:
+            if host.name == 'www.vmware.com':
+                status = "WARN"
+                message = f"External host check failed (expected): {e}"
+            else:
+                status = "FAIL"
+                message = f"Could not check certificate: {e}"
+
             results.append(CheckResult(
                 name=f"SSL: {host.name}:{host.port}",
-                status="FAIL",
-                message=f"Could not check certificate: {e}",
+                status=status,
+                message=message,
                 details={"host": host.name, "port": host.port, "error": str(e)}
             ))
     

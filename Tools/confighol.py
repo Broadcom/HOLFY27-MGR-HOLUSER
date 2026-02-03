@@ -944,8 +944,18 @@ def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
     success = True
     
     # Step 1: Try to enable SSH via API (only NSX Managers support this)
-    enable_nsx_ssh_via_api(hostname, 'admin', password, dry_run)
-    
+    if not enable_nsx_ssh_via_api(hostname, 'admin', password, dry_run):
+        lsf.write_output(f'{hostname}: WARNING - API SSH enablement failed')
+        if not dry_run:
+            lsf.write_output(f'{hostname}: Please enable SSH manually via vSphere Remote Console:')
+            lsf.write_output(f'{hostname}:   1. Login as admin')
+            lsf.write_output(f'{hostname}:   2. Run: start service ssh')
+            lsf.write_output(f'{hostname}:   3. Run: set service ssh start-on-boot')
+            answer = input(f'{hostname}: Is SSH enabled now? (y/n): ')
+            if not answer.lower().startswith('y'):
+                lsf.write_output(f'{hostname}: Skipping configuration - SSH not enabled')
+                return False
+
     if not dry_run:
         # Give SSH service time to start
         time.sleep(3)
@@ -1088,6 +1098,11 @@ def configure_aria_automation_vms(auth_keys_file: str, password: str,
         # VMs may have format: vmname:vcenter
         parts = vravm.split(':')
         hostname = parts[0].strip()
+        
+        # Only process VMs starting with 'auto-' (Aria Automation)
+        if not hostname.lower().startswith('auto-'):
+            lsf.write_output(f'{hostname}: Skipping - Name does not start with "auto-"')
+            continue
         
         if not configure_aria_automation(hostname, auth_keys_file, password, dry_run):
             success = False
