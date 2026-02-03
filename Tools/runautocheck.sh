@@ -1,6 +1,6 @@
 #!/bin/bash
 # runautocheck.sh - HOLFY27 AutoCheck Runner
-# Version 2.1 - February 2026
+# Version 2.2 - February 2026
 # Author - Burke Azbill and HOL Core Team
 #
 # This script runs the AutoCheck validation suite for the lab
@@ -9,7 +9,8 @@
 #   1. Lab-specific autocheck.py from vpodrepo (allows lab customization)
 #   2. Core HOLFY27-MGR-AUTOCHECK/autocheck.py (standard checks)
 #   3. Legacy PowerShell autocheck.ps1 from vpodrepo
-#   4. Legacy CD-based autocheck.ps1
+#   4. GitHub clone fallback (clone HOLFY27-MGR-AUTOCHECK from GitHub)
+#   5. Final fallback: vpodchecker.py (if GitHub is unreachable)
 
 set -e
 
@@ -67,69 +68,94 @@ if [ -f "${VPOD_REPO}/autocheck.ps1" ]; then
 fi
 
 #==============================================================================
-# Priority 4: CD-based AutoCheck (legacy - deprecated)
+# Priority 4: GitHub AutoCheck fallback (clone from remote repository)
 #==============================================================================
 
-if [ -f "/media/cdrom0/autocheck.ps1" ]; then
-    echo "WARNING: CD-based AutoCheck is deprecated" | tee -a $LOGFILE
-    echo "Running PowerShell AutoCheck from CD" | tee -a $LOGFILE
-    
-    # Clone AutoCheck repository if configured
-    autocheckdir="${HOME}/autocheck"
-    [ -d "${autocheckdir}" ] && rm -rf "${autocheckdir}"
-    
-    autorepo="https://github.com/broadcom/HOLFY27-MGR-AUTOCHECK.git"
-    
-    echo "Cloning AutoCheck from GitHub..." | tee -a $LOGFILE
-    git clone -b main "${autorepo}" "${autocheckdir}" > /dev/null 2>&1
-    
-    # Disable proxy filter for module installation
-    ${HOLROOT}/Tools/proxyfilteroff.sh
-    # Wait for 90 seconds to ensure proxy is disabled
-    sleep 90
-    # Check if proxy is disabled
-    if curl -s --max-time 5 -x http://proxy.site-a.vcf.lab:3128 https://github.com > /dev/null 2>&1; then
-        echo "Proxy is not disabled" | tee -a $LOGFILE
-        exit 1
-    else
-        echo "Proxy is disabled" | tee -a $LOGFILE
-    fi
-    # Install required PowerShell modules
-    echo "Installing PowerShell modules..." | tee -a $LOGFILE
-    pwsh -Command 'Install-Module PSSQLite -Confirm:$false -Force' 2>/dev/null
-    
-    # Configure PowerCLI
-    echo "Configuring PowerCLI..." | tee -a $LOGFILE
-    pwsh -Command 'Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false' 2>/dev/null
-    pwsh -Command 'Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false' 2>/dev/null
-    pwsh -Command 'Set-PowerCLIConfiguration -DefaultVIServerMode multiple -Confirm:$false' 2>/dev/null
+echo "No local AutoCheck found, attempting to clone from GitHub..." | tee -a $LOGFILE
+
+autocheckdir="${HOME}/autocheck"
+[ -d "${autocheckdir}" ] && rm -rf "${autocheckdir}"
+
+autorepo="https://github.com/broadcom/HOLFY27-MGR-AUTOCHECK.git"
+
+# Disable proxy filter for GitHub access
+${HOLROOT}/Tools/proxyfilteroff.sh 2>/dev/null || true
+
+# Wait 90 seconds for proxy filter to be disabled
+sleep 90
+# Check if proxy is disabled
+if curl -s --max-time 5 -x http://proxy.site-a.vcf.lab:3128 https://github.com > /dev/null 2>&1; then
+    echo "Proxy is not disabled" | tee -a $LOGFILE
+    exit 1
+else
+    echo "Proxy is disabled" | tee -a $LOGFILE
+fi
+# Attempt to clone the repository
+echo "Cloning AutoCheck from GitHub: ${autorepo}" | tee -a $LOGFILE
+if git clone -b main "${autorepo}" "${autocheckdir}" > /dev/null 2>&1; then
+    echo "Successfully cloned AutoCheck repository" | tee -a $LOGFILE
     
     # Re-enable proxy filter
-    ${HOLROOT}/Tools/proxyfilteron.sh
+    ${HOLROOT}/Tools/proxyfilteron.sh 2>/dev/null || true
     
-    # Run AutoCheck
-    echo "Starting AutoCheck..." | tee -a $LOGFILE
-    cd "${autocheckdir}"
-    pwsh -File autocheck.ps1 2>&1 | tee -a $LOGFILE
-    exit $?
+    # Check if Python autocheck.py exists in cloned repo
+    if [ -f "${autocheckdir}/autocheck.py" ]; then
+        echo "Running Python AutoCheck from GitHub clone" | tee -a $LOGFILE
+        cd "${autocheckdir}"
+        /usr/bin/python3 "${autocheckdir}/autocheck.py" 2>&1 | tee -a $LOGFILE
+        exit $?
+    fi
+    # This line should only be reached if autocheck.py is not found in the cloned repository
+
+    # # Check if PowerShell autocheck.ps1 exists in cloned repo
+    # if [ -f "${autocheckdir}/autocheck.ps1" ]; then
+    #     echo "Running PowerShell AutoCheck from GitHub clone" | tee -a $LOGFILE
+        
+    #     # Install required PowerShell modules
+    #     echo "Installing PowerShell modules..." | tee -a $LOGFILE
+    #     pwsh -Command 'Install-Module PSSQLite -Confirm:$false -Force' 2>/dev/null || true
+        
+    #     # Configure PowerCLI
+    #     echo "Configuring PowerCLI..." | tee -a $LOGFILE
+    #     pwsh -Command 'Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false' 2>/dev/null || true
+    #     pwsh -Command 'Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false' 2>/dev/null || true
+    #     pwsh -Command 'Set-PowerCLIConfiguration -DefaultVIServerMode multiple -Confirm:$false' 2>/dev/null || true
+        
+    #     # Run AutoCheck
+    #     echo "Starting AutoCheck..." | tee -a $LOGFILE
+    #     cd "${autocheckdir}"
+    #     pwsh -File autocheck.ps1 2>&1 | tee -a $LOGFILE
+    #     exit $?
+    # fi
+    
+    echo "ERROR: Cloned repository does not contain autocheck.py" | tee -a $LOGFILE
+else
+    echo "WARNING: Failed to clone AutoCheck from GitHub (network unreachable or repo not found)" | tee -a $LOGFILE
+    
+    # Re-enable proxy filter
+    ${HOLROOT}/Tools/proxyfilteron.sh 2>/dev/null || true
 fi
 
 #==============================================================================
-# No AutoCheck Found - Run core AutoCheck if available
+# Final Fallback: Run vpodchecker.py as minimal AutoCheck
 #==============================================================================
 
-# Final fallback: try to use vpodchecker.py as minimal AutoCheck
 if [ -f "${HOLROOT}/Tools/vpodchecker.py" ]; then
-    echo "No AutoCheck script found, running vpodchecker.py instead" | tee -a $LOGFILE
+    echo "Running vpodchecker.py as fallback AutoCheck" | tee -a $LOGFILE
     /usr/bin/python3 "${HOLROOT}/Tools/vpodchecker.py" 2>&1 | tee -a $LOGFILE
     exit $?
 fi
+
+#==============================================================================
+# No AutoCheck Available
+#==============================================================================
 
 echo "No AutoCheck script found" | tee -a $LOGFILE
 echo "Checked:" | tee -a $LOGFILE
 echo "  - ${VPOD_REPO}/autocheck.py (lab-specific)" | tee -a $LOGFILE
 echo "  - ${AUTOCHECK_DIR}/autocheck.py (core)" | tee -a $LOGFILE
 echo "  - ${VPOD_REPO}/autocheck.ps1 (legacy)" | tee -a $LOGFILE
-echo "  - /media/cdrom0/autocheck.ps1 (deprecated)" | tee -a $LOGFILE
+echo "  - GitHub: ${autorepo} (fallback)" | tee -a $LOGFILE
+echo "  - ${HOLROOT}/Tools/vpodchecker.py (final fallback)" | tee -a $LOGFILE
 
 exit 0
