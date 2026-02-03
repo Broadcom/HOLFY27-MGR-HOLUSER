@@ -1,18 +1,27 @@
 #!/bin/bash
 # runautocheck.sh - HOLFY27 AutoCheck Runner
-# Version 2.0 - January 2026
+# Version 2.1 - February 2026
 # Author - Burke Azbill and HOL Core Team
 #
 # This script runs the AutoCheck validation suite for the lab
+#
+# Search order:
+#   1. Lab-specific autocheck.py from vpodrepo (allows lab customization)
+#   2. Core HOLFY27-MGR-AUTOCHECK/autocheck.py (standard checks)
+#   3. Legacy PowerShell autocheck.ps1 from vpodrepo
+#   4. Legacy CD-based autocheck.ps1
 
 set -e
 
 LOGFILE='/home/holuser/hol/autocheck.log'
 HOLROOT='/home/holuser/hol'
+AUTOCHECK_DIR='/home/holuser/hol/HOLFY27-MGR-AUTOCHECK'
 
 # Get vPod SKU
 if [ -f /tmp/vPod_SKU.txt ]; then
     vPod_SKU=$(cat /tmp/vPod_SKU.txt)
+elif [ -f /tmp/config.ini ]; then
+    vPod_SKU=$(grep -m1 'vPod_SKU' /tmp/config.ini | cut -d'=' -f2 | tr -d ' ')
 else
     vPod_SKU="HOL-UNKNOWN"
 fi
@@ -27,30 +36,42 @@ echo "Lab SKU: ${vPod_SKU}" | tee -a $LOGFILE
 echo "VPod Repo: ${VPOD_REPO}" | tee -a $LOGFILE
 
 #==============================================================================
-# Check for Python AutoCheck (preferred)
+# Priority 1: Lab-specific Python AutoCheck from vpodrepo
 #==============================================================================
 
 if [ -f "${VPOD_REPO}/autocheck.py" ]; then
-    echo "Running Python AutoCheck from vpodrepo" | tee -a $LOGFILE
+    echo "Running lab-specific AutoCheck from vpodrepo" | tee -a $LOGFILE
     /usr/bin/python3 "${VPOD_REPO}/autocheck.py" 2>&1 | tee -a $LOGFILE
     exit $?
 fi
 
 #==============================================================================
-# Check for PowerShell AutoCheck
+# Priority 2: Core HOLFY27-MGR-AUTOCHECK (standard Python AutoCheck)
+#==============================================================================
+
+if [ -f "${AUTOCHECK_DIR}/autocheck.py" ]; then
+    echo "Running HOLFY27 Core AutoCheck" | tee -a $LOGFILE
+    cd "${AUTOCHECK_DIR}"
+    /usr/bin/python3 "${AUTOCHECK_DIR}/autocheck.py" 2>&1 | tee -a $LOGFILE
+    exit $?
+fi
+
+#==============================================================================
+# Priority 3: Legacy PowerShell AutoCheck from vpodrepo
 #==============================================================================
 
 if [ -f "${VPOD_REPO}/autocheck.ps1" ]; then
-    echo "Running PowerShell AutoCheck from vpodrepo" | tee -a $LOGFILE
+    echo "Running PowerShell AutoCheck from vpodrepo (legacy)" | tee -a $LOGFILE
     /usr/bin/pwsh "${VPOD_REPO}/autocheck.ps1" 2>&1 | tee -a $LOGFILE
     exit $?
 fi
 
 #==============================================================================
-# Check for CD-based AutoCheck (legacy)
+# Priority 4: CD-based AutoCheck (legacy - deprecated)
 #==============================================================================
 
 if [ -f "/media/cdrom0/autocheck.ps1" ]; then
+    echo "WARNING: CD-based AutoCheck is deprecated" | tee -a $LOGFILE
     echo "Running PowerShell AutoCheck from CD" | tee -a $LOGFILE
     
     # Clone AutoCheck repository if configured
@@ -64,7 +85,15 @@ if [ -f "/media/cdrom0/autocheck.ps1" ]; then
     
     # Disable proxy filter for module installation
     ${HOLROOT}/Tools/proxyfilteroff.sh
-    
+    # Wait for 90 seconds to ensure proxy is disabled
+    sleep 90
+    # Check if proxy is disabled
+    if curl -s --max-time 5 -x http://proxy.site-a.vcf.lab:3128 https://github.com > /dev/null 2>&1; then
+        echo "Proxy is not disabled" | tee -a $LOGFILE
+        exit 1
+    else
+        echo "Proxy is disabled" | tee -a $LOGFILE
+    fi
     # Install required PowerShell modules
     echo "Installing PowerShell modules..." | tee -a $LOGFILE
     pwsh -Command 'Install-Module PSSQLite -Confirm:$false -Force' 2>/dev/null
@@ -86,13 +115,21 @@ if [ -f "/media/cdrom0/autocheck.ps1" ]; then
 fi
 
 #==============================================================================
-# No AutoCheck Found
+# No AutoCheck Found - Run core AutoCheck if available
 #==============================================================================
+
+# Final fallback: try to use vpodchecker.py as minimal AutoCheck
+if [ -f "${HOLROOT}/Tools/vpodchecker.py" ]; then
+    echo "No AutoCheck script found, running vpodchecker.py instead" | tee -a $LOGFILE
+    /usr/bin/python3 "${HOLROOT}/Tools/vpodchecker.py" 2>&1 | tee -a $LOGFILE
+    exit $?
+fi
 
 echo "No AutoCheck script found" | tee -a $LOGFILE
 echo "Checked:" | tee -a $LOGFILE
-echo "  - ${VPOD_REPO}/autocheck.py" | tee -a $LOGFILE
-echo "  - ${VPOD_REPO}/autocheck.ps1" | tee -a $LOGFILE
-echo "  - /media/cdrom0/autocheck.ps1" | tee -a $LOGFILE
+echo "  - ${VPOD_REPO}/autocheck.py (lab-specific)" | tee -a $LOGFILE
+echo "  - ${AUTOCHECK_DIR}/autocheck.py (core)" | tee -a $LOGFILE
+echo "  - ${VPOD_REPO}/autocheck.ps1 (legacy)" | tee -a $LOGFILE
+echo "  - /media/cdrom0/autocheck.ps1 (deprecated)" | tee -a $LOGFILE
 
 exit 0
