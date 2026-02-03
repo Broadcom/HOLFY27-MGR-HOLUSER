@@ -122,10 +122,10 @@ iptables -A FORWARD -s 10.0.0.0/8 -d 172.16.0.0/12      -j ACCEPT
 iptables -A FORWARD -s 10.0.0.0/8 -d 10.0.0.0/8         -j ACCEPT
 # Allow access to Broadcom package repository
 #This new rule automatically resolves the domain name projects.packages.broadcom.com to its current IP addresses and adds a corresponding iptables ACCEPT rule for each IP address in the FORWARD chain.
-# for ip in $(dig +short projects.packages.broadcom.com | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b")
-# do
-#   iptables -A FORWARD -d $ip -j ACCEPT
-# done
+for ip in $(dig +short projects.packages.broadcom.com | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b")
+do
+  iptables -A FORWARD -d "$ip" -j ACCEPT
+done
 
 ### LAB-SPECIFIC RULES
 ip6tables -P FORWARD ACCEPT

@@ -75,39 +75,84 @@ def main(lsf=None, standalone=False, dry_run=False):
         vcfmgmtcluster_raw = lsf.config.get('VCF', 'vcfmgmtcluster')
         vcfmgmtcluster = [h.strip() for h in vcfmgmtcluster_raw.split('\n') if h.strip()]
     
+    hosts_connected = 0
+    hosts_failed = 0
+    hosts_exited_mm = 0
+    hosts_mm_failed = 0
+    
     if vcfmgmtcluster:
         lsf.write_vpodprogress('VCF Hosts Connect', 'GOOD-3')
+        total_hosts = len(vcfmgmtcluster)
         
         if not dry_run:
             lsf.connect_vcenters(vcfmgmtcluster)
+            hosts_connected = len(lsf.sis)  # Number of successful connections
+            hosts_failed = total_hosts - hosts_connected
             
             # Exit maintenance mode for each host
+            if dashboard:
+                dashboard.update_task('vcf', 'exit_maintenance', TaskStatus.RUNNING)
+            
             for entry in vcfmgmtcluster:
                 parts = entry.split(':')
                 hostname = parts[0].strip()
                 
+                lsf.write_output(f'Checking host status: {hostname}')
                 try:
                     host = lsf.get_host(hostname)
                     if host is None:
                         lsf.write_output(f'Could not find host: {hostname}')
+                        hosts_mm_failed += 1
                         continue
                     
                     if host.runtime.inMaintenanceMode:
                         lsf.write_output(f'Removing {hostname} from Maintenance Mode')
                         host.ExitMaintenanceMode_Task(0)
+                        hosts_exited_mm += 1
+                        lsf.labstartup_sleep(lsf.sleep_seconds)
                     elif host.runtime.connectionState != 'connected':
                         lsf.write_output(f'Host {hostname} in error state: {host.runtime.connectionState}')
-                    
-                    lsf.labstartup_sleep(lsf.sleep_seconds)
+                        hosts_mm_failed += 1
+                    else:
+                        hosts_exited_mm += 1  # Already out of maintenance
                 except Exception as e:
                     lsf.write_output(f'Error processing host {hostname}: {e}')
+                    hosts_mm_failed += 1
+            
+            if dashboard:
+                if hosts_mm_failed > 0:
+                    dashboard.update_task('vcf', 'exit_maintenance', TaskStatus.FAILED,
+                                          f'{hosts_mm_failed} host(s) failed to exit maintenance',
+                                          total=total_hosts, success=hosts_exited_mm, failed=hosts_mm_failed)
+                else:
+                    dashboard.update_task('vcf', 'exit_maintenance', TaskStatus.COMPLETE,
+                                          total=total_hosts, success=hosts_exited_mm, failed=0)
         else:
             lsf.write_output(f'Would connect to VCF hosts: {vcfmgmtcluster}')
+            if dashboard:
+                dashboard.update_task('vcf', 'exit_maintenance', TaskStatus.SKIPPED, 'Dry run mode',
+                                      total=total_hosts, success=0, failed=0, skipped=total_hosts)
+    else:
+        if dashboard:
+            dashboard.update_task('vcf', 'exit_maintenance', TaskStatus.SKIPPED, 
+                                  'No VCF management cluster hosts configured',
+                                  total=0, success=0, failed=0, skipped=0)
     
     if dashboard:
-        dashboard.update_task('vcf', 'mgmt_cluster', TaskStatus.COMPLETE)
+        if vcfmgmtcluster:
+            total_hosts = len(vcfmgmtcluster)
+            if hosts_failed > 0:
+                dashboard.update_task('vcf', 'mgmt_cluster', TaskStatus.FAILED,
+                                      f'{hosts_failed} host(s) failed to connect',
+                                      total=total_hosts, success=hosts_connected, failed=hosts_failed)
+            else:
+                dashboard.update_task('vcf', 'mgmt_cluster', TaskStatus.COMPLETE,
+                                      total=total_hosts, success=hosts_connected, failed=0)
+        else:
+            dashboard.update_task('vcf', 'mgmt_cluster', TaskStatus.SKIPPED,
+                                  'No hosts configured',
+                                  total=0, success=0, failed=0, skipped=0)
         dashboard.update_task('vcf', 'datastore', TaskStatus.RUNNING)
-        dashboard.generate_html()
     
     #==========================================================================
     # TASK 2: Check VCF Management Datastore
@@ -171,17 +216,24 @@ def main(lsf=None, standalone=False, dry_run=False):
                     lsf.labstartup_sleep(30)
     
     if dashboard:
-        dashboard.update_task('vcf', 'datastore', TaskStatus.COMPLETE)
+        if vcfmgmtdatastore:
+            dashboard.update_task('vcf', 'datastore', TaskStatus.COMPLETE,
+                                  total=len(vcfmgmtdatastore), success=len(vcfmgmtdatastore), failed=0)
+        else:
+            dashboard.update_task('vcf', 'datastore', TaskStatus.SKIPPED,
+                                  'No datastores configured',
+                                  total=0, success=0, failed=0, skipped=0)
         dashboard.update_task('vcf', 'nsx_mgr', TaskStatus.RUNNING)
-        dashboard.generate_html()
     
     #==========================================================================
     # TASK 3: Start NSX Manager
     #==========================================================================
     
+    nsx_mgr_count = 0
     if lsf.config.has_option('VCF', 'vcfnsxmgr'):
         vcfnsxmgr_raw = lsf.config.get('VCF', 'vcfnsxmgr')
         vcfnsxmgr = [n.strip() for n in vcfnsxmgr_raw.split('\n') if n.strip()]
+        nsx_mgr_count = len(vcfnsxmgr)
         
         if vcfnsxmgr:
             lsf.write_vpodprogress('VCF NSX Mgr start', 'GOOD-3')
@@ -196,17 +248,24 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output('No NSX Manager configured')
     
     if dashboard:
-        dashboard.update_task('vcf', 'nsx_mgr', TaskStatus.COMPLETE)
+        if nsx_mgr_count > 0:
+            dashboard.update_task('vcf', 'nsx_mgr', TaskStatus.COMPLETE,
+                                  total=nsx_mgr_count, success=nsx_mgr_count, failed=0)
+        else:
+            dashboard.update_task('vcf', 'nsx_mgr', TaskStatus.SKIPPED,
+                                  'No NSX Manager configured',
+                                  total=0, success=0, failed=0, skipped=0)
         dashboard.update_task('vcf', 'nsx_edges', TaskStatus.RUNNING)
-        dashboard.generate_html()
     
     #==========================================================================
     # TASK 4: Start NSX Edges
     #==========================================================================
     
+    nsx_edges_count = 0
     if lsf.config.has_option('VCF', 'vcfnsxedges'):
         vcfnsxedges_raw = lsf.config.get('VCF', 'vcfnsxedges')
         vcfnsxedges = [e.strip() for e in vcfnsxedges_raw.split('\n') if e.strip() and not e.strip().startswith('#')]
+        nsx_edges_count = len(vcfnsxedges)
         
         if vcfnsxedges:
             lsf.write_vpodprogress('VCF NSX Edges start', 'GOOD-3')
@@ -236,7 +295,56 @@ def main(lsf=None, standalone=False, dry_run=False):
                 lsf.write_output(f'Would start NSX Edges: {vcfnsxedges}')
     
     if dashboard:
-        dashboard.update_task('vcf', 'nsx_edges', TaskStatus.COMPLETE)
+        if nsx_edges_count > 0:
+            dashboard.update_task('vcf', 'nsx_edges', TaskStatus.COMPLETE,
+                                  total=nsx_edges_count, success=nsx_edges_count, failed=0)
+        else:
+            dashboard.update_task('vcf', 'nsx_edges', TaskStatus.SKIPPED,
+                                  'No NSX Edges configured',
+                                  total=0, success=0, failed=0, skipped=0)
+    
+    #==========================================================================
+    # TASK 4b: Start Post-Edge VMs (e.g., Aria Automation appliances)
+    #==========================================================================
+    # These VMs need to boot after NSX Edges are up but before vCenter
+    # to allow maximum boot time. Aria Automation (auto-a) is a typical
+    # example that benefits from early boot.
+    
+    if lsf.config.has_option('VCF', 'vcfpostedgevms'):
+        vcfpostedgevms_raw = lsf.config.get('VCF', 'vcfpostedgevms')
+        vcfpostedgevms = [v.strip() for v in vcfpostedgevms_raw.split('\n') 
+                         if v.strip() and not v.strip().startswith('#')]
+        
+        if vcfpostedgevms:
+            lsf.write_vpodprogress('VCF Post-Edge VMs start', 'GOOD-3')
+            lsf.write_output('Starting post-edge VMs (Aria Automation, etc.)...')
+            
+            if not dry_run:
+                # Check if any post-edge VMs need to be started
+                postedge_need_start = False
+                for entry in vcfpostedgevms:
+                    parts = entry.split(':')
+                    vm_name = parts[0].strip()
+                    vms = lsf.get_vm_by_name(vm_name)
+                    for vm in vms:
+                        if vm.runtime.powerState != 'poweredOn':
+                            postedge_need_start = True
+                            break
+                    if postedge_need_start:
+                        break
+                
+                if postedge_need_start:
+                    lsf.start_nested(vcfpostedgevms)
+                    # Short wait - these VMs will continue booting in parallel
+                    # with subsequent startup tasks
+                    lsf.write_output('Post-edge VMs started, continuing with startup...')
+                    lsf.labstartup_sleep(30)
+                else:
+                    lsf.write_output('All post-edge VMs already powered on')
+            else:
+                lsf.write_output(f'Would start post-edge VMs: {vcfpostedgevms}')
+    
+    if dashboard:
         dashboard.update_task('vcf', 'vcenter', TaskStatus.RUNNING)
         dashboard.generate_html()
     
@@ -244,9 +352,11 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 5: Start VCF vCenter
     #==========================================================================
     
+    vcenter_count = 0
     if lsf.config.has_option('VCF', 'vcfvCenter'):
         vcfvCenter_raw = lsf.config.get('VCF', 'vcfvCenter')
         vcfvCenter = [v.strip() for v in vcfvCenter_raw.split('\n') if v.strip()]
+        vcenter_count = len(vcfvCenter)
         
         if vcfvCenter:
             lsf.write_vpodprogress('VCF vCenter start', 'GOOD-3')
@@ -258,8 +368,13 @@ def main(lsf=None, standalone=False, dry_run=False):
                 lsf.write_output(f'Would start vCenter: {vcfvCenter}')
     
     if dashboard:
-        dashboard.update_task('vcf', 'vcenter', TaskStatus.COMPLETE)
-        dashboard.generate_html()
+        if vcenter_count > 0:
+            dashboard.update_task('vcf', 'vcenter', TaskStatus.COMPLETE,
+                                  total=vcenter_count, success=vcenter_count, failed=0)
+        else:
+            dashboard.update_task('vcf', 'vcenter', TaskStatus.SKIPPED,
+                                  'No vCenter configured',
+                                  total=0, success=0, failed=0, skipped=0)
     
     #==========================================================================
     # Cleanup

@@ -118,7 +118,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     try:
         from status_dashboard import StatusDashboard
         dashboard = StatusDashboard(lsf.lab_sku)
-        dashboard.update_task('final', 'url_checks', 'running')
+        dashboard.update_task('urls', 'url_checks', 'running')
         dashboard.generate_html()
     except Exception:
         dashboard = None
@@ -141,6 +141,9 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if not url_targets:
         lsf.write_output('No URL targets configured')
+        if dashboard:
+            dashboard.update_task('urls', 'url_checks', 'skipped', 'No URL targets defined in config',
+                                  total=0, success=0, failed=0, skipped=0)
         return
     
     lsf.write_output(f'URL targets: {len(url_targets)}')
@@ -245,9 +248,14 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_output(f'  - {url}')
     
     if dashboard:
-        status = 'complete' if not failed else 'failed'
-        dashboard.update_task('final', 'url_checks', status)
-        dashboard.generate_html()
+        total_urls = len(url_checks)
+        if failed:
+            dashboard.update_task('urls', 'url_checks', 'failed', 
+                                  f'{len(failed)} URL(s) unreachable',
+                                  total=total_urls, success=len(succeeded), failed=len(failed))
+        else:
+            dashboard.update_task('urls', 'url_checks', 'complete',
+                                  total=total_urls, success=len(succeeded), failed=0)
     
     ##=========================================================================
     ## End Core Team code

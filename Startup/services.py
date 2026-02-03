@@ -67,6 +67,9 @@ def main(lsf=None, standalone=False, dry_run=False):
         else:
             linux_services = [s.strip() for s in linux_raw.split(',') if s.strip()]
     
+    linux_succeeded = []
+    linux_failed = []
+    
     if linux_services:
         lsf.write_vpodprogress('Manage Linux Services', 'GOOD-6')
         lsf.write_output('Starting Linux services')
@@ -89,6 +92,7 @@ def main(lsf=None, standalone=False, dry_run=False):
             action = 'start'
             max_retries = 5
             
+            service_started = False
             for attempt in range(max_retries):
                 lsf.write_output(f'Starting {service} on {host}...')
                 
@@ -99,18 +103,35 @@ def main(lsf=None, standalone=False, dry_run=False):
                         output = result.stdout.lower()
                         if 'running' in output or 'started' in output:
                             lsf.write_output(f'Service {service} started on {host}')
+                            service_started = True
                             break
                 except Exception as e:
                     lsf.write_output(f'Error starting {service} on {host}: {e}')
                 
                 lsf.labstartup_sleep(lsf.sleep_seconds)
+            
+            if service_started:
+                linux_succeeded.append(f'{service}@{host}')
+            else:
+                linux_failed.append(f'{service}@{host}')
         
-        lsf.write_output('Finished starting Linux services')
+        lsf.write_output(f'Finished starting Linux services: {len(linux_succeeded)} succeeded, {len(linux_failed)} failed')
     
     if dashboard:
-        dashboard.update_task('services', 'linux_services', TaskStatus.COMPLETE)
+        if linux_services:
+            total_linux = len(linux_services)
+            if linux_failed:
+                dashboard.update_task('services', 'linux_services', TaskStatus.FAILED,
+                                      f'{len(linux_failed)} service(s) failed to start',
+                                      total=total_linux, success=len(linux_succeeded), failed=len(linux_failed))
+            else:
+                dashboard.update_task('services', 'linux_services', TaskStatus.COMPLETE,
+                                      total=total_linux, success=len(linux_succeeded), failed=0)
+        else:
+            dashboard.update_task('services', 'linux_services', TaskStatus.SKIPPED,
+                                  'No Linux services configured',
+                                  total=0, success=0, failed=0, skipped=0)
         dashboard.update_task('services', 'tcp_ports', TaskStatus.RUNNING)
-        dashboard.generate_html()
     
     #==========================================================================
     # TASK 2: Verify TCP Services
@@ -123,6 +144,9 @@ def main(lsf=None, standalone=False, dry_run=False):
             tcp_services = [s.strip() for s in tcp_raw.split('\n') if s.strip()]
         else:
             tcp_services = [s.strip() for s in tcp_raw.split(',') if s.strip()]
+    
+    tcp_succeeded = []
+    tcp_failed = []
     
     if tcp_services:
         lsf.write_vpodprogress('Testing TCP Ports', 'GOOD-6')
@@ -142,17 +166,39 @@ def main(lsf=None, standalone=False, dry_run=False):
             host = parts[0].strip()
             port = int(parts[1].strip())
             
-            while not lsf.test_tcp_port(host, port):
-                lsf.write_output(f'Waiting for {host}:{port}...')
+            # Try up to max_retries times before giving up
+            max_retries = 20
+            port_responding = False
+            for attempt in range(max_retries):
+                if lsf.test_tcp_port(host, port):
+                    port_responding = True
+                    break
+                lsf.write_output(f'Waiting for {host}:{port}... (attempt {attempt+1}/{max_retries})')
                 lsf.labstartup_sleep(lsf.sleep_seconds)
             
-            lsf.write_output(f'TCP port {host}:{port} is responding')
+            if port_responding:
+                lsf.write_output(f'TCP port {host}:{port} is responding')
+                tcp_succeeded.append(f'{host}:{port}')
+            else:
+                lsf.write_output(f'TCP port {host}:{port} failed after {max_retries} attempts')
+                tcp_failed.append(f'{host}:{port}')
         
-        lsf.write_output('Finished testing TCP ports')
+        lsf.write_output(f'Finished testing TCP ports: {len(tcp_succeeded)} succeeded, {len(tcp_failed)} failed')
     
     if dashboard:
-        dashboard.update_task('services', 'tcp_ports', TaskStatus.COMPLETE)
-        dashboard.generate_html()
+        if tcp_services:
+            total_tcp = len(tcp_services)
+            if tcp_failed:
+                dashboard.update_task('services', 'tcp_ports', TaskStatus.FAILED,
+                                      f'{len(tcp_failed)} port(s) not responding',
+                                      total=total_tcp, success=len(tcp_succeeded), failed=len(tcp_failed))
+            else:
+                dashboard.update_task('services', 'tcp_ports', TaskStatus.COMPLETE,
+                                      total=total_tcp, success=len(tcp_succeeded), failed=0)
+        else:
+            dashboard.update_task('services', 'tcp_ports', TaskStatus.SKIPPED,
+                                  'No TCP services configured',
+                                  total=0, success=0, failed=0, skipped=0)
     
     ##=========================================================================
     ## End Core Team code

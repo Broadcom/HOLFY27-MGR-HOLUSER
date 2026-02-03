@@ -76,7 +76,15 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if not vcenters:
         lsf.write_output('No vCenters configured - skipping vSphere startup')
+        if dashboard:
+            dashboard.update_task('vsphere', 'vcenter_wait', TaskStatus.SKIPPED, 'No vCenters configured')
+            dashboard.generate_html()
         return
+    
+    # Update dashboard - waiting for vCenter
+    if dashboard:
+        dashboard.update_task('vsphere', 'vcenter_wait', TaskStatus.RUNNING)
+        dashboard.generate_html()
     
     lsf.write_vpodprogress('Connecting vCenters', 'GOOD-3')
     
@@ -156,9 +164,12 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output(f'Would connect to vCenters: {vcenters}')
     
     if dashboard:
-        dashboard.update_task('vsphere', 'vcenter_connect', TaskStatus.COMPLETE)
+        vc_count = len([v for v in vcenters if v and not v.strip().startswith('#')])
+        dashboard.update_task('vsphere', 'vcenter_wait', TaskStatus.COMPLETE,
+                              total=vc_count, success=vc_count, failed=0)
+        dashboard.update_task('vsphere', 'vcenter_connect', TaskStatus.COMPLETE,
+                              total=vc_count, success=len(lsf.sis) if not dry_run else vc_count, failed=0)
         dashboard.update_task('vsphere', 'datastores', TaskStatus.RUNNING)
-        dashboard.generate_html()
     
     #==========================================================================
     # TASK 2: Check Datastores
@@ -190,9 +201,14 @@ def main(lsf=None, standalone=False, dry_run=False):
                 lsf.labstartup_sleep(lsf.sleep_seconds)
     
     if dashboard:
-        dashboard.update_task('vsphere', 'datastores', TaskStatus.COMPLETE)
+        if datastores:
+            dashboard.update_task('vsphere', 'datastores', TaskStatus.COMPLETE,
+                                  total=len(datastores), success=len(datastores), failed=0)
+        else:
+            dashboard.update_task('vsphere', 'datastores', TaskStatus.SKIPPED,
+                                  'No datastores configured',
+                                  total=0, success=0, failed=0, skipped=0)
         dashboard.update_task('vsphere', 'maintenance', TaskStatus.RUNNING)
-        dashboard.generate_html()
     
     #==========================================================================
     # TASK 3: ESXi Hosts Exit Maintenance Mode
@@ -226,17 +242,18 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output('All ESXi hosts are out of Maintenance Mode')
     
     if dashboard:
-        dashboard.update_task('vsphere', 'maintenance', TaskStatus.COMPLETE)
+        host_count = len(esx_hosts) if esx_hosts else len(lsf.get_all_hosts()) if not dry_run else 0
+        dashboard.update_task('vsphere', 'maintenance', TaskStatus.COMPLETE,
+                              total=host_count, success=host_count, failed=0)
         dashboard.update_task('vsphere', 'vcls', TaskStatus.RUNNING)
-        dashboard.generate_html()
     
     #==========================================================================
     # TASK 4: Verify vCLS VMs Started
     #==========================================================================
     
+    vcls_count = 0
     if not dry_run:
         vms = lsf.get_all_vms()
-        vcls_count = 0
         
         for vm in vms:
             if 'vCLS' in vm.name:
@@ -249,9 +266,14 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_output(f'All {vcls_count} vCLS VMs have started')
     
     if dashboard:
-        dashboard.update_task('vsphere', 'vcls', TaskStatus.COMPLETE)
+        if vcls_count > 0:
+            dashboard.update_task('vsphere', 'vcls', TaskStatus.COMPLETE,
+                                  total=vcls_count, success=vcls_count, failed=0)
+        else:
+            dashboard.update_task('vsphere', 'vcls', TaskStatus.SKIPPED,
+                                  'No vCLS VMs found',
+                                  total=0, success=0, failed=0, skipped=0)
         dashboard.update_task('vsphere', 'drs', TaskStatus.RUNNING)
-        dashboard.generate_html()
     
     #==========================================================================
     # TASK 5: Wait for DRS to Enable
@@ -285,14 +307,21 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output('DRS is configured on all required clusters')
     
     if dashboard:
-        dashboard.update_task('vsphere', 'drs', TaskStatus.COMPLETE)
+        if drs_clusters:
+            dashboard.update_task('vsphere', 'drs', TaskStatus.COMPLETE,
+                                  total=len(drs_clusters), success=len(drs_clusters), failed=0)
+        else:
+            dashboard.update_task('vsphere', 'drs', TaskStatus.SKIPPED,
+                                  'No DRS clusters configured',
+                                  total=0, success=0, failed=0, skipped=0)
         dashboard.update_task('vsphere', 'shell_warning', TaskStatus.RUNNING)
-        dashboard.generate_html()
     
     #==========================================================================
     # TASK 6: Suppress Shell Warning on ESXi Hosts
     #==========================================================================
     
+    shell_warning_count = 0
+    shell_warning_failed = 0
     if not dry_run:
         esxhosts = lsf.get_all_hosts()
         for host in esxhosts:
@@ -304,13 +333,21 @@ def main(lsf=None, standalone=False, dry_run=False):
                 )
                 lsf.write_output(f'Suppressing shell warning on {host.name}')
                 option_manager.UpdateOptions(changedValue=[option])
+                shell_warning_count += 1
             except Exception as e:
                 lsf.write_output(f'Could not suppress shell warning on {host.name}: {e}')
+                shell_warning_failed += 1
     
     if dashboard:
-        dashboard.update_task('vsphere', 'shell_warning', TaskStatus.COMPLETE)
+        total_shell = shell_warning_count + shell_warning_failed
+        if total_shell > 0:
+            dashboard.update_task('vsphere', 'shell_warning', TaskStatus.COMPLETE,
+                                  total=total_shell, success=shell_warning_count, failed=shell_warning_failed)
+        else:
+            dashboard.update_task('vsphere', 'shell_warning', TaskStatus.SKIPPED,
+                                  'No hosts to configure',
+                                  total=0, success=0, failed=0, skipped=0)
         dashboard.update_task('vsphere', 'vcenter_ready', TaskStatus.RUNNING)
-        dashboard.generate_html()
     
     #==========================================================================
     # TASK 7: Verify vCenter UI Ready
@@ -331,9 +368,10 @@ def main(lsf=None, standalone=False, dry_run=False):
                 lsf.labstartup_sleep(lsf.sleep_seconds)
     
     if dashboard:
-        dashboard.update_task('vsphere', 'vcenter_ready', TaskStatus.COMPLETE)
-        dashboard.update_task('vsphere', 'nested_vms', TaskStatus.RUNNING)
-        dashboard.generate_html()
+        vc_ready_count = len([v for v in vcenters if v and not v.strip().startswith('#')])
+        dashboard.update_task('vsphere', 'vcenter_ready', TaskStatus.COMPLETE,
+                              total=vc_ready_count, success=vc_ready_count, failed=0)
+        dashboard.update_task('vsphere', 'power_on_vms', TaskStatus.RUNNING)
     
     #==========================================================================
     # TASK 8: Start Nested VMs
@@ -359,10 +397,24 @@ def main(lsf=None, standalone=False, dry_run=False):
                 except Exception as e:
                     lsf.write_output(f'VM startup error: {e}')
                 lsf.labstartup_sleep(lsf.sleep_seconds)
+        
+        if dashboard:
+            dashboard.update_task('vsphere', 'power_on_vms', TaskStatus.COMPLETE,
+                                  total=len(vms_to_start), success=len(vms_to_start), failed=0)
+    else:
+        lsf.write_output('No VMs configured to start')
+        if dashboard:
+            dashboard.update_task('vsphere', 'power_on_vms', TaskStatus.SKIPPED, 
+                                  'No VMs defined in config',
+                                  total=0, success=0, failed=0, skipped=0)
     
     #==========================================================================
     # TASK 9: Start vApps
     #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('vsphere', 'power_on_vapps', TaskStatus.RUNNING)
+        dashboard.generate_html()
     
     vapps = []
     if lsf.config.has_option('RESOURCES', 'vApps'):
@@ -383,10 +435,21 @@ def main(lsf=None, standalone=False, dry_run=False):
                 except Exception as e:
                     lsf.write_output(f'vApp startup error: {e}')
                 lsf.labstartup_sleep(lsf.sleep_seconds)
+        
+        if dashboard:
+            dashboard.update_task('vsphere', 'power_on_vapps', TaskStatus.COMPLETE,
+                                  total=len(vapps), success=len(vapps), failed=0)
+    else:
+        lsf.write_output('No vApps configured to start')
+        if dashboard:
+            dashboard.update_task('vsphere', 'power_on_vapps', TaskStatus.SKIPPED, 
+                                  'No vApps defined in config',
+                                  total=0, success=0, failed=0, skipped=0)
     
     if dashboard:
-        dashboard.update_task('vsphere', 'nested_vms', TaskStatus.COMPLETE)
-        dashboard.generate_html()
+        total_nested = len(vms_to_start) + len(vapps)
+        dashboard.update_task('vsphere', 'nested_vms', TaskStatus.COMPLETE,
+                              total=total_nested, success=total_nested, failed=0)
     
     #==========================================================================
     # TASK 10: Clear Host Alarms

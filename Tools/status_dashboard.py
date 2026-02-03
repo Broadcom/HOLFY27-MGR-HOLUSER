@@ -40,6 +40,31 @@ class Task:
     start_time: Optional[datetime.datetime] = None
     end_time: Optional[datetime.datetime] = None
     message: str = ""
+    # Item count tracking for detailed status
+    total_items: int = 0
+    success_items: int = 0
+    failed_items: int = 0
+    skipped_items: int = 0
+    
+    @property
+    def details(self) -> str:
+        """Generate detailed status message including item counts"""
+        if self.total_items == 0:
+            return self.message
+        
+        parts = []
+        if self.success_items > 0:
+            parts.append(f"{self.success_items} succeeded")
+        if self.failed_items > 0:
+            parts.append(f"{self.failed_items} failed")
+        if self.skipped_items > 0:
+            parts.append(f"{self.skipped_items} skipped")
+        
+        count_str = f"{self.total_items} items: " + ", ".join(parts) if parts else f"{self.total_items} items processed"
+        
+        if self.message:
+            return f"{count_str} - {self.message}"
+        return count_str
 
 
 @dataclass
@@ -63,6 +88,9 @@ class TaskGroup:
             return TaskStatus.COMPLETE
         if all(s == TaskStatus.SKIPPED for s in statuses):
             return TaskStatus.SKIPPED
+        # If all tasks are either COMPLETE or SKIPPED (mixed), consider it complete
+        if all(s in [TaskStatus.COMPLETE, TaskStatus.SKIPPED] for s in statuses):
+            return TaskStatus.COMPLETE
         return TaskStatus.PENDING
     
     @property
@@ -101,63 +129,123 @@ class StatusDashboard:
             self._load_state()
     
     def _init_default_groups(self):
-        """Initialize default task groups based on startup sequence"""
+        """
+        Initialize default task groups based on startup module sequence.
+        
+        Groups are ordered top-to-bottom matching the actual execution order
+        from labstartup.py. Each group corresponds to a Startup/ module.
+        
+        Execution order:
+        1. prelim.py    - Preliminary checks (DNS, README, firewall)
+        2. ESXi.py      - ESXi host verification
+        3. VCF.py       - VCF startup (management cluster, NSX, vCenter)
+        4. VVF.py       - VVF startup (alternative to VCF)
+        5. vSphere.py   - vSphere configuration (clusters, VMs)
+        6. pings.py     - Network connectivity verification
+        7. services.py  - Linux services and TCP port verification
+        8. Kubernetes.py - Kubernetes certificate checks
+        9. VCFfinal.py  - VCF final tasks (Tanzu, Aria)
+        10. urls.py     - URL verification
+        11. odyssey.py  - Odyssey client installation
+        12. final.py    - Final checks and cleanup
+        """
+        # Define groups in execution order (top-to-bottom)
         default_groups = [
-            ('prelim', 'Preliminary Checks', [
+            # Group 1: prelim.py - Preliminary Checks
+            ('prelim', '1. Preliminary Checks (prelim.py)', [
+                ('readme', 'README Sync', 'Copy README to console desktop'),
+                ('update_manager', 'Update Manager', 'Disable Ubuntu update popups'),
                 ('dns', 'DNS Health Checks', 'Verify DNS resolution for all sites'),
                 ('dns_import', 'DNS Record Import', 'Import custom DNS records'),
-                ('readme', 'README Sync', 'Synchronize README to console'),
                 ('firewall', 'Firewall Verification', 'Confirm firewall is active'),
-                ('odyssey_cleanup', 'Odyssey Cleanup', 'Remove existing Odyssey files')
+                ('proxy_filter', 'Proxy Filter', 'Verify proxy filtering is active'),
             ]),
-            ('esxi', 'ESXi Hosts', [
-                ('host_check', 'Host Verification', 'Verify nested ESXi hosts are responding')
+            
+            # Group 2: ESXi.py - ESXi Host Verification
+            ('esxi', '2. ESXi Host Verification (ESXi.py)', [
+                ('host_check', 'Host Connectivity', 'Ping and verify ESXi hosts are responding'),
+                ('host_ports', 'Host Port Checks', 'Verify ESXi management ports (443, 902)'),
             ]),
-            ('vcf', 'VCF Startup', [
+            
+            # Group 3: VCF.py - VCF Startup (skipped for VVF labs)
+            ('vcf', '3. VCF Startup (VCF.py)', [
                 ('mgmt_cluster', 'Management Cluster', 'Connect to VCF management cluster hosts'),
+                ('exit_maintenance', 'Exit Maintenance Mode', 'Remove hosts from maintenance mode'),
                 ('datastore', 'Datastore Verification', 'Verify VCF management datastore'),
-                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager'),
+                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager VM'),
                 ('nsx_edges', 'NSX Edge VMs', 'Start NSX Edge virtual machines'),
-                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server')
+                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server'),
             ]),
-            ('vvf', 'VVF Startup', [
+            
+            # Group 4: VVF.py - VVF Startup (skipped for VCF labs)
+            ('vvf', '4. VVF Startup (VVF.py)', [
                 ('mgmt_cluster', 'Management Cluster', 'Connect to VVF management cluster hosts'),
+                ('exit_maintenance', 'Exit Maintenance Mode', 'Remove hosts from maintenance mode'),
                 ('datastore', 'Datastore Verification', 'Verify VVF management datastore'),
-                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager'),
+                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager VM'),
                 ('nsx_edges', 'NSX Edge VMs', 'Start NSX Edge virtual machines'),
-                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server')
+                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server'),
             ]),
-            ('vsphere', 'vSphere Configuration', [
+            
+            # Group 5: vSphere.py - vSphere Configuration
+            ('vsphere', '5. vSphere Configuration (vSphere.py)', [
+                ('vcenter_wait', 'Wait for vCenter', 'Wait for vCenter to become available'),
                 ('vcenter_connect', 'vCenter Connection', 'Connect to vCenter servers'),
                 ('datastores', 'Datastore Verification', 'Verify all datastores are accessible'),
-                ('maintenance', 'Maintenance Mode', 'Exit hosts from maintenance mode'),
+                ('maintenance', 'Exit Maintenance Mode', 'Exit hosts from maintenance mode'),
                 ('vcls', 'vCLS Verification', 'Verify vCLS VMs are running'),
                 ('drs', 'DRS Configuration', 'Configure DRS settings'),
-                ('shell_warning', 'Shell Warning', 'Suppress ESXi shell warnings'),
-                ('vcenter_ready', 'vCenter Ready', 'Wait for vCenter to be ready'),
-                ('nested_vms', 'Nested VMs', 'Power on nested virtual machines')
+                ('shell_warning', 'Shell Warning Suppress', 'Suppress ESXi shell warnings'),
+                ('vcenter_ready', 'vCenter Ready', 'Verify vCenter UI is accessible'),
+                ('power_on_vms', 'Power On VMs', 'Power on configured virtual machines'),
+                ('power_on_vapps', 'Power On vApps', 'Power on configured vApps'),
+                ('nested_vms', 'Nested VMs Complete', 'All VM startup tasks completed'),
             ]),
-            ('services', 'Service Verification', [
-                ('pings', 'Network Connectivity', 'Verify IP connectivity'),
+            
+            # Group 6: pings.py - Network Connectivity
+            ('pings', '6. Network Connectivity (pings.py)', [
+                ('ping_targets', 'Ping Targets', 'Verify IP connectivity to configured hosts'),
+            ]),
+            
+            # Group 7: services.py - Service Verification
+            ('services', '7. Service Verification (services.py)', [
+                ('linux_services', 'Linux Services', 'Start and verify Linux services'),
                 ('tcp_ports', 'TCP Port Checks', 'Verify service ports are responding'),
-                ('linux_services', 'Linux Services', 'Start and verify Linux services')
             ]),
-            ('kubernetes', 'Kubernetes', [
-                ('cert_check', 'Certificate Renewal', 'Check and renew Kubernetes certificates')
+            
+            # Group 8: Kubernetes.py - Kubernetes Certificates
+            ('kubernetes', '8. Kubernetes Certificates (Kubernetes.py)', [
+                ('cert_check', 'Certificate Check', 'Check Kubernetes certificate expiration'),
+                ('cert_renew', 'Certificate Renewal', 'Renew expired certificates if needed'),
             ]),
-            ('vcffinal', 'VCF Final', [
-                ('tanzu_control', 'Tanzu Control Plane', 'Start Tanzu Supervisor control plane VMs'),
-                ('tanzu_deploy', 'Tanzu Deployment', 'Deploy Tanzu components'),
+            
+            # Group 9: VCFfinal.py - VCF Final Tasks
+            ('vcffinal', '9. VCF Final Tasks (VCFfinal.py)', [
+                ('tanzu_control', 'Tanzu Control Plane', 'Start Supervisor control plane VMs'),
+                ('tanzu_workload', 'Tanzu Workload Cluster', 'Start workload cluster VMs'),
                 ('aria_vms', 'Aria VMs', 'Start Aria Automation virtual machines'),
-                ('aria_urls', 'Aria URLs', 'Verify Aria Automation URLs')
+                ('aria_urls', 'Aria URL Verification', 'Verify Aria Automation URLs'),
             ]),
-            ('odyssey', 'Odyssey', [
-                ('install', 'Odyssey Installation', 'Install Odyssey client if enabled')
+            
+            # Group 10: urls.py - URL Verification
+            ('urls', '10. URL Verification (urls.py)', [
+                ('url_checks', 'URL Checks', 'Verify all configured web interfaces'),
             ]),
-            ('final', 'Final Checks', [
-                ('url_checks', 'URL Verification', 'Verify all web interfaces'),
-                ('custom', 'Custom Checks', 'Lab-specific final checks')
-            ])
+            
+            # Group 11: odyssey.py - Odyssey Installation
+            ('odyssey', '11. Odyssey Installation (odyssey.py)', [
+                ('cleanup', 'Odyssey Cleanup', 'Remove existing Odyssey files'),
+                ('install', 'Odyssey Install', 'Download and install Odyssey client'),
+                ('shortcut', 'Desktop Shortcut', 'Create desktop shortcut'),
+            ]),
+            
+            # Group 12: final.py - Final Checks
+            ('final', '12. Final Checks (final.py)', [
+                ('custom', 'Custom Checks', 'Lab-specific final checks'),
+                ('labcheck', 'LabCheck Schedule', 'Configure labcheck scheduled task'),
+                ('holuser_lock', 'holuser lock', 'Lock holuser account if configured'),
+                ('ready', 'Lab Ready', 'Mark lab as ready'),
+            ]),
         ]
         
         for group_id, group_name, tasks in default_groups:
@@ -167,14 +255,31 @@ class StatusDashboard:
             ]
             self.groups[group_id] = TaskGroup(id=group_id, name=group_name, tasks=task_list)
     
-    def update_task(self, group_id: str, task_id: str, status, message: str = ""):
+    def update_task(self, group_id: str, task_id: str, status, message: str = "",
+                    total: int = 0, success: int = 0, failed: int = 0, skipped: int = 0):
         """
-        Update a specific task status
+        Update a specific task status with optional item counts
         
         :param group_id: Group identifier
         :param task_id: Task identifier (without group prefix)
         :param status: Status string (pending, running, complete, failed, skipped) or TaskStatus enum
         :param message: Optional status message
+        :param total: Total number of items processed (e.g., URLs, VMs, services)
+        :param success: Number of items that succeeded
+        :param failed: Number of items that failed
+        :param skipped: Number of items that were skipped
+        
+        Example:
+            # URL check with 6 URLs, all successful
+            dashboard.update_task('urls', 'url_checks', 'complete', 
+                                  total=6, success=6)
+            # Shows: "6 items: 6 succeeded"
+            
+            # VM startup with some failures
+            dashboard.update_task('vsphere', 'power_on_vms', 'failed',
+                                  message='Could not start all VMs',
+                                  total=10, success=8, failed=2)
+            # Shows: "10 items: 8 succeeded, 2 failed - Could not start all VMs"
         """
         if group_id not in self.groups:
             return
@@ -196,15 +301,59 @@ class StatusDashboard:
                 
                 task.status = status_enum
                 task.message = message
+                
+                # Update item counts
+                task.total_items = total
+                task.success_items = success
+                task.failed_items = failed
+                task.skipped_items = skipped
                 break
         
         self._save_state()
         self.generate_html()
     
-    def set_failed(self, reason: str):
-        """Mark the entire startup as failed"""
+    def set_failed(self, reason: str, group_id: str = None, task_id: str = None):
+        """
+        Mark the entire startup as failed.
+        
+        When a failure occurs, this method:
+        1. Sets the overall failed state and reason
+        2. Marks the specific failing task as FAILED (if provided)
+        3. If no specific task is provided, finds any RUNNING task and marks it as FAILED
+        
+        This ensures the dashboard shows both:
+        - The failure banner at the top with the error message
+        - The specific task and group that failed with FAILED status
+        
+        :param reason: Failure reason message
+        :param group_id: Optional group ID of the failing task
+        :param task_id: Optional task ID (without group prefix) of the failing task
+        """
         self.failed = True
         self.failure_reason = reason
+        
+        # If specific task was provided, mark it as failed
+        if group_id and task_id:
+            self.update_task(group_id, task_id, TaskStatus.FAILED, reason)
+        else:
+            # Find any currently RUNNING task and mark it as FAILED
+            # This handles the case where labfail() is called without task context
+            for gid, group in self.groups.items():
+                for task in group.tasks:
+                    if task.status == TaskStatus.RUNNING:
+                        task.status = TaskStatus.FAILED
+                        task.message = reason
+                        task.end_time = datetime.datetime.now()
+                        # Only mark the first running task as failed
+                        # (there should typically only be one)
+                        break
+                else:
+                    # Continue to next group if no running task found in this group
+                    continue
+                # Break outer loop if we found and marked a running task
+                break
+        
+        self._save_state()
         self.generate_html()
     
     def skip_group(self, group_id: str, message: str = "Not applicable"):
@@ -264,6 +413,11 @@ class StatusDashboard:
                                         if task.id == task_id:
                                             task.status = TaskStatus(task_state.get('status', 'pending'))
                                             task.message = task_state.get('message', '')
+                                            # Restore item counts
+                                            task.total_items = task_state.get('total_items', 0)
+                                            task.success_items = task_state.get('success_items', 0)
+                                            task.failed_items = task_state.get('failed_items', 0)
+                                            task.skipped_items = task_state.get('skipped_items', 0)
                                             break
         except Exception:
             # If loading fails, continue with fresh state
@@ -287,7 +441,11 @@ class StatusDashboard:
                         'id': t.id,
                         'name': t.name,
                         'status': t.status.value,
-                        'message': t.message
+                        'message': t.message,
+                        'total_items': t.total_items,
+                        'success_items': t.success_items,
+                        'failed_items': t.failed_items,
+                        'skipped_items': t.skipped_items
                     }
                     for t in group.tasks
                 ]
@@ -569,6 +727,28 @@ class StatusDashboard:
             color: var(--accent-yellow);
         }}
         
+        .task-details {{
+            font-size: 0.8rem;
+            color: var(--accent-green);
+            margin-top: 0.25rem;
+        }}
+        
+        .task-details.has-failures {{
+            color: var(--accent-red);
+        }}
+        
+        .task-details .count-success {{
+            color: var(--accent-green);
+        }}
+        
+        .task-details .count-failed {{
+            color: var(--accent-red);
+        }}
+        
+        .task-details .count-skipped {{
+            color: var(--accent-purple);
+        }}
+        
         .legend {{
             margin-top: 2rem;
             padding: 1.5rem;
@@ -659,8 +839,6 @@ class StatusDashboard:
         for group in self.groups.values():
             group_class = ""
             group_status_icon = "🔄"
-            is_complete = group.status == TaskStatus.COMPLETE
-            is_skipped = group.status == TaskStatus.SKIPPED
             
             if group.status == TaskStatus.COMPLETE:
                 group_class = "complete"
@@ -677,9 +855,19 @@ class StatusDashboard:
             else:
                 group_status_icon = "⏳"
             
-            # Complete and skipped groups are collapsed by default
-            tasks_class = "collapsed" if (is_complete or is_skipped) else "expanded"
-            toggle_class = "collapsed" if (is_complete or is_skipped) else ""
+            # Determine if group should be collapsed:
+            # - Collapse if all tasks are Complete and/or Skipped (no failures, no pending/running)
+            # - Keep expanded if there are any failures OR any pending/running tasks
+            statuses = [t.status for t in group.tasks]
+            has_failures = TaskStatus.FAILED in statuses
+            has_pending_or_running = any(s in [TaskStatus.PENDING, TaskStatus.RUNNING] for s in statuses)
+            all_done = all(s in [TaskStatus.COMPLETE, TaskStatus.SKIPPED] for s in statuses)
+            
+            # Collapse only if all tasks are done (complete/skipped) and no failures
+            should_collapse = all_done and not has_failures
+            
+            tasks_class = "collapsed" if should_collapse else "expanded"
+            toggle_class = "collapsed" if should_collapse else ""
             
             html += f'''
             <div class="task-group {group_class}">
@@ -703,6 +891,26 @@ class StatusDashboard:
                             <div class="task-name">{task.name}</div>
                             <div class="task-desc">{task.description}</div>
 '''
+                # Show item counts if present
+                if task.total_items > 0:
+                    details_class = "task-details"
+                    if task.failed_items > 0:
+                        details_class += " has-failures"
+                    
+                    # Build count parts with colored spans
+                    count_parts = []
+                    if task.success_items > 0:
+                        count_parts.append(f'<span class="count-success">{task.success_items} succeeded</span>')
+                    if task.failed_items > 0:
+                        count_parts.append(f'<span class="count-failed">{task.failed_items} failed</span>')
+                    if task.skipped_items > 0:
+                        count_parts.append(f'<span class="count-skipped">{task.skipped_items} skipped</span>')
+                    
+                    count_str = ", ".join(count_parts) if count_parts else "processed"
+                    html += f'''
+                            <div class="{details_class}">{task.total_items} items: {count_str}</div>
+'''
+                
                 if task.message:
                     html += f'''
                             <div class="task-message">{task.message}</div>
@@ -902,11 +1110,43 @@ if __name__ == '__main__':
         dashboard = StatusDashboard(args.sku)
         
         if args.demo:
-            # Simulate some progress
-            dashboard.update_task('prelim', 'dns', 'complete')
-            dashboard.update_task('prelim', 'readme', 'complete')
-            dashboard.update_task('prelim', 'firewall', 'running', 'Checking firewall status...')
-            dashboard.update_task('infrastructure', 'esxi', 'running')
+            # Simulate some progress through the startup sequence with item counts
+            # Group 1: prelim - complete with counts
+            dashboard.update_task('prelim', 'readme', 'complete', total=1, success=1)
+            dashboard.update_task('prelim', 'update_manager', 'complete', total=2, success=2)
+            dashboard.update_task('prelim', 'dns', 'complete', 'All zones resolved', 
+                                  total=3, success=3)
+            dashboard.update_task('prelim', 'dns_import', 'complete', 
+                                  total=5, success=5)
+            dashboard.update_task('prelim', 'firewall', 'complete')
+            dashboard.update_task('prelim', 'proxy_filter', 'complete')
+            
+            # Group 2: esxi - complete with host counts
+            dashboard.update_task('esxi', 'host_check', 'complete', 
+                                  total=4, success=4)
+            dashboard.update_task('esxi', 'host_ports', 'complete', 
+                                  total=8, success=8)
+            
+            # Group 3: vcf - running with partial progress
+            dashboard.update_task('vcf', 'mgmt_cluster', 'complete', 
+                                  total=4, success=4)
+            dashboard.update_task('vcf', 'exit_maintenance', 'complete', 
+                                  total=4, success=4)
+            dashboard.update_task('vcf', 'datastore', 'complete', 
+                                  total=1, success=1)
+            dashboard.update_task('vcf', 'nsx_mgr', 'running', 'Waiting for NSX Manager to start...',
+                                  total=1, success=0)
+            
+            # Group 4: vvf - skipped (VCF lab)
+            dashboard.skip_group('vvf', 'VCF lab - VVF not applicable')
+            
+            # Group 6: pings - complete with counts
+            dashboard.update_task('pings', 'ping_targets', 'complete', 
+                                  total=12, success=11, failed=1)
+            
+            # Group 10: urls - complete with counts
+            dashboard.update_task('urls', 'url_checks', 'complete', 
+                                  total=8, success=8)
         
         dashboard.generate_html()
         print(f'Dashboard generated at: {STATUS_FILE}')

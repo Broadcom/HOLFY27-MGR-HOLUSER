@@ -1523,8 +1523,11 @@ def push_router_files():
         dst = os.path.join(holorouter_dir, item)
         
         if os.path.isfile(src):
-            shutil.copy2(src, dst)
-            write_output(f'Copied {item} to holorouter NFS share')
+            try:
+                shutil.copy(src, dst)
+                write_output(f'Copied {item} to holorouter NFS share')
+            except Exception as e:
+                write_output(f'Failed to copy {item} to NFS share: {e}')
         elif os.path.isdir(src):
             if os.path.exists(dst):
                 shutil.rmtree(dst)
@@ -1567,8 +1570,11 @@ def push_vpodrepo_router_files():
         dst = os.path.join(holorouter_dir, item)
         
         if os.path.isfile(src):
-            shutil.copy2(src, dst)
-            write_output(f'Copied vpodrepo {item} to holorouter NFS share')
+            try:
+                shutil.copy(src, dst)
+                write_output(f'Copied vpodrepo {item} to holorouter NFS share')
+            except Exception as e:
+                write_output(f'Failed to copy vpodrepo {item} to NFS share: {e}')
     
     return True
 
