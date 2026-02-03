@@ -105,6 +105,7 @@ class ValidationReport:
     ntp_checks: List[CheckResult] = field(default_factory=list)
     vm_config_checks: List[CheckResult] = field(default_factory=list)
     vm_resource_checks: List[CheckResult] = field(default_factory=list)
+    password_expiration_checks: List[CheckResult] = field(default_factory=list)
     overall_status: str = "PASS"
     
     def to_dict(self) -> Dict:
@@ -112,6 +113,71 @@ class ValidationReport:
     
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2, default=str)
+
+
+#==============================================================================
+# LAB YEAR EXTRACTION
+#==============================================================================
+
+def extract_lab_year(lab_sku: str) -> str:
+    """
+    Extract the 2-digit lab year from various SKU formats.
+    
+    Supported formats:
+    - Standard: HOL-2701, ATE-2705, VXP-2703 → extracts '27'
+    - BETA: BETA-901-TNDNS → extracts '27' (from first digit after hyphen, assumes 9XX = FY27 testing)
+    - Named: Discovery-Demo, EDU-Workshop → defaults to current HOLFY year
+    
+    The function attempts multiple extraction strategies:
+    1. Look for 4-digit pattern after hyphen (XXYY format) → extract XX
+    2. Look for 3-digit pattern starting with 9 (beta testing) → default to 27
+    3. Look for any 2-digit year-like number (20-30 range) in the SKU
+    4. Fall back to '27' for HOLFY27
+    
+    :param lab_sku: Lab SKU string (e.g., 'HOL-2701', 'BETA-901-TNDNS', 'Discovery-Demo')
+    :return: 2-digit year string (e.g., '27')
+    """
+    # Default year for HOLFY27
+    default_year = '27'
+    
+    if not lab_sku or len(lab_sku) < 4:
+        return default_year
+    
+    # Strategy 1: Look for standard 4-digit lab number after hyphen (e.g., HOL-2701 → 2701 → 27)
+    # Pattern: PREFIX-XXYY where XX is year and YY is lab number
+    match = re.search(r'-(\d{4})(?:\D|$)', lab_sku)
+    if match:
+        four_digits = match.group(1)
+        year_part = four_digits[:2]
+        # Validate it looks like a reasonable year (20-35 range for HOL labs)
+        try:
+            year_int = int(year_part)
+            if 20 <= year_int <= 35:
+                return year_part
+        except ValueError:
+            pass
+    
+    # Strategy 2: Look for 3-digit pattern starting with 9 (beta/testing labs like BETA-901)
+    # These are typically testing labs for the current fiscal year
+    match = re.search(r'-9\d{2}(?:\D|$)', lab_sku)
+    if match:
+        # Beta labs (9XX) are for current FY testing, use default
+        return default_year
+    
+    # Strategy 3: Look for any 2-digit year pattern in the SKU
+    # This catches edge cases where year might be in a different position
+    match = re.search(r'(\d{2})\d{2}', lab_sku)
+    if match:
+        year_part = match.group(1)
+        try:
+            year_int = int(year_part)
+            if 20 <= year_int <= 35:
+                return year_part
+        except ValueError:
+            pass
+    
+    # Strategy 4: Fall back to default year for named labs (Discovery-Demo, etc.)
+    return default_year
 
 
 #==============================================================================
@@ -621,7 +687,8 @@ def generate_html_report(report: ValidationReport) -> str:
         ('License Checks', report.license_checks),
         ('NTP Configuration', report.ntp_checks),
         ('VM Configuration', report.vm_config_checks),
-        ('VM Resources', report.vm_resource_checks)
+        ('VM Resources', report.vm_resource_checks),
+        ('Password Expiration Checks', report.password_expiration_checks)
     ]
     
     for title, checks in sections:
@@ -645,6 +712,467 @@ def generate_html_report(report: ValidationReport) -> str:
 
 
 #==============================================================================
+# PASSWORD EXPIRATION CHECKS
+#==============================================================================
+
+def get_linux_password_expiration(hostname: str, username: str, password: str) -> Optional[int]:
+    """
+    Get password expiration for a Linux user account.
+    
+    Returns:
+        - None if password never expires or check failed
+        - Number of days until expiration (can be negative if expired)
+    """
+    try:
+        # Use chage command to get password expiration info
+        cmd = f'chage -l {username} 2>/dev/null | grep "Password expires"'
+        result = lsf.ssh(cmd, f'root@{hostname}', password)
+        
+        if not result or 'never' in result.lower():
+            return None  # Password never expires
+        
+        # Parse date from output like "Password expires                        : Dec 31, 2029"
+        match = re.search(r':\s*(.+)$', result)
+        if match:
+            date_str = match.group(1).strip()
+            if 'never' in date_str.lower():
+                return None
+            
+            # Try to parse the date
+            try:
+                exp_date = datetime.datetime.strptime(date_str, '%b %d, %Y').date()
+                days_until = (exp_date - datetime.date.today()).days
+                return days_until
+            except ValueError:
+                # Try alternative format
+                try:
+                    exp_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+                    days_until = (exp_date - datetime.date.today()).days
+                    return days_until
+                except ValueError:
+                    return None
+        
+        return None
+    except Exception as e:
+        return None
+
+
+def get_vcenter_user_expiration(hostname: str, vcuser: str, vcpassword: str, 
+                                  target_user: str) -> Optional[int]:
+    """
+    Get password expiration for vCenter SSO user via REST API.
+    
+    Returns:
+        - None if password never expires or check failed
+        - Number of days until expiration
+    """
+    try:
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        session = requests.Session()
+        session.verify = False
+        
+        # Authenticate
+        auth_url = f'https://{hostname}/rest/com/vmware/cis/session'
+        response = session.post(auth_url, auth=(vcuser, vcpassword))
+        
+        if response.status_code != 200:
+            return None
+        
+        # Get local user info
+        user_url = f'https://{hostname}/rest/appliance/local-accounts/{target_user}'
+        response = session.get(user_url)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if 'value' in data:
+                user_info = data['value']
+                # Check if password has expiration
+                if 'password_expires_at' in user_info:
+                    exp_timestamp = user_info['password_expires_at']
+                    if exp_timestamp:
+                        exp_date = datetime.datetime.fromtimestamp(exp_timestamp).date()
+                        days_until = (exp_date - datetime.date.today()).days
+                        return days_until
+                
+                # Check max_days_between_password_change
+                if 'max_days_between_password_change' in user_info:
+                    max_days = user_info['max_days_between_password_change']
+                    if max_days == -1 or max_days > 9000:
+                        return None  # Effectively never expires
+        
+        return None
+    except Exception:
+        return None
+
+
+def get_nsx_user_expiration(hostname: str, username: str, password: str,
+                              target_user: str) -> Optional[int]:
+    """
+    Get password expiration for NSX user via REST API.
+    
+    Returns:
+        - None if password never expires or check failed
+        - Number of days until expiration
+    """
+    try:
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        session = requests.Session()
+        session.verify = False
+        
+        # Get user info from NSX API
+        url = f'https://{hostname}/api/v1/node/users/{target_user}'
+        response = session.get(url, auth=(username, password))
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Check password_change_frequency (days)
+            if 'password_change_frequency' in data:
+                freq = data['password_change_frequency']
+                if freq == 0 or freq > 9000:
+                    return None  # Never expires
+                
+                # If we have last change date, calculate expiration
+                if 'last_password_change' in data:
+                    last_change = datetime.datetime.fromtimestamp(
+                        data['last_password_change'] / 1000
+                    ).date()
+                    exp_date = last_change + datetime.timedelta(days=freq)
+                    days_until = (exp_date - datetime.date.today()).days
+                    return days_until
+        
+        return None
+    except Exception:
+        return None
+
+
+def check_password_expirations() -> List[CheckResult]:
+    """
+    Check password expiration for all known user accounts.
+    
+    Checks:
+    - ESXi hosts: root user
+    - vCenter servers: root (Linux), administrator@vsphere.local (SSO)
+    - NSX managers: admin, root, audit users
+    - SDDC Manager: vcf, backup, root users
+    - vRA/Automation: vmware-system-user, root users
+    
+    Status:
+    - PASS: No expiration or > 3 years (1095 days)
+    - FAIL: Expires in < 2 years (730 days)
+    - WARN: Could not check
+    """
+    results = []
+    
+    if not lsf:
+        return [CheckResult(
+            name="Password Expiration Checks",
+            status="SKIPPED",
+            message="lsfunctions not available"
+        )]
+    
+    password = lsf.get_password()
+    three_years_days = 1095
+    two_years_days = 730
+    
+    # Check ESXi hosts
+    esxi_hosts = []
+    if lsf.config.has_option('RESOURCES', 'ESXiHosts'):
+        hosts_raw = lsf.config.get('RESOURCES', 'ESXiHosts').split('\n')
+        for entry in hosts_raw:
+            if not entry or entry.strip().startswith('#'):
+                continue
+            hostname = entry.split(':')[0].strip()
+            if hostname:
+                esxi_hosts.append(hostname)
+    
+    for hostname in esxi_hosts:
+        try:
+            days = get_linux_password_expiration(hostname, 'root', password)
+            
+            if days is None:
+                status = "PASS"
+                message = "Password never expires"
+            elif days > three_years_days:
+                status = "PASS"
+                message = f"Expires in {days} days ({days // 365} years)"
+            elif days > two_years_days:
+                status = "PASS"
+                message = f"Expires in {days} days ({days // 365} years)"
+            else:
+                status = "FAIL"
+                if days < 0:
+                    message = f"Password EXPIRED {abs(days)} days ago"
+                else:
+                    message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+            
+            results.append(CheckResult(
+                name=f"ESXi {hostname} (root)",
+                status=status,
+                message=message,
+                details={'hostname': hostname, 'username': 'root', 'days_until_expiration': days}
+            ))
+        except Exception as e:
+            results.append(CheckResult(
+                name=f"ESXi {hostname} (root)",
+                status="WARN",
+                message=f"Could not check: {str(e)[:40]}",
+                details={'hostname': hostname, 'username': 'root', 'error': str(e)}
+            ))
+    
+    # Check vCenter servers
+    vcenters = []
+    if lsf.config.has_option('RESOURCES', 'vCenters'):
+        vcenters_raw = lsf.config.get('RESOURCES', 'vCenters').split('\n')
+        for entry in vcenters_raw:
+            if not entry or entry.strip().startswith('#'):
+                continue
+            parts = entry.split(':')
+            hostname = parts[0].strip()
+            vcuser = parts[2].strip() if len(parts) > 2 else 'administrator@vsphere.local'
+            if hostname:
+                vcenters.append((hostname, vcuser))
+    
+    for hostname, vcuser in vcenters:
+        # Check Linux root account
+        try:
+            days = get_linux_password_expiration(hostname, 'root', password)
+            
+            if days is None:
+                status = "PASS"
+                message = "Password never expires"
+            elif days > three_years_days:
+                status = "PASS"
+                message = f"Expires in {days} days ({days // 365} years)"
+            elif days > two_years_days:
+                status = "PASS"
+                message = f"Expires in {days} days ({days // 365} years)"
+            else:
+                status = "FAIL"
+                if days < 0:
+                    message = f"Password EXPIRED {abs(days)} days ago"
+                else:
+                    message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+            
+            results.append(CheckResult(
+                name=f"vCenter {hostname} (root)",
+                status=status,
+                message=message,
+                details={'hostname': hostname, 'username': 'root', 'days_until_expiration': days}
+            ))
+        except Exception as e:
+            results.append(CheckResult(
+                name=f"vCenter {hostname} (root)",
+                status="WARN",
+                message=f"Could not check: {str(e)[:40]}",
+                details={'hostname': hostname, 'username': 'root', 'error': str(e)}
+            ))
+        
+        # Check vCenter SSO user
+        try:
+            days = get_vcenter_user_expiration(hostname, vcuser, password, vcuser.split('@')[0])
+            
+            if days is None:
+                status = "PASS"
+                message = "Password never expires"
+            elif days > three_years_days:
+                status = "PASS"
+                message = f"Expires in {days} days ({days // 365} years)"
+            elif days > two_years_days:
+                status = "PASS"
+                message = f"Expires in {days} days ({days // 365} years)"
+            else:
+                status = "FAIL"
+                if days < 0:
+                    message = f"Password EXPIRED {abs(days)} days ago"
+                else:
+                    message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+            
+            results.append(CheckResult(
+                name=f"vCenter {hostname} ({vcuser})",
+                status=status,
+                message=message,
+                details={'hostname': hostname, 'username': vcuser, 'days_until_expiration': days}
+            ))
+        except Exception as e:
+            results.append(CheckResult(
+                name=f"vCenter {hostname} ({vcuser})",
+                status="WARN",
+                message=f"Could not check: {str(e)[:40]}",
+                details={'hostname': hostname, 'username': vcuser, 'error': str(e)}
+            ))
+    
+    # Check NSX managers
+    nsx_managers = []
+    if lsf.config.has_section('VCF') and lsf.config.has_option('VCF', 'vcfnsxmgr'):
+        nsx_raw = lsf.config.get('VCF', 'vcfnsxmgr').split('\n')
+        for entry in nsx_raw:
+            if not entry or entry.strip().startswith('#'):
+                continue
+            hostname = entry.split(':')[0].strip()
+            if hostname:
+                nsx_managers.append(hostname)
+    
+    for hostname in nsx_managers:
+        for user in ['admin', 'root', 'audit']:
+            try:
+                if user == 'root':
+                    # Root is a Linux account
+                    days = get_linux_password_expiration(hostname, user, password)
+                else:
+                    # admin and audit are NSX API users
+                    days = get_nsx_user_expiration(hostname, 'admin', password, user)
+                
+                if days is None:
+                    status = "PASS"
+                    message = "Password never expires"
+                elif days > three_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365} years)"
+                elif days > two_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365} years)"
+                else:
+                    status = "FAIL"
+                    if days < 0:
+                        message = f"Password EXPIRED {abs(days)} days ago"
+                    else:
+                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                
+                results.append(CheckResult(
+                    name=f"NSX {hostname} ({user})",
+                    status=status,
+                    message=message,
+                    details={'hostname': hostname, 'username': user, 'days_until_expiration': days}
+                ))
+            except Exception as e:
+                results.append(CheckResult(
+                    name=f"NSX {hostname} ({user})",
+                    status="WARN",
+                    message=f"Could not check: {str(e)[:40]}",
+                    details={'hostname': hostname, 'username': user, 'error': str(e)}
+                ))
+    
+    # Check SDDC Manager - look in URLs for sddcmanager hosts
+    sddc_managers = []
+    
+    # Method 1: Check VCF.sddcmanager if it exists
+    if lsf.config.has_section('VCF') and lsf.config.has_option('VCF', 'sddcmanager'):
+        sddc_raw = lsf.config.get('VCF', 'sddcmanager').split('\n')
+        for entry in sddc_raw:
+            if not entry or entry.strip().startswith('#'):
+                continue
+            hostname = entry.split(':')[0].strip()
+            if hostname:
+                sddc_managers.append(hostname)
+    
+    # Method 2: Extract from URLs containing 'sddcmanager'
+    if lsf.config.has_option('RESOURCES', 'urls'):
+        urls_raw = lsf.config.get('RESOURCES', 'urls').split('\n')
+        for entry in urls_raw:
+            if 'sddcmanager' in entry.lower():
+                url = entry.split(',')[0].strip()
+                # Extract hostname from URL
+                if '://' in url:
+                    hostname = url.split('://')[1].split('/')[0].split(':')[0]
+                    if hostname and hostname not in sddc_managers:
+                        sddc_managers.append(hostname)
+    
+    for hostname in sddc_managers:
+        for user in ['vcf', 'backup', 'root']:
+            try:
+                days = get_linux_password_expiration(hostname, user, password)
+                
+                if days is None:
+                    status = "PASS"
+                    message = "Password never expires"
+                elif days > three_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365} years)"
+                elif days > two_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365} years)"
+                else:
+                    status = "FAIL"
+                    if days < 0:
+                        message = f"Password EXPIRED {abs(days)} days ago"
+                    else:
+                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                
+                results.append(CheckResult(
+                    name=f"SDDC Manager {hostname} ({user})",
+                    status=status,
+                    message=message,
+                    details={'hostname': hostname, 'username': user, 'days_until_expiration': days}
+                ))
+            except Exception as e:
+                results.append(CheckResult(
+                    name=f"SDDC Manager {hostname} ({user})",
+                    status="WARN",
+                    message=f"Could not check: {str(e)[:40]}",
+                    details={'hostname': hostname, 'username': user, 'error': str(e)}
+                ))
+    
+    # Check vRA/Automation (auto-a) - look in VCFFINAL.vraurls
+    vra_hosts = []
+    if lsf.config.has_section('VCFFINAL') and lsf.config.has_option('VCFFINAL', 'vraurls'):
+        vra_urls_raw = lsf.config.get('VCFFINAL', 'vraurls').split('\n')
+        for entry in vra_urls_raw:
+            if not entry or entry.strip().startswith('#'):
+                continue
+            url = entry.split(',')[0].strip()
+            # Extract hostname from URL
+            if '://' in url:
+                hostname = url.split('://')[1].split('/')[0].split(':')[0]
+                if hostname and hostname not in vra_hosts:
+                    vra_hosts.append(hostname)
+    
+    for hostname in vra_hosts:
+        # Check vmware-system-user and root for vRA/Automation
+        for user in ['vmware-system-user', 'root']:
+            try:
+                days = get_linux_password_expiration(hostname, user, password)
+                
+                if days is None:
+                    status = "PASS"
+                    message = "Password never expires"
+                elif days > three_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365} years)"
+                elif days > two_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365} years)"
+                else:
+                    status = "FAIL"
+                    if days < 0:
+                        message = f"Password EXPIRED {abs(days)} days ago"
+                    else:
+                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                
+                results.append(CheckResult(
+                    name=f"vRA/Automation {hostname} ({user})",
+                    status=status,
+                    message=message,
+                    details={'hostname': hostname, 'username': user, 'days_until_expiration': days}
+                ))
+            except Exception as e:
+                results.append(CheckResult(
+                    name=f"vRA/Automation {hostname} ({user})",
+                    status="WARN",
+                    message=f"Could not check: {str(e)[:40]}",
+                    details={'hostname': hostname, 'username': user, 'error': str(e)}
+                ))
+    
+    return results
+
+
+#==============================================================================
 # MAIN
 #==============================================================================
 
@@ -662,14 +1190,17 @@ def main():
     if lsf:
         lsf.init(router=False)
         lab_sku = lsf.lab_sku
-        lab_year = lsf.lab_sku[4:6] if len(lsf.lab_sku) >= 6 else '27'
     else:
         lab_sku = 'HOL-UNKNOWN'
-        lab_year = '27'
+    
+    # Extract lab year from SKU using robust pattern matching
+    # Supports formats like: HOL-2701, ATE-2705, BETA-901, Discovery-Demo, etc.
+    lab_year = extract_lab_year(lab_sku)
     
     # Calculate date ranges
+    # Licenses should expire between Dec 30 of the lab year and Dec 31 of the following year
     min_exp_date = datetime.date(int(lab_year) + 2000, 12, 30)
-    max_exp_date = datetime.date(int(lab_year) + 2001, 1, 31)
+    max_exp_date = datetime.date(int(lab_year) + 2001, 12, 31)
     
     print(f"VPod Checker - HOLFY27")
     print(f"Lab: {lab_sku}")
@@ -801,13 +1332,22 @@ def main():
                 except Exception:
                     pass
     
+    # Password expiration checks
+    print("\nChecking password expirations...")
+    try:
+        report.password_expiration_checks = check_password_expirations()
+        print_results_table("PASSWORD EXPIRATIONS", report.password_expiration_checks)
+    except Exception as e:
+        print(f"Password expiration check failed: {e}")
+    
     # Determine overall status
     all_checks = (
         report.ssl_checks + 
         report.license_checks + 
         report.ntp_checks + 
         report.vm_config_checks + 
-        report.vm_resource_checks
+        report.vm_resource_checks +
+        report.password_expiration_checks
     )
     
     if any(c.status == 'FAIL' for c in all_checks):
