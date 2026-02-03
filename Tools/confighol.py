@@ -419,13 +419,17 @@ def configure_esxi_host(hostname: str, host_system, auth_keys_file: str,
     update_esxi_session_timeout(hostname, 0, dry_run)
     
     # Step 4: Set password expiration to non-expiring
-    if not dry_run:
-        lsf.write_output(f'{hostname}: Setting non-expiring password for root')
-        result = lsf.ssh(f'chage -M {PASSWORD_MAX_DAYS} root', f'{ESX_USERNAME}@{hostname}', password)
-        if result.returncode != 0:
-            lsf.write_output(f'{hostname}: WARNING - Failed to set password expiration')
-    else:
-        lsf.write_output(f'{hostname}: Would set password expiration to {PASSWORD_MAX_DAYS} days')
+    # NOTE: ESXi does not support the 'chage' command (it uses BusyBox).
+    # Password expiration on ESXi is handled via advanced settings or host profile,
+    # but not via standard Linux user management commands.
+    # Disabling this step as requested.
+    # if not dry_run:
+    #     lsf.write_output(f'{hostname}: Setting non-expiring password for root')
+    #     result = lsf.ssh(f'chage -M {PASSWORD_MAX_DAYS} root', f'{ESX_USERNAME}@{hostname}', password)
+    #     if result.returncode != 0:
+    #         lsf.write_output(f'{hostname}: WARNING - Failed to set password expiration')
+    # else:
+    #     lsf.write_output(f'{hostname}: Would set password expiration to {PASSWORD_MAX_DAYS} days')
     
     if success:
         lsf.write_output(f'{hostname}: ESXi configuration complete')
