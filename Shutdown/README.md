@@ -1,14 +1,16 @@
 # HOL Lab Shutdown Scripts
 
-Version 1.1 - January 2026
+Version 1.3 - February 2026
 
 ## Overview
 
-This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab environments. The scripts ensure an orderly shutdown of all VCF components in the **reverse order** of startup to properly handle dependencies.
+This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab environments. The scripts ensure an orderly shutdown of all VCF components following the **official Broadcom VCF 9.0 documentation**.
+
+**Reference**: [VCF 9.0 Shutdown Operations](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-0/fleet-management/vcf-shutdown-and-startup/vcf-shutdown.html)
 
 ### Key Features
 
-- **Status File Updates**: The shutdown progress is written to `/lmchol/hol/startup_status.txt` for console display widgets 
+- **Status File Updates**: The shutdown progress is written to `/lmchol/hol/startup_status.txt` for console display widgets
 - **Real-time Logging**: Detailed progress output for all phases and operations
 - **Host Power-Off Monitoring**: Waits up to 30 minutes for all ESXi hosts to fully power off before completing
 - **Lab-Safe SSH**: Uses `StrictHostKeyChecking=no` to handle host key changes common in lab environments
@@ -72,24 +74,77 @@ python3 fleet.py --fqdn opslcm-a.site-a.vcf.lab --password PASSWORD --action shu
 
 ## Shutdown Order
 
-The shutdown follows the **reverse** of the startup order:
+The shutdown follows the **official Broadcom VCF 9.0 documentation**.
 
-| Startup Order | Shutdown Order (Main) | VCF Shutdown Phases |
-| -------------- | ---------------------- | ------------------- |
-| 1. Preliminary | Phase 0: Pre-Checks | |
-| 2. ESXi Hosts | Phase 1: Docker | |
-| 3. vSphere | Phase 2: VCF Shutdown | 1. Fleet Operations (Aria) |
-| 4. VCF (NSX, vCenter) | | 2. Connect Infrastructure |
-| 5. Services | | 3. Stop WCP |
-| 6. Kubernetes | | 4. Workload VMs |
-| 7. VCF Final (Aria) | | 5. Management VMs |
-| 8. Final | | 6. NSX Edges |
-| | | 7. NSX Manager |
-| | | 8. Host Settings |
-| | | 9. vSAN Elevator |
-| | | 10. ESXi Hosts |
-| | Phase 3: Final Cleanup | |
-| | Phase 4: Wait for Hosts | (ping monitoring) |
+### VCF 9.0 Workload Domain Order
+
+Per [VCF 9.0 Workload Domain Shutdown](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-0/fleet-management/vcf-shutdown-and-startup/vcf-shutdown/shut-down-the-virtual-infrastructure-workload-domain.html):
+
+| VCF 9.0 Order | Component |
+| ------------- | --------- |
+| 1 | Virtualized customer workloads |
+| 2 | VMware Live Recovery (if applicable) |
+| 4 | NSX Edge nodes |
+| 5 | NSX Manager nodes |
+| 7 | ESX hosts |
+| 8 | vCenter Server (LAST for workload domain) |
+
+### VCF 9.0 Management Domain Order
+
+Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-0/fleet-management/vcf-shutdown-and-startup/vcf-shutdown/shut-down-the-management-domain.html):
+
+| VCF 9.0 Order | Component |
+| ------------- | --------- |
+| 1 | VCF Automation (Aria Automation / vra) |
+| 2 | VCF Operations for Networks (vrni) |
+| 3 | VCF Operations collector |
+| 4 | VCF Operations for logs (vrli) |
+| 5 | VCF Identity Broker |
+| 6 | VCF Operations fleet management (Aria Suite Lifecycle) |
+| 7 | VCF Operations (vrops, orchestrator) |
+| 8 | VMware Live Site Recovery (if applicable) |
+| 9 | NSX Edge nodes |
+| 10 | NSX Manager |
+| 11 | SDDC Manager |
+| 12 | vSAN and ESX Hosts (includes vCenter shutdown) |
+
+### Implementation Phases
+
+| Main Orchestrator | VCF Shutdown Phase | Description |
+| ----------------- | ------------------ | ----------- |
+| Phase 0: Pre-Checks | | Check config, detect lab type |
+| Phase 1: Docker | | Stop Docker containers |
+| Phase 2: VCF Shutdown | 1. Fleet Operations | VCF Automation via API (vra, vrni) |
+| | 2. Connect Infrastructure | Connect to management hosts |
+| | 3. Stop WCP | Stop Workload Control Plane services |
+| | 4. Workload VMs | Tanzu, K8s, Supervisor, vCLS VMs |
+| | 5-6. Workload NSX | Workload domain NSX Edges, then Manager |
+| | 7. Workload vCenters | Workload vCenters (LAST per VCF 9.0) |
+| | 8. VCF Ops Networks | VCF Operations for Networks (vrni) |
+| | 9. VCF Ops Collector | VCF Operations Collector |
+| | 10. VCF Ops Logs | VCF Operations for Logs (vrli) |
+| | 11. VCF Identity Broker | VCF Identity Broker |
+| | 12. VCF Fleet Mgmt | VCF Operations Fleet Management |
+| | 13. VCF Operations | VCF Operations (vrops, orchestrator) |
+| | 14-15. Mgmt NSX | Management NSX Edges, then Manager |
+| | 16. SDDC Manager | SDDC Manager |
+| | 17. Mgmt vCenter | Management domain vCenter |
+| | 18. Host Settings | Set ESXi advanced settings |
+| | 19. vSAN Elevator | Enable elevator, wait 45min, disable |
+| | 20. ESXi Hosts | Shutdown ESXi hosts |
+| Phase 3: Final Cleanup | | Disconnect vSphere sessions |
+| Phase 4: Wait for Hosts | | Ping monitoring (15s interval, 30min max) |
+
+### VCF 9.0 Documentation Compliance
+
+The shutdown order aligns with Broadcom's VCF 9.0 documentation:
+
+1. **Workload domains before management domain** - Per VCF 9.0: workload domain components shut down first
+2. **Workload vCenter shuts down LAST in workload domain** - Per VCF 9.0: ESX hosts (#7) before vCenter (#8)
+3. **VCF Operations for Logs is position #4** - In VCF 9.0, vrli shuts down early (after collector, before Identity Broker)
+4. **VCF Operations (vrops) is position #7** - After Fleet Management, before Live Site Recovery
+5. **SDDC Manager after NSX** - SDDC Manager (#11) shuts down after NSX Manager (#10)
+6. **vSAN and ESX with vCenter** - Per VCF 9.0 #12: these shut down together last
 
 ## Process Diagram
 
@@ -151,7 +206,7 @@ flowchart TD
 
 ### VCF Shutdown Module (VCFshutdown.py)
 
-Each phase updates the status file (`/lmchol/hol/startup_status.txt`) and provides detailed logging.
+Each phase updates the status file (`/lmchol/hol/startup_status.txt`) and provides detailed logging. The order follows VCF 5.x documentation.
 
 ```mermaid
 flowchart TD
@@ -160,45 +215,59 @@ flowchart TD
     VCF_START --> P1[/"Phase 1: Fleet Operations"/]
     P1 --> FLEET_CHECK{Fleet Mgmt Reachable?}
     FLEET_CHECK -->|Yes| FLEET_AUTH[Authenticate to SDDC Manager]
-    FLEET_AUTH --> FLEET_SYNC[Sync Inventory]
-    FLEET_SYNC --> FLEET_OFF[Shutdown: vra → vrni → vrops → vrli]
+    FLEET_AUTH --> FLEET_OFF[Shutdown: vra, vrops, vrni]
     FLEET_CHECK -->|No| FLEET_SKIP[Skip Fleet]
     FLEET_OFF --> P2
     FLEET_SKIP --> P2
     
     P2[/"Phase 2: Connect Infrastructure"/]
-    P2 --> CONNECT[Connect to vCenters & Hosts]
+    P2 --> CONNECT[Connect to Management Hosts]
     
     CONNECT --> P3[/"Phase 3: Stop WCP"/]
-    P3 --> WCP["SSH: vmon-cli -k wcp<br/>(StrictHostKeyChecking=no)"]
+    P3 --> WCP["SSH: vmon-cli -k wcp"]
     
     WCP --> P4[/"Phase 4: Workload VMs"/]
-    P4 --> VM_FIND[Find VMs by Pattern]
-    VM_FIND --> VM_OFF["Shutdown Workload VMs<br/>(detailed per-VM logging)"]
+    P4 --> VM_FIND["Find VMs by Pattern<br/>(Tanzu, K8s, vCLS)"]
+    VM_FIND --> VM_OFF[Shutdown Workload VMs]
     
-    VM_OFF --> P5[/"Phase 5: Management VMs"/]
-    P5 --> MGMT_OFF["Shutdown in order:<br/>Aria → SDDC Mgr → vCenters"]
+    VM_OFF --> P5[/"Phase 5: Workload vCenters"/]
+    P5 --> WLD_VC[Shutdown vc-wld* VMs]
     
-    MGMT_OFF --> P6[/"Phase 6: NSX Edges"/]
-    P6 --> EDGE_OFF[Shutdown Edge VMs]
+    WLD_VC --> P5B[/"Phase 5b: Aria Orchestrator"/]
+    P5B --> ORCH[Shutdown o11n-* VMs]
     
-    EDGE_OFF --> P7[/"Phase 7: NSX Manager"/]
-    P7 --> NSX_OFF[Shutdown NSX Manager]
+    ORCH --> P6[/"Phase 6: Aria Suite Lifecycle"/]
+    P6 --> LCM[Shutdown opslcm-* VMs]
     
-    NSX_OFF --> P8[/"Phase 8: Host Settings"/]
-    P8 --> ADV[Set AllocGuestLargePage=1]
+    LCM --> P7[/"Phase 7: Aria Ops for Logs<br/>(LATE - per VCF docs)"/]
+    P7 --> LOGS["Shutdown opslogs-*, opsnet-*<br/>(kept running late for logs)"]
     
-    ADV --> P9[/"Phase 9: vSAN Elevator"/]
-    P9 --> VSAN_CHECK{vSAN Enabled?}
+    LOGS --> P8[/"Phase 8: NSX Edges"/]
+    P8 --> EDGE_OFF[Shutdown Edge VMs]
+    
+    EDGE_OFF --> P9[/"Phase 9: NSX Manager"/]
+    P9 --> NSX_OFF[Shutdown NSX Manager]
+    
+    NSX_OFF --> P10[/"Phase 10: SDDC Manager"/]
+    P10 --> SDDC[Shutdown sddcmanager-a]
+    
+    SDDC --> P11[/"Phase 11: Management vCenter"/]
+    P11 --> MGMT_VC[Shutdown vc-mgmt-a]
+    
+    MGMT_VC --> P12[/"Phase 12: Host Settings"/]
+    P12 --> ADV[Set AllocGuestLargePage=1]
+    
+    ADV --> P13[/"Phase 13: vSAN Elevator"/]
+    P13 --> VSAN_CHECK{vSAN Enabled?}
     VSAN_CHECK -->|Yes| VSAN_ON[Enable plogRunElevator]
     VSAN_ON --> VSAN_WAIT[⏳ Wait 45 minutes]
     VSAN_WAIT --> VSAN_OFF[Disable plogRunElevator]
     VSAN_CHECK -->|No| VSAN_SKIP[Skip vSAN]
-    VSAN_OFF --> P10
-    VSAN_SKIP --> P10
+    VSAN_OFF --> P14
+    VSAN_SKIP --> P14
     
-    P10[/"Phase 10: ESXi Hosts"/]
-    P10 --> HOST_CHECK{Shutdown Hosts?}
+    P14[/"Phase 14: ESXi Hosts"/]
+    P14 --> HOST_CHECK{Shutdown Hosts?}
     HOST_CHECK -->|Yes| HOST_OFF[ShutdownHost_Task]
     HOST_CHECK -->|No| HOST_SKIP[Skip Hosts]
     HOST_OFF --> VCF_END
@@ -213,11 +282,16 @@ flowchart TD
     style P3 fill:#FFF3E6
     style P4 fill:#F3E6FF
     style P5 fill:#E6FFE6
+    style P5B fill:#E6FFE6
     style P6 fill:#FFFDE6
-    style P7 fill:#E6FFFF
-    style P8 fill:#FFE6F3
-    style P9 fill:#F0F0F0
-    style P10 fill:#E6E6FF
+    style P7 fill:#FFD700
+    style P8 fill:#E6FFFF
+    style P9 fill:#E6FFFF
+    style P10 fill:#FFE6F3
+    style P11 fill:#FFE6F3
+    style P12 fill:#F0F0F0
+    style P13 fill:#F0F0F0
+    style P14 fill:#E6E6FF
 ```
 
 ### Fleet Operations Detail
@@ -292,49 +366,47 @@ sequenceDiagram
     Shutdown.py->>StatusFile: "Shutdown Phase 2: VCF Environment Shutdown"
     Shutdown.py->>VCFshutdown.py: Phase 2: VCF Shutdown
     
-    VCFshutdown.py->>StatusFile: "Shutdown Phase 1: Fleet Operations"
+    Note over VCFshutdown.py: Phase 1: Fleet Operations
     VCFshutdown.py->>fleet.py: Fleet Operations
-    fleet.py->>SDDC Manager: Get environments
-    SDDC Manager-->>fleet.py: Environment list
-    fleet.py->>SDDC Manager: Shutdown vra, vrni, vrops, vrli
-    SDDC Manager-->>fleet.py: Request IDs
-    fleet.py->>SDDC Manager: Poll for completion (with progress logging)
+    fleet.py->>SDDC Manager: Shutdown vra, vrops, vrni
     fleet.py-->>VCFshutdown.py: Fleet shutdown complete
     
-    VCFshutdown.py->>StatusFile: "Shutdown Phase 2: Connect to Infrastructure"
-    VCFshutdown.py->>vCenter: Connect
-    VCFshutdown.py->>StatusFile: "Shutdown Phase 3: Stop WCP Services"
+    Note over VCFshutdown.py: Phase 2-4: Connect, WCP, Workload VMs
+    VCFshutdown.py->>vCenter: Connect to management hosts
     VCFshutdown.py->>vCenter: SSH: vmon-cli -k wcp
-    VCFshutdown.py->>StatusFile: "Shutdown Phase 4: Shutdown Workload VMs"
-    VCFshutdown.py->>vCenter: Shutdown workload VMs (per-VM logging)
-    VCFshutdown.py->>StatusFile: "Shutdown Phase 5: Shutdown Management VMs"
-    VCFshutdown.py->>vCenter: Shutdown management VMs
-    VCFshutdown.py->>StatusFile: "Shutdown Phase 6: Shutdown NSX Edges"
-    VCFshutdown.py->>vCenter: Shutdown NSX Edges
-    VCFshutdown.py->>StatusFile: "Shutdown Phase 7: Shutdown NSX Manager"
-    VCFshutdown.py->>vCenter: Shutdown NSX Manager
+    VCFshutdown.py->>vCenter: Shutdown Tanzu/K8s/vCLS VMs
     
-    VCFshutdown.py->>StatusFile: "Shutdown Phase 8: Host Advanced Settings"
+    Note over VCFshutdown.py: Phase 5: Workload vCenters (BEFORE mgmt domain)
+    VCFshutdown.py->>vCenter: Shutdown vc-wld* VMs
+    
+    Note over VCFshutdown.py: Phase 5b-6: Aria Orchestrator, Suite Lifecycle
+    VCFshutdown.py->>vCenter: Shutdown o11n-*, opslcm-*
+    
+    Note over VCFshutdown.py: Phase 7: Aria Ops for Logs (LATE per VCF docs)
+    VCFshutdown.py->>vCenter: Shutdown opslogs-*, opsnet-*
+    
+    Note over VCFshutdown.py: Phase 8-9: NSX Edges, NSX Manager
+    VCFshutdown.py->>vCenter: Shutdown NSX Edge/Manager VMs
+    
+    Note over VCFshutdown.py: Phase 10-11: SDDC Manager, Management vCenter
+    VCFshutdown.py->>vCenter: Shutdown sddcmanager-a
+    VCFshutdown.py->>vCenter: Shutdown vc-mgmt-a
+    
+    Note over VCFshutdown.py: Phase 12-14: Host Settings, vSAN, ESXi
     VCFshutdown.py->>ESXi Hosts: Set advanced settings
-    VCFshutdown.py->>StatusFile: "Shutdown Phase 9: vSAN Elevator Operations"
-    VCFshutdown.py->>ESXi Hosts: Enable vSAN elevator
-    VCFshutdown.py->>VCFshutdown.py: Wait 45 minutes (progress logging)
-    VCFshutdown.py->>ESXi Hosts: Disable vSAN elevator
-    VCFshutdown.py->>StatusFile: "Shutdown Phase 10: Shutdown ESXi Hosts"
+    VCFshutdown.py->>ESXi Hosts: vSAN elevator (45min wait)
     VCFshutdown.py->>ESXi Hosts: ShutdownHost_Task
     
     VCFshutdown.py-->>Shutdown.py: Return {success, esx_hosts list}
     
     Shutdown.py->>StatusFile: "Shutdown Phase 3: Final Cleanup"
-    Shutdown.py->>Shutdown.py: Phase 3: Disconnect vSphere sessions
+    Shutdown.py->>Shutdown.py: Disconnect vSphere sessions
     
     Shutdown.py->>StatusFile: "Shutdown Phase 4: Wait for Host Power Off"
-    Shutdown.py->>StatusFile: "Waiting for ESXi Hosts to Power Off"
     
     loop Every 15 seconds (max 30 min)
         Shutdown.py->>ESXi Hosts: Ping host
         ESXi Hosts-->>Shutdown.py: Response/No response
-        Shutdown.py->>User: Log host status
     end
     
     Shutdown.py->>StatusFile: "Shutdown Complete"
@@ -350,7 +422,7 @@ Shutdown behavior can be customized via the `[SHUTDOWN]` section in `vPodRepo/co
 # Fleet Operations (SDDC Manager)
 fleet_fqdn = opslcm-a.site-a.vcf.lab
 fleet_username = admin@local
-fleet_products = vra,vrni,vrops,vrli
+fleet_products = vra,vrni
 
 # Docker containers
 shutdown_docker = true
@@ -364,28 +436,50 @@ wcp_vcenters = vc-mgmt-a.site-a.vcf.lab
     vc-wld02-a.site-a.vcf.lab
 
 # VM patterns to find and shutdown (regex)
+# Note: vCLS pattern added per VCF docs for vSphere Cluster Services
 vm_patterns = ^kubernetes-cluster-.*$
     ^dev-project-.*$
     ^cci-service-.*$
     ^SupervisorControlPlaneVM.*$
+    ^vCLS-.*$
 
 # Specific workload VMs to shutdown
 workload_vms = core-a
     core-b
     hol-ubuntu-001
 
-# Management VMs (in shutdown order)
-mgmt_vms = o11n-02a
-    o11n-01a
-    opslogs-01a
-    sddcmanager-a
+# Workload vCenters (shut down BEFORE management domain per VCF docs)
+workload_vcenters = vc-wld02-a
     vc-wld01-a
-    vc-mgmt-a
+
+# Aria Orchestrator VMs
+aria_orchestrator_vms = o11n-02a
+    o11n-01a
+
+# Aria Suite Lifecycle VMs
+aria_lifecycle_vms = opslcm-01a
+    opslcm-a
+
+# Aria Operations for Logs VMs (shut down LATE per VCF docs)
+aria_logs_vms = opslogs-01a
+    ops-01a
+    ops-a
+    opscollector-01a
+    opsproxy-01a
+    opsnet-a
+    opsnet-01a
+    opsnetcollector-01a
 
 # NSX components
 nsx_edges = edge-wld01-01a
     edge-wld01-02a
 nsx_mgr = nsx-mgmt-01a
+
+# SDDC Manager VMs
+sddc_manager_vms = sddcmanager-a
+
+# Management vCenter VMs (shut down LAST per VCF docs)
+mgmt_vcenter_vms = vc-mgmt-a
 
 # ESXi hosts
 esx_hosts = esx-01a.site-a.vcf.lab
@@ -427,14 +521,27 @@ The shutdown scripts rely on:
 The shutdown script updates `/lmchol/hol/startup_status.txt` throughout the process to provide status for console desktop widgets:
 
 | Phase | Status Text |
-|-------|-------------|
+| ----- | ----------- |
 | Start | `Shutting Down` |
-| Phase 0 | `Shutdown Phase 0: Pre-Shutdown Checks` |
-| Phase 1 | `Shutdown Phase 1: Docker Containers` |
-| Phase 2 | `Shutdown Phase 2: VCF Environment Shutdown` |
-| VCF Phase 1-10 | `Shutdown Phase N: <Phase Name>` |
-| Phase 3 | `Shutdown Phase 3: Final Cleanup` |
-| Phase 4 | `Shutdown Phase 4: Wait for Host Power Off` |
+| Main Phase 0 | `Shutdown Phase 0: Pre-Shutdown Checks` |
+| Main Phase 1 | `Shutdown Phase 1: Docker Containers` |
+| Main Phase 2 | `Shutdown Phase 2: VCF Environment Shutdown` |
+| VCF Phase 1 | `Shutdown Phase 1: Fleet Operations (Aria Suite)` |
+| VCF Phase 2 | `Shutdown Phase 2: Connect to Infrastructure` |
+| VCF Phase 3 | `Shutdown Phase 3: Stop WCP Services` |
+| VCF Phase 4 | `Shutdown Phase 4: Shutdown Workload VMs` |
+| VCF Phase 5 | `Shutdown Phase 5: Shutdown Workload vCenters` |
+| VCF Phase 6 | `Shutdown Phase 6: Shutdown Aria Suite Lifecycle` |
+| VCF Phase 7 | `Shutdown Phase 7: Shutdown Aria Ops for Logs` |
+| VCF Phase 8 | `Shutdown Phase 8: Shutdown NSX Edges` |
+| VCF Phase 9 | `Shutdown Phase 9: Shutdown NSX Manager` |
+| VCF Phase 10 | `Shutdown Phase 10: Shutdown SDDC Manager` |
+| VCF Phase 11 | `Shutdown Phase 11: Shutdown Management vCenter` |
+| VCF Phase 12 | `Shutdown Phase 12: Host Advanced Settings` |
+| VCF Phase 13 | `Shutdown Phase 13: vSAN Elevator Operations` |
+| VCF Phase 14 | `Shutdown Phase 14: Shutdown ESXi Hosts` |
+| Main Phase 3 | `Shutdown Phase 3: Final Cleanup` |
+| Main Phase 4 | `Shutdown Phase 4: Wait for Host Power Off` |
 | Waiting | `Waiting for ESXi Hosts to Power Off` |
 | Complete | `Shutdown Complete` |
 
