@@ -440,7 +440,7 @@ fi
 
 # Determine branch
 cloud=$(/usr/bin/vmtoolsd --cmd 'info-get guestinfo.ovfEnv' 2>&1)
-holdev=$(echo "${cloud}" | grep -i hol-dev)
+holdev=$(echo "${cloud}" | grep -i dev)
 if [ "${cloud}" = "No value found" ] || [ -n "${holdev}" ]; then
     branch="dev"
 else
