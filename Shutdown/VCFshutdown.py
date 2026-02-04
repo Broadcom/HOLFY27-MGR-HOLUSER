@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 1.2 - February 2026
+# Version 1.3 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v1.3 Changes:
+# - Removed dependency on [SHUTDOWN] section for NSX/vCenter/ESXi components
+# - Now reads from [VCF] section to eliminate duplicate configuration
+# - NSX Edges: Read from [VCF] vcfnsxedges, filtered by "wld" or "mgmt"
+# - NSX Managers: Read from [VCF] vcfnsxmgr, filtered by "wld" or "mgmt"
+# - vCenters: Read from [VCF] vcfvCenter, filtered by "wld" or "mgmt"
+# - ESXi Hosts: Read from [VCF] vcfmgmtcluster
 
 """
 VCF Shutdown Module
@@ -90,7 +98,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 MODULE_NAME = 'VCFshutdown'
-MODULE_VERSION = '1.1'
+MODULE_VERSION = '1.3'
 MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 9.x compliant)'
 
 # Status file for console display
@@ -616,18 +624,18 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(5, 'Shutdown Workload NSX Edges', dry_run)
     
-    # Get all NSX edges from config, then filter for workload domain (contains "wld")
+    # Get all NSX edges from [VCF] vcfnsxedges (primary source)
+    # Format: edge-name:esxhost (we only need the edge name)
     all_nsx_edges = []
-    if lsf.config.has_option('SHUTDOWN', 'nsx_edges'):
-        edges_raw = lsf.config.get('SHUTDOWN', 'nsx_edges')
-        all_nsx_edges = [e.strip() for e in edges_raw.split('\n') 
-                        if e.strip() and not e.strip().startswith('#')]
-    elif lsf.config.has_option('VCF', 'vcfnsxedges'):
+    if lsf.config.has_option('VCF', 'vcfnsxedges'):
         edges_raw = lsf.config.get('VCF', 'vcfnsxedges')
         for entry in edges_raw.split('\n'):
             if entry.strip() and not entry.strip().startswith('#'):
                 parts = entry.split(':')
                 all_nsx_edges.append(parts[0].strip())
+        lsf.write_output(f'Found {len(all_nsx_edges)} NSX Edge(s) in [VCF] vcfnsxedges')
+    else:
+        lsf.write_output('No NSX Edges configured in [VCF] vcfnsxedges')
     
     # Filter for workload domain edges (contain "wld" in name)
     workload_nsx_edges = [e for e in all_nsx_edges if 'wld' in e.lower()]
@@ -661,18 +669,18 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(6, 'Shutdown Workload NSX Manager', dry_run)
     
-    # Get all NSX managers from config, then filter for workload domain (contains "wld")
+    # Get all NSX managers from [VCF] vcfnsxmgr (primary source)
+    # Format: nsx-name:esxhost (we only need the NSX manager name)
     all_nsx_mgr = []
-    if lsf.config.has_option('SHUTDOWN', 'nsx_mgr'):
-        mgr_raw = lsf.config.get('SHUTDOWN', 'nsx_mgr')
-        all_nsx_mgr = [m.strip() for m in mgr_raw.split('\n') 
-                      if m.strip() and not m.strip().startswith('#')]
-    elif lsf.config.has_option('VCF', 'vcfnsxmgr'):
+    if lsf.config.has_option('VCF', 'vcfnsxmgr'):
         mgr_raw = lsf.config.get('VCF', 'vcfnsxmgr')
         for entry in mgr_raw.split('\n'):
             if entry.strip() and not entry.strip().startswith('#'):
                 parts = entry.split(':')
                 all_nsx_mgr.append(parts[0].strip())
+        lsf.write_output(f'Found {len(all_nsx_mgr)} NSX Manager(s) in [VCF] vcfnsxmgr')
+    else:
+        lsf.write_output('No NSX Managers configured in [VCF] vcfnsxmgr')
     
     # Filter for workload domain managers (contain "wld" in name)
     workload_nsx_mgr = [m for m in all_nsx_mgr if 'wld' in m.lower()]
@@ -707,12 +715,22 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(7, 'Shutdown Workload vCenters', dry_run)
     
-    workload_vcenters = ['vc-wld02-a', 'vc-wld01-a']
+    # Get all vCenters from [VCF] vcfvCenter (primary source)
+    # Format: vcenter-name:esxhost (we only need the vCenter name)
+    # Filter for workload vCenters (contain "wld" in name)
+    all_vcenters = []
+    if lsf.config.has_option('VCF', 'vcfvCenter'):
+        vc_raw = lsf.config.get('VCF', 'vcfvCenter')
+        for entry in vc_raw.split('\n'):
+            if entry.strip() and not entry.strip().startswith('#'):
+                parts = entry.split(':')
+                all_vcenters.append(parts[0].strip())
+        lsf.write_output(f'Found {len(all_vcenters)} vCenter(s) in [VCF] vcfvCenter')
+    else:
+        lsf.write_output('No vCenters configured in [VCF] vcfvCenter')
     
-    if lsf.config.has_option('SHUTDOWN', 'workload_vcenters'):
-        wld_vc_raw = lsf.config.get('SHUTDOWN', 'workload_vcenters')
-        workload_vcenters = [v.strip() for v in wld_vc_raw.split('\n') 
-                            if v.strip() and not v.strip().startswith('#')]
+    # Filter for workload vCenters (contain "wld" in name)
+    workload_vcenters = [v for v in all_vcenters if 'wld' in v.lower()]
     
     if not dry_run:
         if workload_vcenters:
@@ -976,18 +994,20 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(14, 'Shutdown Mgmt NSX Edges', dry_run)
     
-    # Get all NSX edges from config, then filter for management domain (contains "mgmt")
+    # Get all NSX edges from [VCF] vcfnsxedges (primary source)
+    # Format: edge-name:esxhost (we only need the edge name)
+    # Note: all_nsx_edges was already populated in Phase 5, but we rebuild
+    # here to ensure we have the full list in case Phase 5 was skipped
     all_nsx_edges = []
-    if lsf.config.has_option('SHUTDOWN', 'nsx_edges'):
-        edges_raw = lsf.config.get('SHUTDOWN', 'nsx_edges')
-        all_nsx_edges = [e.strip() for e in edges_raw.split('\n') 
-                        if e.strip() and not e.strip().startswith('#')]
-    elif lsf.config.has_option('VCF', 'vcfnsxedges'):
+    if lsf.config.has_option('VCF', 'vcfnsxedges'):
         edges_raw = lsf.config.get('VCF', 'vcfnsxedges')
         for entry in edges_raw.split('\n'):
             if entry.strip() and not entry.strip().startswith('#'):
                 parts = entry.split(':')
                 all_nsx_edges.append(parts[0].strip())
+        lsf.write_output(f'Found {len(all_nsx_edges)} NSX Edge(s) in [VCF] vcfnsxedges')
+    else:
+        lsf.write_output('No NSX Edges configured in [VCF] vcfnsxedges')
     
     # Filter for management domain edges (contain "mgmt" in name)
     mgmt_nsx_edges = [e for e in all_nsx_edges if 'mgmt' in e.lower()]
@@ -1023,18 +1043,20 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(15, 'Shutdown Mgmt NSX Manager', dry_run)
     
-    # Get all NSX managers from config, then filter for management domain (contains "mgmt")
+    # Get all NSX managers from [VCF] vcfnsxmgr (primary source)
+    # Format: nsx-name:esxhost (we only need the NSX manager name)
+    # Note: all_nsx_mgr was already populated in Phase 6, but we rebuild
+    # here to ensure we have the full list in case Phase 6 was skipped
     all_nsx_mgr = []
-    if lsf.config.has_option('SHUTDOWN', 'nsx_mgr'):
-        mgr_raw = lsf.config.get('SHUTDOWN', 'nsx_mgr')
-        all_nsx_mgr = [m.strip() for m in mgr_raw.split('\n') 
-                      if m.strip() and not m.strip().startswith('#')]
-    elif lsf.config.has_option('VCF', 'vcfnsxmgr'):
+    if lsf.config.has_option('VCF', 'vcfnsxmgr'):
         mgr_raw = lsf.config.get('VCF', 'vcfnsxmgr')
         for entry in mgr_raw.split('\n'):
             if entry.strip() and not entry.strip().startswith('#'):
                 parts = entry.split(':')
                 all_nsx_mgr.append(parts[0].strip())
+        lsf.write_output(f'Found {len(all_nsx_mgr)} NSX Manager(s) in [VCF] vcfnsxmgr')
+    else:
+        lsf.write_output('No NSX Managers configured in [VCF] vcfnsxmgr')
     
     # Filter for management domain managers (contain "mgmt" in name)
     mgmt_nsx_mgr = [m for m in all_nsx_mgr if 'mgmt' in m.lower()]
@@ -1104,12 +1126,22 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(17, 'Shutdown Management vCenter', dry_run)
     
-    mgmt_vcenter_vms = ['vc-mgmt-a']
+    # Get all vCenters from [VCF] vcfvCenter (primary source)
+    # Format: vcenter-name:esxhost (we only need the vCenter name)
+    # Filter for management vCenters (contain "mgmt" in name)
+    all_vcenters_mgmt = []
+    if lsf.config.has_option('VCF', 'vcfvCenter'):
+        vc_raw = lsf.config.get('VCF', 'vcfvCenter')
+        for entry in vc_raw.split('\n'):
+            if entry.strip() and not entry.strip().startswith('#'):
+                parts = entry.split(':')
+                all_vcenters_mgmt.append(parts[0].strip())
+        lsf.write_output(f'Found {len(all_vcenters_mgmt)} vCenter(s) in [VCF] vcfvCenter')
+    else:
+        lsf.write_output('No vCenters configured in [VCF] vcfvCenter')
     
-    if lsf.config.has_option('SHUTDOWN', 'mgmt_vcenter_vms'):
-        mgmt_vc_raw = lsf.config.get('SHUTDOWN', 'mgmt_vcenter_vms')
-        mgmt_vcenter_vms = [v.strip() for v in mgmt_vc_raw.split('\n') 
-                          if v.strip() and not v.strip().startswith('#')]
+    # Filter for management vCenters (contain "mgmt" in name)
+    mgmt_vcenter_vms = [v for v in all_vcenters_mgmt if 'mgmt' in v.lower()]
     
     if not dry_run:
         if mgmt_vcenter_vms:
@@ -1138,19 +1170,19 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(18, 'Host Advanced Settings', dry_run)
     
-    # Get list of hosts for vSAN operations
+    # Get list of hosts for vSAN operations from [VCF] vcfmgmtcluster (primary source)
+    # Format: hostname:esx (we only need the hostname)
     esx_hosts = []
-    if lsf.config.has_option('SHUTDOWN', 'esx_hosts'):
-        hosts_raw = lsf.config.get('SHUTDOWN', 'esx_hosts')
-        esx_hosts = [h.strip() for h in hosts_raw.split('\n') 
-                    if h.strip() and not h.strip().startswith('#')]
-    elif mgmt_hosts:
-        # Extract hostnames from mgmt_hosts entries
-        for entry in mgmt_hosts:
-            parts = entry.split(':')
-            host = parts[0].strip()
-            if lsf.test_tcp_port(host, 22, timeout=5):
+    if lsf.config.has_option('VCF', 'vcfmgmtcluster'):
+        hosts_raw = lsf.config.get('VCF', 'vcfmgmtcluster')
+        for entry in hosts_raw.split('\n'):
+            if entry.strip() and not entry.strip().startswith('#'):
+                parts = entry.split(':')
+                host = parts[0].strip()
                 esx_hosts.append(host)
+        lsf.write_output(f'Found {len(esx_hosts)} ESXi host(s) in [VCF] vcfmgmtcluster')
+    else:
+        lsf.write_output('No ESXi hosts configured in [VCF] vcfmgmtcluster')
     
     esx_username = 'root'
     if lsf.config.has_option('SHUTDOWN', 'esx_username'):
