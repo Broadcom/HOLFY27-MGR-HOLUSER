@@ -448,34 +448,47 @@ workload_vms = core-a
     core-b
     hol-ubuntu-001
 
-# Workload vCenters (shut down BEFORE management domain per VCF docs)
+# Workload vCenters (shut down LAST in workload domain per VCF 9.0)
 workload_vcenters = vc-wld02-a
     vc-wld01-a
 
-# Aria Orchestrator VMs
-aria_orchestrator_vms = o11n-02a
-    o11n-01a
-
-# Aria Suite Lifecycle VMs
-aria_lifecycle_vms = opslcm-01a
-    opslcm-a
-
-# Aria Operations for Logs VMs (shut down LATE per VCF docs)
-aria_logs_vms = opslogs-01a
-    ops-01a
-    ops-a
-    opscollector-01a
-    opsproxy-01a
-    opsnet-a
+# VCF Operations for Networks (vrni) - VCF 9.0 Mgmt Domain #2
+vcf_ops_networks_vms = opsnet-a
     opsnet-01a
     opsnetcollector-01a
 
-# NSX components
+# VCF Operations Collector - VCF 9.0 Mgmt Domain #3
+vcf_ops_collector_vms = opscollector-01a
+    opsproxy-01a
+
+# VCF Operations for Logs (vrli) - VCF 9.0 Mgmt Domain #4
+vcf_ops_logs_vms = opslogs-01a
+    ops-01a
+    ops-a
+
+# VCF Identity Broker - VCF 9.0 Mgmt Domain #5
+vcf_identity_broker_vms =
+
+# VCF Operations Fleet Management (Aria Suite Lifecycle) - VCF 9.0 Mgmt Domain #6
+vcf_ops_fleet_vms = opslcm-01a
+    opslcm-a
+
+# VCF Operations (orchestrator, etc) - VCF 9.0 Mgmt Domain #7
+vcf_ops_vms = o11n-02a
+    o11n-01a
+
+# NSX components (all edges and managers)
+# NOTE: Script automatically filters by name:
+#   - "wld" in name = Workload Domain (Phase 5-6)
+#   - "mgmt" in name = Management Domain (Phase 14-15)
 nsx_edges = edge-wld01-01a
     edge-wld01-02a
-nsx_mgr = nsx-mgmt-01a
+    edge-mgmt-01a
+    edge-mgmt-02a
+nsx_mgr = nsx-wld01-01a
+    nsx-mgmt-01a
 
-# SDDC Manager VMs
+# SDDC Manager VMs - VCF 9.0 Mgmt Domain #11
 sddc_manager_vms = sddcmanager-a
 
 # Management vCenter VMs (shut down LAST per VCF docs)

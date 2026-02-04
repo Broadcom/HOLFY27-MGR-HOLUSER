@@ -91,7 +91,7 @@ logger = logging.getLogger(__name__)
 
 MODULE_NAME = 'VCFshutdown'
 MODULE_VERSION = '1.1'
-MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 5.x compliant)'
+MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 9.x compliant)'
 
 # Status file for console display
 STATUS_FILE = '/lmchol/hol/startup_status.txt'
@@ -608,6 +608,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     #==========================================================================
     # TASK 5: Shutdown Workload Domain NSX Edges
     # Per VCF 9.0: NSX Edges shut down before NSX Manager in workload domain
+    # Filter: Only edges with "wld" in their name (workload domain)
     #==========================================================================
     
     lsf.write_output('='*60)
@@ -615,13 +616,21 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(5, 'Shutdown Workload NSX Edges', dry_run)
     
-    # Note: In HOL consolidated environments, NSX may be shared. 
-    # If separate workload domain NSX exists, configure it here.
-    workload_nsx_edges = []
-    if lsf.config.has_option('SHUTDOWN', 'workload_nsx_edges'):
-        wld_edges_raw = lsf.config.get('SHUTDOWN', 'workload_nsx_edges')
-        workload_nsx_edges = [e.strip() for e in wld_edges_raw.split('\n') 
-                             if e.strip() and not e.strip().startswith('#')]
+    # Get all NSX edges from config, then filter for workload domain (contains "wld")
+    all_nsx_edges = []
+    if lsf.config.has_option('SHUTDOWN', 'nsx_edges'):
+        edges_raw = lsf.config.get('SHUTDOWN', 'nsx_edges')
+        all_nsx_edges = [e.strip() for e in edges_raw.split('\n') 
+                        if e.strip() and not e.strip().startswith('#')]
+    elif lsf.config.has_option('VCF', 'vcfnsxedges'):
+        edges_raw = lsf.config.get('VCF', 'vcfnsxedges')
+        for entry in edges_raw.split('\n'):
+            if entry.strip() and not entry.strip().startswith('#'):
+                parts = entry.split(':')
+                all_nsx_edges.append(parts[0].strip())
+    
+    # Filter for workload domain edges (contain "wld" in name)
+    workload_nsx_edges = [e for e in all_nsx_edges if 'wld' in e.lower()]
     
     if not dry_run:
         if workload_nsx_edges:
@@ -637,13 +646,14 @@ def main(lsf=None, standalone=False, dry_run=False):
                     lsf.write_output(f'    NSX Edge VM not found')
             lsf.write_output('Workload NSX Edge shutdown complete')
         else:
-            lsf.write_output('No workload-specific NSX Edges configured (may be shared with mgmt domain)')
+            lsf.write_output('No workload NSX Edges found (no edges with "wld" in name)')
     else:
         lsf.write_output(f'Would shutdown workload NSX Edges: {workload_nsx_edges}')
     
     #==========================================================================
     # TASK 6: Shutdown Workload Domain NSX Manager
     # Per VCF 9.0: NSX Manager shuts down after NSX Edges in workload domain
+    # Filter: Only managers with "wld" in their name (workload domain)
     #==========================================================================
     
     lsf.write_output('='*60)
@@ -651,11 +661,21 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(6, 'Shutdown Workload NSX Manager', dry_run)
     
-    workload_nsx_mgr = []
-    if lsf.config.has_option('SHUTDOWN', 'workload_nsx_mgr'):
-        wld_mgr_raw = lsf.config.get('SHUTDOWN', 'workload_nsx_mgr')
-        workload_nsx_mgr = [m.strip() for m in wld_mgr_raw.split('\n') 
-                          if m.strip() and not m.strip().startswith('#')]
+    # Get all NSX managers from config, then filter for workload domain (contains "wld")
+    all_nsx_mgr = []
+    if lsf.config.has_option('SHUTDOWN', 'nsx_mgr'):
+        mgr_raw = lsf.config.get('SHUTDOWN', 'nsx_mgr')
+        all_nsx_mgr = [m.strip() for m in mgr_raw.split('\n') 
+                      if m.strip() and not m.strip().startswith('#')]
+    elif lsf.config.has_option('VCF', 'vcfnsxmgr'):
+        mgr_raw = lsf.config.get('VCF', 'vcfnsxmgr')
+        for entry in mgr_raw.split('\n'):
+            if entry.strip() and not entry.strip().startswith('#'):
+                parts = entry.split(':')
+                all_nsx_mgr.append(parts[0].strip())
+    
+    # Filter for workload domain managers (contain "wld" in name)
+    workload_nsx_mgr = [m for m in all_nsx_mgr if 'wld' in m.lower()]
     
     if not dry_run:
         if workload_nsx_mgr:
@@ -671,7 +691,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                     lsf.write_output(f'    NSX Manager VM not found')
             lsf.write_output('Workload NSX Manager shutdown complete')
         else:
-            lsf.write_output('No workload-specific NSX Manager configured (may be shared with mgmt domain)')
+            lsf.write_output('No workload NSX Managers found (no managers with "wld" in name)')
     else:
         lsf.write_output(f'Would shutdown workload NSX Manager: {workload_nsx_mgr}')
     
@@ -948,6 +968,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     #==========================================================================
     # TASK 14: Shutdown Management Domain NSX Edges
     # Per VCF 9.0 Management Domain order #9
+    # Filter: Only edges with "mgmt" in their name (management domain)
     #==========================================================================
     
     lsf.write_output('='*60)
@@ -955,41 +976,46 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(14, 'Shutdown Mgmt NSX Edges', dry_run)
     
-    nsx_edges = []
+    # Get all NSX edges from config, then filter for management domain (contains "mgmt")
+    all_nsx_edges = []
     if lsf.config.has_option('SHUTDOWN', 'nsx_edges'):
         edges_raw = lsf.config.get('SHUTDOWN', 'nsx_edges')
-        nsx_edges = [e.strip() for e in edges_raw.split('\n') 
-                    if e.strip() and not e.strip().startswith('#')]
+        all_nsx_edges = [e.strip() for e in edges_raw.split('\n') 
+                        if e.strip() and not e.strip().startswith('#')]
     elif lsf.config.has_option('VCF', 'vcfnsxedges'):
         edges_raw = lsf.config.get('VCF', 'vcfnsxedges')
         for entry in edges_raw.split('\n'):
             if entry.strip() and not entry.strip().startswith('#'):
                 parts = entry.split(':')
-                nsx_edges.append(parts[0].strip())
+                all_nsx_edges.append(parts[0].strip())
+    
+    # Filter for management domain edges (contain "mgmt" in name)
+    mgmt_nsx_edges = [e for e in all_nsx_edges if 'mgmt' in e.lower()]
     
     if not dry_run:
-        if nsx_edges:
-            lsf.write_output(f'Processing {len(nsx_edges)} NSX Edge VM(s)...')
+        if mgmt_nsx_edges:
+            lsf.write_output(f'Processing {len(mgmt_nsx_edges)} Management NSX Edge VM(s)...')
             edge_count = 0
-            for edge_name in nsx_edges:
+            for edge_name in mgmt_nsx_edges:
                 edge_count += 1
-                lsf.write_output(f'  [{edge_count}/{len(nsx_edges)}] Looking for: {edge_name}')
+                lsf.write_output(f'  [{edge_count}/{len(mgmt_nsx_edges)}] Looking for: {edge_name}')
                 vms = lsf.get_vm_by_name(edge_name)
                 if vms:
                     for vm in vms:
                         shutdown_vm_gracefully(lsf, vm)
                         time.sleep(2)
                 else:
-                    lsf.write_output(f'    NSX Edge VM not found')
+                    lsf.write_output(f'    Management NSX Edge VM not found')
             lsf.write_output('Management NSX Edge shutdown complete')
         else:
-            lsf.write_output('No NSX Edge VMs configured - skipping')
+            lsf.write_output('No Management NSX Edges found (no edges with "mgmt" in name)')
     else:
-        lsf.write_output(f'Would shutdown NSX Edges: {nsx_edges}')
+        lsf.write_output(f'Would shutdown Management NSX Edges: {mgmt_nsx_edges}')
     
     #==========================================================================
     # TASK 15: Shutdown Management Domain NSX Manager
     # Per VCF 9.0 Management Domain order #10
+    # Filter: Only managers with "mgmt" in their name (management domain)
     #==========================================================================
     
     lsf.write_output('='*60)
@@ -997,37 +1023,41 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(15, 'Shutdown Mgmt NSX Manager', dry_run)
     
-    nsx_mgr = []
+    # Get all NSX managers from config, then filter for management domain (contains "mgmt")
+    all_nsx_mgr = []
     if lsf.config.has_option('SHUTDOWN', 'nsx_mgr'):
         mgr_raw = lsf.config.get('SHUTDOWN', 'nsx_mgr')
-        nsx_mgr = [m.strip() for m in mgr_raw.split('\n') 
-                  if m.strip() and not m.strip().startswith('#')]
+        all_nsx_mgr = [m.strip() for m in mgr_raw.split('\n') 
+                      if m.strip() and not m.strip().startswith('#')]
     elif lsf.config.has_option('VCF', 'vcfnsxmgr'):
         mgr_raw = lsf.config.get('VCF', 'vcfnsxmgr')
         for entry in mgr_raw.split('\n'):
             if entry.strip() and not entry.strip().startswith('#'):
                 parts = entry.split(':')
-                nsx_mgr.append(parts[0].strip())
+                all_nsx_mgr.append(parts[0].strip())
+    
+    # Filter for management domain managers (contain "mgmt" in name)
+    mgmt_nsx_mgr = [m for m in all_nsx_mgr if 'mgmt' in m.lower()]
     
     if not dry_run:
-        if nsx_mgr:
-            lsf.write_output(f'Processing {len(nsx_mgr)} NSX Manager VM(s)...')
+        if mgmt_nsx_mgr:
+            lsf.write_output(f'Processing {len(mgmt_nsx_mgr)} Management NSX Manager VM(s)...')
             mgr_count = 0
-            for mgr_name in nsx_mgr:
+            for mgr_name in mgmt_nsx_mgr:
                 mgr_count += 1
-                lsf.write_output(f'  [{mgr_count}/{len(nsx_mgr)}] Looking for: {mgr_name}')
+                lsf.write_output(f'  [{mgr_count}/{len(mgmt_nsx_mgr)}] Looking for: {mgr_name}')
                 vms = lsf.get_vm_by_name(mgr_name)
                 if vms:
                     for vm in vms:
                         shutdown_vm_gracefully(lsf, vm)
                         time.sleep(5)
                 else:
-                    lsf.write_output(f'    NSX Manager VM not found')
+                    lsf.write_output(f'    Management NSX Manager VM not found')
             lsf.write_output('Management NSX Manager shutdown complete')
         else:
-            lsf.write_output('No NSX Manager VMs configured - skipping')
+            lsf.write_output('No Management NSX Managers found (no managers with "mgmt" in name)')
     else:
-        lsf.write_output(f'Would shutdown NSX Manager: {nsx_mgr}')
+        lsf.write_output(f'Would shutdown Management NSX Manager: {mgmt_nsx_mgr}')
     
     #==========================================================================
     # TASK 16: Shutdown SDDC Manager
