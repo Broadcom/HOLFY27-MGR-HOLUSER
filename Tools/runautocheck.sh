@@ -81,18 +81,39 @@ autorepo="https://github.com/broadcom/HOLFY27-MGR-AUTOCHECK.git"
 # Disable proxy filter for GitHub access
 ${HOLROOT}/Tools/proxyfilteroff.sh 2>/dev/null || true
 
-# Wait 90 seconds for proxy filter to be disabled
-sleep 90
-# Check if proxy is disabled
-if curl -s --max-time 5 -x http://proxy.site-a.vcf.lab:3128 https://github.com > /dev/null 2>&1; then
-    echo "Proxy is not disabled" | tee -a $LOGFILE
-    exit 1
-else
-    echo "Proxy is disabled" | tee -a $LOGFILE
+# Wait for proxy filter to be disabled (check up to 120 seconds)
+echo "Waiting for proxy filter to allow GitHub access..." | tee -a $LOGFILE
+PROXY_CHECK_ATTEMPTS=0
+PROXY_CHECK_MAX=12
+GITHUB_ACCESSIBLE=false
+
+while [ $PROXY_CHECK_ATTEMPTS -lt $PROXY_CHECK_MAX ]; do
+    PROXY_CHECK_ATTEMPTS=$((PROXY_CHECK_ATTEMPTS + 1))
+    # Check if GitHub is accessible through the proxy using HTTP status code
+    # When proxy filter is DISABLED, GitHub should return HTTP 200
+    # When proxy filter is ENABLED, GitHub is blocked (returns 403, 503, or connection fails)
+    HTTP_STATUS=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -x http://proxy.site-a.vcf.lab:3128 https://github.com 2>&1)
+    
+    if [ "$HTTP_STATUS" == "200" ]; then
+        echo "GitHub is accessible through proxy (HTTP ${HTTP_STATUS}, filter disabled)" | tee -a $LOGFILE
+        GITHUB_ACCESSIBLE=true
+        break
+    else
+        echo "Attempt ${PROXY_CHECK_ATTEMPTS}/${PROXY_CHECK_MAX}: GitHub returned HTTP ${HTTP_STATUS}, waiting 10s..." | tee -a $LOGFILE
+        sleep 10
+    fi
+done
+
+if [ "$GITHUB_ACCESSIBLE" != "true" ]; then
+    echo "ERROR: GitHub not accessible after ${PROXY_CHECK_MAX} attempts (last status: ${HTTP_STATUS})." | tee -a $LOGFILE
+    echo "Proxy filter may still be enabled. Continuing with fallback options..." | tee -a $LOGFILE
 fi
-# Attempt to clone the repository
-echo "Cloning AutoCheck from GitHub: ${autorepo}" | tee -a $LOGFILE
-if git clone -b main "${autorepo}" "${autocheckdir}" > /dev/null 2>&1; then
+# Attempt to clone the repository (only if GitHub is accessible)
+if [ "$GITHUB_ACCESSIBLE" == "true" ]; then
+    echo "Cloning AutoCheck from GitHub: ${autorepo}" | tee -a $LOGFILE
+fi
+
+if [ "$GITHUB_ACCESSIBLE" == "true" ] && git clone -b main "${autorepo}" "${autocheckdir}" > /dev/null 2>&1; then
     echo "Successfully cloned AutoCheck repository" | tee -a $LOGFILE
     
     # Re-enable proxy filter

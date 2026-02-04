@@ -799,19 +799,53 @@ Manages the VLP VM Agent installation and event handling. The VLP Agent enables 
 
 **VCF Automation Watcher:**
 
-Monitors and remediates VCF Automation appliance issues during lab startup. Fixes common problems with containerd, kube-scheduler, and seaweedfs pods.
+Monitors and remediates VCF Automation appliance issues during lab startup. Fixes common problems with the Kubernetes environment including containerd, kube-scheduler, CSI controller, volume attachments, and seaweedfs pods.
 
 **Issues Remediated:**
 
-- Stale containerd nodes with `Ready,SchedulingDisabled` status
-- Stuck `kube-scheduler` pods (0/1 Running)
-- Old `seaweedfs-master-0` pods (over 1 hour old)
+| Issue | Symptom | Resolution |
+| ----- | ------- | ---------- |
+| Stale containerd | Node shows `Ready,SchedulingDisabled` status | Restarts containerd service, uncordons node |
+| Stuck kube-scheduler | Pod shows `0/1 Running` | Restarts containerd service |
+| Stale seaweedfs-master-0 | Pod older than 1 hour from captured template | Deletes pod to trigger recreation |
+| Stuck volume attachments | Pods stuck in `ContainerCreating` with "volume attachment is being deleted" errors | Removes finalizers from stuck VolumeAttachment objects |
+| vCenter vAPI endpoint stopped | vCenter REST API returns 503, CSI controller crashes | Starts `vmware-vapi-endpoint` service on vCenter |
+| CSI controller issues | vsphere-csi-controller in `CrashLoopBackOff` | Cleans up stale leader leases and restarts controller |
+
+**Stuck Volume Attachments:**
+
+This is a common issue after the VCFA appliance is restored from a template. Volume attachments that existed when the template was captured may have `deletionTimestamp` set but still be marked as attached. The CSI controller can't clean them up because the finalizer (`external-attacher/csi-vsphere-vmware-com`) requires the attacher to detach the volume first.
+
+The script detects VolumeAttachment objects with `deletionTimestamp != null` and removes their finalizers, allowing Kubernetes to delete them and create fresh attachments for the new pods.
+
+**vCenter vAPI Endpoint Check:**
+
+The vsphere-csi-controller requires vCenter's REST API to be available. The script checks the vAPI endpoint by making a request to `https://vc-mgmt-a.site-a.vcf.lab/rest/com/vmware/cis/session`:
+
+- **HTTP 404** - Service is running (expected for unauthenticated request)
+- **HTTP 503** - Service Unavailable, `vmware-vapi-endpoint` is stopped
+
+If 503 is detected, the script SSHs to vCenter and runs `service-control --start vmware-vapi-endpoint` to start the service.
+
+**CSI Controller Recovery:**
+
+The vsphere-csi-controller can get stuck in CrashLoopBackOff for several reasons:
+
+1. **vCenter REST API unavailable** - The controller expects the vCenter vAPI endpoint to be running. If `vmware-vapi-endpoint` is stopped, the controller crashes. (Checked and fixed by the vAPI endpoint check above)
+2. **Stale leader leases** - When a CSI controller pod is deleted, its leader election leases may persist. The new pod can't become leader and its sidecar containers (csi-attacher, csi-provisioner, etc.) fail.
+
+The script checks for stale leases held by non-existent pods and deletes them, then restarts the CSI controller to pick up leadership.
 
 **Usage:**
 
 ```bash
 ./watchvcfa.sh
 ```
+
+**Log Files:**
+
+- `/home/holuser/hol/labstartup.log` (main log)
+- `/lmchol/hol/labstartup.log` (console log)
 
 ---
 
