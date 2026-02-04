@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 1.3 - February 2026
+# Version 1.4 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation graceful shutdown sequence
+# v 1.4 Changes:
+# - Added support to check ESA vs OSA vSAN architecture to determine if the vSAN elevator is needed
 #
 # v1.3 Changes:
 # - Removed dependency on [SHUTDOWN] section for NSX/vCenter/ESXi components
@@ -73,7 +75,16 @@ PHASE 20: Shutdown ESXi Hosts
 Additional operations handled:
 - Fleet Operations (SDDC Manager) for VCF Automation shutdown
 - WCP (Workload Control Plane) shutdown
-- vSAN elevator operations for clean shutdown
+- vSAN elevator operations for clean shutdown (OSA only - ESA auto-detected and skipped)
+
+NSX VM Domain Detection:
+- VMs with "wld" in name are treated as Workload Domain (Phase 5-6)
+- VMs with "mgmt" in name are treated as Management Domain (Phase 14-15)
+
+vSAN Architecture Detection:
+- OSA (Original Storage Architecture): Requires plogRunElevator and 45-minute wait
+- ESA (Express Storage Architecture): Does NOT use plog, elevator wait is skipped
+- Detection is automatic via vsish path check on first ESXi host
 """
 
 import os
@@ -98,7 +109,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 MODULE_NAME = 'VCFshutdown'
-MODULE_VERSION = '1.3'
+MODULE_VERSION = '1.4'
 MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 9.x compliant)'
 
 # Status file for console display
@@ -288,13 +299,52 @@ def shutdown_wcp_service(lsf, vc_fqdn: str, password: str) -> bool:
         return False
 
 
+def check_vsan_esa(lsf, host: str, username: str, password: str) -> bool:
+    """
+    Check if vSAN ESA (Express Storage Architecture) is in use on an ESXi host.
+    
+    vSAN ESA does NOT use the plog mechanism, so the elevator wait is not needed.
+    vSAN OSA (Original Storage Architecture) DOES use plog and requires the wait.
+    
+    Detection method: Check if the LSOM plog path exists in vsish.
+    ESA hosts won't have the /config/LSOM/intOpts/plogRunElevator path.
+    
+    :param lsf: lsfunctions module reference
+    :param host: ESXi hostname
+    :param username: ESXi username
+    :param password: ESXi password
+    :return: True if ESA is detected, False if OSA (or unable to determine)
+    """
+    if not lsf.test_tcp_port(host, 22, timeout=5):
+        lsf.write_output(f'{host} SSH port not reachable for ESA check')
+        return False
+    
+    try:
+        # Check if the plogRunElevator path exists - if not, this is ESA
+        cmd = 'vsish -e ls /config/LSOM/intOpts/ 2>/dev/null | grep -q plogRunElevator'
+        result = lsf.ssh(cmd, f'{username}@{host}', password)
+        
+        if result.returncode == 0:
+            # plogRunElevator exists = OSA
+            return False
+        else:
+            # plogRunElevator does NOT exist = ESA
+            return True
+    except Exception as e:
+        lsf.write_output(f'Error checking vSAN architecture on {host}: {e}')
+        # Default to OSA behavior (safer - assumes elevator is needed)
+        return False
+
+
 def set_vsan_elevator(lsf, host: str, username: str, password: str, 
                       enable: bool = True) -> bool:
     """
     Set the vSAN elevator mode on an ESXi host for graceful shutdown.
     
-    Before vSAN hosts can be shut down, the plogRunElevator setting must be
+    Before vSAN OSA hosts can be shut down, the plogRunElevator setting must be
     enabled to flush all pending I/O, then disabled after the wait period.
+    
+    NOTE: This is only applicable to vSAN OSA. vSAN ESA does not use plog.
     
     :param lsf: lsfunctions module reference
     :param host: ESXi hostname
@@ -1208,7 +1258,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output(f'Would set advanced settings on: {esx_hosts}')
     
     #==========================================================================
-    # TASK 19: vSAN Elevator Operations
+    # TASK 19: vSAN Elevator Operations (OSA only - ESA does not use plog)
     #==========================================================================
     
     lsf.write_output('='*60)
@@ -1234,39 +1284,60 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output(f'vSAN enabled: {vsan_enabled}, ESXi hosts: {len(esx_hosts)}, Timeout: {vsan_timeout}s ({vsan_timeout/60:.0f}min)')
     
     if vsan_enabled and esx_hosts and not dry_run:
-        # Enable vSAN elevator on all hosts
-        lsf.write_output(f'Enabling vSAN elevator on {len(esx_hosts)} host(s)...')
-        host_count = 0
-        for host in esx_hosts:
-            host_count += 1
-            lsf.write_output(f'  [{host_count}/{len(esx_hosts)}] Enabling elevator on {host}')
-            set_vsan_elevator(lsf, host, esx_username, password, enable=True)
+        # Check if this is vSAN ESA (Express Storage Architecture)
+        # ESA does NOT use the plog mechanism, so elevator wait is not needed
+        lsf.write_output('Checking vSAN architecture (OSA vs ESA)...')
+        is_esa = False
+        if esx_hosts:
+            # Check the first host to determine architecture
+            test_host = esx_hosts[0]
+            is_esa = check_vsan_esa(lsf, test_host, esx_username, password)
+            if is_esa:
+                lsf.write_output(f'  vSAN ESA detected on {test_host}')
+                lsf.write_output('  ESA does not use plog - skipping 45-minute elevator wait')
+            else:
+                lsf.write_output(f'  vSAN OSA detected on {test_host}')
+                lsf.write_output('  OSA uses plog - elevator wait is required')
         
-        # Wait for vSAN I/O to complete
-        lsf.write_output(f'Starting vSAN I/O flush wait ({vsan_timeout/60:.0f} minutes)...')
-        lsf.write_output('  This ensures all pending writes are committed to disk')
-        
-        elapsed = 0
-        while elapsed < vsan_timeout:
-            remaining = (vsan_timeout - elapsed) / 60
-            elapsed_min = elapsed / 60
-            lsf.write_output(f'  vSAN wait: {elapsed_min:.0f}m elapsed, {remaining:.1f}m remaining')
-            time.sleep(VSAN_ELEVATOR_CHECK_INTERVAL)
-            elapsed += VSAN_ELEVATOR_CHECK_INTERVAL
-        
-        lsf.write_output('vSAN I/O flush wait complete')
-        
-        # Disable vSAN elevator on all hosts
-        lsf.write_output(f'Disabling vSAN elevator on {len(esx_hosts)} host(s)...')
-        host_count = 0
-        for host in esx_hosts:
-            host_count += 1
-            lsf.write_output(f'  [{host_count}/{len(esx_hosts)}] Disabling elevator on {host}')
-            set_vsan_elevator(lsf, host, esx_username, password, enable=False)
-        lsf.write_output('vSAN elevator operations complete')
+        if is_esa:
+            # vSAN ESA - skip the elevator process entirely
+            lsf.write_output('vSAN ESA: Elevator operations not required (no plog)')
+        else:
+            # vSAN OSA - run the full elevator process
+            # Enable vSAN elevator on all hosts
+            lsf.write_output(f'Enabling vSAN elevator on {len(esx_hosts)} host(s)...')
+            host_count = 0
+            for host in esx_hosts:
+                host_count += 1
+                lsf.write_output(f'  [{host_count}/{len(esx_hosts)}] Enabling elevator on {host}')
+                set_vsan_elevator(lsf, host, esx_username, password, enable=True)
+            
+            # Wait for vSAN I/O to complete
+            lsf.write_output(f'Starting vSAN I/O flush wait ({vsan_timeout/60:.0f} minutes)...')
+            lsf.write_output('  This ensures all pending writes are committed to disk (OSA plog)')
+            
+            elapsed = 0
+            while elapsed < vsan_timeout:
+                remaining = (vsan_timeout - elapsed) / 60
+                elapsed_min = elapsed / 60
+                lsf.write_output(f'  vSAN wait: {elapsed_min:.0f}m elapsed, {remaining:.1f}m remaining')
+                time.sleep(VSAN_ELEVATOR_CHECK_INTERVAL)
+                elapsed += VSAN_ELEVATOR_CHECK_INTERVAL
+            
+            lsf.write_output('vSAN I/O flush wait complete')
+            
+            # Disable vSAN elevator on all hosts
+            lsf.write_output(f'Disabling vSAN elevator on {len(esx_hosts)} host(s)...')
+            host_count = 0
+            for host in esx_hosts:
+                host_count += 1
+                lsf.write_output(f'  [{host_count}/{len(esx_hosts)}] Disabling elevator on {host}')
+                set_vsan_elevator(lsf, host, esx_username, password, enable=False)
+            lsf.write_output('vSAN elevator operations complete')
     elif dry_run:
         lsf.write_output(f'Would run vSAN elevator on: {esx_hosts}')
         lsf.write_output(f'vSAN timeout: {vsan_timeout} seconds')
+        lsf.write_output('Note: Actual run will check for ESA and skip if detected')
     elif not vsan_enabled:
         lsf.write_output('vSAN elevator skipped (vsan_enabled=false in config)')
     else:
