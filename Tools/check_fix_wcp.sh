@@ -340,10 +340,11 @@ nodeIP="${ACTUAL_IP}"
 
 #==========================================================================
 # Step 5: Check certificate expiration and renew only if needed
-# Only delete/regenerate certificates that are expired or expiring within 48 hours
+# Only delete/regenerate certificates that are expired or expiring within 1 week
 #==========================================================================
 
-EXPIRY_THRESHOLD=172800  # 48 hours in seconds
+#EXPIRY_THRESHOLD=172800  # 48 hours in seconds
+EXPIRY_THRESHOLD=604800  # 1 week in seconds
 
 # Function to check if a K8s secret's certificate is expired or expiring soon
 # Returns: 0 if expired/expiring (needs renewal), 1 if valid, 2 if secret not found
@@ -403,7 +404,7 @@ check_cert_expiry() {
 }
 
 log_msg "=========================================="
-log_msg "Checking WCP certificate expiration (48h threshold)..."
+log_msg "Checking WCP certificate expiration (1 week threshold)..."
 log_msg "=========================================="
 
 # Define the certificates to check: namespace:secret_name
