@@ -25,7 +25,8 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
     - [holpwgen.sh](#holpwgensh)
     - [lkill.sh](#lkillsh)
     - [odyssey-launch.sh](#odyssey-launchsh)
-    - [restart\_k8s\_webhooks.sh](#restart_k8s_webhookssh)
+    - [check\_wcp\_vcenter.sh](#check_wcp_vcentersh)
+    - [check\_fix\_wcp.sh](#check_fix_wcpsh)
     - [runautocheck.sh](#runautochecksh)
     - [VLPagent.sh](#vlpagentsh)
     - [watchvcfa.sh](#watchvcfash)
@@ -722,28 +723,85 @@ Launches the Odyssey desktop client in the background.
 
 ---
 
-### restart_k8s_webhooks.sh
+### check_wcp_vcenter.sh
 
-**Kubernetes Webhook Restart Script:**
+**WCP vCenter Services Check Script:**
 
-Deletes expired certificates and restarts Kubernetes webhooks on Supervisor clusters. Required for labs with Tanzu/vSphere with Kubernetes when certificates have expired.
+Verifies that critical vCenter services required for Workload Control Plane (WCP) / Supervisor clusters are running. This script should be run BEFORE starting Supervisor Control Plane VMs.
+
+**Critical Services Checked:**
+
+| Service | Description |
+| ------- | ----------- |
+| `vapi-endpoint` | vCenter API endpoint service |
+| `trustmanagement` | Encryption key delivery to SCP VMs (critical!) |
+| `wcp` | Workload Control Plane service |
+
+**What it Does:**
+
+1. Verifies vCenter is reachable
+2. Checks each service status via `vmon-cli`
+3. Attempts to start any stopped services
+4. Returns exit code 5 if services cannot be started
+
+**Usage:**
+
+```bash
+# Default vCenter (vc-wld01-a.site-a.vcf.lab)
+./check_wcp_vcenter.sh
+
+# Specify vCenter
+./check_wcp_vcenter.sh vc-wld01-a.site-a.vcf.lab
+```
+
+**Exit Codes:**
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | All services running |
+| 1 | vCenter not reachable |
+| 5 | Could not start required services |
+
+**Note:** This script is also called by `VCFfinal.py` during lab startup when Tanzu/Supervisor is configured.
+
+---
+
+### check_fix_wcp.sh
+
+**WCP Certificate Fix Script:**
+
+Fixes Kubernetes certificates and webhooks on Supervisor Control Plane VMs. This script should be run AFTER Supervisor VMs are started. Replaces the old `restart_k8s_webhooks.sh`.
 
 **What it Does:**
 
 1. SSH to vCenter and extract Supervisor credentials using `decryptK8Pwd.py`
-2. Delete expired certificate secrets
-3. Restart webhook deployments
-4. Scale up CCI, ArgoCD, and Harbor replicas
+2. Verify Supervisor Control Plane is accessible (with VIP fallback logic)
+3. Check hypercrypt and kubelet services on SCP VM
+4. Delete expired certificate secrets
+5. Restart webhook deployments
+6. Scale up CCI, ArgoCD, and Harbor replicas
 
 **Usage:**
 
 ```bash
 # Default vCenter
-./restart_k8s_webhooks.sh
+./check_fix_wcp.sh
 
 # Specify vCenter
-./restart_k8s_webhooks.sh vc-wld01-a.site-a.vcf.lab
+./check_fix_wcp.sh vc-wld01-a.site-a.vcf.lab
 ```
+
+**Exit Codes:**
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | Success |
+| 1 | General error |
+| 2 | SCP not running (hypercrypt/encryption issue) |
+| 3 | Cannot connect to Supervisor |
+| 4 | kubectl commands failed |
+
+**Note:** This script is called by `VCFfinal.py` after starting Supervisor VMs.
 
 ---
 

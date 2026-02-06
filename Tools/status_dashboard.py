@@ -221,8 +221,10 @@ class StatusDashboard:
             
             # Group 9: VCFfinal.py - VCF Final Tasks
             ('vcffinal', '9. VCF Final Tasks (VCFfinal.py)', [
+                ('wcp_vcenter', 'WCP vCenter Services', 'Verify vCenter WCP services (trustmanagement, wcp)'),
                 ('tanzu_control', 'Tanzu Control Plane', 'Start Supervisor control plane VMs'),
-                ('tanzu_workload', 'Tanzu Workload Cluster', 'Start workload cluster VMs'),
+                ('wcp_certs', 'WCP Certificate Fix', 'Fix Kubernetes certificates and webhooks'),
+                ('tanzu_deploy', 'Tanzu Deployment', 'Run Tanzu deployment scripts'),
                 ('aria_vms', 'Aria VMs', 'Start Aria Automation virtual machines'),
                 ('aria_urls', 'Aria URL Verification', 'Verify Aria Automation URLs'),
             ]),

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 1.4 - February 2026
+# Version 1.5 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation graceful shutdown sequence
+# v 1.5 Changes:
+# - WCP vCenters now determined from [VCFFINAL] tanzucontrol config
+#
 # v 1.4 Changes:
 # - Added support to check ESA vs OSA vSAN architecture to determine if the vSAN elevator is needed
 #
@@ -548,6 +551,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     #==========================================================================
     # TASK 3: Stop WCP on vCenters
+    # Determined from [VCFFINAL] tanzucontrol (same config used by VCFfinal.py)
+    # This eliminates redundant config entries and reduces errors
     #==========================================================================
     
     lsf.write_output('='*60)
@@ -555,18 +560,33 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(3, 'Stop WCP Services', dry_run)
     
+    # Determine WCP vCenters from [VCFFINAL] tanzucontrol config
+    # Format: vmname:vcenter or vmname (regex patterns supported)
+    # Extract unique vCenter names from the tanzucontrol entries
     wcp_vcenters = []
-    if lsf.config.has_option('SHUTDOWN', 'wcp_vcenters'):
-        wcp_raw = lsf.config.get('SHUTDOWN', 'wcp_vcenters')
-        wcp_vcenters = [v.strip() for v in wcp_raw.split('\n') 
-                       if v.strip() and not v.strip().startswith('#')]
-    elif lsf.config.has_option('VCF', 'vcfvCenter'):
-        # Use vCenter list from VCF config
-        vc_raw = lsf.config.get('VCF', 'vcfvCenter')
-        for entry in vc_raw.split('\n'):
-            if entry.strip() and not entry.strip().startswith('#'):
-                parts = entry.split(':')
-                wcp_vcenters.append(parts[0].strip())
+    
+    if lsf.config.has_option('VCFFINAL', 'tanzucontrol'):
+        # Parse tanzucontrol to extract vCenter names
+        tanzu_raw = lsf.config.get('VCFFINAL', 'tanzucontrol')
+        seen_vcenters = set()
+        for entry in tanzu_raw.split('\n'):
+            entry = entry.strip()
+            if entry and not entry.startswith('#'):
+                # Format: vmname:vcenter or just vmname
+                if ':' in entry:
+                    parts = entry.split(':')
+                    if len(parts) >= 2:
+                        vc = parts[1].strip()
+                        if vc and vc not in seen_vcenters:
+                            wcp_vcenters.append(vc)
+                            seen_vcenters.add(vc)
+        
+        if wcp_vcenters:
+            lsf.write_output(f'WCP vCenters from tanzucontrol config: {wcp_vcenters}')
+        else:
+            lsf.write_output('tanzucontrol configured but no vCenters specified')
+    else:
+        lsf.write_output('No tanzucontrol in [VCFFINAL] - WCP not configured')
     
     if wcp_vcenters and not dry_run:
         lsf.write_output(f'Found {len(wcp_vcenters)} vCenter(s) with WCP to stop')
@@ -578,8 +598,8 @@ def main(lsf=None, standalone=False, dry_run=False):
                 lsf.write_output(f'{vc} not reachable, skipping WCP stop')
     elif dry_run:
         lsf.write_output(f'Would stop WCP on: {wcp_vcenters}')
-    else:
-        lsf.write_output('No WCP vCenters configured - skipping')
+    elif not wcp_vcenters:
+        lsf.write_output('No WCP vCenters to stop - skipping')
     
     #==========================================================================
     # TASK 4: Shutdown Workload VMs

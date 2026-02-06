@@ -430,10 +430,7 @@ docker_host = docker.site-a.vcf.lab
 docker_user = holuser
 docker_containers = gitlab,ldap,poste.io,flask
 
-# WCP vCenters to stop WCP service
-wcp_vcenters = vc-mgmt-a.site-a.vcf.lab
-    vc-wld01-a.site-a.vcf.lab
-    vc-wld02-a.site-a.vcf.lab
+# NOTE: WCP vCenters are automatically determined from [VCFFINAL] tanzucontrol
 
 # VM patterns to find and shutdown (regex)
 # Note: vCLS pattern added per VCF docs for vSphere Cluster Services

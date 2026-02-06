@@ -114,39 +114,203 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.connect_vcenters(vcfmgmtcluster)
     
     #==========================================================================
-    # TASK 2: Start Supervisor Control Plane VMs (Tanzu)
+    # TASK 2: Supervisor Control Plane (Tanzu/WCP)
     #==========================================================================
     
-    if dashboard:
-        dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.RUNNING)
-        dashboard.generate_html()
-        
     lsf.write_vpodprogress('Tanzu Start', 'GOOD-3')
     
     # Check for Tanzu Control Plane VMs
     tanzu_control_configured = lsf.config.has_option('VCFFINAL', 'tanzucontrol')
     
     if tanzu_control_configured and not dry_run:
-        try:
-            lsf.write_output('Starting Tanzu Control Plane VMs...')
-            lsf.write_vpodprogress('Tanzu Control Plane', 'GOOD-3')
+        #----------------------------------------------------------------------
+        # Determine vCenter host for WCP (look for wld vCenter in config)
+        #----------------------------------------------------------------------
+        wcp_vcenter = None
+        if lsf.config.has_option('RESOURCES', 'vCenters'):
+            vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
+            for vc_line in vcenters_raw.split('\n'):
+                vc_line = vc_line.strip()
+                if vc_line and not vc_line.startswith('#') and 'wld' in vc_line.lower():
+                    # Extract just the hostname (before the colon)
+                    wcp_vcenter = vc_line.split(':')[0].strip()
+                    break
+        
+        if not wcp_vcenter:
+            wcp_vcenter = 'vc-wld01-a.site-a.vcf.lab'  # Default
+        
+        #----------------------------------------------------------------------
+        # TASK 2a: PRE-START - Verify WCP vCenter Services
+        # Check/start trustmanagement, wcp, and vapi-endpoint services
+        # These must be running BEFORE starting Supervisor Control Plane VMs
+        #----------------------------------------------------------------------
+        if dashboard:
+            dashboard.update_task('vcffinal', 'wcp_vcenter', TaskStatus.RUNNING)
+            dashboard.generate_html()
+        
+        lsf.write_output('='*60)
+        lsf.write_output('Checking WCP vCenter Services (pre-start)')
+        lsf.write_output('='*60)
+        lsf.write_vpodprogress('WCP vCenter Check', 'GOOD-3')
+        lsf.write_output(f'Target vCenter: {wcp_vcenter}')
+        
+        wcp_vcenter_ok = True
+        
+        # Check if vCenter is reachable
+        if not lsf.test_tcp_port(wcp_vcenter, 443, timeout=10):
+            lsf.write_output(f'WARNING: Cannot reach vCenter at {wcp_vcenter}:443')
+            wcp_vcenter_ok = False
+        else:
+            lsf.write_output(f'vCenter {wcp_vcenter} is reachable')
             
+            # Critical WCP services to check/start
+            wcp_services = ['vapi-endpoint', 'trustmanagement', 'wcp']
+            
+            for service in wcp_services:
+                lsf.write_output(f'Checking {service} service...')
+                
+                try:
+                    # Check service status via vmon-cli
+                    check_cmd = f"vmon-cli -s {service} 2>/dev/null | grep 'RunState:' | awk '{{print $2}}'"
+                    result = lsf.ssh(check_cmd, f'root@{wcp_vcenter}')
+                    
+                    status = ''
+                    if hasattr(result, 'stdout') and result.stdout:
+                        status = result.stdout.strip()
+                    
+                    if status == 'STARTED':
+                        lsf.write_output(f'  {service}: RUNNING')
+                    else:
+                        lsf.write_output(f'  {service}: NOT RUNNING (status: {status})')
+                        lsf.write_output(f'  Attempting to start {service}...')
+                        
+                        # Start the service
+                        start_cmd = f'vmon-cli -i {service}'
+                        lsf.ssh(start_cmd, f'root@{wcp_vcenter}')
+                        
+                        # Wait for service to start
+                        import time
+                        time.sleep(15)
+                        
+                        # Re-check status
+                        result = lsf.ssh(check_cmd, f'root@{wcp_vcenter}')
+                        if hasattr(result, 'stdout') and result.stdout:
+                            new_status = result.stdout.strip()
+                        else:
+                            new_status = ''
+                        
+                        if new_status == 'STARTED':
+                            lsf.write_output(f'  {service}: Started successfully')
+                        else:
+                            lsf.write_output(f'  WARNING: {service} may still have issues (status: {new_status})')
+                            if service == 'trustmanagement':
+                                lsf.write_output('  NOTE: trustmanagement is critical for SCP encryption key delivery')
+                            wcp_vcenter_ok = False
+                            
+                except Exception as svc_err:
+                    lsf.write_output(f'  Error checking {service}: {svc_err}')
+                    wcp_vcenter_ok = False
+        
+        if dashboard:
+            if wcp_vcenter_ok:
+                dashboard.update_task('vcffinal', 'wcp_vcenter', TaskStatus.COMPLETE)
+            else:
+                dashboard.update_task('vcffinal', 'wcp_vcenter', TaskStatus.FAILED, 'Service issues')
+            dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.RUNNING)
+            dashboard.generate_html()
+        
+        #----------------------------------------------------------------------
+        # TASK 2b: START - Power on the Tanzu Control Plane VMs
+        #----------------------------------------------------------------------
+        lsf.write_output('='*60)
+        lsf.write_output('Starting Tanzu Control Plane VMs')
+        lsf.write_output('='*60)
+        lsf.write_vpodprogress('Tanzu Control Plane', 'GOOD-3')
+        
+        tanzu_start_ok = True
+        try:
             tanzu_control_raw = lsf.config.get('VCFFINAL', 'tanzucontrol')
             tanzu_control_vms = [v.strip() for v in tanzu_control_raw.split('\n') if v.strip()]
             
             if tanzu_control_vms:
                 lsf.start_nested(tanzu_control_vms)
                 lsf.write_output(f'Tanzu Control Plane VMs started: {len(tanzu_control_vms)}')
+            else:
+                lsf.write_output('No Tanzu Control Plane VMs specified in config')
             
         except Exception as e:
             lsf.write_output(f'Error starting Tanzu Control Plane VMs: {e}')
+            tanzu_start_ok = False
+        
+        if dashboard:
+            if tanzu_start_ok:
+                dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.COMPLETE)
+            else:
+                dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.FAILED)
+            dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.RUNNING)
+            dashboard.generate_html()
+        
+        #----------------------------------------------------------------------
+        # TASK 2c: POST-START - Run check_fix_wcp.sh for certificates/webhooks
+        # This runs AFTER VMs are started to fix k8s certificates
+        #----------------------------------------------------------------------
+        lsf.write_output('='*60)
+        lsf.write_output('WCP Certificate Fix (post-start)')
+        lsf.write_output('='*60)
+        lsf.write_vpodprogress('WCP Certificate Fix', 'GOOD-3')
+        
+        check_fix_wcp_script = '/home/holuser/hol/Tools/check_fix_wcp.sh'
+        wcp_certs_ok = True
+        
+        if os.path.isfile(check_fix_wcp_script):
+            lsf.write_output(f'Running: {check_fix_wcp_script} {wcp_vcenter}')
+            
+            try:
+                wcp_cmd = f'{check_fix_wcp_script} {wcp_vcenter}'
+                result = lsf.run_command(wcp_cmd)
+                
+                exit_code = result.returncode if hasattr(result, 'returncode') else (0 if result else 1)
+                
+                if exit_code == 0:
+                    lsf.write_output('WCP certificate fix completed successfully')
+                elif exit_code == 2:
+                    lsf.write_output('WARNING: Supervisor Control Plane not running (encryption issue)')
+                    lsf.write_output('  This may resolve after VMs fully boot - continuing...')
+                    wcp_certs_ok = False
+                elif exit_code == 3:
+                    lsf.write_output('WARNING: Cannot connect to Supervisor - may need manual intervention')
+                    wcp_certs_ok = False
+                elif exit_code == 4:
+                    lsf.write_output('WARNING: kubectl commands failed - certificates may need attention')
+                    wcp_certs_ok = False
+                else:
+                    lsf.write_output(f'WARNING: WCP script exited with code {exit_code}')
+                    wcp_certs_ok = False
+                    
+            except Exception as wcp_err:
+                lsf.write_output(f'WARNING: Error running WCP script: {wcp_err}')
+                lsf.write_output('  Continuing with startup - WCP may need manual attention')
+                wcp_certs_ok = False
+        else:
+            lsf.write_output(f'WCP script not found: {check_fix_wcp_script}')
+            lsf.write_output('  Skipping certificate fix - manual intervention may be needed')
+        
+        if dashboard:
+            if wcp_certs_ok:
+                dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.COMPLETE)
+            else:
+                dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.FAILED, 'See log')
+            dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.RUNNING)
+            dashboard.generate_html()
+            
     else:
         lsf.write_output('No Tanzu Control Plane VMs configured')
-    
-    if dashboard:
-        dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.COMPLETE)
-        dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.RUNNING)
-        dashboard.generate_html()
+        if dashboard:
+            dashboard.update_task('vcffinal', 'wcp_vcenter', TaskStatus.SKIPPED, 'Not configured')
+            dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.SKIPPED, 'Not configured')
+            dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.SKIPPED, 'Not configured')
+            dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.RUNNING)
+            dashboard.generate_html()
     
     #==========================================================================
     # TASK 3: Tanzu Deployment
