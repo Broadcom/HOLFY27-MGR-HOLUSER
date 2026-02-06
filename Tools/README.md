@@ -38,6 +38,8 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
   - [Configuration Files](#configuration-files)
     - [VMware.config](#vmwareconfig)
     - [launch\_odyssey.desktop](#launch_odysseydesktop)
+  - [Partner Export](#partner-export)
+    - [offline-ready.py](#offline-readypy)
   - [Dependencies](#dependencies)
   - [Support](#support)
 
@@ -1009,6 +1011,59 @@ Configuration file for the Conky desktop widget that displays lab status on the 
 **Odyssey Desktop Launcher:**
 
 Desktop entry file for launching the Odyssey client from the desktop environment.
+
+---
+
+## Partner Export
+
+### offline-ready.py
+
+**Offline Lab Export Preparation Tool:**
+
+> **Location:** This script is located at `HOLFY27-MGR-AUTOCHECK/Tools/offline-ready.py` and is deployed to `/home/holuser/hol/HOLFY27-MGR-AUTOCHECK/Tools/` on the Manager VM.
+
+Prepares a lab environment for export to a third-party partner who will run the lab without internet access. This is a one-time preparation tool run manually on the Manager VM before exporting the lab.
+
+**What it Does:**
+
+| Step | Description |
+| ---- | ----------- |
+| 1 | Creates offline-mode marker files to skip git operations on boot |
+| 2 | Creates the testing flag file to skip git clone/pull in labstartup.sh |
+| 3 | Sets `lockholuser = false` in config.ini and holodeck/*.ini files |
+| 4 | Removes external URLs from config.ini URL checks |
+| 5 | Sets passwords on Manager, Router, and Console from creds.txt |
+| 6 | Disables VLP Agent startup |
+| 7 | Verifies that /vpodrepo has a local copy of the lab repository |
+
+**Usage:**
+
+```bash
+# Preview changes (dry-run)
+python3 ~/hol/HOLFY27-MGR-AUTOCHECK/Tools/offline-ready.py --dry-run
+
+# Apply all changes
+python3 ~/hol/HOLFY27-MGR-AUTOCHECK/Tools/offline-ready.py
+
+# Apply without confirmation prompt
+python3 ~/hol/HOLFY27-MGR-AUTOCHECK/Tools/offline-ready.py --yes
+```
+
+**Options:**
+
+| Option | Description |
+| -------- | ------------- |
+| `--dry-run` | Preview changes without applying them |
+| `--yes, -y` | Skip confirmation prompt |
+| `--verbose, -v` | Verbose output |
+
+**Prerequisites:**
+
+- Lab should have completed a successful startup at least once
+- `/vpodrepo` should contain a valid local copy of the lab repository
+- Console and Router VMs should be running and accessible via SSH
+
+See the [HOLFY27-MGR-AUTOCHECK README](../HOLFY27-MGR-AUTOCHECK/README.md#offline-lab-export-partner-preparation) for full documentation.
 
 ---
 

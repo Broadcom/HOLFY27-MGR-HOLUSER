@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 1.5 - February 2026
+# Version 1.6 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation graceful shutdown sequence
+# v 1.6 Changes:
+# - Fixed ESA vs OSA detection: replaced unreliable vsish plogRunElevator
+#   path check with authoritative 'esxcli vsan cluster get' command.
+#   The vsish plog paths still exist on ESA hosts, causing false OSA
+#   detection and an unnecessary 45-minute elevator wait.
+#
 # v 1.5 Changes:
 # - WCP vCenters now determined from [VCFFINAL] tanzucontrol config
 #
@@ -112,7 +118,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 MODULE_NAME = 'VCFshutdown'
-MODULE_VERSION = '1.4'
+MODULE_VERSION = '1.6'
 MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 9.x compliant)'
 
 # Status file for console display
@@ -309,8 +315,12 @@ def check_vsan_esa(lsf, host: str, username: str, password: str) -> bool:
     vSAN ESA does NOT use the plog mechanism, so the elevator wait is not needed.
     vSAN OSA (Original Storage Architecture) DOES use plog and requires the wait.
     
-    Detection method: Check if the LSOM plog path exists in vsish.
-    ESA hosts won't have the /config/LSOM/intOpts/plogRunElevator path.
+    Detection method: Use 'esxcli vsan cluster get' and check for
+    'vSAN ESA Enabled: true'. This is the authoritative detection method.
+    
+    NOTE: The previous vsish-based check (looking for plogRunElevator) was
+    unreliable because the plog vsish paths still exist on ESA hosts even
+    though ESA does not use the plog mechanism.
     
     :param lsf: lsfunctions module reference
     :param host: ESXi hostname
@@ -323,16 +333,32 @@ def check_vsan_esa(lsf, host: str, username: str, password: str) -> bool:
         return False
     
     try:
-        # Check if the plogRunElevator path exists - if not, this is ESA
-        cmd = 'vsish -e ls /config/LSOM/intOpts/ 2>/dev/null | grep -q plogRunElevator'
+        # Use esxcli to definitively determine ESA vs OSA
+        cmd = 'esxcli vsan cluster get 2>/dev/null'
         result = lsf.ssh(cmd, f'{username}@{host}', password)
         
         if result.returncode == 0:
-            # plogRunElevator exists = OSA
+            output = result.stdout if hasattr(result, 'stdout') and result.stdout else ''
+            # Handle cases where output might be bytes
+            if isinstance(output, bytes):
+                output = output.decode('utf-8', errors='replace')
+            
+            # Look for "vSAN ESA Enabled: true" in the output
+            for line in output.splitlines():
+                if 'vSAN ESA Enabled' in line:
+                    if 'true' in line.lower():
+                        lsf.write_output(f'{host}: vSAN ESA Enabled = true')
+                        return True
+                    else:
+                        lsf.write_output(f'{host}: vSAN ESA Enabled = false (OSA)')
+                        return False
+            
+            # If "vSAN ESA Enabled" line not found, likely older ESXi (pre-ESA)
+            lsf.write_output(f'{host}: vSAN ESA field not found in cluster info (assuming OSA)')
             return False
         else:
-            # plogRunElevator does NOT exist = ESA
-            return True
+            lsf.write_output(f'{host}: esxcli vsan cluster get failed (vSAN may not be configured)')
+            return False
     except Exception as e:
         lsf.write_output(f'Error checking vSAN architecture on {host}: {e}')
         # Default to OSA behavior (safer - assumes elevator is needed)

@@ -180,6 +180,41 @@ Check if VM is in the correct config section:
 grep -A10 '\[VCF\]' /tmp/config.ini
 ```
 
+## Analysis: What Happens Today Without Internet?
+
+### Current Failure Points and Timing
+
+When a lab boots without access to GitHub, the following happens:
+
+1. **Root cron** (`@reboot`) runs `[HOLFY27-MGR-ROOT/gitpull.sh](2027-labstartup/HOLFY27-MGR-ROOT/gitpull.sh)`:
+
+   - `wait_for_proxy()` loops up to **60 attempts x 5 seconds = 5 minutes** waiting to reach `https://github.com` through the proxy
+   - After timeout, it logs a WARNING but **continues** (returns 1, does not exit)
+   - `do_git_pull()` runs but fails; logs "Git pull failed - continuing with existing code"
+   - It also tries to `curl` download `tdns-mgr` and `oh-my-posh` from GitHub (lines 74-115) -- these will fail silently
+   - **Result: Does NOT hard-fail. Takes ~5 minutes delay.**
+
+2. **Holuser cron** (`@reboot`) runs `[HOLFY27-MGR-HOLUSER/gitpull.sh](2027-labstartup/HOLFY27-MGR-HOLUSER/gitpull.sh)`:
+
+   - Same `wait_for_proxy()` loop: **5 minutes timeout**
+   - Git pull fails but logs "Git pull failed - continuing with existing code"
+   - Still creates the `gitdone` signal file for the router
+   - **Result: Does NOT hard-fail. Takes ~5 minutes delay.**
+
+3. **Holuser cron** then runs `[HOLFY27-MGR-HOLUSER/labstartup.sh](2027-labstartup/HOLFY27-MGR-HOLUSER/labstartup.sh)`:
+
+   - The `git_clone()` function (lines 95-155) retries **10 attempts x 5 seconds = ~50 seconds per attempt**, meaning up to **~10 minutes** of waiting
+   - For **HOL SKUs**: `git_clone` exits with `FAIL - Could not clone GIT Project` if the repo doesn't already exist locally
+   - For **non-HOL SKUs**: Falls back to local `holodeck/*.ini` files
+   - If `git_pull()` is used (repo already exists locally): retries **30 attempts x 5 seconds = 2.5 minutes**, then logs "Could not perform git pull. Will attempt LabStartup with existing code." and **continues**
+   - **Result: If `/vpodrepo` already has a cloned repo, lab startup WILL eventually succeed after ~7-12 minutes of wasted time. If no local repo exists, HOL SKUs HARD FAIL.**
+
+4. **Router** runs `[27XX-HOLOROUTER/getrules.sh](2027-labstartup/27XX-HOLOROUTER/getrules.sh)`:
+
+   - Waits for NFS mount from manager, then waits for `gitdone` signal
+   - The gitdone signal IS created by holuser's gitpull.sh even on failure, so this works
+   - **Result: No failure here.**
+
 ## Version
 
 - **Version**: 3.0
