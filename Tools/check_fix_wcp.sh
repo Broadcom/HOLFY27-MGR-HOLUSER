@@ -1,13 +1,13 @@
 #!/bin/bash
 # Author: Burke Azbill
-# Version: 3.0
-# Date: 2026-02-05
+# Version: 4.0
+# Date: 2026-02-06
 # Script to fix Kubernetes certificates and webhooks on Supervisor Control Plane
 # This script:
-# 1. Calls check_wcp_vcenter.sh to verify vCenter services are running
-# 2. SSH to vCenter and run decryptK8Pwd.py to get SCP credentials
-# 3. Verify Supervisor Control Plane is accessible (with fallback to VM IP)
-# 4. Check hypercrypt and kubelet services on SCP VM
+# 1. SSH to vCenter and run decryptK8Pwd.py to get SCP credentials
+# 2. Wait for Supervisor Control Plane to be accessible (with polling up to 30m)
+# 3. Wait for hypercrypt and kubelet services to become active (with polling)
+# 4. Wait for Kubernetes API to be available (with polling)
 # 5. Delete old certificates and restart webhooks
 # 6. Scale up CCI, ArgoCD, and Harbor services
 #
@@ -18,10 +18,9 @@
 # Exit Codes:
 #   0 - Success
 #   1 - General error
-#   2 - Supervisor Control Plane not running (hypercrypt/encryption issue)
-#   3 - Cannot connect to Supervisor
+#   2 - Supervisor Control Plane services did not start within timeout
+#   3 - Cannot connect to Supervisor / K8s API not available within timeout
 #   4 - kubectl commands failed
-#   5 - vCenter service issues (from check_wcp_vcenter.sh)
 
 # Don't exit on error - we handle errors explicitly
 set +e
@@ -35,8 +34,32 @@ LOG_FILE="/lmchol/hol/labstartup.log"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 
+# Polling configuration
+POLL_INTERVAL=30      # seconds between polls
+MAX_POLL_TIME=1800    # 30 minutes maximum total wait
+
 # Ensure log directory exists
 mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null
+
+# Track total elapsed time across all wait phases
+TOTAL_START_TIME=$(date +%s)
+
+get_remaining_time() {
+    local now
+    now=$(date +%s)
+    local elapsed=$((now - TOTAL_START_TIME))
+    local remaining=$((MAX_POLL_TIME - elapsed))
+    if [[ ${remaining} -lt 0 ]]; then
+        remaining=0
+    fi
+    echo ${remaining}
+}
+
+get_elapsed_time() {
+    local now
+    now=$(date +%s)
+    echo $((now - TOTAL_START_TIME))
+}
 
 # Helper function for logging
 log_msg() {
@@ -63,12 +86,12 @@ ssh_with_fallback() {
     local host=$2
     shift 2
     local cmd="$*"
-    
+
     # Try key-based authentication first
     if ssh ${SSH_OPTS} -o BatchMode=yes "${user}@${host}" "${cmd}" 2>/dev/null; then
         return 0
     fi
-    
+
     # Fall back to sshpass if key auth fails
     if [[ -f "${CREDS_FILE}" ]]; then
         local password
@@ -83,8 +106,6 @@ ssh_with_fallback() {
 # Function to check if a host is reachable
 check_host_reachable() {
     local host=$1
-    local port=${2:-22}
-    
     if ping -c 1 -W 2 "${host}" >/dev/null 2>&1; then
         return 0
     fi
@@ -95,7 +116,7 @@ check_host_reachable() {
 check_k8s_api() {
     local ip=$1
     local pwd=$2
-    
+
     local result
     result=$(/usr/bin/sshpass -p "${pwd}" ssh ${SSH_OPTS} "root@${ip}" "kubectl get --raw /healthz 2>&1" 2>/dev/null)
     if [[ "${result}" == "ok" ]]; then
@@ -108,7 +129,7 @@ check_k8s_api() {
 check_hypercrypt_status() {
     local ip=$1
     local pwd=$2
-    
+
     local status
     status=$(/usr/bin/sshpass -p "${pwd}" ssh ${SSH_OPTS} "root@${ip}" "systemctl is-active hypercrypt 2>/dev/null" 2>/dev/null)
     echo "${status}"
@@ -118,20 +139,18 @@ check_hypercrypt_status() {
 check_kubelet_status() {
     local ip=$1
     local pwd=$2
-    
+
     local status
     status=$(/usr/bin/sshpass -p "${pwd}" ssh ${SSH_OPTS} "root@${ip}" "systemctl is-active kubelet 2>/dev/null" 2>/dev/null)
     echo "${status}"
 }
 
 log_msg "=========================================="
-log_msg "WCP Webhook Fix Script v3.0"
+log_msg "WCP Webhook Fix Script v4.0"
 log_msg "=========================================="
 log_msg "vCenter Host: ${VCENTER_HOST}"
-
-# NOTE: vCenter services check (check_wcp_vcenter.sh) should be run separately
-# before this script. VCFfinal.py calls check_wcp_vcenter.sh before starting
-# Supervisor Control Plane VMs, then calls this script after VMs are started.
+log_msg "Max total wait time: $((MAX_POLL_TIME / 60)) minutes"
+log_msg "Poll interval: ${POLL_INTERVAL} seconds"
 
 #==========================================================================
 # Step 1: Get credentials from vCenter
@@ -176,76 +195,90 @@ log_msg "Node IP (VIP): ${nodeIP}"
 log_msg "Password retrieved: $(echo "${nodePwd}" | sed 's/./*/g')"
 
 #==========================================================================
-# Step 2: Verify Supervisor Control Plane is accessible
+# Step 2: Wait for Supervisor Control Plane to be accessible
+# Poll until the VIP or a fallback SCP VM IP is reachable and SSH works
 #==========================================================================
 
-ACTUAL_IP="${nodeIP}"
-if ! check_host_reachable "${nodeIP}"; then
-    log_warn "Supervisor VIP ${nodeIP} is not reachable"
-    log_msg "Attempting to find actual SCP VM IP..."
-    
-    # Try common alternative IPs (VIP +1)
-    # In vSphere with Tanzu, VMs typically get .86, .87, .88 for a VIP of .85
-    BASE_IP=$(echo "${nodeIP}" | cut -d. -f1-3)
-    VIP_LAST=$(echo "${nodeIP}" | cut -d. -f4)
-    
-    for offset in 1 2 3; do
-        ALT_IP="${BASE_IP}.$((VIP_LAST + offset))"
-        log_msg "Trying alternative IP: ${ALT_IP}"
-        if check_host_reachable "${ALT_IP}"; then
-            # Verify this is actually the SCP VM by checking for expected services
-            HYPERCRYPT_STATUS=$(check_hypercrypt_status "${ALT_IP}" "${nodePwd}")
-            if [[ -n "${HYPERCRYPT_STATUS}" ]]; then
-                log_msg "Found SCP VM at ${ALT_IP}"
-                ACTUAL_IP="${ALT_IP}"
-                break
+log_msg "Waiting for Supervisor Control Plane to become accessible..."
+
+ACTUAL_IP=""
+FOUND_SCP=false
+
+# Build list of IPs to try: VIP first, then VIP+1, VIP+2, VIP+3
+BASE_IP=$(echo "${nodeIP}" | cut -d. -f1-3)
+VIP_LAST=$(echo "${nodeIP}" | cut -d. -f4)
+CANDIDATE_IPS="${nodeIP}"
+for offset in 1 2 3; do
+    CANDIDATE_IPS="${CANDIDATE_IPS} ${BASE_IP}.$((VIP_LAST + offset))"
+done
+
+while [[ $(get_remaining_time) -gt 0 ]]; do
+    for try_ip in ${CANDIDATE_IPS}; do
+        if check_host_reachable "${try_ip}"; then
+            # Verify we can actually SSH and get a service status
+            HYPERCRYPT_CHECK=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${try_ip}" "systemctl is-active hypercrypt 2>/dev/null" 2>/dev/null)
+            if [[ -n "${HYPERCRYPT_CHECK}" ]]; then
+                ACTUAL_IP="${try_ip}"
+                FOUND_SCP=true
+                if [[ "${try_ip}" != "${nodeIP}" ]]; then
+                    log_msg "VIP ${nodeIP} not reachable, using SCP VM at ${ACTUAL_IP}"
+                else
+                    log_msg "Supervisor VIP ${nodeIP} is reachable"
+                fi
+                break 2  # break both loops
             fi
         fi
     done
-fi
+    log_msg "  Supervisor not yet reachable - waiting... ($(get_elapsed_time)s / ${MAX_POLL_TIME}s)"
+    sleep ${POLL_INTERVAL}
+done
 
-# Check if we can reach the SCP VM now
-if ! check_host_reachable "${ACTUAL_IP}"; then
-    log_error "Cannot reach Supervisor Control Plane at ${ACTUAL_IP}"
+if [[ "${FOUND_SCP}" != "true" ]]; then
+    log_error "Cannot reach any Supervisor Control Plane IP within timeout"
     exit 3
 fi
 
 #==========================================================================
-# Step 3: Check hypercrypt and kubelet services
+# Step 3: Wait for hypercrypt and kubelet to become active
+# These services take time after boot/hibernation wake
 #==========================================================================
 
-HYPERCRYPT_STATUS=$(check_hypercrypt_status "${ACTUAL_IP}" "${nodePwd}")
-log_msg "Hypercrypt service status: ${HYPERCRYPT_STATUS}"
+log_msg "Waiting for SCP services (hypercrypt, kubelet) to become active..."
 
-if [[ "${HYPERCRYPT_STATUS}" == "activating" ]]; then
-    log_error "Supervisor Control Plane is stuck in hypercrypt initialization"
-    log_error "This usually indicates that the encryption keys were not delivered to the SCP VM"
-    log_error "The secrets in /dev/shm/secret are missing - this is a known issue after hibernation/reboot"
-    log_error ""
-    log_error "MANUAL FIX REQUIRED:"
-    log_error "1. Power cycle the Supervisor Control Plane VM through vCenter UI"
-    log_error "2. Wait for hypercrypt to receive encryption keys from ESXi"
-    log_error "3. If issue persists, contact VMware Support or check KB articles for WCP encryption key delivery"
-    log_error ""
-    log_error "Alternative: If this is a lab environment, you may need to re-enable the Supervisor cluster"
-    exit 2
-fi
+SERVICES_OK=false
 
-# Check kubelet status
-KUBELET_STATUS=$(check_kubelet_status "${ACTUAL_IP}" "${nodePwd}")
-log_msg "Kubelet service status: ${KUBELET_STATUS}"
-
-if [[ "${KUBELET_STATUS}" != "active" ]]; then
-    log_warn "Kubelet is not running on ${ACTUAL_IP}. Attempting to start..."
-    /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${ACTUAL_IP}" "systemctl start kubelet" 2>/dev/null
-    sleep 30
-    
+while [[ $(get_remaining_time) -gt 0 ]]; do
+    HYPERCRYPT_STATUS=$(check_hypercrypt_status "${ACTUAL_IP}" "${nodePwd}")
     KUBELET_STATUS=$(check_kubelet_status "${ACTUAL_IP}" "${nodePwd}")
-    if [[ "${KUBELET_STATUS}" != "active" ]]; then
-        log_error "Failed to start kubelet on Supervisor Control Plane"
-        exit 2
+
+    log_msg "  hypercrypt: ${HYPERCRYPT_STATUS:-unknown}, kubelet: ${KUBELET_STATUS:-unknown} ($(get_elapsed_time)s / ${MAX_POLL_TIME}s)"
+
+    if [[ "${HYPERCRYPT_STATUS}" == "active" && "${KUBELET_STATUS}" == "active" ]]; then
+        log_msg "Both hypercrypt and kubelet are active"
+        SERVICES_OK=true
+        break
     fi
-    log_msg "Kubelet started successfully"
+
+    if [[ "${HYPERCRYPT_STATUS}" == "activating" ]]; then
+        log_msg "  hypercrypt is still initializing (encryption keys being delivered)..."
+    elif [[ "${HYPERCRYPT_STATUS}" == "failed" ]]; then
+        log_warn "  hypercrypt has failed - attempting restart..."
+        /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${ACTUAL_IP}" "systemctl restart hypercrypt" 2>/dev/null
+    fi
+
+    if [[ "${KUBELET_STATUS}" != "active" && "${HYPERCRYPT_STATUS}" == "active" ]]; then
+        log_msg "  hypercrypt is active but kubelet is not - attempting to start kubelet..."
+        /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${ACTUAL_IP}" "systemctl start kubelet" 2>/dev/null
+    fi
+
+    sleep ${POLL_INTERVAL}
+done
+
+if [[ "${SERVICES_OK}" != "true" ]]; then
+    log_error "SCP services did not become active within timeout"
+    log_error "  hypercrypt: ${HYPERCRYPT_STATUS:-unknown}, kubelet: ${KUBELET_STATUS:-unknown}"
+    log_error "  This may indicate encryption key delivery issues from ESXi/vTPM"
+    exit 2
 fi
 
 #==========================================================================
@@ -253,18 +286,23 @@ fi
 #==========================================================================
 
 log_msg "Waiting for Kubernetes API to become available..."
-MAX_RETRIES=30
-RETRY_COUNT=0
-while ! check_k8s_api "${ACTUAL_IP}" "${nodePwd}"; do
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-    if [[ ${RETRY_COUNT} -ge ${MAX_RETRIES} ]]; then
-        log_error "Kubernetes API did not become available after ${MAX_RETRIES} attempts"
-        exit 3
+
+K8S_API_OK=false
+
+while [[ $(get_remaining_time) -gt 0 ]]; do
+    if check_k8s_api "${ACTUAL_IP}" "${nodePwd}"; then
+        log_msg "Kubernetes API is available (healthz: ok)"
+        K8S_API_OK=true
+        break
     fi
-    log_msg "Waiting for API server... (attempt ${RETRY_COUNT}/${MAX_RETRIES})"
-    sleep 10
+    log_msg "  K8s API not yet available - waiting... ($(get_elapsed_time)s / ${MAX_POLL_TIME}s)"
+    sleep ${POLL_INTERVAL}
 done
-log_msg "Kubernetes API is available"
+
+if [[ "${K8S_API_OK}" != "true" ]]; then
+    log_error "Kubernetes API did not become available within timeout"
+    exit 3
+fi
 
 # Use ACTUAL_IP from now on (might be VIP or direct VM IP)
 nodeIP="${ACTUAL_IP}"
@@ -357,9 +395,11 @@ else
     log_msg "Harbor namespace not found - skipping"
 fi
 
+TOTAL_ELAPSED=$(get_elapsed_time)
 log_msg ""
 log_msg "=========================================="
-log_msg "✓ Successfully completed certificate resets and webhook restarts"
+log_msg "Successfully completed certificate resets and webhook restarts"
+log_msg "Total elapsed time: $((TOTAL_ELAPSED / 60))m $((TOTAL_ELAPSED % 60))s"
 log_msg "=========================================="
 
 exit 0
