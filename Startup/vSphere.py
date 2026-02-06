@@ -245,38 +245,10 @@ def main(lsf=None, standalone=False, dry_run=False):
         host_count = len(esx_hosts) if esx_hosts else len(lsf.get_all_hosts()) if not dry_run else 0
         dashboard.update_task('vsphere', 'maintenance', TaskStatus.COMPLETE,
                               total=host_count, success=host_count, failed=0)
-        dashboard.update_task('vsphere', 'vcls', TaskStatus.RUNNING)
-    
-    #==========================================================================
-    # TASK 4: Verify vCLS VMs Started
-    #==========================================================================
-    
-    vcls_count = 0
-    if not dry_run:
-        vms = lsf.get_all_vms()
-        
-        for vm in vms:
-            if 'vCLS' in vm.name:
-                vcls_count += 1
-                while vm.runtime.powerState != 'poweredOn':
-                    lsf.write_output(f'Waiting for {vm.name} to power on...')
-                    lsf.labstartup_sleep(lsf.sleep_seconds)
-        
-        if vcls_count > 0:
-            lsf.write_output(f'All {vcls_count} vCLS VMs have started')
-    
-    if dashboard:
-        if vcls_count > 0:
-            dashboard.update_task('vsphere', 'vcls', TaskStatus.COMPLETE,
-                                  total=vcls_count, success=vcls_count, failed=0)
-        else:
-            dashboard.update_task('vsphere', 'vcls', TaskStatus.SKIPPED,
-                                  'No vCLS VMs found',
-                                  total=0, success=0, failed=0, skipped=0)
         dashboard.update_task('vsphere', 'drs', TaskStatus.RUNNING)
     
     #==========================================================================
-    # TASK 5: Wait for DRS to Enable
+    # TASK 4: Wait for DRS to Enable
     #==========================================================================
     
     clusters = []
@@ -317,7 +289,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('vsphere', 'shell_warning', TaskStatus.RUNNING)
     
     #==========================================================================
-    # TASK 6: Suppress Shell Warning on ESXi Hosts
+    # TASK 5: Suppress Shell Warning on ESXi Hosts
     #==========================================================================
     
     shell_warning_count = 0
@@ -350,7 +322,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('vsphere', 'vcenter_ready', TaskStatus.RUNNING)
     
     #==========================================================================
-    # TASK 7: Verify vCenter UI Ready
+    # TASK 6: Verify vCenter UI Ready
     #==========================================================================
     
     if not dry_run:
@@ -375,7 +347,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.generate_html()
     
     #==========================================================================
-    # TASK 7b: Verify all Autostart vCenter services are Started
+    # TASK 7: Verify all Autostart vCenter services are Started
     # Some services configured for AUTOMATIC startup fail to start during
     # vCenter boot (e.g. vapi-endpoint, trustmanagement). Check each vCenter
     # and start any AUTOMATIC services that are not in STARTED state.

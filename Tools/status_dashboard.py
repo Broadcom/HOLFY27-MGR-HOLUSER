@@ -193,7 +193,6 @@ class StatusDashboard:
                 ('vcenter_connect', 'vCenter Connection', 'Connect to vCenter servers'),
                 ('datastores', 'Datastore Verification', 'Verify all datastores are accessible'),
                 ('maintenance', 'Exit Maintenance Mode', 'Exit hosts from maintenance mode'),
-                ('vcls', 'vCLS Verification', 'Verify vCLS VMs are running'),
                 ('drs', 'DRS Configuration', 'Configure DRS settings'),
                 ('shell_warning', 'Shell Warning Suppress', 'Suppress ESXi shell warnings'),
                 ('vcenter_ready', 'vCenter Ready', 'Verify vCenter UI is accessible'),

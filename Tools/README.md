@@ -587,7 +587,6 @@ The license expiration window is calculated as December 30 of the lab year throu
 
 The following system VMs are automatically skipped for VM configuration checks (they cannot be modified):
 
-- `vCLS-*` - vSphere Cluster Services VMs
 - `vcf-services-platform-template-*` - VCF Services Platform Template VMs
 - `SupervisorControlPlaneVM*` - Tanzu Supervisor Control Plane VMs
 

@@ -117,7 +117,7 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 | Phase 2: VCF Shutdown | 1. Fleet Operations | VCF Automation via API (vra, vrni) |
 | | 2. Connect Infrastructure | Connect to management hosts |
 | | 3. Stop WCP | Stop Workload Control Plane services |
-| | 4. Workload VMs | Tanzu, K8s, Supervisor, vCLS VMs |
+| | 4. Workload VMs | Tanzu, K8s, Supervisor VMs |
 | | 5-6. Workload NSX | Workload domain NSX Edges, then Manager |
 | | 7. Workload vCenters | Workload vCenters (LAST per VCF 9.0) |
 | | 8. VCF Ops Networks | VCF Operations for Networks (vrni) |
@@ -227,7 +227,7 @@ flowchart TD
     P3 --> WCP["SSH: vmon-cli -k wcp"]
     
     WCP --> P4[/"Phase 4: Workload VMs"/]
-    P4 --> VM_FIND["Find VMs by Pattern<br/>(Tanzu, K8s, vCLS)"]
+    P4 --> VM_FIND["Find VMs by Pattern<br/>(Tanzu, K8s)"]
     VM_FIND --> VM_OFF[Shutdown Workload VMs]
     
     VM_OFF --> P5[/"Phase 5: Workload vCenters"/]
@@ -374,7 +374,7 @@ sequenceDiagram
     Note over VCFshutdown.py: Phase 2-4: Connect, WCP, Workload VMs
     VCFshutdown.py->>vCenter: Connect to management hosts
     VCFshutdown.py->>vCenter: SSH: vmon-cli -k wcp
-    VCFshutdown.py->>vCenter: Shutdown Tanzu/K8s/vCLS VMs
+    VCFshutdown.py->>vCenter: Shutdown Tanzu/K8s VMs
     
     Note over VCFshutdown.py: Phase 5: Workload vCenters (BEFORE mgmt domain)
     VCFshutdown.py->>vCenter: Shutdown vc-wld* VMs
@@ -433,12 +433,10 @@ docker_containers = gitlab,ldap,poste.io,flask
 # NOTE: WCP vCenters are automatically determined from [VCFFINAL] tanzucontrol
 
 # VM patterns to find and shutdown (regex)
-# Note: vCLS pattern added per VCF docs for vSphere Cluster Services
 vm_patterns = ^kubernetes-cluster-.*$
     ^dev-project-.*$
     ^cci-service-.*$
     ^SupervisorControlPlaneVM.*$
-    ^vCLS-.*$
 
 # Specific workload VMs to shutdown
 workload_vms = core-a

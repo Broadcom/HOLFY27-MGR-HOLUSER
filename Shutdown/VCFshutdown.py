@@ -63,7 +63,7 @@ Shutdown Order (this module) - aligned with VCF 9.0 docs:
 PHASE 1: Fleet Operations (VCF Automation via API)
 PHASE 2: Connect to Management Infrastructure
 PHASE 3: Stop WCP (Workload Control Plane) services
-PHASE 4: Shutdown Workload VMs (Tanzu, K8s, vCLS)
+PHASE 4: Shutdown Workload VMs (Tanzu, K8s)
 PHASE 5: Shutdown Workload Domain NSX Edges (if separate from mgmt)
 PHASE 6: Shutdown Workload Domain NSX Manager (if separate from mgmt)
 PHASE 7: Shutdown Workload vCenters (LAST per VCF 9.0 workload domain order)
@@ -636,14 +636,13 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output('='*60)
     update_shutdown_status(4, 'Shutdown Workload VMs', dry_run)
     
-    # VM regex patterns to find and shutdown (Tanzu, K8s, vCLS, etc.)
-    # Order follows VCF docs: containerized workloads → Supervisor → TKG → vCLS
+    # VM regex patterns to find and shutdown (Tanzu, K8s, etc.)
+    # Order follows VCF docs: containerized workloads → Supervisor → TKG
     vm_patterns = [
         r'^kubernetes-cluster-.*$',  # TKGs clusters (worker nodes)
         r'^dev-project-.*$',  # vSphere with Tanzu projects
         r'^cci-service-.*$',  # CCI services
         r'^SupervisorControlPlaneVM.*$',  # Supervisor Control Plane VMs
-        r'^vCLS-.*$',  # vSphere Cluster Services VMs (per VCF docs)
     ]
     
     if lsf.config.has_option('SHUTDOWN', 'vm_patterns'):
