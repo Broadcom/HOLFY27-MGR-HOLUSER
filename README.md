@@ -15,7 +15,7 @@ The lab startup system boots VMs in a carefully orchestrated sequence to ensure 
 ### VCF Boot Sequence
 
 | Order | Task | Config Key | Description | Wait Time |
-|-------|------|------------|-------------|-----------|
+| ------- | ------ | ------------ | ------------- | ----------- |
 | 1 | Management Cluster | `vcfmgmtcluster` | Connect to ESXi hosts, exit maintenance mode | Variable |
 | 2 | Datastore Check | `vcfmgmtdatastore` | Verify VSAN/storage is accessible | Until ready |
 | 3 | NSX Manager | `vcfnsxmgr` | Start NSX Manager VMs | 30 seconds |
@@ -83,7 +83,7 @@ These VMs start in parallel with subsequent startup tasks, maximizing overall bo
 The system supports multiple lab types with different configurations:
 
 | Lab Type | Firewall | Proxy Filter | Description |
-|----------|----------|--------------|-------------|
+| ---------- | ---------- | -------------- | ------------- |
 | HOL | Yes | Yes | Full production Hands-on Labs |
 | Discovery | No | No | Simplified discovery environments |
 | VXP | Yes | Yes | VCF Experience Program demos |
@@ -106,9 +106,10 @@ Lab-specific configuration template containing all VM lists, URL checks, and fea
 
 ## Tools
 
-### confighol.py
+### confighol-9.0.py
 
-HOLification tool that prepares a vApp for HOL deployment:
+HOLification tool that prepares a vApp for HOL deployment. The script is named according to the VCF version it was developed and tested against - `confighol-9.0.py` is written and tested for VCF 9.0.1.
+
 - Imports Vault root CA to Firefox
 - Imports vCenter CA certificates to Firefox
 - Configures SSH access on ESXi hosts
@@ -116,13 +117,16 @@ HOLification tool that prepares a vApp for HOL deployment:
 - Configures NSX SSH access
 
 ```bash
-python3 Tools/confighol.py --dry-run    # Preview changes
-python3 Tools/confighol.py              # Full HOLification
+python3 Tools/confighol-9.0.py --dry-run    # Preview changes
+python3 Tools/confighol-9.0.py              # Full HOLification
 ```
+
+> **Note:** Future VCF versions may require a new script version (e.g., `confighol-9.1.py` for VCF 9.1.x).
 
 ### cert-replacement.py
 
 Manages SSL certificates for VCF components using HashiCorp Vault PKI:
+
 - Generates CSRs via SDDC Manager API
 - Signs certificates with Vault PKI (2-year TTL)
 - Replaces certificates on VCF components
@@ -153,6 +157,7 @@ The router mounts this share at `/mnt/manager` and applies configurations from t
 ### Proxy Not Working
 
 Check Squid configuration on router:
+
 ```bash
 ssh root@router "grep 'acl whitelist' /etc/squid/squid.conf"
 # Should show: acl whitelist dstdomain "/etc/squid/allowlist"
@@ -161,6 +166,7 @@ ssh root@router "grep 'acl whitelist' /etc/squid/squid.conf"
 ### NFS Mount Failing
 
 Verify directory exists and NFS is exported:
+
 ```bash
 ls -la /tmp/holorouter
 showmount -e localhost
@@ -169,6 +175,7 @@ showmount -e localhost
 ### VM Not Booting
 
 Check if VM is in the correct config section:
+
 ```bash
 grep -A10 '\[VCF\]' /tmp/config.ini
 ```

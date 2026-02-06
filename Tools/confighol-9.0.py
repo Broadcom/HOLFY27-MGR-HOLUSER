@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-# confighol.py - HOLFY27 vApp HOLification Tool
+# confighol-9.0.py - HOLFY27 vApp HOLification Tool
 # Version 2.1 - January 2026
 # Author - Burke Azbill and HOL Core Team
 #
+# Script Naming Convention:
+# This script is named according to the VCF version it was developed and
+# tested against: confighol-9.0.py for VCF 9.0.1. Future VCF versions may
+# require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
+#
 # This script automates the "HOLification" process for vApp templates
 # that will be used in VMware Hands-on Labs. It must be run after the
-# Holodeck factory build process completes.
+# Holodeck 9.0.x factory build process completes.
 #
 # OVERVIEW:
 # The HOL team leverages the Holodeck factory build process (documented
@@ -61,7 +66,12 @@
 #    - Set non-expiring passwords
 #    - Configure SSH authorized_keys
 #
-# 6. Final Steps:
+# 6. SDDC Manager Auto-Rotate Disable:
+#    - Queries SDDC Manager API for credentials with auto-rotate policies
+#    - Disables auto-rotation for all service credentials
+#    - Prevents failed password rotation tasks after template deployment
+#
+# 7. Final Steps:
 #    - Clear ARP cache on console and router
 #    - Run vpodchecker.py to update L2 VMs (uuid, typematicdelay)
 #
@@ -2194,6 +2204,280 @@ def configure_vcenter_ca_for_firefox(dry_run: bool = False) -> bool:
 
 
 #==============================================================================
+# SDDC MANAGER AUTO-ROTATE POLICY DISABLE
+#==============================================================================
+
+def disable_sddc_auto_rotate(dry_run: bool = False) -> bool:
+    """
+    Disable automatic password rotation for all SDDC Manager service credentials.
+
+    SDDC Manager configures automatic password rotation (typically every 30 days)
+    for service accounts used to communicate between VCF components (e.g., vCenter,
+    NSX Manager). In a lab/template environment, this auto-rotation causes failures
+    because the lab is frequently powered off, rebuilt, or cloned from a template.
+    When the rotation fires during a powered-off period or immediately after
+    deployment, it fails and creates unresolvable error notifications in the
+    SDDC Manager UI.
+
+    This function:
+    1. Authenticates to the SDDC Manager API
+    2. Retrieves all credentials with an autoRotatePolicy
+    3. Disables auto-rotation for each credential using the API
+    4. Waits for each disable task to complete
+
+    API Reference:
+        PATCH /v1/credentials with operationType: UPDATE_AUTO_ROTATE_POLICY
+        and autoRotatePolicy: { enableAutoRotatePolicy: false }
+
+    :param dry_run: If True, preview what would be done
+    :return: True if successful (or no auto-rotate policies found)
+    """
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    # Determine if SDDC Manager exists in this environment
+    sddc_host = None
+    if 'VCF' in lsf.config:
+        sddc_host = lsf.config.get('VCF', 'sddcmgr', fallback=None)
+    if not sddc_host:
+        sddc_host = 'sddcmanager-a.site-a.vcf.lab'
+
+    lsf.write_output('')
+    lsf.write_output('=' * 60)
+    lsf.write_output('SDDC Manager Auto-Rotate Policy Disable')
+    lsf.write_output('=' * 60)
+    lsf.write_output(f'SDDC Manager: {sddc_host}')
+
+    if dry_run:
+        lsf.write_output('Would check for credentials with auto-rotate policies')
+        lsf.write_output('Would disable auto-rotation for all service credentials')
+        return True
+
+    # Check connectivity
+    if not lsf.test_ping(sddc_host):
+        lsf.write_output(f'{sddc_host}: Not reachable - skipping auto-rotate disable')
+        return True  # Don't fail the overall process
+
+    password = lsf.get_password()
+
+    # Step 1: Get API token
+    lsf.write_output(f'{sddc_host}: Authenticating to SDDC Manager API...')
+    try:
+        token_url = f'https://{sddc_host}/v1/tokens'
+        token_body = {
+            'username': 'administrator@vsphere.local',
+            'password': password
+        }
+        response = requests.post(token_url, json=token_body, verify=False, timeout=30)
+        if response.status_code != 200:
+            lsf.write_output(f'{sddc_host}: Failed to authenticate (HTTP {response.status_code})')
+            return False
+        token = response.json().get('accessToken', '')
+        if not token:
+            lsf.write_output(f'{sddc_host}: No access token received')
+            return False
+        lsf.write_output(f'{sddc_host}: Authentication successful')
+    except Exception as e:
+        lsf.write_output(f'{sddc_host}: API authentication error: {e}')
+        return False
+
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    }
+
+    # Step 2: Get all credentials and find those with auto-rotate policies
+    lsf.write_output(f'{sddc_host}: Checking for credentials with auto-rotate policies...')
+    try:
+        creds_url = f'https://{sddc_host}/v1/credentials'
+        response = requests.get(creds_url, headers=headers, verify=False, timeout=30)
+        if response.status_code != 200:
+            lsf.write_output(f'{sddc_host}: Failed to get credentials (HTTP {response.status_code})')
+            return False
+
+        all_creds = response.json().get('elements', [])
+        auto_rotate_creds = [c for c in all_creds if c.get('autoRotatePolicy')]
+
+        if not auto_rotate_creds:
+            lsf.write_output(f'{sddc_host}: No credentials with auto-rotate policies found')
+            lsf.write_output(f'{sddc_host}: Nothing to disable')
+            return True
+
+        lsf.write_output(f'{sddc_host}: Found {len(auto_rotate_creds)} credential(s) '
+                         f'with auto-rotate enabled:')
+        for cred in auto_rotate_creds:
+            policy = cred['autoRotatePolicy']
+            lsf.write_output(f'  - {cred["username"]} on '
+                             f'{cred.get("resource", {}).get("resourceName", "?")} '
+                             f'({cred.get("credentialType")}) - '
+                             f'every {policy.get("frequencyInDays")} days')
+
+    except Exception as e:
+        lsf.write_output(f'{sddc_host}: Error retrieving credentials: {e}')
+        return False
+
+    # Step 3: Disable auto-rotate for each credential
+    # Group by resource to batch the API calls efficiently
+    # The API accepts multiple credentials per element in a single PATCH call
+    resource_groups = {}
+    for cred in auto_rotate_creds:
+        resource = cred.get('resource', {})
+        resource_name = resource.get('resourceName', '')
+        resource_type = resource.get('resourceType', '')
+        key = (resource_name, resource_type)
+
+        if key not in resource_groups:
+            resource_groups[key] = []
+        resource_groups[key].append({
+            'credentialType': cred.get('credentialType'),
+            'username': cred.get('username')
+        })
+
+    success = True
+    tasks = []
+
+    for (resource_name, resource_type), credentials in resource_groups.items():
+        lsf.write_output(f'{sddc_host}: Disabling auto-rotate for {resource_name} '
+                         f'({len(credentials)} credential(s))...')
+
+        patch_body = {
+            'operationType': 'UPDATE_AUTO_ROTATE_POLICY',
+            'elements': [{
+                'resourceName': resource_name,
+                'resourceType': resource_type,
+                'credentials': credentials
+            }],
+            'autoRotatePolicy': {
+                'enableAutoRotatePolicy': False
+            }
+        }
+
+        try:
+            response = requests.patch(
+                creds_url, headers=headers, json=patch_body,
+                verify=False, timeout=30
+            )
+
+            if response.status_code == 202:
+                task_data = response.json()
+                task_id = task_data.get('id', '')
+                lsf.write_output(f'{sddc_host}: Disable task submitted '
+                                 f'(task: {task_id[:8]}...)')
+                tasks.append(task_id)
+            else:
+                error_msg = ''
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get('message', '')
+                except Exception:
+                    error_msg = response.text[:200]
+                lsf.write_output(f'{sddc_host}: Failed to disable auto-rotate for '
+                                 f'{resource_name}: HTTP {response.status_code} - {error_msg}')
+                success = False
+
+        except Exception as e:
+            lsf.write_output(f'{sddc_host}: Error disabling auto-rotate for '
+                             f'{resource_name}: {e}')
+            success = False
+
+    # Step 4: Wait for tasks to complete
+    failed_tasks = []
+    if tasks:
+        lsf.write_output(f'{sddc_host}: Waiting for {len(tasks)} disable task(s) '
+                         f'to complete...')
+        time.sleep(10)
+
+        for task_id in tasks:
+            # Poll task status (up to 90 seconds)
+            task_success = False
+            for attempt in range(18):
+                try:
+                    task_url = f'https://{sddc_host}/v1/tasks/{task_id}'
+                    response = requests.get(
+                        task_url, headers=headers, verify=False, timeout=15
+                    )
+                    if response.status_code == 200:
+                        task_data = response.json()
+                        status = task_data.get('status', '')
+                        if status == 'SUCCESSFUL':
+                            lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... '
+                                             f'completed successfully')
+                            task_success = True
+                            break
+                        elif status == 'FAILED':
+                            # Extract error details for better logging
+                            error_msg = 'Unknown error'
+                            for subtask in task_data.get('subTasks', []):
+                                for error in subtask.get('errors', []):
+                                    error_msg = error.get('message', error_msg)
+                            lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... '
+                                             f'FAILED - {error_msg}')
+                            failed_tasks.append(task_id)
+                            break
+                        # Still in progress or pending, wait and retry
+                        time.sleep(5)
+                    else:
+                        time.sleep(5)
+                except Exception:
+                    time.sleep(5)
+
+            if not task_success and task_id not in failed_tasks:
+                lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... did not '
+                                 f'complete within timeout')
+
+    # Step 5: Cancel any failed tasks to prevent UI notifications
+    if failed_tasks:
+        lsf.write_output(f'{sddc_host}: Cancelling {len(failed_tasks)} failed task(s) '
+                         f'to prevent UI notifications...')
+        for task_id in failed_tasks:
+            try:
+                cancel_url = f'https://{sddc_host}/v1/credentials/tasks/{task_id}'
+                response = requests.delete(
+                    cancel_url, headers=headers, verify=False, timeout=15
+                )
+                if response.status_code in [200, 202]:
+                    lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... cancelled')
+                else:
+                    lsf.write_output(f'{sddc_host}: Could not cancel task '
+                                     f'{task_id[:8]}... (HTTP {response.status_code})')
+            except Exception as e:
+                lsf.write_output(f'{sddc_host}: Error cancelling task '
+                                 f'{task_id[:8]}...: {e}')
+
+    # Step 6: Verify
+    lsf.write_output(f'{sddc_host}: Verifying auto-rotate policies are disabled...')
+    try:
+        response = requests.get(creds_url, headers=headers, verify=False, timeout=30)
+        if response.status_code == 200:
+            remaining = [c for c in response.json().get('elements', [])
+                         if c.get('autoRotatePolicy')]
+            if not remaining:
+                lsf.write_output(f'{sddc_host}: SUCCESS - All auto-rotate policies '
+                                 f'have been disabled')
+            else:
+                lsf.write_output(f'{sddc_host}: WARNING - {len(remaining)} credential(s) '
+                                 f'still have auto-rotate enabled '
+                                 f'(resource may not be in ACTIVE state):')
+                for cred in remaining:
+                    res_name = cred.get('resource', {}).get('resourceName', '?')
+                    lsf.write_output(f'  - {cred["username"]} on {res_name}')
+                lsf.write_output(f'{sddc_host}: NOTE - These can be manually disabled '
+                                 f'once the resources are in ACTIVE state')
+    except Exception as e:
+        lsf.write_output(f'{sddc_host}: Could not verify: {e}')
+
+    if failed_tasks:
+        lsf.write_output(f'{sddc_host}: Completed with {len(failed_tasks)} resource(s) '
+                         f'unavailable - auto-rotate could not be disabled for '
+                         f'resources not in ACTIVE state')
+    else:
+        lsf.write_output(f'{sddc_host}: Auto-rotate disable completed successfully')
+
+    return True  # Don't fail HOLification for unavailable resources
+
+
+#==============================================================================
 # FINAL CLEANUP
 #==============================================================================
 
@@ -2255,7 +2539,8 @@ def main():
     5. SDDC Manager configuration
     6. Aria Automation VMs configuration (uses vmware-system-user)
     7. Operations VMs configuration
-    8. Final cleanup
+    8. Disable SDDC Manager auto-rotate policies (prevents post-deployment failures)
+    9. Final cleanup
     """
     parser = argparse.ArgumentParser(
         description='HOLFY27 vApp HOLification Tool',
@@ -2388,7 +2673,12 @@ NOTE: Some NSX operations require manual steps first.
     # Step 6: Configure Operations VMs
     configure_operations_vms(auth_keys_file, password, args.dry_run)
     
-    # Step 7: Final cleanup
+    # Step 7: Disable SDDC Manager auto-rotate policies
+    # This prevents credential rotation failures when the lab template is deployed
+    if 'VCF' in lsf.config or not args.esx_only:
+        disable_sddc_auto_rotate(args.dry_run)
+    
+    # Step 8: Final cleanup
     perform_final_cleanup(args.dry_run)
     
     # Print summary

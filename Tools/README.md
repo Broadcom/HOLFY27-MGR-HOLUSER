@@ -12,7 +12,7 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
   - [Table of Contents](#table-of-contents)
   - [Python Scripts](#python-scripts)
     - [cert-replacement.py](#cert-replacementpy)
-    - [confighol.py](#configholpy)
+    - [confighol-9.0.py](#confighol-90py)
     - [checkfw.py](#checkfwpy)
     - [dns\_checks.py](#dns_checkspy)
     - [labtypes.py](#labtypespy)
@@ -133,9 +133,11 @@ python3 cert-replacement.py --dry-run
 
 ---
 
-### confighol.py
+### confighol-9.0.py
 
-**vApp HOLification Tool:**
+**vApp HOLification Tool for VCF 9.0.1:**
+
+> **Naming Convention:** This script is named according to the VCF version it was developed and tested against. The current version `confighol-9.0.py` is written and tested for VCF 9.0.1. Future VCF versions may require a new script (e.g., `confighol-9.1.py` for VCF 9.1.x).
 
 Comprehensive automation tool for "HOLifying" vApp templates after the Holodeck factory build process. This script consolidates and replaces the previous `esx-config.py` and `configvsphere.ps1` scripts into a single, unified tool.
 
@@ -247,19 +249,19 @@ Enter choice [S/R/F]:
 
 ```bash
 # Full interactive HOLification
-python3 confighol.py
+python3 confighol-9.0.py
 
 # Preview what would be done (no changes)
-python3 confighol.py --dry-run
+python3 confighol-9.0.py --dry-run
 
 # Skip vCenter shell configuration
-python3 confighol.py --skip-vcshell
+python3 confighol-9.0.py --skip-vcshell
 
 # Skip NSX configuration
-python3 confighol.py --skip-nsx
+python3 confighol-9.0.py --skip-nsx
 
 # Only configure ESXi hosts
-python3 confighol.py --esx-only
+python3 confighol-9.0.py --esx-only
 ```
 
 **Options:**
