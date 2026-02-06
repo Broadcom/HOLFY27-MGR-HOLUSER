@@ -79,33 +79,34 @@ get_elapsed_time() {
 }
 
 # Helper function for logging
-# When --stdout-only is set, output goes ONLY to stdout (no tee to log file)
+# When --stdout-only is set, output goes ONLY to stdout with NO timestamp
+# (the caller, e.g. VCFfinal.py via lsf.write_output(), adds its own timestamp)
 log_msg() {
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     if [[ "${STDOUT_ONLY}" == "true" ]]; then
-        echo "[${timestamp}] $1"
+        echo "$1"
     else
+        local timestamp
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
         echo "[${timestamp}] $1" | tee -a "${LOG_FILE}"
     fi
 }
 
 log_error() {
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     if [[ "${STDOUT_ONLY}" == "true" ]]; then
-        echo "[${timestamp}] ERROR: $1" >&2
+        echo "ERROR: $1" >&2
     else
+        local timestamp
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
         echo "[${timestamp}] ERROR: $1" | tee -a "${LOG_FILE}" >&2
     fi
 }
 
 log_warn() {
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     if [[ "${STDOUT_ONLY}" == "true" ]]; then
-        echo "[${timestamp}] WARNING: $1"
+        echo "WARNING: $1"
     else
+        local timestamp
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
         echo "[${timestamp}] WARNING: $1" | tee -a "${LOG_FILE}"
     fi
 }
