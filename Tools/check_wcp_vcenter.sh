@@ -3,6 +3,8 @@
 # Version: 2.0
 # Date: 2026-02-06
 # Script to check and fix critical vCenter services for Workload Control Plane (WCP)
+# This is a utility script checks some services on the vCenter and starts them if they are not running.
+#  it is not called by VCFfinal.py since the functionality has been added to core scripts. Included here for reference or manual use.
 # This script:
 # 1. Verifies vCenter is reachable
 # 2. Checks and starts vAPI endpoint service
