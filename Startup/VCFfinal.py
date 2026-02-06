@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 3.1 - January 2026
+# Version 3.2 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, Aria)
 
@@ -171,14 +171,19 @@ def main(lsf=None, standalone=False, dry_run=False):
                 
                 try:
                     # Check service status via vmon-cli
-                    check_cmd = f"vmon-cli -s {service} 2>/dev/null | grep 'RunState:' | awk '{{print $2}}'"
+                    # Use grep + sed to extract just the status value
+                    # (awk through ssh can lose field separation)
+                    check_cmd = f"vmon-cli -s {service} 2>/dev/null | grep RunState | sed 's/.*RunState: //'"
                     result = lsf.ssh(check_cmd, f'root@{wcp_vcenter}')
                     
                     status = ''
                     if hasattr(result, 'stdout') and result.stdout:
                         status = result.stdout.strip()
                     
-                    if status == 'STARTED':
+                    # Robust check: accept STARTED anywhere in the status string
+                    service_running = 'STARTED' in status
+                    
+                    if service_running:
                         lsf.write_output(f'  {service}: RUNNING')
                     else:
                         lsf.write_output(f'  {service}: NOT RUNNING (status: {status})')
@@ -194,12 +199,11 @@ def main(lsf=None, standalone=False, dry_run=False):
                         
                         # Re-check status
                         result = lsf.ssh(check_cmd, f'root@{wcp_vcenter}')
+                        new_status = ''
                         if hasattr(result, 'stdout') and result.stdout:
                             new_status = result.stdout.strip()
-                        else:
-                            new_status = ''
                         
-                        if new_status == 'STARTED':
+                        if 'STARTED' in new_status:
                             lsf.write_output(f'  {service}: Started successfully')
                         else:
                             lsf.write_output(f'  WARNING: {service} may still have issues (status: {new_status})')
@@ -211,6 +215,11 @@ def main(lsf=None, standalone=False, dry_run=False):
                     lsf.write_output(f'  Error checking {service}: {svc_err}')
                     wcp_vcenter_ok = False
         
+        if wcp_vcenter_ok:
+            lsf.write_output('WCP vCenter Services: All services running')
+        else:
+            lsf.write_output('WCP vCenter Services: Had issues but attempted to start services')
+        
         if dashboard:
             if wcp_vcenter_ok:
                 dashboard.update_task('vcffinal', 'wcp_vcenter', TaskStatus.COMPLETE)
@@ -220,42 +229,85 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.generate_html()
         
         #----------------------------------------------------------------------
-        # TASK 2b: START - Power on the Tanzu Control Plane VMs
+        # TASK 2b: VERIFY - Confirm Tanzu Control Plane VMs are running
+        # These are system-managed VMs (EAM agents) that we cannot power on
+        # directly via the vCenter API due to permission restrictions.
+        # Instead, we verify they are already powered on and running.
         #----------------------------------------------------------------------
         lsf.write_output('='*60)
-        lsf.write_output('Starting Tanzu Control Plane VMs')
+        lsf.write_output('Verifying Tanzu Control Plane VMs')
         lsf.write_output('='*60)
         lsf.write_vpodprogress('Tanzu Control Plane', 'GOOD-3')
         
-        tanzu_start_ok = True
+        tanzu_verify_ok = True
         try:
             tanzu_control_raw = lsf.config.get('VCFFINAL', 'tanzucontrol')
             tanzu_control_vms = [v.strip() for v in tanzu_control_raw.split('\n') if v.strip()]
             
             if tanzu_control_vms:
-                lsf.start_nested(tanzu_control_vms)
-                lsf.write_output(f'Tanzu Control Plane VMs started: {len(tanzu_control_vms)}')
+                import re as _re
+                
+                # Connect to the WCP vCenter to check SCP VMs
+                # We need a connection to the vCenter that owns the SCP VMs
+                wcp_si = None
+                if wcp_vcenter in lsf.sisvc:
+                    wcp_si = lsf.sisvc[wcp_vcenter]
+                else:
+                    # Try to connect to the WCP vCenter
+                    lsf.write_output(f'Connecting to {wcp_vcenter} for SCP VM verification...')
+                    wcp_si = lsf.connect_vc(wcp_vcenter, 'administrator@wld.sso')
+                
+                if wcp_si:
+                    all_vms = lsf.get_all_objs(wcp_si.content, [vim.VirtualMachine])
+                    
+                    for tanzu_entry in tanzu_control_vms:
+                        parts = tanzu_entry.split(':')
+                        vm_pattern = parts[0].strip()
+                        
+                        # Find matching VMs
+                        pattern = _re.compile(vm_pattern, _re.IGNORECASE)
+                        matched = False
+                        
+                        for vm_obj in all_vms:
+                            if pattern.match(vm_obj.name):
+                                matched = True
+                                power_state = vm_obj.runtime.powerState
+                                if power_state == vim.VirtualMachinePowerState.poweredOn:
+                                    lsf.write_output(f'  {vm_obj.name}: Powered On')
+                                else:
+                                    lsf.write_output(f'  WARNING: {vm_obj.name}: {power_state}')
+                                    lsf.write_output(f'    This is a system-managed VM (EAM agent)')
+                                    lsf.write_output(f'    It should be automatically started by vCenter/WCP')
+                                    lsf.write_output(f'    If it remains off, check WCP service health in vCenter')
+                                    tanzu_verify_ok = False
+                        
+                        if not matched:
+                            lsf.write_output(f'  No VMs matching pattern "{vm_pattern}" found')
+                            lsf.write_output(f'    This may be normal if the Supervisor has not been enabled')
+                else:
+                    lsf.write_output(f'WARNING: Could not connect to {wcp_vcenter} to verify SCP VMs')
+                    lsf.write_output('  Continuing without verification...')
             else:
                 lsf.write_output('No Tanzu Control Plane VMs specified in config')
             
         except Exception as e:
-            lsf.write_output(f'Error starting Tanzu Control Plane VMs: {e}')
-            tanzu_start_ok = False
+            lsf.write_output(f'Error verifying Tanzu Control Plane VMs: {e}')
+            tanzu_verify_ok = False
         
         if dashboard:
-            if tanzu_start_ok:
+            if tanzu_verify_ok:
                 dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.COMPLETE)
             else:
-                dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.FAILED)
+                dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.FAILED, 'VMs not running')
             dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.RUNNING)
             dashboard.generate_html()
         
         #----------------------------------------------------------------------
-        # TASK 2c: POST-START - Run check_fix_wcp.sh for certificates/webhooks
-        # This runs AFTER VMs are started to fix k8s certificates
+        # TASK 2c: POST-VERIFY - Run check_fix_wcp.sh for certificates/webhooks
+        # This runs AFTER VMs are verified to fix k8s certificates
         #----------------------------------------------------------------------
         lsf.write_output('='*60)
-        lsf.write_output('WCP Certificate Fix (post-start)')
+        lsf.write_output('WCP Certificate Fix (post-verify)')
         lsf.write_output('='*60)
         lsf.write_vpodprogress('WCP Certificate Fix', 'GOOD-3')
         
@@ -263,18 +315,40 @@ def main(lsf=None, standalone=False, dry_run=False):
         wcp_certs_ok = True
         
         if os.path.isfile(check_fix_wcp_script):
+            # Verify the script is executable before attempting to run it
+            if not os.access(check_fix_wcp_script, os.X_OK):
+                lsf.write_output(f'  Script is not executable: {check_fix_wcp_script}')
+                lsf.write_output(f'  Setting execute permission...')
+                try:
+                    os.chmod(check_fix_wcp_script, 0o755)
+                    lsf.write_output(f'  Execute permission set successfully')
+                except Exception as chmod_err:
+                    lsf.write_output(f'  ERROR: Failed to set execute permission: {chmod_err}')
+                    lsf.write_output(f'  Will run via bash interpreter as fallback')
+            
             lsf.write_output(f'Running: {check_fix_wcp_script} {wcp_vcenter}')
             
             try:
-                wcp_cmd = f'{check_fix_wcp_script} {wcp_vcenter}'
+                # Run via /bin/bash explicitly to avoid execute permission issues
+                wcp_cmd = f'/bin/bash {check_fix_wcp_script} {wcp_vcenter}'
                 result = lsf.run_command(wcp_cmd)
                 
                 exit_code = result.returncode if hasattr(result, 'returncode') else (0 if result else 1)
                 
+                # Log stdout/stderr from the script for diagnostics
+                if hasattr(result, 'stdout') and result.stdout:
+                    for line in result.stdout.strip().split('\n'):
+                        if line.strip():
+                            lsf.write_output(f'  [WCP] {line.strip()}')
+                if hasattr(result, 'stderr') and result.stderr:
+                    for line in result.stderr.strip().split('\n'):
+                        if line.strip():
+                            lsf.write_output(f'  [WCP-ERR] {line.strip()}')
+                
                 if exit_code == 0:
                     lsf.write_output('WCP certificate fix completed successfully')
                 elif exit_code == 2:
-                    lsf.write_output('WARNING: Supervisor Control Plane not running (encryption issue)')
+                    lsf.write_output('WARNING: Supervisor Control Plane not running (encryption/hypercrypt issue)')
                     lsf.write_output('  This may resolve after VMs fully boot - continuing...')
                     wcp_certs_ok = False
                 elif exit_code == 3:
@@ -282,6 +356,16 @@ def main(lsf=None, standalone=False, dry_run=False):
                     wcp_certs_ok = False
                 elif exit_code == 4:
                     lsf.write_output('WARNING: kubectl commands failed - certificates may need attention')
+                    wcp_certs_ok = False
+                elif exit_code == 5:
+                    lsf.write_output('WARNING: vCenter WCP services could not be started')
+                    wcp_certs_ok = False
+                elif exit_code == 126:
+                    lsf.write_output('ERROR: WCP script is not executable (exit code 126)')
+                    lsf.write_output(f'  Fix: chmod +x {check_fix_wcp_script}')
+                    wcp_certs_ok = False
+                elif exit_code == 127:
+                    lsf.write_output('ERROR: WCP script interpreter not found (exit code 127)')
                     wcp_certs_ok = False
                 else:
                     lsf.write_output(f'WARNING: WCP script exited with code {exit_code}')
