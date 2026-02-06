@@ -25,8 +25,23 @@
 # Don't exit on error - we handle errors explicitly
 set +e
 
+# Parse options: --stdout-only means don't write directly to log file
+# (caller handles logging, e.g. VCFfinal.py captures stdout/stderr)
+STDOUT_ONLY=false
+POSITIONAL_ARGS=()
+for arg in "$@"; do
+    case $arg in
+        --stdout-only)
+            STDOUT_ONLY=true
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$arg")
+            ;;
+    esac
+done
+
 # Configuration
-VCENTER_HOST="${1:-vc-wld01-a.site-a.vcf.lab}"
+VCENTER_HOST="${POSITIONAL_ARGS[0]:-vc-wld01-a.site-a.vcf.lab}"
 VCENTER_USER="root"
 DECRYPT_CMD="/usr/lib/vmware-wcp/decryptK8Pwd.py"
 CREDS_FILE="/home/holuser/creds.txt"
@@ -39,7 +54,9 @@ POLL_INTERVAL=30      # seconds between polls
 MAX_POLL_TIME=1800    # 30 minutes maximum total wait
 
 # Ensure log directory exists
-mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null
+if [[ "${STDOUT_ONLY}" != "true" ]]; then
+    mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null
+fi
 
 # Track total elapsed time across all wait phases
 TOTAL_START_TIME=$(date +%s)
@@ -62,22 +79,35 @@ get_elapsed_time() {
 }
 
 # Helper function for logging
+# When --stdout-only is set, output goes ONLY to stdout (no tee to log file)
 log_msg() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[${timestamp}] $1" | tee -a "${LOG_FILE}"
+    if [[ "${STDOUT_ONLY}" == "true" ]]; then
+        echo "[${timestamp}] $1"
+    else
+        echo "[${timestamp}] $1" | tee -a "${LOG_FILE}"
+    fi
 }
 
 log_error() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[${timestamp}] ERROR: $1" | tee -a "${LOG_FILE}" >&2
+    if [[ "${STDOUT_ONLY}" == "true" ]]; then
+        echo "[${timestamp}] ERROR: $1" >&2
+    else
+        echo "[${timestamp}] ERROR: $1" | tee -a "${LOG_FILE}" >&2
+    fi
 }
 
 log_warn() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[${timestamp}] WARNING: $1" | tee -a "${LOG_FILE}"
+    if [[ "${STDOUT_ONLY}" == "true" ]]; then
+        echo "[${timestamp}] WARNING: $1"
+    else
+        echo "[${timestamp}] WARNING: $1" | tee -a "${LOG_FILE}"
+    fi
 }
 
 # Helper function to execute SSH with fallback to sshpass
@@ -308,55 +338,123 @@ fi
 nodeIP="${ACTUAL_IP}"
 
 #==========================================================================
-# Step 5: Delete old certificates and restart webhooks
+# Step 5: Check certificate expiration and renew only if needed
+# Only delete/regenerate certificates that are expired or expiring within 48 hours
 #==========================================================================
 
-# The following must be restarted for Workload Supervisor cluster when the certificates have expired
-# The restart triggers the regeneration of the certificates, allowing for VM creation in the lab
+EXPIRY_THRESHOLD=172800  # 48 hours in seconds
+
+# Function to check if a K8s secret's certificate is expired or expiring soon
+# Returns: 0 if expired/expiring (needs renewal), 1 if valid, 2 if secret not found
+check_cert_expiry() {
+    local namespace=$1
+    local secret_name=$2
+
+    # Get the certificate data from the secret
+    local cert_data
+    cert_data=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+        "kubectl -n ${namespace} get secret ${secret_name} -o jsonpath='{.data.tls\\.crt}' 2>/dev/null" 2>/dev/null)
+
+    if [[ -z "${cert_data}" ]]; then
+        # Secret doesn't exist or has no tls.crt
+        return 2
+    fi
+
+    # Extract the expiration date from the certificate
+    local end_date
+    end_date=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+        "echo '${cert_data}' | base64 -d 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null" 2>/dev/null)
+
+    if [[ -z "${end_date}" ]]; then
+        log_warn "Could not parse certificate in ${namespace}/${secret_name}"
+        return 0  # Cannot determine - treat as needing renewal
+    fi
+
+    # Parse the date: "notAfter=May  7 14:54:44 2026 GMT"
+    local expiry_str
+    expiry_str=$(echo "${end_date}" | sed 's/notAfter=//')
+
+    # Convert to epoch using date command
+    local expiry_epoch
+    expiry_epoch=$(date -d "${expiry_str}" +%s 2>/dev/null)
+
+    if [[ -z "${expiry_epoch}" ]]; then
+        log_warn "Could not parse expiry date: ${expiry_str}"
+        return 0  # Cannot determine - treat as needing renewal
+    fi
+
+    local now_epoch
+    now_epoch=$(date +%s)
+    local remaining=$((expiry_epoch - now_epoch))
+    local remaining_days=$((remaining / 86400))
+    local remaining_hours=$(( (remaining % 86400) / 3600 ))
+
+    if [[ ${remaining} -le 0 ]]; then
+        log_msg "  ${namespace}/${secret_name}: EXPIRED (expired ${remaining_days#-} days ago)"
+        return 0
+    elif [[ ${remaining} -le ${EXPIRY_THRESHOLD} ]]; then
+        log_msg "  ${namespace}/${secret_name}: EXPIRING SOON (${remaining_hours}h remaining)"
+        return 0
+    else
+        log_msg "  ${namespace}/${secret_name}: Valid (${remaining_days}d ${remaining_hours}h remaining)"
+        return 1
+    fi
+}
 
 log_msg "=========================================="
-log_msg "Deleting storage-quota-root-ca-secret..."
+log_msg "Checking WCP certificate expiration (48h threshold)..."
 log_msg "=========================================="
-if /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n vmware-system-cert-manager delete secret storage-quota-root-ca-secret --ignore-not-found=true" >> "${LOG_FILE}" 2>&1; then
-    log_msg "Deleted storage-quota-root-ca-secret"
+
+# Define the certificates to check: namespace:secret_name
+CERTS_TO_CHECK=(
+    "vmware-system-cert-manager:storage-quota-root-ca-secret"
+    "kube-system:storage-quota-webhook-server-internal-cert"
+    "kube-system:cns-storage-quota-extension-cert"
+)
+
+CERTS_NEED_RENEWAL=false
+
+for cert_entry in "${CERTS_TO_CHECK[@]}"; do
+    CERT_NS=$(echo "${cert_entry}" | cut -d: -f1)
+    CERT_NAME=$(echo "${cert_entry}" | cut -d: -f2)
+
+    check_cert_expiry "${CERT_NS}" "${CERT_NAME}"
+    CERT_STATUS=$?
+
+    if [[ ${CERT_STATUS} -eq 0 ]]; then
+        # Expired or expiring - delete to trigger regeneration
+        CERTS_NEED_RENEWAL=true
+        log_msg "  Deleting ${CERT_NS}/${CERT_NAME} to trigger regeneration..."
+        /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+            "kubectl -n ${CERT_NS} delete secret ${CERT_NAME} --ignore-not-found=true" >/dev/null 2>&1
+        log_msg "  Deleted ${CERT_NAME}"
+    elif [[ ${CERT_STATUS} -eq 2 ]]; then
+        log_msg "  ${CERT_NS}/${CERT_NAME}: Not found (will be created automatically)"
+    fi
+    # CERT_STATUS 1 = valid, no action needed
+done
+
+if [[ "${CERTS_NEED_RENEWAL}" == "true" ]]; then
+    log_msg "=========================================="
+    log_msg "Restarting deployments to regenerate certificates..."
+    log_msg "=========================================="
+
+    if /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+        "kubectl -n kube-system rollout restart deploy cns-storage-quota-extension 2>/dev/null || echo 'Deployment not found'" >/dev/null 2>&1; then
+        log_msg "Restarted cns-storage-quota-extension deployment"
+    fi
+
+    if /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+        "kubectl -n kube-system rollout restart deploy storage-quota-webhook 2>/dev/null || echo 'Deployment not found'" >/dev/null 2>&1; then
+        log_msg "Restarted storage-quota-webhook deployment"
+    fi
+
+    log_msg "Waiting 20 seconds for deployments to restart..."
+    sleep 20
 else
-    log_warn "Could not delete storage-quota-root-ca-secret (may not exist)"
+    log_msg "All certificates are valid - no renewal needed"
+    log_msg "Skipping deployment restarts"
 fi
-
-log_msg "=========================================="
-log_msg "Deleting storage-quota-webhook-server-internal-cert..."
-log_msg "=========================================="
-if /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n kube-system delete secret storage-quota-webhook-server-internal-cert --ignore-not-found=true" >> "${LOG_FILE}" 2>&1; then
-    log_msg "Deleted storage-quota-webhook-server-internal-cert"
-else
-    log_warn "Could not delete storage-quota-webhook-server-internal-cert (may not exist)"
-fi
-
-log_msg "=========================================="
-log_msg "Deleting cns-storage-quota-extension-cert..."
-log_msg "=========================================="
-if /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n kube-system delete secret cns-storage-quota-extension-cert --ignore-not-found=true" >> "${LOG_FILE}" 2>&1; then
-    log_msg "Deleted cns-storage-quota-extension-cert"
-else
-    log_warn "Could not delete cns-storage-quota-extension-cert (may not exist)"
-fi
-
-log_msg "=========================================="
-log_msg "Restarting cns-storage-quota-extension..."
-log_msg "=========================================="
-if /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n kube-system rollout restart deploy cns-storage-quota-extension 2>/dev/null || echo 'Deployment not found'" >> "${LOG_FILE}" 2>&1; then
-    log_msg "Restarted cns-storage-quota-extension deployment"
-fi
-
-log_msg "=========================================="
-log_msg "Restarting storage-quota-webhook..."
-log_msg "=========================================="
-if /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n kube-system rollout restart deploy storage-quota-webhook 2>/dev/null || echo 'Deployment not found'" >> "${LOG_FILE}" 2>&1; then
-    log_msg "Restarted storage-quota-webhook deployment"
-fi
-
-log_msg "Waiting 20 seconds for deployments to restart..."
-sleep 20
 
 #==========================================================================
 # Step 6: Scale up services

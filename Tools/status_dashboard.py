@@ -144,10 +144,10 @@ class StatusDashboard:
         6. pings.py     - Network connectivity verification
         7. services.py  - Linux services and TCP port verification
         8. Kubernetes.py - Kubernetes certificate checks
-        9. VCFfinal.py  - VCF final tasks (Tanzu, Aria)
-        10. urls.py     - URL verification
-        11. odyssey.py  - Odyssey client installation
-        12. final.py    - Final checks and cleanup
+        9. urls.py      - URL verification
+        10. VCFfinal.py - VCF final tasks (Tanzu, Aria)
+        11. final.py    - Final checks and cleanup
+        12. odyssey.py  - Odyssey client installation
         """
         # Define groups in execution order (top-to-bottom)
         default_groups = [
@@ -197,6 +197,7 @@ class StatusDashboard:
                 ('drs', 'DRS Configuration', 'Configure DRS settings'),
                 ('shell_warning', 'Shell Warning Suppress', 'Suppress ESXi shell warnings'),
                 ('vcenter_ready', 'vCenter Ready', 'Verify vCenter UI is accessible'),
+                ('autostart_services', 'Autostart Services', 'Verify all autostart vCenter services are running'),
                 ('power_on_vms', 'Power On VMs', 'Power on configured virtual machines'),
                 ('power_on_vapps', 'Power On vApps', 'Power on configured vApps'),
                 ('nested_vms', 'Nested VMs Complete', 'All VM startup tasks completed'),
@@ -219,34 +220,34 @@ class StatusDashboard:
                 ('cert_renew', 'Certificate Renewal', 'Renew expired certificates if needed'),
             ]),
             
-            # Group 9: VCFfinal.py - VCF Final Tasks
-            ('vcffinal', '9. VCF Final Tasks (VCFfinal.py)', [
+            # Group 9: urls.py - URL Verification
+            ('urls', '9. URL Verification (urls.py)', [
+                ('url_checks', 'URL Checks', 'Verify all configured web interfaces'),
+            ]),
+            
+            # Group 10: VCFfinal.py - VCF Final Tasks
+            ('vcffinal', '10. VCF Final Tasks (VCFfinal.py)', [
                 ('wcp_vcenter', 'WCP vCenter Services', 'Verify vCenter WCP services (trustmanagement, wcp)'),
-                ('tanzu_control', 'Tanzu Control Plane', 'Start Supervisor control plane VMs'),
+                ('tanzu_control', 'Tanzu Control Plane', 'Verify Supervisor Control Plane status'),
                 ('wcp_certs', 'WCP Certificate Fix', 'Fix Kubernetes certificates and webhooks'),
                 ('tanzu_deploy', 'Tanzu Deployment', 'Run Tanzu deployment scripts'),
                 ('aria_vms', 'Aria VMs', 'Start Aria Automation virtual machines'),
                 ('aria_urls', 'Aria URL Verification', 'Verify Aria Automation URLs'),
             ]),
             
-            # Group 10: urls.py - URL Verification
-            ('urls', '10. URL Verification (urls.py)', [
-                ('url_checks', 'URL Checks', 'Verify all configured web interfaces'),
-            ]),
-            
-            # Group 11: odyssey.py - Odyssey Installation
-            ('odyssey', '11. Odyssey Installation (odyssey.py)', [
-                ('cleanup', 'Odyssey Cleanup', 'Remove existing Odyssey files'),
-                ('install', 'Odyssey Install', 'Download and install Odyssey client'),
-                ('shortcut', 'Desktop Shortcut', 'Create desktop shortcut'),
-            ]),
-            
-            # Group 12: final.py - Final Checks
-            ('final', '12. Final Checks (final.py)', [
+            # Group 11: final.py - Final Checks
+            ('final', '11. Final Checks (final.py)', [
                 ('custom', 'Custom Checks', 'Lab-specific final checks'),
                 ('labcheck', 'LabCheck Schedule', 'Configure labcheck scheduled task'),
                 ('holuser_lock', 'holuser lock', 'Lock holuser account if configured'),
                 ('ready', 'Lab Ready', 'Mark lab as ready'),
+            ]),
+            
+            # Group 12: odyssey.py - Odyssey Installation
+            ('odyssey', '12. Odyssey Installation (odyssey.py)', [
+                ('cleanup', 'Odyssey Cleanup', 'Remove existing Odyssey files'),
+                ('install', 'Odyssey Install', 'Download and install Odyssey client'),
+                ('shortcut', 'Desktop Shortcut', 'Create desktop shortcut'),
             ]),
         ]
         

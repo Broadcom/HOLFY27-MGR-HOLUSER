@@ -432,20 +432,23 @@ def main(lsf=None, standalone=False, dry_run=False):
             try:
                 # Run via /bin/bash explicitly to avoid execute permission issues
                 # Use extended timeout since the script has internal polling
-                wcp_cmd = f'/bin/bash {check_fix_wcp_script} {wcp_vcenter}'
+                # Pass --stdout-only so script does not also write to log file directly
+                # (VCFfinal.py handles all logging via lsf.write_output)
+                wcp_cmd = f'/bin/bash {check_fix_wcp_script} --stdout-only {wcp_vcenter}'
                 result = lsf.run_command(wcp_cmd, timeout=WCP_SCRIPT_TIMEOUT)
                 
                 exit_code = result.returncode if hasattr(result, 'returncode') else (0 if result else 1)
                 
-                # Log stdout/stderr from the script for diagnostics
+                # Log stdout from the script (timestamps already included by script)
                 if hasattr(result, 'stdout') and result.stdout:
                     for line in result.stdout.strip().split('\n'):
                         if line.strip():
-                            lsf.write_output(f'  [WCP] {line.strip()}')
+                            lsf.write_output(f'  {line.strip()}')
+                # Log stderr (errors/warnings from the script)
                 if hasattr(result, 'stderr') and result.stderr:
                     for line in result.stderr.strip().split('\n'):
                         if line.strip():
-                            lsf.write_output(f'  [WCP-ERR] {line.strip()}')
+                            lsf.write_output(f'  {line.strip()}')
                 
                 if exit_code == 0:
                     lsf.write_output('WCP certificate fix completed successfully')

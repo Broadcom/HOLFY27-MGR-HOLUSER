@@ -23,9 +23,23 @@
 # Don't exit on error - we handle errors explicitly
 set +e
 
+# Parse options: --stdout-only means don't write directly to log file
+STDOUT_ONLY=false
+POSITIONAL_ARGS=()
+for arg in "$@"; do
+    case $arg in
+        --stdout-only)
+            STDOUT_ONLY=true
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$arg")
+            ;;
+    esac
+done
+
 # Configuration
-VCENTER_HOST="${1:-vc-wld01-a.site-a.vcf.lab}"
-SSO_DOMAIN="${2:-wld.sso}"
+VCENTER_HOST="${POSITIONAL_ARGS[0]:-vc-wld01-a.site-a.vcf.lab}"
+SSO_DOMAIN="${POSITIONAL_ARGS[1]:-wld.sso}"
 VCENTER_USER="root"
 CREDS_FILE="/home/holuser/creds.txt"
 LOG_FILE="/lmchol/hol/labstartup.log"
@@ -36,25 +50,40 @@ POLL_INTERVAL=30      # seconds between polls
 MAX_POLL_TIME=1800    # 30 minutes maximum wait
 
 # Ensure log directory exists
-mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null
+if [[ "${STDOUT_ONLY}" != "true" ]]; then
+    mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null
+fi
 
 # Helper function for logging
+# When --stdout-only is set, output goes ONLY to stdout (no tee to log file)
 log_msg() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[${timestamp}] $1" | tee -a "${LOG_FILE}"
+    if [[ "${STDOUT_ONLY}" == "true" ]]; then
+        echo "[${timestamp}] $1"
+    else
+        echo "[${timestamp}] $1" | tee -a "${LOG_FILE}"
+    fi
 }
 
 log_error() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[${timestamp}] ERROR: $1" | tee -a "${LOG_FILE}" >&2
+    if [[ "${STDOUT_ONLY}" == "true" ]]; then
+        echo "[${timestamp}] ERROR: $1" >&2
+    else
+        echo "[${timestamp}] ERROR: $1" | tee -a "${LOG_FILE}" >&2
+    fi
 }
 
 log_warn() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[${timestamp}] WARNING: $1" | tee -a "${LOG_FILE}"
+    if [[ "${STDOUT_ONLY}" == "true" ]]; then
+        echo "[${timestamp}] WARNING: $1"
+    else
+        echo "[${timestamp}] WARNING: $1" | tee -a "${LOG_FILE}"
+    fi
 }
 
 # Helper function to execute SSH with fallback to sshpass
