@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VCF.py - HOLFY27 Core VCF Startup Module
-# Version 3.2 - February 2026
+# Version 3.3 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation startup sequence
 #
@@ -11,6 +11,18 @@
 #   actually registered on. This eliminates FileNotFound / Device-busy errors
 #   caused by vCenter state mismatches after unclean shutdown, and removes the
 #   dependency on the config.ini host hint being correct (DRS may have moved VMs).
+# - If any edge VM fails to power on, the lab FAILS immediately (lsf.labfail)
+#   to prevent downstream cascading failures from missing NSX routing.
+# v3.3 Changes:
+# - Fix: After DRS/HA moves a VM, it can be registered on multiple ESXi hosts
+#   simultaneously (stale registration on old host, active on new host). The
+#   stale registration has its VMX file locked by the host actually running it,
+#   causing FileNotFound / Device-busy on power-on. _start_vm_on_hosts now:
+#   1. Finds ALL registrations across all hosts (not just the first one)
+#   2. If any registration is poweredOn, returns immediately (already running)
+#   3. Tries to power on each candidate; if FileNotFound/Device-busy (VMX
+#      locked = stale registration), skips to the next host automatically
+#   4. Re-checks state after all attempts in case the VM was running all along
 # - If any edge VM fails to power on, the lab FAILS immediately (lsf.labfail)
 #   to prevent downstream cascading failures from missing NSX routing.
 
@@ -38,10 +50,21 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
     Find a VM by name across all connected ESXi hosts and ensure it is powered on.
     
     Since VCF.py connects directly to ESXi hosts (not vCenter), this function
-    searches all host connections for the VM and powers it on from whichever
-    host actually has it registered. This is host-agnostic - it doesn't matter
-    which host the config.ini says the VM should be on, because DRS/HA may
-    have moved it and the config doesn't get updated at shutdown.
+    searches all host connections for the VM. After an unclean shutdown, a VM
+    may be registered on multiple hosts simultaneously - a stale registration
+    on its original host plus an active registration on the host DRS/HA moved
+    it to. The stale registration will have the VMX file locked by the host
+    that is actually running the VM, causing a FileNotFound / Device-busy error
+    if we try to power it on from the wrong host.
+    
+    Strategy:
+    1. Search ALL host connections for the VM by name (may return multiple)
+    2. If ANY registration reports poweredOn, the VM is running - done
+    3. If none are poweredOn, try to power on each one, starting with VMs in
+       'connected' state. The first successful power-on wins.
+    4. If a power-on fails with FileNotFound / Device-busy (VMX locked), skip
+       that stale registration and try the next one - the lock means another
+       host owns the VM.
     
     :param lsf: lsfunctions module
     :param vm_name: VM name to find and power on
@@ -57,35 +80,84 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
         lsf.write_output(f'WARNING: {fail_label} VM not found on any host: {vm_name}')
         return 'not_found'
     
-    vm = vms[0]
-    host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
+    # Log all registrations found
+    for vm in vms:
+        h = vm.runtime.host.name if vm.runtime.host else 'unknown'
+        lsf.write_output(f'  {vm_name}: found on {h} (power={vm.runtime.powerState}, conn={vm.runtime.connectionState})')
     
-    if vm.runtime.powerState == 'poweredOn':
-        lsf.write_output(f'{vm_name} already powered on (host: {host_name})')
-        return 'already_on'
+    # Step 1: Check if ANY registration shows poweredOn
+    for vm in vms:
+        if vm.runtime.powerState == 'poweredOn':
+            host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
+            lsf.write_output(f'{vm_name} already powered on (host: {host_name})')
+            return 'already_on'
     
-    lsf.write_output(f'Powering on {vm_name} (found on host: {host_name})...')
+    # Step 2: Sort candidates - prefer connected VMs first, then by host name
+    # for deterministic ordering
+    candidates = sorted(vms, key=lambda v: (
+        0 if v.runtime.connectionState == 'connected' else 1,
+        v.runtime.host.name if v.runtime.host else 'zzz'
+    ))
     
-    # Wait for VM to be in connected state before attempting power on
-    max_wait = 60
-    waited = 0
-    while vm.runtime.connectionState != 'connected' and waited < max_wait:
-        lsf.write_output(f'  {vm_name} connection state: {vm.runtime.connectionState}, waiting...')
-        time.sleep(5)
-        waited += 5
+    # Step 3: Try to power on each candidate until one succeeds
+    last_error = None
+    for vm in candidates:
+        host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
+        
+        # Wait briefly for VM to reach connected state
+        max_wait = 30
+        waited = 0
+        while vm.runtime.connectionState != 'connected' and waited < max_wait:
+            lsf.write_output(f'  {vm_name} on {host_name}: connection state {vm.runtime.connectionState}, waiting...')
+            time.sleep(5)
+            waited += 5
+        
+        if vm.runtime.connectionState != 'connected':
+            lsf.write_output(f'  {vm_name} on {host_name}: not connected after {max_wait}s, skipping')
+            continue
+        
+        lsf.write_output(f'Powering on {vm_name} (host: {host_name})...')
+        
+        try:
+            task = vm.PowerOnVM_Task()
+            WaitForTask(task)
+            lsf.write_output(f'Powered on {vm_name} (host: {host_name})')
+            return 'started'
+        except Exception as e:
+            error_str = str(e)
+            last_error = error_str
+            
+            # FileNotFound / Device busy = VMX locked by another host
+            # This means the VM is actually running on a different host.
+            # Skip this stale registration and try the next one.
+            is_stale = ('FileNotFound' in error_str or
+                        'Device or resource busy' in error_str or
+                        'Unable to load configuration file' in error_str)
+            
+            if is_stale:
+                lsf.write_output(f'  {vm_name} on {host_name}: VMX locked (stale registration), trying next host...')
+                continue
+            else:
+                lsf.write_output(f'FAILED to power on {vm_name} on {host_name}: {e}')
+                # Non-lock error is a real failure - still try remaining candidates
+                continue
     
-    if vm.runtime.connectionState != 'connected':
-        lsf.write_output(f'  {vm_name} not connected after {max_wait}s on {host_name}')
-        return 'failed'
+    # If we exhausted all candidates with FileNotFound/busy errors, the VM is
+    # likely running on a host we lost the stale registration from (it was
+    # cleaned up). Re-check all registrations for poweredOn - the reload from
+    # the failed PowerOn may have refreshed state.
+    lsf.write_output(f'  {vm_name}: all power-on attempts failed, re-checking state...')
+    vms_recheck = lsf.get_vm_by_name(vm_name)
+    for vm in vms_recheck:
+        if vm.runtime.powerState == 'poweredOn':
+            host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
+            lsf.write_output(f'{vm_name} is now reporting poweredOn (host: {host_name})')
+            return 'already_on'
     
-    try:
-        task = vm.PowerOnVM_Task()
-        WaitForTask(task)
-        lsf.write_output(f'Powered on {vm_name} (host: {host_name})')
-        return 'started'
-    except Exception as e:
-        lsf.write_output(f'FAILED to power on {vm_name} on {host_name}: {e}')
-        return 'failed'
+    lsf.write_output(f'FAILED: {fail_label} {vm_name} could not be powered on from any host')
+    if last_error:
+        lsf.write_output(f'  Last error: {last_error[:200]}')
+    return 'failed'
 
 
 #==============================================================================
