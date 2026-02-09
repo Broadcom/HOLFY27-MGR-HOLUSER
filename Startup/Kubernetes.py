@@ -180,6 +180,8 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.generate_html()
         return
     
+    lsf.write_output(f'Checking {len(kubernetes)} Kubernetes clusters')
+    
     #==========================================================================
     # Check Each Kubernetes Cluster
     #==========================================================================
