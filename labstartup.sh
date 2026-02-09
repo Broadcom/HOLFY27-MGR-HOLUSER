@@ -351,9 +351,27 @@ fi
 #==============================================================================
 # COPY VPOD.TXT AND DETERMINE LAB TYPE
 #==============================================================================
+# Wait for vPod.txt to appear on the Main Console NFS mount.
+# The LMC mount point may be detected before NFS attribute caches are fully
+# populated, causing the file to appear a few seconds after the directory.
+# Retry up to 60 seconds (12 attempts x 5 seconds) before giving up.
 
-if [ -f "${lmcholroot}"/vPod.txt ]; then
-    echo "Copying ${lmcholroot}/vPod.txt to /tmp/vPod.txt..." >> ${logfile}
+vpod_found=false
+vpod_wait=0
+vpod_max_wait=60
+
+while [ "$vpod_wait" -lt "$vpod_max_wait" ]; do
+    if [ -f "${lmcholroot}/vPod.txt" ]; then
+        vpod_found=true
+        break
+    fi
+    vpod_wait=$((vpod_wait + 5))
+    echo "Waiting for vPod.txt on Main Console... (${vpod_wait}/${vpod_max_wait}s)" >> ${logfile}
+    sleep 5
+done
+
+if [ "$vpod_found" = true ]; then
+    echo "vPod.txt found after ${vpod_wait}s. Copying to /tmp/vPod.txt..." >> ${logfile}
     cp "${lmcholroot}"/vPod.txt /tmp/vPod.txt
     labtype=$(grep labtype /tmp/vPod.txt | cut -f2 -d '=' | sed 's/\r$//' | xargs)
     
@@ -368,8 +386,20 @@ if [ -f "${lmcholroot}"/vPod.txt ]; then
         fi
     fi
 else
-    echo "No vPod.txt on Main Console. Abort." >> ${logfile}
+    echo "No vPod.txt on Main Console after ${vpod_max_wait}s. Abort." >> ${logfile}
+    # Write failure status and verify the write succeeded
     echo "FAIL - No vPod_SKU" > "$startupstatus"
+    sync  # Force NFS write to flush
+    # Verify the write - retry if NFS is slow
+    for i in 1 2 3; do
+        if grep -q "FAIL" "$startupstatus" 2>/dev/null; then
+            break
+        fi
+        echo "Retrying status file write (attempt $i)..." >> ${logfile}
+        sleep 1
+        echo "FAIL - No vPod_SKU" > "$startupstatus"
+        sync
+    done
     exit 1
 fi
 
