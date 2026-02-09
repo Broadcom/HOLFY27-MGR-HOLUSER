@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VCF.py - HOLFY27 Core VCF Startup Module
-# Version 3.3 - February 2026
+# Version 3.4 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation startup sequence
 #
@@ -25,6 +25,13 @@
 #   4. Re-checks state after all attempts in case the VM was running all along
 # - If any edge VM fails to power on, the lab FAILS immediately (lsf.labfail)
 #   to prevent downstream cascading failures from missing NSX routing.
+# v3.4 Changes:
+# - TASK 1 now fails the lab immediately (lsf.labfail) if ANY ESXi host
+#   fails to connect after max retries. Previously it logged the failure
+#   and continued, wasting 11+ minutes of retry time per unreachable host
+#   in subsequent modules and causing cascading failures.
+#   connect_vcenters() now returns a list of failed hosts.
+#
 
 import os
 import sys
@@ -223,9 +230,27 @@ def main(lsf=None, standalone=False, dry_run=False):
         total_hosts = len(vcfmgmtcluster)
         
         if not dry_run:
-            lsf.connect_vcenters(vcfmgmtcluster)
+            failed_hosts = lsf.connect_vcenters(vcfmgmtcluster)
             hosts_connected = len(lsf.sis)  # Number of successful connections
-            hosts_failed = total_hosts - hosts_connected
+            hosts_failed = len(failed_hosts) if failed_hosts else 0
+            
+            # If ANY host failed to connect, the lab must fail immediately.
+            # All ESXi hosts are required for VCF - missing hosts means VMs
+            # registered on that host cannot be managed, datastores may be
+            # degraded, and vSAN quorum may be at risk.
+            if hosts_failed > 0:
+                fail_msg = f'{hosts_failed} ESXi host(s) unreachable: {", ".join(failed_hosts)}'
+                lsf.write_output(f'FATAL: {fail_msg}')
+                
+                if dashboard:
+                    dashboard.update_task('vcf', 'mgmt_cluster', TaskStatus.FAILED,
+                                          fail_msg,
+                                          total=total_hosts, success=hosts_connected,
+                                          failed=hosts_failed)
+                    dashboard.generate_html()
+                
+                lsf.labfail(fail_msg)
+                return
             
             # Exit maintenance mode for each host
             if dashboard:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 4.0 - February 2026
+# Version 4.1 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, Aria)
 
@@ -201,7 +201,19 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if vcfmgmtcluster and not dry_run:
         lsf.write_vpodprogress('VCF Hosts Connect', 'GOOD-3')
-        lsf.connect_vcenters(vcfmgmtcluster)
+        failed_hosts = lsf.connect_vcenters(vcfmgmtcluster)
+        
+        if failed_hosts:
+            fail_msg = f'{len(failed_hosts)} ESXi host(s) unreachable: {", ".join(failed_hosts)}'
+            lsf.write_output(f'FATAL: {fail_msg}')
+            
+            if dashboard:
+                dashboard.update_task('vcffinal', 'tanzu', TaskStatus.FAILED,
+                                      fail_msg)
+                dashboard.generate_html()
+            
+            lsf.labfail(fail_msg)
+            return
     
     #==========================================================================
     # TASK 2: Supervisor Control Plane (Tanzu/WCP)
@@ -607,8 +619,10 @@ def main(lsf=None, standalone=False, dry_run=False):
             elif not dry_run:
                 lsf.write_vpodprogress('Connecting vCenters', 'GOOD-3')
                 lsf.write_output(f'Connecting to vCenter(s): {vcenters}')
-                lsf.connect_vcenters(vcenters)
+                failed_vcs = lsf.connect_vcenters(vcenters)
                 lsf.write_output(f'vCenter sessions established: {len(lsf.sis)}')
+                if failed_vcs:
+                    lsf.write_output(f'WARNING: Failed to connect to vCenter(s): {", ".join(failed_vcs)}')
             
             vravms_raw = lsf.config.get('VCFFINAL', 'vravms')
             vravms = [v.strip() for v in vravms_raw.split('\n') if v.strip() and not v.strip().startswith('#')]

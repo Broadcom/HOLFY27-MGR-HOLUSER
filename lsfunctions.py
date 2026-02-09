@@ -1,5 +1,5 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.0 - January 2026
+# Version 3.1 - January 2026
 # Author - Burke Azbill and HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible/Salt, tdns-mgr integration
 
@@ -556,8 +556,10 @@ def connect_vcenters(entries):
     """
     Connect to multiple vCenters or ESXi hosts from a config list
     :param entries: list of vCenter entries from config.ini in format "hostname:type:user"
+    :return: list of hostnames that failed to connect (empty list = all succeeded)
     """
     pwd = get_password()
+    failed_hosts = []
     
     for entry in entries:
         # Skip comments and empty lines
@@ -600,6 +602,10 @@ def connect_vcenters(entries):
                 write_output(f'Connected to ESXi host: {hostname}')
             else:
                 write_output(f'Connected to {hostname}')
+        else:
+            failed_hosts.append(hostname)
+    
+    return failed_hosts
 
 
 def get_host(name):
