@@ -237,27 +237,55 @@ get_git_project_info() {
 push_router_files_nfs() {
     # Push router files via NFS instead of SCP
     # Note: vpodgitdir must be set before calling this function
+    #
+    # Override priority (highest to lowest):
+    #   1. /vpodrepo/20XX-labs/XXXX/holorouter/  (Lab-specific vpodrepo)
+    #   2. /home/holuser/hol/{labtype}/holorouter/ (LabType-specific)
+    #   3. /home/holuser/hol/holorouter/           (Default core)
+    #
     echo "Pushing router files via NFS to ${holorouterdir}..." >> ${logfile}
     
     # Ensure NFS export directory exists
     mkdir -p ${holorouterdir}
     
-    # Copy core team router files
+    # Layer 1 (lowest): Copy core team router files
     if [ -d "${holroot}/${router}" ]; then
         cp -r "${holroot}/${router}"/* ${holorouterdir}/ 2>/dev/null
         echo "Copied core team router files" >> ${logfile}
     fi
     
-    # Merge lab-specific router files if present
+    # Layer 2: Overlay labtype-specific router files if present
+    labtyperouter="${holroot}/${labtype}/${router}"
+    if [ -d "${labtyperouter}" ]; then
+        echo "Merging labtype (${labtype}) router files from ${labtyperouter}" >> ${logfile}
+        
+        # Merge allowlist files (core + labtype)
+        if [ -f "${holorouterdir}/allowlist" ] && [ -f "${labtyperouter}/allowlist" ]; then
+            cat "${holorouterdir}/allowlist" "${labtyperouter}/allowlist" | sort | uniq > ${holorouterdir}/allowlist.tmp
+            mv ${holorouterdir}/allowlist.tmp ${holorouterdir}/allowlist
+            echo "Merged labtype allowlist files" >> ${logfile}
+        fi
+        
+        # Copy other files (override)
+        for file in "${labtyperouter}"/*; do
+            filename=$(basename "$file")
+            if [ "$filename" != "allowlist" ] && [ "$filename" != ".gitkeep" ]; then
+                cp "$file" ${holorouterdir}/ 2>/dev/null
+            fi
+        done
+    fi
+    
+    # Layer 3 (highest): Merge lab-specific router files if present in vpodrepo
     # Use vpodgitdir which is set by get_git_project_info()
     skurouterfiles="${vpodgitdir}/${router}"
     if [ -d "${skurouterfiles}" ]; then
         echo "Merging lab-specific router files from ${skurouterfiles}" >> ${logfile}
         
-        # Merge allowlist files
-        if [ -f "${holroot}/${router}/allowlist" ] && [ -f "${skurouterfiles}/allowlist" ]; then
-            cat "${holroot}/${router}/allowlist" "${skurouterfiles}/allowlist" | sort | uniq > ${holorouterdir}/allowlist
-            echo "Merged allowlist files" >> ${logfile}
+        # Merge allowlist files (accumulated + lab-specific)
+        if [ -f "${holorouterdir}/allowlist" ] && [ -f "${skurouterfiles}/allowlist" ]; then
+            cat "${holorouterdir}/allowlist" "${skurouterfiles}/allowlist" | sort | uniq > ${holorouterdir}/allowlist.tmp
+            mv ${holorouterdir}/allowlist.tmp ${holorouterdir}/allowlist
+            echo "Merged lab-specific allowlist files" >> ${logfile}
         fi
         
         # Copy other files (override)
@@ -276,9 +304,11 @@ push_router_files_nfs() {
 
 push_console_files_nfs() {
     # Push console files via NFS to the Main Console VM
-    # Mirrors the pattern used by push_router_files_nfs():
-    #   1. Copy core team console files from hol/console/
-    #   2. Overlay with SKU-specific console files from vpodrepo/<sku>/console/
+    #
+    # Override priority (highest to lowest):
+    #   1. /vpodrepo/20XX-labs/XXXX/console/   (Lab-specific vpodrepo)
+    #   2. /home/holuser/hol/{labtype}/console/ (LabType-specific)
+    #   3. /home/holuser/hol/console/           (Default core)
     #
     # Target directories on the console (via NFS mount at /lmchol):
     #   /lmchol/home/holuser/desktop-hol/  -> conkywatch.sh, VMware.config
@@ -287,6 +317,7 @@ push_console_files_nfs() {
     # This allows:
     #   - Core team to update conkywatch.sh, conky-startup.sh, VMware.config
     #     via the hol repo (console/ directory)
+    #   - LabType teams to override for their program via {labtype}/console/
     #   - Individual labs to override VMware.config (or any file) by placing
     #     their version in their vpodrepo's console/ directory
     
@@ -301,65 +332,50 @@ push_console_files_nfs() {
         return
     fi
     
-    # Copy core team files to their target locations
-    # VMware.config and conkywatch.sh -> desktop-hol/
-    for file in VMware.config conkywatch.sh; do
-        if [ -f "${console_src}/${file}" ]; then
-            cp "${console_src}/${file}" "${desktop_dest}/${file}" 2>/dev/null
-            if [ $? -eq 0 ]; then
-                echo "Copied console/${file} -> desktop-hol/" >> ${logfile}
-            else
-                echo "WARNING: Failed to copy console/${file} -> desktop-hol/" >> ${logfile}
-            fi
-        fi
-    done
-    
-    # conky-startup.sh -> .conky/
-    if [ -f "${console_src}/conky-startup.sh" ]; then
-        cp "${console_src}/conky-startup.sh" "${conky_dest}/conky-startup.sh" 2>/dev/null
-        if [ $? -eq 0 ]; then
-            echo "Copied console/conky-startup.sh -> .conky/" >> ${logfile}
-        else
-            echo "WARNING: Failed to copy console/conky-startup.sh -> .conky/" >> ${logfile}
-        fi
-    fi
-    
-    # Copy any additional core team console files to desktop-hol/
-    # (future-proofing for new files added to console/)
-    for file in "${console_src}"/*; do
-        filename=$(basename "$file")
+    # Helper function to deploy a single console file to the correct destination
+    _deploy_console_file() {
+        local src_file="$1"
+        local src_label="$2"
+        local filename=$(basename "$src_file")
         case "$filename" in
-            VMware.config|conkywatch.sh|conky-startup.sh)
-                # Already handled above
+            conky-startup.sh)
+                cp "$src_file" "${conky_dest}/${filename}" 2>/dev/null
+                if [ $? -eq 0 ]; then
+                    echo "${src_label}: console/${filename} -> .conky/" >> ${logfile}
+                fi
+                ;;
+            .gitkeep)
+                # Skip placeholder files
                 ;;
             *)
-                cp "$file" "${desktop_dest}/${filename}" 2>/dev/null
+                cp "$src_file" "${desktop_dest}/${filename}" 2>/dev/null
                 if [ $? -eq 0 ]; then
-                    echo "Copied console/${filename} -> desktop-hol/" >> ${logfile}
+                    echo "${src_label}: console/${filename} -> desktop-hol/" >> ${logfile}
                 fi
                 ;;
         esac
+    }
+    
+    # Layer 1 (lowest): Copy core team console files
+    for file in "${console_src}"/*; do
+        [ -f "$file" ] && _deploy_console_file "$file" "Core"
     done
     
-    # Overlay with SKU-specific console files if present in vpodrepo
-    # These override the core team defaults (same pattern as router files)
+    # Layer 2: Overlay labtype-specific console files if present
+    local labtype_console="${holroot}/${labtype}/console"
+    if [ -d "${labtype_console}" ]; then
+        echo "Merging labtype (${labtype}) console files from ${labtype_console}" >> ${logfile}
+        for file in "${labtype_console}"/*; do
+            [ -f "$file" ] && _deploy_console_file "$file" "LabType override"
+        done
+    fi
+    
+    # Layer 3 (highest): Overlay with SKU-specific console files from vpodrepo
     local sku_console="${vpodgitdir}/console"
     if [ -d "${sku_console}" ]; then
         echo "Merging SKU-specific console files from ${sku_console}" >> ${logfile}
         for file in "${sku_console}"/*; do
-            filename=$(basename "$file")
-            case "$filename" in
-                conky-startup.sh)
-                    # conky-startup.sh goes to .conky/ directory
-                    cp "$file" "${conky_dest}/${filename}" 2>/dev/null
-                    echo "SKU override: console/${filename} -> .conky/" >> ${logfile}
-                    ;;
-                *)
-                    # Everything else goes to desktop-hol/
-                    cp "$file" "${desktop_dest}/${filename}" 2>/dev/null
-                    echo "SKU override: console/${filename} -> desktop-hol/" >> ${logfile}
-                    ;;
-            esac
+            [ -f "$file" ] && _deploy_console_file "$file" "SKU override"
         done
     fi
     
@@ -645,6 +661,28 @@ else
         cp ${holroot}/${router}/nofirewall.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
     fi
     cp ${holroot}/${router}/allowall ${holorouterdir}/allowlist 2>/dev/null
+    
+    # Overlay labtype-specific router overrides if present
+    labtyperouter="${holroot}/${labtype}/${router}"
+    if [ -d "${labtyperouter}" ]; then
+        echo "Merging labtype (${labtype}) router files from ${labtyperouter}" >> ${logfile}
+        for file in "${labtyperouter}"/*; do
+            filename=$(basename "$file")
+            if [ "$filename" != ".gitkeep" ]; then
+                cp "$file" ${holorouterdir}/ 2>/dev/null
+            fi
+        done
+    fi
+    
+    # Overlay vpodrepo-specific router overrides if present
+    if [ -d "${vpodgitdir}/${router}" ]; then
+        echo "Merging vpodrepo router files from ${vpodgitdir}/${router}" >> ${logfile}
+        for file in "${vpodgitdir}/${router}"/*; do
+            filename=$(basename "$file")
+            cp "$file" ${holorouterdir}/ 2>/dev/null
+        done
+    fi
+    
     date > ${holorouterdir}/gitdone
 fi
 

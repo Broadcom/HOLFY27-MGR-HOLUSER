@@ -527,10 +527,10 @@ def main(lsf=None, standalone=False, dry_run=False):
                                   total=0, success=0, failed=0, skipped=0)
     
     #==========================================================================
-    # TASK 4b: Start Post-Edge VMs (e.g., Aria Automation appliances)
+    # TASK 4b: Start Post-Edge VMs (e.g., VCF Automation appliances)
     #==========================================================================
     # These VMs need to boot after NSX Edges are up but before vCenter
-    # to allow maximum boot time. Aria Automation (auto-a) is a typical
+    # to allow maximum boot time. VCF Automation (auto-a) is a typical
     # example that benefits from early boot.
     
     if lsf.config.has_option('VCF', 'vcfpostedgevms'):
@@ -540,7 +540,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         
         if vcfpostedgevms:
             lsf.write_vpodprogress('VCF Post-Edge VMs start', 'GOOD-3')
-            lsf.write_output('Starting post-edge VMs (Aria Automation, etc.)...')
+            lsf.write_output('Starting post-edge VMs (VCF Automation, etc.)...')
             
             if not dry_run:
                 postedge_need_wait = False

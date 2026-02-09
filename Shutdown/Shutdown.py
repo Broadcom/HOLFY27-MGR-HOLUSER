@@ -18,13 +18,13 @@ Startup Order (labstartup.py):
 4. VCF.py - VCF management (NSX, vCenter)
 5. services.py - Core services
 6. Kubernetes.py - Kubernetes clusters
-7. VCFfinal.py - Final VCF tasks (Tanzu, Aria)
+7. VCFfinal.py - Final VCF tasks (Tanzu, VCF Automation)
 8. final.py - Final cleanup
 
 Shutdown Order (this script):
-1. Fleet Operations - Aria Suite via SDDC Manager
+1. Fleet Operations - VCF Operations Suite via SDDC Manager
 2. Kubernetes/Tanzu workloads
-3. VCF Final components (Aria VMs)
+3. VCF Final components (VCF Automation VMs)
 4. Core services
 5. VCF Management (vCenter, NSX)
 6. vSphere infrastructure

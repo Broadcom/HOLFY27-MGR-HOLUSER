@@ -77,7 +77,7 @@ For non-SDDC-managed resources (VCF Operations, VCF Automation):
 | vCenter | vc-mgmt-a.site-a.vcf.lab | SDDC Manager API | Automated |
 | NSX Manager | nsx-mgmt-a.site-a.vcf.lab | SDDC Manager API | Automated |
 | VCF Operations | ops-a.site-a.vcf.lab | SSH replacement | Manual |
-| VCF Automation | auto-a.site-a.vcf.lab | Aria Suite Lifecycle | Manual |
+| VCF Automation | auto-a.site-a.vcf.lab | VCF Operations Manager | Manual |
 | VCF Operations for Networks | opsnet-a.site-a.vcf.lab | SSH (TBD) | Manual |
 
 **Default Credentials by Component:**
@@ -360,12 +360,12 @@ Manages different startup sequences for different lab types (HOL, Discovery, VXP
 | EDU | Education | Yes | Yes | Training environments |
 | DISCOVERY | Discovery Labs | No | No | Simplified labs, no firewall restrictions |
 
-**Module Loading Priority:**
+**Override Priority (applies to all subfolders: Startup, Shutdown, Tools, console, holodeck, holorouter):**
 
-1. `/vpodrepo/20XX-labs/XXXX/Startup/{module}.py` (vpodrepo Startup override)
-2. `/vpodrepo/20XX-labs/XXXX/{module}.py` (vpodrepo root override)
-3. `/home/holuser/hol/Startup.{labtype}/{module}.py` (LabType-specific core)
-4. `/home/holuser/hol/Startup/{module}.py` (Default core module)
+1. `/vpodrepo/20XX-labs/XXXX/{subfolder}/{file}` (lab-specific override)
+2. `/vpodrepo/20XX-labs/XXXX/{file}` (lab root override)
+3. `/home/holuser/hol/{labtype}/{subfolder}/{file}` (labtype-specific)
+4. `/home/holuser/hol/{subfolder}/{file}` (default core)
 
 **Usage:**
 

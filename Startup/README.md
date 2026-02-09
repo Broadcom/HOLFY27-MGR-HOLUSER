@@ -2,7 +2,7 @@
 
 1. `/vpodrepo/20XX-labs/XXXX/Startup/{module}.py` (highest)
 2. `/vpodrepo/20XX-labs/XXXX/{module}.py`
-3. `/home/holuser/hol/Startup.{labtype}/{module}.py`
+3. `/home/holuser/hol/{labtype}/Startup/{module}.py`
 4. `/home/holuser/hol/Startup/{module}.py` (lowest)
 
 ## Supported Lab Types

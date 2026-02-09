@@ -8,7 +8,7 @@
 #
 # Override Priority (highest to lowest):
 #   1. /vpodrepo/Discovery-labs/Name/Startup/prelim.py  (Lab-specific override)
-#   2. /home/holuser/hol/Startup.Discovery/prelim.py    (This file - Discovery labtype)
+#   2. /home/holuser/hol/Discovery/Startup/prelim.py    (This file - Discovery labtype)
 #   3. /home/holuser/hol/Startup/prelim.py              (Default core module)
 
 import os

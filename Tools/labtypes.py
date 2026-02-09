@@ -174,30 +174,31 @@ class LabTypeLoader:
         """
         return self.get_labtype_info().get('repo_pattern', 'standard')
     
-    def get_module_path(self, module_name: str) -> Optional[str]:
+    def get_override_path(self, subfolder: str, filename: str) -> Optional[str]:
         """
-        Find the path to a startup module, respecting override hierarchy:
+        Find a file using the 3-tier override hierarchy for any subfolder.
         
-        1. /vpodrepo/20XX-labs/XXXX/Startup/{module}.py  (Highest - vpodrepo Startup override)
-        2. /vpodrepo/20XX-labs/XXXX/{module}.py          (vpodrepo root override)
-        3. /home/holuser/hol/Startup.{labtype}/{module}.py  (LabType-specific core)
-        4. /home/holuser/hol/Startup/{module}.py         (Default core module)
+        Priority (highest to lowest):
+        1. /vpodrepo/20XX-labs/XXXX/{subfolder}/{filename}  (Lab-specific override)
+        2. /vpodrepo/20XX-labs/XXXX/{filename}              (Lab root override)
+        3. /home/holuser/hol/{labtype}/{subfolder}/{filename}  (LabType-specific)
+        4. /home/holuser/hol/{subfolder}/{filename}          (Default core)
         
-        :param module_name: Name of the module (without .py)
-        :return: Full path to the module, or None if not found
+        :param subfolder: Subdirectory name (e.g., 'Startup', 'Shutdown', 'Tools',
+                          'console', 'holodeck', 'holorouter')
+        :param filename: File name to find
+        :return: Full path to the file, or None if not found
         """
-        filename = f'{module_name}.py'
-        
         search_paths = [
             # VPodRepo overrides (highest priority)
-            os.path.join(self.vpod_repo, 'Startup', filename),
+            os.path.join(self.vpod_repo, subfolder, filename),
             os.path.join(self.vpod_repo, filename),
             
-            # LabType-specific core
-            os.path.join(self.holroot, f'Startup.{self.labtype}', filename),
+            # LabType-specific override
+            os.path.join(self.holroot, self.labtype, subfolder, filename),
             
             # Default core (lowest priority)
-            os.path.join(self.holroot, 'Startup', filename)
+            os.path.join(self.holroot, subfolder, filename),
         ]
         
         for path in search_paths:
@@ -205,6 +206,20 @@ class LabTypeLoader:
                 return path
         
         return None
+    
+    def get_module_path(self, module_name: str) -> Optional[str]:
+        """
+        Find the path to a startup module, respecting override hierarchy:
+        
+        1. /vpodrepo/20XX-labs/XXXX/Startup/{module}.py  (Highest - vpodrepo Startup override)
+        2. /vpodrepo/20XX-labs/XXXX/{module}.py          (vpodrepo root override)
+        3. /home/holuser/hol/{labtype}/Startup/{module}.py  (LabType-specific core)
+        4. /home/holuser/hol/Startup/{module}.py          (Default core module)
+        
+        :param module_name: Name of the module (without .py)
+        :return: Full path to the module, or None if not found
+        """
+        return self.get_override_path('Startup', f'{module_name}.py')
     
     def load_module(self, module_name: str):
         """

@@ -87,7 +87,7 @@ class TestChooseFile:
         search_paths = [
             os.path.join(vpod_repo, 'Startup', filename),
             os.path.join(vpod_repo, filename),
-            f'{holroot}/Startup.{labtype}/{filename}',
+            f'{holroot}/{labtype}/Startup/{filename}',
             f'{holroot}/Startup/{filename}',
         ]
         
@@ -112,7 +112,7 @@ class TestChooseFile:
         search_paths = [
             os.path.join(vpod_repo, 'Startup', filename),
             os.path.join(vpod_repo, filename),
-            f'{holroot}/Startup.{labtype}/{filename}',
+            f'{holroot}/{labtype}/Startup/{filename}',
             f'{holroot}/Startup/{filename}',
         ]
         

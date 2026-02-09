@@ -42,10 +42,10 @@ python3 Shutdown.py --help
 
 Handles VCF-specific shutdown tasks including:
 
-- Fleet Operations (Aria Suite) via SDDC Manager API
+- Fleet Operations (VCF Operations Suite) via SDDC Manager API
 - WCP (Workload Control Plane) shutdown
 - Tanzu/Kubernetes workload VMs
-- Management VMs (vCenter, SDDC Manager, Aria)
+- Management VMs (vCenter, SDDC Manager, VCF Operations Suite)
 - NSX Edges and Manager
 - vSAN elevator operations
 - ESXi host shutdown
@@ -58,12 +58,12 @@ python3 VCFshutdown.py --dry-run
 
 ### fleet.py (Fleet Operations Module)
 
-Provides integration with SDDC Manager Fleet Operations API for graceful shutdown of Aria Suite products:
+Provides integration with SDDC Manager Fleet Operations API for graceful shutdown of VCF Operations Suite products:
 
-- vra (Aria Automation)
-- vrni (Aria Operations for Networks)
-- vrops (Aria Operations)
-- vrli (Aria Operations for Logs)
+- vra (VCF Automation)
+- vrni (VCF Operations for Networks)
+- vrops (VCF Operations)
+- vrli (VCF Operations for Logs)
 
 Can be tested standalone:
 
@@ -95,12 +95,12 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 
 | VCF 9.0 Order | Component |
 | ------------- | --------- |
-| 1 | VCF Automation (Aria Automation / vra) |
+| 1 | VCF Automation (VCF Automation / vra) |
 | 2 | VCF Operations for Networks (vrni) |
 | 3 | VCF Operations collector |
 | 4 | VCF Operations for logs (vrli) |
 | 5 | VCF Identity Broker |
-| 6 | VCF Operations fleet management (Aria Suite Lifecycle) |
+| 6 | VCF Operations fleet management (VCF Operations Manager) |
 | 7 | VCF Operations (vrops, orchestrator) |
 | 8 | VMware Live Site Recovery (if applicable) |
 | 9 | NSX Edge nodes |
@@ -233,13 +233,13 @@ flowchart TD
     VM_OFF --> P5[/"Phase 5: Workload vCenters"/]
     P5 --> WLD_VC[Shutdown vc-wld* VMs]
     
-    WLD_VC --> P5B[/"Phase 5b: Aria Orchestrator"/]
+    WLD_VC --> P5B[/"Phase 5b: VCF Operations Orchestrator"/]
     P5B --> ORCH[Shutdown o11n-* VMs]
     
-    ORCH --> P6[/"Phase 6: Aria Suite Lifecycle"/]
+    ORCH --> P6[/"Phase 6: VCF Operations Manager"/]
     P6 --> LCM[Shutdown opslcm-* VMs]
     
-    LCM --> P7[/"Phase 7: Aria Ops for Logs<br/>(LATE - per VCF docs)"/]
+    LCM --> P7[/"Phase 7: VCF Operations for Logs<br/>(LATE - per VCF docs)"/]
     P7 --> LOGS["Shutdown opslogs-*, opsnet-*<br/>(kept running late for logs)"]
     
     LOGS --> P8[/"Phase 8: NSX Edges"/]
@@ -379,10 +379,10 @@ sequenceDiagram
     Note over VCFshutdown.py: Phase 5: Workload vCenters (BEFORE mgmt domain)
     VCFshutdown.py->>vCenter: Shutdown vc-wld* VMs
     
-    Note over VCFshutdown.py: Phase 5b-6: Aria Orchestrator, Suite Lifecycle
+    Note over VCFshutdown.py: Phase 5b-6: VCF Operations Orchestrator, Suite Lifecycle
     VCFshutdown.py->>vCenter: Shutdown o11n-*, opslcm-*
     
-    Note over VCFshutdown.py: Phase 7: Aria Ops for Logs (LATE per VCF docs)
+    Note over VCFshutdown.py: Phase 7: VCF Operations for Logs (LATE per VCF docs)
     VCFshutdown.py->>vCenter: Shutdown opslogs-*, opsnet-*
     
     Note over VCFshutdown.py: Phase 8-9: NSX Edges, NSX Manager
@@ -464,7 +464,7 @@ vcf_ops_logs_vms = opslogs-01a
 # VCF Identity Broker - VCF 9.0 Mgmt Domain #5
 vcf_identity_broker_vms =
 
-# VCF Operations Fleet Management (Aria Suite Lifecycle) - VCF 9.0 Mgmt Domain #6
+# VCF Operations Fleet Management (VCF Operations Manager) - VCF 9.0 Mgmt Domain #6
 vcf_ops_fleet_vms = opslcm-01a
     opslcm-a
 
@@ -534,13 +534,13 @@ The shutdown script updates `/lmchol/hol/startup_status.txt` throughout the proc
 | Main Phase 0 | `Shutdown Phase 0: Pre-Shutdown Checks` |
 | Main Phase 1 | `Shutdown Phase 1: Docker Containers` |
 | Main Phase 2 | `Shutdown Phase 2: VCF Environment Shutdown` |
-| VCF Phase 1 | `Shutdown Phase 1: Fleet Operations (Aria Suite)` |
+| VCF Phase 1 | `Shutdown Phase 1: Fleet Operations (VCF Operations Suite)` |
 | VCF Phase 2 | `Shutdown Phase 2: Connect to Infrastructure` |
 | VCF Phase 3 | `Shutdown Phase 3: Stop WCP Services` |
 | VCF Phase 4 | `Shutdown Phase 4: Shutdown Workload VMs` |
 | VCF Phase 5 | `Shutdown Phase 5: Shutdown Workload vCenters` |
-| VCF Phase 6 | `Shutdown Phase 6: Shutdown Aria Suite Lifecycle` |
-| VCF Phase 7 | `Shutdown Phase 7: Shutdown Aria Ops for Logs` |
+| VCF Phase 6 | `Shutdown Phase 6: Shutdown VCF Operations Manager` |
+| VCF Phase 7 | `Shutdown Phase 7: Shutdown VCF Operations for Logs` |
 | VCF Phase 8 | `Shutdown Phase 8: Shutdown NSX Edges` |
 | VCF Phase 9 | `Shutdown Phase 9: Shutdown NSX Manager` |
 | VCF Phase 10 | `Shutdown Phase 10: Shutdown SDDC Manager` |

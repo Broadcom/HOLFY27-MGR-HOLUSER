@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# prelim.py - VXP LabType Preliminary Tasks Module
+# prelim.py - EDU LabType Preliminary Tasks Module
 # Version 3.0 - January 2026
 # Author - Burke Azbill and HOL Core Team
 # 
-# This is the VXP labtype prelim.py which includes all core functionality
-# plus VXP-specific customizations.
+# This is the EDU labtype prelim.py which includes all core functionality
+# plus EDU-specific customizations.
 #
 # Override Priority (highest to lowest):
 #   1. /vpodrepo/20XX-labs/XXXX/Startup/prelim.py  (Lab-specific override)
-#   2. /home/holuser/hol/Startup.VXP/prelim.py     (This file - VXP labtype)
+#   2. /home/holuser/hol/EDU/Startup/prelim.py     (This file - EDU labtype)
 #   3. /home/holuser/hol/Startup/prelim.py         (Default core module)
 
 import os
@@ -23,8 +23,8 @@ sys.path.insert(0, '/home/holuser/hol')
 #==============================================================================
 
 MODULE_NAME = 'prelim'
-MODULE_DESCRIPTION = 'VXP LabType Preliminary Tasks'
-LABTYPE = 'VXP'
+MODULE_DESCRIPTION = 'EDU LabType Preliminary Tasks'
+LABTYPE = 'EDU'
 
 #==============================================================================
 # MAIN FUNCTION
@@ -32,7 +32,7 @@ LABTYPE = 'VXP'
 
 def main(lsf=None, standalone=False, dry_run=False):
     """
-    Main entry point for VXP prelim module
+    Main entry point for EDU prelim module
     
     :param lsf: lsfunctions module
     :param standalone: Whether running in standalone test mode
@@ -212,18 +212,18 @@ def main(lsf=None, standalone=False, dry_run=False):
     ##=========================================================================
     
     ##=========================================================================
-    ## CUSTOM - VXP LabType Specific Code
+    ## CUSTOM - EDU LabType Specific Code
     ## 
-    ## VXP (VCF Experience Program) labs have:
+    ## EDU (Education) labs have:
     ## - Firewall enabled
     ## - Proxy filtering enabled
-    ## - Demo environments for VCF Experience
+    ## - Training environments
     ##
-    ## Add your VXP-specific customizations below.
+    ## Add your EDU-specific customizations below.
     ##=========================================================================
     
     lsf.write_output(f'{LABTYPE} Lab SKU: {lsf.lab_sku}')
-    lsf.write_output(f'{LABTYPE} (VCF Experience Program) labs have full security features')
+    lsf.write_output(f'{LABTYPE} (Education) labs have full security features')
     
     ## Example 1: Check URL accessibility
     ## ----------------------------------
@@ -285,7 +285,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     ## Example: Fail the lab if critical condition not met
     ## ----------------------------------------------------
-    # lsf.labfail('VXP PRELIM ISSUE - Critical check failed')
+    # lsf.labfail('EDU PRELIM ISSUE - Critical check failed')
     # exit(1)
     
     ##=========================================================================

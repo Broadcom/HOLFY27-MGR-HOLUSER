@@ -1066,7 +1066,7 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
 def configure_aria_automation_vms(auth_keys_file: str, password: str,
                                    dry_run: bool = False) -> bool:
     """
-    Configure all Aria Automation VMs from config.ini.
+    Configure all VCF Automation VMs from config.ini.
     
     Processes VMs defined in the [VCFFINAL] vravms section.
     These are VCF Automation appliances that use 'vmware-system-user' for SSH.
@@ -1077,7 +1077,7 @@ def configure_aria_automation_vms(auth_keys_file: str, password: str,
     :return: True if successful
     """
     if 'VCFFINAL' not in lsf.config.sections():
-        lsf.write_output('No VCFFINAL section in config.ini, skipping Aria Automation')
+        lsf.write_output('No VCFFINAL section in config.ini, skipping VCF Automation')
         return True
     
     if 'vravms' not in lsf.config['VCFFINAL']:
@@ -1086,21 +1086,21 @@ def configure_aria_automation_vms(auth_keys_file: str, password: str,
     
     vravms_raw = lsf.config.get('VCFFINAL', 'vravms').strip()
     if not vravms_raw:
-        lsf.write_output('No Aria Automation VMs defined')
+        lsf.write_output('No VCF Automation VMs defined')
         return True
     
     vravms = [vm.strip() for vm in vravms_raw.split('\n') if vm.strip() and not vm.strip().startswith('#')]
     
     if not vravms:
-        lsf.write_output('No Aria Automation VMs found in config')
+        lsf.write_output('No VCF Automation VMs found in config')
         return True
     
     lsf.write_output('')
     lsf.write_output('=' * 60)
-    lsf.write_output('Aria Automation VMs Configuration')
+    lsf.write_output('VCF Automation VMs Configuration')
     lsf.write_output('=' * 60)
     lsf.write_output('NOTE: These VMs use vmware-system-user for SSH access')
-    lsf.write_output('      SSH is always available on Aria Automation appliances')
+    lsf.write_output('      SSH is always available on VCF Automation appliances')
     
     success = True
     
@@ -1109,7 +1109,7 @@ def configure_aria_automation_vms(auth_keys_file: str, password: str,
         parts = vravm.split(':')
         hostname = parts[0].strip()
         
-        # Only process VMs starting with 'auto-' (Aria Automation)
+        # Only process VMs starting with 'auto-' (VCF Automation)
         if not hostname.lower().startswith('auto-'):
             lsf.write_output(f'{hostname}: Skipping - Name does not start with "auto-"')
             continue
@@ -1123,12 +1123,12 @@ def configure_aria_automation_vms(auth_keys_file: str, password: str,
 def configure_aria_automation(hostname: str, auth_keys_file: str, password: str,
                                dry_run: bool = False) -> bool:
     """
-    Configure Aria Automation (VCF Automation) appliance for HOLification.
+    Configure VCF Automation (VCF Automation) appliance for HOLification.
     
-    The Aria Automation appliance uses 'vmware-system-user' for SSH access
+    The VCF Automation appliance uses 'vmware-system-user' for SSH access
     with sudo NOPASSWD privileges. SSH is always available on this appliance.
     
-    :param hostname: Aria Automation hostname (e.g., auto-a.site-a.vcf.lab)
+    :param hostname: VCF Automation hostname (e.g., auto-a.site-a.vcf.lab)
     :param auth_keys_file: Path to authorized_keys file
     :param password: vmware-system-user password
     :param dry_run: If True, preview only
@@ -1136,7 +1136,7 @@ def configure_aria_automation(hostname: str, auth_keys_file: str, password: str,
     """
     ssh_user = 'vmware-system-user'
     
-    lsf.write_output(f'{hostname}: Configuring Aria Automation appliance...')
+    lsf.write_output(f'{hostname}: Configuring VCF Automation appliance...')
     lsf.write_output(f'{hostname}: Using SSH user: {ssh_user}')
     
     success = True
@@ -1373,7 +1373,7 @@ def configure_sddc_manager(auth_keys_file: str, password: str,
 def configure_operations_vms(auth_keys_file: str, password: str,
                               dry_run: bool = False) -> bool:
     """
-    Configure Operations VMs (vRealize/Aria Operations) for HOLification.
+    Configure Operations VMs (VCF Operations) for HOLification.
     
     Finds VMs with "ops" in the name from the config.ini [RESOURCES] VMs
     section and configures:
@@ -2537,7 +2537,7 @@ def main():
     3. vCenter configuration
     4. NSX configuration (Managers and Edges)
     5. SDDC Manager configuration
-    6. Aria Automation VMs configuration (uses vmware-system-user)
+    6. VCF Automation VMs configuration (uses vmware-system-user)
     7. Operations VMs configuration
     8. Disable SDDC Manager auto-rotate policies (prevents post-deployment failures)
     9. Final cleanup
@@ -2667,7 +2667,7 @@ NOTE: Some NSX operations require manual steps first.
     # Step 4: Configure SDDC Manager
     configure_sddc_manager(auth_keys_file, password, args.dry_run)
     
-    # Step 5: Configure Aria Automation VMs
+    # Step 5: Configure VCF Automation VMs
     configure_aria_automation_vms(auth_keys_file, password, args.dry_run)
     
     # Step 6: Configure Operations VMs

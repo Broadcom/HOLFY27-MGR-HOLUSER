@@ -8,7 +8,7 @@
 #
 # Override Priority (highest to lowest):
 #   1. /vpodrepo/20XX-labs/XXXX/Startup/prelim.py  (Lab-specific override)
-#   2. /home/holuser/hol/Startup.ATE/prelim.py     (This file - ATE labtype)
+#   2. /home/holuser/hol/ATE/Startup/prelim.py     (This file - ATE labtype)
 #   3. /home/holuser/hol/Startup/prelim.py         (Default core module)
 
 import os

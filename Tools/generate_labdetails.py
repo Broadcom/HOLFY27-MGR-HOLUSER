@@ -1146,7 +1146,7 @@ class LabDetailsGenerator:
         self._add("    participant Edges as NSX Edges")
         self._add("    participant VC as vCenter")
         self._add("    participant SDDC as SDDC Manager")
-        self._add("    participant Ops as Aria Suite")
+        self._add("    participant Ops as VCF Operations Suite")
         self._add()
         self._add("    Note over Router,Ops: Lab Startup Sequence (labstartup.py)")
         self._add()
@@ -1167,7 +1167,7 @@ class LabDetailsGenerator:
         self._add()
         self._add("    Manager->>Manager: Connect to vCenters")
         self._add("    Manager->>SDDC: Power On sddcmanager-a")
-        self._add("    Manager->>Ops: Power On Aria Suite VMs")
+        self._add("    Manager->>Ops: Power On VCF Operations Suite VMs")
         self._add()
         self._add("    Manager->>Manager: Verify URLs")
         self._add("    Manager->>Router: Signal Ready")
@@ -1205,9 +1205,9 @@ class LabDetailsGenerator:
             elif 'ops-a' in url:
                 service = "VCF Operations"
             elif 'auto-' in url:
-                service = "Aria Automation"
+                service = "VCF Automation"
             elif 'opslcm' in url:
-                service = "Aria Suite Lifecycle"
+                service = "VCF Operations Manager"
             elif 'vmware.com' in url:
                 service = "VMware.com (Internet Test)"
             
@@ -1236,7 +1236,7 @@ class LabDetailsGenerator:
         self._add("| SDDC Manager | administrator@vsphere.local | See `/home/holuser/creds.txt` |")
         self._add("| NSX Manager | admin | See `/home/holuser/creds.txt` |")
         self._add("| ESXi Hosts | root | See `/home/holuser/creds.txt` |")
-        self._add("| Aria Suite | admin@local | See `/home/holuser/creds.txt` |")
+        self._add("| VCF Operations Suite | admin@local | See `/home/holuser/creds.txt` |")
         self._add("| Linux VMs (holuser) | holuser | See `/home/holuser/creds.txt` |")
         self._add("| Linux VMs (root) | root | See `/home/holuser/creds.txt` |")
         self._add()
@@ -1352,8 +1352,8 @@ class LabDetailsGenerator:
         self._add('            end')
         self._add()
         
-        # Aria Suite
-        self._add('            subgraph Aria["Aria Suite"]')
+        # VCF Operations Suite
+        self._add('            subgraph VCFOps["VCF Operations Suite"]')
         aria_vms = ['auto', 'ops-a', 'opslcm', 'opslogs']
         for vm in self.env.mgmt_vms:
             name_lower = vm.name.lower()
@@ -1383,7 +1383,7 @@ class LabDetailsGenerator:
         self._add('    class Internet external')
         self._add('    class MgmtDomain,SDDC,VCM,NSXM,MgmtHosts mgmtDomain')
         self._add('    class WldDomain,VCW,NSXW,WldHosts,SCP wldDomain')
-        self._add('    class Aria aria')
+        self._add('    class VCFOps vcfops')
         self._add("```")
         self._add()
         self._add("---")
