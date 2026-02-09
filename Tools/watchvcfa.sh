@@ -106,6 +106,22 @@ echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> VCFA Watcher started"  | tee -a  "${LOGFI
   # Volume attachments can get stuck in deletion state with finalizers preventing cleanup.
   # This happens when pods are terminated but the CSI controller can't clean up the attachments.
   # The result is new pods getting stuck in ContainerCreating with "volume attachment is being deleted" errors.
+  #
+  # Root cause chain observed in production:
+  #   1. CSI controller crashes (CrashLoopBackOff, e.g. CRD init error or vCenter unavailable)
+  #   2. CSI controller sidecar containers (csi-attacher, csi-provisioner, etc.) can't connect to
+  #      the CSI socket and also crash
+  #   3. Volume attachments from the previous boot have deletionTimestamp set but the
+  #      external-attacher finalizer can't be removed because the CSI controller is down
+  #   4. New pods (vcfapostgres-0, rabbitmq-ha-0) get stuck in ContainerCreating/Init with
+  #      "volume attachment is being deleted" errors
+  #   5. Without postgres and rabbitmq, VCF Automation UI shows "no healthy upstream"
+  #
+  # Fix order:
+  #   a. Remove finalizers from stuck volume attachments (unblocks volume mounts)
+  #   b. Fix CSI controller if unhealthy (force-delete and wait for restart)
+  #   c. Delete prelude pods stuck in ContainerCreating/Init to force fresh mount attempts
+  STUCK_VA_FIXED=false
   echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Checking for stuck volume attachments with deletionTimestamp..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
   CNT=0
   while [[ "$STUCKVOLATTACH" != "" ]]; do
@@ -123,6 +139,7 @@ echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> VCFA Watcher started"  | tee -a  "${LOGFI
         echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Removing finalizer from volume attachment: ${VA}" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
         vcfa_ssh "kubectl patch volumeattachment ${VA} -p '{\"metadata\":{\"finalizers\":null}}' --type=merge" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
       done
+      STUCK_VA_FIXED=true
       sleep 5
       # Verify the stuck attachments are gone
       vcfa_ssh 'kubectl get volumeattachments' | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
@@ -162,6 +179,9 @@ echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> VCFA Watcher started"  | tee -a  "${LOGFI
   # The vsphere-csi-controller can get stuck in CrashLoopBackOff if:
   # 1. The vCenter REST API (vmware-vapi-endpoint) is not running (checked above)
   # 2. Stale leader leases prevent the new pod from becoming leader
+  # 3. CRD initialization error ("resource name may not be empty") causes main container to crash,
+  #    which kills the CSI socket, causing all sidecar containers to fail with connection timeouts
+  CSI_FIXED=false
   echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Checking vsphere-csi-controller health..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
   CNT=0
   CSISTATUS="."
@@ -171,7 +191,7 @@ echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> VCFA Watcher started"  | tee -a  "${LOGFI
     CSISTATUS=$(vcfa_ssh 'kubectl get pods -n kube-system -l app=vsphere-csi-controller -o jsonpath="{.items[0].status.containerStatuses[*].ready}"' | grep -o "false")
     
     if [ -n "$CSISTATUS" ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> CSI controller not fully ready, checking for stale leader leases..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> CSI controller not fully ready (attempt ${CNT}/3)..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
       
       # Get current CSI controller pod name
       CURRENT_CSI_POD=$(vcfa_ssh 'kubectl get pods -n kube-system -l app=vsphere-csi-controller -o jsonpath="{.items[0].metadata.name}"')
@@ -187,18 +207,64 @@ echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> VCFA Watcher started"  | tee -a  "${LOGFI
           vcfa_ssh "kubectl delete lease ${LEASE} -n kube-system" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
         done
         sleep 5
-        # Restart the CSI controller to pick up the new leases
-        echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Restarting CSI controller pod..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
-        vcfa_ssh 'kubectl delete pod -n kube-system -l app=vsphere-csi-controller' | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
-        sleep 30
       fi
+
+      # Force-delete the unhealthy CSI controller pod to trigger a fresh restart.
+      # A normal delete can hang for minutes if containers are in CrashLoopBackOff,
+      # so we use --grace-period=0 --force to immediately remove it.
+      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Force-deleting unhealthy CSI controller pod: ${CURRENT_CSI_POD}..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      vcfa_ssh "kubectl delete pod ${CURRENT_CSI_POD} -n kube-system --grace-period=0 --force" 2>&1 | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      CSI_FIXED=true
+      sleep 30
+
+      # Wait up to 90s for the new CSI controller pod to become fully ready (7/7)
+      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Waiting for new CSI controller pod to become ready..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      CSI_WAIT=0
+      while [ $CSI_WAIT -lt 90 ]; do
+        NEW_CSI_READY=$(vcfa_ssh 'kubectl get pods -n kube-system -l app=vsphere-csi-controller' | grep -v "NAME" | grep -v "Terminating" | awk '{print $2}')
+        if [ "$NEW_CSI_READY" == "7/7" ]; then
+          echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> CSI controller is now fully ready (${NEW_CSI_READY})" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+          CSISTATUS=""
+          break
+        fi
+        echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> CSI controller status: ${NEW_CSI_READY:-pending} (${CSI_WAIT}/90s)" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+        sleep 15
+        CSI_WAIT=$((CSI_WAIT + 15))
+      done
     fi
-    sleep 10
     if [ $CNT -eq 3 ]; then
       echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> CSI controller check tried 3 times, continuing..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
       break
     fi
   done
+
+  ###### Prelude Pods Stuck Volume Mount Recovery ######
+  # After fixing stuck volume attachments and/or the CSI controller, pods that were stuck
+  # in ContainerCreating or Init due to "volume attachment is being deleted" errors will
+  # NOT automatically recover - they must be deleted so the StatefulSet controller recreates
+  # them with fresh volume mount attempts.
+  if [ "$STUCK_VA_FIXED" = true ] || [ "$CSI_FIXED" = true ]; then
+    echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Volume attachments or CSI controller were fixed, checking prelude pods..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+    sleep 10
+
+    # Check for pods stuck in ContainerCreating or Init states in the prelude namespace
+    STUCK_PODS=$(vcfa_ssh 'kubectl get pods -n prelude -s https://10.1.1.71:6443' | \
+      grep -E "ContainerCreating|Init:" | awk '{print $1}')
+
+    if [ -n "$STUCK_PODS" ]; then
+      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Found stuck prelude pods after volume/CSI fix, deleting to force fresh mount..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      for POD in $STUCK_PODS; do
+        echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Deleting stuck pod: ${POD}" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+        vcfa_ssh "kubectl delete pod ${POD} -n prelude -s https://10.1.1.71:6443" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      done
+      # Wait for pods to be recreated and volumes to attach
+      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Waiting 60s for pods to be recreated with fresh volume mounts..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      sleep 60
+      vcfa_ssh 'kubectl get pods -n prelude -s https://10.1.1.71:6443' | grep -v "Completed" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+    else
+      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> No stuck prelude pods found, services should recover normally" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+    fi
+  fi
   
 
   # CNT=0
