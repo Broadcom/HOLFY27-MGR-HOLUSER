@@ -234,14 +234,76 @@ get_git_project_info() {
     echo "VPod git dir: ${vpodgitdir}" >> ${logfile}
 }
 
+clone_or_pull_labtype_overrides() {
+    # Clone or pull the labtype team override repo if applicable.
+    # External team repos are cloned to /home/holuser/{labtype}/ as a sibling
+    # to the core /home/holuser/hol/ directory.
+    #
+    # Only applies to labtypes that have their own external repo.
+    # Core team labtypes (HOL, VXP) keep overrides inside hol/{labtype}/.
+    #
+    # Input: labtype, branch (global variables)
+    # Output: /home/holuser/{labtype}/ directory with override content
+    
+    local labtype_repo_url=""
+    
+    case "$labtype" in
+        ATE)
+            labtype_repo_url="https://github.com/Broadcom/HOLFY27-ATE-OVERRIDES.git"
+            ;;
+        EDU)
+            labtype_repo_url="https://github.com/Broadcom/HOLFY27-EDU-OVERRIDES.git"
+            ;;
+        Discovery)
+            labtype_repo_url="https://github.com/Broadcom/HOLFY27-DISCOVERY-OVERRIDES.git"
+            ;;
+        *)
+            # HOL, VXP, and others use in-repo overrides - no external repo
+            echo "Labtype ${labtype}: using in-repo overrides (no external repo)" >> ${logfile}
+            return 0
+            ;;
+    esac
+    
+    local labtype_dir="${holuser_home}/${labtype}"
+    
+    echo "Checking for ${labtype} team override repo..." >> ${logfile}
+    
+    if [ -d "${labtype_dir}/.git" ]; then
+        # Repo already cloned - pull latest
+        echo "Pulling latest ${labtype} overrides from ${labtype_repo_url}" >> ${logfile}
+        cd "${labtype_dir}" || return 1
+        git checkout ${branch} >> ${logfile} 2>&1
+        GIT_TERMINAL_PROMPT=0 git pull origin ${branch} >> ${logfile} 2>&1
+        if [ $? -eq 0 ]; then
+            echo "${labtype} overrides updated successfully" >> ${logfile}
+        else
+            echo "WARNING: ${labtype} override pull failed - using existing content" >> ${logfile}
+        fi
+        cd "${holroot}" || return 1
+    else
+        # First boot - clone the repo
+        echo "Cloning ${labtype} overrides from ${labtype_repo_url}" >> ${logfile}
+        GIT_TERMINAL_PROMPT=0 git clone -b ${branch} "${labtype_repo_url}" "${labtype_dir}" >> ${logfile} 2>&1
+        if [ $? -eq 0 ]; then
+            echo "${labtype} overrides cloned successfully" >> ${logfile}
+        else
+            echo "WARNING: ${labtype} override clone failed - ${labtype} overrides not available" >> ${logfile}
+            # Not fatal - the system will use core defaults
+        fi
+    fi
+    
+    return 0
+}
+
 push_router_files_nfs() {
     # Push router files via NFS instead of SCP
     # Note: vpodgitdir must be set before calling this function
     #
     # Override priority (highest to lowest):
-    #   1. /vpodrepo/20XX-labs/XXXX/holorouter/  (Lab-specific vpodrepo)
-    #   2. /home/holuser/hol/{labtype}/holorouter/ (LabType-specific)
-    #   3. /home/holuser/hol/holorouter/           (Default core)
+    #   1. /vpodrepo/20XX-labs/XXXX/holorouter/     (Lab-specific vpodrepo)
+    #   2. /home/holuser/{labtype}/holorouter/       (External team override repo)
+    #   3. /home/holuser/hol/{labtype}/holorouter/   (In-repo labtype override)
+    #   4. /home/holuser/hol/holorouter/             (Default core)
     #
     echo "Pushing router files via NFS to ${holorouterdir}..." >> ${logfile}
     
@@ -255,8 +317,15 @@ push_router_files_nfs() {
     fi
     
     # Layer 2: Overlay labtype-specific router files if present
-    labtyperouter="${holroot}/${labtype}/${router}"
-    if [ -d "${labtyperouter}" ]; then
+    # Check both in-repo ({holroot}/{labtype}) and external ({holuser_home}/{labtype})
+    # External team repo takes precedence over in-repo override
+    labtyperouter=""
+    if [ -d "${holuser_home}/${labtype}/${router}" ]; then
+        labtyperouter="${holuser_home}/${labtype}/${router}"
+    elif [ -d "${holroot}/${labtype}/${router}" ]; then
+        labtyperouter="${holroot}/${labtype}/${router}"
+    fi
+    if [ -n "${labtyperouter}" ] && [ -d "${labtyperouter}" ]; then
         echo "Merging labtype (${labtype}) router files from ${labtyperouter}" >> ${logfile}
         
         # Merge allowlist files (core + labtype)
@@ -306,9 +375,10 @@ push_console_files_nfs() {
     # Push console files via NFS to the Main Console VM
     #
     # Override priority (highest to lowest):
-    #   1. /vpodrepo/20XX-labs/XXXX/console/   (Lab-specific vpodrepo)
-    #   2. /home/holuser/hol/{labtype}/console/ (LabType-specific)
-    #   3. /home/holuser/hol/console/           (Default core)
+    #   1. /vpodrepo/20XX-labs/XXXX/console/     (Lab-specific vpodrepo)
+    #   2. /home/holuser/{labtype}/console/       (External team override repo)
+    #   3. /home/holuser/hol/{labtype}/console/   (In-repo labtype override)
+    #   4. /home/holuser/hol/console/             (Default core)
     #
     # Target directories on the console (via NFS mount at /lmchol):
     #   /lmchol/home/holuser/desktop-hol/  -> conkywatch.sh, VMware.config
@@ -317,7 +387,8 @@ push_console_files_nfs() {
     # This allows:
     #   - Core team to update conkywatch.sh, conky-startup.sh, VMware.config
     #     via the hol repo (console/ directory)
-    #   - LabType teams to override for their program via {labtype}/console/
+    #   - LabType teams to override for their program via their own repo or
+    #     in-repo {labtype}/console/
     #   - Individual labs to override VMware.config (or any file) by placing
     #     their version in their vpodrepo's console/ directory
     
@@ -362,8 +433,14 @@ push_console_files_nfs() {
     done
     
     # Layer 2: Overlay labtype-specific console files if present
-    local labtype_console="${holroot}/${labtype}/console"
-    if [ -d "${labtype_console}" ]; then
+    # Check external team repo first, then in-repo override
+    local labtype_console=""
+    if [ -d "${holuser_home}/${labtype}/console" ]; then
+        labtype_console="${holuser_home}/${labtype}/console"
+    elif [ -d "${holroot}/${labtype}/console" ]; then
+        labtype_console="${holroot}/${labtype}/console"
+    fi
+    if [ -n "${labtype_console}" ] && [ -d "${labtype_console}" ]; then
         echo "Merging labtype (${labtype}) console files from ${labtype_console}" >> ${logfile}
         for file in "${labtype_console}"/*; do
             [ -f "$file" ] && _deploy_console_file "$file" "LabType override"
@@ -390,7 +467,8 @@ push_console_files_nfs() {
 # INITIALIZATION
 #==============================================================================
 
-holroot=/home/holuser/hol
+holuser_home=/home/holuser
+holroot=${holuser_home}/hol
 gitdrive=/vpodrepo
 lmcholroot=/lmchol/hol
 configini=/tmp/config.ini
@@ -624,6 +702,12 @@ else
     fi
 fi
 
+# Clone or pull labtype team override repo (ATE, EDU, Discovery)
+# This runs after the core repo is up to date and labtype is known
+if ! check_testing_mode; then
+    clone_or_pull_labtype_overrides
+fi
+
 # Copy config.ini from vpodrepo if present and git succeeded
 # Otherwise, for non-HOL SKUs, use local holodeck/*.ini fallback
 if [ "$git_success" = true ] && [ -f "${vpodgitdir}"/config.ini ]; then
@@ -663,8 +747,14 @@ else
     cp ${holroot}/${router}/allowall ${holorouterdir}/allowlist 2>/dev/null
     
     # Overlay labtype-specific router overrides if present
-    labtyperouter="${holroot}/${labtype}/${router}"
-    if [ -d "${labtyperouter}" ]; then
+    # Check external team repo first, then in-repo override
+    labtyperouter=""
+    if [ -d "${holuser_home}/${labtype}/${router}" ]; then
+        labtyperouter="${holuser_home}/${labtype}/${router}"
+    elif [ -d "${holroot}/${labtype}/${router}" ]; then
+        labtyperouter="${holroot}/${labtype}/${router}"
+    fi
+    if [ -n "${labtyperouter}" ] && [ -d "${labtyperouter}" ]; then
         echo "Merging labtype (${labtype}) router files from ${labtyperouter}" >> ${logfile}
         for file in "${labtyperouter}"/*; do
             filename=$(basename "$file")

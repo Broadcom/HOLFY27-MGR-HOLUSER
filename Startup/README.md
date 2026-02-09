@@ -2,8 +2,9 @@
 
 1. `/vpodrepo/20XX-labs/XXXX/Startup/{module}.py` (highest)
 2. `/vpodrepo/20XX-labs/XXXX/{module}.py`
-3. `/home/holuser/hol/{labtype}/Startup/{module}.py`
-4. `/home/holuser/hol/Startup/{module}.py` (lowest)
+3. `/home/holuser/{labtype}/Startup/{module}.py` (external team override repo)
+4. `/home/holuser/hol/{labtype}/Startup/{module}.py` (in-repo labtype override)
+5. `/home/holuser/hol/Startup/{module}.py` (lowest)
 
 ## Supported Lab Types
 

@@ -364,8 +364,9 @@ Manages different startup sequences for different lab types (HOL, Discovery, VXP
 
 1. `/vpodrepo/20XX-labs/XXXX/{subfolder}/{file}` (lab-specific override)
 2. `/vpodrepo/20XX-labs/XXXX/{file}` (lab root override)
-3. `/home/holuser/hol/{labtype}/{subfolder}/{file}` (labtype-specific)
-4. `/home/holuser/hol/{subfolder}/{file}` (default core)
+3. `/home/holuser/{labtype}/{subfolder}/{file}` (external team override repo)
+4. `/home/holuser/hol/{labtype}/{subfolder}/{file}` (in-repo labtype override)
+5. `/home/holuser/hol/{subfolder}/{file}` (default core)
 
 **Usage:**
 
