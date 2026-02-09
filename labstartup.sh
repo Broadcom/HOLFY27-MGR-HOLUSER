@@ -1,6 +1,6 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.0 - January 2026
+# Version 3.1 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # Enhanced with NFS-based router communication, DNS import support
 
@@ -274,6 +274,102 @@ push_router_files_nfs() {
     echo "Signaled router: gitdone" >> ${logfile}
 }
 
+push_console_files_nfs() {
+    # Push console files via NFS to the Main Console VM
+    # Mirrors the pattern used by push_router_files_nfs():
+    #   1. Copy core team console files from hol/console/
+    #   2. Overlay with SKU-specific console files from vpodrepo/<sku>/console/
+    #
+    # Target directories on the console (via NFS mount at /lmchol):
+    #   /lmchol/home/holuser/desktop-hol/  -> conkywatch.sh, VMware.config
+    #   /lmchol/home/holuser/.conky/       -> conky-startup.sh
+    #
+    # This allows:
+    #   - Core team to update conkywatch.sh, conky-startup.sh, VMware.config
+    #     via the hol repo (console/ directory)
+    #   - Individual labs to override VMware.config (or any file) by placing
+    #     their version in their vpodrepo's console/ directory
+    
+    local console_src="${holroot}/console"
+    local desktop_dest="/lmchol/home/holuser/desktop-hol"
+    local conky_dest="/lmchol/home/holuser/.conky"
+    
+    echo "Pushing console files via NFS..." >> ${logfile}
+    
+    if [ ! -d "${console_src}" ]; then
+        echo "No console/ directory in hol repo - skipping console file push" >> ${logfile}
+        return
+    fi
+    
+    # Copy core team files to their target locations
+    # VMware.config and conkywatch.sh -> desktop-hol/
+    for file in VMware.config conkywatch.sh; do
+        if [ -f "${console_src}/${file}" ]; then
+            cp "${console_src}/${file}" "${desktop_dest}/${file}" 2>/dev/null
+            if [ $? -eq 0 ]; then
+                echo "Copied console/${file} -> desktop-hol/" >> ${logfile}
+            else
+                echo "WARNING: Failed to copy console/${file} -> desktop-hol/" >> ${logfile}
+            fi
+        fi
+    done
+    
+    # conky-startup.sh -> .conky/
+    if [ -f "${console_src}/conky-startup.sh" ]; then
+        cp "${console_src}/conky-startup.sh" "${conky_dest}/conky-startup.sh" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            echo "Copied console/conky-startup.sh -> .conky/" >> ${logfile}
+        else
+            echo "WARNING: Failed to copy console/conky-startup.sh -> .conky/" >> ${logfile}
+        fi
+    fi
+    
+    # Copy any additional core team console files to desktop-hol/
+    # (future-proofing for new files added to console/)
+    for file in "${console_src}"/*; do
+        filename=$(basename "$file")
+        case "$filename" in
+            VMware.config|conkywatch.sh|conky-startup.sh)
+                # Already handled above
+                ;;
+            *)
+                cp "$file" "${desktop_dest}/${filename}" 2>/dev/null
+                if [ $? -eq 0 ]; then
+                    echo "Copied console/${filename} -> desktop-hol/" >> ${logfile}
+                fi
+                ;;
+        esac
+    done
+    
+    # Overlay with SKU-specific console files if present in vpodrepo
+    # These override the core team defaults (same pattern as router files)
+    local sku_console="${vpodgitdir}/console"
+    if [ -d "${sku_console}" ]; then
+        echo "Merging SKU-specific console files from ${sku_console}" >> ${logfile}
+        for file in "${sku_console}"/*; do
+            filename=$(basename "$file")
+            case "$filename" in
+                conky-startup.sh)
+                    # conky-startup.sh goes to .conky/ directory
+                    cp "$file" "${conky_dest}/${filename}" 2>/dev/null
+                    echo "SKU override: console/${filename} -> .conky/" >> ${logfile}
+                    ;;
+                *)
+                    # Everything else goes to desktop-hol/
+                    cp "$file" "${desktop_dest}/${filename}" 2>/dev/null
+                    echo "SKU override: console/${filename} -> desktop-hol/" >> ${logfile}
+                    ;;
+            esac
+        done
+    fi
+    
+    # Ensure scripts are executable on the console
+    chmod +x "${desktop_dest}/conkywatch.sh" 2>/dev/null
+    chmod +x "${conky_dest}/conky-startup.sh" 2>/dev/null
+    
+    echo "Console file push complete" >> ${logfile}
+}
+
 #==============================================================================
 # INITIALIZATION
 #==============================================================================
@@ -320,8 +416,6 @@ echo "[$(date)] Starting labstartup.sh" >> ${logfile}
 while true; do
     if [ -d ${lmcholroot} ]; then
         echo "LMC detected." >> ${logfile}
-        desktopfile=/lmchol/home/holuser/desktop-hol/VMware.config
-        [ "$1" != "labcheck" ] && cp /home/holuser/hol/Tools/VMware.config $desktopfile 2>/dev/null
         LMC=true
         break
     fi
@@ -552,6 +646,20 @@ else
     fi
     cp ${holroot}/${router}/allowall ${holorouterdir}/allowlist 2>/dev/null
     date > ${holorouterdir}/gitdone
+fi
+
+#==============================================================================
+# PUSH CONSOLE FILES VIA NFS
+#==============================================================================
+# Deploy console files (conkywatch.sh, conky-startup.sh, VMware.config)
+# to the Main Console via the /lmchol NFS mount.
+# Core team files from hol/console/ are copied first, then any SKU-specific
+# overrides from vpodrepo/<sku>/console/ are overlaid on top.
+# This allows labs to customize the conky layout by placing a custom
+# VMware.config (or any console file) in their repo's console/ directory.
+
+if [ "$LMC" = true ] && [ "$1" != "labcheck" ]; then
+    push_console_files_nfs
 fi
 
 date > /tmp/gitdone
