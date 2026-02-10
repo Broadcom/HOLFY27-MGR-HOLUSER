@@ -196,7 +196,7 @@ git_clone() {
             return 0  # Success
         else
             # Check for permanent failures (repo not found)
-            if $(grep -E 'Repository not found|remote: Not Found|fatal: repository.*not found' ${logfile} 2>/dev/null); then
+            if grep -qE 'Repository not found|remote: Not Found|fatal: repository.*not found' ${logfile} 2>/dev/null; then
                 echo "Git repository does not exist: ${gitproject}" >> ${logfile}
                 if is_hol_sku "$vPod_SKU"; then
                     echo "HOL SKU requires git repo. Failing vpod." >> ${logfile}
@@ -427,7 +427,7 @@ push_router_files_nfs() {
     fi
     
     # Signal router that files are ready
-    echo "$(date)" > ${holorouterdir}/gitdone
+    date > ${holorouterdir}/gitdone
     echo "Signaled router: gitdone" >> ${logfile}
 }
 
@@ -655,8 +655,7 @@ echo "$vPod_SKU" > /tmp/vPod_SKU.txt
 # START VLP AGENT
 #==============================================================================
 
-startagent=$(ps -ef | grep VLPagent.sh | grep -v grep)
-if [ "${startagent}" = "" ]; then
+if ! pgrep -f VLPagent.sh > /dev/null 2>&1; then
     cloud=$(/usr/bin/vmtoolsd --cmd "info-get guestinfo.ovfenv" 2>&1 | grep vlp_org_name | cut -f3 -d: | cut -f2 -d\\)
     if [ "${cloud}" = "" ]; then
         echo "Dev environment. Not starting VLP Agent." >> ${logfile}
