@@ -8,15 +8,15 @@
 Fleet Management (SDDC Manager) API Integration Module
 
 This module provides functions for interacting with VMware Fleet Operations
-(via SDDC Manager/Aria Suite Lifecycle Manager) to orchestrate graceful
+(via SDDC Manager/VCF Operations Manager) to orchestrate graceful
 shutdown of VCF environments.
 
 Products that can be managed via Fleet Operations:
-- vra (Aria Automation)
-- vrni (Aria Operations for Networks)  
-- vrops (Aria Operations)
-- vrli (Aria Operations for Logs)
-- vrlcm (Aria Suite Lifecycle Manager itself)
+- vra (VCF Automation)
+- vrni (VCF Operations for Networks)  
+- vrops (VCF Operations)
+- vrli (VCF Operations for Logs)
+- vrlcm (VCF Operations Manager itself)
 
 Power operations:
 - power-on: Start the product VMs

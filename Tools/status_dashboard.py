@@ -145,7 +145,7 @@ class StatusDashboard:
         7. services.py  - Linux services and TCP port verification
         8. Kubernetes.py - Kubernetes certificate checks
         9. urls.py      - URL verification
-        10. VCFfinal.py - VCF final tasks (Tanzu, Aria)
+        10. VCFfinal.py - VCF final tasks (Tanzu, VCF Automation)
         11. final.py    - Final checks and cleanup
         12. odyssey.py  - Odyssey client installation
         """
@@ -230,8 +230,8 @@ class StatusDashboard:
                 ('tanzu_control', 'Tanzu Control Plane', 'Verify Supervisor Control Plane status'),
                 ('wcp_certs', 'WCP Certificate Fix', 'Fix Kubernetes certificates and webhooks'),
                 ('tanzu_deploy', 'Tanzu Deployment', 'Run Tanzu deployment scripts'),
-                ('aria_vms', 'Aria VMs', 'Start Aria Automation virtual machines'),
-                ('aria_urls', 'Aria URL Verification', 'Verify Aria Automation URLs'),
+                ('vcfa_vms', 'VCF Automation VMs', 'Start VCF Automation virtual machines'),
+                ('vcfa_urls', 'VCF Automation URL Verification', 'Verify VCF Automation URLs'),
             ]),
             
             # Group 11: final.py - Final Checks

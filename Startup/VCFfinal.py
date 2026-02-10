@@ -2,7 +2,7 @@
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
 # Version 4.1 - February 2026
 # Author - Burke Azbill and HOL Core Team
-# VCF final tasks (Tanzu, Aria)
+# VCF final tasks (Tanzu, VCF Automation)
 
 import os
 import sys
@@ -23,11 +23,11 @@ logging.basicConfig(level=logging.WARNING)
 #==============================================================================
 
 MODULE_NAME = 'VCFfinal'
-MODULE_DESCRIPTION = 'VCF final tasks (Tanzu, Aria)'
+MODULE_DESCRIPTION = 'VCF final tasks (Tanzu, VCF Automation)'
 
-# Aria URL check configuration
-ARIA_URL_MAX_RETRIES = 30  # Maximum attempts (30 minutes total)
-ARIA_URL_RETRY_DELAY = 60  # Seconds between retries
+# VCF Automation URL check configuration
+VCFA_URL_MAX_RETRIES = 30  # Maximum attempts (30 minutes total)
+VCFA_URL_RETRY_DELAY = 60  # Seconds between retries
 
 # WCP/Supervisor polling configuration
 WCP_POLL_INTERVAL = 30     # seconds between polls
@@ -576,27 +576,27 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if dashboard:
         dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.COMPLETE)
-        dashboard.update_task('vcffinal', 'aria_vms', TaskStatus.RUNNING)
+        dashboard.update_task('vcffinal', 'vcfa_vms', TaskStatus.RUNNING)
         dashboard.generate_html()
     
     #==========================================================================
-    # TASK 4: Check Aria Automation VMs (vRA)
+    # TASK 4: Check VCF Automation VMs (vRA)
     #==========================================================================
     
-    aria_vms_configured = lsf.config.has_option('VCFFINAL', 'vravms')
-    aria_vms_errors = []  # Track errors for this task
-    aria_vms_task_failed = False  # Track if the entire task failed
+    vcfa_vms_configured = lsf.config.has_option('VCFFINAL', 'vravms')
+    vcfa_vms_errors = []  # Track errors for this task
+    vcfa_vms_task_failed = False  # Track if the entire task failed
     
-    # Wrap entire Aria VMs task in try/except to ensure URL checks always run
+    # Wrap entire VCF Automation VMs task in try/except to ensure URL checks always run
     try:
-        if aria_vms_configured:
-            lsf.write_output('Checking Aria Automation VMs...')
-            lsf.write_vpodprogress('Aria Automation', 'GOOD-8')
+        if vcfa_vms_configured:
+            lsf.write_output('Checking VCF Automation VMs...')
+            lsf.write_vpodprogress('VCF Automation', 'GOOD-8')
             
             #------------------------------------------------------------------
             # Clear existing sessions and establish fresh vCenter connection
             # Previous tasks may have connected to ESXi hosts directly, but
-            # Aria VM operations must be done through vCenter
+            # VCF Automation VM operations must be done through vCenter
             #------------------------------------------------------------------
             lsf.write_output('Clearing existing sessions for fresh vCenter connection...')
             for si in lsf.sis:
@@ -607,7 +607,7 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.sis.clear()
             lsf.sisvc.clear()
             
-            # Connect to vCenter(s) - required for Aria VM operations
+            # Connect to vCenter(s) - required for VCF Automation VM operations
             vcenters = []
             if lsf.config.has_option('RESOURCES', 'vCenters'):
                 vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
@@ -615,7 +615,7 @@ def main(lsf=None, standalone=False, dry_run=False):
             
             if not vcenters:
                 lsf.write_output('ERROR: No vCenters configured in RESOURCES section')
-                aria_vms_errors.append('No vCenters configured')
+                vcfa_vms_errors.append('No vCenters configured')
             elif not dry_run:
                 lsf.write_vpodprogress('Connecting vCenters', 'GOOD-3')
                 lsf.write_output(f'Connecting to vCenter(s): {vcenters}')
@@ -627,9 +627,9 @@ def main(lsf=None, standalone=False, dry_run=False):
             vravms_raw = lsf.config.get('VCFFINAL', 'vravms')
             vravms = [v.strip() for v in vravms_raw.split('\n') if v.strip() and not v.strip().startswith('#')]
             
-            if vravms and not dry_run and not aria_vms_errors:
-                lsf.write_output(f'Processing {len(vravms)} Aria Automation VMs...')
-                lsf.write_vpodprogress('Starting Aria VMs', 'GOOD-8')
+            if vravms and not dry_run and not vcfa_vms_errors:
+                lsf.write_output(f'Processing {len(vravms)} VCF Automation VMs...')
+                lsf.write_vpodprogress('Starting VCF Automation VMs', 'GOOD-8')
                 
                 # Before starting, verify NICs are set to start connected
                 for vravm in vravms:
@@ -647,9 +647,9 @@ def main(lsf=None, standalone=False, dry_run=False):
                 try:
                     lsf.start_nested(vravms)
                 except Exception as e:
-                    error_msg = f'Failed to start Aria VMs: {e}'
+                    error_msg = f'Failed to start VCF Automation VMs: {e}'
                     lsf.write_output(error_msg)
-                    aria_vms_errors.append(error_msg)
+                    vcfa_vms_errors.append(error_msg)
                 
                 # After starting, verify VMs are actually powered on and tools running
                 for vravm in vravms:
@@ -694,39 +694,39 @@ def main(lsf=None, standalone=False, dry_run=False):
                         error_msg = str(e)
                         lsf.write_output(f'Warning: Error waiting for {vmname}: {error_msg}')
                 
-                lsf.write_output('Aria Automation VMs processing complete')
+                lsf.write_output('VCF Automation VMs processing complete')
         else:
-            lsf.write_output('No Aria Automation VMs configured')
+            lsf.write_output('No VCF Automation VMs configured')
             
     except Exception as task_error:
-        # Catch any unexpected exception in the entire Aria VMs task
-        error_msg = f'Aria VMs task failed with unexpected error: {task_error}'
+        # Catch any unexpected exception in the entire VCF Automation VMs task
+        error_msg = f'VCF Automation VMs task failed with unexpected error: {task_error}'
         lsf.write_output(error_msg)
-        aria_vms_errors.append(error_msg)
-        aria_vms_task_failed = True
+        vcfa_vms_errors.append(error_msg)
+        vcfa_vms_task_failed = True
     
     # Update dashboard based on task results
     if dashboard:
-        if aria_vms_task_failed or aria_vms_errors:
-            dashboard.update_task('vcffinal', 'aria_vms', TaskStatus.FAILED,
-                                  f'{len(aria_vms_errors)} errors')
+        if vcfa_vms_task_failed or vcfa_vms_errors:
+            dashboard.update_task('vcffinal', 'vcfa_vms', TaskStatus.FAILED,
+                                  f'{len(vcfa_vms_errors)} errors')
         else:
-            dashboard.update_task('vcffinal', 'aria_vms', TaskStatus.COMPLETE)
-        dashboard.update_task('vcffinal', 'aria_urls', TaskStatus.RUNNING)
+            dashboard.update_task('vcffinal', 'vcfa_vms', TaskStatus.COMPLETE)
+        dashboard.update_task('vcffinal', 'vcfa_urls', TaskStatus.RUNNING)
         dashboard.generate_html()
     
     #==========================================================================
-    # TASK 5: Check Aria Automation URLs
+    # TASK 5: Check VCF Automation URLs
     #==========================================================================
     
-    aria_urls_configured = lsf.config.has_option('VCFFINAL', 'vraurls')
+    vcfa_urls_configured = lsf.config.has_option('VCFFINAL', 'vraurls')
     urls_checked = 0
     urls_passed = 0
     urls_failed = 0
     
-    if aria_urls_configured:
-        lsf.write_output('Checking Aria Automation URLs...')
-        lsf.write_vpodprogress('Aria Automation URL Checks', 'GOOD-8')
+    if vcfa_urls_configured:
+        lsf.write_output('Checking VCF Automation URLs...')
+        lsf.write_vpodprogress('VCF Automation URL Checks', 'GOOD-8')
         
         # Run remediation scripts before URL checks
         # Check VCF Automation ssh for password expiration and fix if expired
@@ -754,13 +754,13 @@ def main(lsf=None, standalone=False, dry_run=False):
             
             if url and not dry_run:
                 urls_checked += 1
-                lsf.write_output(f'Testing Aria URL: {url}')
+                lsf.write_output(f'Testing VCF Automation URL: {url}')
                 if expected:
                     lsf.write_output(f'  Expected text: {expected}')
                 
-                # Retry loop - wait up to ARIA_URL_MAX_RETRIES minutes for URL to become available
+                # Retry loop - wait up to VCFA_URL_MAX_RETRIES minutes for URL to become available
                 url_success = False
-                for attempt in range(1, ARIA_URL_MAX_RETRIES + 1):
+                for attempt in range(1, VCFA_URL_MAX_RETRIES + 1):
                     result = lsf.test_url(url, expected_text=expected, verify_ssl=False, timeout=30)
                     if result:
                         lsf.write_output(f'  [SUCCESS] {url} (attempt {attempt})')
@@ -768,25 +768,25 @@ def main(lsf=None, standalone=False, dry_run=False):
                         urls_passed += 1
                         break
                     else:
-                        if attempt == ARIA_URL_MAX_RETRIES:
+                        if attempt == VCFA_URL_MAX_RETRIES:
                             # Final attempt failed - fail the lab
-                            lsf.write_output(f'  [FAILED] {url} after {ARIA_URL_MAX_RETRIES} attempts')
+                            lsf.write_output(f'  [FAILED] {url} after {VCFA_URL_MAX_RETRIES} attempts')
                             urls_failed += 1
-                            lsf.labfail(f'Aria URL {url} not accessible after {ARIA_URL_MAX_RETRIES} minutes - should be reached in under 8 minutes')
+                            lsf.labfail(f'VCF Automation URL {url} not accessible after {VCFA_URL_MAX_RETRIES} minutes - should be reached in under 8 minutes')
                         else:
-                            lsf.write_output(f'  Sleeping and will try again... {attempt} / {ARIA_URL_MAX_RETRIES}')
-                            lsf.labstartup_sleep(ARIA_URL_RETRY_DELAY)
+                            lsf.write_output(f'  Sleeping and will try again... {attempt} / {VCFA_URL_MAX_RETRIES}')
+                            lsf.labstartup_sleep(VCFA_URL_RETRY_DELAY)
         
-        lsf.write_output(f'Aria URL check complete: {urls_passed}/{urls_checked} passed')
+        lsf.write_output(f'VCF Automation URL check complete: {urls_passed}/{urls_checked} passed')
     else:
-        lsf.write_output('No Aria Automation URLs configured')
+        lsf.write_output('No VCF Automation URLs configured')
     
     if dashboard:
         if urls_failed > 0:
-            dashboard.update_task('vcffinal', 'aria_urls', TaskStatus.FAILED, 
+            dashboard.update_task('vcffinal', 'vcfa_urls', TaskStatus.FAILED, 
                                   f'{urls_failed}/{urls_checked} URLs failed')
         else:
-            dashboard.update_task('vcffinal', 'aria_urls', TaskStatus.COMPLETE,
+            dashboard.update_task('vcffinal', 'vcfa_urls', TaskStatus.COMPLETE,
                                   f'{urls_passed} URLs verified' if urls_checked > 0 else '')
         dashboard.generate_html()
     
@@ -826,24 +826,24 @@ def main(lsf=None, standalone=False, dry_run=False):
     # Determine if module succeeded or failed
     # URL failures already call labfail() which exits
     # If we get here, URLs passed (or were not configured)
-    # But if Aria VMs had critical errors AND no URLs were configured to verify,
+    # But if VCF Automation VMs had critical errors AND no URLs were configured to verify,
     # we should still fail
     
     module_failed = False
     
-    if aria_vms_task_failed:
-        # Critical failure in Aria VMs task
-        if not aria_urls_configured:
+    if vcfa_vms_task_failed:
+        # Critical failure in VCF Automation VMs task
+        if not vcfa_urls_configured:
             # No URL checks to verify success - must fail
-            lsf.write_output('CRITICAL: Aria VMs task failed and no URL checks configured to verify')
+            lsf.write_output('CRITICAL: VCF Automation VMs task failed and no URL checks configured to verify')
             module_failed = True
         elif urls_checked == 0:
             # URL checks were configured but none were actually checked (dry_run or empty list)
-            lsf.write_output('WARNING: Aria VMs task failed but URL checks were skipped')
+            lsf.write_output('WARNING: VCF Automation VMs task failed but URL checks were skipped')
             module_failed = True
     
     if module_failed and not dry_run:
-        lsf.labfail(f'{MODULE_NAME} failed: Aria VMs task encountered critical errors')
+        lsf.labfail(f'{MODULE_NAME} failed: VCF Automation VMs task encountered critical errors')
     
     lsf.write_output(f'{MODULE_NAME} completed')
     return not module_failed

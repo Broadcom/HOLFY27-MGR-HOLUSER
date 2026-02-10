@@ -33,6 +33,19 @@ if [ -f "${HOLROOT}/.offline-mode" ] || [ -f "/lmchol/hol/offline-mode" ]; then
     exit 0
 fi
 
+# Check for testing mode - skip git pull to preserve local changes
+# Note: /lmchol may not be mounted yet (mount.sh runs after gitpull.sh),
+# so we check the local path first, then the NFS path as a fallback.
+TESTING_FLAG="${HOLROOT}/testing"
+if [ -f "${TESTING_FLAG}" ] || [ -f "/lmchol/hol/testing" ]; then
+    log_message "TESTING MODE: Skipping git pull to preserve local changes"
+    log_message "*** Delete ${TESTING_FLAG} before capturing to catalog! ***"
+    mkdir -p "${HOLOROUTER_DIR}"
+    touch "${HOLOROUTER_DIR}/gitdone"
+    log_message "holuser gitpull.sh completed (testing mode)"
+    exit 0
+fi
+
 # Wait for network/proxy to be available
 wait_for_proxy() {
     local max_attempts=60

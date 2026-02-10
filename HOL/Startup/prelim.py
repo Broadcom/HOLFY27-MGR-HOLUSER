@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# prelim.py - EDU LabType Preliminary Tasks Module
+# prelim.py - HOL LabType Preliminary Tasks Module
 # Version 3.0 - January 2026
 # Author - Burke Azbill and HOL Core Team
 # 
-# This is the EDU labtype prelim.py which includes all core functionality
-# plus EDU-specific customizations.
+# This is the HOL labtype prelim.py which includes all core functionality
+# plus HOL-specific customizations.
 #
 # Override Priority (highest to lowest):
 #   1. /vpodrepo/20XX-labs/XXXX/Startup/prelim.py  (Lab-specific override)
-#   2. /home/holuser/hol/Startup.EDU/prelim.py     (This file - EDU labtype)
+#   2. /home/holuser/hol/HOL/Startup/prelim.py     (This file - HOL labtype)
 #   3. /home/holuser/hol/Startup/prelim.py         (Default core module)
 
 import os
@@ -23,8 +23,8 @@ sys.path.insert(0, '/home/holuser/hol')
 #==============================================================================
 
 MODULE_NAME = 'prelim'
-MODULE_DESCRIPTION = 'EDU LabType Preliminary Tasks'
-LABTYPE = 'EDU'
+MODULE_DESCRIPTION = 'HOL LabType Preliminary Tasks'
+LABTYPE = 'HOL'
 
 #==============================================================================
 # MAIN FUNCTION
@@ -32,7 +32,7 @@ LABTYPE = 'EDU'
 
 def main(lsf=None, standalone=False, dry_run=False):
     """
-    Main entry point for EDU prelim module
+    Main entry point for HOL prelim module
     
     :param lsf: lsfunctions module
     :param standalone: Whether running in standalone test mode
@@ -212,18 +212,17 @@ def main(lsf=None, standalone=False, dry_run=False):
     ##=========================================================================
     
     ##=========================================================================
-    ## CUSTOM - EDU LabType Specific Code
+    ## CUSTOM - HOL LabType Specific Code
     ## 
-    ## EDU (Education) labs have:
+    ## HOL (Hands-on Labs) labs have:
     ## - Firewall enabled
-    ## - Proxy filtering enabled
-    ## - Training environments
+    ## - NO proxy filtering
     ##
-    ## Add your EDU-specific customizations below.
+    ## Add your HOL-specific customizations below.
     ##=========================================================================
     
     lsf.write_output(f'{LABTYPE} Lab SKU: {lsf.lab_sku}')
-    lsf.write_output(f'{LABTYPE} (Education) labs have full security features')
+    lsf.write_output(f'{LABTYPE} labs have firewall enabled but no proxy filtering')
     
     ## Example 1: Check URL accessibility
     ## ----------------------------------
@@ -285,7 +284,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     ## Example: Fail the lab if critical condition not met
     ## ----------------------------------------------------
-    # lsf.labfail('EDU PRELIM ISSUE - Critical check failed')
+    # lsf.labfail('HOL PRELIM ISSUE - Critical check failed')
     # exit(1)
     
     ##=========================================================================

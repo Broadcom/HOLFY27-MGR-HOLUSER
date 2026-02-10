@@ -26,7 +26,7 @@ VCF Components Managed:
 - vc-mgmt-a.site-a.vcf.lab (vCenter) - SDDC Manager API [AUTOMATED]
 - nsx-mgmt-a.site-a.vcf.lab (NSX Manager) - SDDC Manager API [AUTOMATED]
 - ops-a.site-a.vcf.lab (VCF Operations) - SSH replacement [MANUAL]
-- auto-a.site-a.vcf.lab (VCF Automation) - Aria Suite Lifecycle [MANUAL]
+- auto-a.site-a.vcf.lab (VCF Automation) - VCF Operations Manager [MANUAL]
 - opsnet-a.site-a.vcf.lab (VCF Operations for Networks) - SSH TBD [MANUAL]
 
 Security: Credentials can be provided via:
@@ -863,10 +863,10 @@ class VCFOperationsCertReplacer:
 
 class VCFAutomationCertReplacer:
     """
-    Replace certificates on VCF Automation (Aria Automation).
+    Replace certificates on VCF Automation (VCF Automation).
     
     Note: VCF Automation runs on Kubernetes and certificates are typically managed
-    through Aria Suite Lifecycle, not directly via SSH. This replacer generates
+    through VCF Operations Manager, not directly via SSH. This replacer generates
     the certificate and provides instructions for manual replacement via Lifecycle.
     """
     
@@ -879,8 +879,8 @@ class VCFAutomationCertReplacer:
         """
         Prepare certificate for VCF Automation replacement.
         
-        VCF Automation (Aria Automation) certificates are managed through
-        Aria Suite Lifecycle. This method saves the certificate locally
+        VCF Automation (VCF Automation) certificates are managed through
+        VCF Operations Manager. This method saves the certificate locally
         and provides manual instructions.
         """
         logger.info(f"Preparing certificate for VCF Automation: {self.fqdn}")
@@ -907,7 +907,7 @@ class VCFAutomationCertReplacer:
         logger.info(f"  ✓ Combined PEM for import: {combined_file}")
         logger.info("")
         logger.info("  MANUAL STEPS REQUIRED for VCF Automation:")
-        logger.info("  1. Log in to Aria Suite Lifecycle (https://lcm-a.site-a.vcf.lab)")
+        logger.info("  1. Log in to VCF Operations Manager (https://lcm-a.site-a.vcf.lab)")
         logger.info("  2. Navigate to Locker > Certificates > Import")
         logger.info(f"  3. Import the certificate from: {combined_file}")
         logger.info("  4. Go to Lifecycle Operations > Environments")

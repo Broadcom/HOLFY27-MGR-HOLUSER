@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VCF.py - HOLFY27 Core VCF Startup Module
-# Version 3.4 - February 2026
+# Version 3.5 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation startup sequence
 #
@@ -31,6 +31,11 @@
 #   and continued, wasting 11+ minutes of retry time per unreachable host
 #   in subsequent modules and causing cascading failures.
 #   connect_vcenters() now returns a list of failed hosts.
+# v3.5 Changes:
+# - _start_vm_on_hosts now falls back to prefix matching when an exact VM name
+#   match fails. Some VMs (e.g., VCF Automation appliances) are deployed with a
+#   random suffix (auto-a -> auto-a-45zgb). The fallback uses get_vm_match()
+#   with pattern ^name(-|$) to find the VM without false positives.
 #
 
 import os
@@ -84,8 +89,21 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
     
     vms = lsf.get_vm_by_name(vm_name)
     if not vms:
-        lsf.write_output(f'WARNING: {fail_label} VM not found on any host: {vm_name}')
-        return 'not_found'
+        # Exact name match failed. Some VMs (e.g., VCF Automation appliances) are
+        # deployed with a random suffix appended to the base name (auto-a -> auto-a-45zgb).
+        # Fall back to a prefix match: find VMs whose name starts with vm_name followed
+        # by a dash or end-of-string. This avoids false positives (e.g., "auto-a" should
+        # NOT match "auto-ab" but SHOULD match "auto-a-45zgb").
+        prefix_pattern = f'^{vm_name}(-|$)'
+        prefix_matches = lsf.get_vm_match(prefix_pattern)
+        if prefix_matches:
+            actual_name = prefix_matches[0].name
+            lsf.write_output(f'{fail_label} exact name "{vm_name}" not found, '
+                             f'but prefix match found: "{actual_name}"')
+            vms = prefix_matches
+        else:
+            lsf.write_output(f'WARNING: {fail_label} VM not found on any host: {vm_name}')
+            return 'not_found'
     
     # Log all registrations found
     for vm in vms:
@@ -527,10 +545,10 @@ def main(lsf=None, standalone=False, dry_run=False):
                                   total=0, success=0, failed=0, skipped=0)
     
     #==========================================================================
-    # TASK 4b: Start Post-Edge VMs (e.g., Aria Automation appliances)
+    # TASK 4b: Start Post-Edge VMs (e.g., VCF Automation appliances)
     #==========================================================================
     # These VMs need to boot after NSX Edges are up but before vCenter
-    # to allow maximum boot time. Aria Automation (auto-a) is a typical
+    # to allow maximum boot time. VCF Automation (auto-a) is a typical
     # example that benefits from early boot.
     
     if lsf.config.has_option('VCF', 'vcfpostedgevms'):
@@ -540,7 +558,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         
         if vcfpostedgevms:
             lsf.write_vpodprogress('VCF Post-Edge VMs start', 'GOOD-3')
-            lsf.write_output('Starting post-edge VMs (Aria Automation, etc.)...')
+            lsf.write_output('Starting post-edge VMs (VCF Automation, etc.)...')
             
             if not dry_run:
                 postedge_need_wait = False

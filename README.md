@@ -20,7 +20,7 @@ The lab startup system boots VMs in a carefully orchestrated sequence to ensure 
 | 2 | Datastore Check | `vcfmgmtdatastore` | Verify VSAN/storage is accessible | Until ready |
 | 3 | NSX Manager | `vcfnsxmgr` | Start NSX Manager VMs | 30 seconds |
 | 4 | NSX Edges | `vcfnsxedges` | Start NSX Edge VMs | 5 minutes |
-| 4b | Post-Edge VMs | `vcfpostedgevms` | Start VMs that need early boot (e.g., Aria Automation) | 30 seconds |
+| 4b | Post-Edge VMs | `vcfpostedgevms` | Start VMs that need early boot (e.g., VCF Automation) | 30 seconds |
 | 5 | vCenter | `vcfvCenter` | Start vCenter Server | Continues |
 
 ### Complete Startup Module Sequence
@@ -36,7 +36,7 @@ After VCF component startup, additional modules run in order:
 7. **services** - Windows/Linux service checks
 8. **Kubernetes** - K8s cluster health checks
 9. **urls** - URL availability verification
-10. **VCFfinal** - Aria Automation, Tanzu, final VCF tasks
+10. **VCFfinal** - VCF Automation, Tanzu, final VCF tasks
 11. **final** - Cleanup, ready signal
 12. **odyssey** - Odyssey client installation (if enabled)
 
@@ -72,7 +72,7 @@ vcfvCenter = vc-mgmt-a:esx-02a.site-a.vcf.lab
 
 The `vcfpostedgevms` configuration option allows you to boot VMs immediately after NSX Edges are started, before vCenter. This is useful for:
 
-- **Aria Automation (auto-a)**: Requires significant boot time
+- **VCF Automation (auto-a)**: Requires significant boot time
 - **Large appliances**: VMs that take 10+ minutes to fully initialize
 - **Dependency-free VMs**: VMs that don't need vCenter but need early boot
 

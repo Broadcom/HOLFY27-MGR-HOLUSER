@@ -84,10 +84,13 @@ class TestChooseFile:
         holroot = '/home/holuser/hol'
         labtype = 'HOL'
         
+        home = os.path.dirname(holroot)
+        
         search_paths = [
             os.path.join(vpod_repo, 'Startup', filename),
             os.path.join(vpod_repo, filename),
-            f'{holroot}/Startup.{labtype}/{filename}',
+            f'{home}/{labtype}/Startup/{filename}',
+            f'{holroot}/{labtype}/Startup/{filename}',
             f'{holroot}/Startup/{filename}',
         ]
         
@@ -105,6 +108,7 @@ class TestChooseFile:
         vpod_repo = os.path.join(temp_dir, 'vpodrepo')
         holroot = mock_holroot
         labtype = 'HOL'
+        home = os.path.dirname(holroot)
         
         # Create default file
         default_path = os.path.join(holroot, 'Startup', filename)
@@ -112,7 +116,8 @@ class TestChooseFile:
         search_paths = [
             os.path.join(vpod_repo, 'Startup', filename),
             os.path.join(vpod_repo, filename),
-            f'{holroot}/Startup.{labtype}/{filename}',
+            f'{home}/{labtype}/Startup/{filename}',
+            f'{holroot}/{labtype}/Startup/{filename}',
             f'{holroot}/Startup/{filename}',
         ]
         
