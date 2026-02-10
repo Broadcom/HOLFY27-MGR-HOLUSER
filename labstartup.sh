@@ -25,7 +25,9 @@ holorouterdir=/tmp/holorouter
 # Testing flag file - if this exists, skip git clone/pull operations
 # This allows local testing without overwriting changes
 # IMPORTANT: Delete this file before capturing the lab to the catalog!
-TESTING_FLAG_FILE="/lmchol/hol/testing"
+# Check both the NFS path (Console) and the local path (Manager)
+TESTING_FLAG_LMC="/lmchol/hol/testing"
+TESTING_FLAG_LOCAL="${holroot}/testing"
 
 # Generate new password file if not exists
 if [ ! -f /home/holuser/NEWPASSWORD.txt ]; then
@@ -52,9 +54,10 @@ chmod 775 ${holorouterdir}
 #==============================================================================
 
 check_testing_mode() {
-    if [ -f "${TESTING_FLAG_FILE}" ]; then
+    if [ -f "${TESTING_FLAG_LOCAL}" ] || [ -f "${TESTING_FLAG_LMC}" ]; then
         echo "*** TESTING MODE ENABLED - Skipping git operations ***" >> ${logfile}
-        echo "*** Delete ${TESTING_FLAG_FILE} before capturing to catalog! ***" >> ${logfile}
+        echo "*** Delete testing flag before capturing to catalog! ***" >> ${logfile}
+        echo "***   rm -f ${TESTING_FLAG_LOCAL} ${TESTING_FLAG_LMC} ***" >> ${logfile}
         return 0  # True - testing mode enabled
     fi
     return 1  # False - normal mode
