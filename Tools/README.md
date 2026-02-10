@@ -556,7 +556,7 @@ Checks password expiration for user accounts on all lab infrastructure:
 | Component | Users Checked | Method |
 | ----------- | --------------- | -------- |
 | ESXi Hosts | root | `chage -l` via SSH |
-| vCenter | root (Linux), administrator@vsphere.local | SSH + REST API |
+| vCenter | `root (Linux), administrator@vsphere.local` | SSH + REST API |
 | NSX Manager | admin, root, audit | REST API |
 | SDDC Manager | vcf, root, backup | `chage -l` via SSH |
 | VCF Automation | vmware-system-user, root | `chage -l` via SSH |
