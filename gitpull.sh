@@ -23,6 +23,16 @@ log_message() {
 
 log_message "Starting holuser gitpull.sh"
 
+# Check for offline mode (set by offline-ready.py for partner lab exports)
+# In offline mode, skip all network operations and signal router immediately
+if [ -f "${HOLROOT}/.offline-mode" ] || [ -f "/lmchol/hol/offline-mode" ]; then
+    log_message "OFFLINE MODE: Skipping proxy wait and git pull"
+    mkdir -p "${HOLOROUTER_DIR}"
+    touch "${HOLOROUTER_DIR}/gitdone"
+    log_message "holuser gitpull.sh completed (offline mode)"
+    exit 0
+fi
+
 # Wait for network/proxy to be available
 wait_for_proxy() {
     local max_attempts=60

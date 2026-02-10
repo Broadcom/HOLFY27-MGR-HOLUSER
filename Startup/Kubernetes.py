@@ -175,9 +175,12 @@ def main(lsf=None, standalone=False, dry_run=False):
     if not kubernetes:
         lsf.write_output('No Kubernetes entries configured')
         if dashboard:
-            dashboard.update_task('kubernetes', 'cert_check', TaskStatus.SKIPPED)
+            dashboard.update_task('kubernetes', 'cert_check', TaskStatus.SKIPPED, 'No Kubernetes entries configured')
+            dashboard.update_task('kubernetes', 'cert_renew', TaskStatus.SKIPPED, 'No Kubernetes entries configured')
             dashboard.generate_html()
         return
+    
+    lsf.write_output(f'Checking {len(kubernetes)} Kubernetes clusters')
     
     #==========================================================================
     # Check Each Kubernetes Cluster
@@ -188,6 +191,11 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if dashboard:
         dashboard.update_task('kubernetes', 'cert_check', TaskStatus.COMPLETE)
+        # If cert_renew is still PENDING (no renewal was needed), mark it as skipped
+        for task in dashboard.groups.get('kubernetes', type('', (), {'tasks': []})).tasks:
+            if task.id == 'kubernetes_cert_renew' and task.status == TaskStatus.PENDING:
+                dashboard.update_task('kubernetes', 'cert_renew', TaskStatus.SKIPPED, 'No renewal needed')
+                break
         dashboard.generate_html()
     
     ##=========================================================================

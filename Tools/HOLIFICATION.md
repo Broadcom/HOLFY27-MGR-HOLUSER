@@ -2,7 +2,9 @@
 
 Version 2.0 - January 2026
 
-This document describes the complete HOLification process for preparing vApp templates for VMware Hands-on Labs. It covers both automated steps (handled by `confighol.py`) and manual steps that cannot be automated.
+This document describes the complete HOLification process for preparing vApp templates for VMware Hands-on Labs. It covers both automated steps (handled by `confighol-9.0.py`) and manual steps that cannot be automated.
+
+> **Script Naming Convention:** The confighol script is named according to the VCF version it was developed and tested against. The current version `confighol-9.0.py` is written and tested for VCF 9.0.1. Future VCF versions may require a new script (e.g., `confighol-9.1.py` for VCF 9.1.x).
 
 ---
 
@@ -10,7 +12,7 @@ This document describes the complete HOLification process for preparing vApp tem
 
 - [Overview](#overview)
 - [Prerequisites](#prerequisites)
-- [Automated Steps (confighol.py)](#automated-steps-configholpy)
+- [Automated Steps (confighol-9.0.py)](#automated-steps-confighol-90py)
 - [Manual Steps Required](#manual-steps-required)
   - [Enable SSH on NSX Managers](#enable-ssh-on-nsx-managers)
   - [Enable SSH on NSX Edges](#enable-ssh-on-nsx-edges)
@@ -22,7 +24,7 @@ This document describes the complete HOLification process for preparing vApp tem
 
 ## Overview
 
-The HOL team leverages the Holodeck factory build process (documented elsewhere) and adjusts ("HOLifies") the deliverable for HOL use. The `confighol.py` script automates as much of this process as possible, while some operations require manual intervention due to security architecture constraints.
+The HOL team leverages the Holodeck factory build process (documented elsewhere) and adjusts ("HOLifies") the deliverable for HOL use. The `confighol-9.0.py` script automates as much of this process as possible, while some operations require manual intervention due to security architecture constraints.
 
 ### What Gets Configured
 
@@ -58,9 +60,9 @@ Before beginning HOLification:
 
 ---
 
-## Automated Steps (confighol.py)
+## Automated Steps (confighol-9.0.py)
 
-The following operations are fully automated by running `confighol.py`:
+The following operations are fully automated by running `confighol-9.0.py`:
 
 ### ESXi Host Configuration
 
@@ -107,11 +109,11 @@ The following operations are fully automated by running `confighol.py`:
 
 ## Manual Steps Required
 
-The following steps **must be performed manually** before `confighol.py` can complete NSX configuration:
+The following steps **must be performed manually** before `confighol-9.0.py` can complete NSX configuration:
 
 ### Enable SSH on NSX Managers
 
-SSH must be enabled manually on each NSX Manager via the vSphere Remote Console before `confighol.py` can configure it further.
+SSH must be enabled manually on each NSX Manager via the vSphere Remote Console before `confighol-9.0.py` can configure it further.
 
 **Applies to:**
 
@@ -267,11 +269,11 @@ Follow these steps in order for complete HOLification:
    ssh admin@edge-wld01-01a.site-a.vcf.lab
    ```
 
-### Step 3: Run confighol.py (Automated)
+### Step 3: Run confighol-9.0.py (Automated)
 
 ```bash
 cd ~/hol/Tools
-python3 confighol.py
+python3 confighol-9.0.py
 ```
 
 The script will:
@@ -321,7 +323,7 @@ Repeat Steps 2-4 for Site B / Region B components.
 
 ### NSX API Returns 401 Unauthorized
 
-**Symptom:** `confighol.py` fails with authentication errors for NSX
+**Symptom:** `confighol-9.0.py` fails with authentication errors for NSX
 
 **Solution:** Verify credentials:
 

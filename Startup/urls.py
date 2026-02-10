@@ -123,6 +123,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     except Exception:
         dashboard = None
     
+    lsf.write_vpodprogress('Checking URLs', 'GOOD-3')
+    
     #==========================================================================
     # Get URL Targets from Config
     #==========================================================================

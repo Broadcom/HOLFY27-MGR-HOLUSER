@@ -15,7 +15,7 @@ The lab startup system boots VMs in a carefully orchestrated sequence to ensure 
 ### VCF Boot Sequence
 
 | Order | Task | Config Key | Description | Wait Time |
-|-------|------|------------|-------------|-----------|
+| ------- | ------ | ------------ | ------------- | ----------- |
 | 1 | Management Cluster | `vcfmgmtcluster` | Connect to ESXi hosts, exit maintenance mode | Variable |
 | 2 | Datastore Check | `vcfmgmtdatastore` | Verify VSAN/storage is accessible | Until ready |
 | 3 | NSX Manager | `vcfnsxmgr` | Start NSX Manager VMs | 30 seconds |
@@ -83,7 +83,7 @@ These VMs start in parallel with subsequent startup tasks, maximizing overall bo
 The system supports multiple lab types with different configurations:
 
 | Lab Type | Firewall | Proxy Filter | Description |
-|----------|----------|--------------|-------------|
+| ---------- | ---------- | -------------- | ------------- |
 | HOL | Yes | Yes | Full production Hands-on Labs |
 | Discovery | No | No | Simplified discovery environments |
 | VXP | Yes | Yes | VCF Experience Program demos |
@@ -106,9 +106,10 @@ Lab-specific configuration template containing all VM lists, URL checks, and fea
 
 ## Tools
 
-### confighol.py
+### confighol-9.0.py
 
-HOLification tool that prepares a vApp for HOL deployment:
+HOLification tool that prepares a vApp for HOL deployment. The script is named according to the VCF version it was developed and tested against - `confighol-9.0.py` is written and tested for VCF 9.0.1.
+
 - Imports Vault root CA to Firefox
 - Imports vCenter CA certificates to Firefox
 - Configures SSH access on ESXi hosts
@@ -116,13 +117,16 @@ HOLification tool that prepares a vApp for HOL deployment:
 - Configures NSX SSH access
 
 ```bash
-python3 Tools/confighol.py --dry-run    # Preview changes
-python3 Tools/confighol.py              # Full HOLification
+python3 Tools/confighol-9.0.py --dry-run    # Preview changes
+python3 Tools/confighol-9.0.py              # Full HOLification
 ```
+
+> **Note:** Future VCF versions may require a new script version (e.g., `confighol-9.1.py` for VCF 9.1.x).
 
 ### cert-replacement.py
 
 Manages SSL certificates for VCF components using HashiCorp Vault PKI:
+
 - Generates CSRs via SDDC Manager API
 - Signs certificates with Vault PKI (2-year TTL)
 - Replaces certificates on VCF components
@@ -153,6 +157,7 @@ The router mounts this share at `/mnt/manager` and applies configurations from t
 ### Proxy Not Working
 
 Check Squid configuration on router:
+
 ```bash
 ssh root@router "grep 'acl whitelist' /etc/squid/squid.conf"
 # Should show: acl whitelist dstdomain "/etc/squid/allowlist"
@@ -161,6 +166,7 @@ ssh root@router "grep 'acl whitelist' /etc/squid/squid.conf"
 ### NFS Mount Failing
 
 Verify directory exists and NFS is exported:
+
 ```bash
 ls -la /tmp/holorouter
 showmount -e localhost
@@ -169,9 +175,45 @@ showmount -e localhost
 ### VM Not Booting
 
 Check if VM is in the correct config section:
+
 ```bash
 grep -A10 '\[VCF\]' /tmp/config.ini
 ```
+
+## Analysis: What Happens Today Without Internet?
+
+### Current Failure Points and Timing
+
+When a lab boots without access to GitHub, the following happens:
+
+1. **Root cron** (`@reboot`) runs `[HOLFY27-MGR-ROOT/gitpull.sh](2027-labstartup/HOLFY27-MGR-ROOT/gitpull.sh)`:
+
+   - `wait_for_proxy()` loops up to **60 attempts x 5 seconds = 5 minutes** waiting to reach `https://github.com` through the proxy
+   - After timeout, it logs a WARNING but **continues** (returns 1, does not exit)
+   - `do_git_pull()` runs but fails; logs "Git pull failed - continuing with existing code"
+   - It also tries to `curl` download `tdns-mgr` and `oh-my-posh` from GitHub (lines 74-115) -- these will fail silently
+   - **Result: Does NOT hard-fail. Takes ~5 minutes delay.**
+
+2. **Holuser cron** (`@reboot`) runs `[HOLFY27-MGR-HOLUSER/gitpull.sh](2027-labstartup/HOLFY27-MGR-HOLUSER/gitpull.sh)`:
+
+   - Same `wait_for_proxy()` loop: **5 minutes timeout**
+   - Git pull fails but logs "Git pull failed - continuing with existing code"
+   - Still creates the `gitdone` signal file for the router
+   - **Result: Does NOT hard-fail. Takes ~5 minutes delay.**
+
+3. **Holuser cron** then runs `[HOLFY27-MGR-HOLUSER/labstartup.sh](2027-labstartup/HOLFY27-MGR-HOLUSER/labstartup.sh)`:
+
+   - The `git_clone()` function (lines 95-155) retries **10 attempts x 5 seconds = ~50 seconds per attempt**, meaning up to **~10 minutes** of waiting
+   - For **HOL SKUs**: `git_clone` exits with `FAIL - Could not clone GIT Project` if the repo doesn't already exist locally
+   - For **non-HOL SKUs**: Falls back to local `holodeck/*.ini` files
+   - If `git_pull()` is used (repo already exists locally): retries **30 attempts x 5 seconds = 2.5 minutes**, then logs "Could not perform git pull. Will attempt LabStartup with existing code." and **continues**
+   - **Result: If `/vpodrepo` already has a cloned repo, lab startup WILL eventually succeed after ~7-12 minutes of wasted time. If no local repo exists, HOL SKUs HARD FAIL.**
+
+4. **Router** runs `[27XX-HOLOROUTER/getrules.sh](2027-labstartup/27XX-HOLOROUTER/getrules.sh)`:
+
+   - Waits for NFS mount from manager, then waits for `gitdone` signal
+   - The gitdone signal IS created by holuser's gitpull.sh even on failure, so this works
+   - **Result: No failure here.**
 
 ## Version
 

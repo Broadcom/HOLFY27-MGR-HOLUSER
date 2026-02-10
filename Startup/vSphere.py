@@ -245,38 +245,10 @@ def main(lsf=None, standalone=False, dry_run=False):
         host_count = len(esx_hosts) if esx_hosts else len(lsf.get_all_hosts()) if not dry_run else 0
         dashboard.update_task('vsphere', 'maintenance', TaskStatus.COMPLETE,
                               total=host_count, success=host_count, failed=0)
-        dashboard.update_task('vsphere', 'vcls', TaskStatus.RUNNING)
-    
-    #==========================================================================
-    # TASK 4: Verify vCLS VMs Started
-    #==========================================================================
-    
-    vcls_count = 0
-    if not dry_run:
-        vms = lsf.get_all_vms()
-        
-        for vm in vms:
-            if 'vCLS' in vm.name:
-                vcls_count += 1
-                while vm.runtime.powerState != 'poweredOn':
-                    lsf.write_output(f'Waiting for {vm.name} to power on...')
-                    lsf.labstartup_sleep(lsf.sleep_seconds)
-        
-        if vcls_count > 0:
-            lsf.write_output(f'All {vcls_count} vCLS VMs have started')
-    
-    if dashboard:
-        if vcls_count > 0:
-            dashboard.update_task('vsphere', 'vcls', TaskStatus.COMPLETE,
-                                  total=vcls_count, success=vcls_count, failed=0)
-        else:
-            dashboard.update_task('vsphere', 'vcls', TaskStatus.SKIPPED,
-                                  'No vCLS VMs found',
-                                  total=0, success=0, failed=0, skipped=0)
         dashboard.update_task('vsphere', 'drs', TaskStatus.RUNNING)
     
     #==========================================================================
-    # TASK 5: Wait for DRS to Enable
+    # TASK 4: Wait for DRS to Enable
     #==========================================================================
     
     clusters = []
@@ -317,7 +289,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('vsphere', 'shell_warning', TaskStatus.RUNNING)
     
     #==========================================================================
-    # TASK 6: Suppress Shell Warning on ESXi Hosts
+    # TASK 5: Suppress Shell Warning on ESXi Hosts
     #==========================================================================
     
     shell_warning_count = 0
@@ -350,7 +322,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('vsphere', 'vcenter_ready', TaskStatus.RUNNING)
     
     #==========================================================================
-    # TASK 7: Verify vCenter UI Ready
+    # TASK 6: Verify vCenter UI Ready
     #==========================================================================
     
     if not dry_run:
@@ -371,7 +343,135 @@ def main(lsf=None, standalone=False, dry_run=False):
         vc_ready_count = len([v for v in vcenters if v and not v.strip().startswith('#')])
         dashboard.update_task('vsphere', 'vcenter_ready', TaskStatus.COMPLETE,
                               total=vc_ready_count, success=vc_ready_count, failed=0)
+        dashboard.update_task('vsphere', 'autostart_services', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 7: Verify all Autostart vCenter services are Started
+    # Some services configured for AUTOMATIC startup fail to start during
+    # vCenter boot (e.g. vapi-endpoint, trustmanagement). Check each vCenter
+    # and start any AUTOMATIC services that are not in STARTED state.
+    #==========================================================================
+    
+    autostart_total = 0
+    autostart_started = 0
+    autostart_fixed = 0
+    autostart_failed = 0
+    
+    if not dry_run:
+        import time as _time
+        
+        lsf.write_output('Verifying vCenter autostart services...')
+        
+        AUTOSTART_START_TIMEOUT = 60  # seconds to wait for a service to start
+        AUTOSTART_CHECK_INTERVAL = 10  # seconds between status checks
+        
+        for entry in vcenters:
+            if not entry or entry.strip().startswith('#'):
+                continue
+            
+            vc_hostname = entry.split(':')[0].strip()
+            lsf.write_output(f'Checking autostart services on {vc_hostname}...')
+            
+            # Query all AUTOMATIC services and their RunState via vmon-cli
+            # Use run_command with single-quoted SSH command to avoid
+            # double-quote conflicts in the lsf.ssh() wrapper
+            ssh_opts = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+            check_cmd = (
+                f"{lsf.sshpass} -p {lsf.password} ssh {ssh_opts} root@{vc_hostname} "
+                "'for svc in $(vmon-cli --list 2>/dev/null); do "
+                'info=$(vmon-cli -s $svc 2>/dev/null); '
+                'starttype=$(echo "$info" | grep "Starttype:" | head -1 | sed "s/.*Starttype: //"); '
+                'if [ "$starttype" = "AUTOMATIC" ]; then '
+                'state=$(echo "$info" | grep "RunState:" | head -1 | sed "s/.*RunState: //"); '
+                'echo "$svc:$state"; '
+                "fi; done'"
+            )
+            
+            result = lsf.run_command(check_cmd)
+            
+            if not hasattr(result, 'stdout') or not result.stdout:
+                lsf.write_output(f'  WARNING: Could not query services on {vc_hostname}')
+                autostart_failed += 1
+                continue
+            
+            # Parse results: each line is "service_name:STATE"
+            not_started = []
+            vc_service_count = 0
+            
+            for line in result.stdout.strip().split('\n'):
+                line = line.strip()
+                if ':' not in line:
+                    continue
+                
+                svc_name, svc_state = line.split(':', 1)
+                svc_name = svc_name.strip()
+                svc_state = svc_state.strip()
+                vc_service_count += 1
+                
+                if svc_state == 'STARTED':
+                    autostart_started += 1
+                else:
+                    not_started.append((svc_name, svc_state))
+            
+            autostart_total += vc_service_count
+            
+            if not not_started:
+                lsf.write_output(f'  All {vc_service_count} autostart services on {vc_hostname} are running')
+                continue
+            
+            # Start services that are not running
+            lsf.write_output(f'  Found {len(not_started)} autostart service(s) not started on {vc_hostname}:')
+            for svc_name, svc_state in not_started:
+                lsf.write_output(f'    {svc_name}: {svc_state} - starting...')
+                
+                start_result = lsf.ssh(f'vmon-cli --start {svc_name} 2>&1', f'root@{vc_hostname}')
+                
+                # Wait for service to reach STARTED state
+                started = False
+                wait_start = _time.time()
+                while (_time.time() - wait_start) < AUTOSTART_START_TIMEOUT:
+                    verify_result = lsf.ssh(
+                        f"vmon-cli -s {svc_name} 2>/dev/null | grep 'RunState:' | head -1 | sed 's/.*RunState: //'",
+                        f'root@{vc_hostname}'
+                    )
+                    if hasattr(verify_result, 'stdout') and verify_result.stdout.strip() == 'STARTED':
+                        started = True
+                        break
+                    _time.sleep(AUTOSTART_CHECK_INTERVAL)
+                
+                if started:
+                    lsf.write_output(f'    {svc_name}: Started successfully')
+                    autostart_started += 1
+                    autostart_fixed += 1
+                else:
+                    lsf.write_output(f'    WARNING: {svc_name} did not start within {AUTOSTART_START_TIMEOUT}s')
+                    autostart_failed += 1
+        
+        if autostart_fixed > 0:
+            lsf.write_output(f'Autostart services check complete: {autostart_fixed} service(s) were started')
+        elif autostart_failed > 0:
+            lsf.write_output(f'Autostart services check complete: {autostart_failed} service(s) failed to start')
+        else:
+            lsf.write_output('All autostart services are running on all vCenters')
+    
+    if dashboard:
+        if autostart_total > 0 or dry_run:
+            status = TaskStatus.COMPLETE if autostart_failed == 0 else TaskStatus.FAILED
+            msg = ''
+            if autostart_fixed > 0:
+                msg = f'{autostart_fixed} service(s) required restart'
+            if autostart_failed > 0:
+                msg = f'{autostart_failed} service(s) failed to start'
+            dashboard.update_task('vsphere', 'autostart_services', status,
+                                  msg,
+                                  total=autostart_total, success=autostart_started,
+                                  failed=autostart_failed)
+        else:
+            dashboard.update_task('vsphere', 'autostart_services', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
         dashboard.update_task('vsphere', 'power_on_vms', TaskStatus.RUNNING)
+        dashboard.generate_html()
     
     #==========================================================================
     # TASK 8: Start Nested VMs

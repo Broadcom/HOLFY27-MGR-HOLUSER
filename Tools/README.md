@@ -12,7 +12,7 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
   - [Table of Contents](#table-of-contents)
   - [Python Scripts](#python-scripts)
     - [cert-replacement.py](#cert-replacementpy)
-    - [confighol.py](#configholpy)
+    - [confighol-9.0.py](#confighol-90py)
     - [checkfw.py](#checkfwpy)
     - [dns\_checks.py](#dns_checkspy)
     - [labtypes.py](#labtypespy)
@@ -25,7 +25,8 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
     - [holpwgen.sh](#holpwgensh)
     - [lkill.sh](#lkillsh)
     - [odyssey-launch.sh](#odyssey-launchsh)
-    - [restart\_k8s\_webhooks.sh](#restart_k8s_webhookssh)
+    - [check\_wcp\_vcenter.sh](#check_wcp_vcentersh)
+    - [check\_fix\_wcp.sh](#check_fix_wcpsh)
     - [runautocheck.sh](#runautochecksh)
     - [VLPagent.sh](#vlpagentsh)
     - [watchvcfa.sh](#watchvcfash)
@@ -37,6 +38,8 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
   - [Configuration Files](#configuration-files)
     - [VMware.config](#vmwareconfig)
     - [launch\_odyssey.desktop](#launch_odysseydesktop)
+  - [Partner Export](#partner-export)
+    - [offline-ready.py](#offline-readypy)
   - [Dependencies](#dependencies)
   - [Support](#support)
 
@@ -132,9 +135,11 @@ python3 cert-replacement.py --dry-run
 
 ---
 
-### confighol.py
+### confighol-9.0.py
 
-**vApp HOLification Tool:**
+**vApp HOLification Tool for VCF 9.0.1:**
+
+> **Naming Convention:** This script is named according to the VCF version it was developed and tested against. The current version `confighol-9.0.py` is written and tested for VCF 9.0.1. Future VCF versions may require a new script (e.g., `confighol-9.1.py` for VCF 9.1.x).
 
 Comprehensive automation tool for "HOLifying" vApp templates after the Holodeck factory build process. This script consolidates and replaces the previous `esx-config.py` and `configvsphere.ps1` scripts into a single, unified tool.
 
@@ -246,19 +251,19 @@ Enter choice [S/R/F]:
 
 ```bash
 # Full interactive HOLification
-python3 confighol.py
+python3 confighol-9.0.py
 
 # Preview what would be done (no changes)
-python3 confighol.py --dry-run
+python3 confighol-9.0.py --dry-run
 
 # Skip vCenter shell configuration
-python3 confighol.py --skip-vcshell
+python3 confighol-9.0.py --skip-vcshell
 
 # Skip NSX configuration
-python3 confighol.py --skip-nsx
+python3 confighol-9.0.py --skip-nsx
 
 # Only configure ESXi hosts
-python3 confighol.py --esx-only
+python3 confighol-9.0.py --esx-only
 ```
 
 **Options:**
@@ -582,7 +587,6 @@ The license expiration window is calculated as December 30 of the lab year throu
 
 The following system VMs are automatically skipped for VM configuration checks (they cannot be modified):
 
-- `vCLS-*` - vSphere Cluster Services VMs
 - `vcf-services-platform-template-*` - VCF Services Platform Template VMs
 - `SupervisorControlPlaneVM*` - Tanzu Supervisor Control Plane VMs
 
@@ -722,28 +726,85 @@ Launches the Odyssey desktop client in the background.
 
 ---
 
-### restart_k8s_webhooks.sh
+### check_wcp_vcenter.sh
 
-**Kubernetes Webhook Restart Script:**
+**WCP vCenter Services Check Script:**
 
-Deletes expired certificates and restarts Kubernetes webhooks on Supervisor clusters. Required for labs with Tanzu/vSphere with Kubernetes when certificates have expired.
+Verifies that critical vCenter services required for Workload Control Plane (WCP) / Supervisor clusters are running. This script should be run BEFORE starting Supervisor Control Plane VMs.
+
+**Critical Services Checked:**
+
+| Service | Description |
+| ------- | ----------- |
+| `vapi-endpoint` | vCenter API endpoint service |
+| `trustmanagement` | Encryption key delivery to SCP VMs (critical!) |
+| `wcp` | Workload Control Plane service |
+
+**What it Does:**
+
+1. Verifies vCenter is reachable
+2. Checks each service status via `vmon-cli`
+3. Attempts to start any stopped services
+4. Returns exit code 5 if services cannot be started
+
+**Usage:**
+
+```bash
+# Default vCenter (vc-wld01-a.site-a.vcf.lab)
+./check_wcp_vcenter.sh
+
+# Specify vCenter
+./check_wcp_vcenter.sh vc-wld01-a.site-a.vcf.lab
+```
+
+**Exit Codes:**
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | All services running |
+| 1 | vCenter not reachable |
+| 5 | Could not start required services |
+
+**Note:** This script is also called by `VCFfinal.py` during lab startup when Tanzu/Supervisor is configured.
+
+---
+
+### check_fix_wcp.sh
+
+**WCP Certificate Fix Script:**
+
+Fixes Kubernetes certificates and webhooks on Supervisor Control Plane VMs. This script should be run AFTER Supervisor VMs are started. Replaces the old `restart_k8s_webhooks.sh`.
 
 **What it Does:**
 
 1. SSH to vCenter and extract Supervisor credentials using `decryptK8Pwd.py`
-2. Delete expired certificate secrets
-3. Restart webhook deployments
-4. Scale up CCI, ArgoCD, and Harbor replicas
+2. Verify Supervisor Control Plane is accessible (with VIP fallback logic)
+3. Check hypercrypt and kubelet services on SCP VM
+4. Delete expired certificate secrets
+5. Restart webhook deployments
+6. Scale up CCI, ArgoCD, and Harbor replicas
 
 **Usage:**
 
 ```bash
 # Default vCenter
-./restart_k8s_webhooks.sh
+./check_fix_wcp.sh
 
 # Specify vCenter
-./restart_k8s_webhooks.sh vc-wld01-a.site-a.vcf.lab
+./check_fix_wcp.sh vc-wld01-a.site-a.vcf.lab
 ```
+
+**Exit Codes:**
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | Success |
+| 1 | General error |
+| 2 | SCP not running (hypercrypt/encryption issue) |
+| 3 | Cannot connect to Supervisor |
+| 4 | kubectl commands failed |
+
+**Note:** This script is called by `VCFfinal.py` after starting Supervisor VMs.
 
 ---
 
@@ -949,6 +1010,59 @@ Configuration file for the Conky desktop widget that displays lab status on the 
 **Odyssey Desktop Launcher:**
 
 Desktop entry file for launching the Odyssey client from the desktop environment.
+
+---
+
+## Partner Export
+
+### offline-ready.py
+
+**Offline Lab Export Preparation Tool:**
+
+> **Location:** This script is located at `HOLFY27-MGR-AUTOCHECK/Tools/offline-ready.py` and is deployed to `/home/holuser/hol/HOLFY27-MGR-AUTOCHECK/Tools/` on the Manager VM.
+
+Prepares a lab environment for export to a third-party partner who will run the lab without internet access. This is a one-time preparation tool run manually on the Manager VM before exporting the lab.
+
+**What it Does:**
+
+| Step | Description |
+| ---- | ----------- |
+| 1 | Creates offline-mode marker files to skip git operations on boot |
+| 2 | Creates the testing flag file to skip git clone/pull in labstartup.sh |
+| 3 | Sets `lockholuser = false` in config.ini and holodeck/*.ini files |
+| 4 | Removes external URLs from config.ini URL checks |
+| 5 | Sets passwords on Manager, Router, and Console from creds.txt |
+| 6 | Disables VLP Agent startup |
+| 7 | Verifies that /vpodrepo has a local copy of the lab repository |
+
+**Usage:**
+
+```bash
+# Preview changes (dry-run)
+python3 ~/hol/HOLFY27-MGR-AUTOCHECK/Tools/offline-ready.py --dry-run
+
+# Apply all changes
+python3 ~/hol/HOLFY27-MGR-AUTOCHECK/Tools/offline-ready.py
+
+# Apply without confirmation prompt
+python3 ~/hol/HOLFY27-MGR-AUTOCHECK/Tools/offline-ready.py --yes
+```
+
+**Options:**
+
+| Option | Description |
+| -------- | ------------- |
+| `--dry-run` | Preview changes without applying them |
+| `--yes, -y` | Skip confirmation prompt |
+| `--verbose, -v` | Verbose output |
+
+**Prerequisites:**
+
+- Lab should have completed a successful startup at least once
+- `/vpodrepo` should contain a valid local copy of the lab repository
+- Console and Router VMs should be running and accessible via SSH
+
+See the [HOLFY27-MGR-AUTOCHECK README](../HOLFY27-MGR-AUTOCHECK/README.md#offline-lab-export-partner-preparation) for full documentation.
 
 ---
 
