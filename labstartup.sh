@@ -1,16 +1,55 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.1 - February 2026
+# Version 3.3 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # Enhanced with NFS-based router communication, DNS import support
 
 #==============================================================================
-# TESTING FLAG FILE
+# INITIALIZATION
 #==============================================================================
-# If /lmchol/hol/testing exists, skip git clone/pull operations
+
+holuser_home=/home/holuser
+holroot=${holuser_home}/hol
+gitdrive=/vpodrepo
+lmcholroot=/lmchol/hol
+configini=/tmp/config.ini
+logfile=/tmp/labstartupsh.log
+touch ${logfile} && chmod 666 ${logfile} 2>/dev/null || true
+# Lab environment: disable strict host key checking to handle key changes
+sshoptions='StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+LMC=false
+router='holorouter'
+holorouterdir=/tmp/holorouter
+password=$(cat /home/holuser/creds.txt)
+
+# Testing flag file - if this exists, skip git clone/pull operations
 # This allows local testing without overwriting changes
 # IMPORTANT: Delete this file before capturing the lab to the catalog!
 TESTING_FLAG_FILE="/lmchol/hol/testing"
+
+# Generate new password file if not exists
+if [ ! -f /home/holuser/NEWPASSWORD.txt ]; then
+    /bin/bash /home/holuser/hol/Tools/holpwgen.sh > /home/holuser/NEWPASSWORD.txt
+fi
+
+# Source environment variables
+. /home/holuser/.bashrc
+
+# If no command line argument, clean up old config
+if [ -z "$1" ]; then
+    rm ${configini} > /dev/null 2>&1
+fi
+
+# Remove all at jobs before starting
+for i in $(atq | awk '{print $1}'); do atrm "$i"; done
+
+# Ensure holorouter NFS directory exists
+mkdir -p ${holorouterdir}
+chmod 775 ${holorouterdir}
+
+#==============================================================================
+# FUNCTIONS
+#==============================================================================
 
 check_testing_mode() {
     if [ -f "${TESTING_FLAG_FILE}" ]; then
@@ -89,10 +128,6 @@ use_local_holodeck_ini() {
     echo "ERROR: No defaultconfig.ini found in any holodeck directory" >> ${logfile}
     return 1  # No config found anywhere
 }
-
-#==============================================================================
-# FUNCTIONS
-#==============================================================================
 
 git_pull() {
     cd "$1" || exit
@@ -497,42 +532,8 @@ push_console_files_nfs() {
 }
 
 #==============================================================================
-# INITIALIZATION
+# MAIN EXECUTION
 #==============================================================================
-
-holuser_home=/home/holuser
-holroot=${holuser_home}/hol
-gitdrive=/vpodrepo
-lmcholroot=/lmchol/hol
-configini=/tmp/config.ini
-logfile=/tmp/labstartupsh.log
-touch ${logfile} && chmod 666 ${logfile} 2>/dev/null || true
-# Lab environment: disable strict host key checking to handle key changes
-sshoptions='StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
-LMC=false
-router='holorouter'
-holorouterdir=/tmp/holorouter
-password=$(cat /home/holuser/creds.txt)
-
-# Generate new password file if not exists
-if [ ! -f /home/holuser/NEWPASSWORD.txt ]; then
-    /bin/bash /home/holuser/hol/Tools/holpwgen.sh > /home/holuser/NEWPASSWORD.txt
-fi
-
-# Source environment variables
-. /home/holuser/.bashrc
-
-# If no command line argument, clean up old config
-if [ -z "$1" ]; then
-    rm ${configini} > /dev/null 2>&1
-fi
-
-# Remove all at jobs before starting
-for i in $(atq | awk '{print $1}'); do atrm "$i"; done
-
-# Ensure holorouter NFS directory exists
-mkdir -p ${holorouterdir}
-chmod 775 ${holorouterdir}
 
 #==============================================================================
 # WAIT FOR CONSOLE MOUNT
@@ -603,7 +604,7 @@ if [ "$vpod_found" = true ]; then
         #   1. /home/holuser/{labtype}/holodeck/  (external team repo)
         #   2. /home/holuser/hol/{labtype}/holodeck/  (in-repo labtype)
         #   3. /home/holuser/hol/holodeck/  (core default)
-        local sku_ini=""
+        sku_ini=""
         if [ -f "${holuser_home}/${labtype}/holodeck/${vPod_SKU}.ini" ]; then
             sku_ini="${holuser_home}/${labtype}/holodeck/${vPod_SKU}.ini"
         elif [ -f "${holroot}/${labtype}/holodeck/${vPod_SKU}.ini" ]; then
@@ -617,7 +618,7 @@ if [ "$vpod_found" = true ]; then
             cp "${sku_ini}" ${configini}
         else
             # Fall back to defaultconfig.ini with SKU substitution
-            local default_ini=""
+            default_ini=""
             if [ -f "${holuser_home}/${labtype}/holodeck/defaultconfig.ini" ]; then
                 default_ini="${holuser_home}/${labtype}/holodeck/defaultconfig.ini"
             elif [ -f "${holroot}/${labtype}/holodeck/defaultconfig.ini" ]; then
@@ -834,7 +835,6 @@ else
         done
     fi
     
-    date > ${holorouterdir}/gitdone
 fi
 
 #==============================================================================
@@ -851,7 +851,9 @@ if [ "$LMC" = true ] && [ "$1" != "labcheck" ]; then
     push_console_files_nfs
 fi
 
+# Signal the router that the git pull is complete so files are applied
 date > /tmp/gitdone
+date > ${holorouterdir}/gitdone
 
 #==============================================================================
 # RUN LABSTARTUP
