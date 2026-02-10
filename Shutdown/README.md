@@ -8,6 +8,27 @@ This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab
 
 **Reference**: [VCF 9.0 Shutdown Operations](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-0/fleet-management/vcf-shutdown-and-startup/vcf-shutdown.html)
 
+## Quick-start to Shutdown pod:
+
+### Shutdown procedure:
+
+1) Shutdown nested environment:
+
+    ```bash
+    ssh holuser@manager
+    cd hol
+    python3 Shutdown/Shutdown.py
+    ```
+
+    Wait until complete.
+
+2) Shutdown router as follows:
+On the router, login as root and run the /root/shutdown.sh script -This was written to perform a graceful shutdown of the kubernetes stuff.
+
+3) Shutdown manager
+
+4) Shutdown console
+
 ### Key Features
 
 - **Status File Updates**: The shutdown progress is written to `/lmchol/hol/startup_status.txt` for console display widgets
