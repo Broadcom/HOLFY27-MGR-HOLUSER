@@ -16,11 +16,11 @@ configini=/tmp/config.ini
 logfile=/tmp/labstartupsh.log
 touch ${logfile} && chmod 666 ${logfile} 2>/dev/null || true
 # Lab environment: disable strict host key checking to handle key changes
-sshoptions='StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+# sshoptions='StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
 LMC=false
 router='holorouter'
 holorouterdir=/tmp/holorouter
-password=$(cat /home/holuser/creds.txt)
+#password=$(cat /home/holuser/creds.txt)
 
 # Testing flag file - if this exists, skip git clone/pull operations
 # This allows local testing without overwriting changes
@@ -145,12 +145,10 @@ git_pull() {
             break
         fi
         git checkout $branch >> ${logfile} 2>&1
-        GIT_TERMINAL_PROMPT=0 git pull origin $branch >> ${logfile} 2>&1
-        if [ $? = 0 ]; then
+        if GIT_TERMINAL_PROMPT=0 git pull origin $branch >> ${logfile} 2>&1; then
             break
         else
-            gitresult=$(grep 'could not be found' ${logfile})
-            if [ $? = 0 ]; then
+            if grep -q 'could not be found' ${logfile}; then
                 echo "The git project ${gitproject} does not exist." >> ${logfile}
                 echo "FAIL - No GIT Project" > "$startupstatus"
                 exit 1
@@ -182,8 +180,7 @@ git_clone() {
         fi
         echo "Performing git clone for repo ${vpodgit}" >> ${logfile}
         # Confirm that $gitproject url is valid
-        git ls-remote $gitproject > /dev/null 2>&1
-        if [ $? != 0 ]; then
+        if ! git ls-remote "$gitproject" > /dev/null 2>&1; then
             echo "Git repository does not exist: ${gitproject}" >> ${logfile}
             if is_hol_sku "$vPod_SKU"; then
                 echo "HOL SKU requires git repo. Failing vpod." >> ${logfile}
@@ -195,13 +192,11 @@ git_clone() {
             fi
         fi
         echo "git clone -b $branch $gitproject $vpodgitdir" >> ${logfile}
-        GIT_TERMINAL_PROMPT=0 git clone -b $branch "$gitproject" "$vpodgitdir" >> ${logfile} 2>&1
-        if [ $? = 0 ]; then
+        if GIT_TERMINAL_PROMPT=0 git clone -b $branch "$gitproject" "$vpodgitdir" >> ${logfile} 2>&1; then
             return 0  # Success
         else
             # Check for permanent failures (repo not found)
-            gitresult=$(grep -E 'Repository not found|remote: Not Found|fatal: repository.*not found' ${logfile} 2>/dev/null)
-            if [ $? = 0 ]; then
+            if $(grep -E 'Repository not found|remote: Not Found|fatal: repository.*not found' ${logfile} 2>/dev/null); then
                 echo "Git repository does not exist: ${gitproject}" >> ${logfile}
                 if is_hol_sku "$vPod_SKU"; then
                     echo "HOL SKU requires git repo. Failing vpod." >> ${logfile}
@@ -213,8 +208,7 @@ git_clone() {
                 fi
             fi
             # Check for DNS issues (temporary, retry)
-            gitresult=$(grep 'Could not resolve host' ${logfile})
-            if [ $? = 0 ]; then
+            if grep -q 'Could not resolve host' ${logfile}; then
                 echo "DNS did not resolve, will try again" >> ${logfile}
             else
                 echo "Could not complete git clone. Will try again." >> ${logfile}
@@ -341,8 +335,7 @@ clone_or_pull_labtype_overrides() {
         echo "Pulling latest ${labtype} overrides from ${labtype_repo_url}" >> ${logfile}
         cd "${labtype_dir}" || return 1
         git checkout ${branch} >> ${logfile} 2>&1
-        GIT_TERMINAL_PROMPT=0 git pull origin ${branch} >> ${logfile} 2>&1
-        if [ $? -eq 0 ]; then
+        if GIT_TERMINAL_PROMPT=0 git pull origin ${branch} >> ${logfile} 2>&1; then
             echo "${labtype} overrides updated successfully" >> ${logfile}
         else
             echo "WARNING: ${labtype} override pull failed - using existing content" >> ${logfile}
@@ -351,8 +344,7 @@ clone_or_pull_labtype_overrides() {
     else
         # First boot - clone the repo
         echo "Cloning ${labtype} overrides from ${labtype_repo_url}" >> ${logfile}
-        GIT_TERMINAL_PROMPT=0 git clone -b ${branch} "${labtype_repo_url}" "${labtype_dir}" >> ${logfile} 2>&1
-        if [ $? -eq 0 ]; then
+        if GIT_TERMINAL_PROMPT=0 git clone -b ${branch} "${labtype_repo_url}" "${labtype_dir}" >> ${logfile} 2>&1; then
             echo "${labtype} overrides cloned successfully" >> ${logfile}
         else
             echo "WARNING: ${labtype} override clone failed - ${labtype} overrides not available" >> ${logfile}
@@ -478,8 +470,7 @@ push_console_files_nfs() {
         local filename=$(basename "$src_file")
         case "$filename" in
             conky-startup.sh)
-                cp "$src_file" "${conky_dest}/${filename}" 2>/dev/null
-                if [ $? -eq 0 ]; then
+                if cp "$src_file" "${conky_dest}/${filename}" 2>/dev/null; then
                     echo "${src_label}: console/${filename} -> .conky/" >> ${logfile}
                 fi
                 ;;
@@ -487,8 +478,7 @@ push_console_files_nfs() {
                 # Skip placeholder files
                 ;;
             *)
-                cp "$src_file" "${desktop_dest}/${filename}" 2>/dev/null
-                if [ $? -eq 0 ]; then
+                if cp "$src_file" "${desktop_dest}/${filename}" 2>/dev/null; then
                     echo "${src_label}: console/${filename} -> desktop-hol/" >> ${logfile}
                 fi
                 ;;
@@ -745,9 +735,7 @@ else
     if [ ! -e "${yearrepo}" ] || [ ! -e "${vpodgitdir}" ]; then
         echo "Creating new git repo for ${vPod_SKU}..." >> ${logfile}
         mkdir -p "$yearrepo" > /dev/null 2>&1
-        git_clone "$yearrepo"
-        # shellcheck disable=SC2181
-        if [ $? = 0 ]; then
+        if git_clone "$yearrepo"; then
             git_success=true
             echo "${vPod_SKU} git clone was successful." >> ${logfile}
         else
@@ -778,8 +766,7 @@ if [ "$git_success" = true ] && [ -f "${vpodgitdir}"/config.ini ]; then
 elif [ "$git_success" = false ]; then
     # Fallback for non-HOL SKUs when git repo doesn't exist
     echo "Git operations failed. Attempting local holodeck config fallback for ${vPod_SKU}..." >> ${logfile}
-    use_local_holodeck_ini "$vPod_SKU"
-    if [ $? = 0 ]; then
+    if use_local_holodeck_ini "$vPod_SKU"; then
         echo "Successfully loaded local holodeck config for ${vPod_SKU}" >> ${logfile}
     else
         echo "Failed to load local holodeck config for ${vPod_SKU}" >> ${logfile}
