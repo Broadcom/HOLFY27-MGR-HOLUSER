@@ -38,20 +38,56 @@ is_hol_sku() {
 use_local_holodeck_ini() {
     # Fallback to using local holodeck/*.ini file when git repo not available
     # For non-HOL SKUs only
-    local sku="$1"
-    local ini_file="${holroot}/holodeck/${sku}.ini"
+    #
+    # Search priority for ${sku}.ini:
+    #   1. /home/holuser/{labtype}/holodeck/${sku}.ini  (external team repo)
+    #   2. /home/holuser/hol/{labtype}/holodeck/${sku}.ini  (in-repo labtype)
+    #   3. /home/holuser/hol/holodeck/${sku}.ini  (core default)
+    #
+    # If no ${sku}.ini found, fall back to defaultconfig.ini with same priority:
+    #   1. /home/holuser/{labtype}/holodeck/defaultconfig.ini
+    #   2. /home/holuser/hol/{labtype}/holodeck/defaultconfig.ini
+    #   3. /home/holuser/hol/holodeck/defaultconfig.ini
     
-    if [ -f "${ini_file}" ]; then
+    local sku="$1"
+    local ini_file=""
+    
+    # Search for ${sku}.ini across override hierarchy
+    if [ -f "${holuser_home}/${labtype}/holodeck/${sku}.ini" ]; then
+        ini_file="${holuser_home}/${labtype}/holodeck/${sku}.ini"
+    elif [ -f "${holroot}/${labtype}/holodeck/${sku}.ini" ]; then
+        ini_file="${holroot}/${labtype}/holodeck/${sku}.ini"
+    elif [ -f "${holroot}/holodeck/${sku}.ini" ]; then
+        ini_file="${holroot}/holodeck/${sku}.ini"
+    fi
+    
+    if [ -n "${ini_file}" ]; then
         echo "Using local holodeck config: ${ini_file}" >> ${logfile}
         cp "${ini_file}" ${configini}
         return 0  # Success
-    else
-        echo "No local holodeck config found at ${ini_file}" >> ${logfile}
-        # Fall back to defaultconfig.ini with SKU substitution
-        echo "Using defaultconfig.ini with SKU substitution" >> ${logfile}
-        cat ${holroot}/holodeck/defaultconfig.ini | sed s/HOL-BADSKU/"${sku}"/ > ${configini}
+    fi
+    
+    echo "No local holodeck config found for ${sku}" >> ${logfile}
+    
+    # Fall back to defaultconfig.ini with SKU substitution
+    # Search across override hierarchy
+    local default_ini=""
+    if [ -f "${holuser_home}/${labtype}/holodeck/defaultconfig.ini" ]; then
+        default_ini="${holuser_home}/${labtype}/holodeck/defaultconfig.ini"
+    elif [ -f "${holroot}/${labtype}/holodeck/defaultconfig.ini" ]; then
+        default_ini="${holroot}/${labtype}/holodeck/defaultconfig.ini"
+    elif [ -f "${holroot}/holodeck/defaultconfig.ini" ]; then
+        default_ini="${holroot}/holodeck/defaultconfig.ini"
+    fi
+    
+    if [ -n "${default_ini}" ]; then
+        echo "Using defaultconfig.ini from ${default_ini} with SKU substitution" >> ${logfile}
+        cat "${default_ini}" | sed s/HOL-BADSKU/"${sku}"/ > ${configini}
         return 0  # Still success - we have a config
     fi
+    
+    echo "ERROR: No defaultconfig.ini found in any holodeck directory" >> ${logfile}
+    return 1  # No config found anywhere
 }
 
 #==============================================================================
@@ -249,16 +285,13 @@ clone_or_pull_labtype_overrides() {
     
     case "$labtype" in
         ATE)
-            labtype_repo_url="https://github.com/Broadcom/HOLFY27-ATE-OVERRIDES.git"
+            labtype_repo_url="https://github.com/Broadcom/HOLFY27-MGR-ATE.git"
             ;;
         EDU)
-            labtype_repo_url="https://github.com/Broadcom/HOLFY27-EDU-OVERRIDES.git"
-            ;;
-        Discovery)
-            labtype_repo_url="https://github.com/Broadcom/HOLFY27-DISCOVERY-OVERRIDES.git"
+            labtype_repo_url="https://github.com/Broadcom/HOLFY27-MGR-EDU.git"
             ;;
         *)
-            # HOL, VXP, and others use in-repo overrides - no external repo
+            # HOL, VXP, Discovery,and others use in-repo overrides - no external repo
             echo "Labtype ${labtype}: using in-repo overrides (no external repo)" >> ${logfile}
             return 0
             ;;
@@ -565,12 +598,40 @@ if [ "$vpod_found" = true ]; then
     
     if [ "$labtype" != "HOL" ]; then
         vPod_SKU=$(grep vPod_SKU /tmp/vPod.txt | cut -f2 -d '=' | sed 's/\r$//' | xargs)
-        if [ -f "${holroot}/holodeck/${vPod_SKU}.ini" ]; then
-            echo "Copying ${holroot}/holodeck/${vPod_SKU}.ini to ${configini}" >> ${logfile}
-            cp ${holroot}/holodeck/"${vPod_SKU}".ini ${configini}
+        
+        # Search for ${vPod_SKU}.ini across override hierarchy:
+        #   1. /home/holuser/{labtype}/holodeck/  (external team repo)
+        #   2. /home/holuser/hol/{labtype}/holodeck/  (in-repo labtype)
+        #   3. /home/holuser/hol/holodeck/  (core default)
+        local sku_ini=""
+        if [ -f "${holuser_home}/${labtype}/holodeck/${vPod_SKU}.ini" ]; then
+            sku_ini="${holuser_home}/${labtype}/holodeck/${vPod_SKU}.ini"
+        elif [ -f "${holroot}/${labtype}/holodeck/${vPod_SKU}.ini" ]; then
+            sku_ini="${holroot}/${labtype}/holodeck/${vPod_SKU}.ini"
+        elif [ -f "${holroot}/holodeck/${vPod_SKU}.ini" ]; then
+            sku_ini="${holroot}/holodeck/${vPod_SKU}.ini"
+        fi
+        
+        if [ -n "${sku_ini}" ]; then
+            echo "Copying ${sku_ini} to ${configini}" >> ${logfile}
+            cp "${sku_ini}" ${configini}
         else
-            echo "Copying updated ${holroot}/holodeck/defaultconfig.ini to ${configini}" >> ${logfile}
-            cat ${holroot}/holodeck/defaultconfig.ini | sed s/HOL-BADSKU/"${vPod_SKU}"/ > ${configini}
+            # Fall back to defaultconfig.ini with SKU substitution
+            local default_ini=""
+            if [ -f "${holuser_home}/${labtype}/holodeck/defaultconfig.ini" ]; then
+                default_ini="${holuser_home}/${labtype}/holodeck/defaultconfig.ini"
+            elif [ -f "${holroot}/${labtype}/holodeck/defaultconfig.ini" ]; then
+                default_ini="${holroot}/${labtype}/holodeck/defaultconfig.ini"
+            elif [ -f "${holroot}/holodeck/defaultconfig.ini" ]; then
+                default_ini="${holroot}/holodeck/defaultconfig.ini"
+            fi
+            
+            if [ -n "${default_ini}" ]; then
+                echo "Copying updated ${default_ini} to ${configini}" >> ${logfile}
+                cat "${default_ini}" | sed s/HOL-BADSKU/"${vPod_SKU}"/ > ${configini}
+            else
+                echo "ERROR: No holodeck config found for ${vPod_SKU}" >> ${logfile}
+            fi
         fi
     fi
 else
