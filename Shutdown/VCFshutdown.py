@@ -45,12 +45,12 @@ VCF 9.0 WORKLOAD DOMAIN Shutdown Order:
   8. vCenter Server (LAST for workload domain)
 
 VCF 9.0 MANAGEMENT DOMAIN Shutdown Order:
-  1. VCF Automation (Aria Automation / vra)
+  1. VCF Automation (vra)
   2. VCF Operations for Networks (vrni)
   3. VCF Operations collector
   4. VCF Operations for logs (vrli)
   5. VCF Identity Broker
-  6. VCF Operations fleet management (Aria Suite Lifecycle)
+  6. VCF Operations fleet management (VCF Operations Manager)
   7. VCF Operations (vrops)
   8. VMware Live Site Recovery (if applicable)
   9. NSX Edge nodes
@@ -71,7 +71,7 @@ PHASE 8: Shutdown VCF Operations for Networks (vrni)
 PHASE 9: Shutdown VCF Operations Collector
 PHASE 10: Shutdown VCF Operations for Logs (vrli)
 PHASE 11: Shutdown VCF Identity Broker
-PHASE 12: Shutdown VCF Operations Fleet Management (Aria Suite Lifecycle)
+PHASE 12: Shutdown VCF Operations Fleet Management (VCF Operations Manager)
 PHASE 13: Shutdown VCF Operations (vrops, orchestrator)
 PHASE 14: Shutdown Management Domain NSX Edges
 PHASE 15: Shutdown Management Domain NSX Manager
@@ -486,13 +486,13 @@ def main(lsf=None, standalone=False, dry_run=False):
     password = lsf.get_password()
     
     #==========================================================================
-    # TASK 1: Shutdown Fleet Operations Products (Aria Suite)
+    # TASK 1: Shutdown Fleet Operations Products (VCF Operations Suite)
     #==========================================================================
     
     lsf.write_output('='*60)
-    lsf.write_output('PHASE 1: Fleet Operations (Aria Suite) Shutdown')
+    lsf.write_output('PHASE 1: Fleet Operations (VCF Operations Suite) Shutdown')
     lsf.write_output('='*60)
-    update_shutdown_status(1, 'Fleet Operations (Aria Suite)', dry_run)
+    update_shutdown_status(1, 'Fleet Operations (VCF Operations Suite)', dry_run)
     
     fleet_fqdn = None
     fleet_username = 'admin@local'
@@ -856,7 +856,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     # 3. VCF Operations collector  
     # 4. VCF Operations for logs (vrli)
     # 5. VCF Identity Broker
-    # 6. VCF Operations fleet management (Aria Suite Lifecycle)
+    # 6. VCF Operations fleet management (VCF Operations Manager)
     # 7. VCF Operations (vrops)
     # 8. VMware Live Site Recovery (if applicable)
     # 9. NSX Edge nodes
@@ -1007,7 +1007,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output(f'Would shutdown VCF Identity Broker: {vcf_identity_broker_vms}')
     
     #==========================================================================
-    # TASK 12: Shutdown VCF Operations Fleet Management (Aria Suite Lifecycle)
+    # TASK 12: Shutdown VCF Operations Fleet Management (VCF Operations Manager)
     # Per VCF 9.0 Management Domain order #6
     #==========================================================================
     
@@ -1053,7 +1053,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     # Note: VCF Operations (vrops) may have been partially shut down via Fleet API in Phase 1
     # This phase ensures any remaining VMs are shut down
-    vcf_ops_vms = ['o11n-02a', 'o11n-01a']  # Aria Orchestrator VMs
+    vcf_ops_vms = ['o11n-02a', 'o11n-01a']  # VCF Operations Orchestrator VMs
     
     if lsf.config.has_option('SHUTDOWN', 'vcf_ops_vms'):
         ops_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_vms')

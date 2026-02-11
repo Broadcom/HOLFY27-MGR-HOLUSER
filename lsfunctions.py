@@ -1382,7 +1382,14 @@ def choose_file(folder, name, ext, **kwargs):
     Return HOL file based on vpodrepo override or git update.
     Enhanced to support LabType-specific overrides.
     
-    :param folder: str - the vPod folder of the original file
+    Override priority (highest to lowest):
+    1. /vpodrepo/20XX-labs/XXXX/{folder}/{filename}     (Lab-specific override)
+    2. /vpodrepo/20XX-labs/XXXX/{filename}               (Lab root override)
+    3. /home/holuser/{labtype}/{folder}/{filename}        (External team override repo)
+    4. /home/holuser/hol/{labtype}/{folder}/{filename}    (In-repo labtype override)
+    5. /home/holuser/hol/{folder}/{filename}              (Default core)
+    
+    :param folder: str - the vPod folder of the original file (e.g., 'Startup', 'Shutdown', 'Tools')
     :param name: str - the name of the HOL file to check
     :param ext: str - the extension (typically txt or py)
     :param kwargs: labtype - override labtype for testing
@@ -1395,15 +1402,17 @@ def choose_file(folder, name, ext, **kwargs):
     search_paths = []
     
     # VPodRepo overrides (highest priority)
-    search_paths.append(os.path.join(vpod_repo, 'Startup', filename))
+    search_paths.append(os.path.join(vpod_repo, folder, filename))
     search_paths.append(os.path.join(vpod_repo, filename))
     
-    # LabType-specific core
-    search_paths.append(f'{holroot}/Startup.{lt}/{filename}')
+    # External team override repo (sibling to holroot)
+    search_paths.append(f'{home}/{lt}/{folder}/{filename}')
+    
+    # In-repo labtype override (inside holroot)
+    search_paths.append(f'{holroot}/{lt}/{folder}/{filename}')
     
     # Default core (lowest priority)
     search_paths.append(f'{holroot}/{folder}/{filename}')
-    search_paths.append(f'{holroot}/Startup/{filename}')
     
     for path in search_paths:
         if os.path.exists(path):

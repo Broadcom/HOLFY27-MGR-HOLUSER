@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# prelim.py - HOL LabType Preliminary Tasks Module
+# prelim.py - VXP LabType Preliminary Tasks Module
 # Version 3.0 - January 2026
 # Author - Burke Azbill and HOL Core Team
 # 
-# This is the HOL labtype prelim.py which includes all core functionality
-# plus HOL-specific customizations.
+# This is the VXP labtype prelim.py which includes all core functionality
+# plus VXP-specific customizations.
 #
 # Override Priority (highest to lowest):
 #   1. /vpodrepo/20XX-labs/XXXX/Startup/prelim.py  (Lab-specific override)
-#   2. /home/holuser/hol/Startup.HOL/prelim.py     (This file - HOL labtype)
+#   2. /home/holuser/hol/VXP/Startup/prelim.py     (This file - VXP labtype)
 #   3. /home/holuser/hol/Startup/prelim.py         (Default core module)
 
 import os
@@ -23,8 +23,8 @@ sys.path.insert(0, '/home/holuser/hol')
 #==============================================================================
 
 MODULE_NAME = 'prelim'
-MODULE_DESCRIPTION = 'HOL LabType Preliminary Tasks'
-LABTYPE = 'HOL'
+MODULE_DESCRIPTION = 'VXP LabType Preliminary Tasks'
+LABTYPE = 'VXP'
 
 #==============================================================================
 # MAIN FUNCTION
@@ -32,7 +32,7 @@ LABTYPE = 'HOL'
 
 def main(lsf=None, standalone=False, dry_run=False):
     """
-    Main entry point for HOL prelim module
+    Main entry point for VXP prelim module
     
     :param lsf: lsfunctions module
     :param standalone: Whether running in standalone test mode
@@ -212,17 +212,18 @@ def main(lsf=None, standalone=False, dry_run=False):
     ##=========================================================================
     
     ##=========================================================================
-    ## CUSTOM - HOL LabType Specific Code
+    ## CUSTOM - VXP LabType Specific Code
     ## 
-    ## HOL (Hands-on Labs) labs have:
+    ## VXP (VCF Experience Program) labs have:
     ## - Firewall enabled
-    ## - NO proxy filtering
+    ## - Proxy filtering enabled
+    ## - Demo environments for VCF Experience
     ##
-    ## Add your HOL-specific customizations below.
+    ## Add your VXP-specific customizations below.
     ##=========================================================================
     
     lsf.write_output(f'{LABTYPE} Lab SKU: {lsf.lab_sku}')
-    lsf.write_output(f'{LABTYPE} labs have firewall enabled but no proxy filtering')
+    lsf.write_output(f'{LABTYPE} (VCF Experience Program) labs have full security features')
     
     ## Example 1: Check URL accessibility
     ## ----------------------------------
@@ -284,7 +285,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     ## Example: Fail the lab if critical condition not met
     ## ----------------------------------------------------
-    # lsf.labfail('HOL PRELIM ISSUE - Critical check failed')
+    # lsf.labfail('VXP PRELIM ISSUE - Critical check failed')
     # exit(1)
     
     ##=========================================================================
