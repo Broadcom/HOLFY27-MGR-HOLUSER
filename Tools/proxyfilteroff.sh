@@ -62,13 +62,13 @@ echo "Requested by: $(whoami)@$(hostname)" >> "${DISABLE_PROXY_FILE}"
 
 if [ -f "${DISABLE_PROXY_FILE}" ]; then
     log_message "SUCCESS: Proxy filter disable request sent."
-    log_message "The router watcher will process this on its next cycle."
+    log_message "The router watcher will process this on its next cycle. (every 5 seconds)"
     log_message ""
     log_message "NOTE: The proxy filter will be re-enabled on router reboot."
     log_message "      To re-enable manually, run: proxyfilteron.sh"
     log_message ""
     log_message "IMPORTANT: You may need to wait a few seconds for the change to take effect."
-    log_message "           The router watcher runs periodically."
+    log_message "           The router watcher runs every 5 seconds"
 else
     log_message "ERROR: Failed to create proxy filter disable request file."
     exit 1
@@ -79,4 +79,4 @@ log_message ""
 log_message "REMINDER: You may also need to configure your local environment:"
 log_message "  - For CLI: source ~/.bashrc (proxy is pre-configured)"
 log_message "  - For browsers: Ensure proxy is set to proxy.site-a.vcf.lab:3128"
-log_message "  - To bypass proxy entirely: . ~/noproxy.sh"
+log_message "  - To bypass proxy entirely on your console: . ~/noproxy.sh"
