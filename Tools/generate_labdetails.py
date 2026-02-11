@@ -56,14 +56,14 @@ DEFAULT_OUTPUT = f'{HOL_ROOT}/LABDETAILS.md'
 # Mermaid color styles for different sections
 # Using CSS-style colors in Mermaid style definitions
 MERMAID_STYLES = """
-    %% Color Styles
-    classDef coreVM fill:#d4edda,stroke:#28a745,stroke-width:2px,color:#155724
-    classDef mgmtDomain fill:#cce5ff,stroke:#004085,stroke-width:2px,color:#004085
-    classDef wldDomain fill:#ffe5cc,stroke:#fd7e14,stroke-width:2px,color:#856404
-    classDef external fill:#f8d7da,stroke:#721c24,stroke-width:2px,color:#721c24
-    classDef aria fill:#e2d5f1,stroke:#6f42c1,stroke-width:2px,color:#4a2c7a
-    classDef storage fill:#fff3cd,stroke:#856404,stroke-width:2px,color:#856404
-    classDef network fill:#d1ecf1,stroke:#0c5460,stroke-width:2px,color:#0c5460
+    %% Color Styles - medium-saturation fills with dark text for light/dark mode compatibility
+    classDef coreVM fill:#82d99e,stroke:#28a745,stroke-width:2px,color:#333
+    classDef mgmtDomain fill:#7fbfff,stroke:#004085,stroke-width:2px,color:#333
+    classDef wldDomain fill:#ffbf80,stroke:#fd7e14,stroke-width:2px,color:#333
+    classDef external fill:#f4a6a6,stroke:#721c24,stroke-width:2px,color:#333
+    classDef aria fill:#c4a8e0,stroke:#6f42c1,stroke-width:2px,color:#333
+    classDef storage fill:#ffe082,stroke:#856404,stroke-width:2px,color:#333
+    classDef network fill:#7ec8d9,stroke:#0c5460,stroke-width:2px,color:#333
 """
 
 #==============================================================================
