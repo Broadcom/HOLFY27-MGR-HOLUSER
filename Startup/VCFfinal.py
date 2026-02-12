@@ -194,10 +194,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 1: Connect to VCF Management Cluster Hosts (if needed)
     #==========================================================================
     
-    vcfmgmtcluster = []
-    if lsf.config.has_option('VCF', 'vcfmgmtcluster'):
-        vcfmgmtcluster_raw = lsf.config.get('VCF', 'vcfmgmtcluster')
-        vcfmgmtcluster = [h.strip() for h in vcfmgmtcluster_raw.split('\n') if h.strip()]
+    # Use get_config_list to properly filter commented-out values
+    vcfmgmtcluster = lsf.get_config_list('VCF', 'vcfmgmtcluster')
     
     if vcfmgmtcluster and not dry_run:
         lsf.write_vpodprogress('VCF Hosts Connect', 'GOOD-3')
@@ -219,27 +217,56 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 2: Supervisor Control Plane (Tanzu/WCP)
     #==========================================================================
     
+    # First check if we have any vCenters configured - without vCenters, 
+    # there's no way to have Tanzu/WCP so skip these checks entirely
+    vcenters_list = lsf.get_config_list('RESOURCES', 'vCenters')
+    
+    if not vcenters_list:
+        lsf.write_output('No vCenters configured - skipping Tanzu/WCP checks')
+        if dashboard:
+            dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.SKIPPED, 
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'wcp_vcenter', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'vcfa_vms', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'vcfa_urls', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.generate_html()
+        lsf.write_output('VCFfinal completed (no VCF resources)')
+        return True
+    
     lsf.write_vpodprogress('Tanzu Start', 'GOOD-3')
     
-    # Check for Tanzu Control Plane VMs
-    tanzu_control_configured = lsf.config.has_option('VCFFINAL', 'tanzucontrol')
+    # Check for Tanzu Control Plane VMs - requires tanzucontrol option with valid (non-commented) values
+    tanzu_control_values = lsf.get_config_list('VCFFINAL', 'tanzucontrol')
+    tanzu_control_configured = len(tanzu_control_values) > 0
     
     if tanzu_control_configured and not dry_run:
         #----------------------------------------------------------------------
         # Determine vCenter host for WCP (look for wld vCenter in config)
         #----------------------------------------------------------------------
         wcp_vcenter = None
-        if lsf.config.has_option('RESOURCES', 'vCenters'):
-            vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
-            for vc_line in vcenters_raw.split('\n'):
-                vc_line = vc_line.strip()
-                if vc_line and not vc_line.startswith('#') and 'wld' in vc_line.lower():
-                    # Extract just the hostname (before the colon)
-                    wcp_vcenter = vc_line.split(':')[0].strip()
-                    break
+        for vc_line in vcenters_list:
+            if 'wld' in vc_line.lower():
+                # Extract just the hostname (before the colon)
+                wcp_vcenter = vc_line.split(':')[0].strip()
+                break
         
         if not wcp_vcenter:
-            wcp_vcenter = 'vc-wld01-a.site-a.vcf.lab'  # Default
+            # No WLD vCenter found - use first available vCenter as fallback
+            if vcenters_list:
+                wcp_vcenter = vcenters_list[0].split(':')[0].strip()
+                lsf.write_output(f'No WLD vCenter found, using first available: {wcp_vcenter}')
+            else:
+                lsf.write_output('No vCenters available for Tanzu checks - skipping')
+                if dashboard:
+                    dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.SKIPPED,
+                                          'No vCenters available')
+                    dashboard.generate_html()
+                return True
         
         #----------------------------------------------------------------------
         # TASK 2a: PRE-START - Verify WCP vCenter Services
@@ -258,17 +285,16 @@ def main(lsf=None, standalone=False, dry_run=False):
         
         # Determine SSO domain from vCenter config entry
         sso_domain = 'wld.sso'  # Default
-        if lsf.config.has_option('RESOURCES', 'vCenters'):
-            for vc_line in lsf.config.get('RESOURCES', 'vCenters').split('\n'):
-                vc_line = vc_line.strip()
-                if vc_line and 'wld' in vc_line.lower() and not vc_line.startswith('#'):
-                    parts = vc_line.split(':')
-                    if len(parts) >= 3:
-                        # Extract domain from user like "administrator@wld.sso"
-                        user_part = parts[2].strip()
-                        if '@' in user_part:
-                            sso_domain = user_part.split('@')[1]
-                    break
+        # vcenters_list already filtered by get_config_list above
+        for vc_line in vcenters_list:
+            if 'wld' in vc_line.lower():
+                parts = vc_line.split(':')
+                if len(parts) >= 3:
+                    # Extract domain from user like "administrator@wld.sso"
+                    user_part = parts[2].strip()
+                    if '@' in user_part:
+                        sso_domain = user_part.split('@')[1]
+                break
         
         wcp_vcenter_ok = True
         
@@ -557,8 +583,8 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_vpodprogress('Tanzu Deploy', 'GOOD-3')
             
             # Tanzu deployment scripts can be specified as host:account:script
-            tanzu_deploy_raw = lsf.config.get('VCFFINAL', 'tanzudeploy')
-            tanzu_deploy_items = [t.strip() for t in tanzu_deploy_raw.split('\n') if t.strip()]
+            # Use get_config_list to properly filter commented-out values
+            tanzu_deploy_items = lsf.get_config_list('VCFFINAL', 'tanzudeploy')
             
             for item in tanzu_deploy_items:
                 parts = item.split(':')
@@ -583,7 +609,9 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 4: Check VCF Automation VMs (vRA)
     #==========================================================================
     
-    vcfa_vms_configured = lsf.config.has_option('VCFFINAL', 'vravms')
+    # Check for actual non-commented values, not just the presence of the option
+    vravms = lsf.get_config_list('VCFFINAL', 'vravms')
+    vcfa_vms_configured = len(vravms) > 0
     vcfa_vms_errors = []  # Track errors for this task
     vcfa_vms_task_failed = False  # Track if the entire task failed
     
@@ -608,10 +636,8 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.sisvc.clear()
             
             # Connect to vCenter(s) - required for VCF Automation VM operations
-            vcenters = []
-            if lsf.config.has_option('RESOURCES', 'vCenters'):
-                vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
-                vcenters = [v.strip() for v in vcenters_raw.split('\n') if v.strip() and not v.strip().startswith('#')]
+            # Use get_config_list to properly filter commented-out values
+            vcenters = lsf.get_config_list('RESOURCES', 'vCenters')
             
             if not vcenters:
                 lsf.write_output('ERROR: No vCenters configured in RESOURCES section')
@@ -624,9 +650,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                 if failed_vcs:
                     lsf.write_output(f'WARNING: Failed to connect to vCenter(s): {", ".join(failed_vcs)}')
             
-            vravms_raw = lsf.config.get('VCFFINAL', 'vravms')
-            vravms = [v.strip() for v in vravms_raw.split('\n') if v.strip() and not v.strip().startswith('#')]
-            
+            # vravms already retrieved above to check if configured
             if vravms and not dry_run and not vcfa_vms_errors:
                 lsf.write_output(f'Processing {len(vravms)} VCF Automation VMs...')
                 lsf.write_vpodprogress('Starting VCF Automation VMs', 'GOOD-8')
@@ -719,7 +743,9 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 5: Check VCF Automation URLs
     #==========================================================================
     
-    vcfa_urls_configured = lsf.config.has_option('VCFFINAL', 'vraurls')
+    # Check for actual non-commented URL values, not just the presence of the option
+    vraurls = lsf.get_config_list('VCFFINAL', 'vraurls')
+    vcfa_urls_configured = len(vraurls) > 0
     urls_checked = 0
     urls_passed = 0
     urls_failed = 0
@@ -740,8 +766,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         if os.path.isfile(watchvcfa_script) and not dry_run:
             lsf.run_command(watchvcfa_script)
         
-        vraurls_raw = lsf.config.get('VCFFINAL', 'vraurls')
-        vraurls = [u.strip() for u in vraurls_raw.split('\n') if u.strip() and not u.strip().startswith('#')]
+        # vraurls already retrieved above
         
         for url_spec in vraurls:
             if ',' in url_spec:

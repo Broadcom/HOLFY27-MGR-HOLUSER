@@ -66,13 +66,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     VCENTER_WAIT_TIMEOUT = 600  # seconds
     VCENTER_CHECK_INTERVAL = 20  # seconds between checks
     
-    vcenters = []
-    if lsf.config.has_option('RESOURCES', 'vCenters'):
-        vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
-        if '\n' in vcenters_raw:
-            vcenters = [v.strip() for v in vcenters_raw.split('\n') if v.strip()]
-        else:
-            vcenters = [v.strip() for v in vcenters_raw.split(',') if v.strip()]
+    # Use get_config_list to properly filter commented-out values
+    vcenters = lsf.get_config_list('RESOURCES', 'vCenters')
     
     if not vcenters:
         lsf.write_output('No vCenters configured - skipping vSphere startup')
@@ -96,7 +91,8 @@ def main(lsf=None, standalone=False, dry_run=False):
         
         # Wait for each vCenter to become available before attempting connection
         for entry in vcenters:
-            if not entry or entry.strip().startswith('#'):
+            # get_config_list already filters comments, but double-check
+            if not entry:
                 continue
             
             # Extract hostname from entry (format: hostname:type:user)
@@ -164,7 +160,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output(f'Would connect to vCenters: {vcenters}')
     
     if dashboard:
-        vc_count = len([v for v in vcenters if v and not v.strip().startswith('#')])
+        vc_count = len(vcenters)  # Already filtered by get_config_list
         dashboard.update_task('vsphere', 'vcenter_wait', TaskStatus.COMPLETE,
                               total=vc_count, success=vc_count, failed=0)
         dashboard.update_task('vsphere', 'vcenter_connect', TaskStatus.COMPLETE,
@@ -175,13 +171,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 2: Check Datastores
     #==========================================================================
     
-    datastores = []
-    if lsf.config.has_option('RESOURCES', 'Datastores'):
-        datastores_raw = lsf.config.get('RESOURCES', 'Datastores')
-        if '\n' in datastores_raw:
-            datastores = [d.strip() for d in datastores_raw.split('\n') if d.strip()]
-        else:
-            datastores = [d.strip() for d in datastores_raw.split(',') if d.strip()]
+    # Use get_config_list to properly filter commented-out values
+    datastores = lsf.get_config_list('RESOURCES', 'Datastores')
     
     if datastores:
         lsf.write_vpodprogress('Checking Datastores', 'GOOD-3')
@@ -215,13 +206,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     #==========================================================================
     
     # Parse ESXi hosts to determine which should stay in maintenance mode
-    esx_hosts = []
-    if lsf.config.has_option('RESOURCES', 'ESXiHosts'):
-        esx_hosts_raw = lsf.config.get('RESOURCES', 'ESXiHosts')
-        if '\n' in esx_hosts_raw:
-            esx_hosts = [h.strip() for h in esx_hosts_raw.split('\n') if h.strip()]
-        else:
-            esx_hosts = [h.strip() for h in esx_hosts_raw.split(',') if h.strip()]
+    # Use get_config_list to properly filter commented-out values
+    esx_hosts = lsf.get_config_list('RESOURCES', 'ESXiHosts')
     
     # Build list of hosts to keep in maintenance mode
     for entry in esx_hosts:
@@ -251,13 +237,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 4: Wait for DRS to Enable
     #==========================================================================
     
-    clusters = []
-    if lsf.config.has_option('RESOURCES', 'Clusters'):
-        clusters_raw = lsf.config.get('RESOURCES', 'Clusters')
-        if '\n' in clusters_raw:
-            clusters = [c.strip() for c in clusters_raw.split('\n') if c.strip()]
-        else:
-            clusters = [c.strip() for c in clusters_raw.split(',') if c.strip()]
+    # Use get_config_list to properly filter commented-out values
+    clusters = lsf.get_config_list('RESOURCES', 'Clusters')
     
     drs_clusters = []
     for entry in clusters:
@@ -477,13 +458,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 8: Start Nested VMs
     #==========================================================================
     
-    vms_to_start = []
-    if lsf.config.has_option('RESOURCES', 'VMs'):
-        vms_raw = lsf.config.get('RESOURCES', 'VMs')
-        if '\n' in vms_raw:
-            vms_to_start = [v.strip() for v in vms_raw.split('\n') if v.strip()]
-        else:
-            vms_to_start = [v.strip() for v in vms_raw.split(',') if v.strip()]
+    # Use get_config_list to properly filter commented-out values
+    vms_to_start = lsf.get_config_list('RESOURCES', 'VMs')
     
     if vms_to_start:
         lsf.write_vpodprogress('Starting VMs', 'GOOD-4')
@@ -516,13 +492,8 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('vsphere', 'power_on_vapps', TaskStatus.RUNNING)
         dashboard.generate_html()
     
-    vapps = []
-    if lsf.config.has_option('RESOURCES', 'vApps'):
-        vapps_raw = lsf.config.get('RESOURCES', 'vApps')
-        if '\n' in vapps_raw:
-            vapps = [v.strip() for v in vapps_raw.split('\n') if v.strip()]
-        else:
-            vapps = [v.strip() for v in vapps_raw.split(',') if v.strip()]
+    # Use get_config_list to properly filter commented-out values
+    vapps = lsf.get_config_list('RESOURCES', 'vApps')
     
     if vapps:
         lsf.write_output('Starting vApps')

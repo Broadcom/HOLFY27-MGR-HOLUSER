@@ -164,13 +164,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # Get Kubernetes Entries from Config
     #==========================================================================
     
-    kubernetes = []
-    if lsf.config.has_option('RESOURCES', 'Kubernetes'):
-        k8s_raw = lsf.config.get('RESOURCES', 'Kubernetes')
-        if '\n' in k8s_raw:
-            kubernetes = [k.strip() for k in k8s_raw.split('\n') if k.strip()]
-        else:
-            kubernetes = [k.strip() for k in k8s_raw.split(',') if k.strip()]
+    # Use get_config_list to properly filter commented-out values
+    kubernetes = lsf.get_config_list('RESOURCES', 'Kubernetes')
     
     if not kubernetes:
         lsf.write_output('No Kubernetes entries configured')

@@ -59,14 +59,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # Get ESXi Hosts from Config
     #==========================================================================
     
-    esx_hosts = []
-    if lsf.config.has_option('RESOURCES', 'ESXiHosts'):
-        esx_hosts_raw = lsf.config.get('RESOURCES', 'ESXiHosts')
-        # Handle both newline-separated and comma-separated formats
-        if '\n' in esx_hosts_raw:
-            esx_hosts = [h.strip() for h in esx_hosts_raw.split('\n') if h.strip()]
-        else:
-            esx_hosts = [h.strip() for h in esx_hosts_raw.split(',') if h.strip()]
+    # Use get_config_list to properly filter commented-out values
+    esx_hosts = lsf.get_config_list('RESOURCES', 'ESXiHosts')
     
     if not esx_hosts:
         lsf.write_output('No ESXi hosts configured in config.ini')
