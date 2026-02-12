@@ -671,6 +671,52 @@ if ! pgrep -f VLPagent.sh > /dev/null 2>&1; then
 fi
 
 #==============================================================================
+# CHECK FOR PRIOR PROXY FAILURE
+#==============================================================================
+# gitpull.sh runs before labstartup.sh and checks proxy availability.
+# If it wrote a FAIL status, check if the proxy has recovered since then.
+# If not, fail the startup immediately rather than proceeding with a broken proxy.
+
+if [ -f "$startupstatus" ] && grep -q "FAIL.*Proxy" "$startupstatus" 2>/dev/null; then
+    echo "gitpull.sh reported proxy failure. Checking if proxy has recovered..." >> ${logfile}
+    proxy_recovered=false
+    proxy_recheck_max=12
+    proxy_recheck=0
+    while [ $proxy_recheck -lt $proxy_recheck_max ]; do
+        if nc -z -w3 proxy.site-a.vcf.lab 3128 > /dev/null 2>&1; then
+            proxy_recovered=true
+            echo "Proxy has recovered (squid listening on port 3128). Clearing failure." >> ${logfile}
+            # Clear the failure status since proxy is now available
+            echo "STARTING" > "$startupstatus"
+            break
+        fi
+        proxy_recheck=$((proxy_recheck + 1))
+        echo "Proxy still unavailable (recheck ${proxy_recheck}/${proxy_recheck_max})..." >> ${logfile}
+        sleep 5
+    done
+    if [ "$proxy_recovered" = "false" ]; then
+        echo "Proxy remains unavailable after recheck. Lab startup FAILED." >> ${logfile}
+        echo "FAIL - Proxy Unavailable" > "$startupstatus"
+        sync
+        # Update the HTML dashboard with failure
+        if [ -f "${holroot}/Tools/status_dashboard.py" ]; then
+            /usr/bin/python3 -c "
+import sys
+sys.path.insert(0, '${holroot}/Tools')
+try:
+    from status_dashboard import StatusDashboard
+    dashboard = StatusDashboard('STARTUP')
+    dashboard.set_failed('Proxy Unavailable - squid not listening on port 3128')
+    dashboard.generate_html()
+except Exception as e:
+    pass
+" >> ${logfile} 2>&1
+        fi
+        exit 1
+    fi
+fi
+
+#==============================================================================
 # WAIT FOR VPODREPO MOUNT
 #==============================================================================
 
