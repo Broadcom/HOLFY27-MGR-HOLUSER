@@ -23,13 +23,13 @@ This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab
     Wait until complete.
 
 2) Shutdown router as follows:
-On the router, login as root and run the /root/shutdown.sh script -This was written to perform a graceful shutdown of the kubernetes stuff.
+On the router, login as root and run the /root/shutdown.sh script -This was written to perform a graceful shutdown of the kubernetes environment, services, etc...
 
 3) Shutdown manager
 
 4) Shutdown console
 
-### Key Features
+### Key Features of Shutdown.py
 
 - **Status File Updates**: The shutdown progress is written to `/lmchol/hol/startup_status.txt` for console display widgets
 - **Real-time Logging**: Detailed progress output for all phases and operations
@@ -214,15 +214,15 @@ flowchart TD
     SUMMARY --> STATUS_DONE["Set Status: Shutdown Complete"]
     STATUS_DONE --> FINISH(["✅ Lab shut down.<br/>Manually shutdown manager,<br/>router, and console."])
 
-    style START fill:#90EE90
-    style FINISH fill:#90EE90
-    style P0 fill:#E6F3FF
-    style P1 fill:#FFF3E6
-    style P2_START fill:#F3E6FF
-    style P3_START fill:#E6FFE6
-    style P4_START fill:#FFE6E6
-    style STATUS_INIT fill:#FFFACD
-    style STATUS_DONE fill:#FFFACD
+    style START fill:#5cb85c,color:#333
+    style FINISH fill:#5cb85c,color:#333
+    style P0 fill:#7fbfff,color:#333
+    style P1 fill:#ffcc80,color:#333
+    style P2_START fill:#c4a8e0,color:#333
+    style P3_START fill:#82d99e,color:#333
+    style P4_START fill:#f4a6a6,color:#333
+    style STATUS_INIT fill:#ffe082,color:#333
+    style STATUS_DONE fill:#ffe082,color:#333
 ```
 
 ### VCF Shutdown Module (VCFshutdown.py)
@@ -296,23 +296,23 @@ flowchart TD
     
     VCF_END(["✅ Return success + ESXi host list"])
 
-    style VCF_START fill:#90EE90
-    style VCF_END fill:#90EE90
-    style P1 fill:#FFE6E6
-    style P2 fill:#E6F3FF
-    style P3 fill:#FFF3E6
-    style P4 fill:#F3E6FF
-    style P5 fill:#E6FFE6
-    style P5B fill:#E6FFE6
-    style P6 fill:#FFFDE6
-    style P7 fill:#FFD700
-    style P8 fill:#E6FFFF
-    style P9 fill:#E6FFFF
-    style P10 fill:#FFE6F3
-    style P11 fill:#FFE6F3
-    style P12 fill:#F0F0F0
-    style P13 fill:#F0F0F0
-    style P14 fill:#E6E6FF
+    style VCF_START fill:#5cb85c,color:#333
+    style VCF_END fill:#5cb85c,color:#333
+    style P1 fill:#f4a6a6,color:#333
+    style P2 fill:#7fbfff,color:#333
+    style P3 fill:#ffcc80,color:#333
+    style P4 fill:#c4a8e0,color:#333
+    style P5 fill:#82d99e,color:#333
+    style P5B fill:#82d99e,color:#333
+    style P6 fill:#ffe082,color:#333
+    style P7 fill:#e6b800,color:#333
+    style P8 fill:#7ec8d9,color:#333
+    style P9 fill:#7ec8d9,color:#333
+    style P10 fill:#f2a6c8,color:#333
+    style P11 fill:#f2a6c8,color:#333
+    style P12 fill:#b8b8b8,color:#333
+    style P13 fill:#b8b8b8,color:#333
+    style P14 fill:#a6a6e6,color:#333
 ```
 
 ### Fleet Operations Detail
@@ -329,8 +329,8 @@ flowchart LR
         F_WAIT2 --> F_END([Complete])
     end
 
-    style F_START fill:#90EE90
-    style F_END fill:#FFB6C1
+    style F_START fill:#5cb85c,color:#333
+    style F_END fill:#e68a8a,color:#333
 ```
 
 ### VM Shutdown Logic
@@ -358,9 +358,9 @@ flowchart TB
         VS_FORCE_TIMEOUT --> VS_END
     end
 
-    style VS_START fill:#90EE90
-    style VS_END fill:#FFB6C1
-    style VS_SUCCESS fill:#90EE90
+    style VS_START fill:#5cb85c,color:#333
+    style VS_END fill:#e68a8a,color:#333
+    style VS_SUCCESS fill:#5cb85c,color:#333
 ```
 
 ### Sequence Diagram

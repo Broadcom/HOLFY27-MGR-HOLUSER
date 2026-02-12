@@ -157,9 +157,15 @@ def init(router=True, **kwargs):
             _password = f.read().strip()
             password = _password  # Update public alias
     
-    # Check router if requested and labtype is HOL
+    # Check router and proxy if requested and labtype is HOL
     if router and labtype == 'HOL':
         check_router()
+        # Quick proxy availability check (not a full wait loop - that's done
+        # in gitpull.sh and prelim.py). Just log the current state.
+        if test_tcp_port(proxy, 3128, timeout=3):
+            write_output(f'Proxy is available ({proxy}:3128)')
+        else:
+            write_output(f'WARNING: Proxy not yet available ({proxy}:3128)')
     
     write_output(f'lsfunctions initialized: lab_sku={lab_sku}, labtype={labtype}')
 
@@ -169,6 +175,70 @@ def check_router():
         write_output('Router is reachable')
     else:
         write_output('WARNING: Router not reachable')
+
+def check_proxy(max_attempts=60, remediate=True):
+    """
+    Check proxy (squid) availability by testing TCP port 3128.
+    
+    This verifies that squid is listening and ready to accept connections.
+    We test the TCP port directly rather than curling through the proxy to
+    an external site, because the router's getrules.sh may still be
+    configuring iptables rules (which would block external access even
+    though squid itself is running).
+    
+    If the proxy is not available after initial attempts, optionally
+    attempt remediation by restarting squid on the router via SSH.
+    
+    :param max_attempts: Maximum number of attempts (default 60, ~5 minutes at 5s intervals)
+    :param remediate: Whether to attempt SSH remediation if proxy is down
+    :return: True if proxy is available, False if not
+    """
+    remediation_attempt = max_attempts // 2  # Remediate halfway through
+    remediated = False
+    
+    for attempt in range(1, max_attempts + 1):
+        if test_tcp_port(proxy, 3128, timeout=3):
+            write_output(f'Proxy is available (squid listening on {proxy}:3128)')
+            return True
+        
+        # Attempt remediation at the halfway point
+        if attempt == remediation_attempt and remediate and not remediated:
+            write_output(f'Proxy not available after {attempt - 1} attempts - attempting remediation')
+            remediated = _remediate_proxy()
+            if remediated and test_tcp_port(proxy, 3128, timeout=3):
+                write_output('Proxy is available after remediation')
+                return True
+        
+        write_output(f'Waiting for proxy on {proxy}:3128 (attempt {attempt}/{max_attempts})...')
+        time.sleep(5)
+    
+    write_output(f'ERROR: Proxy not available after {max_attempts} attempts')
+    return False
+
+def _remediate_proxy():
+    """
+    Attempt to remediate proxy by restarting squid on the router via SSH.
+    
+    :return: True if remediation command succeeded, False otherwise
+    """
+    write_output('Attempting proxy remediation: restarting squid on router via SSH...')
+    pwd = get_password()
+    if not pwd:
+        write_output('WARNING: No password available for SSH remediation')
+        return False
+    
+    try:
+        result = ssh('systemctl restart squid', f'root@{router}', pwd)
+        if result.returncode == 0:
+            write_output('Squid restart command succeeded on router')
+            time.sleep(3)  # Give squid time to fully start
+            return True
+        else:
+            write_output(f'Squid restart failed on router: {result.stderr}')
+            return False
+    except Exception as e:
+        write_output(f'SSH remediation failed: {e}')
+        return False
 
 #==============================================================================
 # PASSWORD FUNCTIONS

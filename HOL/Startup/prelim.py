@@ -164,13 +164,32 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output(f'Verifying proxy filter status ({LABTYPE} lab)...')
         
         if not dry_run:
-            # Proxy filter is configured on the router via iptables rules
-            # For verification, check if the router is reachable (already checked above)
-            lsf.write_output('Proxy filter verification passed')
-        
-        if dashboard:
-            dashboard.update_task('prelim', 'proxy_filter', 'complete')
-            dashboard.generate_html()
+            # Verify squid proxy is actually listening on TCP port 3128
+            # This is a definitive check - if the proxy is not available here,
+            # the lab will not function correctly for HOL labs
+            proxy_available = lsf.test_tcp_port(lsf.proxy, 3128, timeout=5)
+            
+            if not proxy_available:
+                lsf.write_output(f'Proxy not available on {lsf.proxy}:3128 - attempting remediation...')
+                # Use the check_proxy function which includes SSH remediation
+                proxy_available = lsf.check_proxy(max_attempts=30, remediate=True)
+            
+            if proxy_available:
+                lsf.write_output('Proxy filter verification passed (squid listening on port 3128)')
+                if dashboard:
+                    dashboard.update_task('prelim', 'proxy_filter', 'complete')
+                    dashboard.generate_html()
+            else:
+                lsf.write_output(f'CRITICAL: Proxy (squid) not available on {lsf.proxy}:3128')
+                if dashboard:
+                    dashboard.update_task('prelim', 'proxy_filter', 'failed',
+                                          f'Squid not listening on {lsf.proxy}:3128')
+                    dashboard.generate_html()
+                lsf.labfail(f'Proxy Unavailable - squid not listening on {lsf.proxy}:3128')
+        else:
+            if dashboard:
+                dashboard.update_task('prelim', 'proxy_filter', 'complete')
+                dashboard.generate_html()
     else:
         lsf.write_output(f'Proxy filter not required for {lsf.labtype} lab type')
         if dashboard:
