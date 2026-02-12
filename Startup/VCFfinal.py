@@ -609,7 +609,9 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 4: Check VCF Automation VMs (vRA)
     #==========================================================================
     
-    vcfa_vms_configured = lsf.config.has_option('VCFFINAL', 'vravms')
+    # Check for actual non-commented values, not just the presence of the option
+    vravms = lsf.get_config_list('VCFFINAL', 'vravms')
+    vcfa_vms_configured = len(vravms) > 0
     vcfa_vms_errors = []  # Track errors for this task
     vcfa_vms_task_failed = False  # Track if the entire task failed
     
@@ -648,9 +650,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                 if failed_vcs:
                     lsf.write_output(f'WARNING: Failed to connect to vCenter(s): {", ".join(failed_vcs)}')
             
-            # Use get_config_list to properly filter commented-out values
-            vravms = lsf.get_config_list('VCFFINAL', 'vravms')
-            
+            # vravms already retrieved above to check if configured
             if vravms and not dry_run and not vcfa_vms_errors:
                 lsf.write_output(f'Processing {len(vravms)} VCF Automation VMs...')
                 lsf.write_vpodprogress('Starting VCF Automation VMs', 'GOOD-8')
@@ -743,7 +743,9 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 5: Check VCF Automation URLs
     #==========================================================================
     
-    vcfa_urls_configured = lsf.config.has_option('VCFFINAL', 'vraurls')
+    # Check for actual non-commented URL values, not just the presence of the option
+    vraurls = lsf.get_config_list('VCFFINAL', 'vraurls')
+    vcfa_urls_configured = len(vraurls) > 0
     urls_checked = 0
     urls_passed = 0
     urls_failed = 0
@@ -764,8 +766,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         if os.path.isfile(watchvcfa_script) and not dry_run:
             lsf.run_command(watchvcfa_script)
         
-        # Use get_config_list to properly filter commented-out values
-        vraurls = lsf.get_config_list('VCFFINAL', 'vraurls')
+        # vraurls already retrieved above
         
         for url_spec in vraurls:
             if ',' in url_spec:
