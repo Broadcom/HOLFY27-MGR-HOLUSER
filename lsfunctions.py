@@ -244,7 +244,7 @@ def _remediate_proxy():
 # CONFIG HELPER FUNCTIONS
 #==============================================================================
 
-def get_config_list(section: str, option: str, fallback: list = None) -> list:
+def get_config_list(section: str, option: str, fallback: list = None, split_comma: bool = False) -> list:
     """
     Get a config option as a list, filtering out commented lines.
     
@@ -255,6 +255,8 @@ def get_config_list(section: str, option: str, fallback: list = None) -> list:
     :param section: Config section name (e.g., 'RESOURCES', 'VCF')
     :param option: Config option name (e.g., 'ESXiHosts', 'vCenters')
     :param fallback: Default value if option doesn't exist (default: empty list)
+    :param split_comma: If True, also split single-line values by comma. 
+                        Default False - commas are preserved (e.g., for URL,expected_text format)
     :return: List of non-commented, non-empty values
     
     Example:
@@ -267,6 +269,12 @@ def get_config_list(section: str, option: str, fallback: list = None) -> list:
         get_config_list('RESOURCES', 'ESXiHosts')
         # Returns: ['esx-02a.site-a.vcf.lab:no']
         # (Lines starting with # are filtered out)
+        
+        # For URL config (comma is part of value, not a separator):
+        # URLS = https://www.vmware.com/,VMware
+        get_config_list('RESOURCES', 'URLS')
+        # Returns: ['https://www.vmware.com/,VMware']
+        # (Comma preserved - it separates URL from expected text)
     """
     if fallback is None:
         fallback = []
@@ -278,11 +286,15 @@ def get_config_list(section: str, option: str, fallback: list = None) -> list:
     if not raw_value:
         return fallback
     
-    # Split by newlines (for multiline values) or commas (for single-line lists)
+    # Split by newlines for multiline values
+    # Only split by comma if explicitly requested AND no newlines present
     if '\n' in raw_value:
         lines = raw_value.split('\n')
-    else:
+    elif split_comma:
         lines = raw_value.split(',')
+    else:
+        # Single line value - treat as one item
+        lines = [raw_value]
     
     # Filter out commented lines and empty lines
     result = []

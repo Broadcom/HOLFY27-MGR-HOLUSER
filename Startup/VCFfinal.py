@@ -217,18 +217,38 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 2: Supervisor Control Plane (Tanzu/WCP)
     #==========================================================================
     
+    # First check if we have any vCenters configured - without vCenters, 
+    # there's no way to have Tanzu/WCP so skip these checks entirely
+    vcenters_list = lsf.get_config_list('RESOURCES', 'vCenters')
+    
+    if not vcenters_list:
+        lsf.write_output('No vCenters configured - skipping Tanzu/WCP checks')
+        if dashboard:
+            dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.SKIPPED, 
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'wcp_vcenter', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'vcfa_vms', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'vcfa_urls', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.generate_html()
+        lsf.write_output('VCFfinal completed (no VCF resources)')
+        return True
+    
     lsf.write_vpodprogress('Tanzu Start', 'GOOD-3')
     
-    # Check for Tanzu Control Plane VMs
-    tanzu_control_configured = lsf.config.has_option('VCFFINAL', 'tanzucontrol')
+    # Check for Tanzu Control Plane VMs - requires tanzucontrol option with valid (non-commented) values
+    tanzu_control_values = lsf.get_config_list('VCFFINAL', 'tanzucontrol')
+    tanzu_control_configured = len(tanzu_control_values) > 0
     
     if tanzu_control_configured and not dry_run:
         #----------------------------------------------------------------------
         # Determine vCenter host for WCP (look for wld vCenter in config)
         #----------------------------------------------------------------------
         wcp_vcenter = None
-        # Use get_config_list to properly filter commented-out values
-        vcenters_list = lsf.get_config_list('RESOURCES', 'vCenters')
         for vc_line in vcenters_list:
             if 'wld' in vc_line.lower():
                 # Extract just the hostname (before the colon)
@@ -236,7 +256,17 @@ def main(lsf=None, standalone=False, dry_run=False):
                 break
         
         if not wcp_vcenter:
-            wcp_vcenter = 'vc-wld01-a.site-a.vcf.lab'  # Default
+            # No WLD vCenter found - use first available vCenter as fallback
+            if vcenters_list:
+                wcp_vcenter = vcenters_list[0].split(':')[0].strip()
+                lsf.write_output(f'No WLD vCenter found, using first available: {wcp_vcenter}')
+            else:
+                lsf.write_output('No vCenters available for Tanzu checks - skipping')
+                if dashboard:
+                    dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.SKIPPED,
+                                          'No vCenters available')
+                    dashboard.generate_html()
+                return True
         
         #----------------------------------------------------------------------
         # TASK 2a: PRE-START - Verify WCP vCenter Services
