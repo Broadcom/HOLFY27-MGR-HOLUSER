@@ -194,10 +194,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 1: Connect to VCF Management Cluster Hosts (if needed)
     #==========================================================================
     
-    vcfmgmtcluster = []
-    if lsf.config.has_option('VCF', 'vcfmgmtcluster'):
-        vcfmgmtcluster_raw = lsf.config.get('VCF', 'vcfmgmtcluster')
-        vcfmgmtcluster = [h.strip() for h in vcfmgmtcluster_raw.split('\n') if h.strip()]
+    # Use get_config_list to properly filter commented-out values
+    vcfmgmtcluster = lsf.get_config_list('VCF', 'vcfmgmtcluster')
     
     if vcfmgmtcluster and not dry_run:
         lsf.write_vpodprogress('VCF Hosts Connect', 'GOOD-3')
@@ -229,14 +227,13 @@ def main(lsf=None, standalone=False, dry_run=False):
         # Determine vCenter host for WCP (look for wld vCenter in config)
         #----------------------------------------------------------------------
         wcp_vcenter = None
-        if lsf.config.has_option('RESOURCES', 'vCenters'):
-            vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
-            for vc_line in vcenters_raw.split('\n'):
-                vc_line = vc_line.strip()
-                if vc_line and not vc_line.startswith('#') and 'wld' in vc_line.lower():
-                    # Extract just the hostname (before the colon)
-                    wcp_vcenter = vc_line.split(':')[0].strip()
-                    break
+        # Use get_config_list to properly filter commented-out values
+        vcenters_list = lsf.get_config_list('RESOURCES', 'vCenters')
+        for vc_line in vcenters_list:
+            if 'wld' in vc_line.lower():
+                # Extract just the hostname (before the colon)
+                wcp_vcenter = vc_line.split(':')[0].strip()
+                break
         
         if not wcp_vcenter:
             wcp_vcenter = 'vc-wld01-a.site-a.vcf.lab'  # Default
@@ -258,17 +255,16 @@ def main(lsf=None, standalone=False, dry_run=False):
         
         # Determine SSO domain from vCenter config entry
         sso_domain = 'wld.sso'  # Default
-        if lsf.config.has_option('RESOURCES', 'vCenters'):
-            for vc_line in lsf.config.get('RESOURCES', 'vCenters').split('\n'):
-                vc_line = vc_line.strip()
-                if vc_line and 'wld' in vc_line.lower() and not vc_line.startswith('#'):
-                    parts = vc_line.split(':')
-                    if len(parts) >= 3:
-                        # Extract domain from user like "administrator@wld.sso"
-                        user_part = parts[2].strip()
-                        if '@' in user_part:
-                            sso_domain = user_part.split('@')[1]
-                    break
+        # vcenters_list already filtered by get_config_list above
+        for vc_line in vcenters_list:
+            if 'wld' in vc_line.lower():
+                parts = vc_line.split(':')
+                if len(parts) >= 3:
+                    # Extract domain from user like "administrator@wld.sso"
+                    user_part = parts[2].strip()
+                    if '@' in user_part:
+                        sso_domain = user_part.split('@')[1]
+                break
         
         wcp_vcenter_ok = True
         
@@ -557,8 +553,8 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_vpodprogress('Tanzu Deploy', 'GOOD-3')
             
             # Tanzu deployment scripts can be specified as host:account:script
-            tanzu_deploy_raw = lsf.config.get('VCFFINAL', 'tanzudeploy')
-            tanzu_deploy_items = [t.strip() for t in tanzu_deploy_raw.split('\n') if t.strip()]
+            # Use get_config_list to properly filter commented-out values
+            tanzu_deploy_items = lsf.get_config_list('VCFFINAL', 'tanzudeploy')
             
             for item in tanzu_deploy_items:
                 parts = item.split(':')
@@ -608,10 +604,8 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.sisvc.clear()
             
             # Connect to vCenter(s) - required for VCF Automation VM operations
-            vcenters = []
-            if lsf.config.has_option('RESOURCES', 'vCenters'):
-                vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
-                vcenters = [v.strip() for v in vcenters_raw.split('\n') if v.strip() and not v.strip().startswith('#')]
+            # Use get_config_list to properly filter commented-out values
+            vcenters = lsf.get_config_list('RESOURCES', 'vCenters')
             
             if not vcenters:
                 lsf.write_output('ERROR: No vCenters configured in RESOURCES section')
@@ -624,8 +618,8 @@ def main(lsf=None, standalone=False, dry_run=False):
                 if failed_vcs:
                     lsf.write_output(f'WARNING: Failed to connect to vCenter(s): {", ".join(failed_vcs)}')
             
-            vravms_raw = lsf.config.get('VCFFINAL', 'vravms')
-            vravms = [v.strip() for v in vravms_raw.split('\n') if v.strip() and not v.strip().startswith('#')]
+            # Use get_config_list to properly filter commented-out values
+            vravms = lsf.get_config_list('VCFFINAL', 'vravms')
             
             if vravms and not dry_run and not vcfa_vms_errors:
                 lsf.write_output(f'Processing {len(vravms)} VCF Automation VMs...')
@@ -740,8 +734,8 @@ def main(lsf=None, standalone=False, dry_run=False):
         if os.path.isfile(watchvcfa_script) and not dry_run:
             lsf.run_command(watchvcfa_script)
         
-        vraurls_raw = lsf.config.get('VCFFINAL', 'vraurls')
-        vraurls = [u.strip() for u in vraurls_raw.split('\n') if u.strip() and not u.strip().startswith('#')]
+        # Use get_config_list to properly filter commented-out values
+        vraurls = lsf.get_config_list('VCFFINAL', 'vraurls')
         
         for url_spec in vraurls:
             if ',' in url_spec:

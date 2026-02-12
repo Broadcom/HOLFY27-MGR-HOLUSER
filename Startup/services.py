@@ -59,13 +59,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 1: Manage Linux Services
     #==========================================================================
     
-    linux_services = []
-    if lsf.config.has_option('RESOURCES', 'LinuxServices'):
-        linux_raw = lsf.config.get('RESOURCES', 'LinuxServices')
-        if '\n' in linux_raw:
-            linux_services = [s.strip() for s in linux_raw.split('\n') if s.strip()]
-        else:
-            linux_services = [s.strip() for s in linux_raw.split(',') if s.strip()]
+    # Use get_config_list to properly filter commented-out values
+    linux_services = lsf.get_config_list('RESOURCES', 'LinuxServices')
     
     linux_succeeded = []
     linux_failed = []
@@ -137,13 +132,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 2: Verify TCP Services
     #==========================================================================
     
-    tcp_services = []
-    if lsf.config.has_option('RESOURCES', 'TCPServices'):
-        tcp_raw = lsf.config.get('RESOURCES', 'TCPServices')
-        if '\n' in tcp_raw:
-            tcp_services = [s.strip() for s in tcp_raw.split('\n') if s.strip()]
-        else:
-            tcp_services = [s.strip() for s in tcp_raw.split(',') if s.strip()]
+    # Use get_config_list to properly filter commented-out values
+    tcp_services = lsf.get_config_list('RESOURCES', 'TCPServices')
     
     tcp_succeeded = []
     tcp_failed = []

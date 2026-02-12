@@ -129,17 +129,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # Get URL Targets from Config
     #==========================================================================
     
-    url_targets = []
-    
-    if lsf.config.has_option('RESOURCES', 'URLS'):
-        urls_raw = lsf.config.get('RESOURCES', 'URLS')
-        # Parse multi-line format: each line is "url,expected_text"
-        for line in urls_raw.split('\n'):
-            line = line.strip()
-            # Skip empty lines and comments
-            if not line or line.startswith('#'):
-                continue
-            url_targets.append(line)
+    # Use get_config_list to properly filter commented-out values
+    url_targets = lsf.get_config_list('RESOURCES', 'URLS')
     
     if not url_targets:
         lsf.write_output('No URL targets configured')

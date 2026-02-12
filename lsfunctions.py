@@ -241,6 +241,89 @@ def _remediate_proxy():
         return False
 
 #==============================================================================
+# CONFIG HELPER FUNCTIONS
+#==============================================================================
+
+def get_config_list(section: str, option: str, fallback: list = None) -> list:
+    """
+    Get a config option as a list, filtering out commented lines.
+    
+    This function handles multiline config values where individual lines
+    may be commented out with '#' or ';' prefix. These commented lines
+    are treated as if they don't exist.
+    
+    :param section: Config section name (e.g., 'RESOURCES', 'VCF')
+    :param option: Config option name (e.g., 'ESXiHosts', 'vCenters')
+    :param fallback: Default value if option doesn't exist (default: empty list)
+    :return: List of non-commented, non-empty values
+    
+    Example:
+        # Config file:
+        # [RESOURCES]
+        # ESXiHosts = #esx-01a.site-a.vcf.lab:no
+        #   esx-02a.site-a.vcf.lab:no
+        #   #esx-03a.site-a.vcf.lab:no
+        
+        get_config_list('RESOURCES', 'ESXiHosts')
+        # Returns: ['esx-02a.site-a.vcf.lab:no']
+        # (Lines starting with # are filtered out)
+    """
+    if fallback is None:
+        fallback = []
+    
+    if not config.has_option(section, option):
+        return fallback
+    
+    raw_value = config.get(section, option)
+    if not raw_value:
+        return fallback
+    
+    # Split by newlines (for multiline values) or commas (for single-line lists)
+    if '\n' in raw_value:
+        lines = raw_value.split('\n')
+    else:
+        lines = raw_value.split(',')
+    
+    # Filter out commented lines and empty lines
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        # Skip empty lines
+        if not stripped:
+            continue
+        # Skip lines that start with comment characters
+        if stripped.startswith('#') or stripped.startswith(';'):
+            continue
+        result.append(stripped)
+    
+    return result
+
+
+def get_config_value(section: str, option: str, fallback: str = '') -> str:
+    """
+    Get a config option value, returning empty string if commented out.
+    
+    If the value itself starts with '#' or ';', it's treated as if
+    the option doesn't exist (returns fallback).
+    
+    :param section: Config section name
+    :param option: Config option name  
+    :param fallback: Default value if option doesn't exist or is commented
+    :return: Config value or fallback
+    """
+    if not config.has_option(section, option):
+        return fallback
+    
+    value = config.get(section, option).strip()
+    
+    # If the value itself starts with a comment character, treat as not set
+    if value.startswith('#') or value.startswith(';'):
+        return fallback
+    
+    return value
+
+
+#==============================================================================
 # PASSWORD FUNCTIONS
 #==============================================================================
 
@@ -632,8 +715,11 @@ def connect_vcenters(entries):
     failed_hosts = []
     
     for entry in entries:
-        # Skip comments and empty lines
-        if not entry or entry.strip().startswith('#'):
+        # Skip comments and empty lines (# or ; prefix)
+        if not entry:
+            continue
+        stripped = entry.strip()
+        if not stripped or stripped.startswith('#') or stripped.startswith(';'):
             continue
         
         vc = entry.split(':')
@@ -990,8 +1076,11 @@ def start_nested(records):
         return
 
     for record in records:
-        # Skip comments and empty lines
-        if not record or record.strip().startswith('#'):
+        # Skip comments and empty lines (# or ; prefix)
+        if not record:
+            continue
+        stripped = record.strip()
+        if not stripped or stripped.startswith('#') or stripped.startswith(';'):
             continue
         
         p = record.split(':')

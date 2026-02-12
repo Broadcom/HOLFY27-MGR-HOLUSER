@@ -54,16 +54,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # Get Ping Targets from Config
     #==========================================================================
     
-    ping_targets = []
-    
-    if lsf.config.has_option('RESOURCES', 'Pings'):
-        pings_raw = lsf.config.get('RESOURCES', 'Pings')
-        ping_targets = [p.strip() for p in pings_raw.split(',') if p.strip()]
-        # Handle both newline-separated and comma-separated formats
-        if '\n' in pings_raw:
-            ping_targets = [p.strip() for p in pings_raw.split('\n') if p.strip()]
-        else:
-            ping_targets = [p.strip() for p in pings_raw.split(',') if p.strip()]
+    # Use get_config_list to properly filter commented-out values
+    ping_targets = lsf.get_config_list('RESOURCES', 'Pings')
     
     if not ping_targets:
         lsf.write_output('No ping targets configured')
