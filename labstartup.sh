@@ -1,6 +1,6 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.3 - February 2026
+# Version 3.4 - 2026-02-12
 # Author - Burke Azbill and HOL Core Team
 # Enhanced with NFS-based router communication, DNS import support
 
@@ -79,7 +79,7 @@ is_hol_sku() {
 
 use_local_holodeck_ini() {
     # Fallback to using local holodeck/*.ini file when git repo not available
-    # For non-HOL SKUs only
+    # Used for non-HOL SKUs and for HOL-BADSKU (base template with no vpodrepo)
     #
     # Search priority for ${sku}.ini:
     #   1. /home/holuser/{labtype}/holodeck/${sku}.ini  (external team repo)
@@ -748,10 +748,15 @@ fi
 
 echo "$vPod_SKU" > /tmp/vPod_SKU.txt
 
-# Check for BAD SKU
+# Check for BAD SKU - no vpodrepo exists for this SKU
+# Fall back to defaultconfig.ini so labstartup.py has a valid config
 if [ "$vPod_SKU" = "HOL-BADSKU" ]; then
-    echo "LabStartup not implemented." >> ${logfile}
+    echo "No vpodrepo for ${vPod_SKU}. Falling back to defaultconfig.ini..." >> ${logfile}
+    if ! use_local_holodeck_ini "$vPod_SKU"; then
+        echo "ERROR: No defaultconfig.ini found. labstartup.py will run without config." >> ${logfile}
+    fi
     date > ${holorouterdir}/gitdone
+    push_router_files_nfs
     runlabstartup
     exit 0
 fi
