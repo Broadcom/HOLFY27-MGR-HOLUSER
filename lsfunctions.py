@@ -29,6 +29,13 @@ from pypsexec.client import Client
 from requests.auth import HTTPBasicAuth
 from configparser import ConfigParser
 
+# Ensure Tools/ directory is on sys.path so that modules like labtypes,
+# status_dashboard, dns_checks, and tdns_import can be imported from anywhere
+# without needing per-file sys.path.insert() calls.
+_tools_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tools')
+if _tools_dir not in sys.path:
+    sys.path.insert(0, _tools_dir)
+
 # Default logging level is WARNING (other levels are DEBUG, INFO, ERROR and CRITICAL)
 logging.basicConfig(level=logging.WARNING)
 # Until the SSL cert issues are resolved...
