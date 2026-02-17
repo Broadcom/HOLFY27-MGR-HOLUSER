@@ -2479,6 +2479,232 @@ def disable_sddc_auto_rotate(dry_run: bool = False) -> bool:
 
 
 #==============================================================================
+# VCF OPERATIONS FLEET PASSWORD POLICY
+#==============================================================================
+
+def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
+    """
+    Create and assign the MaxExpiration password policy in VCF Operations Manager
+    Fleet Settings, then remediate all inventory items.
+    
+    This function:
+    1. Authenticates to VCF Operations Manager suite-api
+    2. Checks if "MaxExpiration" policy already exists
+    3. If not, creates it with expiration = 729 days from today
+    4. Assigns the policy to VCF Management
+    5. Remediates all inventory items (triggers password compliance remediation)
+    
+    If "MaxExpiration" already exists, skips creation and proceeds to remediate.
+    
+    :param dry_run: If True, preview only
+    :return: True if successful
+    """
+    import requests
+    import urllib3
+    from datetime import datetime, timedelta
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    lsf.write_output('')
+    lsf.write_output('=' * 60)
+    lsf.write_output('VCF Operations Fleet Password Policy')
+    lsf.write_output('=' * 60)
+    
+    # Determine VCF Operations Manager FQDN from config
+    ops_fqdn = None
+    try:
+        if lsf.config.has_option('RESOURCES', 'URLs'):
+            urls_raw = lsf.config.get('RESOURCES', 'URLs').split('\n')
+            for entry in urls_raw:
+                url = entry.split(',')[0].strip()
+                if 'ops-' in url and '.vcf.lab' in url:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    ops_fqdn = parsed.hostname
+                    break
+    except Exception:
+        pass
+    
+    if not ops_fqdn:
+        try:
+            if lsf.config.has_section('VCF'):
+                if lsf.config.has_option('VCF', 'urls'):
+                    vcf_urls = lsf.config.get('VCF', 'urls').split('\n')
+                    for entry in vcf_urls:
+                        url = entry.split(',')[0].strip()
+                        if 'ops-' in url:
+                            from urllib.parse import urlparse
+                            parsed = urlparse(url)
+                            ops_fqdn = parsed.hostname
+                            break
+        except Exception:
+            pass
+    
+    if not ops_fqdn:
+        lsf.write_output('WARNING: VCF Operations Manager FQDN not found in config - skipping')
+        return False
+    
+    password = lsf.get_password()
+    base_url = f"https://{ops_fqdn}"
+    api_base = f"{base_url}/suite-api"
+    
+    lsf.write_output(f'VCF Operations Manager: {ops_fqdn}')
+    
+    if dry_run:
+        lsf.write_output('Would create MaxExpiration policy, assign to VCF Management, and remediate')
+        return True
+    
+    # Step 1: Authenticate
+    lsf.write_output('Authenticating to VCF Operations Manager...')
+    try:
+        token_resp = requests.post(
+            f"{api_base}/api/auth/token/acquire",
+            json={"username": "admin", "password": password, "authSource": "local"},
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            verify=False, timeout=30
+        )
+        token_resp.raise_for_status()
+        token = token_resp.json()["token"]
+        lsf.write_output('SUCCESS - Authenticated to VCF Operations Manager')
+    except Exception as e:
+        lsf.write_output(f'FAILED - Could not authenticate: {e}')
+        return False
+    
+    headers = {
+        "Authorization": f"OpsToken {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-vRealizeOps-API-use-unsupported": "true"
+    }
+    
+    # Step 2: Check if MaxExpiration policy already exists
+    lsf.write_output('Checking for existing MaxExpiration policy...')
+    existing_policy_id = None
+    try:
+        query_resp = requests.post(
+            f"{api_base}/internal/passwordmanagement/policies/query",
+            headers=headers, json={}, verify=False, timeout=30
+        )
+        query_resp.raise_for_status()
+        policies = query_resp.json().get("vcfPolicies", [])
+        
+        for policy in policies:
+            if policy.get("policyInfo", {}).get("policyName") == "MaxExpiration":
+                existing_policy_id = policy.get("policyId")
+                lsf.write_output(f'Found existing MaxExpiration policy: {existing_policy_id}')
+                break
+    except Exception as e:
+        lsf.write_output(f'WARNING - Could not query existing policies: {e}')
+    
+    # Step 3: Create MaxExpiration policy if it doesn't exist
+    expiration_days = 729
+    expiration_date = (datetime.now() + timedelta(days=expiration_days)).strftime("%Y-%m-%d")
+    policy_description = f"Passwords will expire {expiration_date} ({expiration_days} days from creation)"
+    
+    if not existing_policy_id:
+        lsf.write_output(f'Creating MaxExpiration policy (expires {expiration_date}, {expiration_days} days)...')
+        try:
+            create_resp = requests.post(
+                f"{api_base}/internal/passwordmanagement/policies",
+                headers=headers,
+                json={
+                    "policyInfo": {
+                        "policyName": "MaxExpiration",
+                        "description": policy_description,
+                        "isFleetPolicy": False
+                    },
+                    "complexityConstraint": {
+                        "minLength": 8,
+                        "minLowercase": 0,
+                        "minUppercase": 0,
+                        "minNumeric": 0,
+                        "minSpecial": 0,
+                        "passwordHistory": 1
+                    },
+                    "expirationConstraint": {
+                        "passwordExpirationDays": expiration_days
+                    },
+                    "lockoutConstraint": {
+                        "lockoutMaxAuthFailures": 5,
+                        "lockoutEvaluationPeriod": 300,
+                        "lockoutPeriod": 600
+                    }
+                },
+                verify=False, timeout=30
+            )
+            create_resp.raise_for_status()
+            policy_data = create_resp.json()
+            existing_policy_id = policy_data.get("policyId")
+            lsf.write_output(f'SUCCESS - Created MaxExpiration policy: {existing_policy_id}')
+        except Exception as e:
+            lsf.write_output(f'FAILED - Could not create policy: {e}')
+            return False
+    else:
+        lsf.write_output('MaxExpiration policy already exists - skipping creation')
+    
+    # Step 4: Assign policy to VCF Management
+    lsf.write_output('Assigning MaxExpiration policy to VCF Management...')
+    try:
+        assign_resp = requests.post(
+            f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}/assign",
+            headers=headers,
+            json={"assignmentGroup": ["MANAGEMENT"]},
+            verify=False, timeout=30
+        )
+        if assign_resp.status_code == 204:
+            lsf.write_output('SUCCESS - Policy assigned to VCF Management')
+        else:
+            lsf.write_output(f'WARNING - Assign returned status {assign_resp.status_code}: {assign_resp.text[:100]}')
+    except Exception as e:
+        lsf.write_output(f'WARNING - Could not assign policy: {e}')
+    
+    # Step 5: Remediate all inventory items
+    # Remediation is triggered through the VCF Operations internal API
+    # Since suite-api/internal doesn't expose the remediate endpoint directly,
+    # we attempt remediation through the available API paths
+    lsf.write_output('Attempting to remediate all inventory items...')
+    
+    # First, verify current policy state after assignment
+    try:
+        verify_resp = requests.get(
+            f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}",
+            headers=headers, verify=False, timeout=30
+        )
+        verify_resp.raise_for_status()
+        policy_state = verify_resp.json()
+        assigned = policy_state.get("vcfPolicyAssignedResourceList", [])
+        lsf.write_output(f'Policy is currently assigned to {len(assigned)} resource(s):')
+        for res in assigned:
+            lsf.write_output(f'  - {res.get("resourceName", "?")} ({res.get("resourceType", "?")})')
+    except Exception as e:
+        lsf.write_output(f'WARNING - Could not verify policy state: {e}')
+    
+    # Attempt remediation via the internal API
+    remediation_attempted = False
+    try:
+        # Try the remediate endpoint through suite-api
+        remediate_resp = requests.post(
+            f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}/remediate",
+            headers=headers, json={}, verify=False, timeout=60
+        )
+        if remediate_resp.status_code in (200, 202, 204):
+            lsf.write_output('SUCCESS - Remediation triggered successfully')
+            remediation_attempted = True
+        else:
+            lsf.write_output(f'INFO - Remediate endpoint returned {remediate_resp.status_code}')
+    except Exception:
+        pass
+    
+    if not remediation_attempted:
+        lsf.write_output('INFO - Automatic remediation via API not available.')
+        lsf.write_output('INFO - Please remediate manually via VCF Operations Manager UI:')
+        lsf.write_output(f'INFO -   {base_url}/vcf-operations/ui/manage/fleet/fleet-settings')
+        lsf.write_output('INFO -   Navigate to Fleet Settings > select policy > Remediate All')
+    
+    lsf.write_output('VCF Operations Fleet Password Policy configuration complete')
+    return True
+
+
+#==============================================================================
 # FINAL CLEANUP
 #==============================================================================
 
@@ -2679,7 +2905,11 @@ NOTE: Some NSX operations require manual steps first.
     if 'VCF' in lsf.config or not args.esx_only:
         disable_sddc_auto_rotate(args.dry_run)
     
-    # Step 8: Final cleanup
+    # Step 8: Configure VCF Operations Fleet Password Policy
+    # Creates "MaxExpiration" policy, assigns to VCF Management, remediates inventory
+    configure_vcf_fleet_password_policy(args.dry_run)
+    
+    # Step 9: Final cleanup
     perform_final_cleanup(args.dry_run)
     
     # Print summary
