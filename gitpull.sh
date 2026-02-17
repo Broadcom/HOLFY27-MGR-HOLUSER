@@ -180,7 +180,7 @@ do_git_pull() {
 
     # Perform pull
     git checkout ${branch} >> ${LOGFILE} 2>&1
-    git pull origin ${branch} >> ${LOGFILE} 2>&1
+    GIT_TERMINAL_PROMPT=0 git pull origin ${branch} >> ${LOGFILE} 2>&1
 
     if [ $? -eq 0 ]; then
         log_message "Git pull successful"

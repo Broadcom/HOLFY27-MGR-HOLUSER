@@ -230,8 +230,11 @@ class StatusDashboard:
                 ('tanzu_control', 'Tanzu Control Plane', 'Verify Supervisor Control Plane status'),
                 ('wcp_certs', 'WCP Certificate Fix', 'Fix Kubernetes certificates and webhooks'),
                 ('tanzu_deploy', 'Tanzu Deployment', 'Run Tanzu deployment scripts'),
+                ('vsp_vms', 'VSP Platform VMs', 'Start and verify VSP Platform virtual machines'),
+                ('vcf_components', 'VCF Components', 'Scale up VCF components on VSP management cluster'),
                 ('vcfa_vms', 'VCF Automation VMs', 'Start VCF Automation virtual machines'),
                 ('vcfa_urls', 'VCF Automation URL Verification', 'Verify VCF Automation URLs'),
+                ('vcf_component_urls', 'VCF Component URL Checks', 'Verify VCF Component URLs'),
             ]),
             
             # Group 11: final.py - Final Checks

@@ -6,12 +6,28 @@
 # Version: 1.1 Date: November, 2025 - re-wrote to account for failed connections, incorrect password, and successful connection.
 # Version: 1.2 Date: November, 2025 - Updated logging
 # Configuration
-# Replace these with your actual values or pass them as arguments
-HOST="10.1.1.71"
+VCFA_FQDN="auto-a.site-a.vcf.lab"
 USER="vmware-system-user"
+CREDS_FILE="/home/holuser/creds.txt"
 # For some reason, outputing to LOGFILE only shows up in the manager log, so attempting to log to both files...
 LOGFILE="/home/holuser/hol/labstartup.log"
 CONSOLELOG="/lmchol/hol/labstartup.log"
+
+# Resolve the VCFA FQDN to an IP
+detect_vcfa_host() {
+    local resolved_ip
+    resolved_ip=$(getent hosts "${VCFA_FQDN}" 2>/dev/null | awk '{print $1}' | head -1)
+
+    if [ -z "${resolved_ip}" ]; then
+        echo "$(date +"%m/%d/%Y %T") WARNING: Cannot resolve ${VCFA_FQDN} via DNS, falling back to 10.1.1.71" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+        HOST="10.1.1.71"
+    else
+        HOST="${resolved_ip}"
+        echo "$(date +"%m/%d/%Y %T") ${VCFA_FQDN} resolves to ${HOST}" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+    fi
+}
+
+detect_vcfa_host
 
 # Loop for 10 total attempts (1 Initial + 9 Retries) for a total of 5 minutes
 for i in {0..10}; do
@@ -31,7 +47,7 @@ for i in {0..10}; do
     # 1. Check for password expiration
     if echo "$OUTPUT" | grep -F -q "You are required to change your password immediately"; then
         echo "$(date +"%m/%d/%Y %T") Password has expired for user $USER on host $HOST, launching password reset script..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
-        /home/holuser/hol/Tools/vcfapass.sh $(cat /home/holuser/creds.txt) $(/home/holuser/hol/Tools/holpwgen.sh)
+        /home/holuser/hol/Tools/vcfapass.sh $HOST $(cat /home/holuser/creds.txt) $(/home/holuser/hol/Tools/holpwgen.sh)
         exit 0
     fi
 
