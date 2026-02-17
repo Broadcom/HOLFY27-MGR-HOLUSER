@@ -149,7 +149,7 @@ def init(router=True, **kwargs):
             lab_sku = config.get('VPOD', 'vPod_SKU')
         
         if config.has_option('VPOD', 'labtype'):
-            labtype = config.get('VPOD', 'labtype')
+            labtype = config.get('VPOD', 'labtype').upper()
         
         if config.has_option('VPOD', 'maxminutes'):
             max_minutes_before_fail = config.getint('VPOD', 'maxminutes')

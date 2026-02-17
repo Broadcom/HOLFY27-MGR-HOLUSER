@@ -415,7 +415,7 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     # Determine lab type
     lab_type = 'VCF'  # Default
     if lsf.config.has_option('VPOD', 'labtype'):
-        lab_type = lsf.config.get('VPOD', 'labtype')
+        lab_type = lsf.config.get('VPOD', 'labtype').upper()
     
     write_shutdown_output(f'Lab type: {lab_type}', lsf)
     

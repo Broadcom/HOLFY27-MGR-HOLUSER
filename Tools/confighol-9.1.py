@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.0.py - HOLFY27 vApp HOLification Tool
-# Version 2.1 - January 2026
+# Version 2.2 - February 2026
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -1105,10 +1105,17 @@ def configure_aria_automation_vms(auth_keys_file: str, password: str,
     
     success = True
     
+    import re
     for vravm in vravms:
         # VMs may have format: vmname:vcenter
         parts = vravm.split(':')
         hostname = parts[0].strip()
+        
+        # Strip wildcard/regex patterns (e.g., "auto-platform-a.*" -> "auto-platform-a")
+        # These patterns are used for VM name matching in vSphere but are not valid hostnames
+        hostname = re.sub(r'\.\*$', '', hostname)   # Remove trailing .*
+        hostname = re.sub(r'\*$', '', hostname)      # Remove trailing *
+        hostname = hostname.rstrip('.')              # Remove trailing dots
         
         # Only process VMs starting with 'auto-' (VCF Automation)
         if not hostname.lower().startswith('auto-'):
@@ -2491,10 +2498,12 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
     1. Authenticates to VCF Operations Manager suite-api
     2. Checks if "MaxExpiration" policy already exists
     3. If not, creates it with expiration = 729 days from today
-    4. Assigns the policy to VCF Management
-    5. Remediates all inventory items (triggers password compliance remediation)
+    4. Queries all policies to find inventory assigned to other policies
+    5. Reassigns MANAGEMENT to MaxExpiration (auto-unassigns from old policy)
+    6. Reassigns each INSTANCE to MaxExpiration using resourceId (auto-unassigns)
+    7. Attempts remediation of all inventory items
     
-    If "MaxExpiration" already exists, skips creation and proceeds to remediate.
+    If "MaxExpiration" already exists, skips creation and reassigns all inventory.
     
     :param dry_run: If True, preview only
     :return: True if successful
@@ -2550,7 +2559,7 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
     lsf.write_output(f'VCF Operations Manager: {ops_fqdn}')
     
     if dry_run:
-        lsf.write_output('Would create MaxExpiration policy, assign to VCF Management, and remediate')
+        lsf.write_output('Would create MaxExpiration policy, assign all inventory, and remediate')
         return True
     
     # Step 1: Authenticate
@@ -2576,22 +2585,27 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
         "X-vRealizeOps-API-use-unsupported": "true"
     }
     
-    # Step 2: Check if MaxExpiration policy already exists
-    lsf.write_output('Checking for existing MaxExpiration policy...')
+    # Step 2: Query all existing policies and their assignments
+    lsf.write_output('Querying existing password policies...')
     existing_policy_id = None
+    all_policies = []
     try:
         query_resp = requests.post(
             f"{api_base}/internal/passwordmanagement/policies/query",
             headers=headers, json={}, verify=False, timeout=30
         )
         query_resp.raise_for_status()
-        policies = query_resp.json().get("vcfPolicies", [])
+        all_policies = query_resp.json().get("vcfPolicies", [])
         
-        for policy in policies:
-            if policy.get("policyInfo", {}).get("policyName") == "MaxExpiration":
-                existing_policy_id = policy.get("policyId")
-                lsf.write_output(f'Found existing MaxExpiration policy: {existing_policy_id}')
-                break
+        for policy in all_policies:
+            pname = policy.get("policyInfo", {}).get("policyName", "")
+            pid = policy.get("policyId", "")
+            assigned = policy.get("vcfPolicyAssignedResourceList", [])
+            lsf.write_output(f'  Policy: {pname} (ID: {pid}), Assigned: {len(assigned)} resource(s)')
+            for res in assigned:
+                lsf.write_output(f'    - {res.get("resourceName", "?")} ({res.get("resourceType", "?")})')
+            if pname == "MaxExpiration":
+                existing_policy_id = pid
     except Exception as e:
         lsf.write_output(f'WARNING - Could not query existing policies: {e}')
     
@@ -2641,8 +2655,12 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
     else:
         lsf.write_output('MaxExpiration policy already exists - skipping creation')
     
-    # Step 4: Assign policy to VCF Management
-    lsf.write_output('Assigning MaxExpiration policy to VCF Management...')
+    # Step 4: Assign ALL inventory to MaxExpiration
+    # Assigning a resource to MaxExpiration automatically unassigns it from any
+    # other policy. We assign MANAGEMENT first, then each INSTANCE by resourceId.
+    
+    # Step 4a: Assign MANAGEMENT to MaxExpiration
+    lsf.write_output('Assigning MANAGEMENT to MaxExpiration...')
     try:
         assign_resp = requests.post(
             f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}/assign",
@@ -2651,19 +2669,63 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
             verify=False, timeout=30
         )
         if assign_resp.status_code == 204:
-            lsf.write_output('SUCCESS - Policy assigned to VCF Management')
+            lsf.write_output('SUCCESS - MANAGEMENT assigned to MaxExpiration')
         else:
-            lsf.write_output(f'WARNING - Assign returned status {assign_resp.status_code}: {assign_resp.text[:100]}')
+            lsf.write_output(f'WARNING - MANAGEMENT assign returned {assign_resp.status_code}: {assign_resp.text[:100]}')
     except Exception as e:
-        lsf.write_output(f'WARNING - Could not assign policy: {e}')
+        lsf.write_output(f'WARNING - Could not assign MANAGEMENT: {e}')
     
-    # Step 5: Remediate all inventory items
-    # Remediation is triggered through the VCF Operations internal API
-    # Since suite-api/internal doesn't expose the remediate endpoint directly,
-    # we attempt remediation through the available API paths
-    lsf.write_output('Attempting to remediate all inventory items...')
+    # Step 4b: Collect all INSTANCE resources from other policies and assign to MaxExpiration
+    # The assign endpoint for INSTANCE requires: {"assignmentGroup": ["INSTANCE"], "resourceId": [<uuid>, ...]}
+    instance_ids = []
+    for policy in all_policies:
+        if policy.get("policyId") == existing_policy_id:
+            continue
+        for res in policy.get("vcfPolicyAssignedResourceList", []):
+            if res.get("resourceType") == "INSTANCE":
+                instance_ids.append(res["resourceId"])
+                lsf.write_output(f'  Will reassign: {res.get("resourceName", "?")} from {policy["policyInfo"]["policyName"]}')
     
-    # First, verify current policy state after assignment
+    # Also check if MaxExpiration itself is missing any INSTANCE assignments
+    # by re-querying after MANAGEMENT assignment
+    try:
+        query_resp = requests.post(
+            f"{api_base}/internal/passwordmanagement/policies/query",
+            headers=headers, json={}, verify=False, timeout=30
+        )
+        query_resp.raise_for_status()
+        refreshed_policies = query_resp.json().get("vcfPolicies", [])
+        for policy in refreshed_policies:
+            if policy.get("policyId") == existing_policy_id:
+                continue
+            for res in policy.get("vcfPolicyAssignedResourceList", []):
+                if res.get("resourceType") == "INSTANCE" and res["resourceId"] not in instance_ids:
+                    instance_ids.append(res["resourceId"])
+                    lsf.write_output(f'  Will reassign: {res.get("resourceName", "?")} from {policy["policyInfo"]["policyName"]}')
+    except Exception:
+        pass
+    
+    if instance_ids:
+        lsf.write_output(f'Assigning {len(instance_ids)} INSTANCE resource(s) to MaxExpiration...')
+        try:
+            assign_resp = requests.post(
+                f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}/assign",
+                headers=headers,
+                json={"assignmentGroup": ["INSTANCE"], "resourceId": instance_ids},
+                verify=False, timeout=30
+            )
+            if assign_resp.status_code == 204:
+                lsf.write_output(f'SUCCESS - {len(instance_ids)} INSTANCE resource(s) assigned to MaxExpiration')
+            else:
+                msg = assign_resp.text[:150] if assign_resp.text else ""
+                lsf.write_output(f'WARNING - INSTANCE assign returned {assign_resp.status_code}: {msg}')
+        except Exception as e:
+            lsf.write_output(f'WARNING - Could not assign INSTANCE resources: {e}')
+    else:
+        lsf.write_output('No INSTANCE resources to reassign from other policies')
+    
+    # Step 5: Verify final assignment state
+    lsf.write_output('Verifying final policy assignments...')
     try:
         verify_resp = requests.get(
             f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}",
@@ -2672,16 +2734,26 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
         verify_resp.raise_for_status()
         policy_state = verify_resp.json()
         assigned = policy_state.get("vcfPolicyAssignedResourceList", [])
-        lsf.write_output(f'Policy is currently assigned to {len(assigned)} resource(s):')
+        lsf.write_output(f'MaxExpiration is assigned to {len(assigned)} resource(s):')
         for res in assigned:
             lsf.write_output(f'  - {res.get("resourceName", "?")} ({res.get("resourceType", "?")})')
+        
+        # Also check if the policy's isFleetPolicy flag is correct
+        is_fleet = policy_state.get("policyInfo", {}).get("isFleetPolicy", False)
+        if is_fleet:
+            lsf.write_output('INFO - Resetting isFleetPolicy to False (was set by previous FLEET assignment)')
+            policy_state["policyInfo"]["isFleetPolicy"] = False
+            requests.put(
+                f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}",
+                headers=headers, json=policy_state, verify=False, timeout=30
+            )
     except Exception as e:
         lsf.write_output(f'WARNING - Could not verify policy state: {e}')
     
-    # Attempt remediation via the internal API
+    # Step 6: Attempt remediation
+    lsf.write_output('Attempting to remediate all inventory items...')
     remediation_attempted = False
     try:
-        # Try the remediate endpoint through suite-api
         remediate_resp = requests.post(
             f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}/remediate",
             headers=headers, json={}, verify=False, timeout=60
@@ -2695,10 +2767,10 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
         pass
     
     if not remediation_attempted:
-        lsf.write_output('INFO - Automatic remediation via API not available.')
+        lsf.write_output('INFO - Automatic remediation via API not available through suite-api proxy.')
         lsf.write_output('INFO - Please remediate manually via VCF Operations Manager UI:')
         lsf.write_output(f'INFO -   {base_url}/vcf-operations/ui/manage/fleet/fleet-settings')
-        lsf.write_output('INFO -   Navigate to Fleet Settings > select policy > Remediate All')
+        lsf.write_output('INFO -   Navigate to Fleet Settings > select MaxExpiration > Remediate All')
     
     lsf.write_output('VCF Operations Fleet Password Policy configuration complete')
     return True
@@ -2906,7 +2978,7 @@ NOTE: Some NSX operations require manual steps first.
         disable_sddc_auto_rotate(args.dry_run)
     
     # Step 8: Configure VCF Operations Fleet Password Policy
-    # Creates "MaxExpiration" policy, assigns to VCF Management, remediates inventory
+    # Creates "MaxExpiration" policy, assigns ALL inventory (MANAGEMENT + INSTANCE), remediates
     configure_vcf_fleet_password_policy(args.dry_run)
     
     # Step 9: Final cleanup
