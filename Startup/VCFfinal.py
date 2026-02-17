@@ -29,6 +29,10 @@ MODULE_DESCRIPTION = 'VCF final tasks (Tanzu, VCF Automation)'
 VCFA_URL_MAX_RETRIES = 30  # Maximum attempts (30 minutes total)
 VCFA_URL_RETRY_DELAY = 60  # Seconds between retries
 
+# VCF Component URL check configuration
+VCFC_URL_MAX_RETRIES = 30  # Maximum attempts (30 minutes total)
+VCFC_URL_RETRY_DELAY = 60  # Seconds between retries
+
 # WCP/Supervisor polling configuration
 WCP_POLL_INTERVAL = 30     # seconds between polls
 WCP_MAX_POLL_TIME = 1800   # 30 minutes maximum wait
@@ -733,53 +737,83 @@ def main(lsf=None, standalone=False, dry_run=False):
         
         try:
             # ---- Discover the VSP control plane IP ----
-            # Read the VSP cluster info from SDDC Manager to find a worker node,
-            # then read that node's kubeconfig to get the K8s API (control plane) IP.
+            # Resolve a VSP worker node via DNS, SSH in, and read the
+            # kubeconfig to find the K8s API server (kube-vip) VIP.
+            # Retries handle the case where VSP VMs were just powered on
+            # and DNS/SSH are not yet available.
+            import socket
+            import re
+            
             vsp_control_plane_ip = None
             password = lsf.get_password()
             vsp_user = 'vmware-system-user'
+            max_discovery_attempts = 12
+            discovery_retry_delay = 15
             
-            # Get VSP platform FQDN from [VCF] vspvms config (first entry's VM name
-            # resolves to a VSP worker node) or fall back to the SDDC Manager API.
             vspvms_list = lsf.get_config_list('VCF', 'vspvms')
-            vsp_worker_ip = None
-            
-            if vspvms_list:
+            if not vspvms_list:
+                lsf.write_output('  No vspvms configured in [VCF] - cannot discover VSP control plane')
+                vcf_comp_errors.append('No vspvms configured - cannot discover VSP control plane')
+            else:
                 # The vspvms entry is like "vsp-01a-.*:vc-mgmt-a.site-a.vcf.lab"
                 # The VM name prefix (vsp-01a) often matches the platform FQDN
-                # Try resolving vsp-01a.site-a.vcf.lab (the platformFqdn from VSP cluster)
-                import socket
                 vsp_candidates = ['vsp-01a.site-a.vcf.lab']
-                for candidate in vsp_candidates:
-                    try:
-                        resolved = socket.gethostbyname(candidate)
-                        lsf.write_output(f'  VSP worker candidate: {candidate} -> {resolved}')
-                        vsp_worker_ip = resolved
+                
+                for attempt in range(1, max_discovery_attempts + 1):
+                    # Step 1: Resolve a VSP worker node via DNS
+                    vsp_worker_ip = None
+                    for candidate in vsp_candidates:
+                        try:
+                            vsp_worker_ip = socket.gethostbyname(candidate)
+                            lsf.write_output(f'  VSP worker candidate: {candidate} -> {vsp_worker_ip}')
+                            break
+                        except socket.gaierror as dns_err:
+                            lsf.write_output(f'  DNS failed for {candidate}: {dns_err} (attempt {attempt}/{max_discovery_attempts})')
+                    
+                    if not vsp_worker_ip:
+                        if attempt < max_discovery_attempts:
+                            lsf.write_output(f'  Waiting {discovery_retry_delay}s for DNS to become available...')
+                            lsf.labstartup_sleep(discovery_retry_delay)
+                            continue
+                        else:
+                            break
+                    
+                    # Step 2: SSH to the worker and read the kubeconfig
+                    lsf.write_output(f'  Reading kubeconfig from VSP worker {vsp_worker_ip}...')
+                    result = lsf.ssh(
+                        f"echo '{password}' | sudo -S grep server: /etc/kubernetes/node-agent.conf",
+                        f'{vsp_user}@{vsp_worker_ip}'
+                    )
+                    
+                    if hasattr(result, 'stdout') and result.stdout:
+                        for line in result.stdout.strip().split('\n'):
+                            if 'server:' in line:
+                                # Extract IP from "    server: https://10.1.1.142:6443"
+                                match = re.search(r'https?://([0-9.]+):', line)
+                                if match:
+                                    vsp_control_plane_ip = match.group(1)
+                                    lsf.write_output(f'  VSP control plane IP: {vsp_control_plane_ip}')
+                                    break
+                    
+                    if vsp_control_plane_ip:
                         break
-                    except socket.gaierror:
-                        continue
-            
-            if vsp_worker_ip:
-                # Read the kubeconfig from the worker node to find the control plane IP
-                lsf.write_output(f'  Reading kubeconfig from VSP worker {vsp_worker_ip}...')
-                kube_cmd = "cat /etc/kubernetes/node-agent.conf 2>/dev/null | grep 'server:' | head -1"
-                result = lsf.ssh(
-                    f"echo '{password}' | sudo -S -i bash -c \"{kube_cmd}\"",
-                    f'{vsp_user}@{vsp_worker_ip}'
-                )
-                if hasattr(result, 'stdout') and result.stdout:
-                    for line in result.stdout.strip().split('\n'):
-                        if 'server:' in line:
-                            # Extract IP from "    server: https://10.1.1.142:6443"
-                            import re
-                            match = re.search(r'https?://([0-9.]+):', line)
-                            if match:
-                                vsp_control_plane_ip = match.group(1)
-                                lsf.write_output(f'  VSP control plane IP: {vsp_control_plane_ip}')
-                                break
+                    
+                    # Log why this attempt failed
+                    if hasattr(result, 'stdout') and result.stdout:
+                        lsf.write_output(f'  SSH succeeded but no server: line found in node-agent.conf (attempt {attempt}/{max_discovery_attempts})')
+                    else:
+                        ssh_rc = getattr(result, 'returncode', 'N/A')
+                        ssh_err = ''
+                        if hasattr(result, 'stderr') and result.stderr:
+                            ssh_err = result.stderr.strip()[:200]
+                        lsf.write_output(f'  SSH to VSP worker failed (rc={ssh_rc}): {ssh_err} (attempt {attempt}/{max_discovery_attempts})')
+                    
+                    if attempt < max_discovery_attempts:
+                        lsf.write_output(f'  Waiting {discovery_retry_delay}s before retry...')
+                        lsf.labstartup_sleep(discovery_retry_delay)
             
             if not vsp_control_plane_ip:
-                lsf.write_output('WARNING: Could not determine VSP control plane IP')
+                lsf.write_output('WARNING: Could not determine VSP control plane IP after all attempts')
                 vcf_comp_errors.append('Could not determine VSP control plane IP')
             else:
                 # ---- Detect sudo mode on the control plane ----
@@ -1168,6 +1202,66 @@ def main(lsf=None, standalone=False, dry_run=False):
         else:
             dashboard.update_task('vcffinal', 'vcfa_urls', TaskStatus.COMPLETE,
                                   f'{urls_passed} URLs verified' if urls_checked > 0 else '')
+        dashboard.update_task('vcffinal', 'vcf_component_urls', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 6: Check VCF Component URLs
+    #==========================================================================
+    
+    vcfcomponenturls = lsf.get_config_list('VCFFINAL', 'vcfcomponenturls')
+    vcfc_urls_configured = len(vcfcomponenturls) > 0
+    vcfc_urls_checked = 0
+    vcfc_urls_passed = 0
+    vcfc_urls_failed = 0
+    
+    if vcfc_urls_configured:
+        lsf.write_output('Checking VCF Component URLs...')
+        lsf.write_vpodprogress('VCF Component URL Checks', 'GOOD-8')
+        
+        for url_spec in vcfcomponenturls:
+            if ',' in url_spec:
+                parts = url_spec.split(',', 1)
+                url = parts[0].strip()
+                expected = parts[1].strip()
+            else:
+                url = url_spec.strip()
+                expected = None
+            
+            if url and not dry_run:
+                vcfc_urls_checked += 1
+                lsf.write_output(f'Testing VCF Component URL: {url}')
+                if expected:
+                    lsf.write_output(f'  Expected text: {expected}')
+                
+                url_success = False
+                for attempt in range(1, VCFC_URL_MAX_RETRIES + 1):
+                    result = lsf.test_url(url, expected_text=expected, verify_ssl=False, timeout=30)
+                    if result:
+                        lsf.write_output(f'  [SUCCESS] {url} (attempt {attempt})')
+                        url_success = True
+                        vcfc_urls_passed += 1
+                        break
+                    else:
+                        if attempt == VCFC_URL_MAX_RETRIES:
+                            lsf.write_output(f'  [FAILED] {url} after {VCFC_URL_MAX_RETRIES} attempts')
+                            vcfc_urls_failed += 1
+                            lsf.labfail(f'VCF Component URL {url} not accessible after {VCFC_URL_MAX_RETRIES} minutes')
+                        else:
+                            lsf.write_output(f'  Sleeping and will try again... {attempt} / {VCFC_URL_MAX_RETRIES}')
+                            lsf.labstartup_sleep(VCFC_URL_RETRY_DELAY)
+        
+        lsf.write_output(f'VCF Component URL check complete: {vcfc_urls_passed}/{vcfc_urls_checked} passed')
+    else:
+        lsf.write_output('No VCF Component URLs configured')
+    
+    if dashboard:
+        if vcfc_urls_failed > 0:
+            dashboard.update_task('vcffinal', 'vcf_component_urls', TaskStatus.FAILED,
+                                  f'{vcfc_urls_failed}/{vcfc_urls_checked} URLs failed')
+        else:
+            dashboard.update_task('vcffinal', 'vcf_component_urls', TaskStatus.COMPLETE,
+                                  f'{vcfc_urls_passed} URLs verified' if vcfc_urls_checked > 0 else '')
         dashboard.generate_html()
     
     #==========================================================================
