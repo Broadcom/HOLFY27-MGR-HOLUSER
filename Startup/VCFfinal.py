@@ -626,70 +626,101 @@ def main(lsf=None, standalone=False, dry_run=False):
             
             if vspvms and not dry_run and not vsp_vms_errors:
                 lsf.write_output(f'Processing {len(vspvms)} VSP Platform VMs...')
-                lsf.write_vpodprogress('Starting VSP Platform VMs', 'GOOD-3')
+                lsf.write_vpodprogress('VSP Platform VMs', 'GOOD-3')
                 
-                # Before starting, verify NICs are set to start connected
+                # Check if all VSP VMs are already running with Tools active
+                all_running = True
                 for vspvm in vspvms:
                     parts = vspvm.split(':')
                     vmname = parts[0].strip()
                     try:
                         vms = lsf.get_vm_match(vmname)
+                        if not vms:
+                            all_running = False
+                            break
                         for vm in vms:
-                            verify_nic_connected(lsf, vm, simple=True)
-                    except Exception as e:
-                        error_msg = str(e)
-                        lsf.write_output(f'Warning: Error checking NICs for {vmname}: {error_msg}')
-                
-                # Start the VMs
-                try:
-                    lsf.start_nested(vspvms)
-                except Exception as e:
-                    error_msg = f'Failed to start VSP Platform VMs: {e}'
-                    lsf.write_output(error_msg)
-                    vsp_vms_errors.append(error_msg)
-                
-                # After starting, verify VMs are actually powered on and tools running
-                for vspvm in vspvms:
-                    parts = vspvm.split(':')
-                    vmname = parts[0].strip()
-                    try:
-                        vms = lsf.get_vm_match(vmname)
-                        for vm in vms:
-                            # Ensure VM is powered on
-                            max_power_attempts = 10
-                            power_attempt = 0
-                            while vm.runtime.powerState != 'poweredOn' and power_attempt < max_power_attempts:
-                                lsf.write_output(f'Waiting for {vm.name} to power on...')
-                                try:
-                                    vm.PowerOnVM_Task()
-                                except Exception:
-                                    pass
-                                lsf.labstartup_sleep(lsf.sleep_seconds)
-                                power_attempt += 1
-                            
-                            # Wait for VMware Tools to be running
-                            max_tools_attempts = 30
-                            tools_attempt = 0
-                            while tools_attempt < max_tools_attempts:
-                                try:
-                                    if vm.summary.guest.toolsRunningStatus == 'guestToolsRunning':
-                                        lsf.write_output(f'VMware Tools running in {vm.name}')
-                                        break
-                                except Exception:
-                                    pass
-                                lsf.write_output(f'Waiting for Tools in {vmname}...')
-                                lsf.labstartup_sleep(lsf.sleep_seconds)
-                                tools_attempt += 1
-                            
-                            # Verify NIC is connected after tools are running
+                            if vm.runtime.powerState != 'poweredOn':
+                                all_running = False
+                                break
                             try:
-                                verify_nic_connected(lsf, vm, simple=False)
-                            except Exception as nic_err:
-                                lsf.write_output(f'Warning: Post-start NIC verification failed for {vm.name}: {nic_err}')
-                            
+                                if vm.summary.guest.toolsRunningStatus != 'guestToolsRunning':
+                                    all_running = False
+                                    break
+                            except Exception:
+                                all_running = False
+                                break
+                        if not all_running:
+                            break
+                    except Exception:
+                        all_running = False
+                        break
+                
+                if all_running:
+                    lsf.write_output('All VSP Platform VMs already running with Tools active - skipping startup')
+                else:
+                    # Connect NICs before starting
+                    for vspvm in vspvms:
+                        parts = vspvm.split(':')
+                        vmname = parts[0].strip()
+                        try:
+                            vms = lsf.get_vm_match(vmname)
+                            for vm in vms:
+                                if vm.runtime.powerState != 'poweredOn':
+                                    verify_nic_connected(lsf, vm, simple=True)
+                                else:
+                                    lsf.write_output(f'{vm.name} already powered on, skipping NIC connect')
+                        except Exception as e:
+                            lsf.write_output(f'Warning: Error checking NICs for {vmname}: {e}')
+                    
+                    # Start the VMs
+                    try:
+                        lsf.start_nested(vspvms)
                     except Exception as e:
-                        error_msg = str(e)
-                        lsf.write_output(f'Warning: Error waiting for {vmname}: {error_msg}')
+                        error_msg = f'Failed to start VSP Platform VMs: {e}'
+                        lsf.write_output(error_msg)
+                        vsp_vms_errors.append(error_msg)
+                    
+                    # After starting, verify VMs are actually powered on and tools running
+                    for vspvm in vspvms:
+                        parts = vspvm.split(':')
+                        vmname = parts[0].strip()
+                        try:
+                            vms = lsf.get_vm_match(vmname)
+                            for vm in vms:
+                                # Ensure VM is powered on
+                                max_power_attempts = 10
+                                power_attempt = 0
+                                while vm.runtime.powerState != 'poweredOn' and power_attempt < max_power_attempts:
+                                    lsf.write_output(f'Waiting for {vm.name} to power on...')
+                                    try:
+                                        vm.PowerOnVM_Task()
+                                    except Exception:
+                                        pass
+                                    lsf.labstartup_sleep(lsf.sleep_seconds)
+                                    power_attempt += 1
+                                
+                                # Wait for VMware Tools to be running
+                                max_tools_attempts = 30
+                                tools_attempt = 0
+                                while tools_attempt < max_tools_attempts:
+                                    try:
+                                        if vm.summary.guest.toolsRunningStatus == 'guestToolsRunning':
+                                            lsf.write_output(f'VMware Tools running in {vm.name}')
+                                            break
+                                    except Exception:
+                                        pass
+                                    lsf.write_output(f'Waiting for Tools in {vmname}...')
+                                    lsf.labstartup_sleep(lsf.sleep_seconds)
+                                    tools_attempt += 1
+                                
+                                # Verify NIC is connected after tools are running
+                                try:
+                                    verify_nic_connected(lsf, vm, simple=False)
+                                except Exception as nic_err:
+                                    lsf.write_output(f'Warning: Post-start NIC verification failed for {vm.name}: {nic_err}')
+                                
+                        except Exception as e:
+                            lsf.write_output(f'Warning: Error waiting for {vmname}: {e}')
                 
                 lsf.write_output('VSP Platform VMs processing complete')
         else:
