@@ -183,7 +183,7 @@ git_clone() {
         fi
         echo "Performing git clone for repo ${vpodgit}" >> ${logfile}
         # Confirm that $gitproject url is valid
-        if ! git ls-remote "$gitproject" > /dev/null 2>&1; then
+        if ! GIT_TERMINAL_PROMPT=0 git ls-remote "$gitproject" > /dev/null 2>&1; then
             echo "Git repository does not exist: ${gitproject}" >> ${logfile}
             if is_hol_sku "$vPod_SKU"; then
                 echo "HOL SKU requires git repo. Failing vpod." >> ${logfile}
