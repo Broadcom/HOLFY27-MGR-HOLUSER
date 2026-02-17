@@ -778,8 +778,8 @@ def main(lsf=None, standalone=False, dry_run=False):
             vsp_control_plane_ip = None
             password = lsf.get_password()
             vsp_user = 'vmware-system-user'
-            max_discovery_attempts = 12
-            discovery_retry_delay = 15
+            max_discovery_attempts = 20
+            discovery_retry_delay = 30
             
             vspvms_list = lsf.get_config_list('VCF', 'vspvms')
             if not vspvms_list:
