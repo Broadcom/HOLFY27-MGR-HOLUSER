@@ -82,13 +82,13 @@ These VMs start in parallel with subsequent startup tasks, maximizing overall bo
 
 The system supports multiple lab types with different configurations:
 
-| Lab Type | Firewall | Proxy Filter | Description |
-| ---------- | ---------- | -------------- | ------------- |
-| HOL | Yes | Yes | Full production Hands-on Labs |
-| Discovery | No | No | Simplified discovery environments |
-| VXP | Yes | Yes | VCF Experience Program demos |
-| ATE | Yes | No | Advanced Technical Enablement (Livefire) |
-| EDU | Yes | Yes | Education/training environments |
+| Lab Type | Description |
+| ---------- |  ------------- |
+| HOL | Full production Hands-on Labs |
+| Discovery | Simplified discovery environments |
+| VXP | VCF Experience Program demos |
+| ATE | Advanced Technical Enablement (Livefire) |
+| EDU | Education/training environments |
 
 ## Key Configuration Files
 
@@ -160,7 +160,7 @@ Check Squid configuration on router:
 
 ```bash
 ssh root@router "grep 'acl whitelist' /etc/squid/squid.conf"
-# Should show: acl whitelist dstdomain "/etc/squid/allowlist"
+# Should show: acl whitelist url_regex "/etc/squid/allowlist"
 ```
 
 ### NFS Mount Failing

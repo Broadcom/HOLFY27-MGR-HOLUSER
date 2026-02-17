@@ -106,6 +106,7 @@ class ValidationReport:
     vm_config_checks: List[CheckResult] = field(default_factory=list)
     vm_resource_checks: List[CheckResult] = field(default_factory=list)
     password_expiration_checks: List[CheckResult] = field(default_factory=list)
+    fleet_password_policy_checks: List[CheckResult] = field(default_factory=list)
     overall_status: str = "PASS"
     
     def to_dict(self) -> Dict:
@@ -404,6 +405,7 @@ def check_vm_configuration(vms: List, fix_issues: bool = True) -> List[CheckResu
     SKIP_VM_PATTERNS = [
         'vcf-services-platform-template-',    # VCF Services Platform Template VMs
         'SupervisorControlPlaneVM',           # Tanzu Supervisor Control Plane VMs
+        'vna-wld01-',                         # VNA Workload VMs
     ]
     
     for vm in vms:
@@ -1172,6 +1174,230 @@ def check_password_expirations() -> List[CheckResult]:
 
 
 #==============================================================================
+# VCF OPERATIONS PASSWORD POLICY CHECKS
+#==============================================================================
+
+def check_vcf_password_policies() -> List[CheckResult]:
+    """
+    Check VCF Operations Manager Fleet Settings Password Policies.
+    
+    Connects to VCF Operations Manager (Aria Operations) suite-api to:
+    - List all configured password policies (Name, Description, etc.)
+    - Report policy assignments to inventory resources
+    - Report compliance status for inventory items
+    
+    :return: List of CheckResult objects
+    """
+    results = []
+    
+    if not lsf:
+        return [CheckResult(
+            name="VCF Password Policies",
+            status="SKIPPED",
+            message="lsfunctions not available"
+        )]
+    
+    # Determine VCF Operations Manager FQDN from config
+    ops_fqdn = None
+    try:
+        if lsf.config.has_option('RESOURCES', 'URLs'):
+            urls_raw = lsf.config.get('RESOURCES', 'URLs').split('\n')
+            for entry in urls_raw:
+                url = entry.split(',')[0].strip()
+                if 'ops-' in url and '.vcf.lab' in url:
+                    # Extract FQDN from URL like https://ops-a.site-a.vcf.lab/ui/
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    ops_fqdn = parsed.hostname
+                    break
+    except Exception:
+        pass
+    
+    if not ops_fqdn:
+        # Try VCF section
+        try:
+            if lsf.config.has_section('VCF'):
+                if lsf.config.has_option('VCF', 'urls'):
+                    vcf_urls = lsf.config.get('VCF', 'urls').split('\n')
+                    for entry in vcf_urls:
+                        url = entry.split(',')[0].strip()
+                        if 'ops-' in url:
+                            from urllib.parse import urlparse
+                            parsed = urlparse(url)
+                            ops_fqdn = parsed.hostname
+                            break
+        except Exception:
+            pass
+    
+    if not ops_fqdn:
+        return [CheckResult(
+            name="VCF Password Policies",
+            status="SKIPPED",
+            message="VCF Operations Manager FQDN not found in config"
+        )]
+    
+    try:
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except ImportError:
+        return [CheckResult(
+            name="VCF Password Policies",
+            status="SKIPPED",
+            message="requests library not available"
+        )]
+    
+    password = lsf.get_password()
+    base_url = f"https://{ops_fqdn}"
+    api_base = f"{base_url}/suite-api"
+    
+    # Authenticate to get OpsToken
+    try:
+        token_resp = requests.post(
+            f"{api_base}/api/auth/token/acquire",
+            json={"username": "admin", "password": password, "authSource": "local"},
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            verify=False, timeout=30
+        )
+        token_resp.raise_for_status()
+        token = token_resp.json()["token"]
+    except Exception as e:
+        return [CheckResult(
+            name="VCF Password Policies",
+            status="WARN",
+            message=f"Could not authenticate to VCF Operations: {str(e)[:60]}"
+        )]
+    
+    headers = {
+        "Authorization": f"OpsToken {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-vRealizeOps-API-use-unsupported": "true"
+    }
+    
+    # Query all password policies
+    try:
+        query_resp = requests.post(
+            f"{api_base}/internal/passwordmanagement/policies/query",
+            headers=headers, json={}, verify=False, timeout=30
+        )
+        query_resp.raise_for_status()
+        query_data = query_resp.json()
+    except Exception as e:
+        return [CheckResult(
+            name="VCF Password Policies",
+            status="WARN",
+            message=f"Could not query password policies: {str(e)[:60]}"
+        )]
+    
+    policies = query_data.get("vcfPolicies", [])
+    total_count = query_data.get("pageInfo", {}).get("totalCount", 0)
+    
+    results.append(CheckResult(
+        name="VCF Password Policies",
+        status="PASS" if total_count > 0 else "WARN",
+        message=f"Found {total_count} password policy(ies) in Fleet Settings",
+        details={"ops_fqdn": ops_fqdn, "policy_count": total_count}
+    ))
+    
+    # Report details for each policy
+    for policy in policies:
+        policy_id = policy.get("policyId", "unknown")
+        policy_info = policy.get("policyInfo", {})
+        policy_name = policy_info.get("policyName", "Unknown")
+        description = policy_info.get("description", "No description")
+        is_fleet = policy_info.get("isFleetPolicy", False)
+        assigned_resources = policy.get("vcfPolicyAssignedResourceList", [])
+        
+        # Get full policy details including expiration
+        try:
+            detail_resp = requests.get(
+                f"{api_base}/internal/passwordmanagement/policies/{policy_id}",
+                headers=headers, verify=False, timeout=30
+            )
+            detail_resp.raise_for_status()
+            detail = detail_resp.json()
+            exp_days = detail.get("expirationConstraint", {}).get("passwordExpirationDays", "N/A")
+        except Exception:
+            exp_days = "N/A"
+        
+        assigned_names = [r.get("resourceName", "?") for r in assigned_resources]
+        assigned_str = ", ".join(assigned_names) if assigned_names else "None"
+        
+        msg = (f"Name: {policy_name} | "
+               f"Description: {description} | "
+               f"Expiration: {exp_days} days | "
+               f"Fleet Policy: {is_fleet} | "
+               f"Assigned To: {assigned_str}")
+        
+        results.append(CheckResult(
+            name=f"  Policy: {policy_name}",
+            status="PASS",
+            message=msg,
+            details={
+                "policyId": policy_id,
+                "policyName": policy_name,
+                "description": description,
+                "isFleetPolicy": is_fleet,
+                "passwordExpirationDays": exp_days,
+                "assignedResources": assigned_resources
+            }
+        ))
+    
+    # Report compliance status for inventory items
+    # Get constraint info to show what the system supports
+    try:
+        constraint_resp = requests.get(
+            f"{api_base}/internal/passwordmanagement/policies/constraint",
+            headers=headers, verify=False, timeout=30
+        )
+        constraint_resp.raise_for_status()
+        constraint = constraint_resp.json()
+        max_exp = constraint.get("passwordExpirationDays", {}).get("max", "N/A")
+        min_exp = constraint.get("passwordExpirationDays", {}).get("min", "N/A")
+        
+        results.append(CheckResult(
+            name="  Policy Constraints",
+            status="PASS",
+            message=f"Expiration range: {min_exp}-{max_exp} days",
+            details={"constraint": constraint}
+        ))
+    except Exception:
+        pass
+    
+    # Report inventory compliance per policy assignment
+    for policy in policies:
+        assigned_resources = policy.get("vcfPolicyAssignedResourceList", [])
+        policy_name = policy.get("policyInfo", {}).get("policyName", "Unknown")
+        
+        for resource in assigned_resources:
+            res_name = resource.get("resourceName", "Unknown")
+            res_type = resource.get("resourceType", "Unknown")
+            assigned_ts = resource.get("assignedAt", 0)
+            
+            if assigned_ts:
+                assigned_date = datetime.datetime.fromtimestamp(
+                    assigned_ts / 1000
+                ).strftime("%Y-%m-%d %H:%M")
+            else:
+                assigned_date = "Unknown"
+            
+            results.append(CheckResult(
+                name=f"  Inventory: {res_name}",
+                status="PASS",
+                message=f"Policy: {policy_name} | Type: {res_type} | Assigned: {assigned_date}",
+                details={
+                    "resourceName": res_name,
+                    "resourceType": res_type,
+                    "policyName": policy_name,
+                    "assignedAt": assigned_date
+                }
+            ))
+    
+    return results
+
+
+#==============================================================================
 # MAIN
 #==============================================================================
 
@@ -1339,6 +1565,14 @@ def main():
     except Exception as e:
         print(f"Password expiration check failed: {e}")
     
+    # VCF Operations Fleet Settings Password Policy checks
+    print("\nChecking VCF Operations Fleet Password Policies...")
+    try:
+        report.fleet_password_policy_checks = check_vcf_password_policies()
+        print_results_table("VCF FLEET PASSWORD POLICIES", report.fleet_password_policy_checks)
+    except Exception as e:
+        print(f"VCF Fleet Password Policy check failed: {e}")
+    
     # Determine overall status
     all_checks = (
         report.ssl_checks + 
@@ -1346,7 +1580,8 @@ def main():
         report.ntp_checks + 
         report.vm_config_checks + 
         report.vm_resource_checks +
-        report.password_expiration_checks
+        report.password_expiration_checks +
+        report.fleet_password_policy_checks
     )
     
     if any(c.status == 'FAIL' for c in all_checks):

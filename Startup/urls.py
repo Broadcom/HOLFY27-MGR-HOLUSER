@@ -32,7 +32,8 @@ MAX_WORKERS = 8
 # URL CHECK FUNCTION
 #==============================================================================
 
-def check_url_with_retries(url, expected_text, max_retries, retry_delay, timeout):
+def check_url_with_retries(url, expected_text, max_retries, retry_delay, timeout,
+                           status_dict=None):
     """
     Check a single URL with retry logic.
     
@@ -41,6 +42,8 @@ def check_url_with_retries(url, expected_text, max_retries, retry_delay, timeout
     :param max_retries: Maximum number of retry attempts
     :param retry_delay: Seconds to wait between retries
     :param timeout: Request timeout in seconds
+    :param status_dict: Optional shared dict for live progress reporting.
+                        Key = url, value = dict with 'attempt', 'last_error', 'done', 'success'.
     :return: tuple (url, success, attempts_made, error_message)
     """
     import time
@@ -50,7 +53,16 @@ def check_url_with_retries(url, expected_text, max_retries, retry_delay, timeout
     
     last_error = None
     
+    # Initialise live status entry
+    if status_dict is not None:
+        status_dict[url] = {'attempt': 0, 'last_error': None, 'done': False, 'success': False}
+    
     for attempt in range(1, max_retries + 1):
+        # Update live status
+        if status_dict is not None:
+            status_dict[url]['attempt'] = attempt
+            status_dict[url]['last_error'] = last_error
+        
         try:
             response = session.get(
                 url,
@@ -73,6 +85,8 @@ def check_url_with_retries(url, expected_text, max_retries, retry_delay, timeout
                 continue
             
             # Success
+            if status_dict is not None:
+                status_dict[url].update({'done': True, 'success': True, 'attempt': attempt, 'last_error': None})
             return (url, True, attempt, None)
             
         except requests.exceptions.SSLError as e:
@@ -84,10 +98,15 @@ def check_url_with_retries(url, expected_text, max_retries, retry_delay, timeout
         except Exception as e:
             last_error = f'Error: {str(e)[:50]}'
         
+        if status_dict is not None:
+            status_dict[url]['last_error'] = last_error
+        
         if attempt < max_retries:
             time.sleep(retry_delay)
     
     # All retries exhausted
+    if status_dict is not None:
+        status_dict[url].update({'done': True, 'success': False, 'attempt': max_retries, 'last_error': last_error})
     return (url, False, max_retries, last_error)
 
 
@@ -129,17 +148,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # Get URL Targets from Config
     #==========================================================================
     
-    url_targets = []
-    
-    if lsf.config.has_option('RESOURCES', 'URLS'):
-        urls_raw = lsf.config.get('RESOURCES', 'URLS')
-        # Parse multi-line format: each line is "url,expected_text"
-        for line in urls_raw.split('\n'):
-            line = line.strip()
-            # Skip empty lines and comments
-            if not line or line.startswith('#'):
-                continue
-            url_targets.append(line)
+    # Use get_config_list to properly filter commented-out values
+    url_targets = lsf.get_config_list('RESOURCES', 'URLS')
     
     if not url_targets:
         lsf.write_output('No URL targets configured')
@@ -182,9 +192,14 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     lsf.write_output(f'Checking {len(url_checks)} URLs in parallel (max {MAX_RETRIES} attempts each)...')
     
+    STATUS_LOG_INTERVAL = 30  # seconds between progress updates
+    
     failed = []
     succeeded = []
     results = []
+    
+    # Shared dict for live progress reporting from worker threads
+    status_dict = {}
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Submit all URL checks
@@ -195,13 +210,75 @@ def main(lsf=None, standalone=False, dry_run=False):
                 expected_text,
                 MAX_RETRIES,
                 RETRY_DELAY,
-                REQUEST_TIMEOUT
+                REQUEST_TIMEOUT,
+                status_dict
             ): (url, expected_text)
             for url, expected_text in url_checks
         }
         
-        # Collect results as they complete
-        for future in as_completed(future_to_url):
+        # Poll for progress every STATUS_LOG_INTERVAL seconds instead of
+        # blocking silently on as_completed().  This gives the operator
+        # regular heartbeat messages in labstartup.log.
+        import time as _time
+        start_wall = _time.time()
+        last_log_time = start_wall
+        
+        while True:
+            # Check if all futures are done
+            all_done = all(f.done() for f in future_to_url)
+            
+            now = _time.time()
+            elapsed = int(now - start_wall)
+            
+            # Log a progress summary every STATUS_LOG_INTERVAL seconds (or when finished)
+            if all_done or (now - last_log_time) >= STATUS_LOG_INTERVAL:
+                done_count = sum(1 for s in status_dict.values() if s.get('done'))
+                ok_count = sum(1 for s in status_dict.values() if s.get('success'))
+                pending_count = len(url_checks) - done_count
+                
+                # Build a compact per-URL status line
+                per_url = []
+                for url, _ in url_checks:
+                    s = status_dict.get(url)
+                    if s is None:
+                        per_url.append(f'  {url}: queued')
+                    elif s['done'] and s['success']:
+                        per_url.append(f'  {url}: OK (attempt {s["attempt"]})')
+                    elif s['done']:
+                        per_url.append(f'  {url}: FAILED ({s["last_error"]})')
+                    else:
+                        err_hint = f' - {s["last_error"]}' if s.get('last_error') else ''
+                        per_url.append(f'  {url}: attempt {s["attempt"]}/{MAX_RETRIES}{err_hint}')
+                
+                lsf.write_output(f'URL check progress ({elapsed}s elapsed): '
+                                 f'{ok_count} OK, {done_count - ok_count} failed, '
+                                 f'{pending_count} pending')
+                for line in per_url:
+                    lsf.write_output(line)
+                
+                # Update dashboard with live counts
+                if dashboard:
+                    total_urls = len(url_checks)
+                    fail_so_far = done_count - ok_count
+                    if fail_so_far > 0:
+                        dashboard.update_task('urls', 'url_checks', 'running',
+                                              f'{ok_count}/{total_urls} OK, {fail_so_far} failed, {pending_count} pending',
+                                              total=total_urls, success=ok_count, failed=fail_so_far)
+                    else:
+                        dashboard.update_task('urls', 'url_checks', 'running',
+                                              f'{ok_count}/{total_urls} OK, {pending_count} pending',
+                                              total=total_urls, success=ok_count, failed=0)
+                    dashboard.generate_html()
+                
+                last_log_time = now
+            
+            if all_done:
+                break
+            
+            _time.sleep(5)  # Short poll interval; log output governed by STATUS_LOG_INTERVAL
+        
+        # Collect final results from futures
+        for future in future_to_url:
             url, expected_text = future_to_url[future]
             try:
                 result_url, success, attempts, error = future.result()

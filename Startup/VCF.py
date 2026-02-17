@@ -233,10 +233,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 1: Connect to VCF Management Cluster Hosts
     #==========================================================================
     
-    vcfmgmtcluster = []
-    if lsf.config.has_option('VCF', 'vcfmgmtcluster'):
-        vcfmgmtcluster_raw = lsf.config.get('VCF', 'vcfmgmtcluster')
-        vcfmgmtcluster = [h.strip() for h in vcfmgmtcluster_raw.split('\n') if h.strip()]
+    # Use get_config_list to properly filter commented-out values
+    vcfmgmtcluster = lsf.get_config_list('VCF', 'vcfmgmtcluster')
     
     hosts_connected = 0
     hosts_failed = 0
@@ -339,10 +337,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 2: Check VCF Management Datastore
     #==========================================================================
     
-    vcfmgmtdatastore = []
-    if lsf.config.has_option('VCF', 'vcfmgmtdatastore'):
-        vcfmgmtdatastore_raw = lsf.config.get('VCF', 'vcfmgmtdatastore')
-        vcfmgmtdatastore = [d.strip() for d in vcfmgmtdatastore_raw.split('\n') if d.strip()]
+    # Use get_config_list to properly filter commented-out values
+    vcfmgmtdatastore = lsf.get_config_list('VCF', 'vcfmgmtdatastore')
     
     if vcfmgmtdatastore:
         lsf.write_vpodprogress('VCF Datastore check', 'GOOD-3')
@@ -415,12 +411,11 @@ def main(lsf=None, standalone=False, dry_run=False):
     nsx_mgr_started = 0
     nsx_mgr_failed = 0
     
-    if lsf.config.has_option('VCF', 'vcfnsxmgr'):
-        vcfnsxmgr_raw = lsf.config.get('VCF', 'vcfnsxmgr')
-        vcfnsxmgr = [n.strip() for n in vcfnsxmgr_raw.split('\n') if n.strip() and not n.strip().startswith('#')]
-        nsx_mgr_count = len(vcfnsxmgr)
-        
-        if vcfnsxmgr:
+    # Use get_config_list to properly filter commented-out values
+    vcfnsxmgr = lsf.get_config_list('VCF', 'vcfnsxmgr')
+    nsx_mgr_count = len(vcfnsxmgr)
+    
+    if vcfnsxmgr:
             lsf.write_vpodprogress('VCF NSX Mgr start', 'GOOD-3')
             lsf.write_output('Starting VCF NSX Manager(s)...')
             
@@ -481,12 +476,11 @@ def main(lsf=None, standalone=False, dry_run=False):
     nsx_edges_started = 0
     nsx_edges_failed = 0
     
-    if lsf.config.has_option('VCF', 'vcfnsxedges'):
-        vcfnsxedges_raw = lsf.config.get('VCF', 'vcfnsxedges')
-        vcfnsxedges = [e.strip() for e in vcfnsxedges_raw.split('\n') if e.strip() and not e.strip().startswith('#')]
-        nsx_edges_count = len(vcfnsxedges)
-        
-        if vcfnsxedges:
+    # Use get_config_list to properly filter commented-out values
+    vcfnsxedges = lsf.get_config_list('VCF', 'vcfnsxedges')
+    nsx_edges_count = len(vcfnsxedges)
+    
+    if vcfnsxedges:
             lsf.write_vpodprogress('VCF NSX Edges start', 'GOOD-3')
             lsf.write_output('Starting VCF NSX Edges...')
             
@@ -551,12 +545,10 @@ def main(lsf=None, standalone=False, dry_run=False):
     # to allow maximum boot time. VCF Automation (auto-a) is a typical
     # example that benefits from early boot.
     
-    if lsf.config.has_option('VCF', 'vcfpostedgevms'):
-        vcfpostedgevms_raw = lsf.config.get('VCF', 'vcfpostedgevms')
-        vcfpostedgevms = [v.strip() for v in vcfpostedgevms_raw.split('\n') 
-                         if v.strip() and not v.strip().startswith('#')]
-        
-        if vcfpostedgevms:
+    # Use get_config_list to properly filter commented-out values
+    vcfpostedgevms = lsf.get_config_list('VCF', 'vcfpostedgevms')
+    
+    if vcfpostedgevms:
             lsf.write_vpodprogress('VCF Post-Edge VMs start', 'GOOD-3')
             lsf.write_output('Starting post-edge VMs (VCF Automation, etc.)...')
             
@@ -596,12 +588,11 @@ def main(lsf=None, standalone=False, dry_run=False):
     vcenter_started = 0
     vcenter_failed = 0
     
-    if lsf.config.has_option('VCF', 'vcfvCenter'):
-        vcfvCenter_raw = lsf.config.get('VCF', 'vcfvCenter')
-        vcfvCenter = [v.strip() for v in vcfvCenter_raw.split('\n') if v.strip() and not v.strip().startswith('#')]
-        vcenter_count = len(vcfvCenter)
-        
-        if vcfvCenter:
+    # Use get_config_list to properly filter commented-out values
+    vcfvCenter = lsf.get_config_list('VCF', 'vcfvCenter')
+    vcenter_count = len(vcfvCenter)
+    
+    if vcfvCenter:
             lsf.write_vpodprogress('VCF vCenter start', 'GOOD-3')
             lsf.write_output('Starting VCF vCenter(s)...')
             

@@ -183,7 +183,7 @@ git_clone() {
         fi
         echo "Performing git clone for repo ${vpodgit}" >> ${logfile}
         # Confirm that $gitproject url is valid
-        if ! git ls-remote "$gitproject" > /dev/null 2>&1; then
+        if ! GIT_TERMINAL_PROMPT=0 git ls-remote "$gitproject" > /dev/null 2>&1; then
             echo "Git repository does not exist: ${gitproject}" >> ${logfile}
             if is_hol_sku "$vPod_SKU"; then
                 echo "HOL SKU requires git repo. Failing vpod." >> ${logfile}
@@ -267,7 +267,7 @@ get_git_project_info() {
     local suffix=$(echo "${vPod_SKU}" | cut -f2- -d'-')
     
     case "$labtype" in
-        Discovery)
+        DISCOVERY)
             # Discovery uses name-based pattern (no year extraction)
             # e.g., Discovery-Demo -> /vpodrepo/Discovery-labs/Demo
             yearrepo="${gitdrive}/Discovery-labs"
@@ -589,6 +589,8 @@ if [ "$vpod_found" = true ]; then
     echo "vPod.txt found after ${vpod_wait}s. Copying to /tmp/vPod.txt..." >> ${logfile}
     cp "${lmcholroot}"/vPod.txt /tmp/vPod.txt
     labtype=$(grep labtype /tmp/vPod.txt | cut -f2 -d '=' | sed 's/\r$//' | xargs)
+    # Normalize labtype to uppercase to avoid case-sensitivity issues
+    labtype=$(echo "${labtype}" | tr '[:lower:]' '[:upper:]')
     
     if [ "$labtype" != "HOL" ]; then
         vPod_SKU=$(grep vPod_SKU /tmp/vPod.txt | cut -f2 -d '=' | sed 's/\r$//' | xargs)

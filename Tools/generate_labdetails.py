@@ -271,7 +271,7 @@ class LabDataCollector:
             self.env.lab_sku = self.config.get('VPOD', 'vPod_SKU')
         
         if self.config.has_option('VPOD', 'labtype'):
-            self.env.lab_type = self.config.get('VPOD', 'labtype')
+            self.env.lab_type = self.config.get('VPOD', 'labtype').upper()
         
         # Get DNS domain from resolv.conf
         try:
@@ -680,7 +680,7 @@ class LabDetailsGenerator:
             'ATE': 'Advanced Technical Enablement / Livefire',
             'VXP': 'VCF Experience Program',
             'EDU': 'Education/Training',
-            'Discovery': 'Discovery Environment'
+            'DISCOVERY': 'Discovery Environment'
         }
         
         type_desc = lab_type_desc.get(self.env.lab_type, self.env.lab_type)

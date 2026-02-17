@@ -29,6 +29,10 @@ MODULE_DESCRIPTION = 'VCF final tasks (Tanzu, VCF Automation)'
 VCFA_URL_MAX_RETRIES = 30  # Maximum attempts (30 minutes total)
 VCFA_URL_RETRY_DELAY = 60  # Seconds between retries
 
+# VCF Component URL check configuration
+VCFC_URL_MAX_RETRIES = 30  # Maximum attempts (30 minutes total)
+VCFC_URL_RETRY_DELAY = 60  # Seconds between retries
+
 # WCP/Supervisor polling configuration
 WCP_POLL_INTERVAL = 30     # seconds between polls
 WCP_MAX_POLL_TIME = 1800   # 30 minutes maximum wait
@@ -194,10 +198,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 1: Connect to VCF Management Cluster Hosts (if needed)
     #==========================================================================
     
-    vcfmgmtcluster = []
-    if lsf.config.has_option('VCF', 'vcfmgmtcluster'):
-        vcfmgmtcluster_raw = lsf.config.get('VCF', 'vcfmgmtcluster')
-        vcfmgmtcluster = [h.strip() for h in vcfmgmtcluster_raw.split('\n') if h.strip()]
+    # Use get_config_list to properly filter commented-out values
+    vcfmgmtcluster = lsf.get_config_list('VCF', 'vcfmgmtcluster')
     
     if vcfmgmtcluster and not dry_run:
         lsf.write_vpodprogress('VCF Hosts Connect', 'GOOD-3')
@@ -219,27 +221,56 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 2: Supervisor Control Plane (Tanzu/WCP)
     #==========================================================================
     
+    # First check if we have any vCenters configured - without vCenters, 
+    # there's no way to have Tanzu/WCP so skip these checks entirely
+    vcenters_list = lsf.get_config_list('RESOURCES', 'vCenters')
+    
+    if not vcenters_list:
+        lsf.write_output('No vCenters configured - skipping Tanzu/WCP checks')
+        if dashboard:
+            dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.SKIPPED, 
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'wcp_vcenter', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'vcfa_vms', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'vcfa_urls', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.generate_html()
+        lsf.write_output('VCFfinal completed (no VCF resources)')
+        return True
+    
     lsf.write_vpodprogress('Tanzu Start', 'GOOD-3')
     
-    # Check for Tanzu Control Plane VMs
-    tanzu_control_configured = lsf.config.has_option('VCFFINAL', 'tanzucontrol')
+    # Check for Tanzu Control Plane VMs - requires tanzucontrol option with valid (non-commented) values
+    tanzu_control_values = lsf.get_config_list('VCFFINAL', 'tanzucontrol')
+    tanzu_control_configured = len(tanzu_control_values) > 0
     
     if tanzu_control_configured and not dry_run:
         #----------------------------------------------------------------------
         # Determine vCenter host for WCP (look for wld vCenter in config)
         #----------------------------------------------------------------------
         wcp_vcenter = None
-        if lsf.config.has_option('RESOURCES', 'vCenters'):
-            vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
-            for vc_line in vcenters_raw.split('\n'):
-                vc_line = vc_line.strip()
-                if vc_line and not vc_line.startswith('#') and 'wld' in vc_line.lower():
-                    # Extract just the hostname (before the colon)
-                    wcp_vcenter = vc_line.split(':')[0].strip()
-                    break
+        for vc_line in vcenters_list:
+            if 'wld' in vc_line.lower():
+                # Extract just the hostname (before the colon)
+                wcp_vcenter = vc_line.split(':')[0].strip()
+                break
         
         if not wcp_vcenter:
-            wcp_vcenter = 'vc-wld01-a.site-a.vcf.lab'  # Default
+            # No WLD vCenter found - use first available vCenter as fallback
+            if vcenters_list:
+                wcp_vcenter = vcenters_list[0].split(':')[0].strip()
+                lsf.write_output(f'No WLD vCenter found, using first available: {wcp_vcenter}')
+            else:
+                lsf.write_output('No vCenters available for Tanzu checks - skipping')
+                if dashboard:
+                    dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.SKIPPED,
+                                          'No vCenters available')
+                    dashboard.generate_html()
+                return True
         
         #----------------------------------------------------------------------
         # TASK 2a: PRE-START - Verify WCP vCenter Services
@@ -258,17 +289,16 @@ def main(lsf=None, standalone=False, dry_run=False):
         
         # Determine SSO domain from vCenter config entry
         sso_domain = 'wld.sso'  # Default
-        if lsf.config.has_option('RESOURCES', 'vCenters'):
-            for vc_line in lsf.config.get('RESOURCES', 'vCenters').split('\n'):
-                vc_line = vc_line.strip()
-                if vc_line and 'wld' in vc_line.lower() and not vc_line.startswith('#'):
-                    parts = vc_line.split(':')
-                    if len(parts) >= 3:
-                        # Extract domain from user like "administrator@wld.sso"
-                        user_part = parts[2].strip()
-                        if '@' in user_part:
-                            sso_domain = user_part.split('@')[1]
-                    break
+        # vcenters_list already filtered by get_config_list above
+        for vc_line in vcenters_list:
+            if 'wld' in vc_line.lower():
+                parts = vc_line.split(':')
+                if len(parts) >= 3:
+                    # Extract domain from user like "administrator@wld.sso"
+                    user_part = parts[2].strip()
+                    if '@' in user_part:
+                        sso_domain = user_part.split('@')[1]
+                break
         
         wcp_vcenter_ok = True
         
@@ -546,6 +576,422 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.generate_html()
     
     #==========================================================================
+    # TASK 2d: Start VSP Platform VMs
+    # Processes vspvms from [VCF] section the same way vravms is processed
+    # in TASK 4 - finds VMs by name/pattern via vCenter, verifies NICs,
+    # powers them on, and waits for VMware Tools.
+    #==========================================================================
+    
+    # Use get_config_list to properly filter commented-out values
+    vspvms = lsf.get_config_list('VCF', 'vspvms')
+    vsp_vms_configured = len(vspvms) > 0
+    vsp_vms_errors = []
+    vsp_vms_task_failed = False
+    
+    if dashboard:
+        dashboard.update_task('vcffinal', 'vsp_vms', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    try:
+        if vsp_vms_configured:
+            lsf.write_output('Checking VSP Platform VMs...')
+            lsf.write_vpodprogress('VSP Platform VMs', 'GOOD-3')
+            
+            #------------------------------------------------------------------
+            # Clear existing sessions and establish fresh vCenter connection
+            # Previous tasks connected to ESXi hosts directly, but VSP
+            # Platform VM operations must be done through vCenter.
+            #------------------------------------------------------------------
+            lsf.write_output('Clearing existing sessions for fresh vCenter connection...')
+            for si in lsf.sis:
+                try:
+                    connect.Disconnect(si)
+                except Exception:
+                    pass
+            lsf.sis.clear()
+            lsf.sisvc.clear()
+            
+            # Connect to vCenter(s) - required for VSP Platform VM operations
+            vcenters = lsf.get_config_list('RESOURCES', 'vCenters')
+            
+            if not vcenters:
+                lsf.write_output('ERROR: No vCenters configured in RESOURCES section')
+                vsp_vms_errors.append('No vCenters configured')
+            elif not dry_run:
+                lsf.write_output(f'Connecting to vCenter(s): {vcenters}')
+                failed_vcs = lsf.connect_vcenters(vcenters)
+                lsf.write_output(f'vCenter sessions established: {len(lsf.sis)}')
+                if failed_vcs:
+                    lsf.write_output(f'WARNING: Failed to connect to vCenter(s): {", ".join(failed_vcs)}')
+            
+            if vspvms and not dry_run and not vsp_vms_errors:
+                lsf.write_output(f'Processing {len(vspvms)} VSP Platform VMs...')
+                lsf.write_vpodprogress('VSP Platform VMs', 'GOOD-3')
+                
+                # Check if all VSP VMs are already running with Tools active
+                all_running = True
+                for vspvm in vspvms:
+                    parts = vspvm.split(':')
+                    vmname = parts[0].strip()
+                    try:
+                        vms = lsf.get_vm_match(vmname)
+                        if not vms:
+                            all_running = False
+                            break
+                        for vm in vms:
+                            if vm.runtime.powerState != 'poweredOn':
+                                all_running = False
+                                break
+                            try:
+                                if vm.summary.guest.toolsRunningStatus != 'guestToolsRunning':
+                                    all_running = False
+                                    break
+                            except Exception:
+                                all_running = False
+                                break
+                        if not all_running:
+                            break
+                    except Exception:
+                        all_running = False
+                        break
+                
+                if all_running:
+                    lsf.write_output('All VSP Platform VMs already running with Tools active - skipping startup')
+                else:
+                    # Connect NICs before starting
+                    for vspvm in vspvms:
+                        parts = vspvm.split(':')
+                        vmname = parts[0].strip()
+                        try:
+                            vms = lsf.get_vm_match(vmname)
+                            for vm in vms:
+                                if vm.runtime.powerState != 'poweredOn':
+                                    verify_nic_connected(lsf, vm, simple=True)
+                                else:
+                                    lsf.write_output(f'{vm.name} already powered on, skipping NIC connect')
+                        except Exception as e:
+                            lsf.write_output(f'Warning: Error checking NICs for {vmname}: {e}')
+                    
+                    # Start the VMs
+                    try:
+                        lsf.start_nested(vspvms)
+                    except Exception as e:
+                        error_msg = f'Failed to start VSP Platform VMs: {e}'
+                        lsf.write_output(error_msg)
+                        vsp_vms_errors.append(error_msg)
+                    
+                    # After starting, verify VMs are actually powered on and tools running
+                    for vspvm in vspvms:
+                        parts = vspvm.split(':')
+                        vmname = parts[0].strip()
+                        try:
+                            vms = lsf.get_vm_match(vmname)
+                            for vm in vms:
+                                # Ensure VM is powered on
+                                max_power_attempts = 10
+                                power_attempt = 0
+                                while vm.runtime.powerState != 'poweredOn' and power_attempt < max_power_attempts:
+                                    lsf.write_output(f'Waiting for {vm.name} to power on...')
+                                    try:
+                                        vm.PowerOnVM_Task()
+                                    except Exception:
+                                        pass
+                                    lsf.labstartup_sleep(lsf.sleep_seconds)
+                                    power_attempt += 1
+                                
+                                # Wait for VMware Tools to be running
+                                max_tools_attempts = 30
+                                tools_attempt = 0
+                                while tools_attempt < max_tools_attempts:
+                                    try:
+                                        if vm.summary.guest.toolsRunningStatus == 'guestToolsRunning':
+                                            lsf.write_output(f'VMware Tools running in {vm.name}')
+                                            break
+                                    except Exception:
+                                        pass
+                                    lsf.write_output(f'Waiting for Tools in {vmname}...')
+                                    lsf.labstartup_sleep(lsf.sleep_seconds)
+                                    tools_attempt += 1
+                                
+                                # Verify NIC is connected after tools are running
+                                try:
+                                    verify_nic_connected(lsf, vm, simple=False)
+                                except Exception as nic_err:
+                                    lsf.write_output(f'Warning: Post-start NIC verification failed for {vm.name}: {nic_err}')
+                                
+                        except Exception as e:
+                            lsf.write_output(f'Warning: Error waiting for {vmname}: {e}')
+                
+                lsf.write_output('VSP Platform VMs processing complete')
+        else:
+            lsf.write_output('No VSP Platform VMs configured')
+            
+    except Exception as task_error:
+        error_msg = f'VSP Platform VMs task failed with unexpected error: {task_error}'
+        lsf.write_output(error_msg)
+        vsp_vms_errors.append(error_msg)
+        vsp_vms_task_failed = True
+    
+    # Update dashboard based on task results
+    if dashboard:
+        if vsp_vms_task_failed or vsp_vms_errors:
+            dashboard.update_task('vcffinal', 'vsp_vms', TaskStatus.FAILED,
+                                  f'{len(vsp_vms_errors)} errors')
+        elif vsp_vms_configured:
+            dashboard.update_task('vcffinal', 'vsp_vms', TaskStatus.COMPLETE)
+        else:
+            dashboard.update_task('vcffinal', 'vsp_vms', TaskStatus.SKIPPED,
+                                  'No VSP Platform VMs configured')
+        dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 2e: Start VCF Components on VSP Management Cluster
+    # These are Kubernetes workloads (Salt Master, Salt RaaS, Telemetry,
+    # Software Depot, Identity Broker) that may remain scaled to 0 after
+    # a cold boot. We SSH to the VSP control plane and scale them up.
+    # Only runs if vcfcomponents is defined in [VCFFINAL] with values.
+    #==========================================================================
+    
+    vcfcomponents = lsf.get_config_list('VCFFINAL', 'vcfcomponents')
+    vcf_comp_configured = len(vcfcomponents) > 0
+    vcf_comp_errors = []
+    vcf_comp_scaled = 0
+    vcf_comp_already_running = 0
+    
+    if dashboard and vcf_comp_configured:
+        dashboard.update_task('vcffinal', 'vcf_components', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    if vcf_comp_configured and not dry_run:
+        lsf.write_output('Starting VCF Components on VSP management cluster...')
+        lsf.write_vpodprogress('VCF Components', 'GOOD-3')
+        
+        try:
+            # ---- Discover the VSP control plane IP ----
+            # Resolve a VSP worker node via DNS, SSH in, and read the
+            # kubeconfig to find the K8s API server (kube-vip) VIP.
+            # Retries handle the case where VSP VMs were just powered on
+            # and DNS/SSH are not yet available.
+            import socket
+            import re
+            
+            vsp_control_plane_ip = None
+            password = lsf.get_password()
+            vsp_user = 'vmware-system-user'
+            max_discovery_attempts = 20
+            discovery_retry_delay = 30
+            
+            vspvms_list = lsf.get_config_list('VCF', 'vspvms')
+            if not vspvms_list:
+                lsf.write_output('  No vspvms configured in [VCF] - cannot discover VSP control plane')
+                vcf_comp_errors.append('No vspvms configured - cannot discover VSP control plane')
+            else:
+                # The vspvms entry is like "vsp-01a-.*:vc-mgmt-a.site-a.vcf.lab"
+                # The VM name prefix (vsp-01a) often matches the platform FQDN
+                vsp_candidates = ['vsp-01a.site-a.vcf.lab']
+                
+                for attempt in range(1, max_discovery_attempts + 1):
+                    # Step 1: Resolve a VSP worker node via DNS
+                    vsp_worker_ip = None
+                    for candidate in vsp_candidates:
+                        try:
+                            vsp_worker_ip = socket.gethostbyname(candidate)
+                            lsf.write_output(f'  VSP worker candidate: {candidate} -> {vsp_worker_ip}')
+                            break
+                        except socket.gaierror as dns_err:
+                            lsf.write_output(f'  DNS failed for {candidate}: {dns_err} (attempt {attempt}/{max_discovery_attempts})')
+                    
+                    if not vsp_worker_ip:
+                        if attempt < max_discovery_attempts:
+                            lsf.write_output(f'  Waiting {discovery_retry_delay}s for DNS to become available...')
+                            lsf.labstartup_sleep(discovery_retry_delay)
+                            continue
+                        else:
+                            break
+                    
+                    # Step 2: SSH to the worker and read the kubeconfig
+                    lsf.write_output(f'  Reading kubeconfig from VSP worker {vsp_worker_ip}...')
+                    result = lsf.ssh(
+                        f"echo '{password}' | sudo -S grep server: /etc/kubernetes/node-agent.conf",
+                        f'{vsp_user}@{vsp_worker_ip}'
+                    )
+                    
+                    if hasattr(result, 'stdout') and result.stdout:
+                        for line in result.stdout.strip().split('\n'):
+                            if 'server:' in line:
+                                # Extract IP from "    server: https://10.1.1.142:6443"
+                                match = re.search(r'https?://([0-9.]+):', line)
+                                if match:
+                                    vsp_control_plane_ip = match.group(1)
+                                    lsf.write_output(f'  VSP control plane IP: {vsp_control_plane_ip}')
+                                    break
+                    
+                    if vsp_control_plane_ip:
+                        break
+                    
+                    # Log why this attempt failed
+                    if hasattr(result, 'stdout') and result.stdout:
+                        lsf.write_output(f'  SSH succeeded but no server: line found in node-agent.conf (attempt {attempt}/{max_discovery_attempts})')
+                    else:
+                        ssh_rc = getattr(result, 'returncode', 'N/A')
+                        ssh_err = ''
+                        if hasattr(result, 'stderr') and result.stderr:
+                            ssh_err = result.stderr.strip()[:200]
+                        lsf.write_output(f'  SSH to VSP worker failed (rc={ssh_rc}): {ssh_err} (attempt {attempt}/{max_discovery_attempts})')
+                    
+                    if attempt < max_discovery_attempts:
+                        lsf.write_output(f'  Waiting {discovery_retry_delay}s before retry...')
+                        lsf.labstartup_sleep(discovery_retry_delay)
+            
+            if not vsp_control_plane_ip:
+                lsf.write_output('WARNING: Could not determine VSP control plane IP after all attempts')
+                vcf_comp_errors.append('Could not determine VSP control plane IP')
+            else:
+                # ---- Detect sudo mode on the control plane ----
+                sudo_needs_password = True  # Default to password-required (VCF 9.1.x)
+                sudo_check = lsf.ssh(
+                    'sudo -n true',
+                    f'{vsp_user}@{vsp_control_plane_ip}'
+                )
+                if hasattr(sudo_check, 'returncode') and sudo_check.returncode == 0:
+                    sudo_needs_password = False
+                lsf.write_output(f'  VSP sudo requires password: {sudo_needs_password}')
+                
+                # ---- Helper to run kubectl on the VSP control plane ----
+                def vsp_kubectl(kubectl_cmd):
+                    if sudo_needs_password:
+                        ssh_cmd = f"echo '{password}' | sudo -S -i bash -c '{kubectl_cmd}'"
+                    else:
+                        ssh_cmd = f"sudo -i bash -c '{kubectl_cmd}'"
+                    return lsf.ssh(ssh_cmd, f'{vsp_user}@{vsp_control_plane_ip}')
+                
+                # ---- Unsuspend postgres instances managed by Zalando operator ----
+                # The VMSP operator sets a "database.vmsp.vmware.com/suspended=true"
+                # label on PostgresInstance CRDs when a component is stopped.  The
+                # Zalando postgres operator honours this label and keeps the
+                # statefulset at 0 replicas regardless of manual scaling.  We must
+                # remove the label BEFORE scaling the statefulset.
+                lsf.write_output('  Checking for suspended Postgres instances...')
+                pg_check = vsp_kubectl(
+                    'kubectl get postgresinstances.database.vmsp.vmware.com -A '
+                    '-o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,'
+                    'SUSPENDED:.metadata.labels.database\\.vmsp\\.vmware\\.com/suspended '
+                    '--no-headers'
+                )
+                if hasattr(pg_check, 'stdout') and pg_check.stdout:
+                    for line in pg_check.stdout.strip().split('\n'):
+                        cols = line.split()
+                        if len(cols) >= 3 and cols[2] == 'true':
+                            pg_ns, pg_name = cols[0], cols[1]
+                            lsf.write_output(f'  Unsuspending Postgres instance: {pg_ns}/{pg_name}')
+                            vsp_kubectl(
+                                f'kubectl label postgresinstances.database.vmsp.vmware.com '
+                                f'{pg_name} -n {pg_ns} database.vmsp.vmware.com/suspended-'
+                            )
+                
+                # ---- Scale up each component ----
+                lsf.write_output(f'  Processing {len(vcfcomponents)} component resources...')
+                
+                for entry in vcfcomponents:
+                    # Format: namespace:resource_type/resource_name
+                    parts = entry.split(':', 1)
+                    if len(parts) != 2 or '/' not in parts[1]:
+                        lsf.write_output(f'  WARNING: Invalid vcfcomponents entry: {entry}')
+                        vcf_comp_errors.append(f'Invalid entry: {entry}')
+                        continue
+                    
+                    namespace = parts[0].strip()
+                    resource = parts[1].strip()  # e.g. "deployment/salt-master"
+                    
+                    # Check current replica count before scaling
+                    check_cmd = f'kubectl get {resource} -n {namespace} -o jsonpath="{{.spec.replicas}}"'
+                    check_result = vsp_kubectl(check_cmd)
+                    current_replicas = ''
+                    if hasattr(check_result, 'stdout') and check_result.stdout:
+                        current_replicas = check_result.stdout.strip().split('\n')[-1].strip()
+                    
+                    if current_replicas == '1' or (current_replicas.isdigit() and int(current_replicas) > 0):
+                        lsf.write_output(f'  {namespace}/{resource}: already running (replicas={current_replicas})')
+                        vcf_comp_already_running += 1
+                        continue
+                    
+                    # Scale to 1 replica
+                    scale_cmd = f'kubectl scale {resource} -n {namespace} --replicas=1'
+                    lsf.write_output(f'  Scaling up: {namespace}/{resource}')
+                    scale_result = vsp_kubectl(scale_cmd)
+                    
+                    if hasattr(scale_result, 'stdout') and 'scaled' in scale_result.stdout:
+                        vcf_comp_scaled += 1
+                    elif hasattr(scale_result, 'returncode') and scale_result.returncode == 0:
+                        vcf_comp_scaled += 1
+                    else:
+                        err = ''
+                        if hasattr(scale_result, 'stderr') and scale_result.stderr:
+                            err = scale_result.stderr.strip()[:200]
+                        elif hasattr(scale_result, 'stdout') and scale_result.stdout:
+                            err = scale_result.stdout.strip()[:200]
+                        lsf.write_output(f'  WARNING: Failed to scale {namespace}/{resource}: {err}')
+                        vcf_comp_errors.append(f'Failed: {namespace}/{resource}')
+                
+                # ---- Update Component CRD annotations to Running ----
+                # The VCF Services Runtime UI reads the annotation
+                # "component.vmsp.vmware.com/operational-status" on each
+                # Component CRD to determine the displayed state.  Scaling
+                # pods alone does not update this annotation, so the UI
+                # would still show "Stopped" without this step.
+                if vcf_comp_scaled > 0:
+                    lsf.write_output('  Updating Component CRD annotations to Running...')
+                    comp_list = vsp_kubectl(
+                        'kubectl get components.api.vmsp.vmware.com -A '
+                        '-o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,'
+                        'STATUS:.metadata.annotations.component\\.vmsp\\.vmware\\.com/operational-status '
+                        '--no-headers'
+                    )
+                    if hasattr(comp_list, 'stdout') and comp_list.stdout:
+                        for line in comp_list.stdout.strip().split('\n'):
+                            cols = line.split()
+                            if len(cols) >= 3 and cols[2] == 'NotRunning':
+                                crd_ns, crd_name = cols[0], cols[1]
+                                lsf.write_output(f'  Annotating {crd_ns}/{crd_name} -> Running')
+                                vsp_kubectl(
+                                    f'kubectl annotate components.api.vmsp.vmware.com '
+                                    f'{crd_name} -n {crd_ns} '
+                                    f'component.vmsp.vmware.com/operational-status=Running --overwrite'
+                                )
+                
+                # ---- Summary ----
+                total = len(vcfcomponents)
+                lsf.write_output(f'VCF Components: {vcf_comp_scaled} scaled up, '
+                                 f'{vcf_comp_already_running} already running, '
+                                 f'{len(vcf_comp_errors)} errors (of {total} total)')
+                
+        except Exception as comp_error:
+            error_msg = f'VCF Components task failed: {comp_error}'
+            lsf.write_output(error_msg)
+            vcf_comp_errors.append(error_msg)
+    elif vcf_comp_configured and dry_run:
+        lsf.write_output(f'Would start {len(vcfcomponents)} VCF components (dry run)')
+    else:
+        lsf.write_output('No VCF Components configured')
+    
+    if dashboard:
+        if vcf_comp_configured:
+            if vcf_comp_errors:
+                dashboard.update_task('vcffinal', 'vcf_components', TaskStatus.FAILED,
+                                      f'{len(vcf_comp_errors)} errors',
+                                      total=len(vcfcomponents), success=vcf_comp_scaled + vcf_comp_already_running,
+                                      failed=len(vcf_comp_errors))
+            else:
+                dashboard.update_task('vcffinal', 'vcf_components', TaskStatus.COMPLETE,
+                                      f'{vcf_comp_scaled} started, {vcf_comp_already_running} already running',
+                                      total=len(vcfcomponents), success=vcf_comp_scaled + vcf_comp_already_running,
+                                      failed=0)
+        else:
+            dashboard.update_task('vcffinal', 'vcf_components', TaskStatus.SKIPPED,
+                                  'No VCF Components configured')
+        dashboard.generate_html()
+    
+    #==========================================================================
     # TASK 3: Tanzu Deployment
     #==========================================================================
     
@@ -557,8 +1003,8 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_vpodprogress('Tanzu Deploy', 'GOOD-3')
             
             # Tanzu deployment scripts can be specified as host:account:script
-            tanzu_deploy_raw = lsf.config.get('VCFFINAL', 'tanzudeploy')
-            tanzu_deploy_items = [t.strip() for t in tanzu_deploy_raw.split('\n') if t.strip()]
+            # Use get_config_list to properly filter commented-out values
+            tanzu_deploy_items = lsf.get_config_list('VCFFINAL', 'tanzudeploy')
             
             for item in tanzu_deploy_items:
                 parts = item.split(':')
@@ -583,7 +1029,9 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 4: Check VCF Automation VMs (vRA)
     #==========================================================================
     
-    vcfa_vms_configured = lsf.config.has_option('VCFFINAL', 'vravms')
+    # Check for actual non-commented values, not just the presence of the option
+    vravms = lsf.get_config_list('VCFFINAL', 'vravms')
+    vcfa_vms_configured = len(vravms) > 0
     vcfa_vms_errors = []  # Track errors for this task
     vcfa_vms_task_failed = False  # Track if the entire task failed
     
@@ -608,10 +1056,8 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.sisvc.clear()
             
             # Connect to vCenter(s) - required for VCF Automation VM operations
-            vcenters = []
-            if lsf.config.has_option('RESOURCES', 'vCenters'):
-                vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
-                vcenters = [v.strip() for v in vcenters_raw.split('\n') if v.strip() and not v.strip().startswith('#')]
+            # Use get_config_list to properly filter commented-out values
+            vcenters = lsf.get_config_list('RESOURCES', 'vCenters')
             
             if not vcenters:
                 lsf.write_output('ERROR: No vCenters configured in RESOURCES section')
@@ -624,9 +1070,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                 if failed_vcs:
                     lsf.write_output(f'WARNING: Failed to connect to vCenter(s): {", ".join(failed_vcs)}')
             
-            vravms_raw = lsf.config.get('VCFFINAL', 'vravms')
-            vravms = [v.strip() for v in vravms_raw.split('\n') if v.strip() and not v.strip().startswith('#')]
-            
+            # vravms already retrieved above to check if configured
             if vravms and not dry_run and not vcfa_vms_errors:
                 lsf.write_output(f'Processing {len(vravms)} VCF Automation VMs...')
                 lsf.write_vpodprogress('Starting VCF Automation VMs', 'GOOD-8')
@@ -719,7 +1163,9 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 5: Check VCF Automation URLs
     #==========================================================================
     
-    vcfa_urls_configured = lsf.config.has_option('VCFFINAL', 'vraurls')
+    # Check for actual non-commented URL values, not just the presence of the option
+    vraurls = lsf.get_config_list('VCFFINAL', 'vraurls')
+    vcfa_urls_configured = len(vraurls) > 0
     urls_checked = 0
     urls_passed = 0
     urls_failed = 0
@@ -740,8 +1186,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         if os.path.isfile(watchvcfa_script) and not dry_run:
             lsf.run_command(watchvcfa_script)
         
-        vraurls_raw = lsf.config.get('VCFFINAL', 'vraurls')
-        vraurls = [u.strip() for u in vraurls_raw.split('\n') if u.strip() and not u.strip().startswith('#')]
+        # vraurls already retrieved above
         
         for url_spec in vraurls:
             if ',' in url_spec:
@@ -788,6 +1233,66 @@ def main(lsf=None, standalone=False, dry_run=False):
         else:
             dashboard.update_task('vcffinal', 'vcfa_urls', TaskStatus.COMPLETE,
                                   f'{urls_passed} URLs verified' if urls_checked > 0 else '')
+        dashboard.update_task('vcffinal', 'vcf_component_urls', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 6: Check VCF Component URLs
+    #==========================================================================
+    
+    vcfcomponenturls = lsf.get_config_list('VCFFINAL', 'vcfcomponenturls')
+    vcfc_urls_configured = len(vcfcomponenturls) > 0
+    vcfc_urls_checked = 0
+    vcfc_urls_passed = 0
+    vcfc_urls_failed = 0
+    
+    if vcfc_urls_configured:
+        lsf.write_output('Checking VCF Component URLs...')
+        lsf.write_vpodprogress('VCF Component URL Checks', 'GOOD-8')
+        
+        for url_spec in vcfcomponenturls:
+            if ',' in url_spec:
+                parts = url_spec.split(',', 1)
+                url = parts[0].strip()
+                expected = parts[1].strip()
+            else:
+                url = url_spec.strip()
+                expected = None
+            
+            if url and not dry_run:
+                vcfc_urls_checked += 1
+                lsf.write_output(f'Testing VCF Component URL: {url}')
+                if expected:
+                    lsf.write_output(f'  Expected text: {expected}')
+                
+                url_success = False
+                for attempt in range(1, VCFC_URL_MAX_RETRIES + 1):
+                    result = lsf.test_url(url, expected_text=expected, verify_ssl=False, timeout=30)
+                    if result:
+                        lsf.write_output(f'  [SUCCESS] {url} (attempt {attempt})')
+                        url_success = True
+                        vcfc_urls_passed += 1
+                        break
+                    else:
+                        if attempt == VCFC_URL_MAX_RETRIES:
+                            lsf.write_output(f'  [FAILED] {url} after {VCFC_URL_MAX_RETRIES} attempts')
+                            vcfc_urls_failed += 1
+                            lsf.labfail(f'VCF Component URL {url} not accessible after {VCFC_URL_MAX_RETRIES} minutes')
+                        else:
+                            lsf.write_output(f'  Sleeping and will try again... {attempt} / {VCFC_URL_MAX_RETRIES}')
+                            lsf.labstartup_sleep(VCFC_URL_RETRY_DELAY)
+        
+        lsf.write_output(f'VCF Component URL check complete: {vcfc_urls_passed}/{vcfc_urls_checked} passed')
+    else:
+        lsf.write_output('No VCF Component URLs configured')
+    
+    if dashboard:
+        if vcfc_urls_failed > 0:
+            dashboard.update_task('vcffinal', 'vcf_component_urls', TaskStatus.FAILED,
+                                  f'{vcfc_urls_failed}/{vcfc_urls_checked} URLs failed')
+        else:
+            dashboard.update_task('vcffinal', 'vcf_component_urls', TaskStatus.COMPLETE,
+                                  f'{vcfc_urls_passed} URLs verified' if vcfc_urls_checked > 0 else '')
         dashboard.generate_html()
     
     #==========================================================================
