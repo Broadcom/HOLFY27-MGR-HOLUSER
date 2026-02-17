@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.0.py - HOLFY27 vApp HOLification Tool
-# Version 2.2 - February 2026
+# Version 2.1 - January 2026
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -2750,7 +2750,37 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
     except Exception as e:
         lsf.write_output(f'WARNING - Could not verify policy state: {e}')
     
-    # Step 6: Attempt remediation
+    # Step 6: Delete other policies that are now unassigned
+    lsf.write_output('Cleaning up old policies with no remaining assignments...')
+    try:
+        query_resp = requests.post(
+            f"{api_base}/internal/passwordmanagement/policies/query",
+            headers=headers, json={}, verify=False, timeout=30
+        )
+        query_resp.raise_for_status()
+        for policy in query_resp.json().get("vcfPolicies", []):
+            pid = policy.get("policyId")
+            pname = policy.get("policyInfo", {}).get("policyName", "")
+            if pid == existing_policy_id:
+                continue
+            assigned = policy.get("vcfPolicyAssignedResourceList", [])
+            if len(assigned) == 0:
+                lsf.write_output(f'Deleting unassigned policy: {pname} ({pid})')
+                del_resp = requests.delete(
+                    f"{api_base}/internal/passwordmanagement/policies/{pid}",
+                    headers=headers, verify=False, timeout=30
+                )
+                if del_resp.status_code == 204:
+                    lsf.write_output(f'SUCCESS - Deleted policy: {pname}')
+                else:
+                    msg = del_resp.text[:100] if del_resp.text else ""
+                    lsf.write_output(f'WARNING - Could not delete {pname}: {del_resp.status_code} {msg}')
+            else:
+                lsf.write_output(f'Keeping policy {pname} - still has {len(assigned)} assignment(s)')
+    except Exception as e:
+        lsf.write_output(f'WARNING - Could not clean up old policies: {e}')
+    
+    # Step 7: Attempt remediation
     lsf.write_output('Attempting to remediate all inventory items...')
     remediation_attempted = False
     try:
