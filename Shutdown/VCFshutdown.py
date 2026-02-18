@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 1.9 - February 2026
+# Version 2.0 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 2.0 Changes:
+# - Phase 1 now supports both VCF 9.0 (opslcm-a, Basic auth) and VCF 9.1
+#   (ops-a Fleet LCM plugin, JWT Bearer auth) API paths
+# - Version detection: reads [VCF] vcf_version from config.ini; if not set,
+#   auto-probes ops-a to detect VCF 9.1 Fleet LCM plugin at runtime
+# - VCF 9.1 path: obtains JWT via suite-api, lists components, triggers
+#   SHUTDOWN_COMPONENT_WORKFLOW, polls task status
+# - Falls back to VCF 9.0 path if 9.1 probe fails or API errors occur
+#   during auto-detect mode (explicit vcf_version=9.1 does not fall back)
+#
 # v 1.9 Changes:
 # - Fixed Fleet API false-positive: shutdown_products() returning True when
 #   no environments found caused Phase 1b (VCF Automation fallback) to be
@@ -586,6 +597,10 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     #==========================================================================
     # TASK 1: Shutdown Fleet Operations Products (VCF Operations Suite)
+    # Supports two API paths:
+    #   VCF 9.1: ops-a Fleet LCM plugin (JWT Bearer, component-based)
+    #   VCF 9.0: opslcm-a legacy API (Basic auth, environment/product-based)
+    # Version is read from [VCF] vcf_version or auto-probed at runtime.
     #==========================================================================
     
     vcf_write(lsf, '='*60)
@@ -593,56 +608,113 @@ def main(lsf=None, standalone=False, dry_run=False):
     vcf_write(lsf, '='*60)
     update_shutdown_status(1, 'Fleet Operations (VCF Operations Suite)', dry_run)
     
+    # --- Read configuration for both API versions ---
+    
+    # VCF 9.0 legacy settings
     fleet_fqdn = None
     fleet_username = 'admin@local'
-    
-    # Check for fleet configuration
     if lsf.config.has_option('SHUTDOWN', 'fleet_fqdn'):
         fleet_fqdn = lsf.config.get('SHUTDOWN', 'fleet_fqdn')
     elif lsf.config.has_option('VCF', 'fleet_fqdn'):
         fleet_fqdn = lsf.config.get('VCF', 'fleet_fqdn')
     else:
-        # Default VCF fleet management FQDN
         fleet_fqdn = 'opslcm-a.site-a.vcf.lab'
-    
     if lsf.config.has_option('SHUTDOWN', 'fleet_username'):
         fleet_username = lsf.config.get('SHUTDOWN', 'fleet_username')
     
+    # VCF 9.1 settings
+    ops_fqdn = 'ops-a.site-a.vcf.lab'
+    ops_username = 'admin'
+    if lsf.config.has_option('SHUTDOWN', 'ops_fqdn'):
+        ops_fqdn = lsf.config.get('SHUTDOWN', 'ops_fqdn')
+    if lsf.config.has_option('SHUTDOWN', 'ops_username'):
+        ops_username = lsf.config.get('SHUTDOWN', 'ops_username')
+    
     # Products to shutdown via Fleet Operations (reverse order from startup)
-    # NOTE: Only vra and vrni support power-off via Fleet Operations API
-    # vrops and vrli return "Shut Down Operation is not supported" - their VMs
-    # are handled directly in PHASE 5 (Management VMs) instead
     fleet_products = ['vra', 'vrni']
     if lsf.config.has_option('SHUTDOWN', 'fleet_products'):
         fleet_products_raw = lsf.config.get('SHUTDOWN', 'fleet_products')
         fleet_products = [p.strip() for p in fleet_products_raw.split(',')]
     
+    # --- Version detection ---
+    vcf_version = fleet.detect_vcf_version(lsf.config)
+    version_explicit = vcf_version is not None
+    
+    if vcf_version:
+        vcf_write(lsf, f'VCF version from config: {vcf_version}')
+    else:
+        vcf_write(lsf, 'VCF version not set in config, will auto-detect')
+    
     fleet_api_succeeded = False
     
-    if lsf.test_tcp_port(fleet_fqdn, 443, timeout=10):
-        vcf_write(lsf, f'Fleet Management available at {fleet_fqdn}')
+    # --- VCF 9.1 API path ---
+    use_v91 = (vcf_version == '9.1')
+    
+    if not version_explicit:
+        if lsf.test_tcp_port(ops_fqdn, 443, timeout=10):
+            vcf_write(lsf, f'Probing {ops_fqdn} for VCF 9.1 Fleet LCM plugin...')
+            if fleet.probe_vcf_91(ops_fqdn):
+                vcf_write(lsf, 'VCF 9.1 Fleet LCM plugin detected (auto-probe)')
+                use_v91 = True
+            else:
+                vcf_write(lsf, 'VCF 9.1 Fleet LCM plugin not detected, using VCF 9.0 API')
+        else:
+            vcf_write(lsf, f'{ops_fqdn} not reachable, using VCF 9.0 API')
+    
+    if use_v91:
+        vcf_write(lsf, f'Using VCF 9.1 Fleet LCM plugin API via {ops_fqdn}')
         
         if not dry_run:
             try:
-                token = fleet.get_encoded_token(fleet_username, password)
-                # Skip inventory sync during shutdown - it often fails when vCenter
-                # is slow or already being shut down, and isn't required for power-off
-                success = fleet.shutdown_products(fleet_fqdn, token, fleet_products,
-                                                  write_output=lsf.write_output,
-                                                  skip_inventory_sync=True)
+                vcf_write(lsf, f'Acquiring JWT token from {ops_fqdn} suite-api...')
+                jwt_token = fleet.get_ops_jwt_token(ops_fqdn, ops_username, password)
+                vcf_write(lsf, 'JWT token acquired successfully')
+                
+                success = fleet.shutdown_products_v91(ops_fqdn, jwt_token,
+                                                      fleet_products,
+                                                      write_output=lsf.write_output)
                 if success:
-                    vcf_write(lsf, 'Fleet Operations products shutdown complete')
+                    vcf_write(lsf, 'Fleet LCM (VCF 9.1) products shutdown complete')
                     fleet_api_succeeded = True
                 else:
-                    vcf_write(lsf, 'WARNING: Some Fleet Operations products may not have shutdown cleanly')
+                    vcf_write(lsf, 'WARNING: Some Fleet LCM products may not have shutdown cleanly')
                     vcf_write(lsf, '(Products will be shut down via VM power-off in later phases)')
             except Exception as e:
-                vcf_write(lsf, f'Fleet Operations shutdown error: {e}')
+                vcf_write(lsf, f'Fleet LCM (VCF 9.1) shutdown error: {e}')
+                if not version_explicit:
+                    vcf_write(lsf, 'Falling back to VCF 9.0 legacy API...')
+                    use_v91 = False
+                else:
+                    vcf_write(lsf, 'VCF version explicitly set to 9.1, not falling back to 9.0')
         else:
-            vcf_write(lsf, f'Would shutdown Fleet products: {fleet_products}')
-    else:
-        vcf_write(lsf, f'Fleet Management not reachable at {fleet_fqdn}, skipping')
-        vcf_write(lsf, 'VCF Automation VMs will be shut down directly in Phase 1b')
+            vcf_write(lsf, f'Would shutdown Fleet products via VCF 9.1 API: {fleet_products}')
+    
+    # --- VCF 9.0 API path (used when 9.1 is not available or as fallback) ---
+    if not use_v91 and not fleet_api_succeeded:
+        vcf_write(lsf, f'Using VCF 9.0 legacy Fleet API via {fleet_fqdn}')
+        
+        if lsf.test_tcp_port(fleet_fqdn, 443, timeout=10):
+            vcf_write(lsf, f'Fleet Management available at {fleet_fqdn}')
+            
+            if not dry_run:
+                try:
+                    token = fleet.get_encoded_token(fleet_username, password)
+                    success = fleet.shutdown_products(fleet_fqdn, token, fleet_products,
+                                                      write_output=lsf.write_output,
+                                                      skip_inventory_sync=True)
+                    if success:
+                        vcf_write(lsf, 'Fleet Operations (VCF 9.0) products shutdown complete')
+                        fleet_api_succeeded = True
+                    else:
+                        vcf_write(lsf, 'WARNING: Some Fleet Operations products may not have shutdown cleanly')
+                        vcf_write(lsf, '(Products will be shut down via VM power-off in later phases)')
+                except Exception as e:
+                    vcf_write(lsf, f'Fleet Operations (VCF 9.0) shutdown error: {e}')
+            else:
+                vcf_write(lsf, f'Would shutdown Fleet products via VCF 9.0 API: {fleet_products}')
+        else:
+            vcf_write(lsf, f'Fleet Management not reachable at {fleet_fqdn}, skipping')
+            vcf_write(lsf, 'VCF Automation VMs will be shut down directly in Phase 1b')
     
     #==========================================================================
     # TASK 2: Connect to vCenters and Management Hosts
