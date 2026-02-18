@@ -1405,12 +1405,18 @@ def main(lsf=None, standalone=False, dry_run=False):
                 }
                 
                 # Find MaxExpiration policy
+                # This internal API may not exist on all VCF Operations versions
+                # (e.g. absent in VCF 9.0.x, available in VCF 9.1+)
                 query_resp = session.post(
                     f'https://{ops_fqdn}/suite-api/internal/passwordmanagement/policies/query',
                     headers=headers, json={}, timeout=30
                 )
-                query_resp.raise_for_status()
-                policies = query_resp.json().get('vcfPolicies', [])
+                if query_resp.status_code == 404:
+                    lsf.write_output('  Password management API not available on this VCF Operations version - skipping')
+                    policies = []
+                else:
+                    query_resp.raise_for_status()
+                    policies = query_resp.json().get('vcfPolicies', [])
                 
                 policy_id = None
                 for p in policies:
