@@ -120,6 +120,13 @@ handle_lab_start() {
 # Initialize log
 echo "=== VLP Agent Script Started: $(date) ===" > ${LOGFILE}
 
+# Check for offline/partner export disable marker (set by offline-ready.py)
+if [ -f "${HOLROOT}/.vlp-disabled" ]; then
+    echo "VLP Agent disabled by offline-ready.py marker: ${HOLROOT}/.vlp-disabled" >> ${LOGFILE}
+    echo "Exiting without starting agent."  >> ${LOGFILE}
+    exit 0
+fi
+
 # Get vPod SKU
 if [ -f /tmp/vPod_SKU.txt ]; then
     vPod_SKU=$(cat /tmp/vPod_SKU.txt)

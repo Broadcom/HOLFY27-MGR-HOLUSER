@@ -660,7 +660,9 @@ echo "$vPod_SKU" > /tmp/vPod_SKU.txt
 # START VLP AGENT
 #==============================================================================
 
-if ! pgrep -f VLPagent.sh > /dev/null 2>&1; then
+if [ -f "${holroot}/.vlp-disabled" ]; then
+    echo "VLP Agent disabled by offline-ready.py marker. Skipping." >> ${logfile}
+elif ! pgrep -f VLPagent.sh > /dev/null 2>&1; then
     cloud=$(/usr/bin/vmtoolsd --cmd "info-get guestinfo.ovfenv" 2>&1 | grep vlp_org_name | cut -f3 -d: | cut -f2 -d\\)
     if [ "${cloud}" = "" ]; then
         echo "Dev environment. Not starting VLP Agent." >> ${logfile}
