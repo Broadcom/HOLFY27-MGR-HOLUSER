@@ -344,7 +344,18 @@ def shutdown_vm_gracefully(lsf, vm, timeout: int = VM_SHUTDOWN_TIMEOUT) -> bool:
     try:
         if tools_status == 'guestToolsRunning':
             vcf_write(lsf, f'{vm_name}: Initiating graceful guest shutdown')
-            vm.ShutdownGuest()
+            try:
+                vm.ShutdownGuest()
+            except vim.fault.ToolsUnavailable:
+                # Race condition: toolsRunningStatus was stale (common with
+                # K8s pod VMs). Fall back to PowerOffVM_Task immediately.
+                vcf_write(lsf, f'{vm_name}: Tools reported running but unavailable '
+                          f'(stale status), forcing power off')
+                task = vm.PowerOffVM_Task()
+                from pyVim.task import WaitForTask
+                WaitForTask(task)
+                vcf_write(lsf, f'{vm_name}: Powered off successfully')
+                return True
         else:
             vcf_write(lsf, f'{vm_name}: No VMware Tools available, forcing power off')
             task = vm.PowerOffVM_Task()
@@ -2031,6 +2042,14 @@ def main(lsf=None, standalone=False, dry_run=False):
     ##=========================================================================
     
     vcf_write(lsf, f'{MODULE_NAME} completed')
+    vcf_write(lsf, '')
+    vcf_write(lsf, 'To complete shutdown of this lab environment, '
+              'please complete in the following order:')
+    vcf_write(lsf, '1. Shutdown the holorouter')
+    vcf_write(lsf, '2. Shutdown the manager')
+    vcf_write(lsf, '3. Shutdown the console')
+    vcf_write(lsf, '')
+    vcf_write(lsf, 'This order minimizes wait time.')
     
     # Return success status and list of ESXi hosts that were shut down
     # This allows the caller to wait for hosts to fully power off

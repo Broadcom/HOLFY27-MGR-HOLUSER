@@ -251,6 +251,11 @@ def main(lsf=None, standalone=False, dry_run=False):
     if not dry_run:
         lsf.write_output('Clearing all triggered vCenter alarms...')
         try:
+            if not lsf.sis:
+                vcenters = lsf.get_config_list('RESOURCES', 'vCenters')
+                if vcenters:
+                    lsf.write_output(f'Reconnecting to {len(vcenters)} vCenter(s) for alarm clearing...')
+                    lsf.connect_vcenters(vcenters)
             cleared = 0
             for si in lsf.sis:
                 alarm_mgr = si.content.alarmManager
