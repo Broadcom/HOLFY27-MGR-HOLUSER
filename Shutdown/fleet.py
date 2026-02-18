@@ -621,7 +621,18 @@ def _make_v91_request(method: str, ops_fqdn: str, path: str, token: str,
             raise ValueError(f"Unsupported HTTP method: {method}")
 
         response.raise_for_status()
-        return response.json() if response.text else {}
+        if not response.text:
+            return {}
+        try:
+            return response.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            content_type = response.headers.get('Content-Type', '')
+            logger.error(f"V91 API returned non-JSON response "
+                         f"(Content-Type: {content_type}, "
+                         f"length: {len(response.text)}): {e}")
+            logger.debug(f"Response body (first 500 chars): "
+                         f"{response.text[:500]}")
+            raise
 
     except requests.exceptions.HTTPError as e:
         logger.error(f"V91 HTTP Error: {e}")
