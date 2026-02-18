@@ -464,7 +464,7 @@ def shutdown_products(fqdn: str, token: str, products: list,
     
     if not env_list:
         _log('No environments found in Fleet Management')
-        return True
+        return False
     
     _log(f'Found {len(env_list)} environment(s)')
     
