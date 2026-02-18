@@ -861,6 +861,10 @@ def main(lsf=None, standalone=False, dry_run=False):
                                 )
                 
                 # Suspend postgres instances (reverse of startup unsuspend)
+                # Two-step process:
+                #   1. Set suspended label on PostgresInstance CRD
+                #   2. Scale Zalando postgres CRD numberOfInstances to 0
+                # Both are needed for clean shutdown and matching startup unsuspend.
                 vcf_write(lsf, '  Suspending Postgres instances...')
                 pg_check = vsp_kubectl(
                     'kubectl get postgresinstances.database.vmsp.vmware.com -A '
@@ -879,6 +883,11 @@ def main(lsf=None, standalone=False, dry_run=False):
                                 vsp_kubectl(
                                     f'kubectl label postgresinstances.database.vmsp.vmware.com '
                                     f'{pg_name} -n {pg_ns} database.vmsp.vmware.com/suspended=true --overwrite'
+                                )
+                                patch_json = '{"spec":{"numberOfInstances":0}}'
+                                vsp_kubectl(
+                                    f"kubectl patch postgresqls.acid.zalan.do {pg_name} -n {pg_ns} "
+                                    f"--type=merge -p '{patch_json}'"
                                 )
                 
                 vcf_write(lsf, f'VCF Component Services: {scaled_down} scaled down, '

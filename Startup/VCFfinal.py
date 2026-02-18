@@ -869,8 +869,12 @@ def main(lsf=None, standalone=False, dry_run=False):
                 # The VMSP operator sets a "database.vmsp.vmware.com/suspended=true"
                 # label on PostgresInstance CRDs when a component is stopped.  The
                 # Zalando postgres operator honours this label and keeps the
-                # statefulset at 0 replicas regardless of manual scaling.  We must
-                # remove the label BEFORE scaling the statefulset.
+                # statefulset at 0 replicas regardless of manual scaling.  We must:
+                #   1. Remove the suspended label from the PostgresInstance CRD
+                #   2. Patch the Zalando postgresql CRD numberOfInstances back to 1
+                # Both steps are required: removing the label alone isn't sufficient
+                # because the operator previously set numberOfInstances=0 and won't
+                # automatically restore it when the label is removed.
                 lsf.write_output('  Checking for suspended Postgres instances...')
                 pg_check = vsp_kubectl(
                     'kubectl get postgresinstances.database.vmsp.vmware.com -A '
@@ -881,13 +885,32 @@ def main(lsf=None, standalone=False, dry_run=False):
                 if hasattr(pg_check, 'stdout') and pg_check.stdout:
                     for line in pg_check.stdout.strip().split('\n'):
                         cols = line.split()
-                        if len(cols) >= 3 and cols[2] == 'true':
+                        if len(cols) >= 2:
                             pg_ns, pg_name = cols[0], cols[1]
-                            lsf.write_output(f'  Unsuspending Postgres instance: {pg_ns}/{pg_name}')
-                            vsp_kubectl(
-                                f'kubectl label postgresinstances.database.vmsp.vmware.com '
-                                f'{pg_name} -n {pg_ns} database.vmsp.vmware.com/suspended-'
+                            suspended = cols[2] if len(cols) >= 3 else '<none>'
+                            if suspended == 'true':
+                                lsf.write_output(f'  Unsuspending Postgres instance: {pg_ns}/{pg_name}')
+                                vsp_kubectl(
+                                    f'kubectl label postgresinstances.database.vmsp.vmware.com '
+                                    f'{pg_name} -n {pg_ns} database.vmsp.vmware.com/suspended-'
+                                )
+                            
+                            # Always ensure Zalando numberOfInstances is 1
+                            zalando_check = vsp_kubectl(
+                                f'kubectl get postgresqls.acid.zalan.do {pg_name} -n {pg_ns} '
+                                f'-o jsonpath="{{.spec.numberOfInstances}}" 2>/dev/null'
                             )
+                            current_instances = ''
+                            if hasattr(zalando_check, 'stdout') and zalando_check.stdout:
+                                current_instances = zalando_check.stdout.strip().split('\n')[-1].strip()
+                            
+                            if current_instances != '1':
+                                lsf.write_output(f'  Scaling Zalando postgres {pg_ns}/{pg_name} to 1 instance (was {current_instances})')
+                                patch_json = '{"spec":{"numberOfInstances":1}}'
+                                vsp_kubectl(
+                                    f"kubectl patch postgresqls.acid.zalan.do {pg_name} -n {pg_ns} "
+                                    f"--type=merge -p '{patch_json}'"
+                                )
                 
                 # ---- Scale up each component ----
                 lsf.write_output(f'  Processing {len(vcfcomponents)} component resources...')
@@ -958,6 +981,27 @@ def main(lsf=None, standalone=False, dry_run=False):
                                     f'{crd_name} -n {crd_ns} '
                                     f'component.vmsp.vmware.com/operational-status=Running --overwrite'
                                 )
+                
+                # ---- Restart any CrashLoopBackOff pods ----
+                # Pods that were crashing while their Postgres database was
+                # down (0 replicas) will be in CrashLoopBackOff with long
+                # exponential backoff delays. Delete them so the deployment
+                # controller recreates them immediately.
+                crash_check = vsp_kubectl(
+                    'kubectl get pods -A --no-headers 2>/dev/null '
+                    '| grep -E "CrashLoopBackOff|Init:CrashLoopBackOff|Error"'
+                )
+                if hasattr(crash_check, 'stdout') and crash_check.stdout and crash_check.stdout.strip():
+                    crashed_count = 0
+                    for line in crash_check.stdout.strip().split('\n'):
+                        cols = line.split()
+                        if len(cols) >= 2:
+                            crash_ns, crash_pod = cols[0], cols[1]
+                            lsf.write_output(f'  Restarting crashed pod: {crash_ns}/{crash_pod}')
+                            vsp_kubectl(f'kubectl delete pod {crash_pod} -n {crash_ns}')
+                            crashed_count += 1
+                    if crashed_count > 0:
+                        lsf.write_output(f'  Restarted {crashed_count} crashed pod(s)')
                 
                 # ---- Summary ----
                 total = len(vcfcomponents)
