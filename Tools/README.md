@@ -1029,11 +1029,11 @@ Prepares a lab environment for export to a third-party partner who will run the 
 | Step | Description |
 | ---- | ----------- |
 | 1 | Creates offline-mode marker files to skip git operations on boot |
-| 2 | Creates the testing flag file to skip git clone/pull in labstartup.sh |
+| 2 | Creates testing flag files (both NFS and local) to skip git clone/pull in labstartup.sh and gitpull.sh |
 | 3 | Sets `lockholuser = false` in config.ini and holodeck/*.ini files |
-| 4 | Removes external URLs from config.ini URL checks |
+| 4 | Removes external URLs from config.ini and holodeck/*.ini URL checks |
 | 5 | Sets passwords on Manager, Router, and Console from creds.txt |
-| 6 | Disables VLP Agent startup |
+| 6 | Disables VLP Agent startup (creates persistent `.vlp-disabled` marker) |
 | 7 | Verifies that /vpodrepo has a local copy of the lab repository |
 
 **Usage:**

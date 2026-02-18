@@ -242,6 +242,29 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('final', 'ready', TaskStatus.RUNNING)
         dashboard.generate_html()
     
+    #==========================================================================
+    # TASK 8: Clear All vCenter Alarms
+    # Runs as the very last step so alarms triggered during startup
+    # (e.g., VM CPU usage spikes from NSX Manager boot) are cleared.
+    #==========================================================================
+    
+    if not dry_run:
+        lsf.write_output('Clearing all triggered vCenter alarms...')
+        try:
+            cleared = 0
+            for si in lsf.sis:
+                alarm_mgr = si.content.alarmManager
+                filter_spec = lsf.vim.alarm.AlarmFilterSpec(
+                    status=[],
+                    typeEntity='entityTypeAll',
+                    typeTrigger='triggerTypeAll'
+                )
+                alarm_mgr.ClearTriggeredAlarms(filter_spec)
+                cleared += 1
+            lsf.write_output(f'Cleared alarms on {cleared} vCenter session(s)')
+        except Exception as e:
+            lsf.write_output(f'Could not clear vCenter alarms: {e}')
+    
     ##=========================================================================
     ## End Core Team code
     ##=========================================================================
