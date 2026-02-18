@@ -869,8 +869,12 @@ def main(lsf=None, standalone=False, dry_run=False):
                 # The VMSP operator sets a "database.vmsp.vmware.com/suspended=true"
                 # label on PostgresInstance CRDs when a component is stopped.  The
                 # Zalando postgres operator honours this label and keeps the
-                # statefulset at 0 replicas regardless of manual scaling.  We must
-                # remove the label BEFORE scaling the statefulset.
+                # statefulset at 0 replicas regardless of manual scaling.  We must:
+                #   1. Remove the suspended label from the PostgresInstance CRD
+                #   2. Patch the Zalando postgresql CRD numberOfInstances back to 1
+                # Both steps are required: removing the label alone isn't sufficient
+                # because the operator previously set numberOfInstances=0 and won't
+                # automatically restore it when the label is removed.
                 lsf.write_output('  Checking for suspended Postgres instances...')
                 pg_check = vsp_kubectl(
                     'kubectl get postgresinstances.database.vmsp.vmware.com -A '
@@ -881,13 +885,32 @@ def main(lsf=None, standalone=False, dry_run=False):
                 if hasattr(pg_check, 'stdout') and pg_check.stdout:
                     for line in pg_check.stdout.strip().split('\n'):
                         cols = line.split()
-                        if len(cols) >= 3 and cols[2] == 'true':
+                        if len(cols) >= 2:
                             pg_ns, pg_name = cols[0], cols[1]
-                            lsf.write_output(f'  Unsuspending Postgres instance: {pg_ns}/{pg_name}')
-                            vsp_kubectl(
-                                f'kubectl label postgresinstances.database.vmsp.vmware.com '
-                                f'{pg_name} -n {pg_ns} database.vmsp.vmware.com/suspended-'
+                            suspended = cols[2] if len(cols) >= 3 else '<none>'
+                            if suspended == 'true':
+                                lsf.write_output(f'  Unsuspending Postgres instance: {pg_ns}/{pg_name}')
+                                vsp_kubectl(
+                                    f'kubectl label postgresinstances.database.vmsp.vmware.com '
+                                    f'{pg_name} -n {pg_ns} database.vmsp.vmware.com/suspended-'
+                                )
+                            
+                            # Always ensure Zalando numberOfInstances is 1
+                            zalando_check = vsp_kubectl(
+                                f'kubectl get postgresqls.acid.zalan.do {pg_name} -n {pg_ns} '
+                                f'-o jsonpath="{{.spec.numberOfInstances}}" 2>/dev/null'
                             )
+                            current_instances = ''
+                            if hasattr(zalando_check, 'stdout') and zalando_check.stdout:
+                                current_instances = zalando_check.stdout.strip().split('\n')[-1].strip()
+                            
+                            if current_instances != '1':
+                                lsf.write_output(f'  Scaling Zalando postgres {pg_ns}/{pg_name} to 1 instance (was {current_instances})')
+                                patch_json = '{"spec":{"numberOfInstances":1}}'
+                                vsp_kubectl(
+                                    f"kubectl patch postgresqls.acid.zalan.do {pg_name} -n {pg_ns} "
+                                    f"--type=merge -p '{patch_json}'"
+                                )
                 
                 # ---- Scale up each component ----
                 lsf.write_output(f'  Processing {len(vcfcomponents)} component resources...')
@@ -958,6 +981,27 @@ def main(lsf=None, standalone=False, dry_run=False):
                                     f'{crd_name} -n {crd_ns} '
                                     f'component.vmsp.vmware.com/operational-status=Running --overwrite'
                                 )
+                
+                # ---- Restart any CrashLoopBackOff pods ----
+                # Pods that were crashing while their Postgres database was
+                # down (0 replicas) will be in CrashLoopBackOff with long
+                # exponential backoff delays. Delete them so the deployment
+                # controller recreates them immediately.
+                crash_check = vsp_kubectl(
+                    'kubectl get pods -A --no-headers 2>/dev/null '
+                    '| grep -E "CrashLoopBackOff|Init:CrashLoopBackOff|Error"'
+                )
+                if hasattr(crash_check, 'stdout') and crash_check.stdout and crash_check.stdout.strip():
+                    crashed_count = 0
+                    for line in crash_check.stdout.strip().split('\n'):
+                        cols = line.split()
+                        if len(cols) >= 2:
+                            crash_ns, crash_pod = cols[0], cols[1]
+                            lsf.write_output(f'  Restarting crashed pod: {crash_ns}/{crash_pod}')
+                            vsp_kubectl(f'kubectl delete pod {crash_pod} -n {crash_ns}')
+                            crashed_count += 1
+                    if crashed_count > 0:
+                        lsf.write_output(f'  Restarted {crashed_count} crashed pod(s)')
                 
                 # ---- Summary ----
                 total = len(vcfcomponents)
@@ -1296,6 +1340,109 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.generate_html()
     
     #==========================================================================
+    # TASK 7: Clear NSX Password Expiration & Fleet Policy Remediation
+    # NSX password expiration can reappear after NSX service restarts.
+    # The fleet password policy in ops-a caches old expiry dates until
+    # remediation runs. This task re-clears expirations and triggers
+    # remediation so the ops-a compliance dashboard shows green.
+    #==========================================================================
+    
+    nsx_mgr_entries = lsf.get_config_list('VCF', 'vcfnsxmgr')
+    nsx_users = ['admin', 'root', 'audit']
+    nsx_expiry_days = 729
+    password = lsf.get_password()
+    
+    if nsx_mgr_entries:
+        lsf.write_output(f'Setting NSX Manager password expiration to {nsx_expiry_days} days...')
+        lsf.write_vpodprogress('NSX Password Config', 'GOOD-8')
+        
+        for entry in nsx_mgr_entries:
+            nsx_host = entry.split(':')[0].strip()
+            nsx_fqdn = f'{nsx_host}.site-a.vcf.lab' if '.' not in nsx_host else nsx_host
+            
+            if not dry_run:
+                if not lsf.test_tcp_port(nsx_fqdn, 22, timeout=5):
+                    lsf.write_output(f'  {nsx_fqdn}: SSH not reachable - skipping')
+                    continue
+                
+                for user in nsx_users:
+                    result = lsf.ssh(
+                        f'set user {user} password-expiration {nsx_expiry_days}',
+                        f'admin@{nsx_fqdn}', password
+                    )
+                    if result.returncode == 0:
+                        lsf.write_output(f'  {nsx_fqdn}: {user} password expiration set to {nsx_expiry_days} days')
+                    else:
+                        lsf.write_output(f'  {nsx_fqdn}: WARNING - could not set {user} password expiration')
+            else:
+                lsf.write_output(f'  Would set {nsx_expiry_days}-day password expiration on {nsx_fqdn} for {nsx_users}')
+    
+    # Fleet password policy remediation via ops-a suite-api
+    ops_fqdn = 'ops-a.site-a.vcf.lab'
+    if lsf.test_tcp_port(ops_fqdn, 443, timeout=5):
+        lsf.write_output('Triggering fleet password policy compliance check...')
+        
+        if not dry_run:
+            import requests
+            try:
+                session = requests.Session()
+                session.verify = False
+                
+                token_resp = session.post(
+                    f'https://{ops_fqdn}/suite-api/api/auth/token/acquire',
+                    json={'username': 'admin', 'password': password, 'authSource': 'local'},
+                    headers={'Accept': 'application/json', 'Content-Type': 'application/json'},
+                    timeout=30
+                )
+                token_resp.raise_for_status()
+                token = token_resp.json()['token']
+                
+                headers = {
+                    'Authorization': f'OpsToken {token}',
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                    'X-vRealizeOps-API-use-unsupported': 'true'
+                }
+                
+                # Find MaxExpiration policy
+                query_resp = session.post(
+                    f'https://{ops_fqdn}/suite-api/internal/passwordmanagement/policies/query',
+                    headers=headers, json={}, timeout=30
+                )
+                query_resp.raise_for_status()
+                policies = query_resp.json().get('vcfPolicies', [])
+                
+                policy_id = None
+                for p in policies:
+                    if p.get('policyInfo', {}).get('policyName') == 'MaxExpiration':
+                        policy_id = p.get('policyId')
+                        assigned = p.get('vcfPolicyAssignedResourceList', [])
+                        lsf.write_output(f'  MaxExpiration policy found: {policy_id}')
+                        lsf.write_output(f'  Assigned to {len(assigned)} resource(s)')
+                        break
+                
+                if policy_id:
+                    # Try remediation endpoint
+                    rem_resp = session.post(
+                        f'https://{ops_fqdn}/suite-api/internal/passwordmanagement/policies/{policy_id}/remediate',
+                        headers=headers, json={}, timeout=60
+                    )
+                    if rem_resp.status_code in (200, 202, 204):
+                        lsf.write_output('  Fleet policy remediation triggered successfully')
+                    else:
+                        lsf.write_output(f'  Fleet remediation API returned {rem_resp.status_code} '
+                                         f'(normal for VCF 9.1 - remediation runs on next compliance scan)')
+                else:
+                    lsf.write_output('  MaxExpiration policy not found - skipping remediation')
+                
+            except Exception as e:
+                lsf.write_output(f'  Fleet policy check failed: {e}')
+        else:
+            lsf.write_output('  Would trigger fleet policy compliance check/remediation')
+    else:
+        lsf.write_output(f'{ops_fqdn} not reachable - skipping fleet policy check')
+    
+    #==========================================================================
     # Cleanup
     #==========================================================================
     
@@ -1306,7 +1453,6 @@ def main(lsf=None, standalone=False, dry_run=False):
                 connect.Disconnect(si)
             except Exception:
                 pass
-        # Clear the session lists so subsequent modules start fresh
         lsf.sis.clear()
         lsf.sisvc.clear()
     

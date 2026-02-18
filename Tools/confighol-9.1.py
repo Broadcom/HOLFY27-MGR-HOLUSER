@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.0.py - HOLFY27 vApp HOLification Tool
-# Version 2.1 - January 2026
+# Version 2.2 - February 2026
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -57,7 +57,7 @@
 # 3. NSX Configuration:
 #    - Enable SSH via API on NSX Managers (where supported)
 #    - Configure SSH authorized_keys for passwordless access
-#    - Remove password expiration for admin, root, audit users
+#    - Set 729-day password expiration for admin, root, audit users
 #
 # 4. SDDC Manager Configuration:
 #    - Configure SSH authorized_keys
@@ -151,7 +151,10 @@ LOCAL_VPXD_CONFIG = '/tmp/vpxd.cfg'
 # NSX users to configure
 NSX_USERS = ['admin', 'root', 'audit']
 
-# Password expiration setting (9999 days ~ 27 years)
+# NSX password expiration (729 days = ~2 years, matches Fleet MaxExpiration policy)
+NSX_PASSWORD_EXPIRY_DAYS = 729
+
+# Password expiration setting for vCenter (9999 days ~ 27 years)
 PASSWORD_MAX_DAYS = 9999
 
 #==============================================================================
@@ -984,20 +987,20 @@ def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
         # Step 3: Configure SSH to start on boot
         configure_nsx_ssh_start_on_boot(hostname, password, dry_run)
         
-        # Step 4: Remove password expiration for NSX users
+        # Step 4: Set password expiration for NSX users (729 days)
         for user in NSX_USERS:
-            lsf.write_output(f'{hostname}: Removing password expiration for {user}...')
-            result = lsf.ssh(f'clear user {user} password-expiration', f'admin@{hostname}', password)
+            lsf.write_output(f'{hostname}: Setting {NSX_PASSWORD_EXPIRY_DAYS}-day password expiration for {user}...')
+            result = lsf.ssh(f'set user {user} password-expiration {NSX_PASSWORD_EXPIRY_DAYS}', f'admin@{hostname}', password)
             if result.returncode == 0:
-                lsf.write_output(f'{hostname}: SUCCESS - Password expiration cleared for {user}')
+                lsf.write_output(f'{hostname}: SUCCESS - {user} password expiration set to {NSX_PASSWORD_EXPIRY_DAYS} days')
             else:
-                lsf.write_output(f'{hostname}: WARNING - Failed to clear password expiration for {user}')
+                lsf.write_output(f'{hostname}: WARNING - Failed to set password expiration for {user}')
     else:
         lsf.write_output(f'{hostname}: Would enable SSH via API')
         lsf.write_output(f'{hostname}: Would copy authorized_keys')
         lsf.write_output(f'{hostname}: Would configure SSH start-on-boot')
         for user in NSX_USERS:
-            lsf.write_output(f'{hostname}: Would remove password expiration for {user}')
+            lsf.write_output(f'{hostname}: Would set {NSX_PASSWORD_EXPIRY_DAYS}-day password expiration for {user}')
     
     return success
 
@@ -1047,19 +1050,19 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
         # Step 2: Configure SSH to start on boot
         configure_nsx_ssh_start_on_boot(hostname, password, dry_run)
         
-        # Step 3: Remove password expiration for NSX users
+        # Step 3: Set password expiration for NSX users (729 days)
         for user in NSX_USERS:
-            lsf.write_output(f'{hostname}: Removing password expiration for {user}...')
-            result = lsf.ssh(f'clear user {user} password-expiration', f'admin@{hostname}', password)
+            lsf.write_output(f'{hostname}: Setting {NSX_PASSWORD_EXPIRY_DAYS}-day password expiration for {user}...')
+            result = lsf.ssh(f'set user {user} password-expiration {NSX_PASSWORD_EXPIRY_DAYS}', f'admin@{hostname}', password)
             if result.returncode == 0:
-                lsf.write_output(f'{hostname}: SUCCESS - Password expiration cleared for {user}')
+                lsf.write_output(f'{hostname}: SUCCESS - {user} password expiration set to {NSX_PASSWORD_EXPIRY_DAYS} days')
             else:
-                lsf.write_output(f'{hostname}: WARNING - Failed to clear password expiration for {user}')
+                lsf.write_output(f'{hostname}: WARNING - Failed to set password expiration for {user}')
     else:
         lsf.write_output(f'{hostname}: Would copy authorized_keys for root')
         lsf.write_output(f'{hostname}: Would configure SSH start-on-boot')
         for user in NSX_USERS:
-            lsf.write_output(f'{hostname}: Would remove password expiration for {user}')
+            lsf.write_output(f'{hostname}: Would set {NSX_PASSWORD_EXPIRY_DAYS}-day password expiration for {user}')
     
     return success
 
