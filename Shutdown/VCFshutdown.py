@@ -1378,6 +1378,22 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         else:
                             vcf_write(lsf, f'    vCenter VM not found (may not exist in this lab)')
                     vcf_write(lsf, 'Workload vCenter shutdown complete')
+
+                    # Remove dead workload vCenter sessions from lsf.sis/sisvc
+                    # so subsequent phases only query the management vCenter
+                    from pyVim import connect as pyvim_connect
+                    for wld_vc in workload_vcenters:
+                        dead_keys = [k for k in lsf.sisvc if wld_vc in k]
+                        for key in dead_keys:
+                            dead_si = lsf.sisvc.pop(key, None)
+                            if dead_si and dead_si in lsf.sis:
+                                lsf.sis.remove(dead_si)
+                                try:
+                                    pyvim_connect.Disconnect(dead_si)
+                                except Exception:
+                                    pass
+                            vcf_write(lsf, f'  Removed dead session for {key}')
+                    vcf_write(lsf, f'  Active vSphere sessions remaining: {len(lsf.sis)}')
                 else:
                     vcf_write(lsf, 'No workload vCenters configured - skipping')
             else:
