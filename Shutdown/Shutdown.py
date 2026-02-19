@@ -407,35 +407,35 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     # Set initial status
     update_status('Shutting Down', dry_run)
     
-    print_banner(lsf)
-    
-    write_shutdown_output(f'Shutdown started at: {start_time.strftime("%Y-%m-%d %H:%M:%S")}', lsf)
-    write_shutdown_output(f'Lab SKU: {lsf.lab_sku}', lsf)
-    write_shutdown_output(f'Dry run mode: {dry_run}', lsf)
-    
-    if dry_run:
-        write_shutdown_output('', lsf)
-        write_shutdown_output('*** DRY RUN MODE - No changes will be made ***', lsf)
-        write_shutdown_output('', lsf)
+    if phase is None:
+        print_banner(lsf)
+        write_shutdown_output(f'Shutdown started at: {start_time.strftime("%Y-%m-%d %H:%M:%S")}', lsf)
+        write_shutdown_output(f'Lab SKU: {lsf.lab_sku}', lsf)
+        write_shutdown_output(f'Dry run mode: {dry_run}', lsf)
+        if dry_run:
+            write_shutdown_output('', lsf)
+            write_shutdown_output('*** DRY RUN MODE - No changes will be made ***', lsf)
+            write_shutdown_output('', lsf)
     
     #==========================================================================
     # Phase 0: Pre-shutdown checks
     #==========================================================================
     
-    print_phase_header(lsf, 0, 'Pre-Shutdown Checks', dry_run)
+    if phase is None:
+        print_phase_header(lsf, 0, 'Pre-Shutdown Checks', dry_run)
     
-    # Check if config.ini exists
     if not os.path.isfile(lsf.configini):
-        write_shutdown_output('WARNING: config.ini not found - using defaults', lsf)
-    else:
+        if phase is None:
+            write_shutdown_output('WARNING: config.ini not found - using defaults', lsf)
+    elif phase is None:
         write_shutdown_output(f'Config file: {lsf.configini}', lsf)
     
-    # Determine lab type
-    lab_type = 'VCF'  # Default
+    lab_type = 'VCF'
     if lsf.config.has_option('VPOD', 'labtype'):
         lab_type = lsf.config.get('VPOD', 'labtype').upper()
     
-    write_shutdown_output(f'Lab type: {lab_type}', lsf)
+    if phase is None:
+        write_shutdown_output(f'Lab type: {lab_type}', lsf)
     
     #==========================================================================
     # Phase 1: Docker Containers (Optional) - skip when --phase targets a VCF phase
@@ -463,18 +463,16 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     # Phase 2: VCF Shutdown (Main)
     #==========================================================================
     
-    print_phase_header(lsf, 2, 'VCF Environment Shutdown', dry_run)
+    if phase is None:
+        print_phase_header(lsf, 2, 'VCF Environment Shutdown', dry_run)
     
-    # Track ESXi hosts for power-off monitoring
     esx_hosts = []
     vcf_result = {'success': False, 'esx_hosts': []}
     
-    # Check if lab type uses VCF shutdown procedure
-    # VCF_LAB_TYPES includes: VCF, HOL, DISCOVERY, ATE, VXP, EDU, NINJA
     if lab_type.upper() in VCF_LAB_TYPES:
-        write_shutdown_output(f'Lab type {lab_type} uses VCF shutdown procedure', lsf)
+        if phase is None:
+            write_shutdown_output(f'Lab type {lab_type} uses VCF shutdown procedure', lsf)
         
-        # Temporarily override vSAN wait if requested
         if skip_vsan_wait and not dry_run:
             if not lsf.config.has_section('SHUTDOWN'):
                 lsf.config.add_section('SHUTDOWN')
@@ -487,10 +485,12 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
         
         vcf_result = run_vcf_shutdown(lsf, dry_run, phase=phase)
     elif lab_type.upper() == 'VVF':
-        write_shutdown_output('VVF lab type - using VVF shutdown procedure', lsf)
+        if phase is None:
+            write_shutdown_output('VVF lab type - using VVF shutdown procedure', lsf)
         vcf_result = run_vcf_shutdown(lsf, dry_run, phase=phase)
     else:
-        write_shutdown_output(f'Lab type {lab_type} - using default VCF shutdown procedure', lsf)
+        if phase is None:
+            write_shutdown_output(f'Lab type {lab_type} - using default VCF shutdown procedure', lsf)
         vcf_result = run_vcf_shutdown(lsf, dry_run, phase=phase)
     
     # Extract ESXi hosts list from VCF shutdown result
@@ -531,20 +531,23 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     
     write_shutdown_output('', lsf)
     write_shutdown_output('=' * 70, lsf)
-    write_shutdown_output('SHUTDOWN COMPLETE', lsf)
+    if phase is not None:
+        write_shutdown_output(f'PHASE {phase} SHUTDOWN COMPLETE', lsf)
+    else:
+        write_shutdown_output('SHUTDOWN COMPLETE', lsf)
     write_shutdown_output('=' * 70, lsf)
     write_shutdown_output(f'Start time: {start_time.strftime("%Y-%m-%d %H:%M:%S")}', lsf)
     write_shutdown_output(f'End time: {end_time.strftime("%Y-%m-%d %H:%M:%S")}', lsf)
     write_shutdown_output(f'Elapsed: {str(elapsed).split(".")[0]}', lsf)
-    write_shutdown_output('', lsf)
     
-    if dry_run:
-        write_shutdown_output('*** DRY RUN COMPLETE - No changes were made ***', lsf)
-    else:
-        write_shutdown_output('Lab environment has been shut down.', lsf)
-        write_shutdown_output('Please manually shutdown your manager, router, and console.', lsf)
-        # Set final status
-        update_status('Shutdown Complete', dry_run)
+    if phase is None:
+        write_shutdown_output('', lsf)
+        if dry_run:
+            write_shutdown_output('*** DRY RUN COMPLETE - No changes were made ***', lsf)
+        else:
+            write_shutdown_output('Lab environment has been shut down.', lsf)
+            write_shutdown_output('Please manually shutdown your manager, router, and console.', lsf)
+            update_status('Shutdown Complete', dry_run)
     
     return True
 

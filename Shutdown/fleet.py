@@ -663,7 +663,7 @@ def _make_v91_request(method: str, ops_fqdn: str, path: str, token: str,
             raise
 
     except requests.exceptions.HTTPError as e:
-        logger.error(f"V91 HTTP Error: {e}")
+        logger.debug(f"V91 HTTP Error: {e}")
         if hasattr(e, 'response') and e.response is not None:
             logger.debug(f"Response: {e.response.text}")
         raise

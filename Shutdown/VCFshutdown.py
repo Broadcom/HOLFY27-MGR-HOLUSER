@@ -637,9 +637,9 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     ## Core Team code - do not modify - place custom code in the CUSTOM section
     ##=========================================================================
     
-    vcf_write(lsf, f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
+    if phase is None:
+        vcf_write(lsf, f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
     
-    # Get password
     password = lsf.get_password()
     
     #==========================================================================
@@ -649,9 +649,6 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     #   VCF 9.0: opslcm-a legacy API (Basic auth, environment/product-based)
     # Version is read from [VCF] vcf_version or auto-probed at runtime.
     #==========================================================================
-    
-    if phase is not None:
-        vcf_write(lsf, f'Running single phase: {phase}')
     
     def should_run(phase_id: str) -> bool:
         """Return True if this phase should execute (no filter, or matches)."""
@@ -2106,16 +2103,6 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
 
     if phase is None:
         vcf_write(lsf, f'{MODULE_NAME} completed')
-        vcf_write(lsf, '')
-        vcf_write(lsf, 'To complete shutdown of this lab environment, '
-                  'please complete in the following order:')
-        vcf_write(lsf, '1. Shutdown the holorouter')
-        vcf_write(lsf, '2. Shutdown the manager')
-        vcf_write(lsf, '3. Shutdown the console')
-        vcf_write(lsf, '')
-        vcf_write(lsf, 'This order minimizes wait time.')
-    else:
-        vcf_write(lsf, f'Phase {phase} complete.')
 
     return {'success': True, 'esx_hosts': esx_hosts}
 
