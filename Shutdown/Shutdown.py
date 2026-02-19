@@ -194,7 +194,7 @@ def print_banner(lsf):
     write_shutdown_output(banner, lsf)
 
 
-def print_phase_header(lsf, phase_num: int, phase_name: str, dry_run: bool = False):
+def print_phase_header(lsf, phase_num, phase_name: str, dry_run: bool = False):
     """Print a phase header and update status file"""
     write_shutdown_output('', lsf)
     write_shutdown_output('=' * 70, lsf)
@@ -440,11 +440,11 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
         write_shutdown_output(f'Lab type: {lab_type}', lsf)
     
     #==========================================================================
-    # Phase 1: Docker Containers (Optional) - skip when --phase targets a VCF phase
+    # Phase 0b: Docker Containers (Optional) - skip when --phase targets a VCF phase
     #==========================================================================
     
     if phase is None:
-        print_phase_header(lsf, 1, 'Docker Containers', dry_run)
+        print_phase_header(lsf, '0b', 'Docker Containers', dry_run)
         
         if lsf.config.has_option('SHUTDOWN', 'shutdown_docker'):
             if lsf.config.getboolean('SHUTDOWN', 'shutdown_docker'):
@@ -462,11 +462,8 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
                 write_shutdown_output(f'Docker host {docker_host} not reachable, skipping', lsf)
     
     #==========================================================================
-    # Phase 2: VCF Shutdown (Main)
+    # VCF Shutdown (Main) - phases 1-20 are handled inside VCFshutdown.py
     #==========================================================================
-    
-    if phase is None:
-        print_phase_header(lsf, 2, 'VCF Environment Shutdown', dry_run)
     
     esx_hosts = []
     vcf_result = {'success': False, 'esx_hosts': []}
@@ -499,11 +496,11 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     esx_hosts = vcf_result.get('esx_hosts', [])
     
     #==========================================================================
-    # Phase 3: Final Cleanup - skip when --phase targets a single VCF phase
+    # Phase 21: Final Cleanup - skip when --phase targets a single VCF phase
     #==========================================================================
     
     if phase is None:
-        print_phase_header(lsf, 3, 'Final Cleanup', dry_run)
+        print_phase_header(lsf, 21, 'Final Cleanup', dry_run)
         
         write_shutdown_output('Disconnecting vSphere sessions...', lsf)
         if not dry_run:
@@ -517,11 +514,11 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
             lsf.sisvc.clear()
         
         #======================================================================
-        # Phase 4: Wait for ESXi Hosts to Power Off
+        # Phase 22: Wait for ESXi Hosts to Power Off
         #======================================================================
         
         if esx_hosts and not skip_host_shutdown:
-            print_phase_header(lsf, 4, 'Wait for ESXi Host Power Off', dry_run)
+            print_phase_header(lsf, 22, 'Wait for ESXi Host Power Off', dry_run)
             wait_for_hosts_poweroff(lsf, esx_hosts, dry_run)
     
     #==========================================================================
