@@ -18,6 +18,7 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
     - [labtypes.py](#labtypespy)
     - [status\_dashboard.py](#status_dashboardpy)
     - [tdns\_import.py](#tdns_importpy)
+    - [url-checker.py](#url-checkerpy)
     - [vpodchecker.py](#vpodcheckerpy)
   - [Shell Scripts](#shell-scripts)
     - [log\_functions.sh](#log_functionssh)
@@ -619,6 +620,47 @@ python3 vpodchecker.py --verbose
 | `--json` | Output as JSON |
 | `--html FILE` | Generate HTML report to specified file |
 | `-v, --verbose` | Verbose output |
+
+---
+
+### url-checker.py
+
+**Standalone URL Checker:**
+
+A standalone utility for testing URL accessibility and response content without requiring a full lab startup or entries in the `config.ini`. This tool is useful for manual verification of APIs and web interfaces during development or troubleshooting.
+
+**Features:**
+
+- Supports custom retry logic (max retries and delay)
+- Verifies specific text exists in the response body
+- Configurable timeout per request
+- Timestamped logging of every attempt and HTTP status
+- SSL certificate verification is disabled by default (supports self-signed certs)
+- Follows redirects automatically
+
+**Usage:**
+
+```bash
+# Basic check (single attempt)
+python3 url-checker.py https://vc-mgmt-a.site-a.vcf.lab
+
+# Check for expected text in response
+python3 url-checker.py https://auto-a.site-a.vcf.lab/cci/api -e "Status"
+
+# Advanced check with retries and custom timeout
+python3 url-checker.py https://sddcmanager-a.site-a.vcf.lab -r 5 -d 10 -t 30
+```
+
+**Options:**
+
+| Option | Description | Default |
+| -------- | ------------- | ------- |
+| `url` | The URL to test (required positional argument) | - |
+| `-e, --expected-text` | Text to look for in the response body | None |
+| `-r, --max-retries` | Maximum number of retry attempts | 1 |
+| `-d, --retry-delay` | Seconds to wait between retries | 5 |
+| `-t, --timeout` | Request timeout in seconds | 15 |
+| `-v, --version` | Show script version and exit | - |
 
 ---
 
