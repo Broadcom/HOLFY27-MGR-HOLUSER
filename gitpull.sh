@@ -24,6 +24,9 @@
 
 LOGFILE="/tmp/gitpull-holuser.log"
 HOLROOT="/home/holuser/hol"
+
+# Source shared logging library
+source "${HOLROOT}/Tools/log_functions.sh"
 HOLOROUTER_DIR="/tmp/holorouter"
 PROXY_HOST="proxy.site-a.vcf.lab"
 PROXY_PORT=3128
@@ -38,7 +41,7 @@ mkdir -p "${HOLOROUTER_DIR}"
 chmod 755 "${HOLOROUTER_DIR}"
 
 log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> ${LOGFILE}
+    log_msg "$1" "$LOGFILE"
 }
 
 # Write failure status to startup_status.txt and HTML dashboard

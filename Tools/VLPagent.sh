@@ -21,13 +21,13 @@ VLP_AGENT_VERSION='1.0.10'
 PREPOP_START='/tmp/prepop.txt'
 LAB_START='/tmp/labstart.txt'
 
+# Source shared logging library
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/log_functions.sh"
+
 #==============================================================================
 # Functions
 #==============================================================================
-
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> ${LOGFILE}
-}
 
 get_vpod_repo() {
     # Calculate the git repo based on the vPod_SKU
@@ -38,14 +38,15 @@ get_vpod_repo() {
 }
 
 install_vlp_agent() {
-    log "Installing VLP Agent version ${VLP_AGENT_VERSION}..."
+    log_msg "Installing VLP Agent version ${VLP_AGENT_VERSION}..." "$LOGFILE"
     
     # Clean up old agent versions
     if [ -d "${VLP_AGENT_DIR}" ]; then
-        for jar in $(ls ${VLP_AGENT_DIR}/vlp-agent-*.jar 2>/dev/null); do
+        for jar in "${VLP_AGENT_DIR}"/vlp-agent-*.jar; do
+            [ -e "${jar}" ] || continue
             if [ "${jar}" != "${VLP_AGENT_DIR}/vlp-agent-${VLP_AGENT_VERSION}.jar" ]; then
                 rm -f "${jar}"
-                log "Removed old agent: ${jar}"
+                log_msg "Removed old agent: ${jar}" "$LOGFILE"
             fi
         done
     fi
@@ -61,38 +62,38 @@ install_vlp_agent() {
 start_vlp_agent() {
     # Check if already running
     if pgrep -f "vlp-agent-${VLP_AGENT_VERSION}.jar" > /dev/null; then
-        log "VLP Agent already running"
+        log_msg "VLP Agent already running" "$LOGFILE"
         return 0
     fi
     
-    log "Starting VLP Agent..."
+    log_msg "Starting VLP Agent..." "$LOGFILE"
     cd "${HOLROOT}"
     Tools/vlp-vm-agent-cli.sh start
     
     if [ $? -eq 0 ]; then
-        log "VLP Agent started successfully"
+        log_msg "VLP Agent started successfully" "$LOGFILE"
     else
-        log "Failed to start VLP Agent"
+        log_msg "Failed to start VLP Agent" "$LOGFILE"
         return 1
     fi
 }
 
 handle_prepop_start() {
-    log "Received prepop start notification"
+    log_msg "Received prepop start notification" "$LOGFILE"
     
     if [ -f "${vpodgitdir}/prepopstart.sh" ] && [ -x "${vpodgitdir}/prepopstart.sh" ]; then
-        log "Running ${vpodgitdir}/prepopstart.sh"
+        log_msg "Running ${vpodgitdir}/prepopstart.sh" "$LOGFILE"
         /bin/bash "${vpodgitdir}/prepopstart.sh"
     fi
 }
 
 handle_lab_start() {
-    log "Received lab start notification"
+    log_msg "Received lab start notification" "$LOGFILE"
     
     # Kill any running labcheck process
     pid=$(pgrep -f 'labstartup.py' 2>/dev/null || true)
     if [ -n "${pid}" ]; then
-        log "Stopping current LabStartup processes..."
+        log_msg "Stopping current LabStartup processes..." "$LOGFILE"
         pkill -P ${pid} 2>/dev/null || true
         kill ${pid} 2>/dev/null || true
     fi
@@ -104,7 +105,7 @@ handle_lab_start() {
     
     # Run lab start script if exists
     if [ -f "${vpodgitdir}/labstart.sh" ] && [ -x "${vpodgitdir}/labstart.sh" ]; then
-        log "Running ${vpodgitdir}/labstart.sh"
+        log_msg "Running ${vpodgitdir}/labstart.sh" "$LOGFILE"
         /bin/bash "${vpodgitdir}/labstart.sh"
     fi
 }
@@ -118,7 +119,7 @@ handle_lab_start() {
 . /home/holuser/noproxy.sh 2>/dev/null || true
 
 # Initialize log
-echo "=== VLP Agent Script Started: $(date) ===" > ${LOGFILE}
+log_msg "=== VLP Agent Script Started ===" "$LOGFILE"
 
 # Check for offline/partner export disable marker (set by offline-ready.py)
 if [ -f "${HOLROOT}/.vlp-disabled" ]; then
@@ -134,20 +135,20 @@ else
     vPod_SKU="HOL-UNKNOWN"
 fi
 
-log "vPod SKU: ${vPod_SKU}"
+log_msg "vPod SKU: ${vPod_SKU}" "$LOGFILE"
 
 # Determine VPod repository
 get_vpod_repo
-log "VPod Repo: ${vpodgitdir}"
+log_msg "VPod Repo: ${vpodgitdir}" "$LOGFILE"
 
 # Wait before installing agent
-log "Waiting 15 seconds before installing VLP Agent..."
+log_msg "Waiting 15 seconds before installing VLP Agent..." "$LOGFILE"
 sleep 15
 
 # Install and start VLP Agent
 install_vlp_agent
 
-log "Waiting 15 seconds before starting VLP Agent..."
+log_msg "Waiting 15 seconds before starting VLP Agent..." "$LOGFILE"
 sleep 15
 
 start_vlp_agent
@@ -156,7 +157,7 @@ start_vlp_agent
 # Event Loop
 #==============================================================================
 
-log "Starting event loop..."
+log_msg "Starting event loop..." "$LOGFILE"
 
 while true; do
     if [ -f "${PREPOP_START}" ]; then

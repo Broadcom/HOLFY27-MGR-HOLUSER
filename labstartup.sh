@@ -15,6 +15,9 @@ lmcholroot=/lmchol/hol
 configini=/tmp/config.ini
 logfile=/tmp/labstartupsh.log
 touch ${logfile} && chmod 666 ${logfile} 2>/dev/null || true
+
+# Source shared logging library
+source "${holroot}/Tools/log_functions.sh"
 # Lab environment: disable strict host key checking to handle key changes
 # sshoptions='StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
 LMC=false
@@ -55,9 +58,9 @@ chmod 775 ${holorouterdir}
 
 check_testing_mode() {
     if [ -f "${TESTING_FLAG_LOCAL}" ] || [ -f "${TESTING_FLAG_LMC}" ]; then
-        echo "*** TESTING MODE ENABLED - Skipping git operations ***" >> ${logfile}
-        echo "*** Delete testing flag before capturing to catalog! ***" >> ${logfile}
-        echo "***   rm -f ${TESTING_FLAG_LOCAL} ${TESTING_FLAG_LMC} ***" >> ${logfile}
+        log_msg "*** TESTING MODE ENABLED - Skipping git operations ***" "${logfile}"
+        log_msg "*** Delete testing flag before capturing to catalog! ***" "${logfile}"
+        log_msg "***   rm -f ${TESTING_FLAG_LOCAL} ${TESTING_FLAG_LMC} ***" "${logfile}"
         return 0  # True - testing mode enabled
     fi
     return 1  # False - normal mode
@@ -104,12 +107,12 @@ use_local_holodeck_ini() {
     fi
     
     if [ -n "${ini_file}" ]; then
-        echo "Using local holodeck config: ${ini_file}" >> ${logfile}
+        log_msg "Using local holodeck config: ${ini_file}" "${logfile}"
         cp "${ini_file}" ${configini}
         return 0  # Success
     fi
     
-    echo "No local holodeck config found for ${sku}" >> ${logfile}
+    log_msg "No local holodeck config found for ${sku}" "${logfile}"
     
     # Fall back to defaultconfig.ini with SKU substitution
     # Search across override hierarchy
@@ -123,12 +126,12 @@ use_local_holodeck_ini() {
     fi
     
     if [ -n "${default_ini}" ]; then
-        echo "Using defaultconfig.ini from ${default_ini} with SKU substitution" >> ${logfile}
+        log_msg "Using defaultconfig.ini from ${default_ini} with SKU substitution" "${logfile}"
         cat "${default_ini}" | sed s/HOL-BADSKU/"${sku}"/ > ${configini}
         return 0  # Still success - we have a config
     fi
     
-    echo "ERROR: No defaultconfig.ini found in any holodeck directory" >> ${logfile}
+    log_error "No defaultconfig.ini found in any holodeck directory" "${logfile}"
     return 1  # No config found anywhere
 }
 
@@ -137,14 +140,14 @@ git_pull() {
     ctr=0
     # stash uncommitted changes if not running in HOL-Dev
     if [ "$branch" = "main" ]; then
-        echo "git stash local changes for prod." >> ${logfile}
+        log_msg "git stash local changes for prod." "${logfile}"
         git stash >> ${logfile}
     else
-        echo "Not doing git stash due to HOL-Dev." >> ${logfile}
+        log_msg "Not doing git stash due to HOL-Dev." "${logfile}"
     fi
     while true; do
         if [ "$ctr" -gt 30 ]; then
-            echo "Could not perform git pull. Will attempt LabStartup with existing code." >> ${logfile}
+            log_msg "Could not perform git pull. Will attempt LabStartup with existing code." "${logfile}"
             break
         fi
         git checkout $branch >> ${logfile} 2>&1
@@ -152,11 +155,11 @@ git_pull() {
             break
         else
             if grep -q 'could not be found' ${logfile}; then
-                echo "The git project ${gitproject} does not exist." >> ${logfile}
+                log_msg "The git project ${gitproject} does not exist." "${logfile}"
                 echo "FAIL - No GIT Project" > "$startupstatus"
                 exit 1
             else
-                echo "Could not complete git pull. Will try again." >> ${logfile}
+                log_msg "Could not complete git pull. Will try again." "${logfile}"
             fi
         fi
         ctr=$((ctr + 1))
@@ -169,52 +172,52 @@ git_clone() {
     ctr=0
     while true; do
         if [ "$ctr" -gt 10 ]; then
-            echo "Could not perform git clone after 10 attempts." >> ${logfile}
+            log_msg "Could not perform git clone after 10 attempts." "${logfile}"
             # For non-HOL SKUs, return failure status instead of exiting
             # The caller will handle the fallback to local holodeck/*.ini
             if is_hol_sku "$vPod_SKU"; then
-                echo "HOL SKU requires git repo. Failing vpod." >> ${logfile}
+                log_msg "HOL SKU requires git repo. Failing vpod." "${logfile}"
                 echo "FAIL - Could not clone GIT Project" > "$startupstatus"
                 exit 1
             else
-                echo "Non-HOL SKU: Will attempt fallback to local config." >> ${logfile}
+                log_msg "Non-HOL SKU: Will attempt fallback to local config." "${logfile}"
                 return 1  # Return failure, let caller handle fallback
             fi
         fi
-        echo "Performing git clone for repo ${vpodgit}" >> ${logfile}
+        log_msg "Performing git clone for repo ${vpodgit}" "${logfile}"
         # Confirm that $gitproject url is valid
         if ! GIT_TERMINAL_PROMPT=0 git ls-remote "$gitproject" > /dev/null 2>&1; then
-            echo "Git repository does not exist: ${gitproject}" >> ${logfile}
+            log_msg "Git repository does not exist: ${gitproject}" "${logfile}"
             if is_hol_sku "$vPod_SKU"; then
-                echo "HOL SKU requires git repo. Failing vpod." >> ${logfile}
+                log_msg "HOL SKU requires git repo. Failing vpod." "${logfile}"
                 echo "FAIL - No GIT Project" > "$startupstatus"
                 exit 1
             else
-                echo "Non-HOL SKU: Will attempt fallback to local config." >> ${logfile}
+                log_msg "Non-HOL SKU: Will attempt fallback to local config." "${logfile}"
                 return 1  # Return failure, let caller handle fallback
             fi
         fi
-        echo "git clone -b $branch $gitproject $vpodgitdir" >> ${logfile}
+        log_msg "git clone -b $branch $gitproject $vpodgitdir" "${logfile}"
         if GIT_TERMINAL_PROMPT=0 git clone -b $branch "$gitproject" "$vpodgitdir" >> ${logfile} 2>&1; then
             return 0  # Success
         else
             # Check for permanent failures (repo not found)
             if grep -qE 'Repository not found|remote: Not Found|fatal: repository.*not found' ${logfile} 2>/dev/null; then
-                echo "Git repository does not exist: ${gitproject}" >> ${logfile}
+                log_msg "Git repository does not exist: ${gitproject}" "${logfile}"
                 if is_hol_sku "$vPod_SKU"; then
-                    echo "HOL SKU requires git repo. Failing vpod." >> ${logfile}
+                    log_msg "HOL SKU requires git repo. Failing vpod." "${logfile}"
                     echo "FAIL - No GIT Project" > "$startupstatus"
                     exit 1
                 else
-                    echo "Non-HOL SKU: Will attempt fallback to local config." >> ${logfile}
+                    log_msg "Non-HOL SKU: Will attempt fallback to local config." "${logfile}"
                     return 1  # Return failure, let caller handle fallback
                 fi
             fi
             # Check for DNS issues (temporary, retry)
             if grep -q 'Could not resolve host' ${logfile}; then
-                echo "DNS did not resolve, will try again" >> ${logfile}
+                log_msg "DNS did not resolve, will try again" "${logfile}"
             else
-                echo "Could not complete git clone. Will try again." >> ${logfile}
+                log_msg "Could not complete git clone. Will try again." "${logfile}"
             fi
         fi
         ctr=$((ctr + 1))
@@ -235,9 +238,8 @@ runlabstartup() {
     local mode="${1:-startup}"
     
     if ! pgrep -f "labstartup.py"; then
-        echo "[$(date)] Starting ${holroot}/labstartup.py ${mode}" >> ${logfile}
-        echo "[$(date)] Starting ${holroot}/labstartup.py ${mode}" >> "${holroot}/labstartup.log"
-        echo "[$(date)] Starting ${holroot}/labstartup.py ${mode}" >> "${lmcholroot}/labstartup.log"
+        log_msg "Starting ${holroot}/labstartup.py ${mode}" "${logfile}" "${holroot}/labstartup.log"
+        log_msg "Starting ${holroot}/labstartup.py ${mode}" "${lmcholroot}/labstartup.log"
         
         # Run Python with unbuffered output (-u)
         # Redirect stderr to local log to capture any errors/exceptions
@@ -273,7 +275,7 @@ get_git_project_info() {
             yearrepo="${gitdrive}/Discovery-labs"
             vpodgitdir="${yearrepo}/${suffix}"
             gitproject="https://github.com/Broadcom/${vPod_SKU}.git"
-            echo "Using Discovery naming pattern for ${vPod_SKU}" >> ${logfile}
+            log_msg "Using Discovery naming pattern for ${vPod_SKU}" "${logfile}"
             ;;
         HOL|ATE|VXP|EDU)
             # Standard format: PREFIX-XXYY where XX=year, YY=index
@@ -283,7 +285,7 @@ get_git_project_info() {
             yearrepo="${gitdrive}/20${year}-labs"
             vpodgitdir="${yearrepo}/${year}${index}"
             gitproject="https://github.com/Broadcom/${prefix}-${year}${index}.git"
-            echo "Using standard naming pattern for ${vPod_SKU} (prefix: ${prefix})" >> ${logfile}
+            log_msg "Using standard naming pattern for ${vPod_SKU} (prefix: ${prefix})" "${logfile}"
             ;;
         *)
             # Fallback to HOL pattern for unknown lab types
@@ -292,14 +294,14 @@ get_git_project_info() {
             yearrepo="${gitdrive}/20${year}-labs"
             vpodgitdir="${yearrepo}/${year}${index}"
             gitproject="https://github.com/Broadcom/HOL-${year}${index}.git"
-            echo "Using fallback HOL pattern for unknown labtype: ${labtype}" >> ${logfile}
+            log_msg "Using fallback HOL pattern for unknown labtype: ${labtype}" "${logfile}"
             ;;
     esac
     
     vpodgit="${vpodgitdir}/.git"
-    echo "Git project: ${gitproject}" >> ${logfile}
-    echo "Year repo: ${yearrepo}" >> ${logfile}
-    echo "VPod git dir: ${vpodgitdir}" >> ${logfile}
+    log_msg "Git project: ${gitproject}" "${logfile}"
+    log_msg "Year repo: ${yearrepo}" "${logfile}"
+    log_msg "VPod git dir: ${vpodgitdir}" "${logfile}"
 }
 
 clone_or_pull_labtype_overrides() {
@@ -324,33 +326,33 @@ clone_or_pull_labtype_overrides() {
             ;;
         *)
             # HOL, VXP, Discovery,and others use in-repo overrides - no external repo
-            echo "Labtype ${labtype}: using in-repo overrides (no external repo)" >> ${logfile}
+            log_msg "Labtype ${labtype}: using in-repo overrides (no external repo)" "${logfile}"
             return 0
             ;;
     esac
     
     local labtype_dir="${holuser_home}/${labtype}"
     
-    echo "Checking for ${labtype} team override repo..." >> ${logfile}
+    log_msg "Checking for ${labtype} team override repo..." "${logfile}"
     
     if [ -d "${labtype_dir}/.git" ]; then
         # Repo already cloned - pull latest
-        echo "Pulling latest ${labtype} overrides from ${labtype_repo_url}" >> ${logfile}
+        log_msg "Pulling latest ${labtype} overrides from ${labtype_repo_url}" "${logfile}"
         cd "${labtype_dir}" || return 1
         git checkout ${branch} >> ${logfile} 2>&1
         if GIT_TERMINAL_PROMPT=0 git pull origin ${branch} >> ${logfile} 2>&1; then
-            echo "${labtype} overrides updated successfully" >> ${logfile}
+            log_msg "${labtype} overrides updated successfully" "${logfile}"
         else
-            echo "WARNING: ${labtype} override pull failed - using existing content" >> ${logfile}
+            log_warn "${labtype} override pull failed - using existing content" "${logfile}"
         fi
         cd "${holroot}" || return 1
     else
         # First boot - clone the repo
-        echo "Cloning ${labtype} overrides from ${labtype_repo_url}" >> ${logfile}
+        log_msg "Cloning ${labtype} overrides from ${labtype_repo_url}" "${logfile}"
         if GIT_TERMINAL_PROMPT=0 git clone -b ${branch} "${labtype_repo_url}" "${labtype_dir}" >> ${logfile} 2>&1; then
-            echo "${labtype} overrides cloned successfully" >> ${logfile}
+            log_msg "${labtype} overrides cloned successfully" "${logfile}"
         else
-            echo "WARNING: ${labtype} override clone failed - ${labtype} overrides not available" >> ${logfile}
+            log_warn "${labtype} override clone failed - ${labtype} overrides not available" "${logfile}"
             # Not fatal - the system will use core defaults
         fi
     fi
@@ -368,7 +370,7 @@ push_router_files_nfs() {
     #   3. /home/holuser/hol/{labtype}/holorouter/   (In-repo labtype override)
     #   4. /home/holuser/hol/holorouter/             (Default core)
     #
-    echo "Pushing router files via NFS to ${holorouterdir}..." >> ${logfile}
+    log_msg "Pushing router files via NFS to ${holorouterdir}..." "${logfile}"
     
     # Ensure NFS export directory exists
     mkdir -p ${holorouterdir}
@@ -376,7 +378,7 @@ push_router_files_nfs() {
     # Layer 1 (lowest): Copy core team router files
     if [ -d "${holroot}/${router}" ]; then
         cp -r "${holroot}/${router}"/* ${holorouterdir}/ 2>/dev/null
-        echo "Copied core team router files" >> ${logfile}
+        log_msg "Copied core team router files" "${logfile}"
     fi
     
     # Layer 2: Overlay labtype-specific router files if present
@@ -389,13 +391,13 @@ push_router_files_nfs() {
         labtyperouter="${holroot}/${labtype}/${router}"
     fi
     if [ -n "${labtyperouter}" ] && [ -d "${labtyperouter}" ]; then
-        echo "Merging labtype (${labtype}) router files from ${labtyperouter}" >> ${logfile}
+        log_msg "Merging labtype (${labtype}) router files from ${labtyperouter}" "${logfile}"
         
         # Merge allowlist files (core + labtype)
         if [ -f "${holorouterdir}/allowlist" ] && [ -f "${labtyperouter}/allowlist" ]; then
             cat "${holorouterdir}/allowlist" "${labtyperouter}/allowlist" | sort | uniq > ${holorouterdir}/allowlist.tmp
             mv ${holorouterdir}/allowlist.tmp ${holorouterdir}/allowlist
-            echo "Merged labtype allowlist files" >> ${logfile}
+            log_msg "Merged labtype allowlist files" "${logfile}"
         fi
         
         # Copy other files (override)
@@ -411,13 +413,13 @@ push_router_files_nfs() {
     # Use vpodgitdir which is set by get_git_project_info()
     skurouterfiles="${vpodgitdir}/${router}"
     if [ -d "${skurouterfiles}" ]; then
-        echo "Merging lab-specific router files from ${skurouterfiles}" >> ${logfile}
+        log_msg "Merging lab-specific router files from ${skurouterfiles}" "${logfile}"
         
         # Merge allowlist files (accumulated + lab-specific)
         if [ -f "${holorouterdir}/allowlist" ] && [ -f "${skurouterfiles}/allowlist" ]; then
             cat "${holorouterdir}/allowlist" "${skurouterfiles}/allowlist" | sort | uniq > ${holorouterdir}/allowlist.tmp
             mv ${holorouterdir}/allowlist.tmp ${holorouterdir}/allowlist
-            echo "Merged lab-specific allowlist files" >> ${logfile}
+            log_msg "Merged lab-specific allowlist files" "${logfile}"
         fi
         
         # Copy other files (override)
@@ -431,7 +433,7 @@ push_router_files_nfs() {
     
     # Signal router that files are ready
     date > ${holorouterdir}/gitdone
-    echo "Signaled router: gitdone" >> ${logfile}
+    log_msg "Signaled router: gitdone" "${logfile}"
 }
 
 push_console_files_nfs() {
@@ -459,10 +461,10 @@ push_console_files_nfs() {
     local desktop_dest="/lmchol/home/holuser/desktop-hol"
     local conky_dest="/lmchol/home/holuser/.conky"
     
-    echo "Pushing console files via NFS..." >> ${logfile}
+    log_msg "Pushing console files via NFS..." "${logfile}"
     
     if [ ! -d "${console_src}" ]; then
-        echo "No console/ directory in hol repo - skipping console file push" >> ${logfile}
+        log_msg "No console/ directory in hol repo - skipping console file push" "${logfile}"
         return
     fi
     
@@ -474,7 +476,7 @@ push_console_files_nfs() {
         case "$filename" in
             conky-startup.sh)
                 if cp "$src_file" "${conky_dest}/${filename}" 2>/dev/null; then
-                    echo "${src_label}: console/${filename} -> .conky/" >> ${logfile}
+                    log_msg "${src_label}: console/${filename} -> .conky/" "${logfile}"
                 fi
                 ;;
             .gitkeep)
@@ -482,7 +484,7 @@ push_console_files_nfs() {
                 ;;
             *)
                 if cp "$src_file" "${desktop_dest}/${filename}" 2>/dev/null; then
-                    echo "${src_label}: console/${filename} -> desktop-hol/" >> ${logfile}
+                    log_msg "${src_label}: console/${filename} -> desktop-hol/" "${logfile}"
                 fi
                 ;;
         esac
@@ -502,7 +504,7 @@ push_console_files_nfs() {
         labtype_console="${holroot}/${labtype}/console"
     fi
     if [ -n "${labtype_console}" ] && [ -d "${labtype_console}" ]; then
-        echo "Merging labtype (${labtype}) console files from ${labtype_console}" >> ${logfile}
+        log_msg "Merging labtype (${labtype}) console files from ${labtype_console}" "${logfile}"
         for file in "${labtype_console}"/*; do
             [ -f "$file" ] && _deploy_console_file "$file" "LabType override"
         done
@@ -511,7 +513,7 @@ push_console_files_nfs() {
     # Layer 3 (highest): Overlay with SKU-specific console files from vpodrepo
     local sku_console="${vpodgitdir}/console"
     if [ -d "${sku_console}" ]; then
-        echo "Merging SKU-specific console files from ${sku_console}" >> ${logfile}
+        log_msg "Merging SKU-specific console files from ${sku_console}" "${logfile}"
         for file in "${sku_console}"/*; do
             [ -f "$file" ] && _deploy_console_file "$file" "SKU override"
         done
@@ -521,7 +523,7 @@ push_console_files_nfs() {
     chmod +x "${desktop_dest}/conkywatch.sh" 2>/dev/null
     chmod +x "${conky_dest}/conky-startup.sh" 2>/dev/null
     
-    echo "Console file push complete" >> ${logfile}
+    log_msg "Console file push complete" "${logfile}"
 }
 
 #==============================================================================
@@ -532,15 +534,15 @@ push_console_files_nfs() {
 # WAIT FOR CONSOLE MOUNT
 #==============================================================================
 
-echo "[$(date)] Starting labstartup.sh" >> ${logfile}
+log_msg "Starting labstartup.sh" "${logfile}"
 
 while true; do
     if [ -d ${lmcholroot} ]; then
-        echo "LMC detected." >> ${logfile}
+        log_msg "LMC detected." "${logfile}"
         LMC=true
         break
     fi
-    echo "Waiting for Main Console mount to complete..." >> ${logfile}
+    log_msg "Waiting for Main Console mount to complete..." "${logfile}"
     sleep 5
 done
 
@@ -551,7 +553,7 @@ if [ "$1" = "labcheck" ]; then
     runlabstartup labcheck
     exit 0
 else
-    echo "Main Console mount is present. Clearing labstartup logs." >> ${logfile}
+    log_msg "Main Console mount is present. Clearing labstartup logs." "${logfile}"
     # Initialize the status dashboard to clear previous run info
     /usr/bin/python3 ${holroot}/Tools/status_dashboard.py --clear >> ${logfile} 2>&1
     echo "" > "${holroot}"/labstartup.log
@@ -581,12 +583,12 @@ while [ "$vpod_wait" -lt "$vpod_max_wait" ]; do
         break
     fi
     vpod_wait=$((vpod_wait + 5))
-    echo "Waiting for vPod.txt on Main Console... (${vpod_wait}/${vpod_max_wait}s)" >> ${logfile}
+    log_msg "Waiting for vPod.txt on Main Console... (${vpod_wait}/${vpod_max_wait}s)" "${logfile}"
     sleep 5
 done
 
 if [ "$vpod_found" = true ]; then
-    echo "vPod.txt found after ${vpod_wait}s. Copying to /tmp/vPod.txt..." >> ${logfile}
+    log_msg "vPod.txt found after ${vpod_wait}s. Copying to /tmp/vPod.txt..." "${logfile}"
     cp "${lmcholroot}"/vPod.txt /tmp/vPod.txt
     labtype=$(grep labtype /tmp/vPod.txt | cut -f2 -d '=' | sed 's/\r$//' | xargs)
     # Normalize labtype to uppercase to avoid case-sensitivity issues
@@ -609,7 +611,7 @@ if [ "$vpod_found" = true ]; then
         fi
         
         if [ -n "${sku_ini}" ]; then
-            echo "Copying ${sku_ini} to ${configini}" >> ${logfile}
+            log_msg "Copying ${sku_ini} to ${configini}" "${logfile}"
             cp "${sku_ini}" ${configini}
         else
             # Fall back to defaultconfig.ini with SKU substitution
@@ -623,15 +625,15 @@ if [ "$vpod_found" = true ]; then
             fi
             
             if [ -n "${default_ini}" ]; then
-                echo "Copying updated ${default_ini} to ${configini}" >> ${logfile}
+                log_msg "Copying updated ${default_ini} to ${configini}" "${logfile}"
                 cat "${default_ini}" | sed s/HOL-BADSKU/"${vPod_SKU}"/ > ${configini}
             else
-                echo "ERROR: No holodeck config found for ${vPod_SKU}" >> ${logfile}
+                log_error "No holodeck config found for ${vPod_SKU}" "${logfile}"
             fi
         fi
     fi
 else
-    echo "No vPod.txt on Main Console after ${vpod_max_wait}s. Abort." >> ${logfile}
+    log_msg "No vPod.txt on Main Console after ${vpod_max_wait}s. Abort." "${logfile}"
     # Write failure status and verify the write succeeded
     echo "FAIL - No vPod_SKU" > "$startupstatus"
     sync  # Force NFS write to flush
@@ -640,7 +642,7 @@ else
         if grep -q "FAIL" "$startupstatus" 2>/dev/null; then
             break
         fi
-        echo "Retrying status file write (attempt $i)..." >> ${logfile}
+        log_msg "Retrying status file write (attempt $i)..." "${logfile}"
         sleep 1
         echo "FAIL - No vPod_SKU" > "$startupstatus"
         sync
@@ -661,14 +663,14 @@ echo "$vPod_SKU" > /tmp/vPod_SKU.txt
 #==============================================================================
 
 if [ -f "${holroot}/.vlp-disabled" ]; then
-    echo "VLP Agent disabled by offline-ready.py marker. Skipping." >> ${logfile}
+    log_msg "VLP Agent disabled by offline-ready.py marker. Skipping." "${logfile}"
 elif ! pgrep -f VLPagent.sh > /dev/null 2>&1; then
     cloud=$(/usr/bin/vmtoolsd --cmd "info-get guestinfo.ovfenv" 2>&1 | grep vlp_org_name | cut -f3 -d: | cut -f2 -d\\)
     if [ "${cloud}" = "" ]; then
-        echo "Dev environment. Not starting VLP Agent." >> ${logfile}
+        log_msg "Dev environment. Not starting VLP Agent." "${logfile}"
         echo "NOT REPORTED" > /tmp/cloudinfo.txt
     else
-        echo "Prod environment. Starting VLP Agent." >> ${logfile}
+        log_msg "Prod environment. Starting VLP Agent." "${logfile}"
         echo "$cloud" > /tmp/cloudinfo.txt
         /home/holuser/hol/Tools/VLPagent.sh &
     fi
@@ -682,24 +684,24 @@ fi
 # If not, fail the startup immediately rather than proceeding with a broken proxy.
 
 if [ -f "$startupstatus" ] && grep -q "FAIL.*Proxy" "$startupstatus" 2>/dev/null; then
-    echo "gitpull.sh reported proxy failure. Checking if proxy has recovered..." >> ${logfile}
+    log_msg "gitpull.sh reported proxy failure. Checking if proxy has recovered..." "${logfile}"
     proxy_recovered=false
     proxy_recheck_max=12
     proxy_recheck=0
     while [ $proxy_recheck -lt $proxy_recheck_max ]; do
         if nc -z -w3 proxy.site-a.vcf.lab 3128 > /dev/null 2>&1; then
             proxy_recovered=true
-            echo "Proxy has recovered (squid listening on port 3128). Clearing failure." >> ${logfile}
+            log_msg "Proxy has recovered (squid listening on port 3128). Clearing failure." "${logfile}"
             # Clear the failure status since proxy is now available
             echo "STARTING" > "$startupstatus"
             break
         fi
         proxy_recheck=$((proxy_recheck + 1))
-        echo "Proxy still unavailable (recheck ${proxy_recheck}/${proxy_recheck_max})..." >> ${logfile}
+        log_msg "Proxy still unavailable (recheck ${proxy_recheck}/${proxy_recheck_max})..." "${logfile}"
         sleep 5
     done
     if [ "$proxy_recovered" = "false" ]; then
-        echo "Proxy remains unavailable after recheck. Lab startup FAILED." >> ${logfile}
+        log_msg "Proxy remains unavailable after recheck. Lab startup FAILED." "${logfile}"
         echo "FAIL - Proxy Unavailable" > "$startupstatus"
         sync
         # Update the HTML dashboard with failure
@@ -725,11 +727,11 @@ fi
 #==============================================================================
 
 while [ ! -d ${gitdrive}/lost+found ]; do
-    echo "Waiting for ${gitdrive}..." >> ${logfile}
+    log_msg "Waiting for ${gitdrive}..." "${logfile}"
     sleep 5
     gitmount=$(mount | grep ${gitdrive})
     if [ "${gitmount}" = "" ]; then
-        echo "External ${gitdrive} not found. Abort." >> ${logfile}
+        log_msg "External ${gitdrive} not found. Abort." "${logfile}"
         echo "FAIL - No GIT Drive" > "$startupstatus"
         exit 1
     fi
@@ -743,11 +745,11 @@ done
 
 if [ -f ${configini} ]; then
     [ "${labtype}" = "" ] && labtype="HOL"
-    echo "labtype: $labtype" >> ${logfile}
+    log_msg "labtype: $labtype" "${logfile}"
 elif [ -f /tmp/vPod.txt ]; then
-    echo "Getting vPod_SKU from /tmp/vPod.txt" >> ${logfile}
+    log_msg "Getting vPod_SKU from /tmp/vPod.txt" "${logfile}"
     vPod_SKU=$(grep vPod_SKU /tmp/vPod.txt | cut -f2 -d '=' | sed 's/\r$//' | xargs)
-    echo "vPod_SKU is ${vPod_SKU}" >> ${logfile}
+    log_msg "vPod_SKU is ${vPod_SKU}" "${logfile}"
 fi
 
 echo "$vPod_SKU" > /tmp/vPod_SKU.txt
@@ -755,9 +757,9 @@ echo "$vPod_SKU" > /tmp/vPod_SKU.txt
 # Check for BAD SKU - no vpodrepo exists for this SKU
 # Fall back to defaultconfig.ini so labstartup.py has a valid config
 if [ "$vPod_SKU" = "HOL-BADSKU" ]; then
-    echo "No vpodrepo for ${vPod_SKU}. Falling back to defaultconfig.ini..." >> ${logfile}
+    log_msg "No vpodrepo for ${vPod_SKU}. Falling back to defaultconfig.ini..." "${logfile}"
     if ! use_local_holodeck_ini "$vPod_SKU"; then
-        echo "ERROR: No defaultconfig.ini found. labstartup.py will run without config." >> ${logfile}
+        log_error "No defaultconfig.ini found. labstartup.py will run without config." "${logfile}"
     fi
     date > ${holorouterdir}/gitdone
     push_router_files_nfs
@@ -784,28 +786,28 @@ get_git_project_info
 git_success=false
 
 if check_testing_mode; then
-    echo "TESTING MODE: Skipping git operations for ${vPod_SKU}" >> ${logfile}
+    log_msg "TESTING MODE: Skipping git operations for ${vPod_SKU}" "${logfile}"
     git_success=true  # Consider testing mode as success (use existing files)
 else
-    echo "Ready to pull updates for ${vPod_SKU} from ${gitproject}." >> ${logfile}
+    log_msg "Ready to pull updates for ${vPod_SKU} from ${gitproject}." "${logfile}"
     
     if [ ! -e "${yearrepo}" ] || [ ! -e "${vpodgitdir}" ]; then
-        echo "Creating new git repo for ${vPod_SKU}..." >> ${logfile}
+        log_msg "Creating new git repo for ${vPod_SKU}..." "${logfile}"
         mkdir -p "$yearrepo" > /dev/null 2>&1
         if git_clone "$yearrepo"; then
             git_success=true
-            echo "${vPod_SKU} git clone was successful." >> ${logfile}
+            log_msg "${vPod_SKU} git clone was successful." "${logfile}"
         else
             # git_clone already handles HOL SKU failure (exits)
             # If we reach here, it's a non-HOL SKU that needs fallback
-            echo "Git clone failed for non-HOL SKU ${vPod_SKU}. Using local config fallback." >> ${logfile}
+            log_msg "Git clone failed for non-HOL SKU ${vPod_SKU}. Using local config fallback." "${logfile}"
             git_success=false
         fi
     else
-        echo "Performing git pull for repo ${vpodgit}" >> ${logfile}
+        log_msg "Performing git pull for repo ${vpodgit}" "${logfile}"
         git_pull "$vpodgitdir"
         git_success=true
-        echo "${vPod_SKU} git pull completed." >> ${logfile}
+        log_msg "${vPod_SKU} git pull completed." "${logfile}"
     fi
 fi
 
@@ -818,15 +820,15 @@ fi
 # Copy config.ini from vpodrepo if present and git succeeded
 # Otherwise, for non-HOL SKUs, use local holodeck/*.ini fallback
 if [ "$git_success" = true ] && [ -f "${vpodgitdir}"/config.ini ]; then
-    echo "Using config.ini from git repo: ${vpodgitdir}/config.ini" >> ${logfile}
+    log_msg "Using config.ini from git repo: ${vpodgitdir}/config.ini" "${logfile}"
     cp "${vpodgitdir}"/config.ini ${configini}
 elif [ "$git_success" = false ]; then
     # Fallback for non-HOL SKUs when git repo doesn't exist
-    echo "Git operations failed. Attempting local holodeck config fallback for ${vPod_SKU}..." >> ${logfile}
+    log_msg "Git operations failed. Attempting local holodeck config fallback for ${vPod_SKU}..." "${logfile}"
     if use_local_holodeck_ini "$vPod_SKU"; then
-        echo "Successfully loaded local holodeck config for ${vPod_SKU}" >> ${logfile}
+        log_msg "Successfully loaded local holodeck config for ${vPod_SKU}" "${logfile}"
     else
-        echo "Failed to load local holodeck config for ${vPod_SKU}" >> ${logfile}
+        log_msg "Failed to load local holodeck config for ${vPod_SKU}" "${logfile}"
         echo "FAIL - No Config Available" > "$startupstatus"
         exit 1
     fi
@@ -839,15 +841,15 @@ fi
 if [ "${labtype}" = "HOL" ]; then
     push_router_files_nfs
 else
-    echo "Pushing $labtype router files via NFS..." >> ${logfile}
+    log_msg "Pushing $labtype router files via NFS..." "${logfile}"
     mkdir -p ${holorouterdir}
     # In dev environment, keep the default iptablescfg.sh from git
     # In prod environment, use nofirewall.sh for non-HOL labs
     if [ "$branch" = "dev" ]; then
-        echo "Dev environment: keeping default iptablescfg.sh from holorouter" >> ${logfile}
+        log_msg "Dev environment: keeping default iptablescfg.sh from holorouter" "${logfile}"
         cp ${holroot}/${router}/iptablescfg.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
     else
-        echo "Prod environment: using nofirewall.sh for non-HOL labtype" >> ${logfile}
+        log_msg "Prod environment: using nofirewall.sh for non-HOL labtype" "${logfile}"
         cp ${holroot}/${router}/nofirewall.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
     fi
     cp ${holroot}/${router}/allowall ${holorouterdir}/allowlist 2>/dev/null
@@ -861,7 +863,7 @@ else
         labtyperouter="${holroot}/${labtype}/${router}"
     fi
     if [ -n "${labtyperouter}" ] && [ -d "${labtyperouter}" ]; then
-        echo "Merging labtype (${labtype}) router files from ${labtyperouter}" >> ${logfile}
+        log_msg "Merging labtype (${labtype}) router files from ${labtyperouter}" "${logfile}"
         for file in "${labtyperouter}"/*; do
             filename=$(basename "$file")
             if [ "$filename" != ".gitkeep" ]; then
@@ -872,7 +874,7 @@ else
     
     # Overlay vpodrepo-specific router overrides if present
     if [ -d "${vpodgitdir}/${router}" ]; then
-        echo "Merging vpodrepo router files from ${vpodgitdir}/${router}" >> ${logfile}
+        log_msg "Merging vpodrepo router files from ${vpodgitdir}/${router}" "${logfile}"
         for file in "${vpodgitdir}/${router}"/*; do
             filename=$(basename "$file")
             cp "$file" ${holorouterdir}/ 2>/dev/null
@@ -905,9 +907,9 @@ date > ${holorouterdir}/gitdone
 
 if [ -f ${configini} ]; then
     runlabstartup
-    echo "$0 finished." >> ${logfile}
+    log_msg "$0 finished." "${logfile}"
 else
-    echo "No config.ini on Main Console or vpodrepo. Abort." >> ${logfile}
+    log_msg "No config.ini on Main Console or vpodrepo. Abort." "${logfile}"
     echo "FAIL - No Config" > "$startupstatus"
     exit 1
 fi

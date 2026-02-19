@@ -46,6 +46,10 @@ VCENTER_USER="root"
 CREDS_FILE="/home/holuser/creds.txt"
 LOG_FILE="/lmchol/hol/labstartup.log"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+
+# Source shared logging library (uses $LOG_FILE automatically)
+source "${SCRIPT_DIR}/log_functions.sh"
 
 # Polling configuration
 POLL_INTERVAL=30      # seconds between polls
@@ -56,37 +60,8 @@ if [[ "${STDOUT_ONLY}" != "true" ]]; then
     mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null
 fi
 
-# Helper function for logging
-# When --stdout-only is set, output goes ONLY to stdout (no tee to log file)
-log_msg() {
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    if [[ "${STDOUT_ONLY}" == "true" ]]; then
-        echo "[${timestamp}] $1"
-    else
-        echo "[${timestamp}] $1" | tee -a "${LOG_FILE}"
-    fi
-}
-
-log_error() {
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    if [[ "${STDOUT_ONLY}" == "true" ]]; then
-        echo "[${timestamp}] ERROR: $1" >&2
-    else
-        echo "[${timestamp}] ERROR: $1" | tee -a "${LOG_FILE}" >&2
-    fi
-}
-
-log_warn() {
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    if [[ "${STDOUT_ONLY}" == "true" ]]; then
-        echo "[${timestamp}] WARNING: $1"
-    else
-        echo "[${timestamp}] WARNING: $1" | tee -a "${LOG_FILE}"
-    fi
-}
+# log_msg, log_error, log_warn provided by shared log_functions.sh
+# They automatically use $LOG_FILE and handle STDOUT_ONLY.
 
 # Helper function to execute SSH with fallback to sshpass
 ssh_with_fallback() {
@@ -96,7 +71,7 @@ ssh_with_fallback() {
     local cmd="$*"
 
     # Try key-based authentication first
-    if ssh ${SSH_OPTS} -o BatchMode=yes "${user}@${host}" "${cmd}" 2>/dev/null; then
+    if ssh "${SSH_OPTS}" -o BatchMode=yes "${user}@${host}" "${cmd}" 2>/dev/null; then
         return 0
     fi
 
@@ -104,7 +79,7 @@ ssh_with_fallback() {
     if [[ -f "${CREDS_FILE}" ]]; then
         local password
         password=$(cat "${CREDS_FILE}")
-        /usr/bin/sshpass -p "${password}" ssh ${SSH_OPTS} "${user}@${host}" "${cmd}"
+        /usr/bin/sshpass -p "${password}" ssh "${SSH_OPTS}" "${user}@${host}" "${cmd}"
     else
         log_error "Key-based authentication failed and credentials file not found at ${CREDS_FILE}"
         return 1

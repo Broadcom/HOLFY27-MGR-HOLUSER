@@ -27,6 +27,10 @@ CONSOLELOG="/lmchol/hol/labstartup.log"
 CREDS_FILE="/home/holuser/creds.txt"
 VCFA_USER="vmware-system-user"
 
+# Source shared logging library
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/log_functions.sh"
+
 # VCFA hostname - DNS resolves to the correct IP in both VCF 9.0.x and 9.1.x
 VCFA_FQDN="auto-a.site-a.vcf.lab"
 VCFA_HOST=""
@@ -68,20 +72,20 @@ detect_vcfa_host() {
   resolved_ip=$(getent hosts "${VCFA_FQDN}" 2>/dev/null | awk '{print $1}' | head -1)
 
   if [ -z "${resolved_ip}" ]; then
-    echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> WARNING: Cannot resolve ${VCFA_FQDN} via DNS" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+    log_warn "Cannot resolve ${VCFA_FQDN} via DNS" "$LOGFILE" "$CONSOLELOG"
     return 1
   fi
 
-  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> ${VCFA_FQDN} resolves to ${resolved_ip}" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+  log_msg "${VCFA_FQDN} resolves to ${resolved_ip}" "$LOGFILE" "$CONSOLELOG"
 
   # Verify SSH is reachable on the resolved IP
   if nc -z -w 5 "${resolved_ip}" 22 >/dev/null 2>&1; then
     VCFA_HOST="${resolved_ip}"
-    echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Detected VCFA host: ${VCFA_HOST} (SSH reachable)" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+    log_msg "Detected VCFA host: ${VCFA_HOST} (SSH reachable)" "$LOGFILE" "$CONSOLELOG"
     return 0
   fi
 
-  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> WARNING: ${VCFA_FQDN} (${resolved_ip}) SSH not reachable" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+  log_warn "${VCFA_FQDN} (${resolved_ip}) SSH not reachable" "$LOGFILE" "$CONSOLELOG"
   return 1
 }
 
@@ -93,22 +97,21 @@ detect_k8s_api() {
   server=$(vcfa_ssh 'cat /etc/kubernetes/super-admin.conf 2>/dev/null || cat /etc/kubernetes/admin.conf 2>/dev/null' | grep "server:" | head -1 | sed 's/.*server: *//')
   if [ -n "${server}" ]; then
     K8S_API="${server}"
-    echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Detected K8s API endpoint: ${K8S_API}" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+    log_msg "Detected K8s API endpoint: ${K8S_API}" "$LOGFILE" "$CONSOLELOG"
   else
     # Fallback: use the VCFA_HOST IP
     K8S_API="https://${VCFA_HOST}:6443"
-    echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Could not detect K8s API from kubeconfig, using fallback: ${K8S_API}" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+    log_msg "Could not detect K8s API from kubeconfig, using fallback: ${K8S_API}" "$LOGFILE" "$CONSOLELOG"
   fi
 }
 
-# Now try to remediate Automation
-echo "[$(date +"%Y-%m-%d %H:%M:%S")] -------------WATCHVCFA RUN START-------------" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
-echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> VCFA Watcher started"  | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+log_msg "-------------WATCHVCFA RUN START-------------" "$LOGFILE" "$CONSOLELOG"
+log_msg "VCFA Watcher started" "$LOGFILE" "$CONSOLELOG"
 
 # Auto-detect VCFA host, sudo mode, and K8s API endpoint
 detect_vcfa_host
 if [ -z "${VCFA_HOST}" ]; then
-  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> ERROR: Cannot find VCFA host, exiting" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+  log_error "Cannot find VCFA host, exiting" "$LOGFILE" "$CONSOLELOG"
   exit 1
 fi
 
@@ -116,28 +119,28 @@ fi
   CNT=0
   while ! $(sshpass -f "${CREDS_FILE}" ssh -q -o ConnectTimeout=5 "${VCFA_USER}@${VCFA_HOST}" exit); do
     sleep 30
-	  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Waiting for VCFA to come Online" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+	  log_msg "Waiting for VCFA to come Online" "$LOGFILE" "$CONSOLELOG"
     ((CNT++))
     if [ $CNT -eq 10 ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> VCFA Online check check tried 10 times (5m), continuing..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "VCFA Online check check tried 10 times (5m), continuing..." "$LOGFILE" "$CONSOLELOG"
       break
     fi
   done
 
   # Detect sudo mode and K8s API after VCFA is online
   detect_sudo_mode
-  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Sudo requires password: ${SUDO_NEEDS_PASSWORD}" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+  log_msg "Sudo requires password: ${SUDO_NEEDS_PASSWORD}" "$LOGFILE" "$CONSOLELOG"
   detect_k8s_api
 
   ###### Containerd check/fix ######
-  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Checking containerd on VCFA for Ready,SchedulingDisabled..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+  log_msg "Checking containerd on VCFA for Ready,SchedulingDisabled..." "$LOGFILE" "$CONSOLELOG"
   CNT=0
   while [[ "$CONATAINERDREADY" != "" ]]; do
     ((CNT++))
     CONATAINERDREADY=$(vcfa_ssh "kubectl -s ${K8S_API} get nodes" | grep "Ready,SchedulingDisabled" | awk '{print $2}')
    
     if [ "$CONATAINERDREADY" == "Ready,SchedulingDisabled" ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Stale containerd found, restarting..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "Stale containerd found, restarting..." "$LOGFILE" "$CONSOLELOG"
       vcfa_ssh "systemctl restart containerd" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
       sleep 5
       vcfa_ssh "kubectl -s ${K8S_API} get nodes" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
@@ -148,13 +151,13 @@ fi
       vcfa_ssh "kubectl -s ${K8S_API} uncordon ${NODENAME}"
     fi
     if [ $CNT -eq 3 ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> containerd check tried 3 times, continuing..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "containerd check tried 3 times, continuing..." "$LOGFILE" "$CONSOLELOG"
       break
     fi
   done
 
 ###### kube-scheduler check/fix ######
-  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Checking kube-scheduler on VCFA for 0/1 Running..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+  log_msg "Checking kube-scheduler on VCFA for 0/1 Running..." "$LOGFILE" "$CONSOLELOG"
   CNT=0
   while [[ "$KUBESCHEDULER" != "" ]]; do
     ((CNT++))
@@ -162,13 +165,13 @@ fi
     KUBESCHEDULER=$(vcfa_ssh "kubectl -n kube-system -s ${K8S_API} get pods" | grep "kube-scheduler" | grep "0/1" | awk '{print $2}')
    
     if [ "$KUBESCHEDULER" == "0/1" ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Stale kube-scheduler found, restarting containerd..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "Stale kube-scheduler found, restarting containerd..." "$LOGFILE" "$CONSOLELOG"
       vcfa_ssh "systemctl restart containerd" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
       sleep 120
       vcfa_ssh "kubectl -n kube-system -s ${K8S_API} get pods" | grep "kube-scheduler" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
     fi
     if [ $CNT -eq 3 ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> kube-scheduler check tried 3 times, continuing..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "kube-scheduler check tried 3 times, continuing..." "$LOGFILE" "$CONSOLELOG"
       break
     fi
   done
@@ -177,7 +180,7 @@ fi
   #   cleaned up properly, resulting in the prevention of many other pods failint go start.
   #  Check this pod and delete it if it is old:
   # Delete the seaweedfs-master-0 pod if age over 1 hour
-  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Checking seaweedfs-master-0 pod from VCFA if older than 1 hour..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+  log_msg "Checking seaweedfs-master-0 pod from VCFA if older than 1 hour..." "$LOGFILE" "$CONSOLELOG"
   CNT=0
   while [[ "$SEAWEEDPOD" != "" ]]; do
     ((CNT++))
@@ -185,14 +188,14 @@ fi
     jq -r '. | select(.metadata.creationTimestamp | fromdateiso8601 < (now - 3600)) | .metadata.name ')
     
     if [ "$SEAWEEDPOD" == "seaweedfs-master-0" ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Stale seaweedfs-master-0 pod found, deleting..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "Stale seaweedfs-master-0 pod found, deleting..." "$LOGFILE" "$CONSOLELOG"
       vcfa_ssh "kubectl -n vmsp-platform -s ${K8S_API} delete pod seaweedfs-master-0" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
       sleep 5
       vcfa_ssh "kubectl -n vmsp-platform -s ${K8S_API} get pods | grep seaweedfs" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
     fi
     sleep 5
     if [ $CNT -eq 3 ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> seaweedfs-master-0 check tried 3 times, continuing..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "seaweedfs-master-0 check tried 3 times, continuing..." "$LOGFILE" "$CONSOLELOG"
       break
     fi
   done
@@ -217,7 +220,7 @@ fi
   #   b. Fix CSI controller if unhealthy (force-delete and wait for restart)
   #   c. Delete prelude pods stuck in ContainerCreating/Init to force fresh mount attempts
   STUCK_VA_FIXED=false
-  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Checking for stuck volume attachments with deletionTimestamp..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+  log_msg "Checking for stuck volume attachments with deletionTimestamp..." "$LOGFILE" "$CONSOLELOG"
   CNT=0
   while [[ "$STUCKVOLATTACH" != "" ]]; do
     ((CNT++))
@@ -226,12 +229,12 @@ fi
       jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .metadata.name' | head -1)
     
     if [ -n "$STUCKVOLATTACH" ] && [ "$STUCKVOLATTACH" != "" ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Stuck volume attachment found: ${STUCKVOLATTACH}, removing finalizer..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "Stuck volume attachment found: ${STUCKVOLATTACH}, removing finalizer..." "$LOGFILE" "$CONSOLELOG"
       # Get all stuck volume attachments and remove their finalizers
       STUCK_VAS=$(vcfa_ssh 'kubectl get volumeattachments -o json' | \
         jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .metadata.name')
       for VA in $STUCK_VAS; do
-        echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Removing finalizer from volume attachment: ${VA}" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+        log_msg "Removing finalizer from volume attachment: ${VA}" "$LOGFILE" "$CONSOLELOG"
         vcfa_ssh "kubectl patch volumeattachment ${VA} -p '{\"metadata\":{\"finalizers\":null}}' --type=merge" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
       done
       STUCK_VA_FIXED=true
@@ -241,7 +244,7 @@ fi
     fi
     sleep 5
     if [ $CNT -eq 3 ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Stuck volume attachment check tried 3 times, continuing..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "Stuck volume attachment check tried 3 times, continuing..." "$LOGFILE" "$CONSOLELOG"
       break
     fi
   done
@@ -250,24 +253,24 @@ fi
   # The vsphere-csi-controller requires vCenter's REST API (vmware-vapi-endpoint) to be running.
   # If this service is stopped, the CSI controller will crash with 503 errors when trying to
   # communicate with vCenter. Check and start the service if needed.
-  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Checking vCenter vAPI endpoint service..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+  log_msg "Checking vCenter vAPI endpoint service..." "$LOGFILE" "$CONSOLELOG"
   VCENTER_HOST="vc-mgmt-a.site-a.vcf.lab"
   # Check if vAPI endpoint is responding (404 is OK - means service is running, 503 means down)
   VAPI_STATUS=$(curl -s -k -o /dev/null -w "%{http_code}" "https://${VCENTER_HOST}/rest/com/vmware/cis/session" 2>&1)
   if [ "$VAPI_STATUS" == "503" ]; then
-    echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> vCenter vAPI endpoint returning 503, attempting to start service..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+    log_msg "vCenter vAPI endpoint returning 503, attempting to start service..." "$LOGFILE" "$CONSOLELOG"
     # Start the vmware-vapi-endpoint service on vCenter
     sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "root@${VCENTER_HOST}" "service-control --start vmware-vapi-endpoint" 2>&1 | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
     sleep 10
     # Verify the service is now responding
     VAPI_STATUS=$(curl -s -k -o /dev/null -w "%{http_code}" "https://${VCENTER_HOST}/rest/com/vmware/cis/session" 2>&1)
     if [ "$VAPI_STATUS" != "503" ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> vCenter vAPI endpoint started successfully (HTTP ${VAPI_STATUS})" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "vCenter vAPI endpoint started successfully (HTTP ${VAPI_STATUS})" "$LOGFILE" "$CONSOLELOG"
     else
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> WARNING: vCenter vAPI endpoint still returning 503 after start attempt" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_warn "vCenter vAPI endpoint still returning 503 after start attempt" "$LOGFILE" "$CONSOLELOG"
     fi
   else
-    echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> vCenter vAPI endpoint is responding (HTTP ${VAPI_STATUS})" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+    log_msg "vCenter vAPI endpoint is responding (HTTP ${VAPI_STATUS})" "$LOGFILE" "$CONSOLELOG"
   fi
 
   ###### CSI Controller health check/fix ######
@@ -277,7 +280,7 @@ fi
   # 3. CRD initialization error ("resource name may not be empty") causes main container to crash,
   #    which kills the CSI socket, causing all sidecar containers to fail with connection timeouts
   CSI_FIXED=false
-  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Checking vsphere-csi-controller health..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+  log_msg "Checking vsphere-csi-controller health..." "$LOGFILE" "$CONSOLELOG"
   CNT=0
   CSISTATUS="."
   while [[ "$CSISTATUS" != "" ]]; do
@@ -286,7 +289,7 @@ fi
     CSISTATUS=$(vcfa_ssh 'kubectl get pods -n kube-system -l app=vsphere-csi-controller -o jsonpath="{.items[0].status.containerStatuses[*].ready}"' | grep -o "false")
     
     if [ -n "$CSISTATUS" ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> CSI controller not fully ready (attempt ${CNT}/3)..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "CSI controller not fully ready (attempt ${CNT}/3)..." "$LOGFILE" "$CONSOLELOG"
       
       # Get current CSI controller pod name
       CURRENT_CSI_POD=$(vcfa_ssh 'kubectl get pods -n kube-system -l app=vsphere-csi-controller -o jsonpath="{.items[0].metadata.name}"')
@@ -296,9 +299,9 @@ fi
         jq -r --arg pod "$CURRENT_CSI_POD" '.items[] | select(.spec.holderIdentity != null and (.spec.holderIdentity | contains("vsphere-csi-controller")) and (.spec.holderIdentity != $pod)) | .metadata.name')
       
       if [ -n "$STALE_LEASES" ]; then
-        echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Found stale CSI leases, deleting..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+        log_msg "Found stale CSI leases, deleting..." "$LOGFILE" "$CONSOLELOG"
         for LEASE in $STALE_LEASES; do
-          echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Deleting stale lease: ${LEASE}" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+          log_msg "Deleting stale lease: ${LEASE}" "$LOGFILE" "$CONSOLELOG"
           vcfa_ssh "kubectl delete lease ${LEASE} -n kube-system" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
         done
         sleep 5
@@ -307,28 +310,28 @@ fi
       # Force-delete the unhealthy CSI controller pod to trigger a fresh restart.
       # A normal delete can hang for minutes if containers are in CrashLoopBackOff,
       # so we use --grace-period=0 --force to immediately remove it.
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Force-deleting unhealthy CSI controller pod: ${CURRENT_CSI_POD}..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "Force-deleting unhealthy CSI controller pod: ${CURRENT_CSI_POD}..." "$LOGFILE" "$CONSOLELOG"
       vcfa_ssh "kubectl delete pod ${CURRENT_CSI_POD} -n kube-system --grace-period=0 --force" 2>&1 | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
       CSI_FIXED=true
       sleep 30
 
       # Wait up to 90s for the new CSI controller pod to become fully ready (7/7)
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Waiting for new CSI controller pod to become ready..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "Waiting for new CSI controller pod to become ready..." "$LOGFILE" "$CONSOLELOG"
       CSI_WAIT=0
       while [ $CSI_WAIT -lt 90 ]; do
         NEW_CSI_READY=$(vcfa_ssh 'kubectl get pods -n kube-system -l app=vsphere-csi-controller' | grep -v "NAME" | grep -v "Terminating" | awk '{print $2}')
         if [ "$NEW_CSI_READY" == "7/7" ]; then
-          echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> CSI controller is now fully ready (${NEW_CSI_READY})" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+          log_msg "CSI controller is now fully ready (${NEW_CSI_READY})" "$LOGFILE" "$CONSOLELOG"
           CSISTATUS=""
           break
         fi
-        echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> CSI controller status: ${NEW_CSI_READY:-pending} (${CSI_WAIT}/90s)" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+        log_msg "CSI controller status: ${NEW_CSI_READY:-pending} (${CSI_WAIT}/90s)" "$LOGFILE" "$CONSOLELOG"
         sleep 15
         CSI_WAIT=$((CSI_WAIT + 15))
       done
     fi
     if [ $CNT -eq 3 ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> CSI controller check tried 3 times, continuing..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "CSI controller check tried 3 times, continuing..." "$LOGFILE" "$CONSOLELOG"
       break
     fi
   done
@@ -339,7 +342,7 @@ fi
   # NOT automatically recover - they must be deleted so the StatefulSet controller recreates
   # them with fresh volume mount attempts.
   if [ "$STUCK_VA_FIXED" = true ] || [ "$CSI_FIXED" = true ]; then
-    echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Volume attachments or CSI controller were fixed, checking prelude pods..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+    log_msg "Volume attachments or CSI controller were fixed, checking prelude pods..." "$LOGFILE" "$CONSOLELOG"
     sleep 10
 
     # Check for pods stuck in ContainerCreating or Init states in the prelude namespace
@@ -347,17 +350,17 @@ fi
       grep -E "ContainerCreating|Init:" | awk '{print $1}')
 
     if [ -n "$STUCK_PODS" ]; then
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Found stuck prelude pods after volume/CSI fix, deleting to force fresh mount..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "Found stuck prelude pods after volume/CSI fix, deleting to force fresh mount..." "$LOGFILE" "$CONSOLELOG"
       for POD in $STUCK_PODS; do
-        echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Deleting stuck pod: ${POD}" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+        log_msg "Deleting stuck pod: ${POD}" "$LOGFILE" "$CONSOLELOG"
         vcfa_ssh "kubectl delete pod ${POD} -n prelude -s ${K8S_API}" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
       done
       # Wait for pods to be recreated and volumes to attach
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Waiting 60s for pods to be recreated with fresh volume mounts..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "Waiting 60s for pods to be recreated with fresh volume mounts..." "$LOGFILE" "$CONSOLELOG"
       sleep 60
       vcfa_ssh "kubectl get pods -n prelude -s ${K8S_API}" | grep -v "Completed" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
     else
-      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> No stuck prelude pods found, services should recover normally" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+      log_msg "No stuck prelude pods found, services should recover normally" "$LOGFILE" "$CONSOLELOG"
     fi
   fi
   
@@ -367,9 +370,9 @@ fi
   #   sleep 60;
 	#   POSTGRES=$(sshpass -f /home/holuser/creds.txt ssh vmware-system-user@10.1.1.71 "sudo -i bash -c 'kubectl get pods -n prelude -s ${K8S_API}'" | grep vcfapostgres-0 | awk '{ print $2 }')
 	#   ((CNT++))
-  #   echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> PG Running pods Result: $POSTGRES - Attempt: $CNT" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}" 
+  #   log_msg "PG Running pods Result: $POSTGRES - Attempt: $CNT" "$LOGFILE" "$CONSOLELOG"
   #   if [ $CNT -eq 5 ]; then
-  #     echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Rebooting after 5 minutes with Postgres only $POSTGRES" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+  #     log_msg "Rebooting after 5 minutes with Postgres only $POSTGRES" "$LOGFILE" "$CONSOLELOG"
   #     #sshpass -f /home/holuser/creds.txt ssh vmware-system-user@10.1.1.71 "sudo -i bash -c reboot"
   #     # Instead of a full reboot try deleting the vcfapostgres-0 pods, this forces the ReplicaSet to re-create them:
   #     sshpass -f /home/holuser/creds.txt ssh vmware-system-user@10.1.1.71 "sudo -i bash -c 'kubectl -n prelude delete pods vcfapostgres-0'"
@@ -383,9 +386,9 @@ fi
   #   sleep 300;
 	#   CCSK3SAPP=$(sshpass -f /home/holuser/creds.txt ssh vmware-system-user@10.1.1.71 "sudo -i bash -c 'kubectl get pods -n prelude -s ${K8S_API}'" | grep ccs-k3s-app | awk '{ print $2 }')
 	#   ((CNT++))
-  #   echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> CCS Running pods Result: $CCSK3SAPP - Attempt: $CNT" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}" 
+  #   log_msg "CCS Running pods Result: $CCSK3SAPP - Attempt: $CNT" "$LOGFILE" "$CONSOLELOG"
   #   if [ $CNT -eq 12 ]; then
-  #     echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Rebooting after 60 minutes with CCS-K3SAPP only $POSTGRES" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+  #     log_msg "Rebooting after 60 minutes with CCS-K3SAPP only $POSTGRES" "$LOGFILE" "$CONSOLELOG"
   #     sshpass -f /home/holuser/creds.txt ssh vmware-system-user@10.1.1.71 "sudo -i bash -c reboot"
   #     sleep 30
   #     break
@@ -395,11 +398,11 @@ fi
   # if [ "$CCSK3SAPP" == "2/2" ]; then
   #   CCSK3SAPPNAME=$(sshpass -f /home/holuser/creds.txt ssh vmware-system-user@10.1.1.71 "sudo -i bash -c 'kubectl get pods -n prelude -s ${K8S_API}'" | grep ccs-k3s-app | awk '{ print $1 }')
   #   sshpass -f /home/holuser/creds.txt ssh vmware-system-user@10.1.1.71 "sudo -i bash -c 'kubectl delete pod '\"$CCSK3SAPPNAME\"' -n prelude -s ${K8S_API}'"
-  #   echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Deleted CCS-K3S-APP for CPU usage bug" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}" 
+  #   log_msg "Deleted CCS-K3S-APP for CPU usage bug" "$LOGFILE" "$CONSOLELOG"
   #   break
   # fi
   # if [ "$POSTGRES" == "2/2" ]; then
-  #   echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Postgres is up, waiting for CCS-K3S-APP" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}" 
+  #   log_msg "Postgres is up, waiting for CCS-K3S-APP" "$LOGFILE" "$CONSOLELOG"
   #   break
   # fi
 #   ((REBOOTS++))

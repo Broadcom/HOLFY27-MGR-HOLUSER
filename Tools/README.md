@@ -20,6 +20,7 @@ This folder contains utility scripts and tools for managing HOLFY27 lab environm
     - [tdns\_import.py](#tdns_importpy)
     - [vpodchecker.py](#vpodcheckerpy)
   - [Shell Scripts](#shell-scripts)
+    - [log\_functions.sh](#log_functionssh)
     - [fwoff.sh / fwon.sh](#fwoffsh--fwonsh)
     - [proxyfilteroff.sh / proxyfilteron.sh](#proxyfilteroffsh--proxyfilteronsh)
     - [holpwgen.sh](#holpwgensh)
@@ -622,6 +623,85 @@ python3 vpodchecker.py --verbose
 ---
 
 ## Shell Scripts
+
+### log_functions.sh
+
+**Shared Bash Logging Library:**
+
+Provides a single, centralized source for timestamped log output across all HOLFY27 bash scripts. All timestamps use the standard format `[YYYY-MM-DD HH:MM:SS]`, matching the Python `lsfunctions.write_output()` format.
+
+**Functions:**
+
+| Function | Description |
+| -------- | ----------- |
+| `log_msg` | Log an informational message to stdout and optional file(s) |
+| `log_error` | Log an error message to stderr and optional file(s) |
+| `log_warn` | Log a warning message (prefixed with `WARNING:`) to stdout and optional file(s) |
+
+**Usage:**
+
+```bash
+# Source the library (use SCRIPT_DIR, HOLROOT, or absolute path)
+source /home/holuser/hol/Tools/log_functions.sh
+
+# Basic usage - stdout only
+log_msg "Lab startup beginning"
+
+# Write to stdout + append to a log file
+log_msg "Lab startup beginning" "$LOGFILE"
+
+# Write to stdout + append to two log files (e.g. manager + console)
+log_msg "Lab startup beginning" "$LOGFILE" "$CONSOLELOG"
+
+# Error and warning variants
+log_error "Cannot connect to vCenter"       # goes to stderr
+log_warn  "Service took longer than expected"
+```
+
+**Log File Resolution:**
+
+File arguments are optional. When omitted, the library checks for these environment variables as defaults:
+
+| Priority | Primary Log File | Secondary Log File |
+| -------- | ---------------- | ------------------ |
+| 1st | Explicit `$2` argument | Explicit `$3` argument |
+| 2nd | `$LOG_FILE` env var | `$CONSOLELOG` env var |
+| 3rd | `$LOGFILE` env var | *(none)* |
+
+This means scripts that set `LOG_FILE` or `LOGFILE` before sourcing the library can call `log_msg "message"` with no extra arguments and the output will automatically go to the right file(s).
+
+**STDOUT_ONLY Mode:**
+
+When the environment variable `STDOUT_ONLY` is set to `"true"`, all log functions:
+
+- Emit plain text to stdout/stderr with **no timestamp** and **no file writes**
+- This is used when the calling Python script (e.g. `VCFfinal.py` via `lsf.write_output()`) already adds its own timestamp
+
+```bash
+# Called by VCFfinal.py with --stdout-only flag:
+STDOUT_ONLY=true
+source /home/holuser/hol/Tools/log_functions.sh
+log_msg "Fixing certificates..."
+# Output: Fixing certificates...
+# (no timestamp, no file write - caller handles both)
+```
+
+**Scripts Using This Library:**
+
+| Script | Log Destination(s) |
+| ------ | ------------------ |
+| `labstartup.sh` | `/tmp/labstartupsh.log`, `labstartup.log` (manager + console) |
+| `gitpull.sh` | `/tmp/gitpull-holuser.log` |
+| `watchvcfa.sh` | `labstartup.log` (manager + console) |
+| `vcfapwcheck.sh` | `labstartup.log` (manager + console) |
+| `check_fix_wcp.sh` | `/lmchol/hol/labstartup.log` (supports `--stdout-only`) |
+| `check_wcp_vcenter.sh` | `/lmchol/hol/labstartup.log` (supports `--stdout-only`) |
+| `VLPagent.sh` | `/tmp/VLPagentsh.log` |
+| `runautocheck.sh` | `/home/holuser/hol/autocheck.log` |
+| `fwoff.sh` / `fwon.sh` | stdout only |
+| `proxyfilteroff.sh` / `proxyfilteron.sh` | stdout only |
+
+---
 
 ### fwoff.sh / fwon.sh
 
