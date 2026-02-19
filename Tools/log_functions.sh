@@ -47,8 +47,8 @@ log_msg() {
     _log_resolve_files "$2" "$3"
     local formatted="[$(_log_ts)] $msg"
     echo "$formatted"
-    [[ -n "$_LOG_PRIMARY" ]]   && echo "$formatted" >> "$_LOG_PRIMARY"
-    [[ -n "$_LOG_SECONDARY" ]] && echo "$formatted" >> "$_LOG_SECONDARY"
+    [[ -n "$_LOG_PRIMARY" ]]   && echo "$formatted" >> "$_LOG_PRIMARY"   || true
+    [[ -n "$_LOG_SECONDARY" ]] && echo "$formatted" >> "$_LOG_SECONDARY" || true
 }
 
 # log_error - Log an error message (output goes to stderr)
@@ -64,8 +64,8 @@ log_error() {
     _log_resolve_files "$2" "$3"
     local formatted="[$(_log_ts)] ERROR: $msg"
     echo "$formatted" >&2
-    [[ -n "$_LOG_PRIMARY" ]]   && echo "$formatted" >> "$_LOG_PRIMARY"
-    [[ -n "$_LOG_SECONDARY" ]] && echo "$formatted" >> "$_LOG_SECONDARY"
+    [[ -n "$_LOG_PRIMARY" ]]   && echo "$formatted" >> "$_LOG_PRIMARY"   || true
+    [[ -n "$_LOG_SECONDARY" ]] && echo "$formatted" >> "$_LOG_SECONDARY" || true
 }
 
 # log_warn - Log a warning message
@@ -81,6 +81,6 @@ log_warn() {
     _log_resolve_files "$2" "$3"
     local formatted="[$(_log_ts)] WARNING: $msg"
     echo "$formatted"
-    [[ -n "$_LOG_PRIMARY" ]]   && echo "$formatted" >> "$_LOG_PRIMARY"
-    [[ -n "$_LOG_SECONDARY" ]] && echo "$formatted" >> "$_LOG_SECONDARY"
+    [[ -n "$_LOG_PRIMARY" ]]   && echo "$formatted" >> "$_LOG_PRIMARY"   || true
+    [[ -n "$_LOG_SECONDARY" ]] && echo "$formatted" >> "$_LOG_SECONDARY" || true
 }
