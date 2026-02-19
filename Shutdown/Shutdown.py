@@ -302,7 +302,9 @@ def run_vcf_shutdown(lsf, dry_run: bool = False, phase=None) -> dict:
         else:
             return {'success': result, 'esx_hosts': []}
     except Exception as e:
-        lsf.write_output(f'VCFshutdown failed: {e}')
+        write_shutdown_output(f'VCFshutdown failed: {e}', lsf)
+        import traceback
+        write_shutdown_output(f'Traceback: {traceback.format_exc()}', lsf)
         return {'success': False, 'esx_hosts': []}
 
 
