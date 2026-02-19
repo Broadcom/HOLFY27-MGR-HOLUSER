@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 2.0 - February 2026
+# Version 2.1 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 2.1 Changes:
+# - Fixed --phase parameter: previously validated and logged the phase but
+#   never gated execution, causing all phases to run regardless of selection
+# - Added should_run() helper function to gate each phase block; every phase
+#   (1, 1b, 2, 2b, 3-20) is now wrapped in if should_run() guards
+# - Fixed cross-phase variable scoping: esx_hosts, mgmt_hosts, and
+#   esx_username are now initialized unconditionally before phase guards
+#   so --phase 17b, 19, 20, etc. can access them without NameError
+# - Single-phase runs now print "Phase N complete." instead of the full
+#   shutdown completion instructions
+# - Cleaner Phase 1 failure messages: "Fleet LCM API shutdown not available
+#   through suite-api proxy" instead of generic warnings
 #
 # v 2.0 Changes:
 # - Phase 1 now supports both VCF 9.0 (opslcm-a, Basic auth) and VCF 9.1
@@ -98,28 +111,33 @@ VCF 9.0 MANAGEMENT DOMAIN Shutdown Order:
   11. SDDC Manager
   12. vSAN and ESX Hosts (includes vCenter shutdown)
 
-Shutdown Order (this module) - aligned with VCF 9.0 docs:
+Shutdown Order (this module) - aligned with VCF 9.0/9.1 docs:
 
-PHASE 1: Fleet Operations (VCF Automation via API)
-PHASE 2: Connect to Management Infrastructure
-PHASE 3: Stop WCP (Workload Control Plane) services
-PHASE 4: Shutdown Workload VMs (Tanzu, K8s)
-PHASE 5: Shutdown Workload Domain NSX Edges (if separate from mgmt)
-PHASE 6: Shutdown Workload Domain NSX Manager (if separate from mgmt)
-PHASE 7: Shutdown Workload vCenters (LAST per VCF 9.0 workload domain order)
-PHASE 8: Shutdown VCF Operations for Networks (vrni)
-PHASE 9: Shutdown VCF Operations Collector
-PHASE 10: Shutdown VCF Operations for Logs (vrli)
-PHASE 11: Shutdown VCF Identity Broker
-PHASE 12: Shutdown VCF Operations Fleet Management (VCF Operations Manager)
-PHASE 13: Shutdown VCF Operations (vrops, orchestrator)
-PHASE 14: Shutdown Management Domain NSX Edges
-PHASE 15: Shutdown Management Domain NSX Manager
-PHASE 16: Shutdown SDDC Manager
-PHASE 17: Shutdown Management vCenter
-PHASE 18: Set Host Advanced Settings
-PHASE 19: vSAN Elevator Operations
-PHASE 20: Shutdown ESXi Hosts
+PHASE 1:   Fleet Operations (VCF Operations Suite shutdown via API)
+PHASE 1b:  VCF Automation VM fallback (if Fleet API failed)
+PHASE 2:   Connect to vCenters (while still available)
+PHASE 2b:  Scale Down VCF Component Services (K8s on VSP)
+PHASE 3:   Stop WCP (Workload Control Plane) services
+PHASE 4:   Shutdown Workload VMs (Tanzu, K8s)
+PHASE 5:   Shutdown Workload Domain NSX Edges
+PHASE 6:   Shutdown Workload Domain NSX Manager
+PHASE 7:   Shutdown Workload vCenters (LAST per workload domain order)
+PHASE 8:   Shutdown VCF Operations for Networks (vrni) VMs
+PHASE 9:   Shutdown VCF Operations Collector VMs
+PHASE 10:  Shutdown VCF Operations for Logs (vrli) VMs
+PHASE 11:  Shutdown VCF Identity Broker VMs
+PHASE 12:  Shutdown VCF Operations Fleet Management VMs
+PHASE 13:  Shutdown VCF Operations (vrops) VMs
+PHASE 14:  Shutdown Management Domain NSX Edges
+PHASE 15:  Shutdown Management Domain NSX Manager
+PHASE 16:  Shutdown SDDC Manager
+PHASE 17:  Shutdown Management vCenter
+PHASE 17b: Connect to ESXi Hosts directly (vCenters now down)
+PHASE 18:  Set Host Advanced Settings
+PHASE 19:  vSAN Elevator Operations
+PHASE 19b: Shutdown VSP Platform VMs
+PHASE 19c: Pre-ESXi Shutdown Audit
+PHASE 20:  Shutdown ESXi Hosts
 
 Additional operations handled:
 - Fleet Operations (SDDC Manager) for VCF Automation shutdown
@@ -158,7 +176,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 MODULE_NAME = 'VCFshutdown'
-MODULE_VERSION = '1.9'
+MODULE_VERSION = '2.1'
 MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 9.x compliant)'
 
 # Status file for console display
@@ -579,13 +597,15 @@ def shutdown_host(lsf, host_fqdn: str, username: str, password: str) -> bool:
 # MAIN FUNCTION
 #==============================================================================
 
-def main(lsf=None, standalone=False, dry_run=False):
+def main(lsf=None, standalone=False, dry_run=False, phase=None):
     """
     Main entry point for VCFshutdown module
     
     :param lsf: lsfunctions module (will be imported if None)
     :param standalone: Whether running in standalone test mode
     :param dry_run: Whether to skip actual changes
+    :param phase: If set, run only this specific phase (e.g., '1', '1b', '2b', '17b')
+                  If None, run all phases in order.
     """
     from pyVim import connect
     from pyVmomi import vim
@@ -596,6 +616,18 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.init(router=False)
     
     import fleet  # Import fleet operations module
+    
+    # Valid phase IDs for --phase parameter validation
+    ALL_PHASES = [
+        '1', '1b', '2', '2b', '3', '4', '5', '6', '7',
+        '8', '9', '10', '11', '12', '13',
+        '14', '15', '16', '17', '17b',
+        '18', '19', '19b', '19c', '20'
+    ]
+    
+    if phase is not None and str(phase).lower() not in ALL_PHASES:
+        vcf_write(lsf, f'ERROR: Invalid phase "{phase}". Valid phases: {", ".join(ALL_PHASES)}')
+        return {'success': False, 'esx_hosts': []}
     
     ##=========================================================================
     ## Core Team code - do not modify - place custom code in the CUSTOM section
@@ -614,12 +646,19 @@ def main(lsf=None, standalone=False, dry_run=False):
     # Version is read from [VCF] vcf_version or auto-probed at runtime.
     #==========================================================================
     
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 1: Fleet Operations (VCF Operations Suite) Shutdown')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(1, 'Fleet Operations (VCF Operations Suite)', dry_run)
+    if phase is not None:
+        vcf_write(lsf, f'Running single phase: {phase}')
     
-    # --- Read configuration for both API versions ---
+    def should_run(phase_id: str) -> bool:
+        """Return True if this phase should execute (no filter, or matches)."""
+        if phase is None:
+            return True
+        return str(phase).lower() == str(phase_id).lower()
+    
+    # All config reading happens unconditionally so later phases have
+    # the data they need even when running a single phase.
+    
+    # --- Read configuration for both API versions (always, needed by later phases) ---
     
     # VCF 9.0 legacy settings
     fleet_fqdn = None
@@ -658,156 +697,203 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     fleet_api_succeeded = False
     
-    # --- VCF 9.1 API path ---
-    use_v91 = (vcf_version == '9.1')
+    # --- Management host lists (needed across multiple phases) ---
+    # mgmt_hosts: full config entries for connect_vcenters (Phase 2, 17b)
+    # esx_hosts: hostnames only for SSH operations (Phase 18, 19, 20)
+    esx_hosts = []
+    mgmt_hosts = []
+    if lsf.config.has_option('VCF', 'vcfmgmtcluster'):
+        hosts_raw = lsf.config.get('VCF', 'vcfmgmtcluster')
+        mgmt_hosts = [h.strip() for h in hosts_raw.split('\n')
+                      if h.strip() and not h.strip().startswith('#')]
+        for entry in mgmt_hosts:
+            parts = entry.split(':')
+            esx_hosts.append(parts[0].strip())
     
-    if not version_explicit:
-        if lsf.test_tcp_port(ops_fqdn, 443, timeout=10):
-            vcf_write(lsf, f'Probing {ops_fqdn} for VCF 9.1 Fleet LCM plugin...')
-            if fleet.probe_vcf_91(ops_fqdn):
-                vcf_write(lsf, 'VCF 9.1 Fleet LCM plugin detected (auto-probe)')
-                use_v91 = True
+    esx_username = 'root'
+    if lsf.config.has_option('SHUTDOWN', 'esx_username'):
+        esx_username = lsf.config.get('SHUTDOWN', 'esx_username')
+    
+    if should_run('1'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 1: Fleet Operations (VCF Operations Suite) Shutdown')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(1, 'Fleet Operations (VCF Operations Suite)', dry_run)
+        
+        # --- VCF 9.1 API path ---
+        use_v91 = (vcf_version == '9.1')
+        
+        if not version_explicit:
+            if lsf.test_tcp_port(ops_fqdn, 443, timeout=10):
+                vcf_write(lsf, f'Probing {ops_fqdn} for VCF 9.1 internal components API...')
+                if fleet.probe_vcf_91(ops_fqdn, password=password):
+                    vcf_write(lsf, 'VCF 9.1 internal components API detected (auto-probe)')
+                    use_v91 = True
+                else:
+                    vcf_write(lsf, 'VCF 9.1 internal components API not detected, using VCF 9.0 API')
             else:
-                vcf_write(lsf, 'VCF 9.1 Fleet LCM plugin not detected, using VCF 9.0 API')
-        else:
-            vcf_write(lsf, f'{ops_fqdn} not reachable, using VCF 9.0 API')
-    
-    if use_v91:
-        vcf_write(lsf, f'Using VCF 9.1 Fleet LCM plugin API via {ops_fqdn}')
+                vcf_write(lsf, f'{ops_fqdn} not reachable, using VCF 9.0 API')
         
-        if not dry_run:
-            try:
-                vcf_write(lsf, f'Acquiring JWT token from {ops_fqdn} suite-api...')
-                jwt_token = fleet.get_ops_jwt_token(ops_fqdn, ops_username, password)
-                vcf_write(lsf, 'JWT token acquired successfully')
-                
-                success = fleet.shutdown_products_v91(ops_fqdn, jwt_token,
-                                                      fleet_products,
-                                                      write_output=lsf.write_output)
-                if success:
-                    vcf_write(lsf, 'Fleet LCM (VCF 9.1) products shutdown complete')
-                    fleet_api_succeeded = True
-                else:
-                    vcf_write(lsf, 'WARNING: Some Fleet LCM products may not have shutdown cleanly')
-                    vcf_write(lsf, '(Products will be shut down via VM power-off in later phases)')
-            except Exception as e:
-                vcf_write(lsf, f'Fleet LCM (VCF 9.1) shutdown error: {e}')
-                if not version_explicit:
-                    vcf_write(lsf, 'Falling back to VCF 9.0 legacy API...')
-                    use_v91 = False
-                else:
-                    vcf_write(lsf, 'VCF version explicitly set to 9.1, not falling back to 9.0')
-        else:
-            vcf_write(lsf, f'Would shutdown Fleet products via VCF 9.1 API: {fleet_products}')
-    
-    # --- VCF 9.0 API path (used when 9.1 is not available or as fallback) ---
-    if not use_v91 and not fleet_api_succeeded:
-        vcf_write(lsf, f'Using VCF 9.0 legacy Fleet API via {fleet_fqdn}')
-        
-        if lsf.test_tcp_port(fleet_fqdn, 443, timeout=10):
-            vcf_write(lsf, f'Fleet Management available at {fleet_fqdn}')
+        if use_v91:
+            vcf_write(lsf, f'Using VCF 9.1 internal components API via {ops_fqdn}')
             
             if not dry_run:
                 try:
-                    token = fleet.get_encoded_token(fleet_username, password)
-                    success = fleet.shutdown_products(fleet_fqdn, token, fleet_products,
-                                                      write_output=lsf.write_output,
-                                                      skip_inventory_sync=True)
+                    vcf_write(lsf, f'Acquiring OpsToken from {ops_fqdn} suite-api...')
+                    jwt_token = fleet.get_ops_jwt_token(ops_fqdn, ops_username, password)
+                    vcf_write(lsf, 'OpsToken acquired successfully')
+                    
+                    def _fleet_log(msg):
+                        vcf_write(lsf, msg)
+                    
+                    success = fleet.shutdown_products_v91(ops_fqdn, jwt_token,
+                                                          fleet_products,
+                                                          write_output=_fleet_log)
                     if success:
-                        vcf_write(lsf, 'Fleet Operations (VCF 9.0) products shutdown complete')
+                        vcf_write(lsf, 'Fleet LCM (VCF 9.1) API shutdown complete')
                         fleet_api_succeeded = True
                     else:
-                        vcf_write(lsf, 'WARNING: Some Fleet Operations products may not have shutdown cleanly')
-                        vcf_write(lsf, '(Products will be shut down via VM power-off in later phases)')
+                        vcf_write(lsf, 'Fleet LCM API shutdown not available through suite-api proxy')
+                        vcf_write(lsf, 'VCF Automation VMs will be shut down directly in Phase 1b')
                 except Exception as e:
-                    vcf_write(lsf, f'Fleet Operations (VCF 9.0) shutdown error: {e}')
+                    vcf_write(lsf, f'Fleet LCM (VCF 9.1) shutdown error: {e}')
+                    if not version_explicit:
+                        vcf_write(lsf, 'Falling back to VCF 9.0 legacy API...')
+                        use_v91 = False
+                    else:
+                        vcf_write(lsf, 'VCF version explicitly set to 9.1, not falling back to 9.0')
             else:
-                vcf_write(lsf, f'Would shutdown Fleet products via VCF 9.0 API: {fleet_products}')
-        else:
-            vcf_write(lsf, f'Fleet Management not reachable at {fleet_fqdn}, skipping')
-            vcf_write(lsf, 'VCF Automation VMs will be shut down directly in Phase 1b')
-    
-    #==========================================================================
-    # TASK 2: Connect to vCenters and Management Hosts
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 2: Connect to Management Infrastructure')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(2, 'Connect to Infrastructure', dry_run)
-    
-    # Get list of vCenters
-    vcenters = []
-    if lsf.config.has_option('RESOURCES', 'vCenters'):
-        vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
-        vcenters = [v.strip() for v in vcenters_raw.split('\n') 
-                   if v.strip() and not v.strip().startswith('#')]
-    
-    # Get list of ESXi hosts
-    mgmt_hosts = []
-    if lsf.config.has_option('VCF', 'vcfmgmtcluster'):
-        mgmt_hosts_raw = lsf.config.get('VCF', 'vcfmgmtcluster')
-        mgmt_hosts = [h.strip() for h in mgmt_hosts_raw.split('\n') 
-                     if h.strip() and not h.strip().startswith('#')]
-    
-    if not dry_run:
-        # Connect to management cluster hosts first (for VM operations)
-        if mgmt_hosts:
-            vcf_write(lsf, f'Connecting to {len(mgmt_hosts)} management host(s):')
-            for host in mgmt_hosts:
-                vcf_write(lsf, f'  - {host}')
-            lsf.connect_vcenters(mgmt_hosts)
-            vcf_write(lsf, f'Connected to {len(lsf.sis)} vSphere endpoint(s)')
-        else:
-            vcf_write(lsf, 'No management hosts configured in VCF section')
+                vcf_write(lsf, f'Would shutdown Fleet products via VCF 9.1 API: {fleet_products}')
+        
+        # --- VCF 9.0 API path (used when 9.1 is not available or as fallback) ---
+        if not use_v91 and not fleet_api_succeeded:
+            vcf_write(lsf, f'Using VCF 9.0 legacy Fleet API via {fleet_fqdn}')
+            
+            if lsf.test_tcp_port(fleet_fqdn, 443, timeout=10):
+                vcf_write(lsf, f'Fleet Management available at {fleet_fqdn}')
+                
+                if not dry_run:
+                    try:
+                        token = fleet.get_encoded_token(fleet_username, password)
+                        success = fleet.shutdown_products(fleet_fqdn, token, fleet_products,
+                                                          write_output=lsf.write_output,
+                                                          skip_inventory_sync=True)
+                        if success:
+                            vcf_write(lsf, 'Fleet Operations (VCF 9.0) products shutdown complete')
+                            fleet_api_succeeded = True
+                        else:
+                            vcf_write(lsf, 'WARNING: Some Fleet Operations products may not have shutdown cleanly')
+                            vcf_write(lsf, '(Products will be shut down via VM power-off in later phases)')
+                    except Exception as e:
+                        vcf_write(lsf, f'Fleet Operations (VCF 9.0) shutdown error: {e}')
+                else:
+                    vcf_write(lsf, f'Would shutdown Fleet products via VCF 9.0 API: {fleet_products}')
+            else:
+                vcf_write(lsf, f'Fleet Management not reachable at {fleet_fqdn}, skipping')
+                vcf_write(lsf, 'VCF Automation VMs will be shut down directly in Phase 1b')
     
     #==========================================================================
     # TASK 1b: VCF Automation VM fallback shutdown
-    # When Fleet Operations API is unreachable (Phase 1), VCF Automation
-    # VMs must be shut down directly. VM names come from [VCFFINAL] vravms.
+    # When Fleet Operations API fails to shut down VCF Automation (Phase 1),
+    # the VMs must be shut down directly. VM names come from [VCFFINAL] vravms.
+    # This runs BEFORE connecting to infrastructure (Phase 2) so that it
+    # follows Phase 1 in the logical shutdown sequence.
     #==========================================================================
     
-    if not fleet_api_succeeded:
-        vcf_write(lsf, '='*60)
-        vcf_write(lsf, 'PHASE 1b: Shutdown VCF Automation VMs (Fleet API fallback)')
-        vcf_write(lsf, '='*60)
-        update_shutdown_status(1, 'Shutdown VCF Automation VMs', dry_run)
-        
-        vra_vm_patterns = []
-        if lsf.config.has_option('VCFFINAL', 'vravms'):
-            vra_raw = lsf.config.get('VCFFINAL', 'vravms')
-            for entry in vra_raw.split('\n'):
-                entry = entry.strip()
-                if entry and not entry.startswith('#'):
-                    vm_pattern = entry.split(':')[0].strip()
-                    if vm_pattern:
-                        vra_vm_patterns.append(vm_pattern)
-        
-        if vra_vm_patterns:
-            vcf_write(lsf, f'Found {len(vra_vm_patterns)} VCF Automation VM pattern(s) from [VCFFINAL] vravms')
-            if not dry_run:
-                for pattern in vra_vm_patterns:
-                    vcf_write(lsf, f'  Searching for VMs matching: {pattern}')
-                    vms = lsf.get_vm_match(pattern)
-                    if vms:
-                        vcf_write(lsf, f'  Found {len(vms)} VM(s)')
-                        for vm in vms:
-                            # Skip sddcmanager - it has its own phase (16)
-                            if 'sddcmanager' in vm.name.lower():
-                                vcf_write(lsf, f'  {vm.name}: Skipping (handled in Phase 16)')
-                                continue
-                            shutdown_vm_gracefully(lsf, vm)
-                            time.sleep(5)
-                    else:
-                        vcf_write(lsf, f'  No VMs found matching pattern')
-                vcf_write(lsf, 'VCF Automation VM fallback shutdown complete')
+    if should_run('1b'):
+        if not fleet_api_succeeded:
+            vcf_write(lsf, '='*60)
+            vcf_write(lsf, 'PHASE 1b: Shutdown VCF Automation VMs (Fleet API fallback)')
+            vcf_write(lsf, '='*60)
+            update_shutdown_status(1, 'Shutdown VCF Automation VMs', dry_run)
+            
+            vcf_write(lsf, 'Fleet API did not fully succeed - connecting to vCenters for VM shutdown...')
+            
+            vcenters_for_1b = []
+            if lsf.config.has_option('RESOURCES', 'vCenters'):
+                vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
+                vcenters_for_1b = [v.strip() for v in vcenters_raw.split('\n')
+                                  if v.strip() and not v.strip().startswith('#')]
+            
+            if vcenters_for_1b and not dry_run and not lsf.sis:
+                vcf_write(lsf, f'Connecting to {len(vcenters_for_1b)} vCenter(s) for Phase 1b:')
+                for vc in vcenters_for_1b:
+                    vcf_write(lsf, f'  - {vc}')
+                lsf.connect_vcenters(vcenters_for_1b)
+                vcf_write(lsf, f'Connected to {len(lsf.sis)} vSphere endpoint(s)')
+            
+            vra_vm_patterns = []
+            if lsf.config.has_option('VCFFINAL', 'vravms'):
+                vra_raw = lsf.config.get('VCFFINAL', 'vravms')
+                for entry in vra_raw.split('\n'):
+                    entry = entry.strip()
+                    if entry and not entry.startswith('#'):
+                        vm_pattern = entry.split(':')[0].strip()
+                        if vm_pattern:
+                            vra_vm_patterns.append(vm_pattern)
+            
+            if vra_vm_patterns:
+                vcf_write(lsf, f'Found {len(vra_vm_patterns)} VCF Automation VM pattern(s) from [VCFFINAL] vravms')
+                if not dry_run:
+                    for pattern in vra_vm_patterns:
+                        vcf_write(lsf, f'  Searching for VMs matching: {pattern}')
+                        vms = lsf.get_vm_match(pattern)
+                        if vms:
+                            vcf_write(lsf, f'  Found {len(vms)} VM(s)')
+                            for vm in vms:
+                                if 'sddcmanager' in vm.name.lower():
+                                    vcf_write(lsf, f'  {vm.name}: Skipping (handled in Phase 16)')
+                                    continue
+                                shutdown_vm_gracefully(lsf, vm)
+                                time.sleep(5)
+                        else:
+                            vcf_write(lsf, f'  No VMs found matching pattern')
+                    vcf_write(lsf, 'VCF Automation VM fallback shutdown complete')
+                else:
+                    vcf_write(lsf, f'Would shutdown VCF Automation VMs: {vra_vm_patterns}')
             else:
-                vcf_write(lsf, f'Would shutdown VCF Automation VMs: {vra_vm_patterns}')
+                vcf_write(lsf, 'No VCF Automation VMs configured in [VCFFINAL] vravms')
         else:
-            vcf_write(lsf, 'No VCF Automation VMs configured in [VCFFINAL] vravms')
-    else:
-        vcf_write(lsf, '')
-        vcf_write(lsf, 'Phase 1b: Skipped (Fleet API handled VCF Automation shutdown)')
+            vcf_write(lsf, '')
+            vcf_write(lsf, 'Phase 1b: Skipped (Fleet API handled VCF Automation shutdown)')
+    
+    #==========================================================================
+    # TASK 2: Connect to vCenters and Management Infrastructure
+    # Connect to vCenters first (while they are still available) for all
+    # subsequent VM shutdown operations. ESXi host direct connections are
+    # only needed after vCenters are shut down (Phase 17+).
+    #==========================================================================
+    
+    if should_run('2'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 2: Connect to Management Infrastructure')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(2, 'Connect to Infrastructure', dry_run)
+        
+        vcenters = []
+        if lsf.config.has_option('RESOURCES', 'vCenters'):
+            vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
+            vcenters = [v.strip() for v in vcenters_raw.split('\n') 
+                       if v.strip() and not v.strip().startswith('#')]
+        
+        if not dry_run:
+            if vcenters and not lsf.sis:
+                vcf_write(lsf, f'Connecting to {len(vcenters)} vCenter(s):')
+                for vc in vcenters:
+                    vcf_write(lsf, f'  - {vc}')
+                lsf.connect_vcenters(vcenters)
+                vcf_write(lsf, f'Connected to {len(lsf.sis)} vSphere endpoint(s)')
+            elif lsf.sis:
+                vcf_write(lsf, f'Already connected to {len(lsf.sis)} vSphere endpoint(s) (from Phase 1b)')
+            elif mgmt_hosts:
+                vcf_write(lsf, 'No vCenters configured, falling back to ESXi host connections')
+                vcf_write(lsf, f'Connecting to {len(mgmt_hosts)} management host(s):')
+                for host in mgmt_hosts:
+                    vcf_write(lsf, f'  - {host}')
+                lsf.connect_vcenters(mgmt_hosts)
+                vcf_write(lsf, f'Connected to {len(lsf.sis)} vSphere endpoint(s)')
+            else:
+                vcf_write(lsf, 'No vCenters or management hosts configured')
     
     #==========================================================================
     # TASK 2b: Scale down VCF Component Services on VSP management cluster
@@ -817,1245 +903,1217 @@ def main(lsf=None, standalone=False, dry_run=False):
     # ESXi hosts are shut down. Also annotates Component CRDs as NotRunning.
     #==========================================================================
     
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 2b: Scale Down VCF Component Services (K8s on VSP)')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(2, 'Scale Down VCF Component Services', dry_run)
-    
-    vcfcomponents = []
-    if lsf.config.has_option('VCFFINAL', 'vcfcomponents'):
-        comp_raw = lsf.config.get('VCFFINAL', 'vcfcomponents')
-        vcfcomponents = [c.strip() for c in comp_raw.split('\n')
-                         if c.strip() and not c.strip().startswith('#')]
-    
-    if vcfcomponents:
-        vcf_write(lsf, f'Found {len(vcfcomponents)} VCF Component(s) to scale down')
-        
-        if not dry_run:
-            import socket
-            
-            vsp_control_plane_ip = None
-            vsp_user = 'vmware-system-user'
-            
-            # Check for static override first
-            if lsf.config.has_option('VCFFINAL', 'vspcontrolplaneip'):
-                vsp_control_plane_ip = lsf.config.get('VCFFINAL', 'vspcontrolplaneip').strip()
+    if should_run('2b'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 2b: Scale Down VCF Component Services (K8s on VSP)')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(2, 'Scale Down VCF Component Services', dry_run)
+
+        vcfcomponents = []
+        if lsf.config.has_option('VCFFINAL', 'vcfcomponents'):
+            comp_raw = lsf.config.get('VCFFINAL', 'vcfcomponents')
+            vcfcomponents = [c.strip() for c in comp_raw.split('\n')
+                             if c.strip() and not c.strip().startswith('#')]
+
+        if vcfcomponents:
+            vcf_write(lsf, f'Found {len(vcfcomponents)} VCF Component(s) to scale down')
+
+            if not dry_run:
+                import socket
+
+                vsp_control_plane_ip = None
+                vsp_user = 'vmware-system-user'
+
+                # Check for static override first
+                if lsf.config.has_option('VCFFINAL', 'vspcontrolplaneip'):
+                    vsp_control_plane_ip = lsf.config.get('VCFFINAL', 'vspcontrolplaneip').strip()
+                    if vsp_control_plane_ip:
+                        vcf_write(lsf, f'  VSP control plane IP (from config): {vsp_control_plane_ip}')
+
+                # Auto-discover VSP control plane via DNS + SSH
+                if not vsp_control_plane_ip:
+                    vsp_candidates = ['vsp-01a.site-a.vcf.lab']
+                    for candidate in vsp_candidates:
+                        try:
+                            worker_ip = socket.gethostbyname(candidate)
+                            vcf_write(lsf, f'  VSP worker: {candidate} -> {worker_ip}')
+                            result = lsf.ssh(
+                                f"echo '{password}' | sudo -S grep server: /etc/kubernetes/node-agent.conf",
+                                f'{vsp_user}@{worker_ip}'
+                            )
+                            if hasattr(result, 'stdout') and result.stdout:
+                                import re as _re
+                                for line in result.stdout.strip().split('\n'):
+                                    if 'server:' in line:
+                                        match = _re.search(r'https?://([0-9.]+):', line)
+                                        if match:
+                                            vsp_control_plane_ip = match.group(1)
+                                            vcf_write(lsf, f'  VSP control plane IP: {vsp_control_plane_ip}')
+                                            break
+                            if vsp_control_plane_ip:
+                                break
+                        except Exception as e:
+                            vcf_write(lsf, f'  VSP discovery failed for {candidate}: {e}')
+
                 if vsp_control_plane_ip:
-                    vcf_write(lsf, f'  VSP control plane IP (from config): {vsp_control_plane_ip}')
-            
-            # Auto-discover VSP control plane via DNS + SSH
-            if not vsp_control_plane_ip:
-                vsp_candidates = ['vsp-01a.site-a.vcf.lab']
-                for candidate in vsp_candidates:
-                    try:
-                        worker_ip = socket.gethostbyname(candidate)
-                        vcf_write(lsf, f'  VSP worker: {candidate} -> {worker_ip}')
-                        result = lsf.ssh(
-                            f"echo '{password}' | sudo -S grep server: /etc/kubernetes/node-agent.conf",
-                            f'{vsp_user}@{worker_ip}'
+                    # Detect sudo mode
+                    sudo_needs_password = True
+                    sudo_check = lsf.ssh('sudo -n true', f'{vsp_user}@{vsp_control_plane_ip}')
+                    if hasattr(sudo_check, 'returncode') and sudo_check.returncode == 0:
+                        sudo_needs_password = False
+
+                    def vsp_kubectl(kubectl_cmd):
+                        if sudo_needs_password:
+                            ssh_cmd = f"echo '{password}' | sudo -S -i bash -c '{kubectl_cmd}'"
+                        else:
+                            ssh_cmd = f"sudo -i bash -c '{kubectl_cmd}'"
+                        return lsf.ssh(ssh_cmd, f'{vsp_user}@{vsp_control_plane_ip}')
+
+                    # Scale down each component to 0 replicas (reverse order from startup)
+                    scaled_down = 0
+                    already_stopped = 0
+                    errors = 0
+
+                    for entry in reversed(vcfcomponents):
+                        parts = entry.split(':', 1)
+                        if len(parts) != 2 or '/' not in parts[1]:
+                            vcf_write(lsf, f'  WARNING: Invalid vcfcomponents entry: {entry}')
+                            errors += 1
+                            continue
+
+                        namespace = parts[0].strip()
+                        resource = parts[1].strip()
+
+                        # Check current replica count
+                        check_cmd = f'kubectl get {resource} -n {namespace} -o jsonpath="{{.spec.replicas}}"'
+                        check_result = vsp_kubectl(check_cmd)
+                        current_replicas = ''
+                        if hasattr(check_result, 'stdout') and check_result.stdout:
+                            current_replicas = check_result.stdout.strip().split('\n')[-1].strip()
+
+                        if current_replicas == '0':
+                            vcf_write(lsf, f'  {namespace}/{resource}: already stopped (replicas=0)')
+                            already_stopped += 1
+                            continue
+
+                        vcf_write(lsf, f'  Scaling down: {namespace}/{resource} (was replicas={current_replicas})')
+                        scale_cmd = f'kubectl scale {resource} -n {namespace} --replicas=0'
+                        scale_result = vsp_kubectl(scale_cmd)
+
+                        if hasattr(scale_result, 'returncode') and scale_result.returncode == 0:
+                            scaled_down += 1
+                        else:
+                            err = ''
+                            if hasattr(scale_result, 'stderr') and scale_result.stderr:
+                                err = scale_result.stderr.strip()[:200]
+                            vcf_write(lsf, f'  WARNING: Failed to scale down {namespace}/{resource}: {err}')
+                            errors += 1
+
+                    # Annotate Component CRDs as NotRunning
+                    if scaled_down > 0:
+                        vcf_write(lsf, '  Updating Component CRD annotations to NotRunning...')
+                        comp_list = vsp_kubectl(
+                            'kubectl get components.api.vmsp.vmware.com -A '
+                            '-o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,'
+                            'STATUS:.metadata.annotations.component\\.vmsp\\.vmware\\.com/operational-status '
+                            '--no-headers'
                         )
-                        if hasattr(result, 'stdout') and result.stdout:
-                            import re as _re
-                            for line in result.stdout.strip().split('\n'):
-                                if 'server:' in line:
-                                    match = _re.search(r'https?://([0-9.]+):', line)
-                                    if match:
-                                        vsp_control_plane_ip = match.group(1)
-                                        vcf_write(lsf, f'  VSP control plane IP: {vsp_control_plane_ip}')
-                                        break
-                        if vsp_control_plane_ip:
-                            break
-                    except Exception as e:
-                        vcf_write(lsf, f'  VSP discovery failed for {candidate}: {e}')
-            
-            if vsp_control_plane_ip:
-                # Detect sudo mode
-                sudo_needs_password = True
-                sudo_check = lsf.ssh('sudo -n true', f'{vsp_user}@{vsp_control_plane_ip}')
-                if hasattr(sudo_check, 'returncode') and sudo_check.returncode == 0:
-                    sudo_needs_password = False
-                
-                def vsp_kubectl(kubectl_cmd):
-                    if sudo_needs_password:
-                        ssh_cmd = f"echo '{password}' | sudo -S -i bash -c '{kubectl_cmd}'"
-                    else:
-                        ssh_cmd = f"sudo -i bash -c '{kubectl_cmd}'"
-                    return lsf.ssh(ssh_cmd, f'{vsp_user}@{vsp_control_plane_ip}')
-                
-                # Scale down each component to 0 replicas (reverse order from startup)
-                scaled_down = 0
-                already_stopped = 0
-                errors = 0
-                
-                for entry in reversed(vcfcomponents):
-                    parts = entry.split(':', 1)
-                    if len(parts) != 2 or '/' not in parts[1]:
-                        vcf_write(lsf, f'  WARNING: Invalid vcfcomponents entry: {entry}')
-                        errors += 1
-                        continue
-                    
-                    namespace = parts[0].strip()
-                    resource = parts[1].strip()
-                    
-                    # Check current replica count
-                    check_cmd = f'kubectl get {resource} -n {namespace} -o jsonpath="{{.spec.replicas}}"'
-                    check_result = vsp_kubectl(check_cmd)
-                    current_replicas = ''
-                    if hasattr(check_result, 'stdout') and check_result.stdout:
-                        current_replicas = check_result.stdout.strip().split('\n')[-1].strip()
-                    
-                    if current_replicas == '0':
-                        vcf_write(lsf, f'  {namespace}/{resource}: already stopped (replicas=0)')
-                        already_stopped += 1
-                        continue
-                    
-                    vcf_write(lsf, f'  Scaling down: {namespace}/{resource} (was replicas={current_replicas})')
-                    scale_cmd = f'kubectl scale {resource} -n {namespace} --replicas=0'
-                    scale_result = vsp_kubectl(scale_cmd)
-                    
-                    if hasattr(scale_result, 'returncode') and scale_result.returncode == 0:
-                        scaled_down += 1
-                    else:
-                        err = ''
-                        if hasattr(scale_result, 'stderr') and scale_result.stderr:
-                            err = scale_result.stderr.strip()[:200]
-                        vcf_write(lsf, f'  WARNING: Failed to scale down {namespace}/{resource}: {err}')
-                        errors += 1
-                
-                # Annotate Component CRDs as NotRunning
-                if scaled_down > 0:
-                    vcf_write(lsf, '  Updating Component CRD annotations to NotRunning...')
-                    comp_list = vsp_kubectl(
-                        'kubectl get components.api.vmsp.vmware.com -A '
+                        if hasattr(comp_list, 'stdout') and comp_list.stdout:
+                            for line in comp_list.stdout.strip().split('\n'):
+                                cols = line.split()
+                                if len(cols) >= 3 and cols[2] == 'Running':
+                                    crd_ns, crd_name = cols[0], cols[1]
+                                    vcf_write(lsf, f'  Annotating {crd_ns}/{crd_name} -> NotRunning')
+                                    vsp_kubectl(
+                                        f'kubectl annotate components.api.vmsp.vmware.com '
+                                        f'{crd_name} -n {crd_ns} '
+                                        f'component.vmsp.vmware.com/operational-status=NotRunning --overwrite'
+                                    )
+
+                    # Suspend postgres instances (reverse of startup unsuspend)
+                    # Two-step process:
+                    #   1. Set suspended label on PostgresInstance CRD
+                    #   2. Scale Zalando postgres CRD numberOfInstances to 0
+                    # Both are needed for clean shutdown and matching startup unsuspend.
+                    vcf_write(lsf, '  Suspending Postgres instances...')
+                    pg_check = vsp_kubectl(
+                        'kubectl get postgresinstances.database.vmsp.vmware.com -A '
                         '-o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,'
-                        'STATUS:.metadata.annotations.component\\.vmsp\\.vmware\\.com/operational-status '
+                        'SUSPENDED:.metadata.labels.database\\.vmsp\\.vmware\\.com/suspended '
                         '--no-headers'
                     )
-                    if hasattr(comp_list, 'stdout') and comp_list.stdout:
-                        for line in comp_list.stdout.strip().split('\n'):
+                    if hasattr(pg_check, 'stdout') and pg_check.stdout:
+                        for line in pg_check.stdout.strip().split('\n'):
                             cols = line.split()
-                            if len(cols) >= 3 and cols[2] == 'Running':
-                                crd_ns, crd_name = cols[0], cols[1]
-                                vcf_write(lsf, f'  Annotating {crd_ns}/{crd_name} -> NotRunning')
-                                vsp_kubectl(
-                                    f'kubectl annotate components.api.vmsp.vmware.com '
-                                    f'{crd_name} -n {crd_ns} '
-                                    f'component.vmsp.vmware.com/operational-status=NotRunning --overwrite'
-                                )
-                
-                # Suspend postgres instances (reverse of startup unsuspend)
-                # Two-step process:
-                #   1. Set suspended label on PostgresInstance CRD
-                #   2. Scale Zalando postgres CRD numberOfInstances to 0
-                # Both are needed for clean shutdown and matching startup unsuspend.
-                vcf_write(lsf, '  Suspending Postgres instances...')
-                pg_check = vsp_kubectl(
-                    'kubectl get postgresinstances.database.vmsp.vmware.com -A '
-                    '-o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,'
-                    'SUSPENDED:.metadata.labels.database\\.vmsp\\.vmware\\.com/suspended '
-                    '--no-headers'
-                )
-                if hasattr(pg_check, 'stdout') and pg_check.stdout:
-                    for line in pg_check.stdout.strip().split('\n'):
-                        cols = line.split()
-                        if len(cols) >= 2:
-                            pg_ns, pg_name = cols[0], cols[1]
-                            suspended = cols[2] if len(cols) >= 3 else '<none>'
-                            if suspended != 'true':
-                                vcf_write(lsf, f'  Suspending Postgres: {pg_ns}/{pg_name}')
-                                vsp_kubectl(
-                                    f'kubectl label postgresinstances.database.vmsp.vmware.com '
-                                    f'{pg_name} -n {pg_ns} database.vmsp.vmware.com/suspended=true --overwrite'
-                                )
-                                patch_json = '{"spec":{"numberOfInstances":0}}'
-                                vsp_kubectl(
-                                    f"kubectl patch postgresqls.acid.zalan.do {pg_name} -n {pg_ns} "
-                                    f"--type=merge -p '{patch_json}'"
-                                )
-                
-                vcf_write(lsf, f'VCF Component Services: {scaled_down} scaled down, '
-                          f'{already_stopped} already stopped, {errors} errors '
-                          f'(of {len(vcfcomponents)} total)')
+                            if len(cols) >= 2:
+                                pg_ns, pg_name = cols[0], cols[1]
+                                suspended = cols[2] if len(cols) >= 3 else '<none>'
+                                if suspended != 'true':
+                                    vcf_write(lsf, f'  Suspending Postgres: {pg_ns}/{pg_name}')
+                                    vsp_kubectl(
+                                        f'kubectl label postgresinstances.database.vmsp.vmware.com '
+                                        f'{pg_name} -n {pg_ns} database.vmsp.vmware.com/suspended=true --overwrite'
+                                    )
+                                    patch_json = '{"spec":{"numberOfInstances":0}}'
+                                    vsp_kubectl(
+                                        f"kubectl patch postgresqls.acid.zalan.do {pg_name} -n {pg_ns} "
+                                        f"--type=merge -p '{patch_json}'"
+                                    )
+
+                    vcf_write(lsf, f'VCF Component Services: {scaled_down} scaled down, '
+                              f'{already_stopped} already stopped, {errors} errors '
+                              f'(of {len(vcfcomponents)} total)')
+                else:
+                    vcf_write(lsf, '  VSP control plane not reachable - skipping component scale-down')
+                    vcf_write(lsf, '  (Components will be stopped when VSP VMs are powered off)')
             else:
-                vcf_write(lsf, '  VSP control plane not reachable - skipping component scale-down')
-                vcf_write(lsf, '  (Components will be stopped when VSP VMs are powered off)')
+                vcf_write(lsf, f'Would scale down {len(vcfcomponents)} VCF component(s) (dry run)')
         else:
-            vcf_write(lsf, f'Would scale down {len(vcfcomponents)} VCF component(s) (dry run)')
-    else:
-        vcf_write(lsf, 'No VCF Components configured in [VCFFINAL] vcfcomponents')
-    
-    #==========================================================================
-    # TASK 3: Stop WCP on vCenters
-    # Determined from [VCFFINAL] tanzucontrol (same config used by VCFfinal.py)
-    # This eliminates redundant config entries and reduces errors
+            vcf_write(lsf, 'No VCF Components configured in [VCFFINAL] vcfcomponents')
+
+        #==========================================================================
+        # TASK 3: Stop WCP on vCenters
+        # Determined from [VCFFINAL] tanzucontrol (same config used by VCFfinal.py)
+        # This eliminates redundant config entries and reduces errors
     #==========================================================================
     
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 3: Stop Workload Control Plane (WCP)')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(3, 'Stop WCP Services', dry_run)
-    
-    # Determine WCP vCenters from [VCFFINAL] tanzucontrol config
-    # Format: vmname:vcenter or vmname (regex patterns supported)
-    # Extract unique vCenter names from the tanzucontrol entries
-    wcp_vcenters = []
-    
-    if lsf.config.has_option('VCFFINAL', 'tanzucontrol'):
-        # Parse tanzucontrol to extract vCenter names
-        tanzu_raw = lsf.config.get('VCFFINAL', 'tanzucontrol')
-        seen_vcenters = set()
-        for entry in tanzu_raw.split('\n'):
-            entry = entry.strip()
-            if entry and not entry.startswith('#'):
-                # Format: vmname:vcenter or just vmname
-                if ':' in entry:
-                    parts = entry.split(':')
-                    if len(parts) >= 2:
-                        vc = parts[1].strip()
-                        if vc and vc not in seen_vcenters:
-                            wcp_vcenters.append(vc)
-                            seen_vcenters.add(vc)
-        
-        if wcp_vcenters:
-            vcf_write(lsf, f'WCP vCenters from tanzucontrol config: {wcp_vcenters}')
+    if should_run('3'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 3: Stop Workload Control Plane (WCP)')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(3, 'Stop WCP Services', dry_run)
+
+        # Determine WCP vCenters from [VCFFINAL] tanzucontrol config
+        # Format: vmname:vcenter or vmname (regex patterns supported)
+        # Extract unique vCenter names from the tanzucontrol entries
+        wcp_vcenters = []
+
+        if lsf.config.has_option('VCFFINAL', 'tanzucontrol'):
+            # Parse tanzucontrol to extract vCenter names
+            tanzu_raw = lsf.config.get('VCFFINAL', 'tanzucontrol')
+            seen_vcenters = set()
+            for entry in tanzu_raw.split('\n'):
+                entry = entry.strip()
+                if entry and not entry.startswith('#'):
+                    # Format: vmname:vcenter or just vmname
+                    if ':' in entry:
+                        parts = entry.split(':')
+                        if len(parts) >= 2:
+                            vc = parts[1].strip()
+                            if vc and vc not in seen_vcenters:
+                                wcp_vcenters.append(vc)
+                                seen_vcenters.add(vc)
+
+            if wcp_vcenters:
+                vcf_write(lsf, f'WCP vCenters from tanzucontrol config: {wcp_vcenters}')
+            else:
+                vcf_write(lsf, 'tanzucontrol configured but no vCenters specified')
         else:
-            vcf_write(lsf, 'tanzucontrol configured but no vCenters specified')
-    else:
-        vcf_write(lsf, 'No tanzucontrol in [VCFFINAL] - WCP not configured')
-    
-    if wcp_vcenters and not dry_run:
-        vcf_write(lsf, f'Found {len(wcp_vcenters)} vCenter(s) with WCP to stop')
-        for vc in wcp_vcenters:
-            vcf_write(lsf, f'Checking WCP on {vc}...')
-            if lsf.test_tcp_port(vc, 443, timeout=10):
-                shutdown_wcp_service(lsf, vc, password)
-            else:
-                vcf_write(lsf, f'{vc} not reachable, skipping WCP stop')
-    elif dry_run:
-        vcf_write(lsf, f'Would stop WCP on: {wcp_vcenters}')
-    elif not wcp_vcenters:
-        vcf_write(lsf, 'No WCP vCenters to stop - skipping')
-    
-    #==========================================================================
-    # TASK 4: Shutdown Workload VMs
+            vcf_write(lsf, 'No tanzucontrol in [VCFFINAL] - WCP not configured')
+
+        if wcp_vcenters and not dry_run:
+            vcf_write(lsf, f'Found {len(wcp_vcenters)} vCenter(s) with WCP to stop')
+            for vc in wcp_vcenters:
+                vcf_write(lsf, f'Checking WCP on {vc}...')
+                if lsf.test_tcp_port(vc, 443, timeout=10):
+                    shutdown_wcp_service(lsf, vc, password)
+                else:
+                    vcf_write(lsf, f'{vc} not reachable, skipping WCP stop')
+        elif dry_run:
+            vcf_write(lsf, f'Would stop WCP on: {wcp_vcenters}')
+        elif not wcp_vcenters:
+            vcf_write(lsf, 'No WCP vCenters to stop - skipping')
+
+        #==========================================================================
+        # TASK 4: Shutdown Workload VMs
     #==========================================================================
     
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 4: Shutdown Workload VMs')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(4, 'Shutdown Workload VMs', dry_run)
-    
-    # VM regex patterns to find and shutdown (Tanzu, K8s, etc.)
-    # Order follows VCF docs: containerized workloads → Supervisor → TKG
-    vm_patterns = [
-        r'^kubernetes-cluster-.*$',  # TKGs clusters (worker nodes)
-        r'^dev-project-.*$',  # vSphere with Tanzu projects
-        r'^cci-service-.*$',  # CCI services
-        r'^SupervisorControlPlaneVM.*$',  # Supervisor Control Plane VMs
-    ]
-    
-    if lsf.config.has_option('SHUTDOWN', 'vm_patterns'):
-        patterns_raw = lsf.config.get('SHUTDOWN', 'vm_patterns')
-        vm_patterns = [p.strip() for p in patterns_raw.split('\n') 
-                      if p.strip() and not p.strip().startswith('#')]
-    
-    # Static VM list (specific VMs to shutdown)
-    workload_vms = []
-    if lsf.config.has_option('SHUTDOWN', 'workload_vms'):
-        vms_raw = lsf.config.get('SHUTDOWN', 'workload_vms')
-        workload_vms = [v.strip() for v in vms_raw.split('\n') 
-                       if v.strip() and not v.strip().startswith('#')]
-    
-    if not dry_run:
-        total_workload_vms = 0
-        
-        # Find VMs by pattern
-        vcf_write(lsf, f'Searching for VMs matching {len(vm_patterns)} pattern(s)...')
-        for pattern in vm_patterns:
-            vcf_write(lsf, f'  Pattern: {pattern}')
-            vms = get_vms_by_regex(lsf, pattern)
-            if vms:
-                vcf_write(lsf, f'  Found {len(vms)} VM(s) matching pattern')
-                for vm in vms:
-                    total_workload_vms += 1
-                    vcf_write(lsf, f'  [{total_workload_vms}] Shutting down: {vm.name}')
-                    shutdown_vm_gracefully(lsf, vm)
-                    time.sleep(2)  # Brief pause between shutdowns
-            else:
-                vcf_write(lsf, f'  No VMs found matching this pattern')
-        
-        # Shutdown static VM list
-        if workload_vms:
-            vcf_write(lsf, f'Processing {len(workload_vms)} static workload VM(s)...')
-            for vm_name in workload_vms:
-                vcf_write(lsf, f'  Looking for VM: {vm_name}')
-                vms = lsf.get_vm_by_name(vm_name)
+    if should_run('4'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 4: Shutdown Workload VMs')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(4, 'Shutdown Workload VMs', dry_run)
+
+        # VM regex patterns to find and shutdown (Tanzu, K8s, etc.)
+        # Order follows VCF docs: containerized workloads → Supervisor → TKG
+        vm_patterns = [
+            r'^kubernetes-cluster-.*$',  # TKGs clusters (worker nodes)
+            r'^dev-project-.*$',  # vSphere with Tanzu projects
+            r'^cci-service-.*$',  # CCI services
+            r'^SupervisorControlPlaneVM.*$',  # Supervisor Control Plane VMs
+        ]
+
+        if lsf.config.has_option('SHUTDOWN', 'vm_patterns'):
+            patterns_raw = lsf.config.get('SHUTDOWN', 'vm_patterns')
+            vm_patterns = [p.strip() for p in patterns_raw.split('\n') 
+                          if p.strip() and not p.strip().startswith('#')]
+
+        # Static VM list (specific VMs to shutdown)
+        workload_vms = []
+        if lsf.config.has_option('SHUTDOWN', 'workload_vms'):
+            vms_raw = lsf.config.get('SHUTDOWN', 'workload_vms')
+            workload_vms = [v.strip() for v in vms_raw.split('\n') 
+                           if v.strip() and not v.strip().startswith('#')]
+
+        if not dry_run:
+            total_workload_vms = 0
+
+            # Find VMs by pattern
+            vcf_write(lsf, f'Searching for VMs matching {len(vm_patterns)} pattern(s)...')
+            for pattern in vm_patterns:
+                vcf_write(lsf, f'  Pattern: {pattern}')
+                vms = get_vms_by_regex(lsf, pattern)
                 if vms:
+                    vcf_write(lsf, f'  Found {len(vms)} VM(s) matching pattern')
                     for vm in vms:
                         total_workload_vms += 1
                         vcf_write(lsf, f'  [{total_workload_vms}] Shutting down: {vm.name}')
                         shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(2)
+                        time.sleep(2)  # Brief pause between shutdowns
                 else:
-                    vcf_write(lsf, f'  VM not found: {vm_name}')
-        else:
-            vcf_write(lsf, 'No static workload VMs configured')
-        
-        vcf_write(lsf, f'Workload VM shutdown complete: {total_workload_vms} VM(s) processed')
-    else:
-        vcf_write(lsf, f'Would shutdown VMs matching patterns: {vm_patterns}')
-        vcf_write(lsf, f'Would shutdown VMs: {workload_vms}')
-    
-    #==========================================================================
-    # VCF 9.0 WORKLOAD DOMAIN SHUTDOWN
-    # Per VCF 9.0 docs, workload domain order is:
-    # 1. Customer workloads (done above)
-    # 2. VMware Live Recovery (if applicable)
-    # 4. NSX Edge nodes
-    # 5. NSX Manager nodes
-    # 7. ESX hosts  
-    # 8. vCenter Server (LAST for workload domain)
-    #==========================================================================
-    
-    #==========================================================================
-    # TASK 5: Shutdown Workload Domain NSX Edges
-    # Per VCF 9.0: NSX Edges shut down before NSX Manager in workload domain
-    # Filter: Only edges with "wld" in their name (workload domain)
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 5: Shutdown Workload Domain NSX Edges')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(5, 'Shutdown Workload NSX Edges', dry_run)
-    
-    # Get all NSX edges from [VCF] vcfnsxedges (primary source)
-    # Format: edge-name:esxhost (we only need the edge name)
-    all_nsx_edges = []
-    if lsf.config.has_option('VCF', 'vcfnsxedges'):
-        edges_raw = lsf.config.get('VCF', 'vcfnsxedges')
-        for entry in edges_raw.split('\n'):
-            if entry.strip() and not entry.strip().startswith('#'):
-                parts = entry.split(':')
-                all_nsx_edges.append(parts[0].strip())
-        vcf_write(lsf, f'Found {len(all_nsx_edges)} NSX Edge(s) in [VCF] vcfnsxedges')
-    else:
-        vcf_write(lsf, 'No NSX Edges configured in [VCF] vcfnsxedges')
-    
-    # Filter for workload domain edges (contain "wld" in name)
-    workload_nsx_edges = [e for e in all_nsx_edges if 'wld' in e.lower()]
-    
-    if not dry_run:
-        if workload_nsx_edges:
-            vcf_write(lsf, f'Processing {len(workload_nsx_edges)} workload NSX Edge VM(s)...')
-            for edge_name in workload_nsx_edges:
-                vcf_write(lsf, f'  Looking for: {edge_name}')
-                vms = lsf.get_vm_by_name(edge_name)
-                if vms:
-                    for vm in vms:
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(2)
-                else:
-                    vcf_write(lsf, f'    NSX Edge VM not found')
-            vcf_write(lsf, 'Workload NSX Edge shutdown complete')
-        else:
-            vcf_write(lsf, 'No workload NSX Edges found (no edges with "wld" in name)')
-    else:
-        vcf_write(lsf, f'Would shutdown workload NSX Edges: {workload_nsx_edges}')
-    
-    #==========================================================================
-    # TASK 6: Shutdown Workload Domain NSX Manager
-    # Per VCF 9.0: NSX Manager shuts down after NSX Edges in workload domain
-    # Filter: Only managers with "wld" in their name (workload domain)
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 6: Shutdown Workload Domain NSX Manager')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(6, 'Shutdown Workload NSX Manager', dry_run)
-    
-    # Get all NSX managers from [VCF] vcfnsxmgr (primary source)
-    # Format: nsx-name:esxhost (we only need the NSX manager name)
-    all_nsx_mgr = []
-    if lsf.config.has_option('VCF', 'vcfnsxmgr'):
-        mgr_raw = lsf.config.get('VCF', 'vcfnsxmgr')
-        for entry in mgr_raw.split('\n'):
-            if entry.strip() and not entry.strip().startswith('#'):
-                parts = entry.split(':')
-                all_nsx_mgr.append(parts[0].strip())
-        vcf_write(lsf, f'Found {len(all_nsx_mgr)} NSX Manager(s) in [VCF] vcfnsxmgr')
-    else:
-        vcf_write(lsf, 'No NSX Managers configured in [VCF] vcfnsxmgr')
-    
-    # Filter for workload domain managers (contain "wld" in name)
-    workload_nsx_mgr = [m for m in all_nsx_mgr if 'wld' in m.lower()]
-    
-    if not dry_run:
-        if workload_nsx_mgr:
-            vcf_write(lsf, f'Processing {len(workload_nsx_mgr)} workload NSX Manager VM(s)...')
-            for mgr_name in workload_nsx_mgr:
-                vcf_write(lsf, f'  Looking for: {mgr_name}')
-                vms = lsf.get_vm_by_name(mgr_name)
-                if vms:
-                    for vm in vms:
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(5)
-                else:
-                    vcf_write(lsf, f'    NSX Manager VM not found')
-            vcf_write(lsf, 'Workload NSX Manager shutdown complete')
-        else:
-            vcf_write(lsf, 'No workload NSX Managers found (no managers with "wld" in name)')
-    else:
-        vcf_write(lsf, f'Would shutdown workload NSX Manager: {workload_nsx_mgr}')
-    
-    #==========================================================================
-    # TASK 7: Shutdown Workload vCenters
-    # Per VCF 9.0: vCenter is LAST in workload domain shutdown order (#8)
-    # Note: In VCF 9.0, ESX hosts shutdown before vCenter for workload domains
-    # For HOL, we keep vCenter up to manage the ESX shutdown, then shut it down
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 7: Shutdown Workload vCenters')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(7, 'Shutdown Workload vCenters', dry_run)
-    
-    # Get all vCenters from [VCF] vcfvCenter (primary source)
-    # Format: vcenter-name:esxhost (we only need the vCenter name)
-    # Filter for workload vCenters (contain "wld" in name)
-    all_vcenters = []
-    if lsf.config.has_option('VCF', 'vcfvCenter'):
-        vc_raw = lsf.config.get('VCF', 'vcfvCenter')
-        for entry in vc_raw.split('\n'):
-            if entry.strip() and not entry.strip().startswith('#'):
-                parts = entry.split(':')
-                all_vcenters.append(parts[0].strip())
-        vcf_write(lsf, f'Found {len(all_vcenters)} vCenter(s) in [VCF] vcfvCenter')
-    else:
-        vcf_write(lsf, 'No vCenters configured in [VCF] vcfvCenter')
-    
-    # Filter for workload vCenters (contain "wld" in name)
-    workload_vcenters = [v for v in all_vcenters if 'wld' in v.lower()]
-    
-    if not dry_run:
-        if workload_vcenters:
-            vcf_write(lsf, f'Processing {len(workload_vcenters)} workload vCenter(s)...')
-            vcf_write(lsf, '  (Per VCF 9.0: vCenter shuts down LAST in workload domain)')
-            vc_count = 0
-            for vc_name in workload_vcenters:
-                vc_count += 1
-                vcf_write(lsf, f'  [{vc_count}/{len(workload_vcenters)}] Looking for: {vc_name}')
-                vms = lsf.get_vm_by_name(vc_name)
-                if vms:
-                    for vm in vms:
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(10)  # Longer pause for vCenter
-                else:
-                    vcf_write(lsf, f'    vCenter VM not found (may not exist in this lab)')
-            vcf_write(lsf, 'Workload vCenter shutdown complete')
-        else:
-            vcf_write(lsf, 'No workload vCenters configured - skipping')
-    else:
-        vcf_write(lsf, f'Would shutdown workload vCenters: {workload_vcenters}')
-    
-    #==========================================================================
-    # VCF 9.0 MANAGEMENT DOMAIN SHUTDOWN
-    # Per VCF 9.0 docs, management domain order is:
-    # 1. VCF Automation (vra)
-    # 2. VCF Operations for Networks (vrni)
-    # 3. VCF Operations collector  
-    # 4. VCF Operations for logs (vrli)
-    # 5. VCF Identity Broker
-    # 6. VCF Operations fleet management (VCF Operations Manager)
-    # 7. VCF Operations (vrops)
-    # 8. VMware Live Site Recovery (if applicable)
-    # 9. NSX Edge nodes
-    # 10. NSX Manager
-    # 11. SDDC Manager
-    # 12. vSAN and ESX Hosts (includes vCenter)
-    #==========================================================================
-    
-    #==========================================================================
-    # TASK 8: Shutdown VCF Operations for Networks (vrni)
-    # Per VCF 9.0 Management Domain order #2
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 8: Shutdown VCF Operations for Networks')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(8, 'Shutdown VCF Ops for Networks', dry_run)
-    
-    # Default names cover both legacy (opsnet-*) and VCF 9.1 (ops_networks-*) naming
-    vcf_ops_networks_vms = ['opsnet-a', 'opsnet-01a', 'opsnetcollector-01a']
-    vcf_ops_networks_patterns = [r'^ops_networks-.*$']
-    
-    if lsf.config.has_option('SHUTDOWN', 'vcf_ops_networks_vms'):
-        net_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_networks_vms')
-        vcf_ops_networks_vms = [v.strip() for v in net_raw.split('\n') 
-                               if v.strip() and not v.strip().startswith('#')]
-        vcf_ops_networks_patterns = []
-    
-    if not dry_run:
-        found_count = 0
-        
-        # Exact name lookups
-        if vcf_ops_networks_vms:
-            vcf_write(lsf, f'Searching {len(vcf_ops_networks_vms)} VCF Ops for Networks VM name(s)...')
-            found_count += shutdown_vms_by_names(lsf, vcf_ops_networks_vms, dry_run)
-        
-        # Regex pattern lookups (VCF 9.1 naming: ops_networks-*)
-        if vcf_ops_networks_patterns:
-            vcf_write(lsf, f'Searching VCF Ops for Networks patterns: {vcf_ops_networks_patterns}')
-            for pattern in vcf_ops_networks_patterns:
-                vcf_write(lsf, f'  Pattern: {pattern}')
-                vms = lsf.get_vm_match(pattern)
-                if vms:
-                    vcf_write(lsf, f'  Found {len(vms)} VM(s) matching pattern')
-                    for vm in vms:
-                        found_count += 1
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(5)
-                else:
-                    vcf_write(lsf, f'  No VMs found matching pattern')
-        
-        vcf_write(lsf, f'VCF Operations for Networks shutdown complete ({found_count} VM(s) processed)')
-    else:
-        vcf_write(lsf, f'Would shutdown VCF Ops for Networks: {vcf_ops_networks_vms}')
-        if vcf_ops_networks_patterns:
-            vcf_write(lsf, f'Would also search patterns: {vcf_ops_networks_patterns}')
-    
-    #==========================================================================
-    # TASK 9: Shutdown VCF Operations Collector
-    # Per VCF 9.0 Management Domain order #3
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 9: Shutdown VCF Operations Collector')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(9, 'Shutdown VCF Ops Collector', dry_run)
-    
-    vcf_ops_collector_vms = ['opscollector-01a', 'opsproxy-01a']
-    
-    if lsf.config.has_option('SHUTDOWN', 'vcf_ops_collector_vms'):
-        coll_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_collector_vms')
-        vcf_ops_collector_vms = [v.strip() for v in coll_raw.split('\n') 
-                                if v.strip() and not v.strip().startswith('#')]
-    
-    if not dry_run:
-        if vcf_ops_collector_vms:
-            vcf_write(lsf, f'Processing {len(vcf_ops_collector_vms)} VCF Ops Collector VM(s)...')
-            for vm_name in vcf_ops_collector_vms:
-                vcf_write(lsf, f'  Looking for: {vm_name}')
-                vms = lsf.get_vm_by_name(vm_name)
-                if vms:
-                    for vm in vms:
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(5)
-                else:
-                    vcf_write(lsf, f'    VM not found')
-            vcf_write(lsf, 'VCF Operations Collector shutdown complete')
-        else:
-            vcf_write(lsf, 'No VCF Ops Collector VMs configured')
-    else:
-        vcf_write(lsf, f'Would shutdown VCF Ops Collector: {vcf_ops_collector_vms}')
-    
-    #==========================================================================
-    # TASK 10: Shutdown VCF Operations for Logs (vrli)
-    # Per VCF 9.0 Management Domain order #4
-    # Note: In VCF 9.0, this is NOT late - it shuts down before Identity Broker
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 10: Shutdown VCF Operations for Logs')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(10, 'Shutdown VCF Ops for Logs', dry_run)
-    
-    vcf_ops_logs_vms = ['opslogs-01a', 'opslogs-a', 'ops-01a']
-    
-    if lsf.config.has_option('SHUTDOWN', 'vcf_ops_logs_vms'):
-        logs_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_logs_vms')
-        vcf_ops_logs_vms = [v.strip() for v in logs_raw.split('\n') 
-                          if v.strip() and not v.strip().startswith('#')]
-    
-    if not dry_run:
-        if vcf_ops_logs_vms:
-            vcf_write(lsf, f'Processing {len(vcf_ops_logs_vms)} VCF Ops for Logs VM(s)...')
-            for vm_name in vcf_ops_logs_vms:
-                vcf_write(lsf, f'  Looking for: {vm_name}')
-                vms = lsf.get_vm_by_name(vm_name)
-                if vms:
-                    for vm in vms:
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(5)
-                else:
-                    vcf_write(lsf, f'    VM not found')
-            vcf_write(lsf, 'VCF Operations for Logs shutdown complete')
-        else:
-            vcf_write(lsf, 'No VCF Ops for Logs VMs configured')
-    else:
-        vcf_write(lsf, f'Would shutdown VCF Ops for Logs: {vcf_ops_logs_vms}')
-    
-    #==========================================================================
-    # TASK 11: Shutdown VCF Identity Broker
-    # Per VCF 9.0 Management Domain order #5
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 11: Shutdown VCF Identity Broker')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(11, 'Shutdown VCF Identity Broker', dry_run)
-    
-    vcf_identity_broker_vms = []  # Not present in all deployments
-    
-    if lsf.config.has_option('SHUTDOWN', 'vcf_identity_broker_vms'):
-        ib_raw = lsf.config.get('SHUTDOWN', 'vcf_identity_broker_vms')
-        vcf_identity_broker_vms = [v.strip() for v in ib_raw.split('\n') 
-                                  if v.strip() and not v.strip().startswith('#')]
-    
-    if not dry_run:
-        if vcf_identity_broker_vms:
-            vcf_write(lsf, f'Processing {len(vcf_identity_broker_vms)} VCF Identity Broker VM(s)...')
-            for vm_name in vcf_identity_broker_vms:
-                vcf_write(lsf, f'  Looking for: {vm_name}')
-                vms = lsf.get_vm_by_name(vm_name)
-                if vms:
-                    for vm in vms:
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(5)
-                else:
-                    vcf_write(lsf, f'    VM not found')
-            vcf_write(lsf, 'VCF Identity Broker shutdown complete')
-        else:
-            vcf_write(lsf, 'No VCF Identity Broker VMs configured (may not be deployed)')
-    else:
-        vcf_write(lsf, f'Would shutdown VCF Identity Broker: {vcf_identity_broker_vms}')
-    
-    #==========================================================================
-    # TASK 12: Shutdown VCF Operations Fleet Management (VCF Operations Manager)
-    # Per VCF 9.0 Management Domain order #6
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 12: Shutdown VCF Operations Fleet Management')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(12, 'Shutdown VCF Ops Fleet Mgmt', dry_run)
-    
-    vcf_ops_fleet_vms = ['opslcm-01a', 'opslcm-a']
-    
-    if lsf.config.has_option('SHUTDOWN', 'vcf_ops_fleet_vms'):
-        fleet_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_fleet_vms')
-        vcf_ops_fleet_vms = [v.strip() for v in fleet_raw.split('\n') 
-                            if v.strip() and not v.strip().startswith('#')]
-    
-    if not dry_run:
-        if vcf_ops_fleet_vms:
-            vcf_write(lsf, f'Processing {len(vcf_ops_fleet_vms)} VCF Ops Fleet Management VM(s)...')
-            for vm_name in vcf_ops_fleet_vms:
-                vcf_write(lsf, f'  Looking for: {vm_name}')
-                vms = lsf.get_vm_by_name(vm_name)
-                if vms:
-                    for vm in vms:
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(5)
-                else:
-                    vcf_write(lsf, f'    VM not found')
-            vcf_write(lsf, 'VCF Operations Fleet Management shutdown complete')
-        else:
-            vcf_write(lsf, 'No VCF Ops Fleet Management VMs configured')
-    else:
-        vcf_write(lsf, f'Would shutdown VCF Ops Fleet Management: {vcf_ops_fleet_vms}')
-    
-    #==========================================================================
-    # TASK 13: Shutdown VCF Operations (vrops)
-    # Per VCF 9.0 Management Domain order #7
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 13: Shutdown VCF Operations')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(13, 'Shutdown VCF Operations', dry_run)
-    
-    # Note: VCF Operations (vrops) may have been partially shut down via Fleet API in Phase 1
-    # This phase ensures any remaining VMs are shut down
-    vcf_ops_vms = ['ops-a', 'o11n-02a', 'o11n-01a']  # VCF Operations (vrops) + Orchestrator VMs
-    
-    if lsf.config.has_option('SHUTDOWN', 'vcf_ops_vms'):
-        ops_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_vms')
-        vcf_ops_vms = [v.strip() for v in ops_raw.split('\n') 
-                      if v.strip() and not v.strip().startswith('#')]
-    
-    if not dry_run:
-        if vcf_ops_vms:
-            vcf_write(lsf, f'Processing {len(vcf_ops_vms)} VCF Operations VM(s)...')
-            for vm_name in vcf_ops_vms:
-                vcf_write(lsf, f'  Looking for: {vm_name}')
-                vms = lsf.get_vm_by_name(vm_name)
-                if vms:
-                    for vm in vms:
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(5)
-                else:
-                    vcf_write(lsf, f'    VM not found')
-            vcf_write(lsf, 'VCF Operations shutdown complete')
-        else:
-            vcf_write(lsf, 'No VCF Operations VMs configured')
-    else:
-        vcf_write(lsf, f'Would shutdown VCF Operations: {vcf_ops_vms}')
-    
-    #==========================================================================
-    # TASK 13b: Shutdown VCF Automation VMs (verification/catch-all)
-    # The Fleet API in Phase 1 may claim success even when no environments
-    # are found (opslcm-a responds on 443 but returns empty env list).
-    # This phase ensures auto-platform-a-* is actually powered off.
-    # Uses [VCFFINAL] vravms and [VCF] vcfpostedgevms as VM sources.
-    # If the VM is already off (Fleet API worked), this is a no-op.
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 13b: Shutdown VCF Automation VMs')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(13, 'Shutdown VCF Automation VMs', dry_run)
-    
-    vra_vm_patterns = []
-    if lsf.config.has_option('VCFFINAL', 'vravms'):
-        vra_raw = lsf.config.get('VCFFINAL', 'vravms')
-        for entry in vra_raw.split('\n'):
-            entry = entry.strip()
-            if entry and not entry.startswith('#'):
-                vm_pattern = entry.split(':')[0].strip()
-                if vm_pattern:
-                    vra_vm_patterns.append(vm_pattern)
-    
-    if lsf.config.has_option('VCF', 'vcfpostedgevms'):
-        postedge_raw = lsf.config.get('VCF', 'vcfpostedgevms')
-        for entry in postedge_raw.split('\n'):
-            entry = entry.strip()
-            if entry and not entry.startswith('#'):
-                vm_pattern = entry.split(':')[0].strip()
-                if vm_pattern and vm_pattern not in vra_vm_patterns:
-                    vra_vm_patterns.append(vm_pattern)
-    
-    if not dry_run:
-        if vra_vm_patterns:
-            vcf_write(lsf, f'Checking {len(vra_vm_patterns)} VCF Automation VM pattern(s)...')
-            auto_shutdown_count = 0
-            auto_already_off = 0
-            for pattern in vra_vm_patterns:
-                vcf_write(lsf, f'  Searching for VMs matching: {pattern}')
-                vms = lsf.get_vm_match(pattern)
-                if vms:
-                    vcf_write(lsf, f'  Found {len(vms)} VM(s)')
-                    for vm in vms:
-                        if 'sddcmanager' in vm.name.lower():
-                            vcf_write(lsf, f'  {vm.name}: Skipping (handled in Phase 16)')
-                            continue
-                        if is_vm_powered_on(vm):
-                            vcf_write(lsf, f'  {vm.name}: Still powered on - shutting down')
+                    vcf_write(lsf, f'  No VMs found matching this pattern')
+
+            # Shutdown static VM list
+            if workload_vms:
+                vcf_write(lsf, f'Processing {len(workload_vms)} static workload VM(s)...')
+                for vm_name in workload_vms:
+                    vcf_write(lsf, f'  Looking for VM: {vm_name}')
+                    vms = lsf.get_vm_by_name(vm_name)
+                    if vms:
+                        for vm in vms:
+                            total_workload_vms += 1
+                            vcf_write(lsf, f'  [{total_workload_vms}] Shutting down: {vm.name}')
                             shutdown_vm_gracefully(lsf, vm)
-                            auto_shutdown_count += 1
-                            time.sleep(5)
-                        else:
-                            vcf_write(lsf, f'  {vm.name}: Already powered off')
-                            auto_already_off += 1
-                else:
-                    vcf_write(lsf, f'  No VMs found matching pattern')
-            vcf_write(lsf, f'VCF Automation: {auto_shutdown_count} shut down, {auto_already_off} already off')
-        else:
-            vcf_write(lsf, 'No VCF Automation VMs configured')
-    else:
-        vcf_write(lsf, f'Would verify/shutdown VCF Automation VMs: {vra_vm_patterns}')
-    
-    #==========================================================================
-    # TASK 14: Shutdown Management Domain NSX Edges
-    # Per VCF 9.0 Management Domain order #9
-    # Filter: Only edges with "mgmt" in their name (management domain)
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 14: Shutdown Management NSX Edges')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(14, 'Shutdown Mgmt NSX Edges', dry_run)
-    
-    # Get all NSX edges from [VCF] vcfnsxedges (primary source)
-    # Format: edge-name:esxhost (we only need the edge name)
-    # Note: all_nsx_edges was already populated in Phase 5, but we rebuild
-    # here to ensure we have the full list in case Phase 5 was skipped
-    all_nsx_edges = []
-    if lsf.config.has_option('VCF', 'vcfnsxedges'):
-        edges_raw = lsf.config.get('VCF', 'vcfnsxedges')
-        for entry in edges_raw.split('\n'):
-            if entry.strip() and not entry.strip().startswith('#'):
-                parts = entry.split(':')
-                all_nsx_edges.append(parts[0].strip())
-        vcf_write(lsf, f'Found {len(all_nsx_edges)} NSX Edge(s) in [VCF] vcfnsxedges')
-    else:
-        vcf_write(lsf, 'No NSX Edges configured in [VCF] vcfnsxedges')
-    
-    # Filter for management domain edges (contain "mgmt" in name)
-    mgmt_nsx_edges = [e for e in all_nsx_edges if 'mgmt' in e.lower()]
-    
-    if not dry_run:
-        if mgmt_nsx_edges:
-            vcf_write(lsf, f'Processing {len(mgmt_nsx_edges)} Management NSX Edge VM(s)...')
-            edge_count = 0
-            for edge_name in mgmt_nsx_edges:
-                edge_count += 1
-                vcf_write(lsf, f'  [{edge_count}/{len(mgmt_nsx_edges)}] Looking for: {edge_name}')
-                vms = lsf.get_vm_by_name(edge_name)
-                if vms:
-                    for vm in vms:
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(2)
-                else:
-                    vcf_write(lsf, f'    Management NSX Edge VM not found')
-            vcf_write(lsf, 'Management NSX Edge shutdown complete')
-        else:
-            vcf_write(lsf, 'No Management NSX Edges found (no edges with "mgmt" in name)')
-    else:
-        vcf_write(lsf, f'Would shutdown Management NSX Edges: {mgmt_nsx_edges}')
-    
-    #==========================================================================
-    # TASK 15: Shutdown Management Domain NSX Manager
-    # Per VCF 9.0 Management Domain order #10
-    # Filter: Only managers with "mgmt" in their name (management domain)
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 15: Shutdown Management NSX Manager')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(15, 'Shutdown Mgmt NSX Manager', dry_run)
-    
-    # Get all NSX managers from [VCF] vcfnsxmgr (primary source)
-    # Format: nsx-name:esxhost (we only need the NSX manager name)
-    # Note: all_nsx_mgr was already populated in Phase 6, but we rebuild
-    # here to ensure we have the full list in case Phase 6 was skipped
-    all_nsx_mgr = []
-    if lsf.config.has_option('VCF', 'vcfnsxmgr'):
-        mgr_raw = lsf.config.get('VCF', 'vcfnsxmgr')
-        for entry in mgr_raw.split('\n'):
-            if entry.strip() and not entry.strip().startswith('#'):
-                parts = entry.split(':')
-                all_nsx_mgr.append(parts[0].strip())
-        vcf_write(lsf, f'Found {len(all_nsx_mgr)} NSX Manager(s) in [VCF] vcfnsxmgr')
-    else:
-        vcf_write(lsf, 'No NSX Managers configured in [VCF] vcfnsxmgr')
-    
-    # Filter for management domain managers (contain "mgmt" in name)
-    mgmt_nsx_mgr = [m for m in all_nsx_mgr if 'mgmt' in m.lower()]
-    
-    if not dry_run:
-        if mgmt_nsx_mgr:
-            vcf_write(lsf, f'Processing {len(mgmt_nsx_mgr)} Management NSX Manager VM(s)...')
-            mgr_count = 0
-            for mgr_name in mgmt_nsx_mgr:
-                mgr_count += 1
-                vcf_write(lsf, f'  [{mgr_count}/{len(mgmt_nsx_mgr)}] Looking for: {mgr_name}')
-                vms = lsf.get_vm_by_name(mgr_name)
-                if vms:
-                    for vm in vms:
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(5)
-                else:
-                    vcf_write(lsf, f'    Management NSX Manager VM not found')
-            vcf_write(lsf, 'Management NSX Manager shutdown complete')
-        else:
-            vcf_write(lsf, 'No Management NSX Managers found (no managers with "mgmt" in name)')
-    else:
-        vcf_write(lsf, f'Would shutdown Management NSX Manager: {mgmt_nsx_mgr}')
-    
-    #==========================================================================
-    # TASK 16: Shutdown SDDC Manager
-    # Per VCF 9.0 Management Domain order #11
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 16: Shutdown SDDC Manager')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(16, 'Shutdown SDDC Manager', dry_run)
-    
-    sddc_manager_vms = ['sddcmanager-a']
-    
-    if lsf.config.has_option('SHUTDOWN', 'sddc_manager_vms'):
-        sddc_raw = lsf.config.get('SHUTDOWN', 'sddc_manager_vms')
-        sddc_manager_vms = [v.strip() for v in sddc_raw.split('\n') 
-                          if v.strip() and not v.strip().startswith('#')]
-    
-    if not dry_run:
-        if sddc_manager_vms:
-            vcf_write(lsf, f'Processing {len(sddc_manager_vms)} SDDC Manager VM(s)...')
-            for vm_name in sddc_manager_vms:
-                vcf_write(lsf, f'  Looking for: {vm_name}')
-                vms = lsf.get_vm_by_name(vm_name)
-                if vms:
-                    for vm in vms:
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(10)  # Longer pause for SDDC Manager
-                else:
-                    vcf_write(lsf, f'    SDDC Manager VM not found')
-            vcf_write(lsf, 'SDDC Manager shutdown complete')
-        else:
-            vcf_write(lsf, 'No SDDC Manager VMs configured')
-    else:
-        vcf_write(lsf, f'Would shutdown SDDC Manager: {sddc_manager_vms}')
-    
-    #==========================================================================
-    # TASK 17: Shutdown Management vCenter
-    # Per VCF 9.0 Management Domain order #12 (with vSAN and ESX hosts)
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 17: Shutdown Management vCenter')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(17, 'Shutdown Management vCenter', dry_run)
-    
-    # Get all vCenters from [VCF] vcfvCenter (primary source)
-    # Format: vcenter-name:esxhost (we only need the vCenter name)
-    # Filter for management vCenters (contain "mgmt" in name)
-    all_vcenters_mgmt = []
-    if lsf.config.has_option('VCF', 'vcfvCenter'):
-        vc_raw = lsf.config.get('VCF', 'vcfvCenter')
-        for entry in vc_raw.split('\n'):
-            if entry.strip() and not entry.strip().startswith('#'):
-                parts = entry.split(':')
-                all_vcenters_mgmt.append(parts[0].strip())
-        vcf_write(lsf, f'Found {len(all_vcenters_mgmt)} vCenter(s) in [VCF] vcfvCenter')
-    else:
-        vcf_write(lsf, 'No vCenters configured in [VCF] vcfvCenter')
-    
-    # Filter for management vCenters (contain "mgmt" in name)
-    mgmt_vcenter_vms = [v for v in all_vcenters_mgmt if 'mgmt' in v.lower()]
-    
-    if not dry_run:
-        if mgmt_vcenter_vms:
-            vcf_write(lsf, f'Processing {len(mgmt_vcenter_vms)} Management vCenter VM(s)...')
-            for vm_name in mgmt_vcenter_vms:
-                vcf_write(lsf, f'  Looking for: {vm_name}')
-                vms = lsf.get_vm_by_name(vm_name)
-                if vms:
-                    for vm in vms:
-                        shutdown_vm_gracefully(lsf, vm)
-                        time.sleep(10)  # Longer pause for vCenter
-                else:
-                    vcf_write(lsf, f'    Management vCenter VM not found')
-            vcf_write(lsf, 'Management vCenter shutdown complete')
-        else:
-            vcf_write(lsf, 'No Management vCenter VMs configured')
-    else:
-        vcf_write(lsf, f'Would shutdown Management vCenter: {mgmt_vcenter_vms}')
-    
-    #==========================================================================
-    # TASK 18: Set Host Advanced Settings
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 18: Set Host Advanced Settings')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(18, 'Host Advanced Settings', dry_run)
-    
-    # Get list of hosts for vSAN operations from [VCF] vcfmgmtcluster (primary source)
-    # Format: hostname:esx (we only need the hostname)
-    esx_hosts = []
-    if lsf.config.has_option('VCF', 'vcfmgmtcluster'):
-        hosts_raw = lsf.config.get('VCF', 'vcfmgmtcluster')
-        for entry in hosts_raw.split('\n'):
-            if entry.strip() and not entry.strip().startswith('#'):
-                parts = entry.split(':')
-                host = parts[0].strip()
-                esx_hosts.append(host)
-        vcf_write(lsf, f'Found {len(esx_hosts)} ESXi host(s) in [VCF] vcfmgmtcluster')
-    else:
-        vcf_write(lsf, 'No ESXi hosts configured in [VCF] vcfmgmtcluster')
-    
-    esx_username = 'root'
-    if lsf.config.has_option('SHUTDOWN', 'esx_username'):
-        esx_username = lsf.config.get('SHUTDOWN', 'esx_username')
-    
-    if not dry_run:
-        if esx_hosts:
-            vcf_write(lsf, f'Configuring {len(esx_hosts)} ESXi host(s)...')
-            host_count = 0
-            for host in esx_hosts:
-                host_count += 1
-                vcf_write(lsf, f'  [{host_count}/{len(esx_hosts)}] Setting advanced settings on {host}')
-                try:
-                    cmd = 'esxcli system settings advanced set -o /Mem/AllocGuestLargePage -i 1'
-                    lsf.ssh(cmd, f'{esx_username}@{host}', password)
-                    vcf_write(lsf, f'    Settings applied successfully')
-                except Exception as e:
-                    vcf_write(lsf, f'    Warning: Failed to set advanced settings: {e}')
-            vcf_write(lsf, 'Host advanced settings complete')
-        else:
-            vcf_write(lsf, 'No ESXi hosts configured - skipping')
-    else:
-        vcf_write(lsf, f'Would set advanced settings on: {esx_hosts}')
-    
-    #==========================================================================
-    # TASK 19: vSAN Elevator Operations (OSA only - ESA does not use plog)
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 19: vSAN Elevator Operations')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(19, 'vSAN Elevator Operations', dry_run)
-    
-    vsan_enabled = True
-    if lsf.config.has_option('SHUTDOWN', 'vsan_enabled'):
-        vsan_enabled = lsf.config.getboolean('SHUTDOWN', 'vsan_enabled')
-    
-    vsan_timeout = VSAN_ELEVATOR_TIMEOUT
-    if lsf.config.has_option('SHUTDOWN', 'vsan_timeout'):
-        vsan_timeout_raw = lsf.config.get('SHUTDOWN', 'vsan_timeout')
-        # Strip any inline comments (e.g., "2700  # 45 minutes")
-        vsan_timeout_str = vsan_timeout_raw.split('#')[0].strip()
-        try:
-            vsan_timeout = int(vsan_timeout_str)
-        except ValueError:
-            vcf_write(lsf, f'Invalid vsan_timeout value: {vsan_timeout_raw}, using default {VSAN_ELEVATOR_TIMEOUT}')
-            vsan_timeout = VSAN_ELEVATOR_TIMEOUT
-    
-    vcf_write(lsf, f'vSAN enabled: {vsan_enabled}, ESXi hosts: {len(esx_hosts)}, Timeout: {vsan_timeout}s ({vsan_timeout/60:.0f}min)')
-    
-    if vsan_enabled and esx_hosts and not dry_run:
-        # Check if this is vSAN ESA (Express Storage Architecture)
-        # ESA does NOT use the plog mechanism, so elevator wait is not needed
-        vcf_write(lsf, 'Checking vSAN architecture (OSA vs ESA)...')
-        is_esa = False
-        if esx_hosts:
-            # Check the first host to determine architecture
-            test_host = esx_hosts[0]
-            is_esa = check_vsan_esa(lsf, test_host, esx_username, password)
-            if is_esa:
-                vcf_write(lsf, f'  vSAN ESA detected on {test_host}')
-                vcf_write(lsf, '  ESA does not use plog - skipping 45-minute elevator wait')
+                            time.sleep(2)
+                    else:
+                        vcf_write(lsf, f'  VM not found: {vm_name}')
             else:
-                vcf_write(lsf, f'  vSAN OSA detected on {test_host}')
-                vcf_write(lsf, '  OSA uses plog - elevator wait is required')
-        
-        if is_esa:
-            # vSAN ESA - skip the elevator process entirely
-            vcf_write(lsf, 'vSAN ESA: Elevator operations not required (no plog)')
+                vcf_write(lsf, 'No static workload VMs configured')
+
+            vcf_write(lsf, f'Workload VM shutdown complete: {total_workload_vms} VM(s) processed')
         else:
-            # vSAN OSA - run the full elevator process
-            # Enable vSAN elevator on all hosts
-            vcf_write(lsf, f'Enabling vSAN elevator on {len(esx_hosts)} host(s)...')
-            host_count = 0
-            for host in esx_hosts:
-                host_count += 1
-                vcf_write(lsf, f'  [{host_count}/{len(esx_hosts)}] Enabling elevator on {host}')
-                set_vsan_elevator(lsf, host, esx_username, password, enable=True)
-            
-            # Wait for vSAN I/O to complete
-            vcf_write(lsf, f'Starting vSAN I/O flush wait ({vsan_timeout/60:.0f} minutes)...')
-            vcf_write(lsf, '  This ensures all pending writes are committed to disk (OSA plog)')
-            
-            elapsed = 0
-            while elapsed < vsan_timeout:
-                remaining = (vsan_timeout - elapsed) / 60
-                elapsed_min = elapsed / 60
-                vcf_write(lsf, f'  vSAN wait: {elapsed_min:.0f}m elapsed, {remaining:.1f}m remaining')
-                time.sleep(VSAN_ELEVATOR_CHECK_INTERVAL)
-                elapsed += VSAN_ELEVATOR_CHECK_INTERVAL
-            
-            vcf_write(lsf, 'vSAN I/O flush wait complete')
-            
-            # Disable vSAN elevator on all hosts
-            vcf_write(lsf, f'Disabling vSAN elevator on {len(esx_hosts)} host(s)...')
-            host_count = 0
-            for host in esx_hosts:
-                host_count += 1
-                vcf_write(lsf, f'  [{host_count}/{len(esx_hosts)}] Disabling elevator on {host}')
-                set_vsan_elevator(lsf, host, esx_username, password, enable=False)
-            vcf_write(lsf, 'vSAN elevator operations complete')
-    elif dry_run:
-        vcf_write(lsf, f'Would run vSAN elevator on: {esx_hosts}')
-        vcf_write(lsf, f'vSAN timeout: {vsan_timeout} seconds')
-        vcf_write(lsf, 'Note: Actual run will check for ESA and skip if detected')
-    elif not vsan_enabled:
-        vcf_write(lsf, 'vSAN elevator skipped (vsan_enabled=false in config)')
-    else:
-        vcf_write(lsf, 'vSAN elevator skipped (no ESXi hosts configured)')
-    
-    #==========================================================================
-    # TASK 19b: Shutdown VSP Platform VMs
-    # VSP VMs (vsp-01a-*) run the K8s management cluster. They should be
-    # shut down gracefully after all K8s workloads have been scaled down
-    # (Phase 2b) and after vCenter is off (Phase 17). We connect to the
-    # ESXi hosts directly to find and shut down these VMs.
+            vcf_write(lsf, f'Would shutdown VMs matching patterns: {vm_patterns}')
+            vcf_write(lsf, f'Would shutdown VMs: {workload_vms}')
+
+        #==========================================================================
+        # VCF 9.0 WORKLOAD DOMAIN SHUTDOWN
+        # Per VCF 9.0 docs, workload domain order is:
+        # 1. Customer workloads (done above)
+        # 2. VMware Live Recovery (if applicable)
+        # 4. NSX Edge nodes
+        # 5. NSX Manager nodes
+        # 7. ESX hosts  
+        # 8. vCenter Server (LAST for workload domain)
+        #==========================================================================
+
+        #==========================================================================
+        # TASK 5: Shutdown Workload Domain NSX Edges
+        # Per VCF 9.0: NSX Edges shut down before NSX Manager in workload domain
+        # Filter: Only edges with "wld" in their name (workload domain)
     #==========================================================================
     
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 19b: Shutdown VSP Platform VMs')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(19, 'Shutdown VSP Platform VMs', dry_run)
-    
-    vsp_vm_patterns = []
-    if lsf.config.has_option('VCF', 'vspvms'):
-        vsp_raw = lsf.config.get('VCF', 'vspvms')
-        for entry in vsp_raw.split('\n'):
-            entry = entry.strip()
-            if entry and not entry.startswith('#'):
-                vm_pattern = entry.split(':')[0].strip()
-                if vm_pattern:
-                    vsp_vm_patterns.append(vm_pattern)
-    
-    if not dry_run:
-        if vsp_vm_patterns:
-            vcf_write(lsf, f'Searching for VSP VMs matching {len(vsp_vm_patterns)} pattern(s)...')
-            vsp_shutdown_count = 0
-            vsp_already_off = 0
-            for pattern in vsp_vm_patterns:
-                vcf_write(lsf, f'  Pattern: {pattern}')
-                vms = lsf.get_vm_match(pattern)
-                if vms:
-                    vcf_write(lsf, f'  Found {len(vms)} VM(s)')
-                    for vm in vms:
-                        if is_vm_powered_on(vm):
+    if should_run('5'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 5: Shutdown Workload Domain NSX Edges')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(5, 'Shutdown Workload NSX Edges', dry_run)
+
+        # Get all NSX edges from [VCF] vcfnsxedges (primary source)
+        # Format: edge-name:esxhost (we only need the edge name)
+        all_nsx_edges = []
+        if lsf.config.has_option('VCF', 'vcfnsxedges'):
+            edges_raw = lsf.config.get('VCF', 'vcfnsxedges')
+            for entry in edges_raw.split('\n'):
+                if entry.strip() and not entry.strip().startswith('#'):
+                    parts = entry.split(':')
+                    all_nsx_edges.append(parts[0].strip())
+            vcf_write(lsf, f'Found {len(all_nsx_edges)} NSX Edge(s) in [VCF] vcfnsxedges')
+        else:
+            vcf_write(lsf, 'No NSX Edges configured in [VCF] vcfnsxedges')
+
+        # Filter for workload domain edges (contain "wld" in name)
+        workload_nsx_edges = [e for e in all_nsx_edges if 'wld' in e.lower()]
+
+        if not dry_run:
+            if workload_nsx_edges:
+                vcf_write(lsf, f'Processing {len(workload_nsx_edges)} workload NSX Edge VM(s)...')
+                for edge_name in workload_nsx_edges:
+                    vcf_write(lsf, f'  Looking for: {edge_name}')
+                    vms = lsf.get_vm_by_name(edge_name)
+                    if vms:
+                        for vm in vms:
                             shutdown_vm_gracefully(lsf, vm)
-                            vsp_shutdown_count += 1
+                            time.sleep(2)
+                    else:
+                        vcf_write(lsf, f'    NSX Edge VM not found')
+                vcf_write(lsf, 'Workload NSX Edge shutdown complete')
+            else:
+                vcf_write(lsf, 'No workload NSX Edges found (no edges with "wld" in name)')
+        else:
+            vcf_write(lsf, f'Would shutdown workload NSX Edges: {workload_nsx_edges}')
+
+        #==========================================================================
+        # TASK 6: Shutdown Workload Domain NSX Manager
+        # Per VCF 9.0: NSX Manager shuts down after NSX Edges in workload domain
+        # Filter: Only managers with "wld" in their name (workload domain)
+    #==========================================================================
+    
+    if should_run('6'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 6: Shutdown Workload Domain NSX Manager')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(6, 'Shutdown Workload NSX Manager', dry_run)
+
+        # Get all NSX managers from [VCF] vcfnsxmgr (primary source)
+        # Format: nsx-name:esxhost (we only need the NSX manager name)
+        all_nsx_mgr = []
+        if lsf.config.has_option('VCF', 'vcfnsxmgr'):
+            mgr_raw = lsf.config.get('VCF', 'vcfnsxmgr')
+            for entry in mgr_raw.split('\n'):
+                if entry.strip() and not entry.strip().startswith('#'):
+                    parts = entry.split(':')
+                    all_nsx_mgr.append(parts[0].strip())
+            vcf_write(lsf, f'Found {len(all_nsx_mgr)} NSX Manager(s) in [VCF] vcfnsxmgr')
+        else:
+            vcf_write(lsf, 'No NSX Managers configured in [VCF] vcfnsxmgr')
+
+        # Filter for workload domain managers (contain "wld" in name)
+        workload_nsx_mgr = [m for m in all_nsx_mgr if 'wld' in m.lower()]
+
+        if not dry_run:
+            if workload_nsx_mgr:
+                vcf_write(lsf, f'Processing {len(workload_nsx_mgr)} workload NSX Manager VM(s)...')
+                for mgr_name in workload_nsx_mgr:
+                    vcf_write(lsf, f'  Looking for: {mgr_name}')
+                    vms = lsf.get_vm_by_name(mgr_name)
+                    if vms:
+                        for vm in vms:
+                            shutdown_vm_gracefully(lsf, vm)
                             time.sleep(5)
-                        else:
-                            vcf_write(lsf, f'  {vm.name}: Already powered off')
-                            vsp_already_off += 1
-                else:
-                    vcf_write(lsf, f'  No VMs found matching pattern')
-            vcf_write(lsf, f'VSP VMs: {vsp_shutdown_count} shut down, {vsp_already_off} already off')
+                    else:
+                        vcf_write(lsf, f'    NSX Manager VM not found')
+                vcf_write(lsf, 'Workload NSX Manager shutdown complete')
+            else:
+                vcf_write(lsf, 'No workload NSX Managers found (no managers with "wld" in name)')
         else:
-            vcf_write(lsf, 'No VSP VMs configured in [VCF] vspvms')
-    else:
-        vcf_write(lsf, f'Would shutdown VSP VMs: {vsp_vm_patterns}')
-    
-    #==========================================================================
-    # TASK 19c: Pre-ESXi Shutdown Audit
-    # Enumerate all VMs still powered on across all connected ESXi hosts.
-    # Any VMs still running at this point were missed by earlier phases.
-    # Attempt graceful shutdown of stragglers (except the console/router).
+            vcf_write(lsf, f'Would shutdown workload NSX Manager: {workload_nsx_mgr}')
+
+        #==========================================================================
+        # TASK 7: Shutdown Workload vCenters
+        # Per VCF 9.0: vCenter is LAST in workload domain shutdown order (#8)
+        # Note: In VCF 9.0, ESX hosts shutdown before vCenter for workload domains
+        # For HOL, we keep vCenter up to manage the ESX shutdown, then shut it down
     #==========================================================================
     
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 19c: Pre-ESXi Shutdown Audit')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(19, 'Pre-ESXi Shutdown Audit', dry_run)
+    if should_run('7'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 7: Shutdown Workload vCenters')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(7, 'Shutdown Workload vCenters', dry_run)
+
+        # Get all vCenters from [VCF] vcfvCenter (primary source)
+        # Format: vcenter-name:esxhost (we only need the vCenter name)
+        # Filter for workload vCenters (contain "wld" in name)
+        all_vcenters = []
+        if lsf.config.has_option('VCF', 'vcfvCenter'):
+            vc_raw = lsf.config.get('VCF', 'vcfvCenter')
+            for entry in vc_raw.split('\n'):
+                if entry.strip() and not entry.strip().startswith('#'):
+                    parts = entry.split(':')
+                    all_vcenters.append(parts[0].strip())
+            vcf_write(lsf, f'Found {len(all_vcenters)} vCenter(s) in [VCF] vcfvCenter')
+        else:
+            vcf_write(lsf, 'No vCenters configured in [VCF] vcfvCenter')
+
+        # Filter for workload vCenters (contain "wld" in name)
+        workload_vcenters = [v for v in all_vcenters if 'wld' in v.lower()]
+
+        if not dry_run:
+            if workload_vcenters:
+                vcf_write(lsf, f'Processing {len(workload_vcenters)} workload vCenter(s)...')
+                vcf_write(lsf, '  (Per VCF 9.0: vCenter shuts down LAST in workload domain)')
+                vc_count = 0
+                for vc_name in workload_vcenters:
+                    vc_count += 1
+                    vcf_write(lsf, f'  [{vc_count}/{len(workload_vcenters)}] Looking for: {vc_name}')
+                    vms = lsf.get_vm_by_name(vc_name)
+                    if vms:
+                        for vm in vms:
+                            shutdown_vm_gracefully(lsf, vm)
+                            time.sleep(10)  # Longer pause for vCenter
+                    else:
+                        vcf_write(lsf, f'    vCenter VM not found (may not exist in this lab)')
+                vcf_write(lsf, 'Workload vCenter shutdown complete')
+            else:
+                vcf_write(lsf, 'No workload vCenters configured - skipping')
+        else:
+            vcf_write(lsf, f'Would shutdown workload vCenters: {workload_vcenters}')
+
+        #==========================================================================
+        # VCF 9.0 MANAGEMENT DOMAIN SHUTDOWN
+        # Per VCF 9.0 docs, management domain order is:
+        # 1. VCF Automation (vra)
+        # 2. VCF Operations for Networks (vrni)
+        # 3. VCF Operations collector  
+        # 4. VCF Operations for logs (vrli)
+        # 5. VCF Identity Broker
+        # 6. VCF Operations fleet management (VCF Operations Manager)
+        # 7. VCF Operations (vrops)
+        # 8. VMware Live Site Recovery (if applicable)
+        # 9. NSX Edge nodes
+        # 10. NSX Manager
+        # 11. SDDC Manager
+        # 12. vSAN and ESX Hosts (includes vCenter)
+        #==========================================================================
+
+        #==========================================================================
+        # TASK 8: Shutdown VCF Operations for Networks (vrni)
+        # Per VCF 9.0 Management Domain order #2
+    #==========================================================================
     
-    skip_vm_patterns = ['holconsole', 'holorouter', 'router', 'console', 'manager']
+    if should_run('8'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 8: Shutdown VCF Operations for Networks')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(8, 'Shutdown VCF Ops for Networks', dry_run)
+
+        # Default names cover both legacy (opsnet-*) and VCF 9.1 (ops_networks-*) naming
+        vcf_ops_networks_vms = ['opsnet-a', 'opsnet-01a', 'opsnetcollector-01a']
+        vcf_ops_networks_patterns = [r'^ops_networks-.*$']
+
+        if lsf.config.has_option('SHUTDOWN', 'vcf_ops_networks_vms'):
+            net_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_networks_vms')
+            vcf_ops_networks_vms = [v.strip() for v in net_raw.split('\n') 
+                                   if v.strip() and not v.strip().startswith('#')]
+            vcf_ops_networks_patterns = []
+
+        if not dry_run:
+            found_count = 0
+
+            # Exact name lookups
+            if vcf_ops_networks_vms:
+                vcf_write(lsf, f'Searching {len(vcf_ops_networks_vms)} VCF Ops for Networks VM name(s)...')
+                found_count += shutdown_vms_by_names(lsf, vcf_ops_networks_vms, dry_run)
+
+            # Regex pattern lookups (VCF 9.1 naming: ops_networks-*)
+            if vcf_ops_networks_patterns:
+                vcf_write(lsf, f'Searching VCF Ops for Networks patterns: {vcf_ops_networks_patterns}')
+                for pattern in vcf_ops_networks_patterns:
+                    vcf_write(lsf, f'  Pattern: {pattern}')
+                    vms = lsf.get_vm_match(pattern)
+                    if vms:
+                        vcf_write(lsf, f'  Found {len(vms)} VM(s) matching pattern')
+                        for vm in vms:
+                            found_count += 1
+                            shutdown_vm_gracefully(lsf, vm)
+                            time.sleep(5)
+                    else:
+                        vcf_write(lsf, f'  No VMs found matching pattern')
+
+            vcf_write(lsf, f'VCF Operations for Networks shutdown complete ({found_count} VM(s) processed)')
+        else:
+            vcf_write(lsf, f'Would shutdown VCF Ops for Networks: {vcf_ops_networks_vms}')
+            if vcf_ops_networks_patterns:
+                vcf_write(lsf, f'Would also search patterns: {vcf_ops_networks_patterns}')
+
+        #==========================================================================
+        # TASK 9: Shutdown VCF Operations Collector
+        # Per VCF 9.0 Management Domain order #3
+    #==========================================================================
     
-    if not dry_run:
-        from pyVmomi import vim as pyvim
-        still_on = []
-        for si in lsf.sis:
-            try:
-                content = si.RetrieveContent()
-                container = content.viewManager.CreateContainerView(
-                    content.rootFolder, [pyvim.VirtualMachine], True)
-                for vm in container.view:
+    if should_run('9'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 9: Shutdown VCF Operations Collector')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(9, 'Shutdown VCF Ops Collector', dry_run)
+
+        vcf_ops_collector_vms = ['opscollector-01a']
+
+        if lsf.config.has_option('SHUTDOWN', 'vcf_ops_collector_vms'):
+            coll_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_collector_vms')
+            vcf_ops_collector_vms = [v.strip() for v in coll_raw.split('\n') 
+                                    if v.strip() and not v.strip().startswith('#')]
+
+        if not dry_run:
+            if vcf_ops_collector_vms:
+                vcf_write(lsf, f'Processing {len(vcf_ops_collector_vms)} VCF Ops Collector VM(s)...')
+                for vm_name in vcf_ops_collector_vms:
+                    vcf_write(lsf, f'  Looking for: {vm_name}')
+                    vms = lsf.get_vm_by_name(vm_name)
+                    if vms:
+                        for vm in vms:
+                            shutdown_vm_gracefully(lsf, vm)
+                            time.sleep(5)
+                    else:
+                        vcf_write(lsf, f'    VM not found')
+                vcf_write(lsf, 'VCF Operations Collector shutdown complete')
+            else:
+                vcf_write(lsf, 'No VCF Ops Collector VMs configured')
+        else:
+            vcf_write(lsf, f'Would shutdown VCF Ops Collector: {vcf_ops_collector_vms}')
+
+        #==========================================================================
+        # TASK 10: Shutdown VCF Operations for Logs (vrli)
+        # Per VCF 9.0 Management Domain order #4
+        # Note: In VCF 9.0, this is NOT late - it shuts down before Identity Broker
+    #==========================================================================
+    
+    if should_run('10'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 10: Shutdown VCF Operations for Logs')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(10, 'Shutdown VCF Ops for Logs', dry_run)
+
+        vcf_ops_logs_vms = []
+
+        if lsf.config.has_option('SHUTDOWN', 'vcf_ops_logs_vms'):
+            logs_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_logs_vms')
+            vcf_ops_logs_vms = [v.strip() for v in logs_raw.split('\n') 
+                              if v.strip() and not v.strip().startswith('#')]
+
+        if not dry_run:
+            if vcf_ops_logs_vms:
+                vcf_write(lsf, f'Processing {len(vcf_ops_logs_vms)} VCF Ops for Logs VM(s)...')
+                for vm_name in vcf_ops_logs_vms:
+                    vcf_write(lsf, f'  Looking for: {vm_name}')
+                    vms = lsf.get_vm_by_name(vm_name)
+                    if vms:
+                        for vm in vms:
+                            shutdown_vm_gracefully(lsf, vm)
+                            time.sleep(5)
+                    else:
+                        vcf_write(lsf, f'    VM not found')
+                vcf_write(lsf, 'VCF Operations for Logs shutdown complete')
+            else:
+                vcf_write(lsf, 'No VCF Ops for Logs VMs configured')
+        else:
+            vcf_write(lsf, f'Would shutdown VCF Ops for Logs: {vcf_ops_logs_vms}')
+
+        #==========================================================================
+        # TASK 11: Shutdown VCF Identity Broker
+        # Per VCF 9.0 Management Domain order #5
+    #==========================================================================
+    
+    if should_run('11'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 11: Shutdown VCF Identity Broker')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(11, 'Shutdown VCF Identity Broker', dry_run)
+
+        vcf_identity_broker_vms = []  # Not present in all deployments
+
+        if lsf.config.has_option('SHUTDOWN', 'vcf_identity_broker_vms'):
+            ib_raw = lsf.config.get('SHUTDOWN', 'vcf_identity_broker_vms')
+            vcf_identity_broker_vms = [v.strip() for v in ib_raw.split('\n') 
+                                      if v.strip() and not v.strip().startswith('#')]
+
+        if not dry_run:
+            if vcf_identity_broker_vms:
+                vcf_write(lsf, f'Processing {len(vcf_identity_broker_vms)} VCF Identity Broker VM(s)...')
+                for vm_name in vcf_identity_broker_vms:
+                    vcf_write(lsf, f'  Looking for: {vm_name}')
+                    vms = lsf.get_vm_by_name(vm_name)
+                    if vms:
+                        for vm in vms:
+                            shutdown_vm_gracefully(lsf, vm)
+                            time.sleep(5)
+                    else:
+                        vcf_write(lsf, f'    VM not found')
+                vcf_write(lsf, 'VCF Identity Broker shutdown complete')
+            else:
+                vcf_write(lsf, 'No VCF Identity Broker VMs configured (may not be deployed)')
+        else:
+            vcf_write(lsf, f'Would shutdown VCF Identity Broker: {vcf_identity_broker_vms}')
+
+        #==========================================================================
+        # TASK 12: Shutdown VCF Operations Fleet Management (VCF Operations Manager)
+        # Per VCF 9.0 Management Domain order #6
+    #==========================================================================
+    
+    if should_run('12'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 12: Shutdown VCF Operations Fleet Management')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(12, 'Shutdown VCF Ops Fleet Mgmt', dry_run)
+
+        vcf_ops_fleet_vms = []
+
+        if lsf.config.has_option('SHUTDOWN', 'vcf_ops_fleet_vms'):
+            fleet_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_fleet_vms')
+            vcf_ops_fleet_vms = [v.strip() for v in fleet_raw.split('\n') 
+                                if v.strip() and not v.strip().startswith('#')]
+
+        if not dry_run:
+            if vcf_ops_fleet_vms:
+                vcf_write(lsf, f'Processing {len(vcf_ops_fleet_vms)} VCF Ops Fleet Management VM(s)...')
+                for vm_name in vcf_ops_fleet_vms:
+                    vcf_write(lsf, f'  Looking for: {vm_name}')
+                    vms = lsf.get_vm_by_name(vm_name)
+                    if vms:
+                        for vm in vms:
+                            shutdown_vm_gracefully(lsf, vm)
+                            time.sleep(5)
+                    else:
+                        vcf_write(lsf, f'    VM not found')
+                vcf_write(lsf, 'VCF Operations Fleet Management shutdown complete')
+            else:
+                vcf_write(lsf, 'No VCF Ops Fleet Management VMs configured')
+        else:
+            vcf_write(lsf, f'Would shutdown VCF Ops Fleet Management: {vcf_ops_fleet_vms}')
+
+        #==========================================================================
+        # TASK 13: Shutdown VCF Operations (vrops)
+        # Per VCF 9.0 Management Domain order #7
+    #==========================================================================
+    
+    if should_run('13'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 13: Shutdown VCF Operations')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(13, 'Shutdown VCF Operations', dry_run)
+
+        # Note: VCF Operations (vrops) may have been partially shut down via Fleet API in Phase 1
+        # This phase ensures any remaining VMs are shut down
+        vcf_ops_vms = ['ops-a']
+
+        if lsf.config.has_option('SHUTDOWN', 'vcf_ops_vms'):
+            ops_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_vms')
+            vcf_ops_vms = [v.strip() for v in ops_raw.split('\n') 
+                          if v.strip() and not v.strip().startswith('#')]
+
+        if not dry_run:
+            if vcf_ops_vms:
+                vcf_write(lsf, f'Processing {len(vcf_ops_vms)} VCF Operations VM(s)...')
+                for vm_name in vcf_ops_vms:
+                    vcf_write(lsf, f'  Looking for: {vm_name}')
+                    vms = lsf.get_vm_by_name(vm_name)
+                    if vms:
+                        for vm in vms:
+                            shutdown_vm_gracefully(lsf, vm)
+                            time.sleep(5)
+                    else:
+                        vcf_write(lsf, f'    VM not found')
+                vcf_write(lsf, 'VCF Operations shutdown complete')
+            else:
+                vcf_write(lsf, 'No VCF Operations VMs configured')
+        else:
+            vcf_write(lsf, f'Would shutdown VCF Operations: {vcf_ops_vms}')
+
+        #==========================================================================
+        # TASK 14: Shutdown Management Domain NSX Edges
+        # Per VCF 9.0 Management Domain order #9
+        # Filter: Only edges with "mgmt" in their name (management domain)
+    #==========================================================================
+    
+    if should_run('14'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 14: Shutdown Management NSX Edges')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(14, 'Shutdown Mgmt NSX Edges', dry_run)
+
+        # Get all NSX edges from [VCF] vcfnsxedges (primary source)
+        # Format: edge-name:esxhost (we only need the edge name)
+        # Note: all_nsx_edges was already populated in Phase 5, but we rebuild
+        # here to ensure we have the full list in case Phase 5 was skipped
+        all_nsx_edges = []
+        if lsf.config.has_option('VCF', 'vcfnsxedges'):
+            edges_raw = lsf.config.get('VCF', 'vcfnsxedges')
+            for entry in edges_raw.split('\n'):
+                if entry.strip() and not entry.strip().startswith('#'):
+                    parts = entry.split(':')
+                    all_nsx_edges.append(parts[0].strip())
+            vcf_write(lsf, f'Found {len(all_nsx_edges)} NSX Edge(s) in [VCF] vcfnsxedges')
+        else:
+            vcf_write(lsf, 'No NSX Edges configured in [VCF] vcfnsxedges')
+
+        # Filter for management domain edges (contain "mgmt" in name)
+        mgmt_nsx_edges = [e for e in all_nsx_edges if 'mgmt' in e.lower()]
+
+        if not dry_run:
+            if mgmt_nsx_edges:
+                vcf_write(lsf, f'Processing {len(mgmt_nsx_edges)} Management NSX Edge VM(s)...')
+                edge_count = 0
+                for edge_name in mgmt_nsx_edges:
+                    edge_count += 1
+                    vcf_write(lsf, f'  [{edge_count}/{len(mgmt_nsx_edges)}] Looking for: {edge_name}')
+                    vms = lsf.get_vm_by_name(edge_name)
+                    if vms:
+                        for vm in vms:
+                            shutdown_vm_gracefully(lsf, vm)
+                            time.sleep(2)
+                    else:
+                        vcf_write(lsf, f'    Management NSX Edge VM not found')
+                vcf_write(lsf, 'Management NSX Edge shutdown complete')
+            else:
+                vcf_write(lsf, 'No Management NSX Edges found (no edges with "mgmt" in name)')
+        else:
+            vcf_write(lsf, f'Would shutdown Management NSX Edges: {mgmt_nsx_edges}')
+
+        #==========================================================================
+        # TASK 15: Shutdown Management Domain NSX Manager
+        # Per VCF 9.0 Management Domain order #10
+        # Filter: Only managers with "mgmt" in their name (management domain)
+    #==========================================================================
+    
+    if should_run('15'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 15: Shutdown Management NSX Manager')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(15, 'Shutdown Mgmt NSX Manager', dry_run)
+
+        # Get all NSX managers from [VCF] vcfnsxmgr (primary source)
+        # Format: nsx-name:esxhost (we only need the NSX manager name)
+        # Note: all_nsx_mgr was already populated in Phase 6, but we rebuild
+        # here to ensure we have the full list in case Phase 6 was skipped
+        all_nsx_mgr = []
+        if lsf.config.has_option('VCF', 'vcfnsxmgr'):
+            mgr_raw = lsf.config.get('VCF', 'vcfnsxmgr')
+            for entry in mgr_raw.split('\n'):
+                if entry.strip() and not entry.strip().startswith('#'):
+                    parts = entry.split(':')
+                    all_nsx_mgr.append(parts[0].strip())
+            vcf_write(lsf, f'Found {len(all_nsx_mgr)} NSX Manager(s) in [VCF] vcfnsxmgr')
+        else:
+            vcf_write(lsf, 'No NSX Managers configured in [VCF] vcfnsxmgr')
+
+        # Filter for management domain managers (contain "mgmt" in name)
+        mgmt_nsx_mgr = [m for m in all_nsx_mgr if 'mgmt' in m.lower()]
+
+        if not dry_run:
+            if mgmt_nsx_mgr:
+                vcf_write(lsf, f'Processing {len(mgmt_nsx_mgr)} Management NSX Manager VM(s)...')
+                mgr_count = 0
+                for mgr_name in mgmt_nsx_mgr:
+                    mgr_count += 1
+                    vcf_write(lsf, f'  [{mgr_count}/{len(mgmt_nsx_mgr)}] Looking for: {mgr_name}')
+                    vms = lsf.get_vm_by_name(mgr_name)
+                    if vms:
+                        for vm in vms:
+                            shutdown_vm_gracefully(lsf, vm)
+                            time.sleep(5)
+                    else:
+                        vcf_write(lsf, f'    Management NSX Manager VM not found')
+                vcf_write(lsf, 'Management NSX Manager shutdown complete')
+            else:
+                vcf_write(lsf, 'No Management NSX Managers found (no managers with "mgmt" in name)')
+        else:
+            vcf_write(lsf, f'Would shutdown Management NSX Manager: {mgmt_nsx_mgr}')
+
+        #==========================================================================
+        # TASK 16: Shutdown SDDC Manager
+        # Per VCF 9.0 Management Domain order #11
+    #==========================================================================
+    
+    if should_run('16'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 16: Shutdown SDDC Manager')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(16, 'Shutdown SDDC Manager', dry_run)
+
+        sddc_manager_vms = ['sddcmanager-a']
+
+        if lsf.config.has_option('SHUTDOWN', 'sddc_manager_vms'):
+            sddc_raw = lsf.config.get('SHUTDOWN', 'sddc_manager_vms')
+            sddc_manager_vms = [v.strip() for v in sddc_raw.split('\n') 
+                              if v.strip() and not v.strip().startswith('#')]
+
+        if not dry_run:
+            if sddc_manager_vms:
+                vcf_write(lsf, f'Processing {len(sddc_manager_vms)} SDDC Manager VM(s)...')
+                for vm_name in sddc_manager_vms:
+                    vcf_write(lsf, f'  Looking for: {vm_name}')
+                    vms = lsf.get_vm_by_name(vm_name)
+                    if vms:
+                        for vm in vms:
+                            shutdown_vm_gracefully(lsf, vm)
+                            time.sleep(10)  # Longer pause for SDDC Manager
+                    else:
+                        vcf_write(lsf, f'    SDDC Manager VM not found')
+                vcf_write(lsf, 'SDDC Manager shutdown complete')
+            else:
+                vcf_write(lsf, 'No SDDC Manager VMs configured')
+        else:
+            vcf_write(lsf, f'Would shutdown SDDC Manager: {sddc_manager_vms}')
+
+        #==========================================================================
+        # TASK 17: Shutdown Management vCenter
+        # Per VCF 9.0 Management Domain order #12 (with vSAN and ESX hosts)
+    #==========================================================================
+    
+    if should_run('17'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 17: Shutdown Management vCenter')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(17, 'Shutdown Management vCenter', dry_run)
+
+        # Get all vCenters from [VCF] vcfvCenter (primary source)
+        # Format: vcenter-name:esxhost (we only need the vCenter name)
+        # Filter for management vCenters (contain "mgmt" in name)
+        all_vcenters_mgmt = []
+        if lsf.config.has_option('VCF', 'vcfvCenter'):
+            vc_raw = lsf.config.get('VCF', 'vcfvCenter')
+            for entry in vc_raw.split('\n'):
+                if entry.strip() and not entry.strip().startswith('#'):
+                    parts = entry.split(':')
+                    all_vcenters_mgmt.append(parts[0].strip())
+            vcf_write(lsf, f'Found {len(all_vcenters_mgmt)} vCenter(s) in [VCF] vcfvCenter')
+        else:
+            vcf_write(lsf, 'No vCenters configured in [VCF] vcfvCenter')
+
+        # Filter for management vCenters (contain "mgmt" in name)
+        mgmt_vcenter_vms = [v for v in all_vcenters_mgmt if 'mgmt' in v.lower()]
+
+        if not dry_run:
+            if mgmt_vcenter_vms:
+                vcf_write(lsf, f'Processing {len(mgmt_vcenter_vms)} Management vCenter VM(s)...')
+                for vm_name in mgmt_vcenter_vms:
+                    vcf_write(lsf, f'  Looking for: {vm_name}')
+                    vms = lsf.get_vm_by_name(vm_name)
+                    if vms:
+                        for vm in vms:
+                            shutdown_vm_gracefully(lsf, vm)
+                            time.sleep(10)  # Longer pause for vCenter
+                    else:
+                        vcf_write(lsf, f'    Management vCenter VM not found')
+                vcf_write(lsf, 'Management vCenter shutdown complete')
+            else:
+                vcf_write(lsf, 'No Management vCenter VMs configured')
+        else:
+            vcf_write(lsf, f'Would shutdown Management vCenter: {mgmt_vcenter_vms}')
+
+        #==========================================================================
+        # TASK 17b: Reconnect to ESXi hosts directly
+        # vCenters are now shut down, so we need direct ESXi connections for
+        # the remaining phases (host settings, vSAN elevator, host shutdown).
+    #==========================================================================
+    
+    if should_run('17b'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 17b: Connect to ESXi Hosts Directly')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(17, 'Connect to ESXi Hosts', dry_run)
+
+        if not dry_run:
+            vcf_write(lsf, 'Disconnecting vCenter sessions...')
+            for si in lsf.sis:
+                try:
+                    connect.Disconnect(si)
+                except Exception:
+                    pass
+            lsf.sis.clear()
+            lsf.sisvc.clear()
+
+            if mgmt_hosts:
+                vcf_write(lsf, f'Connecting directly to {len(mgmt_hosts)} ESXi host(s):')
+                for host in mgmt_hosts:
+                    vcf_write(lsf, f'  - {host}')
+                lsf.connect_vcenters(mgmt_hosts)
+                vcf_write(lsf, f'Connected to {len(lsf.sis)} ESXi endpoint(s)')
+            else:
+                vcf_write(lsf, 'No ESXi hosts configured for direct connection')
+
+        #==========================================================================
+        # TASK 18: Set Host Advanced Settings
+    #==========================================================================
+    
+    if should_run('18'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 18: Set Host Advanced Settings')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(18, 'Host Advanced Settings', dry_run)
+
+        vcf_write(lsf, f'Found {len(esx_hosts)} ESXi host(s) in [VCF] vcfmgmtcluster')
+
+        if not dry_run:
+            if esx_hosts:
+                vcf_write(lsf, f'Configuring {len(esx_hosts)} ESXi host(s)...')
+                host_count = 0
+                for host in esx_hosts:
+                    host_count += 1
+                    vcf_write(lsf, f'  [{host_count}/{len(esx_hosts)}] Setting advanced settings on {host}')
                     try:
-                        if vm.runtime.powerState == pyvim.VirtualMachinePowerState.poweredOn:
-                            still_on.append(vm)
-                    except Exception:
-                        pass
-                container.Destroy()
-            except Exception as e:
-                vcf_write(lsf, f'  Error enumerating VMs on host: {e}')
-        
-        if still_on:
-            vcf_write(lsf, f'Found {len(still_on)} VM(s) still powered on:')
-            straggler_count = 0
-            skipped_count = 0
-            for vm in still_on:
-                vm_name_lower = vm.name.lower()
-                should_skip = any(pat in vm_name_lower for pat in skip_vm_patterns)
-                if should_skip:
-                    vcf_write(lsf, f'  {vm.name}: Skipping (infrastructure VM)')
-                    skipped_count += 1
-                else:
-                    vcf_write(lsf, f'  {vm.name}: STRAGGLER - attempting graceful shutdown')
-                    shutdown_vm_gracefully(lsf, vm)
-                    straggler_count += 1
-                    time.sleep(3)
-            vcf_write(lsf, f'Audit complete: {straggler_count} stragglers shut down, {skipped_count} infrastructure VMs skipped')
+                        cmd = 'esxcli system settings advanced set -o /Mem/AllocGuestLargePage -i 1'
+                        lsf.ssh(cmd, f'{esx_username}@{host}', password)
+                        vcf_write(lsf, f'    Settings applied successfully')
+                    except Exception as e:
+                        vcf_write(lsf, f'    Warning: Failed to set advanced settings: {e}')
+                vcf_write(lsf, 'Host advanced settings complete')
+            else:
+                vcf_write(lsf, 'No ESXi hosts configured - skipping')
         else:
-            vcf_write(lsf, 'All VMs already powered off - clean state for ESXi shutdown')
-    else:
-        vcf_write(lsf, 'Would enumerate all powered-on VMs and shut down stragglers')
-    
-    #==========================================================================
-    # TASK 20: Shutdown ESXi Hosts
-    # Per VCF 9.0 Management Domain order #12 (with vSAN)
+            vcf_write(lsf, f'Would set advanced settings on: {esx_hosts}')
+
+        #==========================================================================
+        # TASK 19: vSAN Elevator Operations (OSA only - ESA does not use plog)
     #==========================================================================
     
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'PHASE 20: Shutdown ESXi Hosts')
-    vcf_write(lsf, '='*60)
-    update_shutdown_status(20, 'Shutdown ESXi Hosts', dry_run)
-    
-    shutdown_hosts = True
-    if lsf.config.has_option('SHUTDOWN', 'shutdown_hosts'):
-        shutdown_hosts = lsf.config.getboolean('SHUTDOWN', 'shutdown_hosts')
-    
-    vcf_write(lsf, f'Host shutdown enabled: {shutdown_hosts}, ESXi hosts: {len(esx_hosts)}')
-    
-    if shutdown_hosts and esx_hosts and not dry_run:
-        vcf_write(lsf, f'Shutting down {len(esx_hosts)} ESXi host(s)...')
-        host_count = 0
-        for host in esx_hosts:
-            host_count += 1
-            vcf_write(lsf, f'  [{host_count}/{len(esx_hosts)}] Initiating shutdown: {host}')
-            shutdown_host(lsf, host, esx_username, password)
-            time.sleep(5)  # Stagger host shutdowns
-        vcf_write(lsf, 'ESXi host shutdown commands sent')
-        vcf_write(lsf, '  Note: Hosts may take several minutes to fully power off')
-    elif dry_run:
-        vcf_write(lsf, f'Would shutdown hosts: {esx_hosts}')
-    elif not shutdown_hosts:
-        vcf_write(lsf, 'Host shutdown skipped (shutdown_hosts=false in config)')
-    else:
-        vcf_write(lsf, 'Host shutdown skipped (no ESXi hosts configured)')
-    
-    #==========================================================================
-    # Cleanup
-    #==========================================================================
-    
-    vcf_write(lsf, '='*60)
-    vcf_write(lsf, 'SHUTDOWN COMPLETE')
-    vcf_write(lsf, '='*60)
-    
-    if not dry_run:
-        vcf_write(lsf, 'Disconnecting sessions...')
-        for si in lsf.sis:
+    if should_run('19'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 19: vSAN Elevator Operations')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(19, 'vSAN Elevator Operations', dry_run)
+
+        vsan_enabled = True
+        if lsf.config.has_option('SHUTDOWN', 'vsan_enabled'):
+            vsan_enabled = lsf.config.getboolean('SHUTDOWN', 'vsan_enabled')
+
+        vsan_timeout = VSAN_ELEVATOR_TIMEOUT
+        if lsf.config.has_option('SHUTDOWN', 'vsan_timeout'):
+            vsan_timeout_raw = lsf.config.get('SHUTDOWN', 'vsan_timeout')
+            # Strip any inline comments (e.g., "2700  # 45 minutes")
+            vsan_timeout_str = vsan_timeout_raw.split('#')[0].strip()
             try:
-                connect.Disconnect(si)
-            except Exception:
-                pass
-        lsf.sis.clear()
-        lsf.sisvc.clear()
+                vsan_timeout = int(vsan_timeout_str)
+            except ValueError:
+                vcf_write(lsf, f'Invalid vsan_timeout value: {vsan_timeout_raw}, using default {VSAN_ELEVATOR_TIMEOUT}')
+                vsan_timeout = VSAN_ELEVATOR_TIMEOUT
+
+        vcf_write(lsf, f'vSAN enabled: {vsan_enabled}, ESXi hosts: {len(esx_hosts)}, Timeout: {vsan_timeout}s ({vsan_timeout/60:.0f}min)')
+
+        if vsan_enabled and esx_hosts and not dry_run:
+            # Check if this is vSAN ESA (Express Storage Architecture)
+            # ESA does NOT use the plog mechanism, so elevator wait is not needed
+            vcf_write(lsf, 'Checking vSAN architecture (OSA vs ESA)...')
+            is_esa = False
+            if esx_hosts:
+                # Check the first host to determine architecture
+                test_host = esx_hosts[0]
+                is_esa = check_vsan_esa(lsf, test_host, esx_username, password)
+                if is_esa:
+                    vcf_write(lsf, f'  vSAN ESA detected on {test_host}')
+                    vcf_write(lsf, '  ESA does not use plog - skipping 45-minute elevator wait')
+                else:
+                    vcf_write(lsf, f'  vSAN OSA detected on {test_host}')
+                    vcf_write(lsf, '  OSA uses plog - elevator wait is required')
+
+            if is_esa:
+                # vSAN ESA - skip the elevator process entirely
+                vcf_write(lsf, 'vSAN ESA: Elevator operations not required (no plog)')
+            else:
+                # vSAN OSA - run the full elevator process
+                # Enable vSAN elevator on all hosts
+                vcf_write(lsf, f'Enabling vSAN elevator on {len(esx_hosts)} host(s)...')
+                host_count = 0
+                for host in esx_hosts:
+                    host_count += 1
+                    vcf_write(lsf, f'  [{host_count}/{len(esx_hosts)}] Enabling elevator on {host}')
+                    set_vsan_elevator(lsf, host, esx_username, password, enable=True)
+
+                # Wait for vSAN I/O to complete
+                vcf_write(lsf, f'Starting vSAN I/O flush wait ({vsan_timeout/60:.0f} minutes)...')
+                vcf_write(lsf, '  This ensures all pending writes are committed to disk (OSA plog)')
+
+                elapsed = 0
+                while elapsed < vsan_timeout:
+                    remaining = (vsan_timeout - elapsed) / 60
+                    elapsed_min = elapsed / 60
+                    vcf_write(lsf, f'  vSAN wait: {elapsed_min:.0f}m elapsed, {remaining:.1f}m remaining')
+                    time.sleep(VSAN_ELEVATOR_CHECK_INTERVAL)
+                    elapsed += VSAN_ELEVATOR_CHECK_INTERVAL
+
+                vcf_write(lsf, 'vSAN I/O flush wait complete')
+
+                # Disable vSAN elevator on all hosts
+                vcf_write(lsf, f'Disabling vSAN elevator on {len(esx_hosts)} host(s)...')
+                host_count = 0
+                for host in esx_hosts:
+                    host_count += 1
+                    vcf_write(lsf, f'  [{host_count}/{len(esx_hosts)}] Disabling elevator on {host}')
+                    set_vsan_elevator(lsf, host, esx_username, password, enable=False)
+                vcf_write(lsf, 'vSAN elevator operations complete')
+        elif dry_run:
+            vcf_write(lsf, f'Would run vSAN elevator on: {esx_hosts}')
+            vcf_write(lsf, f'vSAN timeout: {vsan_timeout} seconds')
+            vcf_write(lsf, 'Note: Actual run will check for ESA and skip if detected')
+        elif not vsan_enabled:
+            vcf_write(lsf, 'vSAN elevator skipped (vsan_enabled=false in config)')
+        else:
+            vcf_write(lsf, 'vSAN elevator skipped (no ESXi hosts configured)')
+
+        #==========================================================================
+        # TASK 19b: Shutdown VSP Platform VMs
+        # VSP VMs (vsp-01a-*) run the K8s management cluster. They should be
+        # shut down gracefully after all K8s workloads have been scaled down
+        # (Phase 2b) and after vCenter is off (Phase 17). We connect to the
+        # ESXi hosts directly to find and shut down these VMs.
+    #==========================================================================
     
-    ##=========================================================================
-    ## End Core Team code
-    ##=========================================================================
+    if should_run('19b'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 19b: Shutdown VSP Platform VMs')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(19, 'Shutdown VSP Platform VMs', dry_run)
+
+        vsp_vm_patterns = []
+        if lsf.config.has_option('VCF', 'vspvms'):
+            vsp_raw = lsf.config.get('VCF', 'vspvms')
+            for entry in vsp_raw.split('\n'):
+                entry = entry.strip()
+                if entry and not entry.startswith('#'):
+                    vm_pattern = entry.split(':')[0].strip()
+                    if vm_pattern:
+                        vsp_vm_patterns.append(vm_pattern)
+
+        if not dry_run:
+            if vsp_vm_patterns:
+                vcf_write(lsf, f'Searching for VSP VMs matching {len(vsp_vm_patterns)} pattern(s)...')
+                vsp_shutdown_count = 0
+                vsp_already_off = 0
+                for pattern in vsp_vm_patterns:
+                    vcf_write(lsf, f'  Pattern: {pattern}')
+                    vms = lsf.get_vm_match(pattern)
+                    if vms:
+                        vcf_write(lsf, f'  Found {len(vms)} VM(s)')
+                        for vm in vms:
+                            if is_vm_powered_on(vm):
+                                shutdown_vm_gracefully(lsf, vm)
+                                vsp_shutdown_count += 1
+                                time.sleep(5)
+                            else:
+                                vcf_write(lsf, f'  {vm.name}: Already powered off')
+                                vsp_already_off += 1
+                    else:
+                        vcf_write(lsf, f'  No VMs found matching pattern')
+                vcf_write(lsf, f'VSP VMs: {vsp_shutdown_count} shut down, {vsp_already_off} already off')
+            else:
+                vcf_write(lsf, 'No VSP VMs configured in [VCF] vspvms')
+        else:
+            vcf_write(lsf, f'Would shutdown VSP VMs: {vsp_vm_patterns}')
+
+        #==========================================================================
+        # TASK 19c: Pre-ESXi Shutdown Audit
+        # Enumerate all VMs still powered on across all connected ESXi hosts.
+        # Any VMs still running at this point were missed by earlier phases.
+        # Attempt graceful shutdown of stragglers (except the console/router).
+    #==========================================================================
     
-    ##=========================================================================
-    ## CUSTOM - Insert your code here using the file in your vPod_repo
-    ##=========================================================================
+    if should_run('19c'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 19c: Pre-ESXi Shutdown Audit')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(19, 'Pre-ESXi Shutdown Audit', dry_run)
+
+        skip_vm_patterns = ['holconsole', 'holorouter', 'router', 'console', 'manager']
+
+        if not dry_run:
+            from pyVmomi import vim as pyvim
+            still_on = []
+            for si in lsf.sis:
+                try:
+                    content = si.RetrieveContent()
+                    container = content.viewManager.CreateContainerView(
+                        content.rootFolder, [pyvim.VirtualMachine], True)
+                    for vm in container.view:
+                        try:
+                            if vm.runtime.powerState == pyvim.VirtualMachinePowerState.poweredOn:
+                                still_on.append(vm)
+                        except Exception:
+                            pass
+                    container.Destroy()
+                except Exception as e:
+                    vcf_write(lsf, f'  Error enumerating VMs on host: {e}')
+
+            if still_on:
+                vcf_write(lsf, f'Found {len(still_on)} VM(s) still powered on:')
+                straggler_count = 0
+                skipped_count = 0
+                for vm in still_on:
+                    vm_name_lower = vm.name.lower()
+                    should_skip = any(pat in vm_name_lower for pat in skip_vm_patterns)
+                    if should_skip:
+                        vcf_write(lsf, f'  {vm.name}: Skipping (infrastructure VM)')
+                        skipped_count += 1
+                    else:
+                        vcf_write(lsf, f'  {vm.name}: STRAGGLER - attempting graceful shutdown')
+                        shutdown_vm_gracefully(lsf, vm)
+                        straggler_count += 1
+                        time.sleep(3)
+                vcf_write(lsf, f'Audit complete: {straggler_count} stragglers shut down, {skipped_count} infrastructure VMs skipped')
+            else:
+                vcf_write(lsf, 'All VMs already powered off - clean state for ESXi shutdown')
+        else:
+            vcf_write(lsf, 'Would enumerate all powered-on VMs and shut down stragglers')
+
+        #==========================================================================
+        # TASK 20: Shutdown ESXi Hosts
+        # Per VCF 9.0 Management Domain order #12 (with vSAN)
+    #==========================================================================
     
-    # Example: Add custom shutdown tasks here
-    
-    ##=========================================================================
-    ## End CUSTOM section
-    ##=========================================================================
-    
-    vcf_write(lsf, f'{MODULE_NAME} completed')
-    vcf_write(lsf, '')
-    vcf_write(lsf, 'To complete shutdown of this lab environment, '
-              'please complete in the following order:')
-    vcf_write(lsf, '1. Shutdown the holorouter')
-    vcf_write(lsf, '2. Shutdown the manager')
-    vcf_write(lsf, '3. Shutdown the console')
-    vcf_write(lsf, '')
-    vcf_write(lsf, 'This order minimizes wait time.')
-    
-    # Return success status and list of ESXi hosts that were shut down
-    # This allows the caller to wait for hosts to fully power off
-    # esx_hosts is defined in Phase 8 so should always exist at this point
-    hosts_to_return = esx_hosts if 'esx_hosts' in locals() else []
-    return {'success': True, 'esx_hosts': hosts_to_return}
+    if should_run('20'):
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'PHASE 20: Shutdown ESXi Hosts')
+        vcf_write(lsf, '='*60)
+        update_shutdown_status(20, 'Shutdown ESXi Hosts', dry_run)
+
+        shutdown_hosts = True
+        if lsf.config.has_option('SHUTDOWN', 'shutdown_hosts'):
+            shutdown_hosts = lsf.config.getboolean('SHUTDOWN', 'shutdown_hosts')
+
+        vcf_write(lsf, f'Host shutdown enabled: {shutdown_hosts}, ESXi hosts: {len(esx_hosts)}')
+
+        if shutdown_hosts and esx_hosts and not dry_run:
+            vcf_write(lsf, f'Shutting down {len(esx_hosts)} ESXi host(s)...')
+            host_count = 0
+            for host in esx_hosts:
+                host_count += 1
+                vcf_write(lsf, f'  [{host_count}/{len(esx_hosts)}] Initiating shutdown: {host}')
+                shutdown_host(lsf, host, esx_username, password)
+                time.sleep(5)  # Stagger host shutdowns
+            vcf_write(lsf, 'ESXi host shutdown commands sent')
+            vcf_write(lsf, '  Note: Hosts may take several minutes to fully power off')
+        elif dry_run:
+            vcf_write(lsf, f'Would shutdown hosts: {esx_hosts}')
+        elif not shutdown_hosts:
+            vcf_write(lsf, 'Host shutdown skipped (shutdown_hosts=false in config)')
+        else:
+            vcf_write(lsf, 'Host shutdown skipped (no ESXi hosts configured)')
+
+        #==========================================================================
+        # Cleanup
+        #==========================================================================
+
+        vcf_write(lsf, '='*60)
+        vcf_write(lsf, 'SHUTDOWN COMPLETE')
+        vcf_write(lsf, '='*60)
+
+        if not dry_run:
+            vcf_write(lsf, 'Disconnecting sessions...')
+            for si in lsf.sis:
+                try:
+                    connect.Disconnect(si)
+                except Exception:
+                    pass
+            lsf.sis.clear()
+            lsf.sisvc.clear()
+
+        ##=========================================================================
+        ## End Core Team code
+        ##=========================================================================
+
+        ##=========================================================================
+        ## CUSTOM - Insert your code here using the file in your vPod_repo
+        ##=========================================================================
+
+        # Example: Add custom shutdown tasks here
+
+        ##=========================================================================
+        ## End CUSTOM section
+        ##=========================================================================
+
+    if phase is None:
+        vcf_write(lsf, f'{MODULE_NAME} completed')
+        vcf_write(lsf, '')
+        vcf_write(lsf, 'To complete shutdown of this lab environment, '
+                  'please complete in the following order:')
+        vcf_write(lsf, '1. Shutdown the holorouter')
+        vcf_write(lsf, '2. Shutdown the manager')
+        vcf_write(lsf, '3. Shutdown the console')
+        vcf_write(lsf, '')
+        vcf_write(lsf, 'This order minimizes wait time.')
+    else:
+        vcf_write(lsf, f'Phase {phase} complete.')
+
+    return {'success': True, 'esx_hosts': esx_hosts}
 
 
 #==============================================================================
@@ -2063,13 +2121,51 @@ def main(lsf=None, standalone=False, dry_run=False):
 #==============================================================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description=MODULE_DESCRIPTION)
+    parser = argparse.ArgumentParser(
+        description=MODULE_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Phase IDs for --phase:
+  1     Fleet Operations (VCF Operations Suite) Shutdown
+  1b    VCF Automation VM fallback (if Fleet API failed)
+  2     Connect to vCenters
+  2b    Scale Down VCF Component Services (K8s on VSP)
+  3     Stop Workload Control Plane (WCP)
+  4     Shutdown Workload VMs (Tanzu, K8s)
+  5     Shutdown Workload Domain NSX Edges
+  6     Shutdown Workload Domain NSX Manager
+  7     Shutdown Workload vCenters
+  8     Shutdown VCF Operations for Networks VMs
+  9     Shutdown VCF Operations Collector VMs
+  10    Shutdown VCF Operations for Logs VMs
+  11    Shutdown VCF Identity Broker VMs
+  12    Shutdown VCF Operations Fleet Management VMs
+  13    Shutdown VCF Operations (vrops) VMs
+  14    Shutdown Management Domain NSX Edges
+  15    Shutdown Management Domain NSX Manager
+  16    Shutdown SDDC Manager
+  17    Shutdown Management vCenter
+  17b   Connect to ESXi Hosts directly
+  18    Set Host Advanced Settings
+  19    vSAN Elevator Operations
+  19b   Shutdown VSP Platform VMs
+  19c   Pre-ESXi Shutdown Audit
+  20    Shutdown ESXi Hosts
+
+Examples:
+  python3 VCFshutdown.py --dry-run              # Preview all phases
+  python3 VCFshutdown.py --phase 1              # Run only Fleet Operations
+  python3 VCFshutdown.py --phase 13 --dry-run   # Preview VCF Operations phase
+"""
+    )
     parser.add_argument('--standalone', action='store_true',
                         help='Run in standalone test mode')
     parser.add_argument('--dry-run', action='store_true',
                         help='Show what would be done without making changes')
     parser.add_argument('--skip-init', action='store_true',
                         help='Skip lsf.init() call')
+    parser.add_argument('--phase', '-p', type=str, default=None,
+                        help='Run only a specific phase (e.g., 1, 1b, 13, 17b)')
     
     args = parser.parse_args()
     
@@ -2082,6 +2178,9 @@ if __name__ == '__main__':
         print(f'Running {MODULE_NAME} in standalone mode')
         print(f'Lab SKU: {lsf.lab_sku}')
         print(f'Dry run: {args.dry_run}')
+        if args.phase:
+            print(f'Phase: {args.phase}')
         print()
     
-    main(lsf=lsf, standalone=args.standalone, dry_run=args.dry_run)
+    main(lsf=lsf, standalone=args.standalone, dry_run=args.dry_run,
+         phase=args.phase)
