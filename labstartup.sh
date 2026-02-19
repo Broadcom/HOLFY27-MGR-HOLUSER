@@ -907,6 +907,7 @@ date > ${holorouterdir}/gitdone
 
 if [ -f ${configini} ]; then
     runlabstartup
+    /home/holuser/hol/Tools/VLPagent.sh &
     log_msg "$0 finished." "${logfile}"
 else
     log_msg "No config.ini on Main Console or vpodrepo. Abort." "${logfile}"
