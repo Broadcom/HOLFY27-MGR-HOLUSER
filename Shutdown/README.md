@@ -1,16 +1,16 @@
 # HOL Lab Shutdown Scripts
 
-Version 1.3 - February 2026
+Version 2.0 - February 2026
 
 ## Overview
 
-This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab environments. The scripts ensure an orderly shutdown of all VCF components following the **official Broadcom VCF 9.0 documentation**.
+This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab environments. The scripts ensure an orderly shutdown of all VCF components following the **official Broadcom VCF 9.0/9.1 documentation**.
 
 **Reference**: [VCF 9.0 Shutdown Operations](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-0/fleet-management/vcf-shutdown-and-startup/vcf-shutdown.html)
 
-## Quick-start to Shutdown pod:
+## Quick-start to Shutdown pod
 
-### Shutdown procedure:
+### Shutdown procedure
 
 1) Shutdown nested environment:
 
@@ -23,18 +23,11 @@ This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab
     Wait until complete.
 
 2) Shutdown router as follows:
-On the router, login as root and run the /root/shutdown.sh script -This was written to perform a graceful shutdown of the kubernetes environment, services, etc...
+On the router, login as root and run the /root/shutdown.sh script - This was written to perform a graceful shutdown of the kubernetes environment, services, etc...
 
 3) Shutdown manager
 
 4) Shutdown console
-
-### Key Features of Shutdown.py
-
-- **Status File Updates**: The shutdown progress is written to `/lmchol/hol/startup_status.txt` for console display widgets
-- **Real-time Logging**: Detailed progress output for all phases and operations
-- **Host Power-Off Monitoring**: Waits up to 30 minutes for all ESXi hosts to fully power off before completing
-- **Lab-Safe SSH**: Uses `StrictHostKeyChecking=no` to handle host key changes common in lab environments
 
 ## Scripts
 
@@ -43,7 +36,7 @@ On the router, login as root and run the /root/shutdown.sh script -This was writ
 The main entry point for lab shutdown. Coordinates all shutdown phases and provides command-line options.
 
 ```bash
-# Full shutdown
+# Full shutdown (all phases)
 python3 Shutdown.py
 
 # Preview mode (no changes made)
@@ -55,7 +48,13 @@ python3 Shutdown.py --quick
 # Shutdown VMs only, leave hosts running
 python3 Shutdown.py --no-hosts
 
-# Show help
+# Run a single VCF shutdown phase
+python3 Shutdown.py --phase 1
+
+# Preview a single phase
+python3 Shutdown.py --phase 13 --dry-run
+
+# Show help (includes full phase list)
 python3 Shutdown.py --help
 ```
 
@@ -63,7 +62,7 @@ python3 Shutdown.py --help
 
 Handles VCF-specific shutdown tasks including:
 
-- Fleet Operations (VCF Operations Suite) via SDDC Manager API
+- Fleet Operations (VCF Operations Suite) via suite-api internal components API
 - WCP (Workload Control Plane) shutdown
 - Tanzu/Kubernetes workload VMs
 - Management VMs (vCenter, SDDC Manager, VCF Operations Suite)
@@ -74,28 +73,59 @@ Handles VCF-specific shutdown tasks including:
 Can be run standalone:
 
 ```bash
+# Full shutdown
+python3 VCFshutdown.py
+
+# Preview all phases
 python3 VCFshutdown.py --dry-run
+
+# Run a single phase
+python3 VCFshutdown.py --phase 1
+
+# Preview a single phase
+python3 VCFshutdown.py --phase 1 --dry-run
 ```
 
 ### fleet.py (Fleet Operations Module)
 
-Provides integration with SDDC Manager Fleet Operations API for graceful shutdown of VCF Operations Suite products:
+Provides integration with VCF Operations Manager APIs for component discovery and graceful shutdown of VCF Operations Suite products.
 
-- vra (VCF Automation)
-- vrni (VCF Operations for Networks)
-- vrops (VCF Operations)
-- vrli (VCF Operations for Logs)
+Supports two API versions:
+
+| Version | Endpoint | Auth | API Style |
+| ------- | -------- | ---- | --------- |
+| VCF 9.1 | `ops-a` via `/suite-api/internal/components/` | OpsToken | Component-based (VCFA, NI, OPS, LI) |
+| VCF 9.0 | `opslcm-a` via `/lcm/lcops/api/v2/` | Basic (base64) | Environment/product-based (vra, vrni) |
+
+VCF 9.1 component type mapping:
+
+| Product | Component Type | Description |
+| ------- | -------------- | ----------- |
+| vra | VCFA | VCF Automation |
+| vrni | NI | Operations for Networks |
+| vrops | OPS | VCF Operations |
+| vrli | LI | Operations for Logs |
+| vrlcm | FLEET_LCM | Fleet Lifecycle Manager |
 
 Can be tested standalone:
 
 ```bash
+# Probe for VCF 9.1 API availability
+python3 fleet.py --fqdn ops-a.site-a.vcf.lab --password PASSWORD --action probe
+
+# List components (VCF 9.1)
+python3 fleet.py --fqdn ops-a.site-a.vcf.lab --password PASSWORD --version 9.1 --action list
+
+# Shutdown products (VCF 9.1)
+python3 fleet.py --fqdn ops-a.site-a.vcf.lab --password PASSWORD --version 9.1 --action shutdown --products vra vrni
+
+# List environments (VCF 9.0)
 python3 fleet.py --fqdn opslcm-a.site-a.vcf.lab --password PASSWORD --action list
-python3 fleet.py --fqdn opslcm-a.site-a.vcf.lab --password PASSWORD --action shutdown
 ```
 
 ## Shutdown Order
 
-The shutdown follows the **official Broadcom VCF 9.0 documentation**.
+The shutdown follows the **official Broadcom VCF 9.0/9.1 documentation**.
 
 ### VCF 9.0 Workload Domain Order
 
@@ -131,308 +161,110 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 
 ### Implementation Phases
 
-| Main Orchestrator | VCF Shutdown Phase | Description |
-| ----------------- | ------------------ | ----------- |
-| Phase 0: Pre-Checks | | Check config, detect lab type |
-| Phase 1: Docker | | Stop Docker containers |
-| Phase 2: VCF Shutdown | 1. Fleet Operations | VCF Automation via API (vra, vrni) |
-| | 2. Connect Infrastructure | Connect to management hosts |
-| | 3. Stop WCP | Stop Workload Control Plane services |
-| | 4. Workload VMs | Tanzu, K8s, Supervisor VMs |
-| | 5-6. Workload NSX | Workload domain NSX Edges, then Manager |
-| | 7. Workload vCenters | Workload vCenters (LAST per VCF 9.0) |
-| | 8. VCF Ops Networks | VCF Operations for Networks (vrni) |
-| | 9. VCF Ops Collector | VCF Operations Collector |
-| | 10. VCF Ops Logs | VCF Operations for Logs (vrli) |
-| | 11. VCF Identity Broker | VCF Identity Broker |
-| | 12. VCF Fleet Mgmt | VCF Operations Fleet Management |
-| | 13. VCF Operations | VCF Operations (vrops, orchestrator) |
-| | 14-15. Mgmt NSX | Management NSX Edges, then Manager |
-| | 16. SDDC Manager | SDDC Manager |
-| | 17. Mgmt vCenter | Management domain vCenter |
-| | 18. Host Settings | Set ESXi advanced settings |
-| | 19. vSAN Elevator | Enable elevator, wait 45min, disable |
-| | 20. ESXi Hosts | Shutdown ESXi hosts |
-| Phase 3: Final Cleanup | | Disconnect vSphere sessions |
-| Phase 4: Wait for Hosts | | Ping monitoring (15s interval, 30min max) |
+| Phase | Description | Notes |
+| ----- | ----------- | ----- |
+| **Main Orchestrator (Shutdown.py)** | | |
+| Phase 0 | Pre-Shutdown Checks | Check config, detect lab type |
+| Phase 1 | Docker Containers | Stop Docker containers |
+| Phase 2 | VCF Environment Shutdown | Calls VCFshutdown.py |
+| Phase 3 | Final Cleanup | Disconnect vSphere sessions |
+| Phase 4 | Wait for Host Power Off | Ping monitoring (15s, 30min max) |
+| **VCF Shutdown (VCFshutdown.py)** | | |
+| Phase 1 | Fleet Operations | VCF Ops Suite via API (vra, vrni, vrops, vrli) |
+| Phase 1b | VCF Automation VM fallback | Only if Fleet API failed |
+| Phase 2 | Connect to vCenters | vCenters first (while available) |
+| Phase 2b | Scale Down VCF Components | K8s workloads on VSP |
+| Phase 3 | Stop WCP | Workload Control Plane services |
+| Phase 4 | Workload VMs | Tanzu, K8s, Supervisor VMs |
+| Phase 5 | Workload NSX Edges | Workload domain NSX Edges |
+| Phase 6 | Workload NSX Manager | Workload domain NSX Manager |
+| Phase 7 | Workload vCenters | Workload vCenters (LAST per VCF 9.0) |
+| Phase 8 | VCF Ops Networks VMs | VCF Operations for Networks VMs |
+| Phase 9 | VCF Ops Collector VMs | VCF Operations Collector VMs |
+| Phase 10 | VCF Ops Logs VMs | VCF Operations for Logs VMs |
+| Phase 11 | VCF Identity Broker VMs | VCF Identity Broker VMs |
+| Phase 12 | VCF Fleet Mgmt VMs | VCF Operations Fleet Management VMs |
+| Phase 13 | VCF Operations VMs | VCF Operations (vrops) VMs |
+| Phase 14 | Mgmt NSX Edges | Management NSX Edges |
+| Phase 15 | Mgmt NSX Manager | Management NSX Manager |
+| Phase 16 | SDDC Manager | SDDC Manager |
+| Phase 17 | Mgmt vCenter | Management domain vCenter |
+| Phase 17b | Connect to ESXi | Direct ESXi connections (vCenters now down) |
+| Phase 18 | Host Settings | Set ESXi advanced settings |
+| Phase 19 | vSAN Elevator | Enable elevator, wait 45min, disable (OSA only) |
+| Phase 19b | VSP Platform VMs | Shutdown VSP VMs |
+| Phase 19c | Pre-ESXi Audit | Find and shutdown straggler VMs |
+| Phase 20 | ESXi Hosts | Shutdown ESXi hosts |
 
-### VCF 9.0 Documentation Compliance
+### Key Design Decisions
 
-The shutdown order aligns with Broadcom's VCF 9.0 documentation:
+1. **vCenters connected first (Phase 2)**: While vCenters are still running, all VM shutdown operations (Phases 3-17) go through vCenter for reliable VM discovery and graceful shutdown. ESXi host direct connections only happen after vCenters are shut down (Phase 17b).
 
-1. **Workload domains before management domain** - Per VCF 9.0: workload domain components shut down first
-2. **Workload vCenter shuts down LAST in workload domain** - Per VCF 9.0: ESX hosts (#7) before vCenter (#8)
-3. **VCF Operations for Logs is position #4** - In VCF 9.0, vrli shuts down early (after collector, before Identity Broker)
-4. **VCF Operations (vrops) is position #7** - After Fleet Management, before Live Site Recovery
-5. **SDDC Manager after NSX** - SDDC Manager (#11) shuts down after NSX Manager (#10)
-6. **vSAN and ESX with vCenter** - Per VCF 9.0 #12: these shut down together last
+2. **Phase 1b follows Phase 1**: If the Fleet API cannot shut down VCF Automation, the fallback VM shutdown (Phase 1b) runs immediately after, before connecting to infrastructure (Phase 2).
 
-## Process Diagram
+3. **VCF Components vs VMs**: In VCF 9.1, many services (opslogs-a, opslcm-a, Identity Broker, etc.) run as Kubernetes workloads on VSP, not as standalone VMs. These are handled by Phase 2b (K8s scale-down) and Phase 1 (Fleet API), not by VM lookup phases. Phases 10-12 only target actual VMs when configured in `config.ini`.
 
-The following Mermaid diagrams illustrate the complete shutdown process flow.
+4. **Fleet API uses suite-api internal endpoint**: The VCF 9.1 Fleet LCM plugin API at `/vcf-operations/plug/fleet-lcm/v1/` requires a UI session. Instead, the script uses `/suite-api/internal/components/` with OpsToken authentication (same pattern as the password management API). The shutdown *action* (`POST ?action=shutdown`) returns HTTP 500 through this proxy, so Phase 1 performs component discovery only - actual shutdown is handled by VM power-off in Phase 1b and subsequent phases.
 
-### Main Orchestrator (Shutdown.py)
+## Command-Line Options
 
-```mermaid
-flowchart TD
-    START([🚀 Start Shutdown])
-    START --> STATUS_INIT["Set Status: Shutting Down"]
-    STATUS_INIT --> INIT[Initialize Logging]
-    INIT --> BANNER[Print Banner & Config]
-    
-    BANNER --> P0[/"Phase 0: Pre-Shutdown Checks"/]
-    P0 --> STATUS_P0["Update Status File"]
-    STATUS_P0 --> CHECK_CONFIG[Check config.ini exists]
-    CHECK_CONFIG --> DETECT_LAB[Detect Lab Type]
-    
-    DETECT_LAB --> P1[/"Phase 1: Docker Containers"/]
-    P1 --> STATUS_P1["Update Status File"]
-    STATUS_P1 --> DOCKER_CHECK{Docker Host Reachable?}
-    DOCKER_CHECK -->|Yes| DOCKER_STOP[Stop Containers]
-    DOCKER_CHECK -->|No| DOCKER_SKIP[Skip Docker]
-    DOCKER_STOP --> P2_START
-    DOCKER_SKIP --> P2_START
-    
-    P2_START[/"Phase 2: VCF Shutdown"/] --> STATUS_P2["Update Status File"]
-    STATUS_P2 --> VCF_CHECK{Lab Type in VCF_LAB_TYPES?}
-    VCF_CHECK -->|Yes| VCF_MODULE["Call VCFshutdown.py<br/>(returns ESXi host list)"]
-    VCF_CHECK -->|No| VCF_DEFAULT[Use Default Shutdown]
-    VCF_MODULE --> P3_START
-    VCF_DEFAULT --> P3_START
-    
-    P3_START[/"Phase 3: Final Cleanup"/] --> STATUS_P3["Update Status File"]
-    STATUS_P3 --> DISCONNECT[Disconnect vSphere Sessions]
-    
-    DISCONNECT --> P4_START[/"Phase 4: Wait for Host Power Off"/]
-    P4_START --> STATUS_P4["Update Status File"]
-    STATUS_P4 --> HOST_WAIT{"Ping ESXi Hosts<br/>(15s interval, 30min max)"}
-    HOST_WAIT -->|All Offline| HOSTS_DONE[All Hosts Powered Off]
-    HOST_WAIT -->|Timeout| HOSTS_TIMEOUT[Report Remaining Hosts]
-    
-    HOSTS_DONE --> SUMMARY[Print Summary]
-    HOSTS_TIMEOUT --> SUMMARY
-    SUMMARY --> STATUS_DONE["Set Status: Shutdown Complete"]
-    STATUS_DONE --> FINISH(["✅ Lab shut down.<br/>Manually shutdown manager,<br/>router, and console."])
+### Shutdown.py Options
 
-    style START fill:#5cb85c,color:#333
-    style FINISH fill:#5cb85c,color:#333
-    style P0 fill:#7fbfff,color:#333
-    style P1 fill:#ffcc80,color:#333
-    style P2_START fill:#c4a8e0,color:#333
-    style P3_START fill:#82d99e,color:#333
-    style P4_START fill:#f4a6a6,color:#333
-    style STATUS_INIT fill:#ffe082,color:#333
-    style STATUS_DONE fill:#ffe082,color:#333
+| Option | Short | Description |
+| ------ | ----- | ----------- |
+| `--dry-run` | `-n` | Preview mode - show what would be done without making changes |
+| `--quick` | `-q` | Skip the 45-minute vSAN elevator wait (faster but less safe) |
+| `--no-hosts` | | Skip ESXi host shutdown (leave hosts running) |
+| `--phase PHASE` | `-p` | Run only a specific VCF shutdown phase |
+| `--version` | `-v` | Show version number |
+| `--debug` | `-d` | Enable debug logging |
+
+### VCFshutdown.py Options
+
+| Option | Short | Description |
+| ------ | ----- | ----------- |
+| `--dry-run` | | Preview mode |
+| `--standalone` | | Run in standalone test mode |
+| `--skip-init` | | Skip lsf.init() call |
+| `--phase PHASE` | `-p` | Run only a specific phase |
+
+### Using --phase for Selective Shutdown
+
+The `--phase` parameter allows you to run a single shutdown phase at a time. This is useful for:
+
+- **Debugging**: Test a specific phase without running the entire sequence
+- **Selective operations**: Shut down only certain components
+- **Recovery**: Re-run a failed phase without repeating completed ones
+
+```bash
+# Shut down only Fleet Operations (VCF Automation, Networks, etc.)
+python3 Shutdown.py --phase 1
+
+# Preview what Phase 13 (VCF Operations) would do
+python3 Shutdown.py --phase 13 --dry-run
+
+# Scale down VCF Component Services on VSP
+python3 Shutdown.py --phase 2b
+
+# Shut down only SDDC Manager
+python3 Shutdown.py --phase 16
+
+# Run the vSAN elevator operations
+python3 Shutdown.py --phase 19
+
+# Run the pre-ESXi audit to find straggler VMs
+python3 Shutdown.py --phase 19c
+
+# Not passing --phase runs all phases in order (default behavior)
+python3 Shutdown.py
 ```
 
-### VCF Shutdown Module (VCFshutdown.py)
+When `--phase` is specified:
 
-Each phase updates the status file (`/lmchol/hol/startup_status.txt`) and provides detailed logging. The order follows VCF 5.x documentation.
-
-```mermaid
-flowchart TD
-    VCF_START([🔧 VCF Shutdown Start])
-    
-    VCF_START --> P1[/"Phase 1: Fleet Operations"/]
-    P1 --> FLEET_CHECK{Fleet Mgmt Reachable?}
-    FLEET_CHECK -->|Yes| FLEET_AUTH[Authenticate to SDDC Manager]
-    FLEET_AUTH --> FLEET_OFF[Shutdown: vra, vrops, vrni]
-    FLEET_CHECK -->|No| FLEET_SKIP[Skip Fleet]
-    FLEET_OFF --> P2
-    FLEET_SKIP --> P2
-    
-    P2[/"Phase 2: Connect Infrastructure"/]
-    P2 --> CONNECT[Connect to Management Hosts]
-    
-    CONNECT --> P3[/"Phase 3: Stop WCP"/]
-    P3 --> WCP["SSH: vmon-cli -k wcp"]
-    
-    WCP --> P4[/"Phase 4: Workload VMs"/]
-    P4 --> VM_FIND["Find VMs by Pattern<br/>(Tanzu, K8s)"]
-    VM_FIND --> VM_OFF[Shutdown Workload VMs]
-    
-    VM_OFF --> P5[/"Phase 5: Workload vCenters"/]
-    P5 --> WLD_VC[Shutdown vc-wld* VMs]
-    
-    WLD_VC --> P5B[/"Phase 5b: VCF Operations Orchestrator"/]
-    P5B --> ORCH[Shutdown o11n-* VMs]
-    
-    ORCH --> P6[/"Phase 6: VCF Operations Manager"/]
-    P6 --> LCM[Shutdown opslcm-* VMs]
-    
-    LCM --> P7[/"Phase 7: VCF Operations for Logs<br/>(LATE - per VCF docs)"/]
-    P7 --> LOGS["Shutdown opslogs-*, opsnet-*<br/>(kept running late for logs)"]
-    
-    LOGS --> P8[/"Phase 8: NSX Edges"/]
-    P8 --> EDGE_OFF[Shutdown Edge VMs]
-    
-    EDGE_OFF --> P9[/"Phase 9: NSX Manager"/]
-    P9 --> NSX_OFF[Shutdown NSX Manager]
-    
-    NSX_OFF --> P10[/"Phase 10: SDDC Manager"/]
-    P10 --> SDDC[Shutdown sddcmanager-a]
-    
-    SDDC --> P11[/"Phase 11: Management vCenter"/]
-    P11 --> MGMT_VC[Shutdown vc-mgmt-a]
-    
-    MGMT_VC --> P12[/"Phase 12: Host Settings"/]
-    P12 --> ADV[Set AllocGuestLargePage=1]
-    
-    ADV --> P13[/"Phase 13: vSAN Elevator"/]
-    P13 --> VSAN_CHECK{vSAN Enabled?}
-    VSAN_CHECK -->|Yes| VSAN_ON[Enable plogRunElevator]
-    VSAN_ON --> VSAN_WAIT[⏳ Wait 45 minutes]
-    VSAN_WAIT --> VSAN_OFF[Disable plogRunElevator]
-    VSAN_CHECK -->|No| VSAN_SKIP[Skip vSAN]
-    VSAN_OFF --> P14
-    VSAN_SKIP --> P14
-    
-    P14[/"Phase 14: ESXi Hosts"/]
-    P14 --> HOST_CHECK{Shutdown Hosts?}
-    HOST_CHECK -->|Yes| HOST_OFF[ShutdownHost_Task]
-    HOST_CHECK -->|No| HOST_SKIP[Skip Hosts]
-    HOST_OFF --> VCF_END
-    HOST_SKIP --> VCF_END
-    
-    VCF_END(["✅ Return success + ESXi host list"])
-
-    style VCF_START fill:#5cb85c,color:#333
-    style VCF_END fill:#5cb85c,color:#333
-    style P1 fill:#f4a6a6,color:#333
-    style P2 fill:#7fbfff,color:#333
-    style P3 fill:#ffcc80,color:#333
-    style P4 fill:#c4a8e0,color:#333
-    style P5 fill:#82d99e,color:#333
-    style P5B fill:#82d99e,color:#333
-    style P6 fill:#ffe082,color:#333
-    style P7 fill:#e6b800,color:#333
-    style P8 fill:#7ec8d9,color:#333
-    style P9 fill:#7ec8d9,color:#333
-    style P10 fill:#f2a6c8,color:#333
-    style P11 fill:#f2a6c8,color:#333
-    style P12 fill:#b8b8b8,color:#333
-    style P13 fill:#b8b8b8,color:#333
-    style P14 fill:#a6a6e6,color:#333
-```
-
-### Fleet Operations Detail
-
-```mermaid
-flowchart LR
-    subgraph FLEET["fleet.py - Fleet Operations"]
-        F_START([Start]) --> F_AUTH[Get Encoded Token<br/>base64 credentials]
-        F_AUTH --> F_ENV[Get All Environments<br/>from SDDC Manager]
-        F_ENV --> F_SYNC[Trigger Inventory Sync<br/>for each product]
-        F_SYNC --> F_WAIT1[Wait for Sync<br/>max 5 min]
-        F_WAIT1 --> F_POWER[Trigger power-off<br/>for each product]
-        F_POWER --> F_WAIT2[Wait for Power Op<br/>max 30 min]
-        F_WAIT2 --> F_END([Complete])
-    end
-
-    style F_START fill:#5cb85c,color:#333
-    style F_END fill:#e68a8a,color:#333
-```
-
-### VM Shutdown Logic
-
-```mermaid
-flowchart TB
-    subgraph VM_SHUTDOWN["VM Graceful Shutdown Logic"]
-        VS_START([Shutdown VM]) --> VS_STATE{Current<br/>Power State?}
-        
-        VS_STATE -->|Powered Off| VS_SKIP[Already Off - Skip]
-        VS_STATE -->|Suspended| VS_FORCE_SUSPEND[Force Power Off]
-        VS_STATE -->|Powered On| VS_TOOLS{VMware Tools<br/>Running?}
-        
-        VS_TOOLS -->|Yes| VS_GUEST[ShutdownGuest]
-        VS_TOOLS -->|No| VS_FORCE_NO_TOOLS[Force Power Off]
-        
-        VS_GUEST --> VS_WAIT{Wait for<br/>Power Off<br/>max 5 min}
-        VS_WAIT -->|Powered Off| VS_SUCCESS[Success]
-        VS_WAIT -->|Timeout| VS_FORCE_TIMEOUT[Force Power Off]
-        
-        VS_SKIP --> VS_END([Done])
-        VS_FORCE_SUSPEND --> VS_END
-        VS_FORCE_NO_TOOLS --> VS_END
-        VS_SUCCESS --> VS_END
-        VS_FORCE_TIMEOUT --> VS_END
-    end
-
-    style VS_START fill:#5cb85c,color:#333
-    style VS_END fill:#e68a8a,color:#333
-    style VS_SUCCESS fill:#5cb85c,color:#333
-```
-
-### Sequence Diagram
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant StatusFile
-    participant Shutdown.py
-    participant VCFshutdown.py
-    participant fleet.py
-    participant SDDC Manager
-    participant vCenter
-    participant ESXi Hosts
-
-    User->>Shutdown.py: python3 Shutdown.py
-    Shutdown.py->>StatusFile: "Shutting Down"
-    Shutdown.py->>Shutdown.py: Initialize logging
-    Shutdown.py->>StatusFile: "Shutdown Phase 0: Pre-Shutdown Checks"
-    Shutdown.py->>Shutdown.py: Phase 0: Pre-checks
-    Shutdown.py->>StatusFile: "Shutdown Phase 1: Docker Containers"
-    Shutdown.py->>Shutdown.py: Phase 1: Docker containers
-    
-    Shutdown.py->>StatusFile: "Shutdown Phase 2: VCF Environment Shutdown"
-    Shutdown.py->>VCFshutdown.py: Phase 2: VCF Shutdown
-    
-    Note over VCFshutdown.py: Phase 1: Fleet Operations
-    VCFshutdown.py->>fleet.py: Fleet Operations
-    fleet.py->>SDDC Manager: Shutdown vra, vrops, vrni
-    fleet.py-->>VCFshutdown.py: Fleet shutdown complete
-    
-    Note over VCFshutdown.py: Phase 2-4: Connect, WCP, Workload VMs
-    VCFshutdown.py->>vCenter: Connect to management hosts
-    VCFshutdown.py->>vCenter: SSH: vmon-cli -k wcp
-    VCFshutdown.py->>vCenter: Shutdown Tanzu/K8s VMs
-    
-    Note over VCFshutdown.py: Phase 5: Workload vCenters (BEFORE mgmt domain)
-    VCFshutdown.py->>vCenter: Shutdown vc-wld* VMs
-    
-    Note over VCFshutdown.py: Phase 5b-6: VCF Operations Orchestrator, Suite Lifecycle
-    VCFshutdown.py->>vCenter: Shutdown o11n-*, opslcm-*
-    
-    Note over VCFshutdown.py: Phase 7: VCF Operations for Logs (LATE per VCF docs)
-    VCFshutdown.py->>vCenter: Shutdown opslogs-*, opsnet-*
-    
-    Note over VCFshutdown.py: Phase 8-9: NSX Edges, NSX Manager
-    VCFshutdown.py->>vCenter: Shutdown NSX Edge/Manager VMs
-    
-    Note over VCFshutdown.py: Phase 10-11: SDDC Manager, Management vCenter
-    VCFshutdown.py->>vCenter: Shutdown sddcmanager-a
-    VCFshutdown.py->>vCenter: Shutdown vc-mgmt-a
-    
-    Note over VCFshutdown.py: Phase 12-14: Host Settings, vSAN, ESXi
-    VCFshutdown.py->>ESXi Hosts: Set advanced settings
-    VCFshutdown.py->>ESXi Hosts: vSAN elevator (45min wait)
-    VCFshutdown.py->>ESXi Hosts: ShutdownHost_Task
-    
-    VCFshutdown.py-->>Shutdown.py: Return {success, esx_hosts list}
-    
-    Shutdown.py->>StatusFile: "Shutdown Phase 3: Final Cleanup"
-    Shutdown.py->>Shutdown.py: Disconnect vSphere sessions
-    
-    Shutdown.py->>StatusFile: "Shutdown Phase 4: Wait for Host Power Off"
-    
-    loop Every 15 seconds (max 30 min)
-        Shutdown.py->>ESXi Hosts: Ping host
-        ESXi Hosts-->>Shutdown.py: Response/No response
-    end
-    
-    Shutdown.py->>StatusFile: "Shutdown Complete"
-    Shutdown.py-->>User: Lab shut down. Manually shutdown manager, router, console.
-```
+- Only the selected VCF shutdown phase executes
+- Infrastructure connections (Phase 2) are set up automatically if needed
+- Configuration is always read so the selected phase has all required data
+- Docker containers, final cleanup, and host power-off monitoring are skipped
 
 ## Configuration
 
@@ -440,10 +272,14 @@ Shutdown behavior can be customized via the `[SHUTDOWN]` section in `vPodRepo/co
 
 ```ini
 [SHUTDOWN]
-# Fleet Operations (SDDC Manager)
+# Fleet Operations - VCF 9.1 (internal components API via ops-a)
+ops_fqdn = ops-a.site-a.vcf.lab
+ops_username = admin
+
+# Fleet Operations - VCF 9.0 legacy (SDDC Manager LCM API via opslcm-a)
 fleet_fqdn = opslcm-a.site-a.vcf.lab
 fleet_username = admin@local
-fleet_products = vra,vrni
+fleet_products = vra,vrni,vrops,vrli
 
 # Docker containers
 shutdown_docker = true
@@ -451,79 +287,55 @@ docker_host = docker.site-a.vcf.lab
 docker_user = holuser
 docker_containers = gitlab,ldap,poste.io,flask
 
-# NOTE: WCP vCenters are automatically determined from [VCFFINAL] tanzucontrol
-
-# VM patterns to find and shutdown (regex)
+# VM regex patterns to find and shutdown (regex)
 vm_patterns = ^kubernetes-cluster-.*$
     ^dev-project-.*$
     ^cci-service-.*$
     ^SupervisorControlPlaneVM.*$
 
-# Specific workload VMs to shutdown
-workload_vms = core-a
-    core-b
-    hol-ubuntu-001
+# VCF Operations for Networks VMs (vrni) - only actual VMs
+vcf_ops_networks_vms = ops_networks-platform-10-1-1-60
+    ops_networks-collector-10-1-1-62
 
-# Workload vCenters (shut down LAST in workload domain per VCF 9.0)
-workload_vcenters = vc-wld02-a
-    vc-wld01-a
-
-# VCF Operations for Networks (vrni) - VCF 9.0 Mgmt Domain #2
-vcf_ops_networks_vms = opsnet-a
-    opsnet-01a
-    opsnetcollector-01a
-
-# VCF Operations Collector - VCF 9.0 Mgmt Domain #3
+# VCF Operations Collector VMs - only actual VMs
 vcf_ops_collector_vms = opscollector-01a
-    opsproxy-01a
 
-# VCF Operations for Logs (vrli) - VCF 9.0 Mgmt Domain #4
-vcf_ops_logs_vms = opslogs-01a
-    ops-01a
-    ops-a
+# VCF Operations for Logs VMs (vrli) - only actual VMs
+# NOTE: opslogs-a is a VCF Component on VSP, NOT a VM. Do not list it here.
+#vcf_ops_logs_vms = 
 
-# VCF Identity Broker - VCF 9.0 Mgmt Domain #5
-vcf_identity_broker_vms =
+# VCF Identity Broker VMs - only actual VMs
+# NOTE: Not deployed as VMs in VCF 9.1
+#vcf_identity_broker_vms =
 
-# VCF Operations Fleet Management (VCF Operations Manager) - VCF 9.0 Mgmt Domain #6
-vcf_ops_fleet_vms = opslcm-01a
-    opslcm-a
+# VCF Operations Fleet Management VMs - only actual VMs
+# NOTE: opslcm-a runs on VSP/K8s in VCF 9.1, NOT a standalone VM
+#vcf_ops_fleet_vms =
 
-# VCF Operations (orchestrator, etc) - VCF 9.0 Mgmt Domain #7
-vcf_ops_vms = o11n-02a
-    o11n-01a
+# VCF Operations VMs (vrops) - only actual VMs
+vcf_ops_vms = ops-a
 
-# NSX components (all edges and managers)
-# NOTE: Script automatically filters by name:
-#   - "wld" in name = Workload Domain (Phase 5-6)
-#   - "mgmt" in name = Management Domain (Phase 14-15)
-nsx_edges = edge-wld01-01a
-    edge-wld01-02a
-    edge-mgmt-01a
-    edge-mgmt-02a
-nsx_mgr = nsx-wld01-01a
-    nsx-mgmt-01a
-
-# SDDC Manager VMs - VCF 9.0 Mgmt Domain #11
+# SDDC Manager VMs
 sddc_manager_vms = sddcmanager-a
 
-# Management vCenter VMs (shut down LAST per VCF docs)
-mgmt_vcenter_vms = vc-mgmt-a
-
-# ESXi hosts
-esx_hosts = esx-01a.site-a.vcf.lab
-    esx-02a.site-a.vcf.lab
-    esx-03a.site-a.vcf.lab
-    esx-04a.site-a.vcf.lab
+# ESXi settings
 esx_username = root
-
-# vSAN settings
 vsan_enabled = true
-vsan_timeout = 2700  # 45 minutes
-
-# Host shutdown
+vsan_timeout = 2700
 shutdown_hosts = true
 ```
+
+### Important: VCF Components vs VMs
+
+In VCF 9.1, many services run as Kubernetes workloads on VSP rather than as standalone VMs. The `[SHUTDOWN]` VM lists should only contain **actual VM names** that exist in vCenter inventory. VCF Component services are managed by:
+
+| Service | How it's managed | NOT a VM |
+| ------- | ---------------- | -------- |
+| opslogs-a (VCF Ops for Logs) | VCF Component on VSP (Phase 2b) | Do not list in vcf_ops_logs_vms |
+| opslcm-a (Fleet LCM) | VCF Component on VSP (Phase 2b) | Do not list in vcf_ops_fleet_vms |
+| opsproxy-01a | Service/VIP, not a VM | Do not list in vcf_ops_collector_vms |
+| Identity Broker | VCF Component on VSP | Do not list in vcf_identity_broker_vms |
+| o11n-01a, o11n-02a | Not deployed in VCF 9.1 | Do not list in vcf_ops_vms |
 
 ## vSAN Considerations
 
@@ -533,6 +345,8 @@ Before ESXi hosts can be safely shut down, the vSAN cluster must complete all pe
 2. Wait 45 minutes for vSAN to complete all I/O
 3. Disable `plogRunElevator` on all hosts
 4. Proceed with host shutdown
+
+**vSAN ESA** (Express Storage Architecture) does NOT use the plog mechanism and the elevator wait is automatically skipped.
 
 The `--quick` flag skips this wait period but may result in data loss if vSAN has pending operations.
 
@@ -545,35 +359,6 @@ The shutdown scripts rely on:
 - `requests` - HTTP API calls
 - Standard Python 3.x libraries
 
-## Status File
-
-The shutdown script updates `/lmchol/hol/startup_status.txt` throughout the process to provide status for console desktop widgets:
-
-| Phase | Status Text |
-| ----- | ----------- |
-| Start | `Shutting Down` |
-| Main Phase 0 | `Shutdown Phase 0: Pre-Shutdown Checks` |
-| Main Phase 1 | `Shutdown Phase 1: Docker Containers` |
-| Main Phase 2 | `Shutdown Phase 2: VCF Environment Shutdown` |
-| VCF Phase 1 | `Shutdown Phase 1: Fleet Operations (VCF Operations Suite)` |
-| VCF Phase 2 | `Shutdown Phase 2: Connect to Infrastructure` |
-| VCF Phase 3 | `Shutdown Phase 3: Stop WCP Services` |
-| VCF Phase 4 | `Shutdown Phase 4: Shutdown Workload VMs` |
-| VCF Phase 5 | `Shutdown Phase 5: Shutdown Workload vCenters` |
-| VCF Phase 6 | `Shutdown Phase 6: Shutdown VCF Operations Manager` |
-| VCF Phase 7 | `Shutdown Phase 7: Shutdown VCF Operations for Logs` |
-| VCF Phase 8 | `Shutdown Phase 8: Shutdown NSX Edges` |
-| VCF Phase 9 | `Shutdown Phase 9: Shutdown NSX Manager` |
-| VCF Phase 10 | `Shutdown Phase 10: Shutdown SDDC Manager` |
-| VCF Phase 11 | `Shutdown Phase 11: Shutdown Management vCenter` |
-| VCF Phase 12 | `Shutdown Phase 12: Host Advanced Settings` |
-| VCF Phase 13 | `Shutdown Phase 13: vSAN Elevator Operations` |
-| VCF Phase 14 | `Shutdown Phase 14: Shutdown ESXi Hosts` |
-| Main Phase 3 | `Shutdown Phase 3: Final Cleanup` |
-| Main Phase 4 | `Shutdown Phase 4: Wait for Host Power Off` |
-| Waiting | `Waiting for ESXi Hosts to Power Off` |
-| Complete | `Shutdown Complete` |
-
 ## Logging
 
 Shutdown logs are written to:
@@ -582,28 +367,26 @@ Shutdown logs are written to:
 - `/home/holuser/hol/labstartup.log` (Reset)
 - Console output (real-time with detailed per-operation progress)
 
-### Detailed Logging
-
-The shutdown scripts provide granular, real-time feedback including:
-
-- Per-VM shutdown status and timing
-- Fleet Operations API polling progress (check count, elapsed time)
-- Host power-off monitoring (which hosts are still responding)
-- Phase transitions with timestamps
-
 ## Troubleshooting
 
-### Fleet Operations fails
+### Fleet Operations fails (VCF 9.1)
 
-- Verify SDDC Manager is reachable: `ping opslcm-a.site-a.vcf.lab`
-- Check credentials in `/home/holuser/creds.txt`
-- Test with: `python3 fleet.py --fqdn ... --action list`
+- Verify VCF Operations Manager is reachable: `ping ops-a.site-a.vcf.lab`
+- Test the components API: `python3 fleet.py --fqdn ops-a.site-a.vcf.lab --password PASSWORD --version 9.1 --action list`
+- The suite-api internal components endpoint requires OpsToken auth with `X-vRealizeOps-API-use-unsupported: true`
+- If the API returns HTML instead of JSON, the auth header format may be wrong
+
+### Fleet Operations fails (VCF 9.0)
+
+- Verify SDDC Manager LCM is reachable: `ping opslcm-a.site-a.vcf.lab`
+- Check credentials
+- Test with: `python3 fleet.py --fqdn opslcm-a.site-a.vcf.lab --password PASSWORD --action list`
 
 ### VMs not shutting down
 
 - Check VMware Tools status in vCenter
-- VMs without Tools will be force powered off
-- Check VM power state in vCenter
+- VMs without Tools will be force powered off after timeout
+- Use `--phase 19c` to run the pre-ESXi audit and find straggler VMs
 
 ### vSAN timeout too long
 
@@ -613,24 +396,11 @@ The shutdown scripts provide granular, real-time feedback including:
 ### Hosts not shutting down
 
 - Verify ESXi SSH is enabled
-- Check root password in `/home/holuser/creds.txt`
 - Use `--no-hosts` to skip host shutdown
 
 ### SSH host key errors
 
-The scripts use `StrictHostKeyChecking=no` and `UserKnownHostsFile=/dev/null` to handle host key changes common in lab environments. If you still encounter SSH issues:
-
-- Verify the target host is reachable: `ping <hostname>`
-- Test SSH manually: `ssh -o StrictHostKeyChecking=no root@<hostname>`
-- Check that `sshpass` is installed
-
-### Hosts still responding after shutdown
-
-Phase 4 monitors ESXi hosts via ping for up to 30 minutes:
-
-- Hosts may take several minutes to fully power off after receiving the shutdown command
-- If hosts are still responding after 30 minutes, they will be reported and the script will complete
-- Check vCenter or host console for shutdown status if hosts appear stuck
+The scripts use `StrictHostKeyChecking=no` and `UserKnownHostsFile=/dev/null` to handle host key changes common in lab environments.
 
 ## Support
 

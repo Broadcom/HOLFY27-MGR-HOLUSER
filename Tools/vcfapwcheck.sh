@@ -13,17 +13,21 @@ CREDS_FILE="/home/holuser/creds.txt"
 LOGFILE="/home/holuser/hol/labstartup.log"
 CONSOLELOG="/lmchol/hol/labstartup.log"
 
+# Source shared logging library
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/log_functions.sh"
+
 # Resolve the VCFA FQDN to an IP
 detect_vcfa_host() {
     local resolved_ip
     resolved_ip=$(getent hosts "${VCFA_FQDN}" 2>/dev/null | awk '{print $1}' | head -1)
 
     if [ -z "${resolved_ip}" ]; then
-        echo "$(date +"%m/%d/%Y %T") WARNING: Cannot resolve ${VCFA_FQDN} via DNS, falling back to 10.1.1.71" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+        log_warn "Cannot resolve ${VCFA_FQDN} via DNS, falling back to 10.1.1.71" "$LOGFILE" "$CONSOLELOG"
         HOST="10.1.1.71"
     else
         HOST="${resolved_ip}"
-        echo "$(date +"%m/%d/%Y %T") ${VCFA_FQDN} resolves to ${HOST}" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+        log_msg "${VCFA_FQDN} resolves to ${HOST}" "$LOGFILE" "$CONSOLELOG"
     fi
 }
 
@@ -46,8 +50,8 @@ for i in {0..10}; do
     # grep -F uses fixed string matching (safer/faster than regex)
     # 1. Check for password expiration
     if echo "$OUTPUT" | grep -F -q "You are required to change your password immediately"; then
-        echo "$(date +"%m/%d/%Y %T") Password has expired for user $USER on host $HOST, launching password reset script..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
-        /home/holuser/hol/Tools/vcfapass.sh $HOST $(cat /home/holuser/creds.txt) $(/home/holuser/hol/Tools/holpwgen.sh)
+        log_msg "Password has expired for user $USER on host $HOST, launching password reset script..." "$LOGFILE" "$CONSOLELOG"
+        /home/holuser/hol/Tools/vcfapass.sh "$HOST" "$(cat ${CREDS_FILE})" "$(/home/holuser/hol/Tools/holpwgen.sh)"
         exit 0
     fi
 
@@ -55,28 +59,28 @@ for i in {0..10}; do
     #    Note: "Permission denied, please try again." is standard, but sometimes it's just "Permission denied".
     #    Using -F for fixed string matching on the specific message provided.
     if echo "$OUTPUT" | grep -F -q "Permission denied, please try again."; then
-        echo "$(date +"%m/%d/%Y %T") Incorrect password for user $USER on host $HOST . Unable to continue, exiting..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+        log_error "Incorrect password for user $USER on host $HOST . Unable to continue, exiting..." "$LOGFILE" "$CONSOLELOG"
         exit 1
     fi
     
     # Fallback check for standard "Permission denied" (publickey,password,keyboard-interactive) 
     # which might occur if password auth fails entirely or after max attempts.
     if echo "$OUTPUT" | grep -F -q "Permission denied ("; then
-        echo "$(date +"%m/%d/%Y %T") Authentication failed (Incorrect password or method)" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+        log_error "Authentication failed (Incorrect password or method)" "$LOGFILE" "$CONSOLELOG"
         exit 1
     fi
 
     # 3. Check for successful connection (Exit Code 0)
     if [ $RET -eq 0 ]; then
-        echo "$(date +"%m/%d/%Y %T") Successful SSH connection to host $HOST detected, exiting..." | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+        log_msg "Successful SSH connection to host $HOST detected, exiting..." "$LOGFILE" "$CONSOLELOG"
         exit 0
     fi
 
     # If failed and retries remain, wait 30 seconds
     if [ $i -lt 10 ]; then
-        echo "$(date +"%m/%d/%Y %T") Trying SSH connection to $HOST again in 30s... OUTPUT: $OUTPUT" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+        log_msg "Trying SSH connection to $HOST again in 30s... OUTPUT: $OUTPUT" "$LOGFILE" "$CONSOLELOG"
         sleep 30
     fi
 done
 
-echo "$(date +"%m/%d/%Y %T") The vcfapwcheck.sh script made it to the end of the file - this shouldn't have happened, maybe the host is not powered on! OUTPUT: $OUTPUT" | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
+log_error "The vcfapwcheck.sh script made it to the end of the file - this shouldn't have happened, maybe the host is not powered on! OUTPUT: $OUTPUT" "$LOGFILE" "$CONSOLELOG"

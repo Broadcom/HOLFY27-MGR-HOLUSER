@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 # fleet.py - HOLFY27 Fleet Management (SDDC Manager) Operations
-# Version 2.0 - February 2026
+# Version 2.1 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # Provides Fleet Operations API integration for shutdown orchestration
+#
+# v2.1 Changes:
+# - Fixed shutdown_products_v91() hammering API with repeated HTTP 500 errors:
+#   now attempts shutdown action on first component only; if suite-api proxy
+#   returns 500, immediately switches to discovery-only mode and lists
+#   remaining components for VM-level fallback
+# - Cleaner HTTP 500 handling in shutdown_component_v91(): single-line message
+#   for the expected suite-api proxy limitation instead of verbose error dump
+# - Updated docstrings to clarify suite-api proxy limitations (shutdown action
+#   not supported, component listing is discovery-only)
 #
 # v2.0 Changes:
 # - Added VCF 9.1 Fleet LCM plugin API support (ops-a proxy, JWT Bearer auth,
@@ -54,7 +64,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 sys.path.insert(0, '/home/holuser/hol')
 
 # Default logging level
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(
+    level=logging.WARNING,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
 #==============================================================================
@@ -72,18 +86,26 @@ INVENTORY_SYNC_POLL_INTERVAL = 15  # seconds between inventory sync checks
 INVENTORY_SYNC_MAX_WAIT = 300  # 5 minutes max wait for inventory sync
 
 # VCF 9.1 Fleet LCM Plugin configuration
-V91_API_BASE = '/vcf-operations/plug/fleet-lcm/v1'
+# NOTE: The /vcf-operations/plug/fleet-lcm/v1 path requires a VCF Operations
+# Manager UI session and is NOT accessible via standard REST API auth.
+# The suite-api internal proxy at /suite-api/internal/ provides the same
+# component data using OpsToken authentication.
+V91_API_BASE = '/suite-api/internal'
 V91_TASK_POLL_INTERVAL = 15  # seconds between task status checks
 V91_TASK_MAX_WAIT = 1800     # 30 minutes max wait for shutdown workflow
 V91_TOKEN_TIMEOUT = 30       # seconds for suite-api token acquisition
 
 # VCF 9.0 product name -> VCF 9.1 component type mapping
+# Actual types from /suite-api/internal/components/:
+#   VCFA (VCF Automation), NI (Operations for Networks), OPS (Operations/vROps),
+#   LI (Operations for Logs), FDS (Fleet Depot Service), VSP, VIDB,
+#   SALT_MASTER, SALT_RAAS, FLEET_LCM, SDDC_LCM
 PRODUCT_TO_COMPONENT_TYPE = {
     'vra':   'VCFA',
-    'vrni':  'VRNI',
-    'vrops': 'VROPS',
-    'vrli':  'VRLI',
-    'vrlcm': 'VRLCM',
+    'vrni':  'NI',
+    'vrops': 'OPS',
+    'vrli':  'LI',
+    'vrlcm': 'FLEET_LCM',
 }
 
 #==============================================================================
@@ -543,16 +565,17 @@ def shutdown_products(fqdn: str, token: str, products: list,
 def get_ops_jwt_token(ops_fqdn: str, username: str, password: str,
                       verify: bool = SSL_VERIFY) -> str:
     """
-    Obtain a JWT Bearer token from VCF Operations Manager suite-api.
+    Obtain an OpsToken from VCF Operations Manager suite-api.
     
-    The suite-api /auth/token/acquire endpoint returns an ops token that is
-    accepted by the Fleet LCM plugin proxy as a Bearer token.
+    The suite-api /auth/token/acquire endpoint returns an OpsToken that is
+    used with the "OpsToken <token>" Authorization header for internal API
+    access at /suite-api/internal/*.
     
     :param ops_fqdn: VCF Operations Manager FQDN (e.g., ops-a.site-a.vcf.lab)
     :param username: Local admin username (e.g., admin)
     :param password: Admin password
     :param verify: SSL verification flag
-    :return: JWT token string
+    :return: OpsToken string
     :raises: Exception on authentication failure
     """
     url = f'https://{ops_fqdn}/suite-api/api/auth/token/acquire'
@@ -589,12 +612,16 @@ def _make_v91_request(method: str, ops_fqdn: str, path: str, token: str,
                       payload: dict = None, verify: bool = SSL_VERIFY,
                       params: dict = None) -> dict:
     """
-    Make an authenticated API request to the VCF 9.1 Fleet LCM plugin.
+    Make an authenticated API request to the VCF 9.1 internal API via suite-api.
+    
+    Uses OpsToken authentication and the X-vRealizeOps-API-use-unsupported
+    header, matching the pattern used by other internal APIs (e.g.,
+    /suite-api/internal/passwordmanagement/).
     
     :param method: HTTP method (GET, POST)
     :param ops_fqdn: VCF Operations Manager FQDN
     :param path: API path (appended to V91_API_BASE)
-    :param token: JWT Bearer token
+    :param token: OpsToken from suite-api/api/auth/token/acquire
     :param payload: Optional request body (dict)
     :param verify: SSL verification flag
     :param params: Optional query parameters
@@ -604,8 +631,9 @@ def _make_v91_request(method: str, ops_fqdn: str, path: str, token: str,
     url = f'https://{ops_fqdn}{V91_API_BASE}{path}'
     headers = {
         'Content-Type': 'application/json',
-        'Authorization': f'Bearer {token}',
-        'Accept': 'application/json'
+        'Authorization': f'OpsToken {token}',
+        'Accept': 'application/json',
+        'X-vRealizeOps-API-use-unsupported': 'true'
     }
 
     try:
@@ -635,7 +663,7 @@ def _make_v91_request(method: str, ops_fqdn: str, path: str, token: str,
             raise
 
     except requests.exceptions.HTTPError as e:
-        logger.error(f"V91 HTTP Error: {e}")
+        logger.debug(f"V91 HTTP Error: {e}")
         if hasattr(e, 'response') and e.response is not None:
             logger.debug(f"Response: {e.response.text}")
         raise
@@ -656,20 +684,32 @@ def _make_v91_request(method: str, ops_fqdn: str, path: str, token: str,
 def get_components_v91(ops_fqdn: str, token: str,
                        verify: bool = SSL_VERIFY) -> list:
     """
-    List all components registered in the VCF 9.1 Fleet LCM plugin.
+    List all components registered in VCF 9.1 via the suite-api internal API.
+    
+    The API at /suite-api/internal/components/ returns:
+        {"components": [{"componentType": "VCFA", "componentUuid": "...", ...}, ...]}
+    
+    Each component has: componentType, componentUuid, properties (with fqdn),
+    nodes (with nodeType, properties), and references.
     
     :param ops_fqdn: VCF Operations Manager FQDN
-    :param token: JWT Bearer token
+    :param token: OpsToken
     :param verify: SSL verification flag
-    :return: List of component dicts with id, componentType, fqdn, status, etc.
+    :return: List of component dicts
     """
     if DEBUG:
         logger.debug("In: get_components_v91")
 
     try:
-        response = _make_v91_request('GET', ops_fqdn, '/components', token,
+        response = _make_v91_request('GET', ops_fqdn, '/components/', token,
                                      verify=verify)
-        components = response if isinstance(response, list) else response.get('content', [])
+        if isinstance(response, list):
+            components = response
+        elif isinstance(response, dict):
+            components = response.get('components',
+                         response.get('content', []))
+        else:
+            components = []
 
         if DEBUG:
             logger.debug(f"Components: {json.dumps(components, indent=2)}")
@@ -685,7 +725,7 @@ def find_component_by_type(components: list, component_type: str) -> dict:
     Find a component in the list by its componentType.
     
     :param components: List of component dicts from get_components_v91()
-    :param component_type: Component type to match (e.g., VCFA, VRNI)
+    :param component_type: Component type to match (e.g., VCFA, VRNI, NI, OPS, LI)
     :return: Matching component dict or None
     """
     for comp in components:
@@ -701,14 +741,17 @@ def shutdown_component_v91(ops_fqdn: str, token: str, component_id: str,
                            verify: bool = SSL_VERIFY,
                            write_output=None) -> str:
     """
-    Trigger a graceful shutdown of a VCF 9.1 component via Fleet LCM plugin.
+    Trigger a graceful shutdown of a VCF 9.1 component via suite-api proxy.
     
-    Sends POST /components/{componentId}?action=shutdown which initiates a
-    SHUTDOWN_COMPONENT_WORKFLOW and returns a task object with an ID that can
-    be polled for completion.
+    Sends POST /suite-api/internal/components/{componentId}?action=shutdown
+    which initiates a SHUTDOWN_COMPONENT_WORKFLOW.
+    
+    NOTE: The suite-api proxy may return HTTP 500 for the shutdown action
+    even though the component listing works. In that case this function
+    returns None and the caller should fall back to VM-level shutdown.
     
     :param ops_fqdn: VCF Operations Manager FQDN
-    :param token: JWT Bearer token
+    :param token: OpsToken
     :param component_id: Component UUID to shut down
     :param verify: SSL verification flag
     :param write_output: Optional logging function
@@ -724,7 +767,9 @@ def shutdown_component_v91(ops_fqdn: str, token: str, component_id: str,
         task_id = response.get('id')
         task_name = response.get('name', 'UNKNOWN')
         status = response.get('status', 'UNKNOWN')
-        desc = response.get('description', {}).get('defaultMessage', '')
+        desc = response.get('description', {})
+        if isinstance(desc, dict):
+            desc = desc.get('defaultMessage', '')
 
         if task_id:
             _log(f'  Shutdown workflow started: {task_name} (task: {task_id[:8]}...)')
@@ -735,16 +780,20 @@ def shutdown_component_v91(ops_fqdn: str, token: str, component_id: str,
         return task_id
 
     except requests.exceptions.HTTPError as e:
-        error_detail = ""
-        if hasattr(e, 'response') and e.response is not None:
-            try:
-                error_json = e.response.json()
-                error_detail = error_json.get('message', e.response.text)
-            except Exception:
-                error_detail = e.response.text
-        _log(f'  HTTP Error triggering shutdown for component {component_id}: {e}')
-        if error_detail:
-            _log(f'  Detail: {error_detail}')
+        status_code = e.response.status_code if hasattr(e, 'response') and e.response is not None else 0
+        if status_code == 500:
+            _log(f'  Shutdown action returned HTTP 500 (not supported via suite-api proxy)')
+        else:
+            error_detail = ""
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_json = e.response.json()
+                    error_detail = error_json.get('message', e.response.text)
+                except Exception:
+                    error_detail = e.response.text
+            _log(f'  HTTP Error triggering shutdown for component {component_id}: {e}')
+            if error_detail:
+                _log(f'  Detail: {error_detail}')
         return None
     except Exception as e:
         _log(f'  Failed to trigger shutdown for component {component_id}: {e}')
@@ -839,20 +888,24 @@ def shutdown_products_v91(ops_fqdn: str, token: str, products: list,
                           verify: bool = SSL_VERIFY,
                           write_output=None) -> bool:
     """
-    Shutdown multiple products via the VCF 9.1 Fleet LCM plugin API.
+    Shutdown VCF 9.1 products via Fleet LCM API.
     
     This function will:
-    1. List all components from Fleet LCM
+    1. List all components from the suite-api internal components endpoint
     2. Match requested products to component types
-    3. Shutdown each matching component
-    4. Poll task status until completion
+    3. Attempt shutdown via POST ?action=shutdown on each component
+    4. If the shutdown action fails (HTTP 500 - common when the Fleet LCM
+       orchestration layer is only accessible via UI session), report which
+       components need VM-level shutdown and return False so the caller
+       can fall back to direct VM power-off.
     
     :param ops_fqdn: VCF Operations Manager FQDN
-    :param token: JWT Bearer token
+    :param token: OpsToken
     :param products: List of product IDs to shutdown (vra, vrni, etc.)
     :param verify: SSL verification flag
     :param write_output: Optional logging function
-    :return: True if all shutdowns succeeded, False otherwise
+    :return: True if all shutdowns succeeded via API, False if any failed
+             (caller should fall back to VM-level shutdown)
     """
     _log = write_output if write_output else lambda x: print(f'INFO: {x}')
 
@@ -866,11 +919,13 @@ def shutdown_products_v91(ops_fqdn: str, token: str, products: list,
     _log(f'Found {len(components)} component(s):')
     for comp in components:
         comp_type = comp.get('componentType', 'UNKNOWN')
-        comp_fqdn = comp.get('fqdn', comp.get('hostname', 'unknown'))
-        comp_status = comp.get('status', comp.get('powerState', 'unknown'))
-        _log(f'  {comp_type}: {comp_fqdn} (status: {comp_status})')
+        props = comp.get('properties', {})
+        comp_fqdn = props.get('fqdn', 'unknown')
+        _log(f'  {comp_type}: {comp_fqdn}')
 
     all_success = True
+    api_shutdown_attempted = False
+
     for product in products:
         component_type = PRODUCT_TO_COMPONENT_TYPE.get(product)
         if not component_type:
@@ -882,22 +937,32 @@ def shutdown_products_v91(ops_fqdn: str, token: str, products: list,
             _log(f'{product} ({component_type}) not found in Fleet LCM components')
             continue
 
-        comp_id = comp.get('id', comp.get('componentId', ''))
-        comp_fqdn = comp.get('fqdn', comp.get('hostname', 'unknown'))
+        comp_id = comp.get('componentUuid', comp.get('id', ''))
+        props = comp.get('properties', {})
+        comp_fqdn = props.get('fqdn', 'unknown')
 
-        _log(f'Shutting down {product} ({component_type}): {comp_fqdn}...')
-        task_id = shutdown_component_v91(ops_fqdn, token, comp_id, verify,
-                                         write_output)
-        if not task_id:
-            _log(f'WARNING: Failed to trigger shutdown for {product}')
-            all_success = False
-            continue
+        if not api_shutdown_attempted:
+            _log(f'Attempting API shutdown for {product} ({component_type}): {comp_fqdn}...')
+            task_id = shutdown_component_v91(ops_fqdn, token, comp_id, verify,
+                                             write_output)
+            api_shutdown_attempted = True
 
-        success = wait_for_task_v91(ops_fqdn, token, task_id, verify=verify,
-                                    write_output=write_output)
-        if not success:
-            _log(f'WARNING: Shutdown workflow for {product} did not complete successfully')
+            if task_id:
+                success = wait_for_task_v91(ops_fqdn, token, task_id,
+                                            verify=verify,
+                                            write_output=write_output)
+                if not success:
+                    _log(f'WARNING: Shutdown workflow for {product} did not '
+                         f'complete successfully')
+                    all_success = False
+                continue
+
+            _log(f'API shutdown action not available through suite-api proxy')
+            _log(f'Components will be shut down via VM power-off in later phases')
+            _log(f'Verified components that need shutdown:')
             all_success = False
+
+        _log(f'  {product} ({component_type}): {comp_fqdn}')
 
     return all_success
 
@@ -922,31 +987,39 @@ def detect_vcf_version(config) -> str:
                 return version
     return None
 
-def probe_vcf_91(ops_fqdn: str, verify: bool = SSL_VERIFY) -> bool:
+def probe_vcf_91(ops_fqdn: str, password: str = None,
+                  verify: bool = SSL_VERIFY) -> bool:
     """
-    Probe whether the VCF 9.1 Fleet LCM plugin API is available.
+    Probe whether the VCF 9.1 internal components API is available.
     
-    Attempts a lightweight GET request to the tasks endpoint. If the API
-    responds (even with an auth error 401), the plugin is present. A
-    connection error or 404 indicates VCF 9.0 or the plugin is unavailable.
+    Attempts to authenticate via suite-api and fetch /suite-api/internal/components/.
+    If the response contains JSON component data, VCF 9.1 is confirmed.
     
     :param ops_fqdn: VCF Operations Manager FQDN (e.g., ops-a.site-a.vcf.lab)
+    :param password: Admin password (required for authenticated probe)
     :param verify: SSL verification flag
-    :return: True if VCF 9.1 Fleet LCM plugin is detected
+    :return: True if VCF 9.1 internal components API is available
     """
-    url = f'https://{ops_fqdn}{V91_API_BASE}/tasks'
+    if not password:
+        return False
+
     try:
-        response = requests.get(url, params={'pageSize': '1'},
-                                verify=verify, timeout=10,
-                                headers={'Accept': 'application/json'})
-        # 200 = API available, 401 = API present but needs auth
-        # 404 = plugin not installed (VCF 9.0)
-        if response.status_code in (200, 401, 403):
-            return True
-        return False
-    except requests.exceptions.ConnectionError:
-        return False
-    except requests.exceptions.Timeout:
+        token = get_ops_jwt_token(ops_fqdn, 'admin', password, verify=verify)
+        headers = {
+            'Authorization': f'OpsToken {token}',
+            'Accept': 'application/json',
+            'X-vRealizeOps-API-use-unsupported': 'true'
+        }
+        url = f'https://{ops_fqdn}/suite-api/internal/components/'
+        response = requests.get(url, headers=headers,
+                                verify=verify, timeout=15)
+        if response.status_code == 200:
+            ct = response.headers.get('Content-Type', '')
+            if 'json' in ct:
+                data = response.json()
+                components = data.get('components', [])
+                if components:
+                    return True
         return False
     except Exception:
         return False
@@ -976,10 +1049,14 @@ if __name__ == '__main__':
     
     if args.debug:
         DEBUG = True
-        logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(
+            level=logging.DEBUG, force=True,
+            format='[%(asctime)s] %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
 
     if args.action == 'probe':
-        is_91 = probe_vcf_91(args.fqdn)
+        is_91 = probe_vcf_91(args.fqdn, password=args.password)
         print(f'VCF 9.1 Fleet LCM plugin detected: {is_91}')
         sys.exit(0)
 

@@ -37,7 +37,11 @@ if _tools_dir not in sys.path:
     sys.path.insert(0, _tools_dir)
 
 # Default logging level is WARNING (other levels are DEBUG, INFO, ERROR and CRITICAL)
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(
+    level=logging.WARNING,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 # Until the SSL cert issues are resolved...
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 

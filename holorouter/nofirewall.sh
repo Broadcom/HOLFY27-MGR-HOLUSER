@@ -23,4 +23,4 @@ iptables -t nat -A POSTROUTING -o eth2 -j MASQUERADE
 # Create indicator file
 true > /home/holuser/firewall
 
-echo "Permissive firewall configured at $(date)"
+echo "Permissive firewall configured at [$(date '+%Y-%m-%d %H:%M:%S')]"

@@ -16,6 +16,9 @@ set -e
 
 LOGFILE='/home/holuser/hol/autocheck.log'
 HOLROOT='/home/holuser/hol'
+
+# Source shared logging library
+source "${HOLROOT}/Tools/log_functions.sh"
 AUTOCHECK_DIR='/home/holuser/hol/HOLFY27-MGR-AUTOCHECK'
 
 # Get vPod SKU
@@ -32,7 +35,7 @@ year=$(echo "${vPod_SKU}" | cut -c5-6)
 index=$(echo "${vPod_SKU}" | cut -c7-8)
 VPOD_REPO="/vpodrepo/20${year}-labs/${year}${index}"
 
-echo "=== AutoCheck Started: $(date) ===" | tee $LOGFILE
+log_msg "=== AutoCheck Started ===" "$LOGFILE"
 echo "Lab SKU: ${vPod_SKU}" | tee -a $LOGFILE
 echo "VPod Repo: ${VPOD_REPO}" | tee -a $LOGFILE
 
@@ -126,28 +129,6 @@ if [ "$GITHUB_ACCESSIBLE" == "true" ] && GIT_TERMINAL_PROMPT=0 git clone -b main
         /usr/bin/python3 "${autocheckdir}/autocheck.py" 2>&1 | tee -a $LOGFILE
         exit $?
     fi
-    # This line should only be reached if autocheck.py is not found in the cloned repository
-
-    # # Check if PowerShell autocheck.ps1 exists in cloned repo
-    # if [ -f "${autocheckdir}/autocheck.ps1" ]; then
-    #     echo "Running PowerShell AutoCheck from GitHub clone" | tee -a $LOGFILE
-        
-    #     # Install required PowerShell modules
-    #     echo "Installing PowerShell modules..." | tee -a $LOGFILE
-    #     pwsh -Command 'Install-Module PSSQLite -Confirm:$false -Force' 2>/dev/null || true
-        
-    #     # Configure PowerCLI
-    #     echo "Configuring PowerCLI..." | tee -a $LOGFILE
-    #     pwsh -Command 'Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false' 2>/dev/null || true
-    #     pwsh -Command 'Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false' 2>/dev/null || true
-    #     pwsh -Command 'Set-PowerCLIConfiguration -DefaultVIServerMode multiple -Confirm:$false' 2>/dev/null || true
-        
-    #     # Run AutoCheck
-    #     echo "Starting AutoCheck..." | tee -a $LOGFILE
-    #     cd "${autocheckdir}"
-    #     pwsh -File autocheck.ps1 2>&1 | tee -a $LOGFILE
-    #     exit $?
-    # fi
     
     echo "ERROR: Cloned repository does not contain autocheck.py" | tee -a $LOGFILE
 else

@@ -13,12 +13,16 @@ HOLOROUTER_DIR="/tmp/holorouter"
 ENABLE_FW_FILE="${HOLOROUTER_DIR}/enable-firewall"
 DISABLE_FW_FILE="${HOLOROUTER_DIR}/disable-firewall"
 
+# Source shared logging library
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/log_functions.sh"
+
 #==============================================================================
 # FUNCTIONS
 #==============================================================================
 
 log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    log_msg "$1"
 }
 
 check_dev_cloud() {
@@ -62,7 +66,7 @@ fi
 
 # Create the enable-firewall flag file
 log_message "Sending firewall enable request to router..."
-echo "Firewall enable requested at $(date)" > "${ENABLE_FW_FILE}"
+echo "Firewall enable requested at [$(_log_ts)]" > "${ENABLE_FW_FILE}"
 echo "Requested by: $(whoami)@$(hostname)" >> "${ENABLE_FW_FILE}"
 
 if [ -f "${ENABLE_FW_FILE}" ]; then

@@ -12,12 +12,16 @@
 HOLOROUTER_DIR="/tmp/holorouter"
 DISABLE_PROXY_FILE="${HOLOROUTER_DIR}/disable-proxy-filter"
 
+# Source shared logging library
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/log_functions.sh"
+
 #==============================================================================
 # FUNCTIONS
 #==============================================================================
 
 log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    log_msg "$1"
 }
 
 check_dev_cloud() {
@@ -57,7 +61,7 @@ fi
 
 # Create the disable-proxy-filter flag file
 log_message "Sending proxy filter disable request to router..."
-echo "Proxy filter disable requested at $(date)" > "${DISABLE_PROXY_FILE}"
+echo "Proxy filter disable requested at [$(_log_ts)]" > "${DISABLE_PROXY_FILE}"
 echo "Requested by: $(whoami)@$(hostname)" >> "${DISABLE_PROXY_FILE}"
 
 if [ -f "${DISABLE_PROXY_FILE}" ]; then
