@@ -2069,16 +2069,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
         else:
             vcf_write(lsf, 'Host shutdown skipped (no ESXi hosts configured)')
 
-        #==========================================================================
-        # Cleanup
-        #==========================================================================
-
-        vcf_write(lsf, '='*60)
-        vcf_write(lsf, 'SHUTDOWN COMPLETE')
-        vcf_write(lsf, '='*60)
-
         if not dry_run:
-            vcf_write(lsf, 'Disconnecting sessions...')
             for si in lsf.sis:
                 try:
                     connect.Disconnect(si)
