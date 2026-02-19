@@ -1157,12 +1157,14 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             update_shutdown_status(4, 'Shutdown Workload VMs', dry_run)
 
             # VM regex patterns to find and shutdown (Tanzu, K8s, etc.)
-            # Order follows VCF docs: containerized workloads → Supervisor → TKG
+            # Order follows VCF docs: containerized workloads first
+            # NOTE: SupervisorControlPlaneVM is excluded - these are WCP-managed
+            # VMs that cannot be shut down via vCenter API (NoPermission).
+            # WCP is stopped in Phase 3, which handles the Supervisor lifecycle.
             vm_patterns = [
                 r'^kubernetes-cluster-.*$',  # TKGs clusters (worker nodes)
                 r'^dev-project-.*$',  # vSphere with Tanzu projects
                 r'^cci-service-.*$',  # CCI services
-                r'^SupervisorControlPlaneVM.*$',  # Supervisor Control Plane VMs
             ]
 
             if lsf.config.has_option('SHUTDOWN', 'vm_patterns'):
@@ -1379,21 +1381,47 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                             vcf_write(lsf, f'    vCenter VM not found (may not exist in this lab)')
                     vcf_write(lsf, 'Workload vCenter shutdown complete')
 
-                    # Remove dead workload vCenter sessions from lsf.sis/sisvc
-                    # so subsequent phases only query the management vCenter
                     from pyVim import connect as pyvim_connect
-                    for wld_vc in workload_vcenters:
-                        dead_keys = [k for k in lsf.sisvc if wld_vc in k]
-                        for key in dead_keys:
-                            dead_si = lsf.sisvc.pop(key, None)
-                            if dead_si and dead_si in lsf.sis:
-                                lsf.sis.remove(dead_si)
-                                try:
-                                    pyvim_connect.Disconnect(dead_si)
-                                except Exception:
-                                    pass
-                            vcf_write(lsf, f'  Removed dead session for {key}')
-                    vcf_write(lsf, f'  Active vSphere sessions remaining: {len(lsf.sis)}')
+
+                    # Disconnect ALL sessions and reconnect only to management
+                    # vCenter(s). The workload vCenter sessions are dead, and the
+                    # management session's underlying socket may have stale state
+                    # from the workload domain teardown (NSX overlay changes, etc.).
+                    # A fresh connection ensures Phases 8-17 have a reliable session.
+                    vcf_write(lsf, '  Reconnecting to management vCenter(s)...')
+                    mgmt_vc_entries = []
+                    for key in list(lsf.sisvc.keys()):
+                        is_workload = any(wld_vc in key for wld_vc in workload_vcenters)
+                        if not is_workload:
+                            mgmt_vc_entries.append(key)
+                    for si in lsf.sis:
+                        try:
+                            pyvim_connect.Disconnect(si)
+                        except Exception:
+                            pass
+                    lsf.sis.clear()
+                    lsf.sisvc.clear()
+
+                    if mgmt_vc_entries:
+                        vcenters_raw = lsf.config.get('RESOURCES', 'vCenters')
+                        reconnect_entries = []
+                        for v in vcenters_raw.split('\n'):
+                            v = v.strip()
+                            if not v or v.startswith('#'):
+                                continue
+                            vc_host = v.split(':')[0].strip()
+                            if any(mgmt_key in vc_host or vc_host in mgmt_key for mgmt_key in mgmt_vc_entries):
+                                reconnect_entries.append(v)
+                        if reconnect_entries:
+                            for entry in reconnect_entries:
+                                vcf_write(lsf, f'    Reconnecting: {entry.split(":")[0]}')
+                            lsf.connect_vcenters(reconnect_entries)
+                            vcf_write(lsf, f'  Reconnected to {len(lsf.sis)} management vCenter(s)')
+                        else:
+                            vcf_write(lsf, '  WARNING: Could not find management vCenter config entries')
+                    else:
+                        vcf_write(lsf, '  No management vCenters to reconnect')
+
                 else:
                     vcf_write(lsf, 'No workload vCenters configured - skipping')
             else:
