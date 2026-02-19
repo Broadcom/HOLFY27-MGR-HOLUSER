@@ -128,13 +128,13 @@ SSH must be enabled manually on each NSX Manager via the vSphere Remote Console 
 2. **Connect to Management vCenter:**
    - Bookmarks Toolbar → Region A → vc-mgmt-a Client
    - Login: `administrator@vsphere.local`
-   - Password: `VMware123!VMware123!` (or lab password)
+   - Password: `[check in creds.txt]` (or lab password)
 
 3. **Open Remote Console to NSX Manager:**
    - Menu → Inventory → vc-mgmt-a.site-a.vcf.lab
    - Navigate: dc-a → cluster-mgmt-01a
    - Right-click `nsx-mgmt-01a` → Launch Remote Console
-   - Login: `admin` / `VMware123!VMware123!`
+   - Login: `admin` / `[check in creds.txt]`
 
 4. **Enable SSH service:**
 
@@ -176,14 +176,14 @@ SSH must be enabled manually on each NSX Edge via the vSphere Remote Console. Th
 2. **Connect to Workload vCenter:**
    - Bookmarks Toolbar → Region A → vc-wld01-a Client
    - Login: `administrator@wld.sso`
-   - Password: `VMware123!VMware123!` (or lab password)
+   - Password: `[check in creds.txt]` (or lab password)
 
 3. **Open Remote Console to NSX Edge:**
    - Menu → Inventory → vc-wld01-a.site-a.vcf.lab
    - Navigate: dc-a → cluster-wld01-01a
    - Find the VCF-edge resource pool (may have a long name like `VCF-edge_edgecl-wkld-a_ResourcePool_...`)
    - Right-click `edge-wld01-01a` → Launch Remote Console
-   - Login: `admin` / `VMware123!VMware123!`
+   - Login: `admin` / `[check in creds.txt]`
 
 4. **Enable SSH service:**
 
