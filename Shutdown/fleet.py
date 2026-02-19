@@ -64,7 +64,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 sys.path.insert(0, '/home/holuser/hol')
 
 # Default logging level
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(
+    level=logging.WARNING,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
 #==============================================================================
@@ -1045,7 +1049,11 @@ if __name__ == '__main__':
     
     if args.debug:
         DEBUG = True
-        logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(
+            level=logging.DEBUG, force=True,
+            format='[%(asctime)s] %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
 
     if args.action == 'probe':
         is_91 = probe_vcf_91(args.fqdn, password=args.password)

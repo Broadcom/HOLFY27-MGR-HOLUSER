@@ -49,6 +49,9 @@ LOG_FILE="/lmchol/hol/labstartup.log"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 
+# Source shared logging library
+source "${SCRIPT_DIR}/log_functions.sh"
+
 # Polling configuration
 POLL_INTERVAL=30      # seconds between polls
 MAX_POLL_TIME=1800    # 30 minutes maximum total wait
@@ -78,38 +81,8 @@ get_elapsed_time() {
     echo $((now - TOTAL_START_TIME))
 }
 
-# Helper function for logging
-# When --stdout-only is set, output goes ONLY to stdout with NO timestamp
-# (the caller, e.g. VCFfinal.py via lsf.write_output(), adds its own timestamp)
-log_msg() {
-    if [[ "${STDOUT_ONLY}" == "true" ]]; then
-        echo "$1"
-    else
-        local timestamp
-        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-        echo "[${timestamp}] $1" | tee -a "${LOG_FILE}"
-    fi
-}
-
-log_error() {
-    if [[ "${STDOUT_ONLY}" == "true" ]]; then
-        echo "ERROR: $1" >&2
-    else
-        local timestamp
-        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-        echo "[${timestamp}] ERROR: $1" | tee -a "${LOG_FILE}" >&2
-    fi
-}
-
-log_warn() {
-    if [[ "${STDOUT_ONLY}" == "true" ]]; then
-        echo "WARNING: $1"
-    else
-        local timestamp
-        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-        echo "[${timestamp}] WARNING: $1" | tee -a "${LOG_FILE}"
-    fi
-}
+# The shared log_functions.sh provides log_msg, log_error, log_warn.
+# They automatically use $LOG_FILE when no file argument is passed.
 
 # Helper function to execute SSH with fallback to sshpass
 ssh_with_fallback() {

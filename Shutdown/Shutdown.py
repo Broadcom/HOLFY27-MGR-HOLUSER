@@ -65,7 +65,11 @@ sys.path.insert(0, '/home/holuser/hol')
 sys.path.insert(0, '/home/holuser/hol/Shutdown')
 
 # Default logging level
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(
+    level=logging.WARNING,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
 #==============================================================================
@@ -625,7 +629,11 @@ Configuration:
     args = parser.parse_args()
     
     if args.debug:
-        logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(
+            level=logging.DEBUG, force=True,
+            format='[%(asctime)s] %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
     
     # Run main shutdown
     try:
