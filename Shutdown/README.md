@@ -23,7 +23,13 @@ This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab
     Wait until complete.
 
 2) Shutdown router as follows:
-On the router, login as root and run the /root/shutdown.sh script - This was written to perform a graceful shutdown of the kubernetes environment, services, etc...
+
+   ```bash
+    # login as root and run 
+    /root/shutdown.sh
+    # This was written to perform a graceful shutdown of 
+    # the kubernetes environment, services, etc...
+    ```
 
 3) Shutdown manager
 
