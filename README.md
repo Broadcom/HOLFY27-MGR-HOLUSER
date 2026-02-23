@@ -219,4 +219,4 @@ When a lab boots without access to GitHub, the following happens:
 
 - **Version**: 3.0
 - **Updated**: January 2026
-- **Authors**: Burke Azbill and HOL Core Team
+- **Authors**: Burke Azbill, Bill Call, Doug Baer, and HOL Core Team. If additional names need to be called out here, please notify Burke.

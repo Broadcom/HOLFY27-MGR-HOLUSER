@@ -1,6 +1,7 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
 # Version 3.2 - February 2026
 # Author - Burke Azbill and HOL Core Team
+# Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible/Salt, tdns-mgr integration
 
 import os
