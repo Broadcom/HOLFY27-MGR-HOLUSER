@@ -2,6 +2,7 @@
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
 # Version 2.1 - February 2026
 # Author - Burke Azbill and HOL Core Team
+# Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
 #
 # v 2.1 Changes:
