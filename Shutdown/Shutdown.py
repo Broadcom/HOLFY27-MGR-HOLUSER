@@ -2,6 +2,7 @@
 # Shutdown.py - HOLFY27 Lab Shutdown Orchestration
 # Version 2.1 - February 2026
 # Author - Burke Azbill and HOL Core Team
+# Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # Main shutdown script for graceful lab environment shutdown
 #
 # v 2.1 Changes:

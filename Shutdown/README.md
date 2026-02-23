@@ -4,7 +4,7 @@ Version 2.0 - February 2026
 
 ## Overview
 
-This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab environments. The scripts ensure an orderly shutdown of all VCF components following the **official Broadcom VCF 9.0/9.1 documentation**.
+This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab environments. While they are based on/inspired by the great work of Christopher Lewis, they have been completely rewritten and refactored, using 5-8% of the original code. The scripts ensure an orderly shutdown of all VCF components following the **official Broadcom VCF 9.0/9.1 documentation**.
 
 **Reference**: [VCF 9.0 Shutdown Operations](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-0/fleet-management/vcf-shutdown-and-startup/vcf-shutdown.html)
 
@@ -23,7 +23,13 @@ This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab
     Wait until complete.
 
 2) Shutdown router as follows:
-On the router, login as root and run the /root/shutdown.sh script - This was written to perform a graceful shutdown of the kubernetes environment, services, etc...
+
+   ```bash
+    # login as root and run 
+    /root/shutdown.sh
+    # This was written to perform a graceful shutdown of 
+    # the kubernetes environment, services, etc...
+    ```
 
 3) Shutdown manager
 
