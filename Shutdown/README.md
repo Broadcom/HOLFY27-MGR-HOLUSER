@@ -4,7 +4,7 @@ Version 2.0 - February 2026
 
 ## Overview
 
-This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab environments. While they are based on/inspired by the great work of Christopher Lewis, they have been completely rewritten and refactored, using 5-8% of the original code. The scripts ensure an orderly shutdown of all VCF components following the **official Broadcom VCF 9.0/9.1 documentation**.
+This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab environments. Based on/inspired by the great work of Christopher Lewis on the FY26 Shutdown scripts. The scripts ensure an orderly shutdown of all VCF components following the **official Broadcom VCF 9.0/9.1 documentation**.
 
 **Reference**: [VCF 9.0 Shutdown Operations](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-0/fleet-management/vcf-shutdown-and-startup/vcf-shutdown.html)
 
