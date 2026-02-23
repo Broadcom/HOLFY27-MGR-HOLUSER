@@ -2,6 +2,7 @@
 # fleet.py - HOLFY27 Fleet Management (SDDC Manager) Operations
 # Version 2.1 - February 2026
 # Author - Burke Azbill and HOL Core Team
+# Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # Provides Fleet Operations API integration for shutdown orchestration
 #
 # v2.1 Changes:

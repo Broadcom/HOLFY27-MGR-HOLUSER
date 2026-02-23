@@ -447,10 +447,11 @@ def update_desktop_status(message, color='red'):
             with open(desktop_config, 'r') as f:
                 lines = f.readlines()
             
-            # Get conky_title from config or use lab_sku
+            # For HOL labtypes, always use the lab SKU as the conky title.
+            # conky_title from config only applies to non-HOL labtypes (DISCOVERY, ATE, etc.)
             conky_title = lab_sku
-            if config.has_option('VPOD', 'conky_title'):
-                conky_title = config.get('VPOD', 'conky_title')
+            if labtype != 'HOL' and config.has_option('VPOD', 'conky_title'):
+                conky_title = config.get('VPOD', 'conky_title').split('#')[0].strip()
             
             # Determine color tag for status line
             color_tag = '${color green}' if color == 'green' else '${color red}'
