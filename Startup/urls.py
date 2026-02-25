@@ -352,6 +352,9 @@ def main(lsf=None, standalone=False, dry_run=False):
     ##=========================================================================
     
     lsf.write_output(f'{MODULE_NAME} completed')
+    
+    if failed:
+        return False
 
 
 #==============================================================================
