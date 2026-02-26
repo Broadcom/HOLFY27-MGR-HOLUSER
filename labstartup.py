@@ -2,6 +2,7 @@
 # labstartup.py - HOLFY27 Main Lab Startup Orchestrator
 # Version 3.0 - January 2026
 # Author - Burke Azbill and HOL Core Team
+# Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # LabType-aware orchestrator with enhanced features
 
 import datetime

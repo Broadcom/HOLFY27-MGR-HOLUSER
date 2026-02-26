@@ -251,6 +251,9 @@ def main(lsf=None, standalone=False, dry_run=False):
     # Check for Tanzu Control Plane VMs - requires tanzucontrol option with valid (non-commented) values
     tanzu_control_values = lsf.get_config_list('VCFFINAL', 'tanzucontrol')
     tanzu_control_configured = len(tanzu_control_values) > 0
+    tanzu_verify_ok = False
+    last_config_status = ''
+    last_k8s_status = ''
     
     if tanzu_control_configured and not dry_run:
         #----------------------------------------------------------------------
@@ -388,10 +391,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output('='*60)
         lsf.write_vpodprogress('Tanzu Control Plane', 'GOOD-3')
         
-        tanzu_verify_ok = False
         supervisor_start_time = time.time()
-        last_config_status = ''
-        last_k8s_status = ''
         
         try:
             while (time.time() - supervisor_start_time) < WCP_MAX_POLL_TIME:
@@ -1495,16 +1495,20 @@ def main(lsf=None, standalone=False, dry_run=False):
     if vcfa_vms_task_failed:
         # Critical failure in VCF Automation VMs task
         if not vcfa_urls_configured:
-            # No URL checks to verify success - must fail
             lsf.write_output('CRITICAL: VCF Automation VMs task failed and no URL checks configured to verify')
             module_failed = True
         elif urls_checked == 0:
-            # URL checks were configured but none were actually checked (dry_run or empty list)
             lsf.write_output('WARNING: VCF Automation VMs task failed but URL checks were skipped')
             module_failed = True
     
+    # Supervisor Control Plane failure is critical
+    if tanzu_control_configured and not tanzu_verify_ok:
+        lsf.write_output(f'CRITICAL: Supervisor Control Plane did not reach RUNNING/READY state')
+        lsf.write_output(f'  Last status: config={last_config_status or "unknown"}, k8s={last_k8s_status or "unknown"}')
+        module_failed = True
+    
     if module_failed and not dry_run:
-        lsf.labfail(f'{MODULE_NAME} failed: VCF Automation VMs task encountered critical errors')
+        lsf.labfail(f'{MODULE_NAME} failed: Supervisor Control Plane not ready or VCF Automation errors')
     
     lsf.write_output(f'{MODULE_NAME} completed')
     return not module_failed
