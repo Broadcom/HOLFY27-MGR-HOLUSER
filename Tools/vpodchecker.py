@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.1 - February 26, 2026
+# Version 2.3 - February 26, 2026
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.3 - 2026-02-26:
+#   - Added "Firefox Trusted Private CAs" section: enumerates custom CAs in the
+#     Firefox NSS cert store, verifies expected CAs are present, reports expiry
+# v2.2 - 2026-02-26:
+#   - NSX Edge password expiration checks added (admin, root, audit) via NSX
+#     Manager transport node API (edges don't expose /api/v1/node/users directly)
+#   - SDDC Manager root/backup password checks now use expect/su instead of
+#     INFO placeholders (vcf user has no sudo but can su to root)
+#   - VCF Automation root password check now uses sudo -S for privilege escalation
+#   - New get_linux_password_expiration_via_su() for appliances requiring su
+#   - get_linux_password_expiration() gains use_sudo parameter for sudo -S escalation
 # v2.1 - 2026-02-26:
 #   - License checks now report ALL entities individually (evaluation licenses
 #     are no longer de-duplicated by key, so every ESXi host is shown)
@@ -41,7 +52,9 @@ import socket
 import re
 import json
 import argparse
-from typing import Dict, List, Optional, Any
+import subprocess
+import glob
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field, asdict
 
 # Add hol directory for imports
@@ -116,6 +129,7 @@ class ValidationReport:
     vm_resource_checks: List[CheckResult] = field(default_factory=list)
     password_expiration_checks: List[CheckResult] = field(default_factory=list)
     fleet_password_policy_checks: List[CheckResult] = field(default_factory=list)
+    firefox_ca_checks: List[CheckResult] = field(default_factory=list)
     overall_status: str = "PASS"
     
     def to_dict(self) -> Dict:
@@ -832,55 +846,130 @@ def generate_html_report(report: ValidationReport) -> str:
 # PASSWORD EXPIRATION CHECKS
 #==============================================================================
 
-def get_linux_password_expiration(hostname: str, username: str, password: str) -> Optional[int]:
+def _parse_chage_output(output: str) -> Optional[int]:
+    """
+    Parse 'chage -l' output to extract days until password expiration.
+    
+    :param output: Raw chage -l output (may contain multiple lines)
+    :return: None if never expires or unparseable, else days until expiration
+    """
+    if not output or 'never' in output.lower():
+        return None
+    
+    match = re.search(r'Password expires\s*:\s*(.+)', output)
+    if match:
+        date_str = match.group(1).strip()
+        if 'never' in date_str.lower():
+            return None
+        
+        for fmt in ('%b %d, %Y', '%Y-%m-%d', '%m/%d/%Y'):
+            try:
+                exp_date = datetime.datetime.strptime(date_str, fmt).date()
+                return (exp_date - datetime.date.today()).days
+            except ValueError:
+                continue
+    
+    return None
+
+
+def get_linux_password_expiration(hostname: str, username: str, password: str,
+                                   ssh_user: str = 'root',
+                                   use_sudo: bool = False) -> Optional[int]:
     """
     Get password expiration for a Linux user account.
     
-    Returns:
-        - None if password never expires or check failed
-        - Number of days until expiration (can be negative if expired)
+    Uses 'chage -l' to query password aging. Not available on ESXi
+    (returns None, which callers treat as "never expires" -- correct
+    since ESXi root defaults to 99999-day max in /etc/shadow).
+    
+    When use_sudo=True, pipes the ssh_user's password to 'sudo -S chage -l'.
+    This is needed when the SSH user has sudo privileges but is not root
+    (e.g., vmware-system-user on VCF Automation appliances).
+    
+    Note: without use_sudo, 'chage -l' for a different user requires root.
+    Non-root SSH users can only query their own account.
+    
+    :param hostname: Target host
+    :param username: Account to check expiration for
+    :param password: SSH password
+    :param ssh_user: SSH login user (default 'root')
+    :param use_sudo: If True, use sudo -S to escalate (default False)
+    :return: None if never expires or check failed, else days until expiration
     """
     try:
-        # Use chage command to get password expiration info
-        cmd = f'chage -l {username} 2>/dev/null | grep "Password expires"'
-        result = lsf.ssh(cmd, f'root@{hostname}', password)
+        if use_sudo:
+            cmd = f"echo '{password}' | sudo -S chage -l {username} 2>/dev/null"
+        else:
+            cmd = f"chage -l {username} 2>/dev/null | grep 'Password expires'"
+        result = lsf.ssh(cmd, f'{ssh_user}@{hostname}', password)
         
-        if not result or 'never' in result.lower():
-            return None  # Password never expires
+        output = ''
+        if hasattr(result, 'stdout') and result.stdout:
+            output = result.stdout.strip()
+        elif isinstance(result, str):
+            output = result.strip()
         
-        # Parse date from output like "Password expires                        : Dec 31, 2029"
-        match = re.search(r':\s*(.+)$', result)
-        if match:
-            date_str = match.group(1).strip()
-            if 'never' in date_str.lower():
-                return None
-            
-            # Try to parse the date
-            try:
-                exp_date = datetime.datetime.strptime(date_str, '%b %d, %Y').date()
-                days_until = (exp_date - datetime.date.today()).days
-                return days_until
-            except ValueError:
-                # Try alternative format
-                try:
-                    exp_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
-                    days_until = (exp_date - datetime.date.today()).days
-                    return days_until
-                except ValueError:
-                    return None
-        
+        return _parse_chage_output(output)
+    except Exception:
         return None
-    except Exception as e:
+
+
+def get_linux_password_expiration_via_su(hostname: str, username: str,
+                                          password: str,
+                                          ssh_user: str = 'vcf') -> Optional[int]:
+    """
+    Get password expiration using 'su' to root, then 'chage -l'.
+    
+    Required on appliances like SDDC Manager where the SSH user (vcf) has
+    no sudo privileges but can 'su' to root with a password. Uses expect
+    to handle the interactive password prompt.
+    
+    :param hostname: Target host
+    :param username: Account to check (e.g. 'root', 'backup')
+    :param password: Password for both SSH user and root (su)
+    :param ssh_user: SSH login user (default 'vcf')
+    :return: None if never expires or check failed, else days until expiration
+    """
+    try:
+        expect_cmd = (
+            f"expect -c '"
+            f'set timeout 10\n'
+            f'spawn sshpass -p {{{password}}} ssh -o StrictHostKeyChecking=no '
+            f'-o UserKnownHostsFile=/dev/null {ssh_user}@{hostname}\n'
+            f'expect " ]$"\n'
+            f'send "su - root\\r"\n'
+            f'expect "Password:"\n'
+            f'send "{password}\\r"\n'
+            f'expect " ]#"\n'
+            f'send "chage -l {username}\\r"\n'
+            f'expect " ]#"\n'
+            f'send "exit\\r"\n'
+            f'expect " ]$"\n'
+            f'send "exit\\r"\n'
+            f"expect eof'"
+        )
+        result = subprocess.run(expect_cmd, shell=True, capture_output=True,
+                                text=True, timeout=30)
+        
+        output = result.stdout if result.stdout else ''
+        return _parse_chage_output(output)
+    except Exception:
         return None
 
 
 def get_vcenter_user_expiration(hostname: str, vcuser: str, vcpassword: str, 
                                   target_user: str) -> Optional[int]:
     """
-    Get password expiration for vCenter SSO user via REST API.
+    Get password expiration for a vCenter local appliance account via REST API.
+    
+    Uses /rest/appliance/local-accounts/{user} which only works for local
+    OS accounts (e.g. root), NOT SSO directory users (e.g. administrator).
+    
+    The password_expires_at field is an ISO 8601 date string
+    (e.g. "2053-07-11T00:00:00.000Z"), not a numeric timestamp.
     
     Returns:
-        - None if password never expires or check failed
+        - None if password never expires, user not found, or check failed
         - Number of days until expiration
     """
     try:
@@ -891,38 +980,55 @@ def get_vcenter_user_expiration(hostname: str, vcuser: str, vcpassword: str,
         session = requests.Session()
         session.verify = False
         
-        # Authenticate
         auth_url = f'https://{hostname}/rest/com/vmware/cis/session'
-        response = session.post(auth_url, auth=(vcuser, vcpassword))
+        response = session.post(auth_url, auth=(vcuser, vcpassword), timeout=15)
         
         if response.status_code != 200:
             return None
         
-        # Get local user info
         user_url = f'https://{hostname}/rest/appliance/local-accounts/{target_user}'
-        response = session.get(user_url)
+        response = session.get(user_url, timeout=15)
         
         if response.status_code == 200:
             data = response.json()
             if 'value' in data:
                 user_info = data['value']
-                # Check if password has expiration
-                if 'password_expires_at' in user_info:
-                    exp_timestamp = user_info['password_expires_at']
-                    if exp_timestamp:
-                        exp_date = datetime.datetime.fromtimestamp(exp_timestamp).date()
-                        days_until = (exp_date - datetime.date.today()).days
-                        return days_until
                 
-                # Check max_days_between_password_change
+                if 'password_expires_at' in user_info and user_info['password_expires_at']:
+                    exp_str = user_info['password_expires_at']
+                    try:
+                        exp_str_clean = exp_str.replace('Z', '+00:00')
+                        exp_date = datetime.datetime.fromisoformat(exp_str_clean).date()
+                        return (exp_date - datetime.date.today()).days
+                    except (ValueError, TypeError):
+                        pass
+                
                 if 'max_days_between_password_change' in user_info:
                     max_days = user_info['max_days_between_password_change']
                     if max_days == -1 or max_days > 9000:
                         return None  # Effectively never expires
+                    if 'last_password_change' in user_info and user_info['last_password_change']:
+                        try:
+                            lpc_str = user_info['last_password_change'].replace('Z', '+00:00')
+                            lpc_date = datetime.datetime.fromisoformat(lpc_str).date()
+                            exp_date = lpc_date + datetime.timedelta(days=max_days)
+                            return (exp_date - datetime.date.today()).days
+                        except (ValueError, TypeError):
+                            pass
+                    return max_days
         
         return None
     except Exception:
         return None
+
+
+NSX_USER_IDS = {
+    'root': 0,
+    'admin': 10000,
+    'audit': 10002,
+    'guestuser1': 10003,
+    'guestuser2': 10004,
+}
 
 
 def get_nsx_user_expiration(hostname: str, username: str, password: str,
@@ -930,6 +1036,12 @@ def get_nsx_user_expiration(hostname: str, username: str, password: str,
     """
     Get password expiration for NSX user via REST API.
     
+    The NSX API identifies users by numeric userid, not username:
+      root=0, admin=10000, audit=10002
+    
+    If the target_user is not in the known ID map, falls back to
+    listing all users and matching by username.
+    
     Returns:
         - None if password never expires or check failed
         - Number of days until expiration
@@ -942,31 +1054,166 @@ def get_nsx_user_expiration(hostname: str, username: str, password: str,
         session = requests.Session()
         session.verify = False
         
-        # Get user info from NSX API
-        url = f'https://{hostname}/api/v1/node/users/{target_user}'
-        response = session.get(url, auth=(username, password))
+        user_id = NSX_USER_IDS.get(target_user)
+        data = None
         
-        if response.status_code == 200:
-            data = response.json()
+        if user_id is not None:
+            url = f'https://{hostname}/api/v1/node/users/{user_id}'
+            response = session.get(url, auth=(username, password), timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+        
+        if data is None:
+            url = f'https://{hostname}/api/v1/node/users'
+            response = session.get(url, auth=(username, password), timeout=15)
+            if response.status_code == 200:
+                for user_entry in response.json().get('results', []):
+                    if user_entry.get('username') == target_user:
+                        data = user_entry
+                        break
+        
+        if data is None:
+            return None
+        
+        if 'password_change_frequency' in data:
+            freq = data['password_change_frequency']
+            if freq == 0 or freq > 9000:
+                return None  # Never expires
             
-            # Check password_change_frequency (days)
-            if 'password_change_frequency' in data:
-                freq = data['password_change_frequency']
-                if freq == 0 or freq > 9000:
-                    return None  # Never expires
-                
-                # If we have last change date, calculate expiration
-                if 'last_password_change' in data:
+            if 'last_password_change' in data:
+                last_change_epoch = data['last_password_change']
+                if last_change_epoch > 1e9:
                     last_change = datetime.datetime.fromtimestamp(
-                        data['last_password_change'] / 1000
+                        last_change_epoch / 1000
                     ).date()
-                    exp_date = last_change + datetime.timedelta(days=freq)
-                    days_until = (exp_date - datetime.date.today()).days
-                    return days_until
+                else:
+                    last_change = datetime.date.today() - datetime.timedelta(days=last_change_epoch)
+                exp_date = last_change + datetime.timedelta(days=freq)
+                days_until = (exp_date - datetime.date.today()).days
+                return days_until
+            
+            return freq
         
         return None
     except Exception:
         return None
+
+
+def get_nsx_edge_user_expiration(edge_hostname: str, nsx_manager: str,
+                                  password: str,
+                                  target_user: str) -> Optional[int]:
+    """
+    Get password expiration for an NSX Edge user via the NSX Manager transport node API.
+    
+    Edges don't expose /api/v1/node/users directly; the managing NSX Manager
+    proxies these calls through:
+        GET /api/v1/transport-nodes/{node-id}/node/users/{user-id}
+    
+    :param edge_hostname: Edge display name (e.g. edge-wld01-01a)
+    :param nsx_manager: NSX Manager FQDN that manages this edge
+    :param password: Admin password for the NSX Manager
+    :param target_user: User to check (root, admin, audit)
+    :return: None if never expires or check failed, else days until expiration
+    """
+    try:
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        session = requests.Session()
+        session.verify = False
+
+        # Find the edge's transport node ID
+        tn_url = f'https://{nsx_manager}/api/v1/transport-nodes'
+        resp = session.get(tn_url, auth=('admin', password), timeout=30)
+        if resp.status_code != 200:
+            return None
+
+        node_id = None
+        for node in resp.json().get('results', []):
+            if node.get('display_name', '') == edge_hostname:
+                node_id = node.get('node_id', node.get('id'))
+                break
+
+        if not node_id:
+            return None
+
+        user_id = NSX_USER_IDS.get(target_user)
+        data = None
+
+        if user_id is not None:
+            url = f'https://{nsx_manager}/api/v1/transport-nodes/{node_id}/node/users/{user_id}'
+            resp = session.get(url, auth=('admin', password), timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+
+        if data is None:
+            url = f'https://{nsx_manager}/api/v1/transport-nodes/{node_id}/node/users'
+            resp = session.get(url, auth=('admin', password), timeout=15)
+            if resp.status_code == 200:
+                for user_entry in resp.json().get('results', []):
+                    if user_entry.get('username') == target_user:
+                        data = user_entry
+                        break
+
+        if data is None:
+            return None
+
+        if 'password_change_frequency' in data:
+            freq = data['password_change_frequency']
+            if freq == 0 or freq > 9000:
+                return None
+
+            if 'last_password_change' in data:
+                last_change_epoch = data['last_password_change']
+                if last_change_epoch > 1e9:
+                    last_change = datetime.datetime.fromtimestamp(
+                        last_change_epoch / 1000
+                    ).date()
+                else:
+                    last_change = datetime.date.today() - datetime.timedelta(days=last_change_epoch)
+                exp_date = last_change + datetime.timedelta(days=freq)
+                days_until = (exp_date - datetime.date.today()).days
+                return days_until
+
+            return freq
+
+        return None
+    except Exception:
+        return None
+
+
+def _get_nsx_manager_for_edge_check(edge_hostname: str) -> Optional[str]:
+    """
+    Determine which NSX Manager manages a given edge node by name convention.
+    
+    Edge names follow the pattern edge-{domain}-{num}{site} where domain
+    matches the NSX Manager pattern nsx-{domain}-{num}{site}.
+    For example: edge-wld01-01a -> nsx-wld01-01a
+    
+    :param edge_hostname: NSX Edge hostname (e.g. edge-wld01-01a)
+    :return: NSX Manager FQDN, or None if not found
+    """
+    if not lsf or not lsf.config.has_section('VCF'):
+        return None
+    if not lsf.config.has_option('VCF', 'vcfnsxmgr'):
+        return None
+
+    vcfnsxmgrs = lsf.config.get('VCF', 'vcfnsxmgr').split('\n')
+    nsx_managers = []
+    for entry in vcfnsxmgrs:
+        if not entry or entry.strip().startswith('#'):
+            continue
+        nsx_managers.append(entry.split(':')[0].strip())
+
+    edge_match = re.match(r'edge-(\w+)-\d+', edge_hostname)
+    if edge_match:
+        edge_domain = edge_match.group(1)
+        for mgr in nsx_managers:
+            if edge_domain in mgr:
+                return mgr
+
+    return nsx_managers[0] if nsx_managers else None
 
 
 def check_password_expirations() -> List[CheckResult]:
@@ -977,6 +1224,7 @@ def check_password_expirations() -> List[CheckResult]:
     - ESXi hosts: root user
     - vCenter servers: root (Linux), administrator@vsphere.local (SSO)
     - NSX managers: admin, root, audit users
+    - NSX edges: admin, root, audit users (via NSX Manager transport node API)
     - SDDC Manager: vcf, backup, root users
     - vRA/Automation: vmware-system-user, root users
     
@@ -1091,38 +1339,41 @@ def check_password_expirations() -> List[CheckResult]:
                 details={'hostname': hostname, 'username': 'root', 'error': str(e)}
             ))
         
-        # Check vCenter SSO user
+        # Check vCenter root via REST API (cross-validates chage result above)
+        # SSO users like administrator@vsphere.local are directory-managed,
+        # not local appliance accounts; their policy is governed by SDDC Manager
+        # fleet password settings (checked separately).
         try:
-            days = get_vcenter_user_expiration(hostname, vcuser, password, vcuser.split('@')[0])
+            days = get_vcenter_user_expiration(hostname, vcuser, password, 'root')
             
             if days is None:
                 status = "PASS"
-                message = "Password never expires"
+                message = "Password never expires (REST API)"
             elif days > three_years_days:
                 status = "PASS"
-                message = f"Expires in {days} days ({days // 365} years)"
+                message = f"Expires in {days} days ({days // 365} years) (REST API)"
             elif days > two_years_days:
                 status = "PASS"
-                message = f"Expires in {days} days ({days // 365} years)"
+                message = f"Expires in {days} days ({days // 365} years) (REST API)"
             else:
                 status = "FAIL"
                 if days < 0:
-                    message = f"Password EXPIRED {abs(days)} days ago"
+                    message = f"Password EXPIRED {abs(days)} days ago (REST API)"
                 else:
-                    message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                    message = f"Expires in {days} days ({days // 365} years) - TOO SOON (REST API)"
             
             results.append(CheckResult(
-                name=f"vCenter {hostname} ({vcuser})",
+                name=f"vCenter {hostname} (root via REST)",
                 status=status,
                 message=message,
-                details={'hostname': hostname, 'username': vcuser, 'days_until_expiration': days}
+                details={'hostname': hostname, 'username': 'root', 'days_until_expiration': days}
             ))
         except Exception as e:
             results.append(CheckResult(
-                name=f"vCenter {hostname} ({vcuser})",
+                name=f"vCenter {hostname} (root via REST)",
                 status="WARN",
                 message=f"Could not check: {str(e)[:40]}",
-                details={'hostname': hostname, 'username': vcuser, 'error': str(e)}
+                details={'hostname': hostname, 'username': 'root', 'error': str(e)}
             ))
     
     # Check NSX managers
@@ -1176,6 +1427,63 @@ def check_password_expirations() -> List[CheckResult]:
                     details={'hostname': hostname, 'username': user, 'error': str(e)}
                 ))
     
+    # Check NSX edges (via NSX Manager transport node API)
+    nsx_edges = []
+    if lsf.config.has_section('VCF') and lsf.config.has_option('VCF', 'vcfnsxedges'):
+        edge_raw = lsf.config.get('VCF', 'vcfnsxedges').split('\n')
+        for entry in edge_raw:
+            if not entry or entry.strip().startswith('#'):
+                continue
+            hostname = entry.split(':')[0].strip()
+            if hostname:
+                nsx_edges.append(hostname)
+    
+    for hostname in nsx_edges:
+        nsx_mgr = _get_nsx_manager_for_edge_check(hostname)
+        if not nsx_mgr:
+            results.append(CheckResult(
+                name=f"NSX Edge {hostname}",
+                status="WARN",
+                message="Cannot determine managing NSX Manager",
+                details={'hostname': hostname}
+            ))
+            continue
+        
+        for user in ['admin', 'root', 'audit']:
+            try:
+                days = get_nsx_edge_user_expiration(hostname, nsx_mgr, password, user)
+                
+                if days is None:
+                    status = "PASS"
+                    message = "Password never expires"
+                elif days > three_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365} years)"
+                elif days > two_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365} years)"
+                else:
+                    status = "FAIL"
+                    if days < 0:
+                        message = f"Password EXPIRED {abs(days)} days ago"
+                    else:
+                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                
+                results.append(CheckResult(
+                    name=f"NSX Edge {hostname} ({user})",
+                    status=status,
+                    message=message,
+                    details={'hostname': hostname, 'username': user,
+                             'nsx_manager': nsx_mgr, 'days_until_expiration': days}
+                ))
+            except Exception as e:
+                results.append(CheckResult(
+                    name=f"NSX Edge {hostname} ({user})",
+                    status="WARN",
+                    message=f"Could not check: {str(e)[:40]}",
+                    details={'hostname': hostname, 'username': user, 'error': str(e)}
+                ))
+    
     # Check SDDC Manager - look in URLs for sddcmanager hosts
     sddc_managers = []
     
@@ -1202,9 +1510,47 @@ def check_password_expirations() -> List[CheckResult]:
                         sddc_managers.append(hostname)
     
     for hostname in sddc_managers:
-        for user in ['vcf', 'backup', 'root']:
+        # SDDC Manager only allows SSH as 'vcf' user (root SSH disabled).
+        # chage can only query the caller's own account without root, so
+        # we can only verify 'vcf'. The backup/root accounts are configured
+        # by confighol via expect script and cannot be remotely verified.
+        try:
+            days = get_linux_password_expiration(hostname, 'vcf', password, ssh_user='vcf')
+            
+            if days is None:
+                status = "PASS"
+                message = "Password never expires"
+            elif days > three_years_days:
+                status = "PASS"
+                message = f"Expires in {days} days ({days // 365} years)"
+            elif days > two_years_days:
+                status = "PASS"
+                message = f"Expires in {days} days ({days // 365} years)"
+            else:
+                status = "FAIL"
+                if days < 0:
+                    message = f"Password EXPIRED {abs(days)} days ago"
+                else:
+                    message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+            
+            results.append(CheckResult(
+                name=f"SDDC Manager {hostname} (vcf)",
+                status=status,
+                message=message,
+                details={'hostname': hostname, 'username': 'vcf', 'days_until_expiration': days}
+            ))
+        except Exception as e:
+            results.append(CheckResult(
+                name=f"SDDC Manager {hostname} (vcf)",
+                status="WARN",
+                message=f"Could not check: {str(e)[:40]}",
+                details={'hostname': hostname, 'username': 'vcf', 'error': str(e)}
+            ))
+        
+        for user in ['backup', 'root']:
             try:
-                days = get_linux_password_expiration(hostname, user, password)
+                days = get_linux_password_expiration_via_su(
+                    hostname, user, password, ssh_user='vcf')
                 
                 if days is None:
                     status = "PASS"
@@ -1251,10 +1597,15 @@ def check_password_expirations() -> List[CheckResult]:
                     vra_hosts.append(hostname)
     
     for hostname in vra_hosts:
-        # Check vmware-system-user and root for vRA/Automation
+        # VCF Automation appliances only allow SSH as vmware-system-user.
+        # vmware-system-user can check its own account directly, but
+        # checking root requires sudo -S to escalate privileges.
         for user in ['vmware-system-user', 'root']:
             try:
-                days = get_linux_password_expiration(hostname, user, password)
+                needs_sudo = (user != 'vmware-system-user')
+                days = get_linux_password_expiration(hostname, user, password,
+                                                      ssh_user='vmware-system-user',
+                                                      use_sudo=needs_sudo)
                 
                 if days is None:
                     status = "PASS"
@@ -1286,6 +1637,234 @@ def check_password_expirations() -> List[CheckResult]:
                     details={'hostname': hostname, 'username': user, 'error': str(e)}
                 ))
     
+    return results
+
+
+#==============================================================================
+# FIREFOX TRUSTED PRIVATE CAS
+#==============================================================================
+
+LMC_FIREFOX_PROFILE_BASE = '/lmchol/home/holuser/snap/firefox/common/.mozilla/firefox'
+CERTUTIL_BINARY = 'certutil'
+
+EXPECTED_PRIVATE_CAS = [
+    'vcf.lab Root Authority',
+]
+
+
+def _find_firefox_profiles() -> List[str]:
+    """
+    Find Firefox profile directories containing a cert9.db on the console VM.
+    
+    :return: List of profile directory paths
+    """
+    pattern = os.path.join(LMC_FIREFOX_PROFILE_BASE, '*', 'cert9.db')
+    profiles = []
+    for db_path in glob.glob(pattern):
+        profiles.append(os.path.dirname(db_path))
+    return profiles
+
+
+def _get_firefox_private_cas(profile_path: str) -> List[Tuple[str, str, dict]]:
+    """
+    List custom (non-builtin) CA certificates in a Firefox profile.
+    
+    Runs ``certutil -L`` to get all certs, then ``certutil -L -n <name> -a``
+    piped through ``openssl x509`` for each to extract subject, issuer, and
+    validity dates. Built-in Mozilla root CAs ship with trust ``CT,C,C`` or
+    similar multi-purpose flags; our private CAs have ``CT,,`` (SSL-only).
+    We filter to ``CT,,`` entries so only HOL-added CAs are reported.
+    
+    :param profile_path: Path to a Firefox profile directory
+    :return: List of (nickname, trust_flags, details_dict) tuples
+    """
+    result = subprocess.run(
+        [CERTUTIL_BINARY, '-L', '-d', f'sql:{profile_path}'],
+        capture_output=True, text=True, timeout=10
+    )
+    if result.returncode != 0:
+        return []
+
+    certs = []
+    for line in result.stdout.splitlines():
+        line = line.rstrip()
+        if not line or line.startswith('Certificate Nickname') or 'Trust Attributes' in line:
+            continue
+        # certutil output: nickname padded to ~60 chars then trust flags
+        # Trust flags are the last token(s), e.g. "CT,," or "CT,C,C"
+        # Find the trust flags at the end (pattern: X,X,X where X is letters or empty)
+        match = re.search(r'\s+([A-Za-z]*,[A-Za-z]*,[A-Za-z]*)\s*$', line)
+        if not match:
+            continue
+        trust = match.group(1)
+        nickname = line[:match.start()].strip()
+
+        # Only report private/custom CAs (trust CT,, means SSL-only trust,
+        # which is what confighol imports with; Mozilla builtins have broader trust)
+        if trust != 'CT,,':
+            continue
+
+        # Get cert details via openssl
+        details = {'nickname': nickname, 'trust': trust}
+        try:
+            export = subprocess.run(
+                [CERTUTIL_BINARY, '-L', '-d', f'sql:{profile_path}',
+                 '-n', nickname, '-a'],
+                capture_output=True, text=True, timeout=10
+            )
+            if export.returncode == 0 and export.stdout:
+                info = subprocess.run(
+                    ['openssl', 'x509', '-noout', '-subject', '-issuer',
+                     '-startdate', '-enddate'],
+                    input=export.stdout, capture_output=True, text=True, timeout=10
+                )
+                if info.returncode == 0:
+                    for info_line in info.stdout.splitlines():
+                        if info_line.startswith('subject='):
+                            details['subject'] = info_line[len('subject='):].strip()
+                        elif info_line.startswith('issuer='):
+                            details['issuer'] = info_line[len('issuer='):].strip()
+                        elif info_line.startswith('notBefore='):
+                            details['not_before'] = info_line[len('notBefore='):].strip()
+                        elif info_line.startswith('notAfter='):
+                            details['not_after'] = info_line[len('notAfter='):].strip()
+
+                    # Calculate days until expiry
+                    if 'not_after' in details:
+                        for fmt in ('%b %d %H:%M:%S %Y %Z', '%b  %d %H:%M:%S %Y %Z'):
+                            try:
+                                exp = datetime.datetime.strptime(details['not_after'], fmt).date()
+                                details['days_until_expiry'] = (exp - datetime.date.today()).days
+                                break
+                            except ValueError:
+                                continue
+        except Exception:
+            pass
+
+        certs.append((nickname, trust, details))
+
+    return certs
+
+
+def _build_expected_ca_list() -> List[str]:
+    """
+    Build the list of private CAs that should be trusted in Firefox.
+    
+    Sources:
+    - Vault Root CA (always expected)
+    - One VMCA per vCenter (from [RESOURCES] vCenters in config.ini)
+    - Broadcom VCF Root CA (always expected for VCF labs)
+    
+    :return: List of expected CA nicknames
+    """
+    expected = list(EXPECTED_PRIVATE_CAS)
+    expected.append('Broadcom, Inc CA')
+
+    if lsf and hasattr(lsf, 'config'):
+        try:
+            if lsf.config.has_option('RESOURCES', 'vCenters'):
+                for entry in lsf.config.get('RESOURCES', 'vCenters').split('\n'):
+                    entry = entry.strip()
+                    if not entry or entry.startswith('#'):
+                        continue
+                    hostname = entry.split(':')[0].strip()
+                    if hostname:
+                        expected.append(f'{hostname} CA')
+        except Exception:
+            pass
+
+    return expected
+
+
+def check_firefox_trusted_cas() -> List[CheckResult]:
+    """
+    Check that all expected private CA certificates are trusted in Firefox.
+    
+    Enumerates custom (non-builtin) CAs in the Firefox NSS certificate store
+    on the console VM and verifies that every expected CA is present, trusted,
+    and not expired.
+    
+    :return: List of CheckResult objects
+    """
+    results = []
+
+    # Pre-flight: certutil must be available
+    import shutil
+    if not shutil.which(CERTUTIL_BINARY):
+        return [CheckResult(
+            name="Firefox Trusted CAs",
+            status="WARN",
+            message="certutil not installed (libnss3-tools package required)",
+        )]
+
+    profiles = _find_firefox_profiles()
+    if not profiles:
+        return [CheckResult(
+            name="Firefox Trusted CAs",
+            status="WARN",
+            message=f"No Firefox profiles found under {LMC_FIREFOX_PROFILE_BASE}",
+        )]
+
+    # Use the first profile (there's typically just one)
+    profile_path = profiles[0]
+    found_cas = _get_firefox_private_cas(profile_path)
+
+    if not found_cas:
+        return [CheckResult(
+            name="Firefox Trusted CAs",
+            status="FAIL",
+            message="No custom private CAs found in Firefox",
+            details={'profile': profile_path}
+        )]
+
+    expected = _build_expected_ca_list()
+    found_names = {name for name, _, _ in found_cas}
+
+    # Report each found CA
+    for nickname, trust, details in found_cas:
+        days = details.get('days_until_expiry')
+        not_after = details.get('not_after', 'unknown')
+        subject = details.get('subject', '')
+
+        if days is not None and days < 0:
+            status = "FAIL"
+            message = f"EXPIRED {abs(days)} days ago (was {not_after})"
+        elif days is not None and days < 365:
+            status = "WARN"
+            message = f"Expires in {days} days ({not_after})"
+        elif days is not None:
+            status = "PASS"
+            message = f"Trusted, expires in {days} days ({days // 365} yr)"
+        else:
+            status = "PASS"
+            message = "Trusted (could not determine expiry)"
+
+        # Include a concise subject hint for context
+        if subject:
+            # Pull the most identifying field (CN or O)
+            cn_match = re.search(r'CN\s*=\s*([^,]+)', subject)
+            o_match = re.search(r'O\s*=\s*([^,]+)', subject)
+            hint = (cn_match or o_match)
+            if hint:
+                message += f" | {hint.group(0).strip()}"
+
+        results.append(CheckResult(
+            name=f"Firefox CA: {nickname}",
+            status=status,
+            message=message,
+            details=details,
+        ))
+
+    # Report any expected CAs that are missing
+    for expected_name in expected:
+        if expected_name not in found_names:
+            results.append(CheckResult(
+                name=f"Firefox CA: {expected_name}",
+                status="FAIL",
+                message="MISSING - not found in Firefox certificate store",
+                details={'expected': expected_name, 'profile': profile_path}
+            ))
+
     return results
 
 
@@ -1697,6 +2276,14 @@ def main():
     except Exception as e:
         print(f"VCF Fleet Password Policy check failed: {e}")
     
+    # Firefox Trusted Private CAs
+    print("\nChecking Firefox Trusted Private CAs...")
+    try:
+        report.firefox_ca_checks = check_firefox_trusted_cas()
+        print_results_table("FIREFOX TRUSTED PRIVATE CAs", report.firefox_ca_checks)
+    except Exception as e:
+        print(f"Firefox CA check failed: {e}")
+    
     # Determine overall status
     all_checks = (
         report.ssl_checks + 
@@ -1705,7 +2292,8 @@ def main():
         report.vm_config_checks + 
         report.vm_resource_checks +
         report.password_expiration_checks +
-        report.fleet_password_policy_checks
+        report.fleet_password_policy_checks +
+        report.firefox_ca_checks
     )
     
     if any(c.status == 'FAIL' for c in all_checks):
