@@ -1,16 +1,28 @@
 #!/usr/bin/env python3
-# confighol-9.0.py - HOLFY27 vApp HOLification Tool
-# Version 2.2 - February 2026
+# confighol-9.1.py - HOLFY27 vApp HOLification Tool
+# Version 2.3 - February 26, 2026
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
 # This script is named according to the VCF version it was developed and
-# tested against: confighol-9.0.py for VCF 9.0.1. Future VCF versions may
+# tested against: confighol-9.1.py for VCF 9.1.x. Future VCF versions may
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
+#
+# CHANGELOG:
+# v2.3 - 2026-02-26:
+#   - NSX Edge SSH now enabled automatically via vSphere Guest Operations API
+#     (eliminates manual console step; uses systemctl enable/start sshd)
+#   - Operations VMs SSH now enabled via Guest Operations when port 22 is closed
+#   - NSX Manager root password: auto-recovers SDDC Manager rotated passwords
+#     (queries SDDC Manager credentials API, resets to standard lab password)
+#   - Unreachable Operations VMs (e.g. not deployed) are skipped gracefully
+#   - Removed interactive prompt for NSX Edge SSH confirmation
+# v2.2 - 2026-02:
+#   - Initial release for VCF 9.1
 #
 # This script automates the "HOLification" process for vApp templates
 # that will be used in VMware Hands-on Labs. It must be run after the
-# Holodeck 9.0.x factory build process completes.
+# Holodeck 9.x factory build process completes.
 #
 # OVERVIEW:
 # The HOL team leverages the Holodeck factory build process (documented
@@ -56,14 +68,17 @@
 #
 # 3. NSX Configuration:
 #    - Enable SSH via API on NSX Managers (where supported)
+#    - Enable SSH via Guest Operations on NSX Edges (automatic)
 #    - Configure SSH authorized_keys for passwordless access
 #    - Set 729-day password expiration for admin, root, audit users
+#    - Auto-recover SDDC Manager rotated root passwords
 #
 # 4. SDDC Manager Configuration:
 #    - Configure SSH authorized_keys
 #    - Set non-expiring passwords for vcf, backup, root accounts
 #
 # 5. Operations VMs:
+#    - Enable SSH via Guest Operations (if not already running)
 #    - Set non-expiring passwords
 #    - Configure SSH authorized_keys
 #
@@ -83,9 +98,9 @@
 #    python3 confighol.py --skip-nsx         # Skip NSX configuration
 #    python3 confighol.py --esx-only         # Only configure ESXi hosts
 #
-# NOTE: Some operations (vCenter shell, NSX Edge SSH) require manual
-#       confirmation or may need to be performed via the vSphere client.
-#       See HOLIFICATION.md for details on manual steps.
+# NOTE: Some operations (vCenter shell) may require manual confirmation.
+#       NSX Edge SSH is now enabled automatically via Guest Operations.
+#       See HOLIFICATION.md for details.
 
 """
 HOLification Tool for vApp Templates
@@ -851,6 +866,118 @@ def configure_vcenter(entry: str, auth_keys_file: str, password: str,
 # NSX CONFIGURATION FUNCTIONS
 #==============================================================================
 
+def get_nsx_root_password_from_sddc(nsx_fqdn: str, password: str) -> Optional[str]:
+    """
+    Retrieve the actual NSX Manager root SSH password from SDDC Manager.
+    
+    SDDC Manager may have rotated the root password away from the standard
+    lab password. This queries the SDDC Manager credentials API to get the
+    current password.
+    
+    :param nsx_fqdn: NSX Manager FQDN (individual node, e.g. nsx-wld01-01a)
+    :param password: Standard lab password (used to auth to SDDC Manager)
+    :return: The actual root password, or None if lookup fails
+    """
+    sddc_host = 'sddcmanager-a.site-a.vcf.lab'
+    
+    try:
+        # Map individual node name to VIP/cluster name for SDDC Manager lookup
+        # e.g. nsx-wld01-01a -> nsx-wld01-a, nsx-mgmt-01a -> nsx-mgmt-a
+        import re
+        # Remove node number suffix (e.g. -01a -> -a) to get cluster VIP name
+        cluster_name = re.sub(r'-\d+a\.', '-a.', nsx_fqdn)
+        if cluster_name == nsx_fqdn:
+            cluster_name = re.sub(r'-\d+b\.', '-b.', nsx_fqdn)
+        
+        # Get SDDC Manager token
+        get_token_cmd = (
+            f'curl -sk -X POST https://localhost/v1/tokens '
+            f'-H "Content-Type: application/json" '
+            f'-d \'{{"username":"admin@local","password":"{password}"}}\''
+        )
+        token_result = lsf.ssh(
+            f'{get_token_cmd} | python3 -c "import json,sys; print(json.load(sys.stdin)[\'accessToken\'])"',
+            f'vcf@{sddc_host}', password)
+        
+        if token_result.returncode != 0:
+            return None
+        
+        token = str(token_result.stdout).strip() if hasattr(token_result, 'stdout') and token_result.stdout else str(token_result).strip()
+        # Extract just the token from output
+        for line in token.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('Warning') and not line.startswith('Welcome') and len(line) > 50:
+                token = line
+                break
+        
+        # Query credentials for NSX managers
+        cred_cmd = (
+            f'curl -sk -X GET "https://localhost/v1/credentials?resourceType=NSXT_MANAGER" '
+            f'-H "Authorization: Bearer {token}" '
+            f'-H "Content-Type: application/json"'
+        )
+        cred_result = lsf.ssh(cred_cmd, f'vcf@{sddc_host}', password)
+        
+        if cred_result.returncode != 0:
+            return None
+        
+        import json
+        output = str(cred_result.stdout) if hasattr(cred_result, 'stdout') and cred_result.stdout else str(cred_result)
+        # Find the JSON portion
+        json_start = output.find('{"elements"')
+        if json_start < 0:
+            return None
+        
+        data = json.loads(output[json_start:])
+        
+        for elem in data.get('elements', []):
+            resource = elem.get('resource', {})
+            rname = resource.get('resourceName', '')
+            cred_type = elem.get('credentialType', '')
+            username = elem.get('username', '')
+            
+            if cred_type == 'SSH' and username == 'root':
+                if cluster_name in rname or nsx_fqdn in rname:
+                    return elem.get('password', None)
+        
+        return None
+    except Exception as e:
+        lsf.write_output(f'WARNING: Could not retrieve NSX root password from SDDC Manager: {e}')
+        return None
+
+
+def reset_nsx_root_password(hostname: str, admin_password: str,
+                             old_root_password: str, new_root_password: str) -> bool:
+    """
+    Reset NSX Manager root password via the NSX API.
+    
+    Uses the admin user to authenticate and change root's password.
+    
+    :param hostname: NSX Manager hostname
+    :param admin_password: Admin user password
+    :param old_root_password: Current root password
+    :param new_root_password: Desired new root password
+    :return: True if successful
+    """
+    try:
+        resp = requests.put(
+            f'https://{hostname}/api/v1/node/users/0',
+            auth=('admin', admin_password),
+            json={'password': new_root_password, 'old_password': old_root_password},
+            verify=False, timeout=30
+        )
+        if resp.status_code == 200:
+            lsf.write_output(f'{hostname}: SUCCESS - Root password reset to standard')
+            return True
+        else:
+            error_msg = resp.json().get('error_message', resp.text[:100]) if resp.text else 'Unknown error'
+            lsf.write_output(f'{hostname}: FAILED - Password reset: {error_msg}')
+            return False
+    except Exception as e:
+        lsf.write_output(f'{hostname}: FAILED - Password reset error: {e}')
+        return False
+
+
 def enable_nsx_ssh_via_api(hostname: str, user: str, password: str,
                             dry_run: bool = False) -> bool:
     """
@@ -974,12 +1101,27 @@ def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
         # Give SSH service time to start
         time.sleep(3)
         
-        # Step 2: Copy authorized_keys for root user
+        # Determine root password (may have been rotated by SDDC Manager)
+        root_password = password
         lsf.write_output(f'{hostname}: Copying authorized_keys...')
         result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', password)
+        if result.returncode != 0:
+            lsf.write_output(f'{hostname}: Standard password failed for root SSH - checking SDDC Manager...')
+            sddc_root_pw = get_nsx_root_password_from_sddc(hostname, password)
+            if sddc_root_pw and sddc_root_pw != password:
+                lsf.write_output(f'{hostname}: Found rotated root password in SDDC Manager')
+                # Reset to standard password via NSX API
+                if reset_nsx_root_password(hostname, password, sddc_root_pw, password):
+                    root_password = password
+                    time.sleep(3)
+                    result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', root_password)
+                else:
+                    root_password = sddc_root_pw
+                    result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', root_password)
+        
         if result.returncode == 0:
             lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied')
-            lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{hostname}', password)
+            lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{hostname}', root_password)
         else:
             lsf.write_output(f'{hostname}: FAILED - Could not copy authorized_keys')
             success = False
@@ -997,7 +1139,7 @@ def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
                 lsf.write_output(f'{hostname}: WARNING - Failed to set password expiration for {user}')
     else:
         lsf.write_output(f'{hostname}: Would enable SSH via API')
-        lsf.write_output(f'{hostname}: Would copy authorized_keys')
+        lsf.write_output(f'{hostname}: Would copy authorized_keys (with SDDC Manager password fallback)')
         lsf.write_output(f'{hostname}: Would configure SSH start-on-boot')
         for user in NSX_USERS:
             lsf.write_output(f'{hostname}: Would set {NSX_PASSWORD_EXPIRY_DAYS}-day password expiration for {user}')
@@ -1005,33 +1147,185 @@ def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
     return success
 
 
+def enable_nsx_edge_ssh_via_guest_ops(edge_hostname: str, esx_host: str,
+                                       password: str,
+                                       dry_run: bool = False) -> bool:
+    """
+    Enable SSH on an NSX Edge VM via vSphere Guest Operations Manager.
+    
+    NSX Edges don't expose a REST API for SSH management, and the NSX CLI
+    commands (start service ssh, set service ssh start-on-boot) can only be
+    run from the console or an existing SSH session. This function bypasses
+    that limitation by using VMware Tools guest operations to run systemctl
+    commands directly inside the Edge VM.
+    
+    The Edge VM's owning vCenter is determined by checking which vCenter
+    manages the ESXi host the Edge runs on (from config.ini vcfnsxedges).
+    
+    :param edge_hostname: NSX Edge hostname (e.g. edge-wld01-01a)
+    :param esx_host: ESXi host the Edge runs on (e.g. esx-06a.site-a.vcf.lab)
+    :param password: Root password for the Edge VM guest OS
+    :param dry_run: If True, preview only
+    :return: True if SSH is now enabled and set to start on boot
+    """
+    if dry_run:
+        lsf.write_output(f'{edge_hostname}: Would enable SSH via Guest Operations API')
+        return True
+    
+    import ssl as ssl_module
+    
+    # Determine which vCenter manages this ESXi host by checking config
+    vcenter_fqdn = None
+    vcenter_user = None
+    if lsf.config.has_option('RESOURCES', 'vCenters'):
+        vc_lines = lsf.config.get('RESOURCES', 'vCenters').split('\n')
+        for vc_line in vc_lines:
+            if not vc_line or vc_line.strip().startswith('#'):
+                continue
+            vc_parts = vc_line.split(':')
+            vc_host = vc_parts[0].strip()
+            vc_user = vc_parts[2].strip() if len(vc_parts) > 2 else 'administrator@vsphere.local'
+            
+            # Check if this vCenter manages the ESXi host
+            try:
+                context = ssl_module._create_unverified_context()
+                si = connect.SmartConnect(host=vc_host, user=vc_user,
+                                          pwd=password, sslContext=context)
+                content = si.RetrieveContent()
+                container = content.viewManager.CreateContainerView(
+                    content.rootFolder, [vim.VirtualMachine], True)
+                found = False
+                for vm in container.view:
+                    if vm.name == edge_hostname:
+                        found = True
+                        break
+                container.Destroy()
+                connect.Disconnect(si)
+                if found:
+                    vcenter_fqdn = vc_host
+                    vcenter_user = vc_user
+                    break
+            except Exception:
+                continue
+    
+    if not vcenter_fqdn:
+        lsf.write_output(f'{edge_hostname}: Could not find Edge VM in any configured vCenter')
+        return False
+    
+    lsf.write_output(f'{edge_hostname}: Found in vCenter {vcenter_fqdn}')
+    
+    try:
+        context = ssl_module._create_unverified_context()
+        si = connect.SmartConnect(host=vcenter_fqdn, user=vcenter_user,
+                                  pwd=password, sslContext=context)
+    except Exception as e:
+        lsf.write_output(f'{edge_hostname}: Could not connect to vCenter {vcenter_fqdn}: {e}')
+        return False
+    
+    try:
+        content = si.RetrieveContent()
+        gom = content.guestOperationsManager
+        
+        container = content.viewManager.CreateContainerView(
+            content.rootFolder, [vim.VirtualMachine], True)
+        target_vm = None
+        for vm in container.view:
+            if vm.name == edge_hostname:
+                target_vm = vm
+                break
+        container.Destroy()
+        
+        if not target_vm:
+            lsf.write_output(f'{edge_hostname}: VM not found in vCenter inventory')
+            return False
+        
+        if target_vm.runtime.powerState != 'poweredOn':
+            lsf.write_output(f'{edge_hostname}: VM is not powered on ({target_vm.runtime.powerState})')
+            return False
+        
+        if target_vm.guest.toolsStatus not in ('toolsOk', 'toolsOld'):
+            lsf.write_output(f'{edge_hostname}: VMware Tools not running ({target_vm.guest.toolsStatus})')
+            return False
+        
+        creds = vim.vm.guest.NamePasswordAuthentication(
+            username='root', password=password)
+        
+        success = True
+        for action in ['enable', 'start']:
+            spec = vim.vm.guest.ProcessManager.ProgramSpec(
+                programPath='/usr/bin/systemctl',
+                arguments=f'{action} sshd'
+            )
+            try:
+                pid = gom.processManager.StartProgramInGuest(target_vm, creds, spec)
+                time.sleep(2)
+                processes = gom.processManager.ListProcessesInGuest(target_vm, creds, [pid])
+                for p in processes:
+                    if p.exitCode == 0:
+                        lsf.write_output(f'{edge_hostname}: SUCCESS - systemctl {action} sshd')
+                    elif action == 'enable' and p.exitCode == 1:
+                        # Exit code 1 for enable = already enabled (idempotent)
+                        lsf.write_output(f'{edge_hostname}: SUCCESS - sshd already enabled')
+                    else:
+                        lsf.write_output(f'{edge_hostname}: WARNING - systemctl {action} sshd exit code {p.exitCode}')
+            except vim.fault.InvalidGuestLogin:
+                lsf.write_output(f'{edge_hostname}: FAILED - Invalid guest credentials for root')
+                lsf.write_output(f'{edge_hostname}:         Root password may have been rotated by SDDC Manager')
+                success = False
+                break
+            except Exception as e:
+                lsf.write_output(f'{edge_hostname}: FAILED - Guest operations error: {e}')
+                success = False
+                break
+        
+        return success
+    finally:
+        connect.Disconnect(si)
+
+
 def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
-                       dry_run: bool = False) -> bool:
+                       esx_host: str = '', dry_run: bool = False) -> bool:
     """
     Configure an NSX Edge node for HOLification.
     
-    NSX Edges do NOT support enabling SSH via API - SSH must be enabled
-    manually via the vSphere console before running this function.
+    SSH is enabled automatically via vSphere Guest Operations if not already
+    running. This eliminates the need for manual console access.
     
     This function:
-    1. Copies authorized_keys for root user (SSH must already be enabled)
-    2. Configures SSH to start on boot
-    3. Removes password expiration for admin, root, audit users
+    1. Enables SSH via Guest Operations (systemctl enable/start sshd)
+    2. Copies authorized_keys for root user
+    3. Configures SSH to start on boot (via SSH now that it's enabled)
+    4. Removes password expiration for admin, root, audit users
     
     :param hostname: NSX Edge hostname
     :param auth_keys_file: Path to authorized_keys file
     :param password: Admin/root password
+    :param esx_host: ESXi host the Edge runs on (for Guest Ops vCenter lookup)
     :param dry_run: If True, preview only
     :return: True if successful
     """
     lsf.write_output(f'{hostname}: Configuring NSX Edge...')
-    lsf.write_output(f'{hostname}: NOTE - NSX Edges do not support SSH enable via API')
     
     success = True
     
     if not dry_run:
-        # Step 1: Copy authorized_keys for root user
-        # NSX Edges use root for SSH access
+        # Step 1: Enable SSH via Guest Operations if not already running
+        if not lsf.test_tcp_port(hostname, 22):
+            lsf.write_output(f'{hostname}: SSH not running - enabling via Guest Operations...')
+            if not enable_nsx_edge_ssh_via_guest_ops(hostname, esx_host, password, dry_run):
+                lsf.write_output(f'{hostname}: FAILED - Could not enable SSH via Guest Operations')
+                lsf.write_output(f'{hostname}:         Enable SSH manually via vSphere console:')
+                lsf.write_output(f'{hostname}:           Login as admin, run: start service ssh')
+                lsf.write_output(f'{hostname}:           Then run: set service ssh start-on-boot')
+                return False
+            time.sleep(3)
+            if not lsf.test_tcp_port(hostname, 22):
+                lsf.write_output(f'{hostname}: FAILED - SSH still not reachable after Guest Operations enable')
+                return False
+        else:
+            lsf.write_output(f'{hostname}: SSH already running')
+        
+        # Step 2: Copy authorized_keys for root user
         lsf.write_output(f'{hostname}: Copying authorized_keys for root...')
         result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', password)
         if result.returncode == 0:
@@ -1044,13 +1338,13 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
         else:
             lsf.write_output(f'{hostname}: FAILED - Could not copy authorized_keys')
             if result.returncode == 255:
-                lsf.write_output(f'{hostname}:         SSH connection failed - is SSH enabled on this Edge?')
+                lsf.write_output(f'{hostname}:         SSH connection failed despite enable attempt')
             success = False
         
-        # Step 2: Configure SSH to start on boot
+        # Step 3: Configure SSH to start on boot
         configure_nsx_ssh_start_on_boot(hostname, password, dry_run)
         
-        # Step 3: Set password expiration for NSX users (729 days)
+        # Step 4: Set password expiration for NSX users (729 days)
         for user in NSX_USERS:
             lsf.write_output(f'{hostname}: Setting {NSX_PASSWORD_EXPIRY_DAYS}-day password expiration for {user}...')
             result = lsf.ssh(f'set user {user} password-expiration {NSX_PASSWORD_EXPIRY_DAYS}', f'admin@{hostname}', password)
@@ -1059,6 +1353,7 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
             else:
                 lsf.write_output(f'{hostname}: WARNING - Failed to set password expiration for {user}')
     else:
+        lsf.write_output(f'{hostname}: Would enable SSH via Guest Operations (if not running)')
         lsf.write_output(f'{hostname}: Would copy authorized_keys for root')
         lsf.write_output(f'{hostname}: Would configure SSH start-on-boot')
         for user in NSX_USERS:
@@ -1201,8 +1496,8 @@ def configure_nsx_components(auth_keys_file: str, password: str,
     Processes NSX Managers (vcfnsxmgr) and NSX Edges (vcfnsxedges)
     defined in the [VCF] section of config.ini.
     
-    NOTE: SSH must be manually enabled on NSX Edges via the vSphere console.
-    NSX Managers support enabling SSH via API.
+    NSX Managers: SSH enabled via REST API.
+    NSX Edges: SSH enabled via vSphere Guest Operations (systemctl).
     
     :param auth_keys_file: Path to authorized_keys file
     :param password: Admin password
@@ -1253,8 +1548,7 @@ def configure_nsx_components(auth_keys_file: str, password: str,
     if 'vcfnsxedges' in lsf.config['VCF']:
         lsf.write_output('')
         lsf.write_output('Processing NSX Edges...')
-        lsf.write_output('NOTE: NSX Edges do NOT support enabling SSH via API.')
-        lsf.write_output('      SSH must be enabled manually via vSphere console first.')
+        lsf.write_output('SSH will be enabled automatically via Guest Operations if needed.')
         vcfnsxedges = lsf.config.get('VCF', 'vcfnsxedges').split('\n')
         
         for entry in vcfnsxedges:
@@ -1264,15 +1558,10 @@ def configure_nsx_components(auth_keys_file: str, password: str,
             # Format: nsxedge_hostname:esxhost
             parts = entry.split(':')
             nsxedge = parts[0].strip()
+            esx_host = parts[1].strip() if len(parts) > 1 else ''
             
-            if not dry_run:
-                # Interactive prompt - SSH must be enabled manually first for Edges
-                answer = input(f'Is SSH enabled on NSX Edge {nsxedge}? (y/n): ')
-                if not answer.lower().startswith('y'):
-                    lsf.write_output(f'{nsxedge}: Skipping - SSH not enabled')
-                    continue
-            
-            if not configure_nsx_edge(nsxedge, auth_keys_file, password, dry_run):
+            if not configure_nsx_edge(nsxedge, auth_keys_file, password,
+                                       esx_host=esx_host, dry_run=dry_run):
                 success = False
     
     return success
@@ -1381,6 +1670,90 @@ def configure_sddc_manager(auth_keys_file: str, password: str,
 # OPERATIONS VMS CONFIGURATION
 #==============================================================================
 
+def enable_ops_vm_ssh_via_guest_ops(vm_name: str, vcenter_fqdn: str,
+                                     vcenter_user: str, password: str,
+                                     dry_run: bool = False) -> bool:
+    """
+    Enable SSH on a VCF Operations VM via vSphere Guest Operations Manager.
+    
+    VCF Operations appliances (Photon OS) have sshd installed but disabled
+    by default. This uses VMware Tools guest operations to run systemctl
+    inside the VM without needing SSH access first.
+    
+    :param vm_name: VM name as it appears in vCenter inventory
+    :param vcenter_fqdn: vCenter managing this VM
+    :param vcenter_user: vCenter SSO user
+    :param password: Root password for the guest OS
+    :param dry_run: If True, preview only
+    :return: True if SSH is now enabled
+    """
+    if dry_run:
+        lsf.write_output(f'{vm_name}: Would enable SSH via Guest Operations API')
+        return True
+    
+    import ssl as ssl_module
+    
+    try:
+        context = ssl_module._create_unverified_context()
+        si = connect.SmartConnect(host=vcenter_fqdn, user=vcenter_user,
+                                  pwd=password, sslContext=context)
+    except Exception as e:
+        lsf.write_output(f'{vm_name}: Could not connect to vCenter {vcenter_fqdn}: {e}')
+        return False
+    
+    try:
+        content = si.RetrieveContent()
+        container = content.viewManager.CreateContainerView(
+            content.rootFolder, [vim.VirtualMachine], True)
+        target_vm = None
+        for vm in container.view:
+            if vm.name == vm_name:
+                target_vm = vm
+                break
+        container.Destroy()
+        
+        if not target_vm:
+            lsf.write_output(f'{vm_name}: VM not found in vCenter {vcenter_fqdn}')
+            return False
+        
+        if target_vm.runtime.powerState != 'poweredOn':
+            lsf.write_output(f'{vm_name}: VM is not powered on ({target_vm.runtime.powerState})')
+            return False
+        
+        if target_vm.guest.toolsStatus not in ('toolsOk', 'toolsOld'):
+            lsf.write_output(f'{vm_name}: VMware Tools not available ({target_vm.guest.toolsStatus})')
+            return False
+        
+        gom = content.guestOperationsManager
+        creds = vim.vm.guest.NamePasswordAuthentication(
+            username='root', password=password)
+        
+        for action in ['enable', 'start']:
+            spec = vim.vm.guest.ProcessManager.ProgramSpec(
+                programPath='/usr/bin/systemctl',
+                arguments=f'{action} sshd'
+            )
+            try:
+                pid = gom.processManager.StartProgramInGuest(target_vm, creds, spec)
+                time.sleep(2)
+                processes = gom.processManager.ListProcessesInGuest(target_vm, creds, [pid])
+                for p in processes:
+                    if p.exitCode == 0:
+                        lsf.write_output(f'{vm_name}: SUCCESS - systemctl {action} sshd')
+                    else:
+                        lsf.write_output(f'{vm_name}: WARNING - systemctl {action} sshd exited with code {p.exitCode}')
+            except vim.fault.InvalidGuestLogin:
+                lsf.write_output(f'{vm_name}: FAILED - Invalid guest credentials for root')
+                return False
+            except Exception as e:
+                lsf.write_output(f'{vm_name}: FAILED - Guest operations error: {e}')
+                return False
+        
+        return True
+    finally:
+        connect.Disconnect(si)
+
+
 def configure_operations_vms(auth_keys_file: str, password: str,
                               dry_run: bool = False) -> bool:
     """
@@ -1388,8 +1761,9 @@ def configure_operations_vms(auth_keys_file: str, password: str,
     
     Finds VMs with "ops" in the name from the config.ini [RESOURCES] VMs
     section and configures:
-    1. Non-expiring password for root
-    2. SSH authorized_keys for passwordless access
+    1. Enables SSH via Guest Operations API (if not already running)
+    2. Non-expiring password for root
+    3. SSH authorized_keys for passwordless access
     
     :param auth_keys_file: Path to authorized_keys file
     :param password: Root password
@@ -1400,16 +1774,17 @@ def configure_operations_vms(auth_keys_file: str, password: str,
         lsf.write_output('No Operations VMs defined in config')
         return True
     
-    vms = lsf.config.get('RESOURCES', 'VMs').split('\n')
+    vms_raw = lsf.config.get('RESOURCES', 'VMs').split('\n')
     ops_vms = []
     
-    for vm in vms:
+    for vm in vms_raw:
         if not vm or vm.strip().startswith('#'):
             continue
         if 'ops' in vm.lower():
-            # Format: vmname:vcenter
             parts = vm.split(':')
-            ops_vms.append(parts[0].strip())
+            vm_name = parts[0].strip()
+            vcenter = parts[1].strip() if len(parts) > 1 else ''
+            ops_vms.append((vm_name, vcenter))
     
     if not ops_vms:
         lsf.write_output('No Operations VMs found in config')
@@ -1420,9 +1795,20 @@ def configure_operations_vms(auth_keys_file: str, password: str,
     lsf.write_output('Operations VMs Configuration')
     lsf.write_output('=' * 60)
     
+    # Determine default vCenter user for Guest Operations
+    default_vcenter_user = 'administrator@vsphere.local'
+    if lsf.config.has_option('RESOURCES', 'vCenters'):
+        vc_lines = lsf.config.get('RESOURCES', 'vCenters').split('\n')
+        for vc_line in vc_lines:
+            if vc_line and not vc_line.strip().startswith('#'):
+                vc_parts = vc_line.split(':')
+                if len(vc_parts) > 2:
+                    default_vcenter_user = vc_parts[2].strip()
+                break
+    
     overall_success = True
     
-    for opsvm in ops_vms:
+    for opsvm, vcenter in ops_vms:
         lsf.write_output('')
         lsf.write_output(f'{opsvm}: Starting configuration...')
         vm_success = True
@@ -1431,17 +1817,39 @@ def configure_operations_vms(auth_keys_file: str, password: str,
             # First, check if the host is reachable
             lsf.write_output(f'{opsvm}: Checking connectivity...')
             if not lsf.test_ping(opsvm):
-                lsf.write_output(f'{opsvm}: FAILED - Host is not reachable (ping failed)')
-                overall_success = False
+                lsf.write_output(f'{opsvm}: SKIPPING - Host is not reachable (ping failed)')
+                lsf.write_output(f'{opsvm}:           VM may not be deployed in this environment')
                 continue
             lsf.write_output(f'{opsvm}: SUCCESS - Host is reachable')
             
-            # Check if SSH port is open
+            # Check if SSH port is open; if not, enable via Guest Operations
             if not lsf.test_tcp_port(opsvm, 22):
-                lsf.write_output(f'{opsvm}: FAILED - SSH port 22 is not open')
-                overall_success = False
-                continue
-            lsf.write_output(f'{opsvm}: SUCCESS - SSH port 22 is open')
+                lsf.write_output(f'{opsvm}: SSH port 22 is not open - enabling via Guest Operations...')
+                if vcenter:
+                    # Determine the vCenter user for this vCenter
+                    vc_user = default_vcenter_user
+                    if lsf.config.has_option('RESOURCES', 'vCenters'):
+                        for vc_line in lsf.config.get('RESOURCES', 'vCenters').split('\n'):
+                            if vc_line and not vc_line.strip().startswith('#') and vcenter in vc_line:
+                                vc_parts = vc_line.split(':')
+                                if len(vc_parts) > 2:
+                                    vc_user = vc_parts[2].strip()
+                                break
+                    
+                    enable_ops_vm_ssh_via_guest_ops(opsvm, vcenter, vc_user, password, dry_run)
+                    time.sleep(3)
+                    
+                    if not lsf.test_tcp_port(opsvm, 22):
+                        lsf.write_output(f'{opsvm}: FAILED - SSH still not available after Guest Operations enable')
+                        overall_success = False
+                        continue
+                    lsf.write_output(f'{opsvm}: SUCCESS - SSH enabled via Guest Operations')
+                else:
+                    lsf.write_output(f'{opsvm}: FAILED - SSH port 22 not open and no vCenter specified for Guest Operations')
+                    overall_success = False
+                    continue
+            else:
+                lsf.write_output(f'{opsvm}: SUCCESS - SSH port 22 is open')
             
             # Set non-expiring password for root
             lsf.write_output(f'{opsvm}: Setting non-expiring password for root...')
@@ -1492,6 +1900,7 @@ def configure_operations_vms(auth_keys_file: str, password: str,
                 overall_success = False
         else:
             lsf.write_output(f'{opsvm}: Would check connectivity (ping, SSH port)')
+            lsf.write_output(f'{opsvm}: Would enable SSH via Guest Operations if not running')
             lsf.write_output(f'{opsvm}: Would set non-expiring password for root')
             lsf.write_output(f'{opsvm}: Would copy authorized_keys to {LINUX_AUTH_FILE}')
     
@@ -1538,7 +1947,7 @@ def install_certutil(dry_run: bool = False) -> bool:
     REQUIRED PACKAGE: libnss3-tools
     
     To install manually (if apt is unavailable):
-        sudo apt-get install libnss3-tools
+        sudo apt install -y libnss3-tools
     
     Or download from Ubuntu archives:
         wget http://archive.ubuntu.com/ubuntu/pool/main/n/nss/libnss3-tools_3.98-1build1_amd64.deb
@@ -1558,7 +1967,7 @@ def install_certutil(dry_run: bool = False) -> bool:
     lsf.write_output('Installing libnss3-tools package (provides certutil)...')
     
     try:
-        result = lsf.run_command('sudo apt-get update && sudo apt-get install -y libnss3-tools')
+        result = lsf.run_command('sudo apt update && sudo apt install -y libnss3-tools')
         if result.returncode == 0:
             lsf.write_output('libnss3-tools installed successfully')
             return True
@@ -1566,7 +1975,7 @@ def install_certutil(dry_run: bool = False) -> bool:
             lsf.write_output('ERROR: Failed to install libnss3-tools via apt')
             lsf.write_output('')
             lsf.write_output('To install manually, run:')
-            lsf.write_output('  sudo apt-get install libnss3-tools')
+            lsf.write_output('  sudo apt install libnss3-tools')
             lsf.write_output('')
             lsf.write_output('Or download and install the .deb package:')
             lsf.write_output('  wget http://archive.ubuntu.com/ubuntu/pool/main/n/nss/libnss3-tools_3.98-1build1_amd64.deb')
@@ -2893,8 +3302,8 @@ Prerequisites:
   - Valid /tmp/config.ini with all resources defined
   - 'expect' utility installed (/usr/bin/expect)
 
-NOTE: Some NSX operations require manual steps first.
-      See HOLIFICATION.md for complete instructions.
+NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
+      See HOLIFICATION.md for any remaining manual steps.
         """
     )
     
@@ -3023,9 +3432,9 @@ NOTE: Some NSX operations require manual steps first.
     print('HOLification Complete')
     print('=' * 60)
     print('')
-    print('IMPORTANT: Review HOLIFICATION.md for any manual steps required,')
-    print('particularly for NSX Edge SSH configuration which must be done')
-    print('via the vSphere console.')
+    print('IMPORTANT: Review HOLIFICATION.md for any remaining manual steps.')
+    print('NSX Edge and Operations VM SSH were enabled automatically via')
+    print('Guest Operations. Verify SSH connectivity to all components.')
     print('')
 
 
