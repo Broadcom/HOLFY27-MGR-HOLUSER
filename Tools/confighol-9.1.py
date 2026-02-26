@@ -9,9 +9,25 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.6 - 2026-02-26:
+#   - vCenter CA import: fixed bug where only the first certificate from each
+#     download.zip was imported (premature break); now imports ALL CA certs
+#   - vCenter CA import: deduplicate certs by SHA-256 fingerprint across vCenters
+#   - vCenter CA import: fixed cert nickname quoting (strip stray quotes from
+#     openssl subject O= field, e.g. "Broadcom, Inc" -> Broadcom, Inc)
+# v2.5 - 2026-02-26:
+#   - VCF Automation: set vmware-system-user and root passwords to never expire
+#     (chage -M -1 via sudo -S)
+# v2.4 - 2026-02-26:
+#   - NSX Edge SSH now enabled via NSX Manager transport node API
+#     (fixes systemctl exit code 5 on Edge appliances where sshd is
+#     managed by the NSX control plane, not systemd)
+#   - NSX CLI SSH commands now use -T flag to disable PTY allocation
+#     (fixes connection reset on Edge nodes for set service/user commands)
+#   - VCF Automation (auto-platform-a) sudo now uses -S flag to pipe password
+#     (fixes "a terminal is required to read the password" error)
 # v2.3 - 2026-02-26:
-#   - NSX Edge SSH now enabled automatically via vSphere Guest Operations API
-#     (eliminates manual console step; uses systemctl enable/start sshd)
+#   - NSX Edge SSH initially attempted via vSphere Guest Operations API
 #   - Operations VMs SSH now enabled via Guest Operations when port 22 is closed
 #   - NSX Manager root password: auto-recovers SDDC Manager rotated passwords
 #     (queries SDDC Manager credentials API, resets to standard lab password)
@@ -67,10 +83,10 @@
 #    - Clear ARP cache
 #
 # 3. NSX Configuration:
-#    - Enable SSH via API on NSX Managers (where supported)
-#    - Enable SSH via Guest Operations on NSX Edges (automatic)
+#    - Enable SSH via API on NSX Managers (direct API call)
+#    - Enable SSH via NSX Manager transport node API on NSX Edges
 #    - Configure SSH authorized_keys for passwordless access
-#    - Set 729-day password expiration for admin, root, audit users
+#    - Set 9999-day password expiration for admin, root, audit users
 #    - Auto-recover SDDC Manager rotated root passwords
 #
 # 4. SDDC Manager Configuration:
@@ -145,7 +161,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.0'
+SCRIPT_VERSION = '2.6'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -166,8 +182,8 @@ LOCAL_VPXD_CONFIG = '/tmp/vpxd.cfg'
 # NSX users to configure
 NSX_USERS = ['admin', 'root', 'audit']
 
-# NSX password expiration (729 days = ~2 years, matches Fleet MaxExpiration policy)
-NSX_PASSWORD_EXPIRY_DAYS = 729
+# NSX password expiration (9999 days)
+NSX_PASSWORD_EXPIRY_DAYS = 9999
 
 # Password expiration setting for vCenter (9999 days ~ 27 years)
 PASSWORD_MAX_DAYS = 9999
@@ -1030,6 +1046,79 @@ def enable_nsx_ssh_via_api(hostname: str, user: str, password: str,
         return False
 
 
+def nsx_cli_ssh(command: str, hostname: str, password: str) -> 'subprocess.CompletedProcess':
+    """
+    Execute an NSX CLI command via SSH with the -T flag.
+    
+    NSX appliances (especially Edges) close the connection when a PTY is
+    allocated for non-interactive CLI commands. The -T flag disables PTY
+    allocation and is required for reliable automated CLI access.
+    
+    :param command: NSX CLI command (e.g. 'set service ssh start-on-boot')
+    :param hostname: NSX hostname
+    :param password: Admin password
+    :return: subprocess.CompletedProcess
+    """
+    options = 'StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -T'
+    return lsf.ssh(command, f'admin@{hostname}', password, options=options)
+
+
+def set_nsx_password_expiration_via_api(hostname: str, password: str,
+                                        user_id: int, username: str,
+                                        days: int,
+                                        dry_run: bool = False) -> bool:
+    """
+    Set password expiration for an NSX user via the REST API.
+    
+    The NSX CLI command 'set user <user> password-expiration <days>' does not
+    work reliably for admin/audit users in NSX 9.1 (sets frequency to 0
+    instead of the requested value). The REST API is the reliable method.
+    
+    For NSX Manager nodes, calls /api/v1/node/users/{user_id} directly.
+    For NSX Edge nodes, the caller should use the transport node endpoint
+    via the managing NSX Manager.
+    
+    :param hostname: NSX Manager or Edge hostname (must expose API)
+    :param password: Admin password
+    :param user_id: Numeric user ID (0=root, 10000=admin, 10002=audit)
+    :param username: Username (for logging only)
+    :param days: Number of days until password expires
+    :param dry_run: If True, preview only
+    :return: True if successful
+    """
+    if dry_run:
+        lsf.write_output(f'{hostname}: Would set {days}-day password expiration for {username}')
+        return True
+    
+    lsf.write_output(f'{hostname}: Setting {days}-day password expiration for {username}...')
+    
+    try:
+        resp = requests.put(
+            f'https://{hostname}/api/v1/node/users/{user_id}',
+            auth=('admin', password),
+            json={'password_change_frequency': days},
+            verify=False, timeout=30
+        )
+        if resp.status_code == 200:
+            freq = resp.json().get('password_change_frequency', 'unknown')
+            lsf.write_output(f'{hostname}: SUCCESS - {username} password expiration set to {freq} days')
+            return True
+        else:
+            error_msg = resp.text[:100] if resp.text else 'Unknown error'
+            lsf.write_output(f'{hostname}: FAILED - HTTP {resp.status_code}: {error_msg}')
+            return False
+    except Exception as e:
+        lsf.write_output(f'{hostname}: FAILED - {e}')
+        return False
+
+
+NSX_USER_ID_MAP = {
+    'root': 0,
+    'admin': 10000,
+    'audit': 10002,
+}
+
+
 def configure_nsx_ssh_start_on_boot(hostname: str, password: str,
                                      dry_run: bool = False) -> bool:
     """
@@ -1038,6 +1127,8 @@ def configure_nsx_ssh_start_on_boot(hostname: str, password: str,
     The NSX API does not support setting start-on-boot directly, so we
     must use SSH to run the CLI command:
     - set service ssh start-on-boot
+    
+    Uses -T flag to disable PTY allocation (required for NSX Edge CLI).
     
     PREREQUISITE: SSH must already be enabled on the NSX appliance.
     
@@ -1052,8 +1143,7 @@ def configure_nsx_ssh_start_on_boot(hostname: str, password: str,
     
     lsf.write_output(f'{hostname}: Configuring SSH start-on-boot...')
     
-    # Run the CLI command to enable start-on-boot
-    result = lsf.ssh('set service ssh start-on-boot', f'admin@{hostname}', password)
+    result = nsx_cli_ssh('set service ssh start-on-boot', hostname, password)
     
     if result.returncode == 0:
         lsf.write_output(f'{hostname}: SSH start-on-boot configured')
@@ -1129,14 +1219,14 @@ def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
         # Step 3: Configure SSH to start on boot
         configure_nsx_ssh_start_on_boot(hostname, password, dry_run)
         
-        # Step 4: Set password expiration for NSX users (729 days)
+        # Step 4: Set password expiration via REST API (CLI is unreliable for admin/audit)
         for user in NSX_USERS:
-            lsf.write_output(f'{hostname}: Setting {NSX_PASSWORD_EXPIRY_DAYS}-day password expiration for {user}...')
-            result = lsf.ssh(f'set user {user} password-expiration {NSX_PASSWORD_EXPIRY_DAYS}', f'admin@{hostname}', password)
-            if result.returncode == 0:
-                lsf.write_output(f'{hostname}: SUCCESS - {user} password expiration set to {NSX_PASSWORD_EXPIRY_DAYS} days')
+            user_id = NSX_USER_ID_MAP.get(user)
+            if user_id is not None:
+                set_nsx_password_expiration_via_api(hostname, password, user_id, user,
+                                                    NSX_PASSWORD_EXPIRY_DAYS, dry_run)
             else:
-                lsf.write_output(f'{hostname}: WARNING - Failed to set password expiration for {user}')
+                lsf.write_output(f'{hostname}: WARNING - Unknown NSX user {user}, skipping')
     else:
         lsf.write_output(f'{hostname}: Would enable SSH via API')
         lsf.write_output(f'{hostname}: Would copy authorized_keys (with SDDC Manager password fallback)')
@@ -1147,140 +1237,168 @@ def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
     return success
 
 
-def enable_nsx_edge_ssh_via_guest_ops(edge_hostname: str, esx_host: str,
-                                       password: str,
-                                       dry_run: bool = False) -> bool:
+def _get_nsx_manager_for_edge(edge_hostname: str) -> Optional[str]:
     """
-    Enable SSH on an NSX Edge VM via vSphere Guest Operations Manager.
+    Determine which NSX Manager manages a given edge node by name convention.
     
-    NSX Edges don't expose a REST API for SSH management, and the NSX CLI
-    commands (start service ssh, set service ssh start-on-boot) can only be
-    run from the console or an existing SSH session. This function bypasses
-    that limitation by using VMware Tools guest operations to run systemctl
-    commands directly inside the Edge VM.
+    Edge names follow the pattern edge-{domain}-{num}{site} where domain
+    matches the NSX Manager pattern nsx-{domain}-{num}{site}.
+    For example: edge-wld01-01a -> nsx-wld01-01a (or any nsx-wld01-* manager)
     
-    The Edge VM's owning vCenter is determined by checking which vCenter
-    manages the ESXi host the Edge runs on (from config.ini vcfnsxedges).
+    Falls back to trying all configured NSX Managers via API.
     
     :param edge_hostname: NSX Edge hostname (e.g. edge-wld01-01a)
-    :param esx_host: ESXi host the Edge runs on (e.g. esx-06a.site-a.vcf.lab)
-    :param password: Root password for the Edge VM guest OS
-    :param dry_run: If True, preview only
-    :return: True if SSH is now enabled and set to start on boot
+    :return: NSX Manager FQDN, or None if not found
     """
+    import re
+    
+    if 'VCF' not in lsf.config or 'vcfnsxmgr' not in lsf.config['VCF']:
+        return None
+    
+    vcfnsxmgrs = lsf.config.get('VCF', 'vcfnsxmgr').split('\n')
+    nsx_managers = []
+    for entry in vcfnsxmgrs:
+        if not entry or entry.strip().startswith('#'):
+            continue
+        parts = entry.split(':')
+        nsx_managers.append(parts[0].strip())
+    
+    # Try name-based matching: edge-wld01-01a -> nsx-wld01-*
+    edge_match = re.match(r'edge-(\w+)-\d+', edge_hostname)
+    if edge_match:
+        edge_domain = edge_match.group(1)
+        for mgr in nsx_managers:
+            if edge_domain in mgr:
+                return mgr
+    
+    return nsx_managers[0] if nsx_managers else None
+
+
+def enable_nsx_edge_ssh_via_api(edge_hostname: str, nsx_manager: str,
+                                 password: str,
+                                 dry_run: bool = False) -> bool:
+    """
+    Enable SSH on an NSX Edge node via the central NSX Manager API.
+    
+    NSX Edges are managed as transport nodes by their NSX Manager. The SSH
+    service on edges must be controlled through the NSX Manager's transport
+    node API, NOT via systemctl (which returns exit code 5 on NSX Edges
+    because sshd is managed by the NSX control plane).
+    
+    API endpoint:
+    POST /api/v1/transport-nodes/{node-id}/node/services/ssh?action=start
+    
+    :param edge_hostname: NSX Edge hostname (e.g. edge-wld01-01a)
+    :param nsx_manager: NSX Manager FQDN that manages this edge
+    :param password: Admin password for NSX Manager API
+    :param dry_run: If True, preview only
+    :return: True if SSH is now enabled
+    """
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
     if dry_run:
-        lsf.write_output(f'{edge_hostname}: Would enable SSH via Guest Operations API')
+        lsf.write_output(f'{edge_hostname}: Would enable SSH via NSX Manager API ({nsx_manager})')
         return True
     
-    import ssl as ssl_module
-    
-    # Determine which vCenter manages this ESXi host by checking config
-    vcenter_fqdn = None
-    vcenter_user = None
-    if lsf.config.has_option('RESOURCES', 'vCenters'):
-        vc_lines = lsf.config.get('RESOURCES', 'vCenters').split('\n')
-        for vc_line in vc_lines:
-            if not vc_line or vc_line.strip().startswith('#'):
-                continue
-            vc_parts = vc_line.split(':')
-            vc_host = vc_parts[0].strip()
-            vc_user = vc_parts[2].strip() if len(vc_parts) > 2 else 'administrator@vsphere.local'
-            
-            # Check if this vCenter manages the ESXi host
-            try:
-                context = ssl_module._create_unverified_context()
-                si = connect.SmartConnect(host=vc_host, user=vc_user,
-                                          pwd=password, sslContext=context)
-                content = si.RetrieveContent()
-                container = content.viewManager.CreateContainerView(
-                    content.rootFolder, [vim.VirtualMachine], True)
-                found = False
-                for vm in container.view:
-                    if vm.name == edge_hostname:
-                        found = True
-                        break
-                container.Destroy()
-                connect.Disconnect(si)
-                if found:
-                    vcenter_fqdn = vc_host
-                    vcenter_user = vc_user
-                    break
-            except Exception:
-                continue
-    
-    if not vcenter_fqdn:
-        lsf.write_output(f'{edge_hostname}: Could not find Edge VM in any configured vCenter')
-        return False
-    
-    lsf.write_output(f'{edge_hostname}: Found in vCenter {vcenter_fqdn}')
+    lsf.write_output(f'{edge_hostname}: Enabling SSH via NSX Manager API ({nsx_manager})...')
     
     try:
-        context = ssl_module._create_unverified_context()
-        si = connect.SmartConnect(host=vcenter_fqdn, user=vcenter_user,
-                                  pwd=password, sslContext=context)
-    except Exception as e:
-        lsf.write_output(f'{edge_hostname}: Could not connect to vCenter {vcenter_fqdn}: {e}')
-        return False
-    
-    try:
-        content = si.RetrieveContent()
-        gom = content.guestOperationsManager
+        # Find the edge's transport node ID
+        tn_url = f'https://{nsx_manager}/api/v1/transport-nodes'
+        resp = requests.get(tn_url, auth=('admin', password), verify=False, timeout=30)
+        if resp.status_code != 200:
+            lsf.write_output(f'{edge_hostname}: Failed to query transport nodes: HTTP {resp.status_code}')
+            return False
         
-        container = content.viewManager.CreateContainerView(
-            content.rootFolder, [vim.VirtualMachine], True)
-        target_vm = None
-        for vm in container.view:
-            if vm.name == edge_hostname:
-                target_vm = vm
+        node_id = None
+        for node in resp.json().get('results', []):
+            if node.get('display_name', '') == edge_hostname:
+                node_id = node.get('node_id', node.get('id'))
                 break
-        container.Destroy()
         
-        if not target_vm:
-            lsf.write_output(f'{edge_hostname}: VM not found in vCenter inventory')
+        if not node_id:
+            lsf.write_output(f'{edge_hostname}: Edge not found as transport node in {nsx_manager}')
             return False
         
-        if target_vm.runtime.powerState != 'poweredOn':
-            lsf.write_output(f'{edge_hostname}: VM is not powered on ({target_vm.runtime.powerState})')
+        lsf.write_output(f'{edge_hostname}: Found transport node ID: {node_id}')
+        
+        # Start SSH service via the transport node API
+        ssh_url = f'https://{nsx_manager}/api/v1/transport-nodes/{node_id}/node/services/ssh?action=start'
+        resp = requests.post(ssh_url, auth=('admin', password), verify=False, timeout=30)
+        
+        if resp.status_code == 200:
+            result = resp.json()
+            runtime_state = result.get('runtime_state', 'unknown')
+            lsf.write_output(f'{edge_hostname}: SSH service state: {runtime_state}')
+            return runtime_state == 'running'
+        else:
+            lsf.write_output(f'{edge_hostname}: Failed to start SSH: HTTP {resp.status_code}')
+            return False
+    
+    except Exception as e:
+        lsf.write_output(f'{edge_hostname}: Error enabling SSH via API: {e}')
+        return False
+
+
+def set_nsx_edge_password_expiration(edge_hostname: str, nsx_manager: str,
+                                       password: str, days: int,
+                                       dry_run: bool = False) -> bool:
+    """
+    Set password expiration for all NSX users on an Edge node via the
+    central NSX Manager's transport node API.
+    
+    Edges don't expose /api/v1/node/users directly; the managing NSX
+    Manager proxies these calls through the transport node endpoint.
+    
+    :param edge_hostname: NSX Edge display name
+    :param nsx_manager: NSX Manager FQDN
+    :param password: Admin password
+    :param days: Password expiration days
+    :param dry_run: If True, preview only
+    :return: True if all users updated successfully
+    """
+    if dry_run:
+        for user in NSX_USERS:
+            lsf.write_output(f'{edge_hostname}: Would set {days}-day password expiration for {user}')
+        return True
+    
+    try:
+        tn_url = f'https://{nsx_manager}/api/v1/transport-nodes'
+        resp = requests.get(tn_url, auth=('admin', password), verify=False, timeout=30)
+        if resp.status_code != 200:
+            lsf.write_output(f'{edge_hostname}: Failed to query transport nodes')
             return False
         
-        if target_vm.guest.toolsStatus not in ('toolsOk', 'toolsOld'):
-            lsf.write_output(f'{edge_hostname}: VMware Tools not running ({target_vm.guest.toolsStatus})')
-            return False
+        node_id = None
+        for node in resp.json().get('results', []):
+            if node.get('display_name', '') == edge_hostname:
+                node_id = node.get('node_id', node.get('id'))
+                break
         
-        creds = vim.vm.guest.NamePasswordAuthentication(
-            username='root', password=password)
+        if not node_id:
+            lsf.write_output(f'{edge_hostname}: Not found as transport node in {nsx_manager}')
+            return False
         
         success = True
-        for action in ['enable', 'start']:
-            spec = vim.vm.guest.ProcessManager.ProgramSpec(
-                programPath='/usr/bin/systemctl',
-                arguments=f'{action} sshd'
-            )
-            try:
-                pid = gom.processManager.StartProgramInGuest(target_vm, creds, spec)
-                time.sleep(2)
-                processes = gom.processManager.ListProcessesInGuest(target_vm, creds, [pid])
-                for p in processes:
-                    if p.exitCode == 0:
-                        lsf.write_output(f'{edge_hostname}: SUCCESS - systemctl {action} sshd')
-                    elif action == 'enable' and p.exitCode == 1:
-                        # Exit code 1 for enable = already enabled (idempotent)
-                        lsf.write_output(f'{edge_hostname}: SUCCESS - sshd already enabled')
-                    else:
-                        lsf.write_output(f'{edge_hostname}: WARNING - systemctl {action} sshd exit code {p.exitCode}')
-            except vim.fault.InvalidGuestLogin:
-                lsf.write_output(f'{edge_hostname}: FAILED - Invalid guest credentials for root')
-                lsf.write_output(f'{edge_hostname}:         Root password may have been rotated by SDDC Manager')
+        for user, user_id in NSX_USER_ID_MAP.items():
+            lsf.write_output(f'{edge_hostname}: Setting {days}-day password expiration for {user}...')
+            url = f'https://{nsx_manager}/api/v1/transport-nodes/{node_id}/node/users/{user_id}'
+            resp = requests.put(url, auth=('admin', password),
+                                json={'password_change_frequency': days},
+                                verify=False, timeout=30)
+            if resp.status_code == 200:
+                freq = resp.json().get('password_change_frequency', 'unknown')
+                lsf.write_output(f'{edge_hostname}: SUCCESS - {user} password expiration set to {freq} days')
+            else:
+                lsf.write_output(f'{edge_hostname}: WARNING - Failed for {user}: HTTP {resp.status_code}')
                 success = False
-                break
-            except Exception as e:
-                lsf.write_output(f'{edge_hostname}: FAILED - Guest operations error: {e}')
-                success = False
-                break
         
         return success
-    finally:
-        connect.Disconnect(si)
+    except Exception as e:
+        lsf.write_output(f'{edge_hostname}: Error setting password expiration: {e}')
+        return False
 
 
 def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
@@ -1288,19 +1406,20 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
     """
     Configure an NSX Edge node for HOLification.
     
-    SSH is enabled automatically via vSphere Guest Operations if not already
-    running. This eliminates the need for manual console access.
+    SSH is enabled via the central NSX Manager API (transport node endpoint).
+    NSX Edges use a managed sshd that cannot be controlled via systemctl;
+    the NSX Manager API is the only reliable remote method.
     
     This function:
-    1. Enables SSH via Guest Operations (systemctl enable/start sshd)
+    1. Enables SSH via NSX Manager transport node API
     2. Copies authorized_keys for root user
-    3. Configures SSH to start on boot (via SSH now that it's enabled)
-    4. Removes password expiration for admin, root, audit users
+    3. Configures SSH to start on boot (via NSX CLI over SSH)
+    4. Sets 9999-day password expiration for admin, root, audit users
     
     :param hostname: NSX Edge hostname
     :param auth_keys_file: Path to authorized_keys file
     :param password: Admin/root password
-    :param esx_host: ESXi host the Edge runs on (for Guest Ops vCenter lookup)
+    :param esx_host: ESXi host the Edge runs on (unused, kept for compat)
     :param dry_run: If True, preview only
     :return: True if successful
     """
@@ -1309,18 +1428,23 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
     success = True
     
     if not dry_run:
-        # Step 1: Enable SSH via Guest Operations if not already running
+        # Step 1: Enable SSH via NSX Manager API if not already running
         if not lsf.test_tcp_port(hostname, 22):
-            lsf.write_output(f'{hostname}: SSH not running - enabling via Guest Operations...')
-            if not enable_nsx_edge_ssh_via_guest_ops(hostname, esx_host, password, dry_run):
-                lsf.write_output(f'{hostname}: FAILED - Could not enable SSH via Guest Operations')
-                lsf.write_output(f'{hostname}:         Enable SSH manually via vSphere console:')
+            lsf.write_output(f'{hostname}: SSH not running - enabling via NSX Manager API...')
+            nsx_mgr = _get_nsx_manager_for_edge(hostname)
+            if not nsx_mgr:
+                lsf.write_output(f'{hostname}: FAILED - Could not determine NSX Manager for this edge')
+                return False
+            
+            if not enable_nsx_edge_ssh_via_api(hostname, nsx_mgr, password, dry_run):
+                lsf.write_output(f'{hostname}: FAILED - Could not enable SSH via NSX Manager API')
+                lsf.write_output(f'{hostname}:         Enable SSH manually via NSX Manager UI or console:')
                 lsf.write_output(f'{hostname}:           Login as admin, run: start service ssh')
                 lsf.write_output(f'{hostname}:           Then run: set service ssh start-on-boot')
                 return False
-            time.sleep(3)
+            time.sleep(5)
             if not lsf.test_tcp_port(hostname, 22):
-                lsf.write_output(f'{hostname}: FAILED - SSH still not reachable after Guest Operations enable')
+                lsf.write_output(f'{hostname}: FAILED - SSH still not reachable after API enable')
                 return False
         else:
             lsf.write_output(f'{hostname}: SSH already running')
@@ -1341,19 +1465,18 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
                 lsf.write_output(f'{hostname}:         SSH connection failed despite enable attempt')
             success = False
         
-        # Step 3: Configure SSH to start on boot
+        # Step 3: Configure SSH to start on boot via NSX CLI
         configure_nsx_ssh_start_on_boot(hostname, password, dry_run)
         
-        # Step 4: Set password expiration for NSX users (729 days)
-        for user in NSX_USERS:
-            lsf.write_output(f'{hostname}: Setting {NSX_PASSWORD_EXPIRY_DAYS}-day password expiration for {user}...')
-            result = lsf.ssh(f'set user {user} password-expiration {NSX_PASSWORD_EXPIRY_DAYS}', f'admin@{hostname}', password)
-            if result.returncode == 0:
-                lsf.write_output(f'{hostname}: SUCCESS - {user} password expiration set to {NSX_PASSWORD_EXPIRY_DAYS} days')
-            else:
-                lsf.write_output(f'{hostname}: WARNING - Failed to set password expiration for {user}')
+        # Step 4: Set password expiration via NSX Manager transport node API
+        nsx_mgr = _get_nsx_manager_for_edge(hostname)
+        if nsx_mgr:
+            set_nsx_edge_password_expiration(hostname, nsx_mgr, password,
+                                              NSX_PASSWORD_EXPIRY_DAYS, dry_run)
+        else:
+            lsf.write_output(f'{hostname}: WARNING - Cannot set password expiration (no NSX Manager found)')
     else:
-        lsf.write_output(f'{hostname}: Would enable SSH via Guest Operations (if not running)')
+        lsf.write_output(f'{hostname}: Would enable SSH via NSX Manager API (if not running)')
         lsf.write_output(f'{hostname}: Would copy authorized_keys for root')
         lsf.write_output(f'{hostname}: Would configure SSH start-on-boot')
         for user in NSX_USERS:
@@ -1473,17 +1596,32 @@ def configure_aria_automation(hostname: str, auth_keys_file: str, password: str,
         # Step 2: Copy authorized_keys for root using sudo
         lsf.write_output(f'{hostname}: Copying authorized_keys for root via sudo...')
         
-        # Use sudo to copy keys to root's authorized_keys
-        # vmware-system-user has sudo NOPASSWD access
-        sudo_cmd = f'sudo mkdir -p /root/.ssh && sudo cp {user_auth_file} /root/.ssh/authorized_keys && sudo chmod 600 /root/.ssh/authorized_keys'
+        # Use sudo -S to pipe the password via stdin (vmware-system-user
+        # requires password for sudo on VCF Automation appliances)
+        sudo_cmd = (
+            f'echo \'{password}\' | sudo -S mkdir -p /root/.ssh && '
+            f'echo \'{password}\' | sudo -S cp {user_auth_file} /root/.ssh/authorized_keys && '
+            f'echo \'{password}\' | sudo -S chmod 600 /root/.ssh/authorized_keys'
+        )
         result = lsf.ssh(sudo_cmd, f'{ssh_user}@{hostname}', password)
         if result.returncode == 0:
             lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied for root')
         else:
             lsf.write_output(f'{hostname}: WARNING - Failed to copy authorized_keys for root')
+        
+        # Step 3: Set password to never expire for vmware-system-user and root
+        for account in [ssh_user, 'root']:
+            lsf.write_output(f'{hostname}: Setting non-expiring password for {account}...')
+            chage_cmd = f"echo '{password}' | sudo -S chage -M -1 {account}"
+            result = lsf.ssh(chage_cmd, f'{ssh_user}@{hostname}', password)
+            if result.returncode == 0:
+                lsf.write_output(f'{hostname}: SUCCESS - Non-expiring password set for {account}')
+            else:
+                lsf.write_output(f'{hostname}: WARNING - Failed to set password for {account}')
     else:
         lsf.write_output(f'{hostname}: Would copy authorized_keys for {ssh_user}')
         lsf.write_output(f'{hostname}: Would copy authorized_keys for root via sudo')
+        lsf.write_output(f'{hostname}: Would set non-expiring password for {ssh_user} and root')
     
     return success
 
@@ -1496,8 +1634,8 @@ def configure_nsx_components(auth_keys_file: str, password: str,
     Processes NSX Managers (vcfnsxmgr) and NSX Edges (vcfnsxedges)
     defined in the [VCF] section of config.ini.
     
-    NSX Managers: SSH enabled via REST API.
-    NSX Edges: SSH enabled via vSphere Guest Operations (systemctl).
+    NSX Managers: SSH enabled via REST API on the manager itself.
+    NSX Edges: SSH enabled via NSX Manager transport node API.
     
     :param auth_keys_file: Path to authorized_keys file
     :param password: Admin password
@@ -1548,7 +1686,7 @@ def configure_nsx_components(auth_keys_file: str, password: str,
     if 'vcfnsxedges' in lsf.config['VCF']:
         lsf.write_output('')
         lsf.write_output('Processing NSX Edges...')
-        lsf.write_output('SSH will be enabled automatically via Guest Operations if needed.')
+        lsf.write_output('SSH will be enabled automatically via NSX Manager API if needed.')
         vcfnsxedges = lsf.config.get('VCF', 'vcfnsxedges').split('\n')
         
         for entry in vcfnsxedges:
@@ -2402,6 +2540,11 @@ def download_vcenter_ca_certificates(vcenter_hostname: str) -> Optional[list]:
     
     vCenter exposes its CA certificates at /certs/download.zip which contains
     certificates in different formats for Linux, Mac, and Windows.
+    Each zip may contain multiple CA certificates (VMCA root, Broadcom VCF
+    root, etc.) that all need to be imported.
+    
+    We use only the Linux (.0) files to avoid importing the same cert twice
+    from both lin/ and win/ directories, and deduplicate by SHA-256 fingerprint.
     
     :param vcenter_hostname: vCenter FQDN
     :return: List of tuples (cert_name, cert_pem) or None on failure
@@ -2419,48 +2562,55 @@ def download_vcenter_ca_certificates(vcenter_hostname: str) -> Optional[list]:
             lsf.write_output(f'ERROR: Failed to download certificates: HTTP {response.status_code}')
             return None
         
-        # Extract certificates from zip
         certificates = []
+        seen_fingerprints = set()
         
         with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-            # Look for .crt files in the win folder (or .0 files in lin folder)
             for filename in zf.namelist():
-                # Prefer Windows format (.crt) or Linux format (.0)
-                if filename.endswith('.crt') or (filename.endswith('.0') and '/lin/' in filename):
-                    # Skip CRL files
-                    if '.r0' in filename or '.crl' in filename:
-                        continue
-                    
-                    cert_data = zf.read(filename)
-                    cert_pem = cert_data.decode('utf-8')
-                    
-                    # Verify it's a valid certificate
-                    if '-----BEGIN CERTIFICATE-----' in cert_pem:
-                        # Extract a friendly name from the certificate
-                        try:
-                            result = subprocess.run(
-                                ['openssl', 'x509', '-noout', '-subject'],
-                                input=cert_pem,
-                                capture_output=True,
-                                text=True
-                            )
-                            if result.returncode == 0:
-                                subject = result.stdout.strip()
-                                # Extract CN or O from subject
-                                cert_name = f"{vcenter_hostname} CA"
-                                if 'O = ' in subject:
-                                    # Extract organization
-                                    org = subject.split('O = ')[1].split(',')[0].strip()
-                                    cert_name = f"{org} CA"
-                            else:
-                                cert_name = f"{vcenter_hostname} CA"
-                        except:
-                            cert_name = f"{vcenter_hostname} CA"
-                        
-                        certificates.append((cert_name, cert_pem))
-                        lsf.write_output(f'  Found certificate: {cert_name}')
-                        # Only take the first valid certificate per format
-                        break
+                # Use only Linux format (.0) to avoid duplicates across lin/win/mac
+                if not (filename.endswith('.0') and '/lin/' in filename):
+                    continue
+                
+                cert_data = zf.read(filename)
+                cert_pem = cert_data.decode('utf-8')
+                
+                if '-----BEGIN CERTIFICATE-----' not in cert_pem:
+                    continue
+                
+                # Deduplicate by SHA-256 fingerprint
+                try:
+                    fp_result = subprocess.run(
+                        ['openssl', 'x509', '-noout', '-fingerprint', '-sha256'],
+                        input=cert_pem, capture_output=True, text=True
+                    )
+                    fingerprint = fp_result.stdout.strip() if fp_result.returncode == 0 else None
+                except Exception:
+                    fingerprint = None
+                
+                if fingerprint and fingerprint in seen_fingerprints:
+                    continue
+                if fingerprint:
+                    seen_fingerprints.add(fingerprint)
+                
+                # Build a friendly, unique nickname from the certificate subject
+                cert_name = f"{vcenter_hostname} CA"
+                try:
+                    result = subprocess.run(
+                        ['openssl', 'x509', '-noout', '-subject'],
+                        input=cert_pem, capture_output=True, text=True
+                    )
+                    if result.returncode == 0:
+                        subject = result.stdout.strip()
+                        if 'O = ' in subject:
+                            org = subject.split('O = ')[1].split(',')[0].strip()
+                            # Strip surrounding quotes that openssl may include
+                            org = org.strip('"')
+                            cert_name = f"{org} CA"
+                except Exception:
+                    pass
+                
+                certificates.append((cert_name, cert_pem))
+                lsf.write_output(f'  Found certificate: {cert_name} ({os.path.basename(filename)})')
         
         if not certificates:
             lsf.write_output('ERROR: No valid CA certificates found in download')
@@ -2909,7 +3059,7 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
     This function:
     1. Authenticates to VCF Operations Manager suite-api
     2. Checks if "MaxExpiration" policy already exists
-    3. If not, creates it with expiration = 729 days from today
+    3. If not, creates it with expiration = 9999 days from today
     4. Queries all policies to find inventory assigned to other policies
     5. Reassigns MANAGEMENT to MaxExpiration (auto-unassigns from old policy)
     6. Reassigns each INSTANCE to MaxExpiration using resourceId (auto-unassigns)
