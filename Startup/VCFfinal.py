@@ -1353,7 +1353,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     nsx_mgr_entries = lsf.get_config_list('VCF', 'vcfnsxmgr')
     nsx_users = ['admin', 'root', 'audit']
-    nsx_expiry_days = 729
+    nsx_expiry_days = 9999
     password = lsf.get_password()
     
     if nsx_mgr_entries:

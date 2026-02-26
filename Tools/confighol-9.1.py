@@ -9,6 +9,15 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.6 - 2026-02-26:
+#   - vCenter CA import: fixed bug where only the first certificate from each
+#     download.zip was imported (premature break); now imports ALL CA certs
+#   - vCenter CA import: deduplicate certs by SHA-256 fingerprint across vCenters
+#   - vCenter CA import: fixed cert nickname quoting (strip stray quotes from
+#     openssl subject O= field, e.g. "Broadcom, Inc" -> Broadcom, Inc)
+# v2.5 - 2026-02-26:
+#   - VCF Automation: set vmware-system-user and root passwords to never expire
+#     (chage -M -1 via sudo -S)
 # v2.4 - 2026-02-26:
 #   - NSX Edge SSH now enabled via NSX Manager transport node API
 #     (fixes systemctl exit code 5 on Edge appliances where sshd is
@@ -77,7 +86,7 @@
 #    - Enable SSH via API on NSX Managers (direct API call)
 #    - Enable SSH via NSX Manager transport node API on NSX Edges
 #    - Configure SSH authorized_keys for passwordless access
-#    - Set 729-day password expiration for admin, root, audit users
+#    - Set 9999-day password expiration for admin, root, audit users
 #    - Auto-recover SDDC Manager rotated root passwords
 #
 # 4. SDDC Manager Configuration:
@@ -152,7 +161,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.4'
+SCRIPT_VERSION = '2.6'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -173,8 +182,8 @@ LOCAL_VPXD_CONFIG = '/tmp/vpxd.cfg'
 # NSX users to configure
 NSX_USERS = ['admin', 'root', 'audit']
 
-# NSX password expiration (729 days = ~2 years, matches Fleet MaxExpiration policy)
-NSX_PASSWORD_EXPIRY_DAYS = 729
+# NSX password expiration (9999 days)
+NSX_PASSWORD_EXPIRY_DAYS = 9999
 
 # Password expiration setting for vCenter (9999 days ~ 27 years)
 PASSWORD_MAX_DAYS = 9999
@@ -1054,6 +1063,62 @@ def nsx_cli_ssh(command: str, hostname: str, password: str) -> 'subprocess.Compl
     return lsf.ssh(command, f'admin@{hostname}', password, options=options)
 
 
+def set_nsx_password_expiration_via_api(hostname: str, password: str,
+                                        user_id: int, username: str,
+                                        days: int,
+                                        dry_run: bool = False) -> bool:
+    """
+    Set password expiration for an NSX user via the REST API.
+    
+    The NSX CLI command 'set user <user> password-expiration <days>' does not
+    work reliably for admin/audit users in NSX 9.1 (sets frequency to 0
+    instead of the requested value). The REST API is the reliable method.
+    
+    For NSX Manager nodes, calls /api/v1/node/users/{user_id} directly.
+    For NSX Edge nodes, the caller should use the transport node endpoint
+    via the managing NSX Manager.
+    
+    :param hostname: NSX Manager or Edge hostname (must expose API)
+    :param password: Admin password
+    :param user_id: Numeric user ID (0=root, 10000=admin, 10002=audit)
+    :param username: Username (for logging only)
+    :param days: Number of days until password expires
+    :param dry_run: If True, preview only
+    :return: True if successful
+    """
+    if dry_run:
+        lsf.write_output(f'{hostname}: Would set {days}-day password expiration for {username}')
+        return True
+    
+    lsf.write_output(f'{hostname}: Setting {days}-day password expiration for {username}...')
+    
+    try:
+        resp = requests.put(
+            f'https://{hostname}/api/v1/node/users/{user_id}',
+            auth=('admin', password),
+            json={'password_change_frequency': days},
+            verify=False, timeout=30
+        )
+        if resp.status_code == 200:
+            freq = resp.json().get('password_change_frequency', 'unknown')
+            lsf.write_output(f'{hostname}: SUCCESS - {username} password expiration set to {freq} days')
+            return True
+        else:
+            error_msg = resp.text[:100] if resp.text else 'Unknown error'
+            lsf.write_output(f'{hostname}: FAILED - HTTP {resp.status_code}: {error_msg}')
+            return False
+    except Exception as e:
+        lsf.write_output(f'{hostname}: FAILED - {e}')
+        return False
+
+
+NSX_USER_ID_MAP = {
+    'root': 0,
+    'admin': 10000,
+    'audit': 10002,
+}
+
+
 def configure_nsx_ssh_start_on_boot(hostname: str, password: str,
                                      dry_run: bool = False) -> bool:
     """
@@ -1154,14 +1219,14 @@ def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
         # Step 3: Configure SSH to start on boot
         configure_nsx_ssh_start_on_boot(hostname, password, dry_run)
         
-        # Step 4: Set password expiration for NSX users (729 days)
+        # Step 4: Set password expiration via REST API (CLI is unreliable for admin/audit)
         for user in NSX_USERS:
-            lsf.write_output(f'{hostname}: Setting {NSX_PASSWORD_EXPIRY_DAYS}-day password expiration for {user}...')
-            result = nsx_cli_ssh(f'set user {user} password-expiration {NSX_PASSWORD_EXPIRY_DAYS}', hostname, password)
-            if result.returncode == 0:
-                lsf.write_output(f'{hostname}: SUCCESS - {user} password expiration set to {NSX_PASSWORD_EXPIRY_DAYS} days')
+            user_id = NSX_USER_ID_MAP.get(user)
+            if user_id is not None:
+                set_nsx_password_expiration_via_api(hostname, password, user_id, user,
+                                                    NSX_PASSWORD_EXPIRY_DAYS, dry_run)
             else:
-                lsf.write_output(f'{hostname}: WARNING - Failed to set password expiration for {user}')
+                lsf.write_output(f'{hostname}: WARNING - Unknown NSX user {user}, skipping')
     else:
         lsf.write_output(f'{hostname}: Would enable SSH via API')
         lsf.write_output(f'{hostname}: Would copy authorized_keys (with SDDC Manager password fallback)')
@@ -1277,6 +1342,65 @@ def enable_nsx_edge_ssh_via_api(edge_hostname: str, nsx_manager: str,
         return False
 
 
+def set_nsx_edge_password_expiration(edge_hostname: str, nsx_manager: str,
+                                       password: str, days: int,
+                                       dry_run: bool = False) -> bool:
+    """
+    Set password expiration for all NSX users on an Edge node via the
+    central NSX Manager's transport node API.
+    
+    Edges don't expose /api/v1/node/users directly; the managing NSX
+    Manager proxies these calls through the transport node endpoint.
+    
+    :param edge_hostname: NSX Edge display name
+    :param nsx_manager: NSX Manager FQDN
+    :param password: Admin password
+    :param days: Password expiration days
+    :param dry_run: If True, preview only
+    :return: True if all users updated successfully
+    """
+    if dry_run:
+        for user in NSX_USERS:
+            lsf.write_output(f'{edge_hostname}: Would set {days}-day password expiration for {user}')
+        return True
+    
+    try:
+        tn_url = f'https://{nsx_manager}/api/v1/transport-nodes'
+        resp = requests.get(tn_url, auth=('admin', password), verify=False, timeout=30)
+        if resp.status_code != 200:
+            lsf.write_output(f'{edge_hostname}: Failed to query transport nodes')
+            return False
+        
+        node_id = None
+        for node in resp.json().get('results', []):
+            if node.get('display_name', '') == edge_hostname:
+                node_id = node.get('node_id', node.get('id'))
+                break
+        
+        if not node_id:
+            lsf.write_output(f'{edge_hostname}: Not found as transport node in {nsx_manager}')
+            return False
+        
+        success = True
+        for user, user_id in NSX_USER_ID_MAP.items():
+            lsf.write_output(f'{edge_hostname}: Setting {days}-day password expiration for {user}...')
+            url = f'https://{nsx_manager}/api/v1/transport-nodes/{node_id}/node/users/{user_id}'
+            resp = requests.put(url, auth=('admin', password),
+                                json={'password_change_frequency': days},
+                                verify=False, timeout=30)
+            if resp.status_code == 200:
+                freq = resp.json().get('password_change_frequency', 'unknown')
+                lsf.write_output(f'{edge_hostname}: SUCCESS - {user} password expiration set to {freq} days')
+            else:
+                lsf.write_output(f'{edge_hostname}: WARNING - Failed for {user}: HTTP {resp.status_code}')
+                success = False
+        
+        return success
+    except Exception as e:
+        lsf.write_output(f'{edge_hostname}: Error setting password expiration: {e}')
+        return False
+
+
 def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
                        esx_host: str = '', dry_run: bool = False) -> bool:
     """
@@ -1290,7 +1414,7 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
     1. Enables SSH via NSX Manager transport node API
     2. Copies authorized_keys for root user
     3. Configures SSH to start on boot (via NSX CLI over SSH)
-    4. Sets 729-day password expiration for admin, root, audit users
+    4. Sets 9999-day password expiration for admin, root, audit users
     
     :param hostname: NSX Edge hostname
     :param auth_keys_file: Path to authorized_keys file
@@ -1344,14 +1468,13 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
         # Step 3: Configure SSH to start on boot via NSX CLI
         configure_nsx_ssh_start_on_boot(hostname, password, dry_run)
         
-        # Step 4: Set password expiration for NSX users (729 days)
-        for user in NSX_USERS:
-            lsf.write_output(f'{hostname}: Setting {NSX_PASSWORD_EXPIRY_DAYS}-day password expiration for {user}...')
-            result = nsx_cli_ssh(f'set user {user} password-expiration {NSX_PASSWORD_EXPIRY_DAYS}', hostname, password)
-            if result.returncode == 0:
-                lsf.write_output(f'{hostname}: SUCCESS - {user} password expiration set to {NSX_PASSWORD_EXPIRY_DAYS} days')
-            else:
-                lsf.write_output(f'{hostname}: WARNING - Failed to set password expiration for {user}')
+        # Step 4: Set password expiration via NSX Manager transport node API
+        nsx_mgr = _get_nsx_manager_for_edge(hostname)
+        if nsx_mgr:
+            set_nsx_edge_password_expiration(hostname, nsx_mgr, password,
+                                              NSX_PASSWORD_EXPIRY_DAYS, dry_run)
+        else:
+            lsf.write_output(f'{hostname}: WARNING - Cannot set password expiration (no NSX Manager found)')
     else:
         lsf.write_output(f'{hostname}: Would enable SSH via NSX Manager API (if not running)')
         lsf.write_output(f'{hostname}: Would copy authorized_keys for root')
@@ -1485,9 +1608,20 @@ def configure_aria_automation(hostname: str, auth_keys_file: str, password: str,
             lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied for root')
         else:
             lsf.write_output(f'{hostname}: WARNING - Failed to copy authorized_keys for root')
+        
+        # Step 3: Set password to never expire for vmware-system-user and root
+        for account in [ssh_user, 'root']:
+            lsf.write_output(f'{hostname}: Setting non-expiring password for {account}...')
+            chage_cmd = f"echo '{password}' | sudo -S chage -M -1 {account}"
+            result = lsf.ssh(chage_cmd, f'{ssh_user}@{hostname}', password)
+            if result.returncode == 0:
+                lsf.write_output(f'{hostname}: SUCCESS - Non-expiring password set for {account}')
+            else:
+                lsf.write_output(f'{hostname}: WARNING - Failed to set password for {account}')
     else:
         lsf.write_output(f'{hostname}: Would copy authorized_keys for {ssh_user}')
         lsf.write_output(f'{hostname}: Would copy authorized_keys for root via sudo')
+        lsf.write_output(f'{hostname}: Would set non-expiring password for {ssh_user} and root')
     
     return success
 
@@ -2406,6 +2540,11 @@ def download_vcenter_ca_certificates(vcenter_hostname: str) -> Optional[list]:
     
     vCenter exposes its CA certificates at /certs/download.zip which contains
     certificates in different formats for Linux, Mac, and Windows.
+    Each zip may contain multiple CA certificates (VMCA root, Broadcom VCF
+    root, etc.) that all need to be imported.
+    
+    We use only the Linux (.0) files to avoid importing the same cert twice
+    from both lin/ and win/ directories, and deduplicate by SHA-256 fingerprint.
     
     :param vcenter_hostname: vCenter FQDN
     :return: List of tuples (cert_name, cert_pem) or None on failure
@@ -2423,48 +2562,55 @@ def download_vcenter_ca_certificates(vcenter_hostname: str) -> Optional[list]:
             lsf.write_output(f'ERROR: Failed to download certificates: HTTP {response.status_code}')
             return None
         
-        # Extract certificates from zip
         certificates = []
+        seen_fingerprints = set()
         
         with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-            # Look for .crt files in the win folder (or .0 files in lin folder)
             for filename in zf.namelist():
-                # Prefer Windows format (.crt) or Linux format (.0)
-                if filename.endswith('.crt') or (filename.endswith('.0') and '/lin/' in filename):
-                    # Skip CRL files
-                    if '.r0' in filename or '.crl' in filename:
-                        continue
-                    
-                    cert_data = zf.read(filename)
-                    cert_pem = cert_data.decode('utf-8')
-                    
-                    # Verify it's a valid certificate
-                    if '-----BEGIN CERTIFICATE-----' in cert_pem:
-                        # Extract a friendly name from the certificate
-                        try:
-                            result = subprocess.run(
-                                ['openssl', 'x509', '-noout', '-subject'],
-                                input=cert_pem,
-                                capture_output=True,
-                                text=True
-                            )
-                            if result.returncode == 0:
-                                subject = result.stdout.strip()
-                                # Extract CN or O from subject
-                                cert_name = f"{vcenter_hostname} CA"
-                                if 'O = ' in subject:
-                                    # Extract organization
-                                    org = subject.split('O = ')[1].split(',')[0].strip()
-                                    cert_name = f"{org} CA"
-                            else:
-                                cert_name = f"{vcenter_hostname} CA"
-                        except:
-                            cert_name = f"{vcenter_hostname} CA"
-                        
-                        certificates.append((cert_name, cert_pem))
-                        lsf.write_output(f'  Found certificate: {cert_name}')
-                        # Only take the first valid certificate per format
-                        break
+                # Use only Linux format (.0) to avoid duplicates across lin/win/mac
+                if not (filename.endswith('.0') and '/lin/' in filename):
+                    continue
+                
+                cert_data = zf.read(filename)
+                cert_pem = cert_data.decode('utf-8')
+                
+                if '-----BEGIN CERTIFICATE-----' not in cert_pem:
+                    continue
+                
+                # Deduplicate by SHA-256 fingerprint
+                try:
+                    fp_result = subprocess.run(
+                        ['openssl', 'x509', '-noout', '-fingerprint', '-sha256'],
+                        input=cert_pem, capture_output=True, text=True
+                    )
+                    fingerprint = fp_result.stdout.strip() if fp_result.returncode == 0 else None
+                except Exception:
+                    fingerprint = None
+                
+                if fingerprint and fingerprint in seen_fingerprints:
+                    continue
+                if fingerprint:
+                    seen_fingerprints.add(fingerprint)
+                
+                # Build a friendly, unique nickname from the certificate subject
+                cert_name = f"{vcenter_hostname} CA"
+                try:
+                    result = subprocess.run(
+                        ['openssl', 'x509', '-noout', '-subject'],
+                        input=cert_pem, capture_output=True, text=True
+                    )
+                    if result.returncode == 0:
+                        subject = result.stdout.strip()
+                        if 'O = ' in subject:
+                            org = subject.split('O = ')[1].split(',')[0].strip()
+                            # Strip surrounding quotes that openssl may include
+                            org = org.strip('"')
+                            cert_name = f"{org} CA"
+                except Exception:
+                    pass
+                
+                certificates.append((cert_name, cert_pem))
+                lsf.write_output(f'  Found certificate: {cert_name} ({os.path.basename(filename)})')
         
         if not certificates:
             lsf.write_output('ERROR: No valid CA certificates found in download')
@@ -2913,7 +3059,7 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
     This function:
     1. Authenticates to VCF Operations Manager suite-api
     2. Checks if "MaxExpiration" policy already exists
-    3. If not, creates it with expiration = 729 days from today
+    3. If not, creates it with expiration = 9999 days from today
     4. Queries all policies to find inventory assigned to other policies
     5. Reassigns MANAGEMENT to MaxExpiration (auto-unassigns from old policy)
     6. Reassigns each INSTANCE to MaxExpiration using resourceId (auto-unassigns)
