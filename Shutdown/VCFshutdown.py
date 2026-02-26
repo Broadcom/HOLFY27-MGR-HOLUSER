@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 2.1 - February 2026
+# Version 2.2 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 2.2 Changes:
+# - Fixed ESA vs OSA detection: SSH-based check ('esxcli vsan cluster get')
+#   fails when SSH is not enabled on ESXi hosts at shutdown time, causing
+#   false OSA detection and an unnecessary 45-minute elevator wait.
+#   Now uses PyVmomi API (host.config.vsanHostConfig.vsanEsaEnabled) as the
+#   primary detection method, with SSH as fallback. The API check uses the
+#   direct ESXi connections already established in Phase 17b.
 #
 # v 2.1 Changes:
 # - Fixed --phase parameter: previously validated and logged the phase but
@@ -152,7 +160,7 @@ NSX VM Domain Detection:
 vSAN Architecture Detection:
 - OSA (Original Storage Architecture): Requires plogRunElevator and 45-minute wait
 - ESA (Express Storage Architecture): Does NOT use plog, elevator wait is skipped
-- Detection is automatic via vsish path check on first ESXi host
+- Detection via PyVmomi API (vsanHostConfig.vsanEsaEnabled), SSH fallback
 """
 
 import os
@@ -466,12 +474,13 @@ def check_vsan_esa(lsf, host: str, username: str, password: str) -> bool:
     vSAN ESA does NOT use the plog mechanism, so the elevator wait is not needed.
     vSAN OSA (Original Storage Architecture) DOES use plog and requires the wait.
     
-    Detection method: Use 'esxcli vsan cluster get' and check for
-    'vSAN ESA Enabled: true'. This is the authoritative detection method.
+    Detection uses two methods in order of preference:
+      1. PyVmomi API: host.config.vsanHostConfig.vsanEsaEnabled (no SSH needed)
+      2. SSH fallback: 'esxcli vsan cluster get' and parse 'vSAN ESA Enabled'
     
-    NOTE: The previous vsish-based check (looking for plogRunElevator) was
-    unreliable because the plog vsish paths still exist on ESA hosts even
-    though ESA does not use the plog mechanism.
+    The PyVmomi method is preferred because by Phase 19 (when this runs),
+    SSH may not be enabled on the ESXi hosts, while the PyVmomi sessions
+    established in Phase 17b are still active.
     
     :param lsf: lsfunctions module reference
     :param host: ESXi hostname
@@ -479,8 +488,27 @@ def check_vsan_esa(lsf, host: str, username: str, password: str) -> bool:
     :param password: ESXi password
     :return: True if ESA is detected, False if OSA (or unable to determine)
     """
+    # Method 1: PyVmomi API (preferred - no SSH dependency)
+    try:
+        host_system = lsf.get_host(host)
+        if host_system is not None:
+            vsan_config = getattr(host_system.config, 'vsanHostConfig', None)
+            if vsan_config is not None:
+                esa_enabled = getattr(vsan_config, 'vsanEsaEnabled', None)
+                if esa_enabled is not None:
+                    if esa_enabled:
+                        vcf_write(lsf, f'{host}: vSAN ESA Enabled = true (via API)')
+                    else:
+                        vcf_write(lsf, f'{host}: vSAN ESA Enabled = false / OSA (via API)')
+                    return esa_enabled
+            vcf_write(lsf, f'{host}: vsanEsaEnabled not available via API, trying SSH')
+    except Exception as e:
+        vcf_write(lsf, f'{host}: API-based ESA check failed ({e}), trying SSH')
+
+    # Method 2: SSH fallback
     if not lsf.test_tcp_port(host, 22, timeout=5):
-        vcf_write(lsf, f'{host} SSH port not reachable for ESA check')
+        vcf_write(lsf, f'{host}: SSH port not reachable for ESA check')
+        vcf_write(lsf, f'{host}: Unable to determine vSAN architecture via API or SSH')
         return False
     
     try:
@@ -495,10 +523,10 @@ def check_vsan_esa(lsf, host: str, username: str, password: str) -> bool:
             for line in output.splitlines():
                 if 'vSAN ESA Enabled' in line:
                     if 'true' in line.lower():
-                        vcf_write(lsf, f'{host}: vSAN ESA Enabled = true')
+                        vcf_write(lsf, f'{host}: vSAN ESA Enabled = true (via SSH)')
                         return True
                     else:
-                        vcf_write(lsf, f'{host}: vSAN ESA Enabled = false (OSA)')
+                        vcf_write(lsf, f'{host}: vSAN ESA Enabled = false / OSA (via SSH)')
                         return False
             
             vcf_write(lsf, f'{host}: vSAN ESA field not found in cluster info (assuming OSA)')
