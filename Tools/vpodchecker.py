@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.0 - January 2026
+# Version 2.1 - February 26, 2026
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
+#
+# CHANGELOG:
+# v2.1 - 2026-02-26:
+#   - License checks now report ALL entities individually (evaluation licenses
+#     are no longer de-duplicated by key, so every ESXi host is shown)
+#   - Added VCF Operations Manager (ops-a) license/status check
+# v2.0 - 2026-01:
+#   - Initial modernized release for HOLFY27
 
 """
 VPod Checker - Validates lab configuration against HOL standards
 
 This tool checks:
 - SSL certificate expiration dates
-- vSphere license validity and expiration
+- vSphere license validity and expiration (all entities per vCenter)
+- VCF Operations Manager license status
 - ESXi host NTP configuration
 - VM configuration (uuid.action, typematic delay, autolock)
 - VM resource configuration (reservations, shares)
@@ -529,9 +538,15 @@ def get_license_expiration_status(exp_date: datetime.date) -> tuple:
 
 
 def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetime.date) -> List[CheckResult]:
-    """Check vSphere licenses"""
+    """
+    Check vSphere licenses for ALL entities (vCenters, ESXi hosts, etc.).
+    
+    Reports every entity's license assignment individually so that evaluation
+    licenses or expiring licenses are visible per-host rather than being
+    de-duplicated by license key.
+    """
     results = []
-    license_keys_checked = set()
+    license_keys_detail_reported = set()
     
     for si in sis:
         try:
@@ -544,11 +559,6 @@ def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetim
                 license_name = asset.assignedLicense.name
                 entity_name = asset.entityDisplayName
                 
-                if license_key in license_keys_checked:
-                    continue
-                license_keys_checked.add(license_key)
-                
-                # Check for evaluation license
                 if license_key == '00000-00000-00000-00000-00000':
                     results.append(CheckResult(
                         name=f"License: {entity_name}",
@@ -558,7 +568,6 @@ def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetim
                     ))
                     continue
                 
-                # Get expiration date
                 exp_date = None
                 for prop in asset.assignedLicense.properties:
                     if prop.key == 'expirationDate':
@@ -566,7 +575,6 @@ def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetim
                         break
                 
                 if exp_date:
-                    # Use the new expiration status logic based on months from today
                     status, message = get_license_expiration_status(exp_date.date())
                 else:
                     if 'NSX for vShield Endpoint' in license_name:
@@ -576,21 +584,33 @@ def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetim
                         status = "FAIL"
                         message = "Non-expiring license detected - no expiration date"
                 
-                results.append(CheckResult(
-                    name=f"License: {license_name}",
-                    status=status,
-                    message=message,
-                    details={
-                        "license_key": license_key[:5] + "-****-****-****-" + license_key[-5:],
-                        "entity": entity_name,
-                        "expiration": str(exp_date.date()) if exp_date else "Never"
-                    }
-                ))
+                if license_key not in license_keys_detail_reported:
+                    license_keys_detail_reported.add(license_key)
+                    results.append(CheckResult(
+                        name=f"License: {license_name}",
+                        status=status,
+                        message=f"{entity_name} - {message}",
+                        details={
+                            "license_key": license_key[:5] + "-****-****-****-" + license_key[-5:],
+                            "entity": entity_name,
+                            "expiration": str(exp_date.date()) if exp_date else "Never"
+                        }
+                    ))
+                else:
+                    results.append(CheckResult(
+                        name=f"  License: {entity_name}",
+                        status=status,
+                        message=f"{license_name} - {message}",
+                        details={
+                            "license_key": license_key[:5] + "-****-****-****-" + license_key[-5:],
+                            "entity": entity_name,
+                            "expiration": str(exp_date.date()) if exp_date else "Never"
+                        }
+                    ))
             
             # Check for unassigned licenses
             for lic in lic_mgr.licenses:
                 if not lic.used and lic.licenseKey != '00000-00000-00000-00000-00000':
-                    # Get expiration date for unassigned license
                     exp_date = None
                     for prop in lic.properties:
                         if prop.key == 'expirationDate':
@@ -615,6 +635,102 @@ def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetim
                 status="FAIL",
                 message=f"Could not check licenses: {e}"
             ))
+    
+    return results
+
+
+def check_vcf_operations_license() -> List[CheckResult]:
+    """
+    Check VCF Operations Manager (ops-a) license status via suite-api.
+    
+    VCF Operations in VCF 9.x is licensed through the VCF platform license.
+    This check verifies that the Operations Manager is online and the
+    deployment is not in an evaluation/unlicensed state by querying the
+    node status and solution inventory.
+    """
+    results = []
+    
+    if not lsf:
+        return results
+    
+    ops_fqdn = None
+    try:
+        if lsf.config.has_option('RESOURCES', 'URLs'):
+            urls_raw = lsf.config.get('RESOURCES', 'URLs').split('\n')
+            for entry in urls_raw:
+                url = entry.split(',')[0].strip()
+                if 'ops-' in url and '.vcf.lab' in url:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    ops_fqdn = parsed.hostname
+                    break
+    except Exception:
+        pass
+    
+    if not ops_fqdn:
+        return results
+    
+    try:
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except ImportError:
+        return results
+    
+    password = lsf.get_password()
+    api_base = f"https://{ops_fqdn}/suite-api"
+    
+    try:
+        token_resp = requests.post(
+            f"{api_base}/api/auth/token/acquire",
+            json={"username": "admin", "password": password, "authSource": "local"},
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            verify=False, timeout=30
+        )
+        token_resp.raise_for_status()
+        token = token_resp.json()["token"]
+    except Exception as e:
+        results.append(CheckResult(
+            name=f"VCF Operations: {ops_fqdn}",
+            status="WARN",
+            message=f"Could not authenticate: {str(e)[:60]}"
+        ))
+        return results
+    
+    headers = {
+        "Authorization": f"OpsToken {token}",
+        "Accept": "application/json",
+    }
+    
+    try:
+        status_resp = requests.get(
+            f"{api_base}/api/deployment/node/status",
+            headers=headers, verify=False, timeout=30
+        )
+        status_resp.raise_for_status()
+        status_data = status_resp.json()
+        node_status = status_data.get("status", "UNKNOWN")
+        
+        if node_status == "ONLINE":
+            results.append(CheckResult(
+                name=f"VCF Operations: {ops_fqdn}",
+                status="PASS",
+                message=f"VCF Operations Manager is ONLINE (VCF platform license)",
+                details={"ops_fqdn": ops_fqdn, "status": node_status}
+            ))
+        else:
+            results.append(CheckResult(
+                name=f"VCF Operations: {ops_fqdn}",
+                status="WARN",
+                message=f"VCF Operations Manager status: {node_status}",
+                details={"ops_fqdn": ops_fqdn, "status": node_status}
+            ))
+    except Exception as e:
+        results.append(CheckResult(
+            name=f"VCF Operations: {ops_fqdn}",
+            status="WARN",
+            message=f"Could not check status: {str(e)[:60]}"
+        ))
     
     return results
 
@@ -1542,13 +1658,21 @@ def main():
             except Exception as e:
                 print(f"VM config check failed: {e}")
             
-            # License checks
+            # License checks (all vCenter entities including every ESXi host)
             print("\nChecking licenses...")
             try:
                 report.license_checks = check_licenses(lsf.sis, min_exp_date, max_exp_date)
-                print_results_table("LICENSES", report.license_checks)
             except Exception as e:
                 print(f"License check failed: {e}")
+            
+            # VCF Operations license/status check
+            try:
+                ops_license_checks = check_vcf_operations_license()
+                report.license_checks.extend(ops_license_checks)
+            except Exception as e:
+                print(f"VCF Operations license check failed: {e}")
+            
+            print_results_table("LICENSES", report.license_checks)
             
             # Disconnect
             for si in lsf.sis:

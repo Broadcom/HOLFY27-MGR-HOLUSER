@@ -488,21 +488,26 @@ class StatusDashboard:
         elapsed = self._get_elapsed_time()
         
         # Determine overall status
-        if self.failed:
+        has_failed_tasks = any(
+            t.status == TaskStatus.FAILED
+            for g in self.groups.values()
+            for t in g.tasks
+        )
+        
+        if self.failed or has_failed_tasks:
             overall_status = "FAILED"
             status_color = "#ef4444"
         elif progress >= 100:
             overall_status = "READY"
             status_color = "#22c55e"
         else:
-            # Check if any task is currently running or has completed
             has_running = any(
                 t.status == TaskStatus.RUNNING 
                 for g in self.groups.values() 
                 for t in g.tasks
             )
             has_completed = any(
-                t.status in [TaskStatus.COMPLETE, TaskStatus.FAILED, TaskStatus.SKIPPED]
+                t.status in [TaskStatus.COMPLETE, TaskStatus.SKIPPED]
                 for g in self.groups.values() 
                 for t in g.tasks
             )

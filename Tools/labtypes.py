@@ -268,7 +268,7 @@ class LabTypeLoader:
         lsf.write_output(f'Starting {self.labtype} startup sequence: {sequence}')
         
         # Define which modules are critical (failure should stop the sequence)
-        critical_modules = ['prelim', 'ESXi', 'VCF', 'VCFfinal']
+        critical_modules = ['prelim', 'ESXi', 'VCF', 'VCFfinal', 'urls', 'services']
         
         for module_name in sequence:
             module_path = self.get_module_path(module_name)

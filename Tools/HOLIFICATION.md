@@ -1,10 +1,14 @@
 # HOLification Guide
 
-Version 2.0 - January 2026
+Version 2.1 - February 26, 2026
 
-This document describes the complete HOLification process for preparing vApp templates for VMware Hands-on Labs. It covers both automated steps (handled by `confighol-9.0.py`) and manual steps that cannot be automated.
+This document describes the complete HOLification process for preparing vApp templates for VMware Hands-on Labs. It covers the automated steps handled by the confighol scripts.
 
-> **Script Naming Convention:** The confighol script is named according to the VCF version it was developed and tested against. The current version `confighol-9.0.py` is written and tested for VCF 9.0.1. Future VCF versions may require a new script (e.g., `confighol-9.1.py` for VCF 9.1.x).
+> **Changelog:**
+> - **v2.1 (2026-02-26):** NSX Edge SSH automated via Guest Operations; Operations VM SSH automated via Guest Operations; SDDC Manager password rotation recovery for NSX; license checks expanded to all ESXi hosts and VCF Operations; updated procedures to remove manual Edge SSH steps.
+> - **v2.0 (2026-01):** Initial version.
+
+> **Script Naming Convention:** The confighol script is named according to the VCF version it was developed and tested against. The current version `confighol-9.1.py` is written and tested for VCF 9.1.x.
 
 ---
 
@@ -12,11 +16,10 @@ This document describes the complete HOLification process for preparing vApp tem
 
 - [Overview](#overview)
 - [Prerequisites](#prerequisites)
-- [Automated Steps (confighol-9.0.py)](#automated-steps-confighol-90py)
+- [Automated Steps (confighol-9.1.py)](#automated-steps-confighol-91py)
 - [Manual Steps Required](#manual-steps-required)
   - [Enable SSH on NSX Managers](#enable-ssh-on-nsx-managers)
-  - [Enable SSH on NSX Edges](#enable-ssh-on-nsx-edges)
-- [Why Some Steps Cannot Be Automated](#why-some-steps-cannot-be-automated)
+- [How NSX Edge and Operations VM SSH Is Automated](#how-nsx-edge-and-operations-vm-ssh-is-automated)
 - [Complete HOLification Procedure](#complete-holification-procedure)
 - [Troubleshooting](#troubleshooting)
 
@@ -24,7 +27,7 @@ This document describes the complete HOLification process for preparing vApp tem
 
 ## Overview
 
-The HOL team leverages the Holodeck factory build process (documented elsewhere) and adjusts ("HOLifies") the deliverable for HOL use. The `confighol-9.0.py` script automates as much of this process as possible, while some operations require manual intervention due to security architecture constraints.
+The HOL team leverages the Holodeck factory build process (documented elsewhere) and adjusts ("HOLifies") the deliverable for HOL use. The `confighol-9.1.py` script automates as much of this process as possible. NSX Edge and Operations VM SSH enablement - previously a manual task - is now fully automated via vSphere Guest Operations.
 
 ### What Gets Configured
 
@@ -32,10 +35,10 @@ The HOL team leverages the Holodeck factory build process (documented elsewhere)
 | ----------- | --------------- | ------------ |
 | ESXi Hosts | SSH enabled, auto-start, passwordless auth, password expiration | ✅ Yes |
 | vCenters | Shell enabled, MOB, password policies, DRS/HA settings | ✅ Yes |
-| NSX Managers | SSH enabled, start-on-boot, passwordless auth, password expiration | ⚠️ Partial |
-| NSX Edges | SSH enabled, start-on-boot, passwordless auth, password expiration | ❌ No (Manual) |
+| NSX Managers | SSH enabled, start-on-boot, passwordless auth, password expiration, SDDC rotated password recovery | ⚠️ Partial |
+| NSX Edges | SSH enabled (via Guest Ops), start-on-boot, passwordless auth, password expiration | ✅ Yes |
 | SDDC Manager | SSH keys, password expiration | ✅ Yes |
-| Operations VMs | SSH keys, password expiration | ✅ Yes |
+| Operations VMs | SSH enabled (via Guest Ops), SSH keys, password expiration | ✅ Yes |
 
 ---
 
@@ -60,9 +63,9 @@ Before beginning HOLification:
 
 ---
 
-## Automated Steps (confighol-9.0.py)
+## Automated Steps (confighol-9.1.py)
 
-The following operations are fully automated by running `confighol-9.0.py`:
+The following operations are fully automated by running `confighol-9.1.py`:
 
 ### ESXi Host Configuration
 
@@ -89,6 +92,14 @@ The following operations are fully automated by running `confighol-9.0.py`:
 - Configure SSH to start on boot (via SSH after manual enable)
 - Copy authorized_keys for passwordless access
 - Remove password expiration for admin, root, audit users
+- Automatically recover rotated root passwords from SDDC Manager
+
+### NSX Edge Configuration (Fully Automated)
+
+- Enable SSH via vSphere Guest Operations API (`systemctl enable/start sshd`)
+- Configure SSH to start on boot
+- Copy authorized_keys for passwordless access
+- Remove password expiration for admin, root, audit users
 
 ### SDDC Manager Configuration
 
@@ -97,6 +108,7 @@ The following operations are fully automated by running `confighol-9.0.py`:
 
 ### Operations VMs Configuration
 
+- Enable SSH via vSphere Guest Operations API (if not already running)
 - Set non-expiring password for root
 - Configure SSH authorized_keys
 
@@ -109,11 +121,11 @@ The following operations are fully automated by running `confighol-9.0.py`:
 
 ## Manual Steps Required
 
-The following steps **must be performed manually** before `confighol-9.0.py` can complete NSX configuration:
+The following steps **must be performed manually** before `confighol-9.1.py` can complete NSX Manager configuration:
 
 ### Enable SSH on NSX Managers
 
-SSH must be enabled manually on each NSX Manager via the vSphere Remote Console before `confighol-9.0.py` can configure it further.
+SSH must be enabled manually on each NSX Manager via the vSphere Remote Console before `confighol-9.1.py` can configure it further. NSX Managers require an initial SSH enable via the console; the script then configures start-on-boot and passwordless access.
 
 **Applies to:**
 
@@ -138,113 +150,66 @@ SSH must be enabled manually on each NSX Manager via the vSphere Remote Console 
 
 4. **Enable SSH service:**
 
-   ```bash
-   start service ssh
-   set service ssh start-on-boot
-   get service ssh
-   ```
+```bash
+start service ssh
+set service ssh start-on-boot
+get service ssh
+```
 
 5. **Verify output shows:**
 
-   ```bash
-   Service name: ssh
-   Service state: running
-   Start on boot: True
-   ```
+```bash
+Service name: ssh
+Service state: running
+Start on boot: True
+```
 
 6. **Close the Remote Console and Firefox**
 
 7. **Repeat for all NSX Managers** (nsx-mgmt-01a, nsx-wld-01a, etc.)
 
----
-
-### Enable SSH on NSX Edges
-
-SSH must be enabled manually on each NSX Edge via the vSphere Remote Console. The NSX-T API cannot be used to enable SSH on Edge nodes remotely.
-
-**Applies to:**
-
-- `edge-wld01-01a`
-- `edge-wld01-02a`
-- All additional Edge nodes for each Workload Domain
-- Repeat for Site B if applicable
-
-**Procedure for edge-wld01-01a:**
-
-1. **Launch Firefox Browser** on the console
-
-2. **Connect to Workload vCenter:**
-   - Bookmarks Toolbar → Region A → vc-wld01-a Client
-   - Login: `administrator@wld.sso`
-   - Password: `[check in creds.txt]` (or lab password)
-
-3. **Open Remote Console to NSX Edge:**
-   - Menu → Inventory → vc-wld01-a.site-a.vcf.lab
-   - Navigate: dc-a → cluster-wld01-01a
-   - Find the VCF-edge resource pool (may have a long name like `VCF-edge_edgecl-wkld-a_ResourcePool_...`)
-   - Right-click `edge-wld01-01a` → Launch Remote Console
-   - Login: `admin` / `[check in creds.txt]`
-
-4. **Enable SSH service:**
-
-   ```bash
-   start service ssh
-   set service ssh start-on-boot
-   get service ssh
-   ```
-
-5. **Verify output shows:**
-
-   ```bash
-   Service name: ssh
-   Service state: running
-   Start on boot: True
-   ```
-
-6. **Close the Remote Console and Firefox**
-
-7. **Repeat for edge-wld01-02a and all other Edge nodes**
+> **Note:** NSX Edges no longer require manual SSH enablement. The script enables SSH on Edges automatically via vSphere Guest Operations.
 
 ---
 
-## Why Some Steps Cannot Be Automated
+## How NSX Edge and Operations VM SSH Is Automated
 
-### NSX Edge SSH Configuration
+### vSphere Guest Operations API
 
-The NSX-T REST API has limited scope for SSH service management:
+The `confighol-9.1.py` script uses the vSphere Guest Operations Manager API to run commands inside VMs via VMware Tools, without needing SSH access first. This solves the chicken-and-egg problem where SSH must be enabled before SSH can be used to enable SSH on boot.
 
-| Operation | API Support | Reason |
-| ----------- | ------------- | -------- |
-| Start SSH on Manager | ✅ Available | `/api/v1/node/services/ssh?action=start` |
-| Set start-on-boot | ❌ Not Available | CLI-only: `set service ssh start-on-boot` |
-| Configure Edge SSH | ❌ Not Available | Edge nodes don't expose the appliance API |
+**How it works:**
 
-**Technical Details:**
+1. The script connects to the vCenter that manages the target VM
+2. Locates the VM by name in the vCenter inventory
+3. Authenticates to the guest OS via VMware Tools (using root credentials)
+4. Runs `systemctl enable sshd` and `systemctl start sshd` inside the VM
+5. Waits for SSH port 22 to become available
+6. Proceeds with the remaining configuration (authorized_keys, password expiration)
 
-1. **NSX Edges don't expose the `/api/v1/node/` endpoints**
-   - The appliance management API (`/api/v1/node/services/ssh`) is only available on NSX Manager appliances
-   - Edge nodes are managed through the Manager but don't have their own REST API for service control
+**Requirements:**
 
-2. **Start-on-boot requires CLI access**
-   - The `set service ssh start-on-boot` command can only be run via the NSX CLI
-   - This requires SSH access, creating a chicken-and-egg problem: you need SSH to enable SSH on boot
-   - The only way to initially enable SSH is via the console
+- VMware Tools must be running in the target VM (verified automatically)
+- Root credentials must be valid for the guest OS
+- The VM must be powered on
 
-3. **Security by design**
-   - NSX is designed so that SSH is disabled by default for security
-   - Enabling it requires physical/console access as a security boundary
-   - This prevents remote attackers from enabling SSH even with API credentials
+### Previously Considered Alternatives (Now Superseded)
 
-### Alternative Approaches Considered
+| Approach | Previous Status | Current Status |
+| ---------- | -------- | -------- |
+| vSphere Guest Operations API (VM Tools) | "Not available" | ✅ Works on both NSX Edges and Operations VMs |
+| Serial console automation | Too fragile | Not needed |
+| Custom NSX plugin | Would require engineering support | Not needed |
+| Pre-built images with SSH enabled | Would require factory changes | Not needed |
 
-| Approach | Result |
-| ---------- | -------- |
-| vSphere Guest Operations API (VM Tools) | Not available - NSX appliances don't support guest operations |
-| Serial console automation | Too fragile and environment-dependent |
-| Custom NSX plugin | Would require VMware engineering support |
-| Pre-built images with SSH enabled | Would require changes to Holodeck factory |
+### SDDC Manager Password Rotation Recovery
 
-**Conclusion:** The manual console steps for NSX Edges are required by NSX's security architecture and cannot be bypassed.
+SDDC Manager may rotate the root password on NSX components during credential management operations. When this happens, the standard lab password no longer works for root SSH. The `confighol-9.1.py` script now handles this automatically:
+
+1. Detects root SSH authentication failure with the standard password
+2. Queries the SDDC Manager credentials API for the actual current password
+3. Resets the root password back to the standard lab password via the NSX API
+4. Updates the SDDC Manager credential record to match
 
 ---
 
@@ -258,49 +223,60 @@ Follow these steps in order for complete HOLification:
 2. Verify `/hol/vPod.txt` is set correctly
 3. Verify `/tmp/config.ini` is accurate
 
-### Step 2: Enable SSH on NSX Components (Manual)
+### Step 2: Enable SSH on NSX Managers (Manual)
 
 1. Enable SSH on all NSX Managers (see procedure above)
-2. Enable SSH on all NSX Edges (see procedure above)
-3. Verify SSH is working:
+2. Verify SSH is working:
 
-   ```bash
-   ssh admin@nsx-mgmt-01a.site-a.vcf.lab
-   ssh admin@edge-wld01-01a.site-a.vcf.lab
-   ```
+```bash
+ssh admin@nsx-mgmt-01a.site-a.vcf.lab
+```
 
-### Step 3: Run confighol-9.0.py (Automated)
+> **Note:** NSX Edge SSH is now handled automatically by the script in Step 3.
+
+### Step 3: Run confighol-9.1.py (Automated)
 
 ```bash
 cd ~/hol/Tools
-python3 confighol-9.0.py
+python3 confighol-9.1.py
 ```
 
 The script will:
 
 - Configure all ESXi hosts
 - Configure all vCenters (with interactive prompts for shell configuration)
-- Configure NSX components (with interactive prompts to confirm SSH is enabled)
+- Configure NSX Managers (with interactive prompts to confirm SSH is enabled)
+- Configure NSX Edges (SSH enabled automatically via Guest Operations)
 - Configure SDDC Manager
-- Configure Operations VMs
+- Configure VCF Automation VMs
+- Configure Operations VMs (SSH enabled automatically via Guest Operations)
+- Disable SDDC Manager auto-rotate policies
+- Configure VCF Operations Fleet Password Policy
 - Perform final cleanup
 
 ### Step 4: Verify Configuration
 
 1. Verify passwordless SSH to all ESXi hosts:
 
-   ```bash
-   ssh root@esx-01a.site-a.vcf.lab hostname
-   ```
+```bash
+ssh root@esx-01a.site-a.vcf.lab hostname
+```
 
 2. Verify vCenter MOB is accessible:
    - Browse to `https://vc-mgmt-a.site-a.vcf.lab/mob`
 
 3. Verify NSX SSH works:
 
-   ```bash
-   ssh admin@nsx-mgmt-01a.site-a.vcf.lab
-   ```
+```bash
+ssh admin@nsx-mgmt-01a.site-a.vcf.lab
+ssh root@edge-wld01-01a.site-a.vcf.lab hostname
+```
+
+4. Verify Operations VM SSH works:
+
+```bash
+ssh root@ops-a.site-a.vcf.lab hostname
+```
 
 ### Step 5: Site B (If Applicable)
 
@@ -323,12 +299,32 @@ Repeat Steps 2-4 for Site B / Region B components.
 
 ### NSX API Returns 401 Unauthorized
 
-**Symptom:** `confighol-9.0.py` fails with authentication errors for NSX
+**Symptom:** `confighol-9.1.py` fails with authentication errors for NSX
 
 **Solution:** Verify credentials:
 
 - Default user: `admin`
 - Verify password matches lab password in `/home/holuser/creds.txt`
+
+### NSX Root Password Rotated by SDDC Manager
+
+**Symptom:** Root SSH to NSX Manager/Edge fails with "Permission denied" even though the password is correct for admin.
+
+**Solution:** SDDC Manager may have rotated the root password. The `confighol-9.1.py` script handles this automatically by querying SDDC Manager for the actual password and resetting it. If manual recovery is needed:
+
+1. Query SDDC Manager credentials API for the current root password
+2. Reset via NSX API: `PUT /api/v1/node/users/0` with old and new password
+3. Update SDDC Manager credential record: `PATCH /v1/credentials`
+
+### Guest Operations Fails on NSX Edge
+
+**Symptom:** "Invalid guest credentials" or "Guest operations unavailable" when enabling Edge SSH
+
+**Solution:**
+
+1. Verify the Edge VM is powered on and VMware Tools is running
+2. Check if root password has been rotated (see above)
+3. As a fallback, enable SSH manually via vSphere Remote Console (login as admin, run `start service ssh` and `set service ssh start-on-boot`)
 
 ### vCenter Shell Already Changed Error
 
