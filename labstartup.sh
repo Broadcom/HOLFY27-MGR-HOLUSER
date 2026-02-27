@@ -135,9 +135,30 @@ use_local_holodeck_ini() {
     return 1  # No config found anywhere
 }
 
+git_repo_exists() {
+    # Validate that a remote git repository exists and is accessible.
+    # Uses a 15-second timeout to prevent hangs when the repo requires auth.
+    # Returns 0 if the repo exists, 1 otherwise.
+    local repo_url="$1"
+    if timeout 15 env GIT_TERMINAL_PROMPT=0 git ls-remote "$repo_url" > /dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 git_pull() {
     cd "$1" || exit
     ctr=0
+
+    # Validate the remote repo exists before attempting pull
+    log_msg "Validating remote repository: ${gitproject}" "${logfile}"
+    if ! git_repo_exists "$gitproject"; then
+        log_msg "Remote repository not found or not accessible: ${gitproject}" "${logfile}"
+        log_msg "Will attempt LabStartup with existing code." "${logfile}"
+        return 1
+    fi
+
     # stash uncommitted changes if not running in HOL-Dev
     if [ "$branch" = "main" ]; then
         log_msg "git stash local changes for prod." "${logfile}"
@@ -151,7 +172,7 @@ git_pull() {
             break
         fi
         git checkout $branch >> ${logfile} 2>&1
-        if GIT_TERMINAL_PROMPT=0 git pull origin $branch >> ${logfile} 2>&1; then
+        if timeout 30 env GIT_TERMINAL_PROMPT=0 git pull origin $branch >> ${logfile} 2>&1; then
             break
         else
             if grep -q 'could not be found' ${logfile}; then
@@ -185,8 +206,7 @@ git_clone() {
             fi
         fi
         log_msg "Performing git clone for repo ${vpodgit}" "${logfile}"
-        # Confirm that $gitproject url is valid
-        if ! GIT_TERMINAL_PROMPT=0 git ls-remote "$gitproject" > /dev/null 2>&1; then
+        if ! git_repo_exists "$gitproject"; then
             log_msg "Git repository does not exist: ${gitproject}" "${logfile}"
             if is_hol_sku "$vPod_SKU"; then
                 log_msg "HOL SKU requires git repo. Failing vpod." "${logfile}"
@@ -198,7 +218,7 @@ git_clone() {
             fi
         fi
         log_msg "git clone -b $branch $gitproject $vpodgitdir" "${logfile}"
-        if GIT_TERMINAL_PROMPT=0 git clone -b $branch "$gitproject" "$vpodgitdir" >> ${logfile} 2>&1; then
+        if timeout 120 env GIT_TERMINAL_PROMPT=0 git clone -b $branch "$gitproject" "$vpodgitdir" >> ${logfile} 2>&1; then
             return 0  # Success
         else
             # Check for permanent failures (repo not found)
@@ -335,12 +355,19 @@ clone_or_pull_labtype_overrides() {
     
     log_msg "Checking for ${labtype} team override repo..." "${logfile}"
     
+    # Validate the remote repo exists before attempting any git operations
+    if ! git_repo_exists "$labtype_repo_url"; then
+        log_warn "${labtype} override repo not found or not accessible: ${labtype_repo_url}" "${logfile}"
+        log_warn "${labtype} overrides not available - using core defaults" "${logfile}"
+        return 0
+    fi
+    
     if [ -d "${labtype_dir}/.git" ]; then
         # Repo already cloned - pull latest
         log_msg "Pulling latest ${labtype} overrides from ${labtype_repo_url}" "${logfile}"
         cd "${labtype_dir}" || return 1
         git checkout ${branch} >> ${logfile} 2>&1
-        if GIT_TERMINAL_PROMPT=0 git pull origin ${branch} >> ${logfile} 2>&1; then
+        if timeout 30 env GIT_TERMINAL_PROMPT=0 git pull origin ${branch} >> ${logfile} 2>&1; then
             log_msg "${labtype} overrides updated successfully" "${logfile}"
         else
             log_warn "${labtype} override pull failed - using existing content" "${logfile}"
@@ -349,11 +376,10 @@ clone_or_pull_labtype_overrides() {
     else
         # First boot - clone the repo
         log_msg "Cloning ${labtype} overrides from ${labtype_repo_url}" "${logfile}"
-        if GIT_TERMINAL_PROMPT=0 git clone -b ${branch} "${labtype_repo_url}" "${labtype_dir}" >> ${logfile} 2>&1; then
+        if timeout 120 env GIT_TERMINAL_PROMPT=0 git clone -b ${branch} "${labtype_repo_url}" "${labtype_dir}" >> ${logfile} 2>&1; then
             log_msg "${labtype} overrides cloned successfully" "${logfile}"
         else
             log_warn "${labtype} override clone failed - ${labtype} overrides not available" "${logfile}"
-            # Not fatal - the system will use core defaults
         fi
     fi
     
@@ -805,9 +831,13 @@ else
         fi
     else
         log_msg "Performing git pull for repo ${vpodgit}" "${logfile}"
-        git_pull "$vpodgitdir"
-        git_success=true
-        log_msg "${vPod_SKU} git pull completed." "${logfile}"
+        if git_pull "$vpodgitdir"; then
+            git_success=true
+            log_msg "${vPod_SKU} git pull completed." "${logfile}"
+        else
+            log_msg "Git pull failed for ${vPod_SKU} (repo not found or not accessible)." "${logfile}"
+            git_success=true  # Local clone exists; proceed with existing code
+        fi
     fi
 fi
 
