@@ -1,0 +1,73 @@
+---
+alwaysApply: true
+---
+# VCF 9 API Guidance and Troubleshooting
+
+This skill provides guidance and automation patterns for interacting with VCF 9.0 and 9.1 APIs, based on extensive troubleshooting and exploration.
+
+## Core API Principles
+
+1.  **SDDC Manager**: Use Basic Auth with `vcf` user. Check `/v1/credentials` for rotated passwords.
+2.  **VCF Operations (Aria)**: Use `OpsToken` with `X-vRealizeOps-API-use-unsupported: true` header for internal endpoints.
+3.  **NSX Manager**: Use numeric IDs for user management (`0`=root, `10000`=admin).
+4.  **NSX Edges**: Manage via NSX Manager Transport Node API (`/api/v1/transport-nodes/{id}/node/...`).
+
+## Common API Snippets
+
+### Get OpsToken (VCF Operations)
+```python
+import requests
+url = "https://ops-a.site-a.vcf.lab/suite-api/api/auth/token/acquire"
+payload = {"username": "admin", "password": "...", "authSource": "localItem"}
+headers = {"X-vRealizeOps-API-use-unsupported": "true"}
+response = requests.post(url, json=payload, headers=headers)
+token = response.json()["token"]
+```
+
+### Enable SSH on NSX Edge
+```python
+# POST /api/v1/transport-nodes/{node_id}/node/services/ssh?action=start
+```
+
+### Set NSX Password Expiration (9.1)
+```python
+# Use the API, as CLI may reset to 0
+# PUT /api/v1/node/users/10000
+# Body: {"password_change_frequency": 729}
+```
+
+## VCF Services Runtime (VSP Cluster) Patterns
+
+### Component CRDs Are Cluster-Scoped
+*   `components.api.vmsp.vmware.com` is **NOT namespaced** (`NAMESPACED=false`).
+*   Do NOT use `-A` flag (produces `<none>` namespace columns).
+*   Do NOT use `-n` flag on get/annotate (silently fails).
+*   Correct: `kubectl annotate components.api.vmsp.vmware.com salt component.vmsp.vmware.com/operational-status=Running --overwrite`
+
+### SSH Escaping with kubectl
+*   `lsf.ssh()` wraps commands in double quotes: `sshpass -p pw ssh target "cmd"`.
+*   Combined with `bash -c '...'`, dotted annotation keys in `custom-columns`/`jsonpath` get mangled through 4 escaping layers.
+*   **Fix**: Use `-o json` and parse the JSON locally in Python (`json.loads()`). Strip SSH banner by finding first `{` in stdout.
+
+### Graceful Shutdown/Startup
+*   **Shutdown**: `python3 hol/Shutdown/Shutdown.py --phase 2b` (scales down components, suspends postgres, annotates CRDs NotRunning)
+*   **Startup**: `hol/Startup/VCFfinal.py` Task 2e (unsuspends postgres, scales up, annotates Running)
+*   **Config**: `/tmp/config.ini` `[VCFFINAL] vcfcomponents` (format: `namespace:resource_type/name`)
+*   Postgres suspension is two-step: label `suspended=true` AND patch Zalando `numberOfInstances` to 0.
+*   vodap ClickHouse statefulsets (`chi-*`, `chk-*`) must be scaled down separately from the operator.
+
+## Troubleshooting Patterns
+
+### Supervisor Stuck in "Configuring"
+*   **Check**: `kubectl get pods -n kube-system` on the SCP node.
+*   **Issue**: `kubectl-plugin-vsphere` (nginx) in `CrashLoopBackOff`.
+*   **Cause**: Unresolvable upstream `fleet-01a.site-a.vcf.lab` in nginx config.
+*   **Fix**: Use nginx variables in `/etc/vmware/wcp/nginx/forwarding_rules_vcf_cli.conf` to defer DNS resolution.
+
+### VCF Operations Internal API (401/403)
+*   **Issue**: `suite-api/internal/` endpoints return 401 or 403.
+*   **Fix**: Ensure `X-vRealizeOps-API-use-unsupported: true` header is present and `authSource` is `localItem`.
+
+### SDDC Manager Password Rotation
+*   **Check**: If SSH fails with standard password, check SDDC Manager for rotation.
+*   **API**: `GET /v1/credentials` to find the current rotated password.
