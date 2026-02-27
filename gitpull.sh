@@ -181,9 +181,9 @@ do_git_pull() {
         git stash >> ${LOGFILE} 2>&1
     fi
 
-    # Perform pull
+    # Perform pull with timeout to prevent hangs
     git checkout ${branch} >> ${LOGFILE} 2>&1
-    GIT_TERMINAL_PROMPT=0 git pull origin ${branch} >> ${LOGFILE} 2>&1
+    timeout 60 env GIT_TERMINAL_PROMPT=0 git pull origin ${branch} >> ${LOGFILE} 2>&1
 
     if [ $? -eq 0 ]; then
         log_message "Git pull successful"

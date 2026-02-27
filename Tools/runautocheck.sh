@@ -116,7 +116,7 @@ if [ "$GITHUB_ACCESSIBLE" == "true" ]; then
     echo "Cloning AutoCheck from GitHub: ${autorepo}" | tee -a $LOGFILE
 fi
 
-if [ "$GITHUB_ACCESSIBLE" == "true" ] && GIT_TERMINAL_PROMPT=0 git clone -b main "${autorepo}" "${autocheckdir}" > /dev/null 2>&1; then
+if [ "$GITHUB_ACCESSIBLE" == "true" ] && timeout 120 env GIT_TERMINAL_PROMPT=0 git clone -b main "${autorepo}" "${autocheckdir}" > /dev/null 2>&1; then
     echo "Successfully cloned AutoCheck repository" | tee -a $LOGFILE
     
     # Re-enable proxy filter
