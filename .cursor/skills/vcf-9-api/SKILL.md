@@ -116,12 +116,13 @@ requests.post(
 )
 ```
 
-### Inaccessible Endpoints (Do NOT attempt)
+### Inaccessible / Limited Endpoints
 
 | Path | Why |
 | --- | --- |
 | `/vcf-operations/rest/ops/internal/*` | Requires browser CSRF/Session — not proxied through suite-api |
 | `/suite-api/api/fleet-management/*` | Returns 401 — auth mechanism differs from OpsToken |
+| `/suite-api/internal/components/{id}?action=shutdown` | Returns **HTTP 500** — the suite-api proxy passes through GET/list but does NOT support shutdown actions. Use the fleet-lcm direct API instead (see section 8). |
 
 ## 3. NSX Manager API
 
@@ -356,6 +357,115 @@ spec = vim.vm.guest.ProcessManager.ProgramSpec(
 pm.StartProgramInGuest(vm, creds, spec)
 ```
 
+## 8. Fleet LCM Direct API (VCF 9.1 Component Lifecycle)
+
+The Fleet LCM service on `fleet-01a.site-a.vcf.lab` exposes the full component lifecycle API including **shutdown**, **startup**, and status queries. This is the **only** way to gracefully shut down VCF Automation (and other components) via API — the `ops-a` suite-api proxy returns HTTP 500 for action endpoints.
+
+### Authentication: JWT via VSP Identity Service
+
+Fleet LCM requires a Bearer JWT obtained through an OAuth2 **password grant** from the VSP Identity Service.
+
+**Step 1: Discover IAM client credentials from Kubernetes secret**
+
+```bash
+# SSH to VSP control plane (10.1.1.142)
+PASSWORD=$(cat /home/holuser/creds.txt)
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no vmware-system-user@10.1.1.142 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get secret vcf-iam-vcfa-admin \
+   -n vcf-fleet-lcm -o jsonpath='{.data}' 2>/dev/null"
+
+# Output: {"clientId":"<base64>","clientSecret":"<base64>"}
+# Decode: echo '<base64>' | base64 -d
+```
+
+**Step 2: Obtain JWT using password grant**
+
+```python
+import requests, base64, urllib3
+urllib3.disable_warnings()
+
+FLEET = "fleet-01a.site-a.vcf.lab"
+PASSWORD = open("/home/holuser/creds.txt").read().strip()
+
+# client_id and client_secret from Step 1 (decoded)
+basic_creds = base64.b64encode(f'{client_id}:{client_secret}'.encode()).decode()
+
+token_resp = requests.post(
+    f"https://{FLEET}/api/v1/identity/token",
+    data={'grant_type': 'password', 'username': 'admin', 'password': PASSWORD},
+    headers={
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': f'Basic {basic_creds}',
+    },
+    verify=False
+)
+jwt = token_resp.json()['access_token']
+```
+
+**Step 3: Use JWT for fleet-lcm API calls**
+
+```python
+headers = {
+    'Authorization': f'Bearer {jwt}',
+    'Accept': 'application/json',
+}
+
+# List components
+components = requests.get(
+    f"https://{FLEET}/fleet-lcm/v1/components",
+    headers=headers, verify=False
+).json()
+
+# Graceful shutdown (returns HTTP 202 with task ID)
+comp_uuid = components[0]['componentUuid']
+shutdown = requests.post(
+    f"https://{FLEET}/fleet-lcm/v1/components/{comp_uuid}",
+    params={'action': 'shutdown'},
+    headers=headers, verify=False
+)
+task_id = shutdown.json()['id']
+
+# Poll task status
+task = requests.get(
+    f"https://{FLEET}/fleet-lcm/v1/tasks/{task_id}",
+    headers=headers, verify=False
+).json()
+# status: IN_PROGRESS -> SUCCEEDED / FAILED
+```
+
+### Key Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/fleet-lcm/v1/components` | List all managed components |
+| POST | `/fleet-lcm/v1/components/{uuid}?action=shutdown` | Graceful shutdown (HTTP 202) |
+| POST | `/fleet-lcm/v1/components/{uuid}?action=startup` | Start component |
+| GET | `/fleet-lcm/v1/tasks/{taskId}` | Poll task status |
+| GET | `/api/v1/identity/.well-known/openid-configuration` | OIDC discovery |
+| POST | `/api/v1/identity/token` | OAuth2 token endpoint |
+
+### Health Check
+
+The fleet-lcm API returns **HTTP 401** (Unauthorized) when healthy but unauthenticated. For URL health checks (e.g., `lsf.test_url()`), treat 401 as healthy for `fleet-lcm/v1/` URLs.
+
+```
+https://fleet-01a.site-a.vcf.lab/fleet-lcm/v1/components  →  HTTP 401 = healthy
+```
+
+### Automation Scripts
+
+- **Shutdown**: `hol/Shutdown/fleet.py` → `shutdown_products_fleet_lcm()` (primary for VCF 9.1)
+- **Auth**: `hol/Shutdown/fleet.py` → `get_fleet_lcm_jwt()` (handles credential discovery + JWT)
+- **Orchestration**: `hol/Shutdown/VCFshutdown.py` Phase 1 tries fleet-lcm direct first, then suite-api proxy fallback, then VCF 9.0 legacy, then Phase 1b VM power-off
+
+### Component Type Mapping
+
+| Product ID | Component Type | FQDN |
+| --- | --- | --- |
+| `vra` | `VCFA` | `auto-a.site-a.vcf.lab` |
+| `vrni` | `OPERATIONS_FOR_NETWORKS` | `opsnet-a.site-a.vcf.lab` |
+| `vrli` | `OPERATIONS_FOR_LOGS` | `opslogs-a.site-a.vcf.lab` |
+
 ## Critical Pitfalls Discovered
 
 1. **NSX user IDs are numeric**: `/api/v1/node/users/admin` = 404. Use `/api/v1/node/users/10000`.
@@ -371,5 +481,10 @@ pm.StartProgramInGuest(vm, creds, spec)
 11. **VSP worker kubeconfig path differs**: Workers use `/etc/kubernetes/node-agent.conf`; only the control plane has `super-admin.conf`.
 12. **Postgres suspension is two-step**: Must set label `database.vmsp.vmware.com/suspended=true` AND patch Zalando `postgresqls.acid.zalan.do` `numberOfInstances` to 0. Both are needed for clean shutdown matching the startup unsuspend.
 13. **ClickHouse in vodap managed by operator**: The `chi-vcf-obs-*` and `chk-vcf-obs-keeper-*` statefulsets are managed by clickhouse-operator (in vmsp-metrics-store). Scaling down the operator alone does not stop ClickHouse pods — must scale the statefulsets directly.
+14. **suite-api proxy cannot shutdown components**: `POST /suite-api/internal/components/{id}?action=shutdown` returns HTTP 500. The proxy passes through GET/list operations but not lifecycle actions. Use the fleet-lcm direct API on `fleet-01a` instead (see section 8).
+15. **Fleet-lcm auth requires IAM client credentials from K8s secret**: The JWT for `fleet-01a` is obtained via OAuth2 password grant from `/api/v1/identity/token`. The client ID/secret must be read from the `vcf-iam-vcfa-admin` secret in the `vcf-fleet-lcm` namespace on the VSP control plane.
+16. **Fleet-lcm returns 401 when healthy**: Unauthenticated requests to `/fleet-lcm/v1/components` return HTTP 401, not 200. URL health checks must treat 401 as healthy for these endpoints.
+17. **Suspended Postgres causes cascading fleet-lcm CrashLoopBackOff**: If `postgresinstances.database.vmsp.vmware.com` have `database.vmsp.vmware.com/suspended=true` and `postgresqls.acid.zalan.do` have `numberOfInstances=0`, the Postgres pods never start. Fleet-lcm pods then crash with "Connection to vcf-fleet-lcm-db:5432 refused", making the VCF Management UI show "not functional". Fix by removing the label and patching numberOfInstances back to 1.
+18. **JSON parsing from SSH output requires banner stripping**: `kubectl -o json` output via SSH is prepended with Photon OS banner messages ("Welcome to Photon..."). Always find the first `{` character to isolate JSON before calling `json.loads()`. Use balanced-brace counting if the output has trailing garbage after the JSON.
 
 For detailed endpoint reference and troubleshooting, see [VCF_9x_Endpoints.md](../../Documents/git/cursor/VCF_9x_Endpoints.md).

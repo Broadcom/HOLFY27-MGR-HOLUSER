@@ -21,6 +21,8 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | Console black screen | VMware console shows black, desktop works via SSH | NoMachine EGL capture blanks framebuffer | 8 |
 | apt update hangs | Stuck at noble-backports InRelease | Broken upstream Ubuntu mirror IPs | 9 |
 | Proxy wait timeout | Lab startup stuck "Waiting for proxy" | Circular dependency between manager and router boot | 10 |
+| VCF Management not functional | Fleet LCM UI shows "not functional", HTTP 500 | Postgres instances suspended, fleet-lcm pods CrashLoopBackOff | 11 |
+| VCF Automation API shutdown fails | suite-api proxy returns HTTP 500 on shutdown action | suite-api does not proxy lifecycle actions; use fleet-lcm direct API | 12 |
 
 ---
 
@@ -383,6 +385,91 @@ squid -k reconfigure
 **Root Cause**: `gitpull.sh` tests proxy by curling GitHub through it, but squid can't reach GitHub until iptables/squid config is applied by `getrules.sh` on the router — which waits for `gitdone` from `gitpull.sh`. Circular dependency.
 
 **Fix**: The proxy check was changed from `curl -x proxy:3128 https://github.com` (wrong) to `nc -z -w3 proxy 3128` (TCP port check). Remediation at attempt 31 restarts squid on router via SSH.
+
+---
+
+## 11. VCF Management "Not Functional" (Fleet LCM Down)
+
+**Symptom**: In VCF Operations UI (`ops-a` → Build → Lifecycle), VCF Management shows "not currently functional." Direct curl to `https://fleet-01a.site-a.vcf.lab/fleet-lcm/v1/components` returns HTTP 500.
+
+**Diagnosis**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+VU='vmware-system-user'
+VSP_CP='10.1.1.142'
+
+# Check fleet-lcm pods
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get pods -n vcf-fleet-lcm --no-headers 2>/dev/null"
+# Look for: CrashLoopBackOff
+
+# Check fleet-lcm pod logs
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
+  "echo '${PASSWORD}' | sudo -S -i kubectl logs -n vcf-fleet-lcm \
+   \$(kubectl get pods -n vcf-fleet-lcm -o name | head -1) --tail=20 2>/dev/null"
+# Look for: "Connection to vcf-fleet-lcm-db.vcf-fleet-lcm:5432 refused"
+
+# Check Postgres suspension state
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get postgresinstances.database.vmsp.vmware.com \
+   -A -o json 2>/dev/null" | python3 -c "
+import json,sys
+data = json.load(sys.stdin)
+for item in data.get('items', []):
+    ns = item['metadata']['namespace']
+    name = item['metadata']['name']
+    labels = item['metadata'].get('labels', {})
+    suspended = labels.get('database.vmsp.vmware.com/suspended', 'false')
+    print(f'{ns}/{name}: suspended={suspended}')
+"
+```
+
+**Root Cause**: After a cold boot, the `VCFfinal.py` startup script may fail to unsuspend Postgres instances due to an SSH escaping bug with `kubectl custom-columns` and dotted label keys. The `database.vmsp.vmware.com/suspended=true` label persists, and the Zalando operator keeps `numberOfInstances=0`, so the Postgres pods never start. Fleet-lcm pods then crash because their database is unreachable.
+
+**Fix**:
+
+```bash
+# Unsuspend Postgres + restore numberOfInstances
+for ns in salt-raas vcf-fleet-lcm vcf-sddc-lcm vidb-external; do
+    sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
+      "echo '${PASSWORD}' | sudo -S -i kubectl label postgresinstances.database.vmsp.vmware.com \
+       --all -n ${ns} database.vmsp.vmware.com/suspended- 2>/dev/null"
+
+    sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
+      "echo '${PASSWORD}' | sudo -S -i kubectl get postgresqls.acid.zalan.do -n ${ns} \
+       -o name 2>/dev/null" | while read pg; do
+        sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
+          "echo '${PASSWORD}' | sudo -S -i kubectl patch ${pg} -n ${ns} --type=merge \
+           -p '{\"spec\":{\"numberOfInstances\":1}}' 2>/dev/null"
+    done
+done
+
+# Delete crashed pods to force restart (they'll reconnect to the now-running Postgres)
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
+  "echo '${PASSWORD}' | sudo -S -i kubectl delete pods -n vcf-fleet-lcm \
+   --field-selector=status.phase!=Running 2>/dev/null"
+```
+
+**Prevention**: The `VCFfinal.py` startup script (v4.2+) now uses `kubectl get ... -o json` parsed locally in Python instead of `custom-columns` via SSH, avoiding the escaping issue. It also has a fallback that unconditionally unsuspends known namespaces if JSON parsing fails.
+
+---
+
+## 12. VCF Automation API Shutdown Fails (HTTP 500 via suite-api)
+
+**Symptom**: `fleet.py:shutdown_products_v91()` returns HTTP 500 when calling `POST /suite-api/internal/components/{id}?action=shutdown` on `ops-a`.
+
+**Root Cause**: The VCF Operations `suite-api` internal proxy passes through GET/list requests to the fleet-lcm backend but does **not** support lifecycle action endpoints (shutdown, startup). These actions return HTTP 500.
+
+**Fix**: Use the fleet-lcm direct API on `fleet-01a.site-a.vcf.lab` instead. This requires a JWT from the VSP Identity Service — see the vcf-9-api skill, section 8 (Fleet LCM Direct API).
+
+**Implementation**: `VCFshutdown.py` (v2.4+) Phase 1 now tries the fleet-lcm direct API first, falling back to the suite-api proxy (which works for component listing but not actions), then VCF 9.0 legacy, then Phase 1b VM power-off.
+
+The key functions in `fleet.py`:
+- `get_fleet_lcm_jwt()` — handles IAM credential discovery + JWT acquisition
+- `shutdown_products_fleet_lcm()` — orchestrates component shutdown with task polling
+- `shutdown_component_fleet_lcm()` — triggers shutdown for a single component
+- `wait_for_fleet_lcm_task()` — polls task status until SUCCEEDED/FAILED/timeout
 
 ---
 

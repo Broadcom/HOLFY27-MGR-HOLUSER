@@ -11,6 +11,7 @@ This skill provides guidance and automation patterns for interacting with VCF 9.
 2.  **VCF Operations (Aria)**: Use `OpsToken` with `X-vRealizeOps-API-use-unsupported: true` header for internal endpoints.
 3.  **NSX Manager**: Use numeric IDs for user management (`0`=root, `10000`=admin).
 4.  **NSX Edges**: Manage via NSX Manager Transport Node API (`/api/v1/transport-nodes/{id}/node/...`).
+5.  **Fleet LCM (VCF 9.1)**: Use JWT Bearer token from VSP Identity Service (`fleet-01a/api/v1/identity/token`). The `ops-a` suite-api proxy does NOT support lifecycle actions (shutdown/startup) — use `fleet-01a` direct API.
 
 ## Common API Snippets
 
@@ -22,6 +23,18 @@ payload = {"username": "admin", "password": "...", "authSource": "localItem"}
 headers = {"X-vRealizeOps-API-use-unsupported": "true"}
 response = requests.post(url, json=payload, headers=headers)
 token = response.json()["token"]
+```
+
+### Get Fleet LCM JWT (VCF 9.1 Component Lifecycle)
+```python
+# 1. Get IAM credentials from K8s secret vcf-iam-vcfa-admin in vcf-fleet-lcm ns
+# 2. POST https://fleet-01a.site-a.vcf.lab/api/v1/identity/token
+#    grant_type=password, username=admin, password=<creds.txt>
+#    Authorization: Basic <base64(client_id:client_secret)>
+# 3. Use access_token as Bearer token for fleet-lcm API
+# Shutdown: POST /fleet-lcm/v1/components/{uuid}?action=shutdown -> HTTP 202
+# CRITICAL: ops-a suite-api proxy returns HTTP 500 for shutdown actions.
+#           Use fleet-01a direct API instead.
 ```
 
 ### Enable SSH on NSX Edge
@@ -71,3 +84,17 @@ token = response.json()["token"]
 ### SDDC Manager Password Rotation
 *   **Check**: If SSH fails with standard password, check SDDC Manager for rotation.
 *   **API**: `GET /v1/credentials` to find the current rotated password.
+
+### VCF Management "Not Functional" (Fleet LCM Down)
+*   **Symptom**: ops-a Build>Lifecycle shows "not functional"; `fleet-01a/fleet-lcm/v1/components` returns HTTP 500.
+*   **Cause**: Postgres instances in `vcf-fleet-lcm`, `salt-raas`, etc. are suspended (`database.vmsp.vmware.com/suspended=true` label + `numberOfInstances=0`).
+*   **Fix**: Remove `suspended` label and patch `numberOfInstances=1` on all affected namespaces, then delete crashed pods.
+*   **Prevention**: `VCFfinal.py` v4.2+ uses `-o json` parsed in Python (not `custom-columns` via SSH) to detect/remove suspended labels.
+
+### VCF Automation Shutdown via API
+*   **Issue**: `suite-api/internal/components/{id}?action=shutdown` returns HTTP 500. The proxy does NOT support lifecycle actions.
+*   **Fix**: Use fleet-lcm direct API on `fleet-01a`. Auth: OAuth2 password grant to `/api/v1/identity/token` with `vcf-iam-vcfa-admin` K8s secret credentials. Then `POST /fleet-lcm/v1/components/{uuid}?action=shutdown` (returns 202).
+*   **Scripts**: `fleet.py:shutdown_products_fleet_lcm()`, `VCFshutdown.py` Phase 1 (fleet-lcm first, suite-api fallback).
+
+### Fleet LCM URL Health Check
+*   **Behavior**: `fleet-lcm/v1/components` returns HTTP 401 when healthy (unauthenticated). `lsfunctions.py:test_url()` treats 401 as healthy for `fleet-lcm/v1/` URLs.
