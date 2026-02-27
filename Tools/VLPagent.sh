@@ -1,6 +1,6 @@
 #!/bin/bash
 # VLPagent.sh - HOLFY27 VLP Agent Management
-# Version 2.0 - January 2026
+# Version 2.1 - February 2026
 # Author - Burke Azbill and HOL Core Team
 #
 # Manages the VLP VM Agent installation and event handling
@@ -117,6 +117,13 @@ handle_lab_start() {
 # Source environment
 . /home/holuser/.bashrc 2>/dev/null || true
 . /home/holuser/noproxy.sh 2>/dev/null || true
+
+# Ensure only one instance runs at a time
+SELF_NAME="$(basename "$0")"
+if pidof -x "$SELF_NAME" -o $$ > /dev/null 2>&1; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') ${SELF_NAME} is already running. Exiting duplicate instance." >> "$LOGFILE"
+    exit 0
+fi
 
 # Initialize log
 log_msg "=== VLP Agent Script Started ===" "$LOGFILE"
