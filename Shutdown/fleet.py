@@ -1284,6 +1284,21 @@ def wait_for_fleet_lcm_task(fleet_fqdn: str, token: str, task_id: str,
     return False
 
 
+def _get_component_fqdn(comp: dict) -> str:
+    """
+    Extract the FQDN from a component dict, handling both the fleet-lcm
+    direct API format (fqdn at top level) and the suite-api proxy format
+    (fqdn inside properties dict).
+    """
+    fqdn = comp.get('fqdn')
+    if fqdn:
+        return fqdn
+    props = comp.get('properties', {})
+    if isinstance(props, dict):
+        return props.get('fqdn', 'unknown')
+    return 'unknown'
+
+
 def shutdown_products_fleet_lcm(fleet_fqdn: str, token: str,
                                  products: list,
                                  verify: bool = SSL_VERIFY,
@@ -1318,8 +1333,7 @@ def shutdown_products_fleet_lcm(fleet_fqdn: str, token: str,
     _log(f'Found {len(components)} component(s):')
     for comp in components:
         comp_type = comp.get('componentType', 'UNKNOWN')
-        props = comp.get('properties', {})
-        comp_fqdn = props.get('fqdn', 'unknown')
+        comp_fqdn = _get_component_fqdn(comp)
         _log(f'  {comp_type}: {comp_fqdn}')
 
     all_success = True
@@ -1335,9 +1349,8 @@ def shutdown_products_fleet_lcm(fleet_fqdn: str, token: str,
             _log(f'{product} ({component_type}) not found in Fleet LCM components')
             continue
 
-        comp_id = comp.get('componentUuid', comp.get('id', ''))
-        props = comp.get('properties', {})
-        comp_fqdn = props.get('fqdn', 'unknown')
+        comp_id = comp.get('id', comp.get('componentUuid', ''))
+        comp_fqdn = _get_component_fqdn(comp)
 
         _log(f'Shutting down {product} ({component_type}): {comp_fqdn}...')
         task_id = shutdown_component_fleet_lcm(
