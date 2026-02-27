@@ -966,25 +966,35 @@ def main(lsf=None, standalone=False, dry_run=False):
                 # Component CRD to determine the displayed state.  Scaling
                 # pods alone does not update this annotation, so the UI
                 # would still show "Stopped" without this step.
+                # Component CRDs are cluster-scoped (not namespaced).
+                # We fetch JSON and parse locally to avoid SSH escaping
+                # issues with dotted annotation keys in custom-columns/jsonpath.
                 if vcf_comp_scaled > 0:
                     lsf.write_output('  Updating Component CRD annotations to Running...')
-                    comp_list = vsp_kubectl(
-                        'kubectl get components.api.vmsp.vmware.com -A '
-                        '-o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,'
-                        'STATUS:.metadata.annotations.component\\.vmsp\\.vmware\\.com/operational-status '
-                        '--no-headers'
+                    comp_json = vsp_kubectl(
+                        'kubectl get components.api.vmsp.vmware.com -o json 2>/dev/null'
                     )
-                    if hasattr(comp_list, 'stdout') and comp_list.stdout:
-                        for line in comp_list.stdout.strip().split('\n'):
-                            cols = line.split()
-                            if len(cols) >= 3 and cols[2] == 'NotRunning':
-                                crd_ns, crd_name = cols[0], cols[1]
-                                lsf.write_output(f'  Annotating {crd_ns}/{crd_name} -> Running')
-                                vsp_kubectl(
-                                    f'kubectl annotate components.api.vmsp.vmware.com '
-                                    f'{crd_name} -n {crd_ns} '
-                                    f'component.vmsp.vmware.com/operational-status=Running --overwrite'
-                                )
+                    if hasattr(comp_json, 'stdout') and comp_json.stdout:
+                        try:
+                            import json as _json
+                            raw = comp_json.stdout.strip()
+                            json_start = raw.find('{')
+                            if json_start >= 0:
+                                raw = raw[json_start:]
+                            comp_data = _json.loads(raw)
+                            for comp_item in comp_data.get('items', []):
+                                crd_name = comp_item.get('metadata', {}).get('name', '')
+                                ann = comp_item.get('metadata', {}).get('annotations', {})
+                                status = ann.get('component.vmsp.vmware.com/operational-status', '')
+                                if status == 'NotRunning':
+                                    lsf.write_output(f'  Annotating {crd_name} -> Running')
+                                    vsp_kubectl(
+                                        f'kubectl annotate components.api.vmsp.vmware.com '
+                                        f'{crd_name} '
+                                        f'component.vmsp.vmware.com/operational-status=Running --overwrite'
+                                    )
+                        except (ValueError, Exception) as je:
+                            lsf.write_output(f'  WARNING: Could not parse component JSON: {je}')
                 
                 # ---- Restart any CrashLoopBackOff pods ----
                 # Pods that were crashing while their Postgres database was

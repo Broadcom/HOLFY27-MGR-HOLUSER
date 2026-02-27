@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 2.2 - February 2026
+# Version 2.3 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 2.3 Changes:
+# - Fixed Component CRD annotation update: components.api.vmsp.vmware.com is
+#   cluster-scoped (not namespaced), so the -A flag produced <none> namespace
+#   columns and the -n flag on annotate commands failed silently. Now queries
+#   without -A and omits -n from annotation commands.
+# - Skips annotating the 'vsp' component itself (infrastructure, not app-level)
 #
 # v 2.2 Changes:
 # - Fixed ESA vs OSA detection: SSH-based check ('esxcli vsan cluster get')
@@ -189,7 +196,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 MODULE_NAME = 'VCFshutdown'
-MODULE_VERSION = '2.1'
+MODULE_VERSION = '2.3'
 MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 9.x compliant)'
 
 # Status file for console display
@@ -1053,25 +1060,36 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                                 errors += 1
 
                         # Annotate Component CRDs as NotRunning
-                        if scaled_down > 0:
+                        # Component CRDs are cluster-scoped (not namespaced).
+                        # We fetch JSON and parse locally to avoid SSH escaping
+                        # issues with dotted annotation keys in custom-columns/jsonpath.
+                        # Always run (not gated by scaled_down) so re-runs after
+                        # partial failures still update annotations.
+                        if scaled_down > 0 or already_stopped > 0:
                             vcf_write(lsf, '  Updating Component CRD annotations to NotRunning...')
-                            comp_list = vsp_kubectl(
-                                'kubectl get components.api.vmsp.vmware.com -A '
-                                '-o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,'
-                                'STATUS:.metadata.annotations.component\\.vmsp\\.vmware\\.com/operational-status '
-                                '--no-headers'
+                            comp_json = vsp_kubectl(
+                                'kubectl get components.api.vmsp.vmware.com -o json 2>/dev/null'
                             )
-                            if hasattr(comp_list, 'stdout') and comp_list.stdout:
-                                for line in comp_list.stdout.strip().split('\n'):
-                                    cols = line.split()
-                                    if len(cols) >= 3 and cols[2] == 'Running':
-                                        crd_ns, crd_name = cols[0], cols[1]
-                                        vcf_write(lsf, f'  Annotating {crd_ns}/{crd_name} -> NotRunning')
-                                        vsp_kubectl(
-                                            f'kubectl annotate components.api.vmsp.vmware.com '
-                                            f'{crd_name} -n {crd_ns} '
-                                            f'component.vmsp.vmware.com/operational-status=NotRunning --overwrite'
-                                        )
+                            if hasattr(comp_json, 'stdout') and comp_json.stdout:
+                                try:
+                                    raw = comp_json.stdout.strip()
+                                    json_start = raw.find('{')
+                                    if json_start >= 0:
+                                        raw = raw[json_start:]
+                                    comp_data = json.loads(raw)
+                                    for comp_item in comp_data.get('items', []):
+                                        crd_name = comp_item.get('metadata', {}).get('name', '')
+                                        ann = comp_item.get('metadata', {}).get('annotations', {})
+                                        status = ann.get('component.vmsp.vmware.com/operational-status', '')
+                                        if status == 'Running' and crd_name != 'vsp':
+                                            vcf_write(lsf, f'  Annotating {crd_name} -> NotRunning')
+                                            vsp_kubectl(
+                                                f'kubectl annotate components.api.vmsp.vmware.com '
+                                                f'{crd_name} '
+                                                f'component.vmsp.vmware.com/operational-status=NotRunning --overwrite'
+                                            )
+                                except (json.JSONDecodeError, ValueError) as je:
+                                    vcf_write(lsf, f'  WARNING: Could not parse component JSON: {je}')
 
                         # Suspend postgres instances (reverse of startup unsuspend)
                         # Two-step process:

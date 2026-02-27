@@ -559,6 +559,13 @@ def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetim
     licenses or expiring licenses are visible per-host rather than being
     de-duplicated by license key.
     """
+    LICENSE_SHORT_NAMES = {
+        'VMware Cloud Foundation (cores)': 'VCF (c)',
+    }
+    
+    def _short(name: str) -> str:
+        return LICENSE_SHORT_NAMES.get(name, name)
+    
     results = []
     license_keys_detail_reported = set()
     
@@ -598,29 +605,17 @@ def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetim
                         status = "FAIL"
                         message = "Non-expiring license detected - no expiration date"
                 
-                if license_key not in license_keys_detail_reported:
-                    license_keys_detail_reported.add(license_key)
-                    results.append(CheckResult(
-                        name=f"License: {license_name}",
-                        status=status,
-                        message=f"{entity_name} - {message}",
-                        details={
-                            "license_key": license_key[:5] + "-****-****-****-" + license_key[-5:],
-                            "entity": entity_name,
-                            "expiration": str(exp_date.date()) if exp_date else "Never"
-                        }
-                    ))
-                else:
-                    results.append(CheckResult(
-                        name=f"  License: {entity_name}",
-                        status=status,
-                        message=f"{license_name} - {message}",
-                        details={
-                            "license_key": license_key[:5] + "-****-****-****-" + license_key[-5:],
-                            "entity": entity_name,
-                            "expiration": str(exp_date.date()) if exp_date else "Never"
-                        }
-                    ))
+                license_keys_detail_reported.add(license_key)
+                results.append(CheckResult(
+                    name=f"License: {entity_name}",
+                    status=status,
+                    message=f"{_short(license_name)} - {message}",
+                    details={
+                        "license_key": license_key[:5] + "-****-****-****-" + license_key[-5:],
+                        "entity": entity_name,
+                        "expiration": str(exp_date.date()) if exp_date else "Never"
+                    }
+                ))
             
             # Check for unassigned licenses
             for lic in lic_mgr.licenses:
@@ -637,7 +632,7 @@ def check_licenses(sis: List, min_exp_date: datetime.date, max_exp_date: datetim
                         exp_msg = " - no expiration date"
                     
                     results.append(CheckResult(
-                        name=f"License: {lic.name}",
+                        name=f"License: {_short(lic.name)}",
                         status="WARN",
                         message=f"Unassigned license - should be removed{exp_msg}",
                         details={"license_key": lic.licenseKey[:5] + "-****"}
@@ -749,12 +744,63 @@ def check_vcf_operations_license() -> List[CheckResult]:
     return results
 
 
+def _sort_license_results(results: List[CheckResult]) -> List[CheckResult]:
+    """Sort license check results into a deterministic display order.
+    
+    Order: VCF Operations, vCenters (mgmt then wld), clusters (mgmt then
+    wld), ESXi hosts (numeric), then everything else (unassigned, errors).
+    
+    After sorting, entities that share the same license key are visually
+    grouped: the first occurrence keeps its name as-is, subsequent ones
+    are indented with two spaces.
+    """
+    def _sort_key(r: CheckResult):
+        entity = (r.details or {}).get('entity', r.name).lower()
+
+        if 'ops-' in entity or 'vcf operations' in entity:
+            return (0, 0, entity)
+        if entity.startswith('vc-'):
+            priority = 0 if 'mgmt' in entity else 1
+            return (1, priority, entity)
+        if entity.startswith('cluster'):
+            priority = 0 if 'mgmt' in entity else 1
+            return (2, priority, entity)
+        if entity.startswith('esx-'):
+            num_match = re.search(r'esx-(\d+)', entity)
+            num = int(num_match.group(1)) if num_match else 99
+            return (3, num, entity)
+        return (9, 0, entity)
+
+    sorted_results = sorted(results, key=_sort_key)
+
+    # Indent every row except the VCF Operations entry (always first)
+    for r in sorted_results:
+        entity = (r.details or {}).get('entity', r.name).lower()
+        is_ops = 'ops-' in entity or 'vcf operations' in entity
+        if not is_ops and not r.name.startswith('  '):
+            r.name = f"  {r.name}"
+
+    return sorted_results
+
+
 #==============================================================================
 # REPORT GENERATION
 #==============================================================================
 
-def print_results_table(title: str, results: List[CheckResult]):
-    """Print results as a table"""
+def print_results_table(title: str, results: List[CheckResult],
+                        max_message_width: int = 72):
+    """Print results as a table with word-wrapping for long messages.
+    
+    Messages that exceed *max_message_width* are wrapped with a 2-space
+    indent on continuation lines so it is easy to see they belong to the
+    same row.
+    
+    :param title: Section heading
+    :param results: List of CheckResult objects
+    :param max_message_width: Maximum width for the Message column before wrapping
+    """
+    import textwrap
+    
     if PRETTYTABLE_AVAILABLE:
         table = PrettyTable()
         table.field_names = ['Name', 'Status', 'Message']
@@ -769,7 +815,10 @@ def print_results_table(title: str, results: List[CheckResult]):
                 'SKIPPED': '⏭️'
             }.get(result.status, '❓')
             
-            table.add_row([result.name, f"{status_icon} {result.status}", result.message[:60]])
+            wrapped = '\n'.join(textwrap.wrap(
+                result.message, width=max_message_width,
+                subsequent_indent='  '))
+            table.add_row([result.name, f"{status_icon} {result.status}", wrapped])
         
         print(f"\n==== {title} ====")
         print(table)
@@ -2251,6 +2300,7 @@ def main():
             except Exception as e:
                 print(f"VCF Operations license check failed: {e}")
             
+            report.license_checks = _sort_license_results(report.license_checks)
             print_results_table("LICENSES", report.license_checks)
             
             # Disconnect
