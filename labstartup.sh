@@ -897,6 +897,11 @@ if [ "$LMC" = true ] && [ "$1" != "labcheck" ]; then
     push_console_files_nfs
 fi
 
+# Set up Cursor IDE symlinks (skills, rules, MCP) from hol repo
+if [ -x "${holroot}/console/setup-cursor.sh" ] && [ "$1" != "labcheck" ]; then
+    ${holroot}/console/setup-cursor.sh >> ${logfile} 2>&1
+fi
+
 # Signal the router that the git pull is complete so files are applied
 date > /tmp/gitdone
 date > ${holorouterdir}/gitdone
