@@ -1,6 +1,6 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.4 - 2026-02-12
+# Version 3.5 - 2026-02-12
 # Author - Burke Azbill and HOL Core Team
 # Enhanced with NFS-based router communication, DNS import support
 
@@ -137,10 +137,13 @@ use_local_holodeck_ini() {
 
 git_repo_exists() {
     # Validate that a remote git repository exists and is accessible.
-    # Uses a 15-second timeout to prevent hangs when the repo requires auth.
-    # Returns 0 if the repo exists, 1 otherwise.
+    # Uses curl with a 15-second timeout to check HTTP status of the repo URL.
+    # Returns 0 if the repo exists (HTTP 200), 1 otherwise.
     local repo_url="$1"
-    if timeout 15 env GIT_TERMINAL_PROMPT=0 git ls-remote "$repo_url" > /dev/null 2>&1; then
+    local check_url="${repo_url%.git}"
+    local http_status
+    http_status=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" "$check_url" 2>/dev/null)
+    if [ "$http_status" = "200" ]; then
         return 0
     else
         return 1
