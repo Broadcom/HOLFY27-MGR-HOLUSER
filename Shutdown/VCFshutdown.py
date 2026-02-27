@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 2.3 - February 2026
+# Version 2.4 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 2.4 Changes:
+# - Phase 1 now uses fleet-lcm direct API (JWT via VSP Identity Service)
+#   as the primary shutdown method for VCF 9.1 instead of the suite-api
+#   internal proxy which returns HTTP 500 for shutdown actions.
+# - Auth flow: discovers IAM credentials from vcf-iam-vcfa-admin secret,
+#   obtains JWT from fleet-01a /api/v1/identity/token, then calls
+#   /fleet-lcm/v1/components/{id}?action=shutdown
+# - Falls back to suite-api proxy, then VCF 9.0 legacy, then Phase 1b VM shutdown
 #
 # v 2.3 Changes:
 # - Fixed Component CRD annotation update: components.api.vmsp.vmware.com is
@@ -773,33 +782,64 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                     vcf_write(lsf, f'{ops_fqdn} not reachable, using VCF 9.0 API')
 
             if use_v91:
-                vcf_write(lsf, f'Using VCF 9.1 internal components API via {ops_fqdn}')
+                vcf_write(lsf, f'Using VCF 9.1 Fleet LCM API')
+
+                # Fleet LCM gateway FQDN (configurable, defaults to fleet-01a)
+                fleet_lcm_fqdn = 'fleet-01a.site-a.vcf.lab'
+                if lsf.config.has_option('SHUTDOWN', 'fleet_lcm_fqdn'):
+                    fleet_lcm_fqdn = lsf.config.get('SHUTDOWN', 'fleet_lcm_fqdn')
 
                 if not dry_run:
-                    try:
-                        vcf_write(lsf, f'Acquiring OpsToken from {ops_fqdn} suite-api...')
-                        jwt_token = fleet.get_ops_jwt_token(ops_fqdn, ops_username, password)
-                        vcf_write(lsf, 'OpsToken acquired successfully')
+                    def _fleet_log(msg):
+                        vcf_write(lsf, msg)
 
-                        def _fleet_log(msg):
-                            vcf_write(lsf, msg)
+                    # Primary path: fleet-lcm direct API (JWT via VSP Identity Service)
+                    if lsf.test_tcp_port(fleet_lcm_fqdn, 443, timeout=10):
+                        vcf_write(lsf, f'Fleet LCM gateway reachable at {fleet_lcm_fqdn}')
+                        try:
+                            vcf_write(lsf, f'Acquiring JWT from VSP Identity Service...')
+                            fleet_jwt = fleet.get_fleet_lcm_jwt(fleet_lcm_fqdn, password, lsf=lsf)
+                            vcf_write(lsf, 'JWT acquired successfully')
 
-                        success = fleet.shutdown_products_v91(ops_fqdn, jwt_token,
-                                                              fleet_products,
-                                                              write_output=_fleet_log)
-                        if success:
-                            vcf_write(lsf, 'Fleet LCM (VCF 9.1) API shutdown complete')
-                            fleet_api_succeeded = True
-                        else:
-                            vcf_write(lsf, 'Fleet LCM API shutdown not available through suite-api proxy')
-                            vcf_write(lsf, 'VCF Automation VMs will be shut down directly in Phase 1b')
-                    except Exception as e:
-                        vcf_write(lsf, f'Fleet LCM (VCF 9.1) shutdown error: {e}')
-                        if not version_explicit:
-                            vcf_write(lsf, 'Falling back to VCF 9.0 legacy API...')
-                            use_v91 = False
-                        else:
-                            vcf_write(lsf, 'VCF version explicitly set to 9.1, not falling back to 9.0')
+                            success = fleet.shutdown_products_fleet_lcm(
+                                fleet_lcm_fqdn, fleet_jwt, fleet_products,
+                                write_output=_fleet_log)
+                            if success:
+                                vcf_write(lsf, 'Fleet LCM direct API shutdown complete')
+                                fleet_api_succeeded = True
+                            else:
+                                vcf_write(lsf, 'WARNING: Fleet LCM direct API shutdown had issues')
+                                vcf_write(lsf, 'VCF Automation VMs will be shut down directly in Phase 1b')
+                        except Exception as e:
+                            vcf_write(lsf, f'Fleet LCM direct API error: {e}')
+                            vcf_write(lsf, 'Falling back to suite-api internal proxy...')
+                    else:
+                        vcf_write(lsf, f'Fleet LCM gateway {fleet_lcm_fqdn} not reachable')
+                        vcf_write(lsf, 'Falling back to suite-api internal proxy...')
+
+                    # Fallback: suite-api internal proxy (may return HTTP 500 for shutdown)
+                    if not fleet_api_succeeded:
+                        try:
+                            vcf_write(lsf, f'Acquiring OpsToken from {ops_fqdn} suite-api...')
+                            jwt_token = fleet.get_ops_jwt_token(ops_fqdn, ops_username, password)
+                            vcf_write(lsf, 'OpsToken acquired successfully')
+
+                            success = fleet.shutdown_products_v91(ops_fqdn, jwt_token,
+                                                                  fleet_products,
+                                                                  write_output=_fleet_log)
+                            if success:
+                                vcf_write(lsf, 'Fleet LCM (suite-api proxy) shutdown complete')
+                                fleet_api_succeeded = True
+                            else:
+                                vcf_write(lsf, 'Fleet LCM API shutdown not available through suite-api proxy')
+                                vcf_write(lsf, 'VCF Automation VMs will be shut down directly in Phase 1b')
+                        except Exception as e:
+                            vcf_write(lsf, f'Fleet LCM (suite-api proxy) shutdown error: {e}')
+                            if not version_explicit:
+                                vcf_write(lsf, 'Falling back to VCF 9.0 legacy API...')
+                                use_v91 = False
+                            else:
+                                vcf_write(lsf, 'VCF version explicitly set to 9.1, not falling back to 9.0')
                 else:
                     vcf_write(lsf, f'Would shutdown Fleet products via VCF 9.1 API: {fleet_products}')
 

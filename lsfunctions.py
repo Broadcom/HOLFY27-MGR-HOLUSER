@@ -1,5 +1,5 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.2 - February 2026
+# Version 3.3 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible/Salt, tdns-mgr integration
@@ -611,11 +611,13 @@ def test_url(url, **kwargs):
         response = session.get(url, verify=verify_ssl, timeout=timeout, proxies=None)
         
         if response.status_code != 200:
-            # Special exception for VCF Automation CCI projects URL:
-            # 401 Unauthorized is acceptable as it confirms the service is alive.
+            # 401 Unauthorized from authenticated API endpoints confirms the
+            # service is alive and responding — treat as healthy.
             is_cci_url = "project.cci.vmware.com/v1alpha2/projects" in url
-            if not (is_cci_url and response.status_code == 401):
-                return False
+            is_fleet_lcm_url = "fleet-lcm/v1/" in url
+            if response.status_code == 401 and (is_cci_url or is_fleet_lcm_url):
+                return True
+            return False
         
         if expected_text and expected_text not in response.text:
             return False

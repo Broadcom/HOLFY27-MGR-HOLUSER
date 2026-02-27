@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 4.1 - February 2026
+# Version 4.2 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
 
@@ -880,25 +880,34 @@ def main(lsf=None, standalone=False, dry_run=False):
                 # because the operator previously set numberOfInstances=0 and won't
                 # automatically restore it when the label is removed.
                 lsf.write_output('  Checking for suspended Postgres instances...')
+                # Use -o json and parse locally to avoid SSH escaping issues
+                # with dotted label keys in custom-columns (see skill doc:
+                # "SSH Escaping Pitfall" — dotted keys get mangled through
+                # SSH+sudo+bash-c layers, silently returning <none>).
                 pg_check = vsp_kubectl(
-                    'kubectl get postgresinstances.database.vmsp.vmware.com -A '
-                    '-o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,'
-                    'SUSPENDED:.metadata.labels.database\\.vmsp\\.vmware\\.com/suspended '
-                    '--no-headers'
+                    'kubectl get postgresinstances.database.vmsp.vmware.com -A -o json 2>/dev/null'
                 )
                 if hasattr(pg_check, 'stdout') and pg_check.stdout:
-                    for line in pg_check.stdout.strip().split('\n'):
-                        cols = line.split()
-                        if len(cols) >= 2:
-                            pg_ns, pg_name = cols[0], cols[1]
-                            suspended = cols[2] if len(cols) >= 3 else '<none>'
+                    try:
+                        import json as _json_pg
+                        raw_pg = pg_check.stdout.strip()
+                        json_start_pg = raw_pg.find('{')
+                        if json_start_pg >= 0:
+                            raw_pg = raw_pg[json_start_pg:]
+                        pg_data = _json_pg.loads(raw_pg)
+                        for pg_item in pg_data.get('items', []):
+                            pg_ns = pg_item.get('metadata', {}).get('namespace', '')
+                            pg_name = pg_item.get('metadata', {}).get('name', '')
+                            pg_labels = pg_item.get('metadata', {}).get('labels', {})
+                            suspended = pg_labels.get('database.vmsp.vmware.com/suspended', '')
+
                             if suspended == 'true':
                                 lsf.write_output(f'  Unsuspending Postgres instance: {pg_ns}/{pg_name}')
                                 vsp_kubectl(
                                     f'kubectl label postgresinstances.database.vmsp.vmware.com '
                                     f'{pg_name} -n {pg_ns} database.vmsp.vmware.com/suspended-'
                                 )
-                            
+
                             # Always ensure Zalando numberOfInstances is 1
                             zalando_check = vsp_kubectl(
                                 f'kubectl get postgresqls.acid.zalan.do {pg_name} -n {pg_ns} '
@@ -907,7 +916,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                             current_instances = ''
                             if hasattr(zalando_check, 'stdout') and zalando_check.stdout:
                                 current_instances = zalando_check.stdout.strip().split('\n')[-1].strip()
-                            
+
                             if current_instances != '1':
                                 lsf.write_output(f'  Scaling Zalando postgres {pg_ns}/{pg_name} to 1 instance (was {current_instances})')
                                 patch_json = '{"spec":{"numberOfInstances":1}}'
@@ -915,6 +924,14 @@ def main(lsf=None, standalone=False, dry_run=False):
                                     f"kubectl patch postgresqls.acid.zalan.do {pg_name} -n {pg_ns} "
                                     f"--type=merge -p '{patch_json}'"
                                 )
+                    except (ValueError, Exception) as pg_err:
+                        lsf.write_output(f'  WARNING: Could not parse postgres JSON: {pg_err}')
+                        lsf.write_output(f'  Falling back to unconditional unsuspend of known namespaces...')
+                        for fallback_ns in ['salt-raas', 'vcf-fleet-lcm', 'vcf-sddc-lcm', 'vidb-external']:
+                            vsp_kubectl(
+                                f'kubectl label postgresinstances.database.vmsp.vmware.com '
+                                f'--all -n {fallback_ns} database.vmsp.vmware.com/suspended- 2>/dev/null'
+                            )
                 
                 # ---- Scale up each component ----
                 lsf.write_output(f'  Processing {len(vcfcomponents)} component resources...')

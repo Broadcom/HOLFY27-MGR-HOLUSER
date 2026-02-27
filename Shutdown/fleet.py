@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 # fleet.py - HOLFY27 Fleet Management (SDDC Manager) Operations
-# Version 2.1 - February 2026
+# Version 2.2 - February 2026
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # Provides Fleet Operations API integration for shutdown orchestration
+#
+# v2.2 Changes:
+# - Added fleet-lcm direct API functions for VCF 9.1 shutdown:
+#   get_fleet_lcm_jwt(), shutdown_products_fleet_lcm(), etc.
+#   The suite-api internal proxy returns HTTP 500 for shutdown actions;
+#   the fleet-lcm service on fleet-01a accepts them directly with a JWT
+#   obtained via OAuth2 password grant from the VSP Identity Service.
+# - IAM credentials auto-discovered from vcf-iam-vcfa-admin secret
 #
 # v2.1 Changes:
 # - Fixed shutdown_products_v91() hammering API with repeated HTTP 500 errors:
@@ -966,6 +974,388 @@ def shutdown_products_v91(ops_fqdn: str, token: str, products: list,
         _log(f'  {product} ({component_type}): {comp_fqdn}')
 
     return all_success
+
+#==============================================================================
+# VCF 9.1 - FLEET-LCM DIRECT API (JWT via VSP Identity Service)
+# The suite-api internal proxy does not support the shutdown action (HTTP 500).
+# The fleet-lcm service on fleet-01a exposes the full API including shutdown,
+# but requires a JWT issued by the VSP Identity Service at
+# /api/v1/identity/token using OAuth2 password grant.
+#==============================================================================
+
+def get_fleet_lcm_jwt(fleet_fqdn: str, password: str,
+                      lsf=None, verify: bool = SSL_VERIFY) -> str:
+    """
+    Obtain a JWT from the VSP Identity Service for fleet-lcm API access.
+
+    Uses OAuth2 password grant with IAM client credentials discovered from
+    the vcf-iam-vcfa-admin secret in the vcf-fleet-lcm namespace on the
+    VSP control plane.
+
+    :param fleet_fqdn: Fleet LCM gateway FQDN (e.g., fleet-01a.site-a.vcf.lab)
+    :param password: Admin password (from creds.txt)
+    :param lsf: Optional lsfunctions module (used to SSH to VSP for credentials)
+    :param verify: SSL verification flag
+    :return: JWT access token string
+    :raises: Exception on authentication failure
+    """
+    # Discover IAM client credentials from VSP cluster
+    client_id, client_secret = _discover_iam_credentials(password, lsf)
+
+    # Request JWT via password grant
+    basic_creds = base64.b64encode(
+        f'{client_id}:{client_secret}'.encode()
+    ).decode()
+
+    token_url = f'https://{fleet_fqdn}/api/v1/identity/token'
+    response = requests.post(
+        token_url,
+        data={'grant_type': 'password', 'username': 'admin', 'password': password},
+        headers={
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Authorization': f'Basic {basic_creds}',
+        },
+        verify=verify,
+        timeout=V91_TOKEN_TIMEOUT
+    )
+    response.raise_for_status()
+    token = response.json().get('access_token')
+    if not token:
+        raise ValueError('No access_token in identity service response')
+    return token
+
+
+def _discover_iam_credentials(password: str, lsf=None) -> tuple:
+    """
+    Discover IAM client credentials from the VSP cluster.
+
+    SSH to the VSP control plane and reads the vcf-iam-vcfa-admin secret
+    in the vcf-fleet-lcm namespace.
+
+    :param password: SSH password for vmware-system-user
+    :param lsf: lsfunctions module (required for SSH)
+    :return: tuple of (client_id, client_secret)
+    :raises: Exception if credentials cannot be discovered
+    """
+    if lsf is None:
+        raise ValueError('lsf module required for IAM credential discovery')
+
+    import re
+    import socket
+
+    # Resolve VSP control plane IP
+    vsp_control_plane_ip = None
+    vsp_user = 'vmware-system-user'
+
+    for candidate in ['vsp-01a.site-a.vcf.lab']:
+        try:
+            vsp_worker_ip = socket.gethostbyname(candidate)
+        except socket.gaierror:
+            continue
+
+        result = lsf.ssh(
+            f"echo '{password}' | sudo -S grep server: /etc/kubernetes/node-agent.conf",
+            f'{vsp_user}@{vsp_worker_ip}'
+        )
+        if hasattr(result, 'stdout') and result.stdout:
+            for line in result.stdout.strip().split('\n'):
+                if 'server:' in line:
+                    match = re.search(r'https?://([0-9.]+):', line)
+                    if match:
+                        vsp_control_plane_ip = match.group(1)
+                        break
+        if vsp_control_plane_ip:
+            break
+
+    if not vsp_control_plane_ip:
+        raise ValueError('Could not determine VSP control plane IP')
+
+    # Read the vcf-iam-vcfa-admin secret
+    cmd = (
+        f"echo '{password}' | sudo -S -i kubectl get secret vcf-iam-vcfa-admin "
+        f"-n vcf-fleet-lcm -o jsonpath='{{.data}}' 2>/dev/null"
+    )
+    result = lsf.ssh(cmd, f'{vsp_user}@{vsp_control_plane_ip}')
+
+    if not hasattr(result, 'stdout') or not result.stdout:
+        raise ValueError('Could not read vcf-iam-vcfa-admin secret')
+
+    raw = result.stdout.strip()
+    json_start = raw.find('{')
+    if json_start < 0:
+        raise ValueError('No JSON in vcf-iam-vcfa-admin secret output')
+
+    raw = raw[json_start:]
+    # Find balanced JSON end
+    depth = 0
+    end = len(raw)
+    for i, c in enumerate(raw):
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        if depth == 0:
+            end = i + 1
+            break
+    raw = raw[:end]
+
+    secret_data = json.loads(raw)
+    client_id = base64.b64decode(secret_data['clientId']).decode('utf-8')
+    client_secret = base64.b64decode(secret_data['clientSecret']).decode('utf-8')
+
+    return client_id, client_secret
+
+
+def _make_fleet_lcm_request(method: str, fleet_fqdn: str, path: str,
+                             token: str, payload: dict = None,
+                             params: dict = None,
+                             verify: bool = SSL_VERIFY) -> requests.Response:
+    """
+    Make an authenticated request to the fleet-lcm direct API.
+
+    :param method: HTTP method (GET, POST)
+    :param fleet_fqdn: Fleet LCM gateway FQDN
+    :param path: API path (e.g., /fleet-lcm/v1/components)
+    :param token: JWT access token
+    :param payload: Optional JSON body
+    :param params: Optional query parameters
+    :param verify: SSL verification flag
+    :return: requests.Response object
+    """
+    url = f'https://{fleet_fqdn}{path}'
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+    }
+
+    if method.upper() == 'GET':
+        return requests.get(url, headers=headers, params=params,
+                            verify=verify, timeout=REQUEST_TIMEOUT)
+    elif method.upper() == 'POST':
+        data = json.dumps(payload) if payload else None
+        return requests.post(url, headers=headers, data=data,
+                             params=params, verify=verify,
+                             timeout=REQUEST_TIMEOUT)
+    else:
+        raise ValueError(f'Unsupported HTTP method: {method}')
+
+
+def get_components_fleet_lcm(fleet_fqdn: str, token: str,
+                              verify: bool = SSL_VERIFY) -> list:
+    """
+    List all components via the fleet-lcm direct API.
+
+    :param fleet_fqdn: Fleet LCM gateway FQDN
+    :param token: JWT access token
+    :param verify: SSL verification flag
+    :return: List of component dicts
+    """
+    resp = _make_fleet_lcm_request(
+        'GET', fleet_fqdn, '/fleet-lcm/v1/components', token, verify=verify)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get('components', data.get('content', []))
+    return []
+
+
+def shutdown_component_fleet_lcm(fleet_fqdn: str, token: str,
+                                  component_id: str,
+                                  verify: bool = SSL_VERIFY,
+                                  write_output=None) -> str:
+    """
+    Trigger a graceful shutdown of a component via the fleet-lcm direct API.
+
+    POST /fleet-lcm/v1/components/{componentId}?action=shutdown
+
+    :param fleet_fqdn: Fleet LCM gateway FQDN
+    :param token: JWT access token
+    :param component_id: Component UUID
+    :param verify: SSL verification flag
+    :param write_output: Optional logging function
+    :return: Task ID string or None on failure
+    """
+    _log = write_output if write_output else lambda x: logger.info(x)
+
+    try:
+        resp = _make_fleet_lcm_request(
+            'POST', fleet_fqdn,
+            f'/fleet-lcm/v1/components/{component_id}',
+            token, params={'action': 'shutdown'}, verify=verify)
+
+        if resp.status_code in (200, 202):
+            data = resp.json()
+            task_id = data.get('id')
+            task_name = data.get('name', 'UNKNOWN')
+            status = data.get('status', 'UNKNOWN')
+            desc = data.get('description', {})
+            if isinstance(desc, dict):
+                desc = desc.get('defaultMessage', '')
+
+            if task_id:
+                _log(f'  Shutdown workflow started: {task_name} (task: {task_id[:8]}...)')
+                if desc:
+                    _log(f'  Description: {desc}')
+                _log(f'  Initial status: {status}')
+            return task_id
+        else:
+            _log(f'  Shutdown action returned HTTP {resp.status_code}')
+            _log(f'  {resp.text[:200]}')
+            return None
+
+    except Exception as e:
+        _log(f'  Failed to trigger shutdown: {e}')
+        return None
+
+
+def wait_for_fleet_lcm_task(fleet_fqdn: str, token: str, task_id: str,
+                             poll_interval: int = V91_TASK_POLL_INTERVAL,
+                             max_wait: int = V91_TASK_MAX_WAIT,
+                             verify: bool = SSL_VERIFY,
+                             write_output=None) -> bool:
+    """
+    Wait for a fleet-lcm task to complete.
+
+    :param fleet_fqdn: Fleet LCM gateway FQDN
+    :param token: JWT access token
+    :param task_id: Task UUID
+    :param poll_interval: Seconds between status checks
+    :param max_wait: Maximum seconds to wait
+    :param verify: SSL verification flag
+    :param write_output: Optional logging function
+    :return: True if task succeeded, False otherwise
+    """
+    _log = write_output if write_output else lambda x: print(f'INFO: {x}')
+    start_time = time.time()
+    check_count = 0
+
+    while (time.time() - start_time) < max_wait:
+        check_count += 1
+        elapsed = int(time.time() - start_time)
+
+        try:
+            resp = _make_fleet_lcm_request(
+                'GET', fleet_fqdn, f'/fleet-lcm/v1/tasks/{task_id}',
+                token, verify=verify)
+
+            if resp.status_code != 200:
+                _log(f'  [Check {check_count}] Task poll returned HTTP {resp.status_code} (elapsed: {elapsed}s)')
+                time.sleep(poll_interval)
+                continue
+
+            task_info = resp.json()
+        except Exception as e:
+            _log(f'  [Check {check_count}] Task poll error: {e} (elapsed: {elapsed}s)')
+            time.sleep(poll_interval)
+            continue
+
+        status = task_info.get('status', 'UNKNOWN')
+
+        stages = task_info.get('stages', [])
+        stage_summary = ''
+        if stages:
+            current_stage = stages[-1]
+            stage_name = current_stage.get('name', '')
+            stage_status = current_stage.get('status', '')
+            stage_summary = f' | stage: {stage_name}={stage_status}'
+
+        _log(f'  [Check {check_count}] Task {task_id[:8]}... status: '
+             f'{status}{stage_summary} (elapsed: {elapsed}s)')
+
+        if status == 'SUCCEEDED':
+            _log(f'  Task completed successfully in {elapsed}s')
+            return True
+        elif status == 'FAILED':
+            messages = task_info.get('messages', [])
+            if messages:
+                for msg in messages[:3]:
+                    msg_text = msg if isinstance(msg, str) else msg.get('defaultMessage', str(msg))
+                    _log(f'  Error: {msg_text}')
+            _log(f'  Task FAILED after {elapsed}s')
+            return False
+
+        time.sleep(poll_interval)
+
+    elapsed = int(time.time() - start_time)
+    _log(f'  Task {task_id[:8]}... timed out after {elapsed}s (max: {max_wait}s)')
+    return False
+
+
+def shutdown_products_fleet_lcm(fleet_fqdn: str, token: str,
+                                 products: list,
+                                 verify: bool = SSL_VERIFY,
+                                 write_output=None) -> bool:
+    """
+    Shutdown VCF products via the fleet-lcm direct API.
+
+    This is the preferred shutdown method for VCF 9.1 — it uses the
+    fleet-lcm service directly (on fleet-01a) instead of the suite-api
+    internal proxy (on ops-a) which does not support the shutdown action.
+
+    :param fleet_fqdn: Fleet LCM gateway FQDN (e.g., fleet-01a.site-a.vcf.lab)
+    :param token: JWT access token from get_fleet_lcm_jwt()
+    :param products: List of product IDs to shutdown (vra, vrni, etc.)
+    :param verify: SSL verification flag
+    :param write_output: Optional logging function
+    :return: True if all shutdowns succeeded, False if any failed
+    """
+    _log = write_output if write_output else lambda x: print(f'INFO: {x}')
+
+    _log('Getting all components from Fleet LCM direct API')
+    try:
+        components = get_components_fleet_lcm(fleet_fqdn, token, verify)
+    except Exception as e:
+        _log(f'Failed to list components: {e}')
+        return False
+
+    if not components:
+        _log('No components found in Fleet LCM')
+        return False
+
+    _log(f'Found {len(components)} component(s):')
+    for comp in components:
+        comp_type = comp.get('componentType', 'UNKNOWN')
+        props = comp.get('properties', {})
+        comp_fqdn = props.get('fqdn', 'unknown')
+        _log(f'  {comp_type}: {comp_fqdn}')
+
+    all_success = True
+
+    for product in products:
+        component_type = PRODUCT_TO_COMPONENT_TYPE.get(product)
+        if not component_type:
+            _log(f'Skipping {product} - no component type mapping')
+            continue
+
+        comp = find_component_by_type(components, component_type)
+        if not comp:
+            _log(f'{product} ({component_type}) not found in Fleet LCM components')
+            continue
+
+        comp_id = comp.get('componentUuid', comp.get('id', ''))
+        props = comp.get('properties', {})
+        comp_fqdn = props.get('fqdn', 'unknown')
+
+        _log(f'Shutting down {product} ({component_type}): {comp_fqdn}...')
+        task_id = shutdown_component_fleet_lcm(
+            fleet_fqdn, token, comp_id, verify, write_output)
+
+        if task_id:
+            success = wait_for_fleet_lcm_task(
+                fleet_fqdn, token, task_id, verify=verify,
+                write_output=write_output)
+            if not success:
+                _log(f'WARNING: Shutdown workflow for {product} did not complete successfully')
+                all_success = False
+        else:
+            _log(f'WARNING: Could not trigger shutdown for {product}')
+            all_success = False
+
+    return all_success
+
 
 #==============================================================================
 # VERSION DETECTION
