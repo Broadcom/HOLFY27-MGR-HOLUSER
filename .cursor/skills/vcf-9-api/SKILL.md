@@ -1,6 +1,6 @@
 ---
 name: vcf-9-api
-description: Guide API interactions with VMware Cloud Foundation (VCF) 9.0 and 9.1 environments running on Holodeck nested virtualization. Provides correct endpoints, credentials, authentication flows, and SSH access for SDDC Manager, VCF Operations (Aria), NSX Manager, NSX Edges, vCenter, VCF Automation, and Supervisor clusters. Use when the user mentions VCF, SDDC Manager, Aria Operations, NSX, vCenter API, VCF Automation, Supervisor, Tanzu, password policies, fleet management, or any VMware Cloud Foundation operations.
+description: Guide API interactions with VMware Cloud Foundation (VCF) 9.0 and 9.1 environments running on Holodeck nested virtualization. Provides correct endpoints, credentials, authentication flows, SSH access, dir-cli SSO management, CSI secret structure, SDDC Manager auto-rotate API, credential remediation, resource lock management, PostgreSQL direct access, and version-specific differences for SDDC Manager, VCF Operations (Aria), NSX Manager, NSX Edges, vCenter, VCF Automation, and Supervisor clusters. Use when the user mentions VCF, SDDC Manager, Aria Operations, NSX, vCenter API, VCF Automation, Supervisor, Tanzu, password policies, fleet management, CSI driver, dir-cli, service accounts, auto-rotate, credential remediation, password reset, resource locks, or any VMware Cloud Foundation operations.
 ---
 
 # VCF 9.x API Interaction Guide
@@ -116,13 +116,12 @@ requests.post(
 )
 ```
 
-### Inaccessible / Limited Endpoints
+### Inaccessible Endpoints (Do NOT attempt)
 
 | Path | Why |
 | --- | --- |
 | `/vcf-operations/rest/ops/internal/*` | Requires browser CSRF/Session — not proxied through suite-api |
 | `/suite-api/api/fleet-management/*` | Returns 401 — auth mechanism differs from OpsToken |
-| `/suite-api/internal/components/{id}?action=shutdown` | Returns **HTTP 500** — the suite-api proxy passes through GET/list but does NOT support shutdown actions. Use the fleet-lcm direct API instead (see section 8). |
 
 ## 3. NSX Manager API
 
@@ -357,114 +356,269 @@ spec = vim.vm.guest.ProcessManager.ProgramSpec(
 pm.StartProgramInGuest(vm, creds, spec)
 ```
 
-## 8. Fleet LCM Direct API (VCF 9.1 Component Lifecycle)
+## 8. vCenter SSO Service Account Management (dir-cli)
 
-The Fleet LCM service on `fleet-01a.site-a.vcf.lab` exposes the full component lifecycle API including **shutdown**, **startup**, and status queries. This is the **only** way to gracefully shut down VCF Automation (and other components) via API — the `ops-a` suite-api proxy returns HTTP 500 for action endpoints.
-
-### Authentication: JWT via VSP Identity Service
-
-Fleet LCM requires a Bearer JWT obtained through an OAuth2 **password grant** from the VSP Identity Service.
-
-**Step 1: Discover IAM client credentials from Kubernetes secret**
+The `dir-cli` utility on vCenter (`/usr/lib/vmware-vmafd/bin/dir-cli`) manages SSO service accounts. These accounts (e.g., `svc-vcfsp-vc-*@vsphere.local`) are used by CSI drivers, VCF Automation, and other components.
 
 ```bash
-# SSH to VSP control plane (10.1.1.142)
 PASSWORD=$(cat /home/holuser/creds.txt)
-sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no vmware-system-user@10.1.1.142 \
-  "echo '${PASSWORD}' | sudo -S -i kubectl get secret vcf-iam-vcfa-admin \
-   -n vcf-fleet-lcm -o jsonpath='{.data}' 2>/dev/null"
 
-# Output: {"clientId":"<base64>","clientSecret":"<base64>"}
-# Decode: echo '<base64>' | base64 -d
+# Find a service account
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-mgmt-a.site-a.vcf.lab \
+  "/usr/lib/vmware-vmafd/bin/dir-cli user find-by-name --account svc-vcfsp-vc-zna836 \
+   --login administrator@vsphere.local --password '${PASSWORD}'"
+
+# Reset a service account password (user modify does NOT support password changes)
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-mgmt-a.site-a.vcf.lab \
+  "/usr/lib/vmware-vmafd/bin/dir-cli password reset --account svc-vcfsp-vc-zna836 \
+   --new 'NewPassword123!' --login administrator@vsphere.local --password '${PASSWORD}'"
+
+# Set password to never expire
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-mgmt-a.site-a.vcf.lab \
+  "/usr/lib/vmware-vmafd/bin/dir-cli user modify --account svc-vcfsp-vc-zna836 \
+   --password-never-expires --login administrator@vsphere.local --password '${PASSWORD}'"
 ```
 
-**Step 2: Obtain JWT using password grant**
+### CSI Secret Structure on VCF Automation
 
-```python
-import requests, base64, urllib3
-urllib3.disable_warnings()
+The vSphere CSI driver on VCF Automation (`auto-a`, K8s API at `10.1.1.71`) uses two secrets in `kube-system`:
 
-FLEET = "fleet-01a.site-a.vcf.lab"
-PASSWORD = open("/home/holuser/creds.txt").read().strip()
-
-# client_id and client_secret from Step 1 (decoded)
-basic_creds = base64.b64encode(f'{client_id}:{client_secret}'.encode()).decode()
-
-token_resp = requests.post(
-    f"https://{FLEET}/api/v1/identity/token",
-    data={'grant_type': 'password', 'username': 'admin', 'password': PASSWORD},
-    headers={
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': f'Basic {basic_creds}',
-    },
-    verify=False
-)
-jwt = token_resp.json()['access_token']
-```
-
-**Step 3: Use JWT for fleet-lcm API calls**
-
-```python
-headers = {
-    'Authorization': f'Bearer {jwt}',
-    'Accept': 'application/json',
-}
-
-# List components
-components = requests.get(
-    f"https://{FLEET}/fleet-lcm/v1/components",
-    headers=headers, verify=False
-).json()
-
-# Graceful shutdown (returns HTTP 202 with task ID)
-comp_uuid = components[0]['componentUuid']
-shutdown = requests.post(
-    f"https://{FLEET}/fleet-lcm/v1/components/{comp_uuid}",
-    params={'action': 'shutdown'},
-    headers=headers, verify=False
-)
-task_id = shutdown.json()['id']
-
-# Poll task status
-task = requests.get(
-    f"https://{FLEET}/fleet-lcm/v1/tasks/{task_id}",
-    headers=headers, verify=False
-).json()
-# status: IN_PROGRESS -> SUCCEEDED / FAILED
-```
-
-### Key Endpoints
-
-| Method | Path | Purpose |
+| Secret | Key | Content |
 | --- | --- | --- |
-| GET | `/fleet-lcm/v1/components` | List all managed components |
-| POST | `/fleet-lcm/v1/components/{uuid}?action=shutdown` | Graceful shutdown (HTTP 202) |
-| POST | `/fleet-lcm/v1/components/{uuid}?action=startup` | Start component |
-| GET | `/fleet-lcm/v1/tasks/{taskId}` | Poll task status |
-| GET | `/api/v1/identity/.well-known/openid-configuration` | OIDC discovery |
-| POST | `/api/v1/identity/token` | OAuth2 token endpoint |
+| `vsphere-config-secret` | `csi-vsphere.conf` | Full CSI config with user, password, thumbprint, datacenter |
+| `vsphere-cloud-secret` | `vc-mgmt-a.site-a.vcf.lab.password` | Just the password |
+|  | `vc-mgmt-a.site-a.vcf.lab.username` | Just the username |
 
-### Health Check
+Both must be updated when the service account password is reset.
 
-The fleet-lcm API returns **HTTP 401** (Unauthorized) when healthy but unauthenticated. For URL health checks (e.g., `lsf.test_url()`), treat 401 as healthy for `fleet-lcm/v1/` URLs.
+## 9. SDDC Manager Auto-Rotate API
 
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+TOKEN=$(curl -sk -X POST "https://sddcmanager-a.site-a.vcf.lab/v1/tokens" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"admin@local\",\"password\":\"${PASSWORD}\"}" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin).get('accessToken',''))")
+
+# List credentials with auto-rotate
+curl -sk -H "Authorization: Bearer ${TOKEN}" \
+  "https://sddcmanager-a.site-a.vcf.lab/v1/credentials" | python3 -c "
+import json,sys
+for el in json.load(sys.stdin).get('elements', []):
+    ar = el.get('autoRotatePolicy', {})
+    if ar.get('frequencyInDays'):
+        print(f'{el[\"username\"]} ({el[\"credentialType\"]}): rotate every {ar[\"frequencyInDays\"]}d')
+"
+
+# Disable auto-rotate (requires resource in ACTIVE state)
+curl -sk -X PATCH -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  "https://sddcmanager-a.site-a.vcf.lab/v1/credentials" \
+  -d '{"operationType":"UPDATE","elements":[{
+    "resourceName":"vc-mgmt-a.site-a.vcf.lab",
+    "resourceType":"VCENTER",
+    "credentials":[{"credentialType":"SSH","username":"root",
+      "autoRotatePolicy":{"frequencyInDays":0,"enableAutoRotatePolicy":false}}]
+  }]}'
 ```
-https://fleet-01a.site-a.vcf.lab/fleet-lcm/v1/components  →  HTTP 401 = healthy
+
+**Limitation**: SDDC Manager requires the resource to be in ACTIVE state. In partially-started labs, resources may show ERROR status, causing the PATCH to fail with `RESOURCE_IS_NOT_IN_ACTIVE_STATE`.
+
+## 10. SDDC Manager Credential Remediation API
+
+SDDC Manager's `PATCH /v1/credentials` endpoint supports three operation types:
+- **UPDATE**: Changes the password on both SDDC Manager's database AND the target component. Does NOT work for service accounts.
+- **ROTATE**: Generates a new password and applies it to the target component. Used for service accounts (`svc-*`).
+- **REMEDIATE**: Tells SDDC Manager "the password on the target is already X, update your records." Used when you've already set the password externally.
+
+### Authentication (Bearer Token, NOT Basic Auth)
+
+Credential operations require a Bearer token, not Basic Auth:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+SDDC="sddcmanager-a.site-a.vcf.lab"
+
+TOKEN=$(curl -sk -X POST "https://${SDDC}/v1/tokens" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"admin@local\",\"password\":\"${PASSWORD}\"}" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin).get('accessToken',''))")
 ```
 
-### Automation Scripts
+### List Credentials and Their Status
 
-- **Shutdown**: `hol/Shutdown/fleet.py` → `shutdown_products_fleet_lcm()` (primary for VCF 9.1)
-- **Auth**: `hol/Shutdown/fleet.py` → `get_fleet_lcm_jwt()` (handles credential discovery + JWT)
-- **Orchestration**: `hol/Shutdown/VCFshutdown.py` Phase 1 tries fleet-lcm direct first, then suite-api proxy fallback, then VCF 9.0 legacy, then Phase 1b VM power-off
+```bash
+curl -sk -H "Authorization: Bearer ${TOKEN}" \
+  "https://${SDDC}/v1/credentials" | python3 -c "
+import json,sys
+for el in json.load(sys.stdin).get('elements', []):
+    print(f\"{el['resource']['resourceName']:40s} {el['username']:50s} {el['credentialType']:15s} {el.get('accountStatus','UNKNOWN')}\")
+"
+```
 
-### Component Type Mapping
+### REMEDIATE a Single Resource
 
-| Product ID | Component Type | FQDN |
+```bash
+curl -sk -X PATCH -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  "https://${SDDC}/v1/credentials" \
+  -d '{
+    "operationType": "REMEDIATE",
+    "elements": [{
+      "resourceName": "esx-01a.site-a.vcf.lab",
+      "resourceType": "ESXI",
+      "credentials": [{
+        "credentialType": "SSH",
+        "username": "root",
+        "password": "'"${PASSWORD}"'"
+      }]
+    }]
+  }'
+```
+
+### Credential Resource Types
+
+| resourceType | Example Resources |
+| --- | --- |
+| `ESXI` | `esx-01a.site-a.vcf.lab` through `esx-07a` |
+| `VCENTER` | `vc-mgmt-a.site-a.vcf.lab`, `vc-wld01-a.site-a.vcf.lab` |
+| `NSXT_MANAGER` | `nsx-mgmt-01a.site-a.vcf.lab`, `nsx-wld01-01a.site-a.vcf.lab` |
+| `NSXT_EDGE` | `edge-mgmt-01a.site-a.vcf.lab`, `edge-wld01-01a.site-a.vcf.lab` |
+| `PSC` | Same FQDNs as vCenters (SSO admin credentials) |
+| `BACKUP` | Same FQDNs (backup credentials — skip these in bulk ops) |
+
+### Concurrency Limit
+
+SDDC Manager enforces a maximum of **10 concurrent credential operations**. If you see `HTTP 403` with "you have reached the maximum number of 10 concurrent update/rotate passwords operations", you must wait for existing tasks to complete or clear them.
+
+### Monitor Credential Task Progress
+
+```bash
+TASK_ID="<from PATCH response>"
+curl -sk -H "Authorization: Bearer ${TOKEN}" \
+  "https://${SDDC}/v1/tasks/${TASK_ID}" | python3 -c "
+import json,sys
+t = json.load(sys.stdin)
+print(f\"Status: {t['status']}\")
+for sub in t.get('subTasks', []):
+    print(f\"  {sub['name']}: {sub['status']} {sub.get('description','')}\")
+"
+```
+
+## 11. SDDC Manager PostgreSQL Direct Access
+
+When API-level operations are blocked by stale locks or inconsistent resource statuses, direct PostgreSQL access on SDDC Manager can be used as a last resort.
+
+### SSH + PostgreSQL Connection
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+# SSH as vcf, then su to root via expect (su requires a TTY)
+# The PostgreSQL password is in /root/.pgpass (base64-encoded format)
+# Connection: TCP on 127.0.0.1:5432, user postgres, database platform
+
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T \
+  vcf@sddcmanager-a.site-a.vcf.lab \
+  "export PGPASSWORD='iHk0JKypNFrR9C5iOI2PmBmUCfSbdrjFxaGoxEEFz3w='; \
+   /usr/pgsql/15/bin/psql -h 127.0.0.1 -U postgres -d platform -c \"SELECT 1\""
+```
+
+**Note**: The `PGPASSWORD` value above was discovered in `/root/.pgpass`. It may differ per deployment.
+
+### Clear Stale Resource Locks
+
+```bash
+# Resource locks prevent credential operations when previous tasks failed/hung
+/usr/pgsql/15/bin/psql -h 127.0.0.1 -U postgres -d platform \
+  -c "DELETE FROM lock"
+```
+
+### Fix Resource Statuses
+
+Resources stuck in `ERROR` or `ACTIVATING` state block credential operations with "Resources [...] are not available/ready."
+
+```bash
+/usr/pgsql/15/bin/psql -h 127.0.0.1 -U postgres -d platform \
+  -c "UPDATE host SET status = 'ACTIVE'" \
+  -c "UPDATE nsxt SET status = 'ACTIVE'" \
+  -c "UPDATE vcenter SET status = 'ACTIVE'" \
+  -c "UPDATE nsxt_edge_cluster SET status = 'ACTIVE'" \
+  -c "UPDATE domain SET status = 'ACTIVE'"
+```
+
+### Restart SDDC Manager Services After DB Changes
+
+```bash
+# Must restart services to pick up DB changes
+systemctl restart operationsmanager commonsvcs domainmanager
+```
+
+### Key Database Tables
+
+| Database | Table | Purpose |
 | --- | --- | --- |
-| `vra` | `VCFA` | `auto-a.site-a.vcf.lab` |
-| `vrni` | `OPERATIONS_FOR_NETWORKS` | `opsnet-a.site-a.vcf.lab` |
-| `vrli` | `OPERATIONS_FOR_LOGS` | `opslogs-a.site-a.vcf.lab` |
+| `platform` | `lock` | Resource-level locks for credential operations |
+| `platform` | `host` | ESXi host records (status column) |
+| `platform` | `nsxt` | NSX Manager records (status column) |
+| `platform` | `vcenter` | vCenter records (status column) |
+| `platform` | `nsxt_edge_cluster` | NSX Edge cluster records (status column) |
+| `platform` | `domain` | VCF domain records (status column) |
+| `platform` | `credential` | Credential records (encrypted secrets with IV) |
+| `operationsmanager` | `task` | Credential operation task records |
+| `operationsmanager` | `processing_task` | Active task tracking |
+| `operationsmanager` | `execution` | Task execution history |
+
+## 12. SDDC Manager Service Account Dependencies
+
+When SDDC Manager performs credential operations, it authenticates to vCenter using SSO service accounts. If these service account passwords are wrong on the vCenter SSO side, all credential operations fail with "Cannot complete login due to incorrect credentials."
+
+### Identify Service Accounts
+
+Service accounts follow the pattern `svc-sddcmanager-a-vc-<vcenter>-<id>@<sso-domain>` and `svc-nsx-<domain>-vc-<vcenter>-<id>@<sso-domain>`.
+
+```bash
+# List service accounts from SDDC Manager credentials
+curl -sk -H "Authorization: Bearer ${TOKEN}" \
+  "https://${SDDC}/v1/credentials" | python3 -c "
+import json,sys
+for el in json.load(sys.stdin).get('elements', []):
+    if el['username'].startswith('svc-'):
+        print(f\"{el['resource']['resourceName']:40s} {el['username']}\")
+"
+```
+
+### Reset Service Account Passwords on vCenter SSO
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+# Management vCenter (SSO domain: vsphere.local)
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-mgmt-a.site-a.vcf.lab \
+  "/usr/lib/vmware-vmafd/bin/dir-cli password reset \
+   --account svc-sddcmanager-a-vc-mgmt-a-9382 \
+   --new '${PASSWORD}' \
+   --login administrator@vsphere.local --password '${PASSWORD}'"
+
+# Workload vCenter (SSO domain: wld.sso)
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-wld01-a.site-a.vcf.lab \
+  "/usr/lib/vmware-vmafd/bin/dir-cli password reset \
+   --account svc-sddcmanager-a-vc-wld01-a-7530 \
+   --new '${PASSWORD}' \
+   --login administrator@wld.sso --password '${PASSWORD}'"
+```
+
+**Note**: The service account IDs (e.g., `-9382`, `-7530`) are unique per deployment. Query `/v1/credentials` to find the exact names.
+
+## 13. VCF Operations Version Differences
+
+| Behavior | VCF 9.0 | VCF 9.1 |
+| --- | --- | --- |
+| OpsToken authSource | `"local"` | `"localItem"` |
+| Password management API | Not available (404) | `/suite-api/internal/passwordmanagement/policies/*` |
+| Fleet CA certificate name | `VCF Operations Fleet Management Locker CA` | `Broadcom, Inc CA` |
+| suite-api lifecycle actions | HTTP 500 (not supported) | HTTP 500 (not supported) — use fleet-lcm direct API |
+| VCF Automation `sudo` | NOPASSWD | Password required (`echo pw \| sudo -S -i`) |
 
 ## Critical Pitfalls Discovered
 
@@ -475,16 +629,22 @@ https://fleet-01a.site-a.vcf.lab/fleet-lcm/v1/components  →  HTTP 401 = health
 5. **vCenter SSO domain differs**: Management = `@vsphere.local`, Workload = `@wld.sso`.
 6. **VCF Automation sudo changed in 9.1**: No longer NOPASSWD. Use `echo 'pw' | sudo -S -i`.
 7. **NSX Edge SSH requires -T flag**: PTY allocation causes connection drops for inline commands.
-8. **vCenter services may not autostart**: `vapi-endpoint` and `trustmanagement` frequently need manual start.
+8. **vCenter services may not autostart**: `vapi-endpoint` and `trustmanagement` frequently need manual start after cold boot.
 9. **Component CRDs are cluster-scoped**: `components.api.vmsp.vmware.com` is NOT namespaced. Using `-A` produces `<none>` namespace columns; using `-n` on annotate silently fails. Omit both.
 10. **SSH escaping breaks kubectl custom-columns**: Dotted annotation keys (e.g., `component\\.vmsp\\.vmware\\.com/...`) get mangled through SSH+sudo+bash-c layers. Use `-o json` and parse locally in Python instead.
 11. **VSP worker kubeconfig path differs**: Workers use `/etc/kubernetes/node-agent.conf`; only the control plane has `super-admin.conf`.
 12. **Postgres suspension is two-step**: Must set label `database.vmsp.vmware.com/suspended=true` AND patch Zalando `postgresqls.acid.zalan.do` `numberOfInstances` to 0. Both are needed for clean shutdown matching the startup unsuspend.
 13. **ClickHouse in vodap managed by operator**: The `chi-vcf-obs-*` and `chk-vcf-obs-keeper-*` statefulsets are managed by clickhouse-operator (in vmsp-metrics-store). Scaling down the operator alone does not stop ClickHouse pods — must scale the statefulsets directly.
-14. **suite-api proxy cannot shutdown components**: `POST /suite-api/internal/components/{id}?action=shutdown` returns HTTP 500. The proxy passes through GET/list operations but not lifecycle actions. Use the fleet-lcm direct API on `fleet-01a` instead (see section 8).
-15. **Fleet-lcm auth requires IAM client credentials from K8s secret**: The JWT for `fleet-01a` is obtained via OAuth2 password grant from `/api/v1/identity/token`. The client ID/secret must be read from the `vcf-iam-vcfa-admin` secret in the `vcf-fleet-lcm` namespace on the VSP control plane.
-16. **Fleet-lcm returns 401 when healthy**: Unauthenticated requests to `/fleet-lcm/v1/components` return HTTP 401, not 200. URL health checks must treat 401 as healthy for these endpoints.
-17. **Suspended Postgres causes cascading fleet-lcm CrashLoopBackOff**: If `postgresinstances.database.vmsp.vmware.com` have `database.vmsp.vmware.com/suspended=true` and `postgresqls.acid.zalan.do` have `numberOfInstances=0`, the Postgres pods never start. Fleet-lcm pods then crash with "Connection to vcf-fleet-lcm-db:5432 refused", making the VCF Management UI show "not functional". Fix by removing the label and patching numberOfInstances back to 1.
-18. **JSON parsing from SSH output requires banner stripping**: `kubectl -o json` output via SSH is prepended with Photon OS banner messages ("Welcome to Photon..."). Always find the first `{` character to isolate JSON before calling `json.loads()`. Use balanced-brace counting if the output has trailing garbage after the JSON.
-
-For detailed endpoint reference and troubleshooting, see [VCF_9x_Endpoints.md](../../Documents/git/cursor/VCF_9x_Endpoints.md).
+14. **dir-cli `user modify` does NOT change passwords**: Use `password reset` subcommand instead. `user modify --password-never-expires` only controls expiration policy.
+15. **VCF upgrade rotates CSI service account passwords**: After VCF upgrades (e.g., 9.0.0 to 9.0.1), the `svc-vcfsp-vc-*@vsphere.local` password in vCenter SSO may no longer match the K8s secrets. Both `vsphere-config-secret` and `vsphere-cloud-secret` in kube-system namespace must be updated.
+16. **vCenter SSH host keys change on upgrade**: VCF upgrades regenerate vCenter SSH host keys. Use `ssh-keygen -R` to remove old keys and `-o StrictHostKeyChecking=accept-new` for all SSH commands.
+17. **VCF Automation microservices don't auto-scale after shutdown**: The ~50 deployments in the `prelude` namespace stay at 0 replicas. The `vcfa-service-manager` reconciles addons/CRDs but does not restore replica counts. Must be manually scaled to 1.
+18. **NSX Edge `/root/.ssh/` directory missing**: NSX Edges don't have `/root/.ssh/` by default. Must `mkdir -p /root/.ssh && chmod 700 /root/.ssh` before copying authorized_keys.
+19. **VCF Operations Fleet CA extraction**: The Fleet Operations root CA can be extracted from the TLS chain at `ops-a:443` using `openssl s_client -showcerts`. It's the last cert in the chain (self-signed, O=VMware, CN=VCF Operations Fleet Management Locker CA).
+20. **SDDC Manager credential `UPDATE` vs `REMEDIATE`**: `UPDATE` changes the password on the target component AND SDDC Manager's DB. `REMEDIATE` only updates SDDC Manager's stored credential (assumes you already changed it externally). `UPDATE` does NOT work for service accounts — use `ROTATE` instead.
+21. **SDDC Manager resource locks block credential ops**: Failed or hung credential tasks leave stale entries in the `platform.lock` table. The `/v1/resource-locks` API does NOT support DELETE. Must clear locks via direct PostgreSQL access (`DELETE FROM lock`).
+22. **SDDC Manager resource status must be ACTIVE**: Credential operations fail with "Resources [...] are not available/ready" if the host/nsxt/vcenter/domain status is `ERROR` or `ACTIVATING`. Fix via direct DB update, not API.
+23. **SDDC Manager PostgreSQL uses TCP, not socket**: `psql` must connect via `-h 127.0.0.1`, not the default Unix socket (which doesn't exist). Password is in `/root/.pgpass`.
+24. **SDDC Manager `su - root` requires TTY**: SSH to SDDC Manager as `vcf` then `su - root` fails with "must be run from a terminal" unless `ssh -t` or `expect` is used to allocate a PTY.
+25. **SDDC Manager service account dependencies are circular**: Credential remediation for ESXi/NSX/vCenter requires SDDC Manager to authenticate to vCenter via SSO service accounts (`svc-sddcmanager-a-vc-*`). If those service account passwords are wrong in vCenter SSO, ALL credential operations fail — even for unrelated resources like ESXi hosts. Fix the service accounts first via `dir-cli password reset` on each vCenter.
+26. **SDDC Manager 10-task concurrency limit**: Maximum 10 concurrent credential update/rotate operations. Failed/cancelled tasks count against this limit until they expire. Clear by restarting `operationsmanager` service or waiting.

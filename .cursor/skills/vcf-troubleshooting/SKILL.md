@@ -1,6 +1,6 @@
 ---
 name: vcf-troubleshooting
-description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, and proxy/DNS issues. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, or proxy issues.
+description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, and SDDC Manager credential remediation failures. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, or password remediation failures.
 ---
 
 # VCF 9.x Troubleshooting Guide
@@ -23,6 +23,13 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | Proxy wait timeout | Lab startup stuck "Waiting for proxy" | Circular dependency between manager and router boot | 10 |
 | VCF Management not functional | Fleet LCM UI shows "not functional", HTTP 500 | Postgres instances suspended, fleet-lcm pods CrashLoopBackOff | 11 |
 | VCF Automation API shutdown fails | suite-api proxy returns HTTP 500 on shutdown action | suite-api does not proxy lifecycle actions; use fleet-lcm direct API | 12 |
+| CSI password rotated after upgrade | CSI CrashLoopBackOff, "incorrect user name or password" | VCF upgrade rotates `svc-vcfsp-vc-*` SSO service account password | 13 |
+| SSH host key mismatch after upgrade | SSH rejected with "REMOTE HOST IDENTIFICATION HAS CHANGED" | VCF upgrade regenerates vCenter SSH host keys | 14 |
+| VCFA microservices at 0 replicas | VCF Automation returns "no healthy upstream" (503) | Shutdown scaled all ~50 prelude deployments to 0, not auto-restored | 15 |
+| SDDC Manager credentials all UNKNOWN | All 43 credentials show UNKNOWN status in UI | Service account passwords out of sync with vCenter SSO + stale resource locks | 16 |
+| SDDC Manager REMEDIATE blocked by locks | "Unable to acquire resource level lock(s)" | Stale locks in platform.lock table from failed/cancelled tasks | 17 |
+| SDDC Manager REMEDIATE resources not ready | "Resources [...] are not available/ready" | Host/NSX/vCenter status stuck in ERROR/ACTIVATING in platform DB | 18 |
+| SDDC Manager REMEDIATE SSO login failure | "Cannot complete login due to incorrect credentials" | SDDC Manager service account passwords wrong in vCenter SSO | 19 |
 
 ---
 
@@ -388,91 +395,6 @@ squid -k reconfigure
 
 ---
 
-## 11. VCF Management "Not Functional" (Fleet LCM Down)
-
-**Symptom**: In VCF Operations UI (`ops-a` → Build → Lifecycle), VCF Management shows "not currently functional." Direct curl to `https://fleet-01a.site-a.vcf.lab/fleet-lcm/v1/components` returns HTTP 500.
-
-**Diagnosis**:
-
-```bash
-PASSWORD=$(cat /home/holuser/creds.txt)
-VU='vmware-system-user'
-VSP_CP='10.1.1.142'
-
-# Check fleet-lcm pods
-sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
-  "echo '${PASSWORD}' | sudo -S -i kubectl get pods -n vcf-fleet-lcm --no-headers 2>/dev/null"
-# Look for: CrashLoopBackOff
-
-# Check fleet-lcm pod logs
-sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
-  "echo '${PASSWORD}' | sudo -S -i kubectl logs -n vcf-fleet-lcm \
-   \$(kubectl get pods -n vcf-fleet-lcm -o name | head -1) --tail=20 2>/dev/null"
-# Look for: "Connection to vcf-fleet-lcm-db.vcf-fleet-lcm:5432 refused"
-
-# Check Postgres suspension state
-sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
-  "echo '${PASSWORD}' | sudo -S -i kubectl get postgresinstances.database.vmsp.vmware.com \
-   -A -o json 2>/dev/null" | python3 -c "
-import json,sys
-data = json.load(sys.stdin)
-for item in data.get('items', []):
-    ns = item['metadata']['namespace']
-    name = item['metadata']['name']
-    labels = item['metadata'].get('labels', {})
-    suspended = labels.get('database.vmsp.vmware.com/suspended', 'false')
-    print(f'{ns}/{name}: suspended={suspended}')
-"
-```
-
-**Root Cause**: After a cold boot, the `VCFfinal.py` startup script may fail to unsuspend Postgres instances due to an SSH escaping bug with `kubectl custom-columns` and dotted label keys. The `database.vmsp.vmware.com/suspended=true` label persists, and the Zalando operator keeps `numberOfInstances=0`, so the Postgres pods never start. Fleet-lcm pods then crash because their database is unreachable.
-
-**Fix**:
-
-```bash
-# Unsuspend Postgres + restore numberOfInstances
-for ns in salt-raas vcf-fleet-lcm vcf-sddc-lcm vidb-external; do
-    sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
-      "echo '${PASSWORD}' | sudo -S -i kubectl label postgresinstances.database.vmsp.vmware.com \
-       --all -n ${ns} database.vmsp.vmware.com/suspended- 2>/dev/null"
-
-    sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
-      "echo '${PASSWORD}' | sudo -S -i kubectl get postgresqls.acid.zalan.do -n ${ns} \
-       -o name 2>/dev/null" | while read pg; do
-        sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
-          "echo '${PASSWORD}' | sudo -S -i kubectl patch ${pg} -n ${ns} --type=merge \
-           -p '{\"spec\":{\"numberOfInstances\":1}}' 2>/dev/null"
-    done
-done
-
-# Delete crashed pods to force restart (they'll reconnect to the now-running Postgres)
-sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no ${VU}@${VSP_CP} \
-  "echo '${PASSWORD}' | sudo -S -i kubectl delete pods -n vcf-fleet-lcm \
-   --field-selector=status.phase!=Running 2>/dev/null"
-```
-
-**Prevention**: The `VCFfinal.py` startup script (v4.2+) now uses `kubectl get ... -o json` parsed locally in Python instead of `custom-columns` via SSH, avoiding the escaping issue. It also has a fallback that unconditionally unsuspends known namespaces if JSON parsing fails.
-
----
-
-## 12. VCF Automation API Shutdown Fails (HTTP 500 via suite-api)
-
-**Symptom**: `fleet.py:shutdown_products_v91()` returns HTTP 500 when calling `POST /suite-api/internal/components/{id}?action=shutdown` on `ops-a`.
-
-**Root Cause**: The VCF Operations `suite-api` internal proxy passes through GET/list requests to the fleet-lcm backend but does **not** support lifecycle action endpoints (shutdown, startup). These actions return HTTP 500.
-
-**Fix**: Use the fleet-lcm direct API on `fleet-01a.site-a.vcf.lab` instead. This requires a JWT from the VSP Identity Service — see the vcf-9-api skill, section 8 (Fleet LCM Direct API).
-
-**Implementation**: `VCFshutdown.py` (v2.4+) Phase 1 now tries the fleet-lcm direct API first, falling back to the suite-api proxy (which works for component listing but not actions), then VCF 9.0 legacy, then Phase 1b VM power-off.
-
-The key functions in `fleet.py`:
-- `get_fleet_lcm_jwt()` — handles IAM credential discovery + JWT acquisition
-- `shutdown_products_fleet_lcm()` — orchestrates component shutdown with task polling
-- `shutdown_component_fleet_lcm()` — triggers shutdown for a single component
-- `wait_for_fleet_lcm_task()` — polls task status until SUCCEEDED/FAILED/timeout
-
----
-
 ## Holodeck Environment Architecture
 
 ```
@@ -510,3 +432,369 @@ External Network
                - vmsp-gateway-0: 10.1.1.132 = instance-01a.site-a.vcf.lab
                - vmsp-gateway-1: 10.1.1.36  = fleet-01a.site-a.vcf.lab
 ```
+
+---
+
+## 11. VCF Management "Not Functional" (Fleet LCM Down)
+
+**Symptom**: In VCF Operations UI (`ops-a` > Build > Lifecycle), VCF Management shows "not currently functional." Direct curl to `https://fleet-01a.site-a.vcf.lab/fleet-lcm/v1/components` returns HTTP 500.
+
+**Diagnosis**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+VU='vmware-system-user'
+VSP_CP='10.1.1.142'
+
+# Check fleet-lcm pods
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new ${VU}@${VSP_CP} \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get pods -n vcf-fleet-lcm --no-headers 2>/dev/null"
+
+# Check Postgres suspension state
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new ${VU}@${VSP_CP} \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get postgresinstances.database.vmsp.vmware.com \
+   -A -o json 2>/dev/null" | python3 -c "
+import json,sys
+data = json.load(sys.stdin)
+for item in data.get('items', []):
+    ns = item['metadata']['namespace']
+    name = item['metadata']['name']
+    labels = item['metadata'].get('labels', {})
+    suspended = labels.get('database.vmsp.vmware.com/suspended', 'false')
+    print(f'{ns}/{name}: suspended={suspended}')
+"
+```
+
+**Root Cause**: After a cold boot, the `VCFfinal.py` startup script may fail to unsuspend Postgres instances due to an SSH escaping bug with `kubectl custom-columns`. The `database.vmsp.vmware.com/suspended=true` label persists, and the Zalando operator keeps `numberOfInstances=0`.
+
+**Fix**: See Section 6 (VCF Components Stopped After Cold Boot) for the unsuspend procedure.
+
+---
+
+## 12. VCF Automation API Shutdown Fails (HTTP 500 via suite-api)
+
+**Symptom**: `POST /suite-api/internal/components/{id}?action=shutdown` on `ops-a` returns HTTP 500.
+
+**Root Cause**: The VCF Operations `suite-api` internal proxy does **not** support lifecycle action endpoints (shutdown, startup). These actions return HTTP 500.
+
+**Fix**: Use the fleet-lcm direct API on `fleet-01a.site-a.vcf.lab`. Requires JWT from VSP Identity Service. See the vcf-9-api skill for Fleet LCM JWT acquisition.
+
+---
+
+## 13. CSI Service Account Password Rotated After VCF Upgrade
+
+**Symptom**: CSI controller on VCF Automation (`auto-a`) in CrashLoopBackOff. Logs show:
+`failed to login to vc. err: ServerFaultCode: Cannot complete login due to an incorrect user name or password.`
+
+**Diagnosis**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+# Check CSI controller logs
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl logs -n kube-system \
+   -l app=vsphere-csi-controller -c vsphere-csi-controller --tail=10 2>/dev/null"
+# Look for: "Cannot complete login due to an incorrect user name or password"
+
+# Check what credentials CSI is using
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get secret vsphere-config-secret \
+   -n kube-system -o jsonpath='{.data.csi-vsphere\.conf}' 2>/dev/null" | base64 -d
+
+# Test the credentials against vCenter
+curl -sk 'https://vc-mgmt-a.site-a.vcf.lab/rest/com/vmware/cis/session' \
+  -u 'SERVICE_ACCOUNT:PASSWORD_FROM_SECRET' -X POST -o /dev/null -w '%{http_code}'
+```
+
+**Root Cause**: VCF upgrades (e.g., 9.0.0 to 9.0.1) can rotate the vSphere CSI service account password (`svc-vcfsp-vc-*@vsphere.local`) in vCenter SSO without updating the K8s secrets on the VCF Automation VM. The CSI controller then crashes because it can't authenticate to vCenter.
+
+**Fix**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+# 1. Find the service account name from the CSI secret
+CSI_USER=$(sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get secret vsphere-config-secret \
+   -n kube-system -o jsonpath='{.data.csi-vsphere\.conf}' 2>/dev/null" | base64 -d | grep user | awk -F'"' '{print $2}')
+CSI_ACCOUNT=$(echo "$CSI_USER" | cut -d@ -f1)
+
+# 2. Reset the password in vCenter SSO (use dir-cli, NOT the REST API)
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-mgmt-a.site-a.vcf.lab \
+  "/usr/lib/vmware-vmafd/bin/dir-cli password reset --account ${CSI_ACCOUNT} \
+   --new 'NEW_PASSWORD_HERE' --login administrator@vsphere.local --password '${PASSWORD}'"
+
+# 3. Also set password to never expire
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-mgmt-a.site-a.vcf.lab \
+  "/usr/lib/vmware-vmafd/bin/dir-cli user modify --account ${CSI_ACCOUNT} \
+   --password-never-expires --login administrator@vsphere.local --password '${PASSWORD}'"
+
+# 4. Update the K8s secrets on auto-a with the new password
+# Generate new config content, base64 encode, and patch both secrets:
+#   - vsphere-config-secret (csi-vsphere.conf key)
+#   - vsphere-cloud-secret (vc-mgmt-a.site-a.vcf.lab.password key)
+
+# 5. Restart CSI pods
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i bash -c '\
+   kubectl delete pod -n kube-system -l app=vsphere-csi-controller --force; \
+   kubectl delete pod -n kube-system -l app=vsphere-csi-node --force'"
+```
+
+**Key Detail**: `dir-cli` on vCenter is at `/usr/lib/vmware-vmafd/bin/dir-cli`. The `user modify` subcommand does NOT support changing passwords — you must use `password reset`. The `user modify --password-never-expires` only controls expiration policy.
+
+---
+
+## 14. SSH Host Key Mismatch After VCF Upgrade
+
+**Symptom**: SSH to vCenters fails with `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!` and `Password authentication is disabled to avoid man-in-the-middle attacks.`
+
+**Root Cause**: VCF upgrades (e.g., 9.0.0 to 9.0.1) regenerate vCenter SSH host keys. The old fingerprints in `/home/holuser/.ssh/known_hosts` no longer match, and SSH refuses to connect.
+
+**Impact**: Lab startup scripts that SSH to vCenters to start `vapi-endpoint` and `trustmanagement` services will fail silently, causing cascading failures (CSI controller can't reach vCenter, volumes can't attach, pods can't start).
+
+**Fix**:
+
+```bash
+# Remove stale host keys for all vCenters
+ssh-keygen -f '/home/holuser/.ssh/known_hosts' -R 'vc-mgmt-a.site-a.vcf.lab'
+ssh-keygen -f '/home/holuser/.ssh/known_hosts' -R 'vc-wld01-a.site-a.vcf.lab'
+
+# Reconnect with auto-accept (future SSH commands should use this flag)
+sshpass -p "$(cat /home/holuser/creds.txt)" ssh -o StrictHostKeyChecking=accept-new \
+  root@vc-mgmt-a.site-a.vcf.lab "echo connected"
+```
+
+**Prevention**: All SSH commands in startup scripts should use `-o StrictHostKeyChecking=accept-new` instead of `-o StrictHostKeyChecking=no` to auto-accept new keys without prompting, or explicitly clear known_hosts entries before connecting.
+
+---
+
+## 15. VCF Automation Microservices All at 0 Replicas
+
+**Symptom**: VCF Automation (`https://auto-a.site-a.vcf.lab`) returns "no healthy upstream" (HTTP 503) even though `tenant-manager-0` is Running and the VCD cell has completed startup. The cell.log shows `Cell startup completed`.
+
+**Diagnosis**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+# Check deployments in prelude namespace
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get deployments -n prelude --no-headers 2>/dev/null" \
+  | head -20
+# Look for 0/0 in the READY column — all microservices at zero replicas
+
+# Check vcfa-service-manager
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get deployment vcfa-service-manager \
+   -n prelude --no-headers 2>/dev/null"
+```
+
+**Root Cause**: During shutdown, all VCF Automation deployments in the `prelude` namespace (api-gateway, cloud-automation-ui, authentication, catalog-service, etc. — approximately 50 deployments) are scaled to 0 replicas. The `vcfa-service-manager` is also scaled to 0. On restart, the infrastructure pods (rabbitmq, postgres, kafka, tenant-manager) come up, but the service-manager reconciles addons/service-accounts without scaling up the application deployments.
+
+**Fix**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+# 1. Scale up vcfa-service-manager first
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl scale deployment vcfa-service-manager \
+   -n prelude --replicas=1 2>/dev/null"
+
+# 2. Scale up ALL zero-replica deployments in prelude namespace
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get deployments -n prelude -o json 2>/dev/null" \
+  | python3 -c "
+import json,sys
+data = json.load(sys.stdin)
+for d in data.get('items', []):
+    name = d['metadata']['name']
+    if d['spec'].get('replicas', 1) == 0:
+        print(name)
+" | while read dep; do
+    sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+      "echo '${PASSWORD}' | sudo -S -i kubectl scale deployment ${dep} \
+       -n prelude --replicas=1 2>/dev/null"
+done
+
+# 3. Wait ~5 minutes for all pods to start (50+ microservices)
+# Monitor with:
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get deployments -n prelude --no-headers 2>/dev/null" \
+  | grep -c '1/1'
+# Should reach ~50 when fully started
+```
+
+**Key Details**:
+- The VCF Automation K8s API is on `10.1.1.71` (VCF 9.0) or `10.1.1.72` (VCF 9.1), NOT `auto-a` (10.1.1.70) which is the istio ingress IP.
+- The `tenant-manager-0` pod runs the VCD cell (Java process). It takes ~2 minutes to initialize. Check: `kubectl exec tenant-manager-0 -n prelude -- tail -5 /opt/vmware/vcloud-director/logs/cell.log`
+- The `vco-app-0` StatefulSet (Orchestrator) also needs to be running. Check with `kubectl get statefulset -n prelude`.
+- After scaling up, it takes ~5 minutes for all 50 microservices to reach 1/1 Running state.
+
+---
+
+## 16. SDDC Manager Credentials All Showing UNKNOWN Status
+
+**Symptom**: SDDC Manager UI (Inventory > Passwords) shows all 43 credentials with `UNKNOWN` account status. The GUI displays password warning/error icons for multiple resources.
+
+**Diagnosis**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+SDDC="sddcmanager-a.site-a.vcf.lab"
+
+TOKEN=$(curl -sk -X POST "https://${SDDC}/v1/tokens" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"admin@local\",\"password\":\"${PASSWORD}\"}" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin).get('accessToken',''))")
+
+curl -sk -H "Authorization: Bearer ${TOKEN}" \
+  "https://${SDDC}/v1/credentials" | python3 -c "
+import json,sys
+creds = json.load(sys.stdin).get('elements', [])
+for c in creds:
+    print(f\"{c['resource']['resourceName']:40s} {c['username']:50s} {c.get('accountStatus','?')}\")
+print(f'Total: {len(creds)} credentials')
+"
+```
+
+**Root Cause**: This is a compound failure with multiple interdependent causes:
+1. SDDC Manager's SSO service accounts (`svc-sddcmanager-a-vc-*`) have incorrect passwords in vCenter SSO, so SDDC Manager cannot authenticate to vCenters to validate any credentials.
+2. Previous failed credential operations left stale resource locks in the database, blocking new operations.
+3. Resource statuses are stuck in `ERROR` or `ACTIVATING`, preventing credential validation.
+
+**Fix** (must be done in this order):
+
+1. **Reset vCenter SSO service account passwords** — see Section 19
+2. **Clear stale resource locks** — see Section 17
+3. **Fix resource statuses** — see Section 18
+4. **Run REMEDIATE operations** one resource at a time (not all at once to avoid the 10-task concurrency limit)
+
+---
+
+## 17. SDDC Manager REMEDIATE Blocked by Stale Resource Locks
+
+**Symptom**: `PATCH /v1/credentials` with `operationType: REMEDIATE` fails with "Unable to acquire resource level lock(s)."
+
+**Diagnosis**:
+
+```bash
+# Check for existing locks (API endpoint is read-only)
+curl -sk -H "Authorization: Bearer ${TOKEN}" \
+  "https://${SDDC}/v1/resource-locks"
+```
+
+**Root Cause**: Failed, cancelled, or timed-out credential operations leave lock entries in the `platform.lock` database table. The `/v1/resource-locks` API does NOT support DELETE — locks can only be cleared via direct database access.
+
+**Fix**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T \
+  vcf@sddcmanager-a.site-a.vcf.lab \
+  "export PGPASSWORD='iHk0JKypNFrR9C5iOI2PmBmUCfSbdrjFxaGoxEEFz3w='; \
+   /usr/pgsql/15/bin/psql -h 127.0.0.1 -U postgres -d platform \
+   -c 'SELECT * FROM lock' \
+   -c 'DELETE FROM lock'"
+```
+
+**Note**: The PostgreSQL password is found in `/root/.pgpass` on SDDC Manager. It may differ per deployment. SSH as `vcf` user can run `psql` directly without needing root.
+
+---
+
+## 18. SDDC Manager REMEDIATE Fails — Resources Not Ready
+
+**Symptom**: `PATCH /v1/credentials` with `operationType: REMEDIATE` fails with "Resources [esx-01a.site-a.vcf.lab] are not available/ready."
+
+**Diagnosis**:
+
+```bash
+# Check resource statuses via API
+curl -sk -H "Authorization: Bearer ${TOKEN}" \
+  "https://${SDDC}/v1/hosts" | python3 -c "
+import json,sys
+for h in json.load(sys.stdin).get('elements', []):
+    print(f\"{h['fqdn']:40s} status={h['status']}\")
+"
+
+# Similarly check NSX and vCenter
+curl -sk -H "Authorization: Bearer ${TOKEN}" "https://${SDDC}/v1/nsxt-clusters"
+curl -sk -H "Authorization: Bearer ${TOKEN}" "https://${SDDC}/v1/vcenters"
+```
+
+**Root Cause**: SDDC Manager's internal database tracks resource statuses. After failed credential operations or lab restarts, resources can get stuck in `ERROR`, `ACTIVATING`, or other non-`ACTIVE` states. The credential validation pre-check rejects operations on non-ACTIVE resources, even if the actual components are reachable.
+
+**Fix**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T \
+  vcf@sddcmanager-a.site-a.vcf.lab \
+  "export PGPASSWORD='iHk0JKypNFrR9C5iOI2PmBmUCfSbdrjFxaGoxEEFz3w='; \
+   /usr/pgsql/15/bin/psql -h 127.0.0.1 -U postgres -d platform \
+   -c \"UPDATE host SET status = 'ACTIVE' WHERE status != 'ACTIVE'\" \
+   -c \"UPDATE nsxt SET status = 'ACTIVE' WHERE status != 'ACTIVE'\" \
+   -c \"UPDATE vcenter SET status = 'ACTIVE' WHERE status != 'ACTIVE'\" \
+   -c \"UPDATE nsxt_edge_cluster SET status = 'ACTIVE' WHERE status != 'ACTIVE'\" \
+   -c \"UPDATE domain SET status = 'ACTIVE' WHERE status != 'ACTIVE'\""
+```
+
+After updating, restart SDDC Manager services:
+
+```bash
+# Requires root (via expect or su) on SDDC Manager
+systemctl restart operationsmanager commonsvcs domainmanager
+```
+
+---
+
+## 19. SDDC Manager REMEDIATE Fails — SSO Service Account Login Error
+
+**Symptom**: `PATCH /v1/credentials` with `operationType: REMEDIATE` fails with "Cannot complete login due to incorrect credentials: ... svc-sddcmanager-a-vc-mgmt-a-9382@vsphere.local"
+
+**Diagnosis**: SDDC Manager uses vCenter SSO service accounts to authenticate to vCenters during credential validation. These service accounts are managed in vCenter's SSO directory, NOT in SDDC Manager's credential store.
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+# List SDDC Manager's service accounts
+curl -sk -H "Authorization: Bearer ${TOKEN}" \
+  "https://${SDDC}/v1/credentials" | python3 -c "
+import json,sys
+for el in json.load(sys.stdin).get('elements', []):
+    if el['username'].startswith('svc-'):
+        print(f\"{el['resource']['resourceName']:40s} {el['username']}\")
+"
+```
+
+**Root Cause**: The service account passwords stored in SDDC Manager's database no longer match what vCenter SSO expects. This can happen after lab resets, SDDC Manager DB restores, or manual password changes.
+
+**Fix**: Reset each service account's password in vCenter SSO using `dir-cli`, then update SDDC Manager's credential via REMEDIATE.
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+# Management vCenter service accounts (SSO domain: vsphere.local)
+for acct in svc-sddcmanager-a-vc-mgmt-a-9382 svc-nsx-mgmt-a-vc-mgmt-a-5529; do
+  sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-mgmt-a.site-a.vcf.lab \
+    "/usr/lib/vmware-vmafd/bin/dir-cli password reset \
+     --account ${acct} --new '${PASSWORD}' \
+     --login administrator@vsphere.local --password '${PASSWORD}'"
+done
+
+# Workload vCenter service accounts (SSO domain: wld.sso)
+for acct in svc-sddcmanager-a-vc-wld01-a-7530 svc-nsx-wld01-a-vc-wld01-a-1894; do
+  sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-wld01-a.site-a.vcf.lab \
+    "/usr/lib/vmware-vmafd/bin/dir-cli password reset \
+     --account ${acct} --new '${PASSWORD}' \
+     --login administrator@wld.sso --password '${PASSWORD}'"
+done
+```
+
+**Note**: Service account IDs (e.g., `-9382`, `-7530`, `-5529`, `-1894`) are unique per deployment. Always query `/v1/credentials` to discover the exact names. After resetting in vCenter SSO, restart SDDC Manager services (`systemctl restart operationsmanager commonsvcs domainmanager`) before retrying credential operations.
+
+**Important**: Fix service accounts BEFORE attempting REMEDIATE on any other credentials. SDDC Manager uses these accounts as part of its validation pipeline for ALL credential operations — even ESXi host password checks flow through the vCenter SSO service account.

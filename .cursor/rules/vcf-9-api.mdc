@@ -1,100 +1,40 @@
 ---
 alwaysApply: true
 ---
-# VCF 9 API Guidance and Troubleshooting
+# VCF 9.x Lab Environment Quick Reference
 
-This skill provides guidance and automation patterns for interacting with VCF 9.0 and 9.1 APIs, based on extensive troubleshooting and exploration.
+This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All passwords default to `/home/holuser/creds.txt`.
 
-## Core API Principles
+## Key Hostnames & Auth
 
-1.  **SDDC Manager**: Use Basic Auth with `vcf` user. Check `/v1/credentials` for rotated passwords.
-2.  **VCF Operations (Aria)**: Use `OpsToken` with `X-vRealizeOps-API-use-unsupported: true` header for internal endpoints.
-3.  **NSX Manager**: Use numeric IDs for user management (`0`=root, `10000`=admin).
-4.  **NSX Edges**: Manage via NSX Manager Transport Node API (`/api/v1/transport-nodes/{id}/node/...`).
-5.  **Fleet LCM (VCF 9.1)**: Use JWT Bearer token from VSP Identity Service (`fleet-01a/api/v1/identity/token`). The `ops-a` suite-api proxy does NOT support lifecycle actions (shutdown/startup) — use `fleet-01a` direct API.
+| Component | Hostname | User | Auth |
+| --- | --- | --- | --- |
+| SDDC Manager | `sddcmanager-a.site-a.vcf.lab` | `vcf` | Basic Auth |
+| VCF Operations | `ops-a.site-a.vcf.lab` | `admin` | OpsToken |
+| vCenter (Mgmt) | `vc-mgmt-a.site-a.vcf.lab` | `administrator@vsphere.local` | Session |
+| vCenter (WLD) | `vc-wld01-a.site-a.vcf.lab` | `administrator@wld.sso` | Session |
+| NSX (Mgmt) | `nsx-mgmt-01a.site-a.vcf.lab` | `admin` | Basic Auth |
+| NSX (WLD) | `nsx-wld01-01a.site-a.vcf.lab` | `admin` | Basic Auth |
+| VCF Automation | `auto-a.site-a.vcf.lab` (10.1.1.70/71) | `vmware-system-user` | SSH+sudo |
+| VSP Cluster CP | `10.1.1.142` (VIP) | `vmware-system-user` | SSH+sudo |
 
-## Common API Snippets
+## Critical Reminders
 
-### Get OpsToken (VCF Operations)
-```python
-import requests
-url = "https://ops-a.site-a.vcf.lab/suite-api/api/auth/token/acquire"
-payload = {"username": "admin", "password": "...", "authSource": "localItem"}
-headers = {"X-vRealizeOps-API-use-unsupported": "true"}
-response = requests.post(url, json=payload, headers=headers)
-token = response.json()["token"]
-```
+- **SDDC Manager rotates passwords** — check `/v1/credentials` if standard password fails.
+- **vCenter SSH host keys change on upgrade** — always use `StrictHostKeyChecking=accept-new`.
+- **vapi-endpoint and trustmanagement often STOPPED** after boot — start via `vmon-cli --start`.
+- **NSX user IDs are numeric** (`0`=root, `10000`=admin). NSX CLI password-expiration broken on 9.1 — use REST API.
+- **Component CRDs are cluster-scoped** (`components.api.vmsp.vmware.com`) — never use `-A` or `-n` flags.
+- **SSH escaping with kubectl** — use `-o json` parsed locally, never `custom-columns` through SSH layers.
+- **VCF Automation microservice deployments** may remain at 0 replicas after shutdown — must be scaled up manually.
+- **CSI service account passwords** (`svc-vcfsp-vc-*@vsphere.local`) can be rotated during VCF upgrades — reset via `dir-cli password reset` on vCenter.
+- **VCF 9.0 vs 9.1**: OpsToken authSource is `local` (9.0) vs `localItem` (9.1). Password management API only exists in 9.1+. VCF Automation sudo is NOPASSWD (9.0) vs password-required (9.1).
+- **SDDC Manager credential REMEDIATE** requires: (1) service accounts fixed in vCenter SSO first, (2) stale locks cleared from `platform.lock` table, (3) resource statuses set to ACTIVE in platform DB. Process one resource at a time (10-task concurrency limit).
+- **SDDC Manager PostgreSQL** is on `127.0.0.1:5432` (TCP, not socket). Password in `/root/.pgpass`. SSH as `vcf` user can run `psql` without root.
+- **SDDC Manager `/v1/resource-locks` API is read-only** — cannot DELETE locks via API. Must use direct `psql` access to `DELETE FROM lock`.
 
-### Get Fleet LCM JWT (VCF 9.1 Component Lifecycle)
-```python
-# 1. Get IAM credentials from K8s secret vcf-iam-vcfa-admin in vcf-fleet-lcm ns
-# 2. POST https://fleet-01a.site-a.vcf.lab/api/v1/identity/token
-#    grant_type=password, username=admin, password=<creds.txt>
-#    Authorization: Basic <base64(client_id:client_secret)>
-# 3. Use access_token as Bearer token for fleet-lcm API
-# Shutdown: POST /fleet-lcm/v1/components/{uuid}?action=shutdown -> HTTP 202
-# CRITICAL: ops-a suite-api proxy returns HTTP 500 for shutdown actions.
-#           Use fleet-01a direct API instead.
-```
+## Session Knowledge Capture
 
-### Enable SSH on NSX Edge
-```python
-# POST /api/v1/transport-nodes/{node_id}/node/services/ssh?action=start
-```
-
-### Set NSX Password Expiration (9.1)
-```python
-# Use the API, as CLI may reset to 0
-# PUT /api/v1/node/users/10000
-# Body: {"password_change_frequency": 729}
-```
-
-## VCF Services Runtime (VSP Cluster) Patterns
-
-### Component CRDs Are Cluster-Scoped
-*   `components.api.vmsp.vmware.com` is **NOT namespaced** (`NAMESPACED=false`).
-*   Do NOT use `-A` flag (produces `<none>` namespace columns).
-*   Do NOT use `-n` flag on get/annotate (silently fails).
-*   Correct: `kubectl annotate components.api.vmsp.vmware.com salt component.vmsp.vmware.com/operational-status=Running --overwrite`
-
-### SSH Escaping with kubectl
-*   `lsf.ssh()` wraps commands in double quotes: `sshpass -p pw ssh target "cmd"`.
-*   Combined with `bash -c '...'`, dotted annotation keys in `custom-columns`/`jsonpath` get mangled through 4 escaping layers.
-*   **Fix**: Use `-o json` and parse the JSON locally in Python (`json.loads()`). Strip SSH banner by finding first `{` in stdout.
-
-### Graceful Shutdown/Startup
-*   **Shutdown**: `python3 hol/Shutdown/Shutdown.py --phase 2b` (scales down components, suspends postgres, annotates CRDs NotRunning)
-*   **Startup**: `hol/Startup/VCFfinal.py` Task 2e (unsuspends postgres, scales up, annotates Running)
-*   **Config**: `/tmp/config.ini` `[VCFFINAL] vcfcomponents` (format: `namespace:resource_type/name`)
-*   Postgres suspension is two-step: label `suspended=true` AND patch Zalando `numberOfInstances` to 0.
-*   vodap ClickHouse statefulsets (`chi-*`, `chk-*`) must be scaled down separately from the operator.
-
-## Troubleshooting Patterns
-
-### Supervisor Stuck in "Configuring"
-*   **Check**: `kubectl get pods -n kube-system` on the SCP node.
-*   **Issue**: `kubectl-plugin-vsphere` (nginx) in `CrashLoopBackOff`.
-*   **Cause**: Unresolvable upstream `fleet-01a.site-a.vcf.lab` in nginx config.
-*   **Fix**: Use nginx variables in `/etc/vmware/wcp/nginx/forwarding_rules_vcf_cli.conf` to defer DNS resolution.
-
-### VCF Operations Internal API (401/403)
-*   **Issue**: `suite-api/internal/` endpoints return 401 or 403.
-*   **Fix**: Ensure `X-vRealizeOps-API-use-unsupported: true` header is present and `authSource` is `localItem`.
-
-### SDDC Manager Password Rotation
-*   **Check**: If SSH fails with standard password, check SDDC Manager for rotation.
-*   **API**: `GET /v1/credentials` to find the current rotated password.
-
-### VCF Management "Not Functional" (Fleet LCM Down)
-*   **Symptom**: ops-a Build>Lifecycle shows "not functional"; `fleet-01a/fleet-lcm/v1/components` returns HTTP 500.
-*   **Cause**: Postgres instances in `vcf-fleet-lcm`, `salt-raas`, etc. are suspended (`database.vmsp.vmware.com/suspended=true` label + `numberOfInstances=0`).
-*   **Fix**: Remove `suspended` label and patch `numberOfInstances=1` on all affected namespaces, then delete crashed pods.
-*   **Prevention**: `VCFfinal.py` v4.2+ uses `-o json` parsed in Python (not `custom-columns` via SSH) to detect/remove suspended labels.
-
-### VCF Automation Shutdown via API
-*   **Issue**: `suite-api/internal/components/{id}?action=shutdown` returns HTTP 500. The proxy does NOT support lifecycle actions.
-*   **Fix**: Use fleet-lcm direct API on `fleet-01a`. Auth: OAuth2 password grant to `/api/v1/identity/token` with `vcf-iam-vcfa-admin` K8s secret credentials. Then `POST /fleet-lcm/v1/components/{uuid}?action=shutdown` (returns 202).
-*   **Scripts**: `fleet.py:shutdown_products_fleet_lcm()`, `VCFshutdown.py` Phase 1 (fleet-lcm first, suite-api fallback).
-
-### Fleet LCM URL Health Check
-*   **Behavior**: `fleet-lcm/v1/components` returns HTTP 401 when healthy (unauthenticated). `lsfunctions.py:test_url()` treats 401 as healthy for `fleet-lcm/v1/` URLs.
+At the end of any session involving VCF troubleshooting or API exploration, review what was learned and update the relevant skill files:
+- **New API patterns or credentials**: Update `/home/holuser/hol/.cursor/skills/vcf-9-api/SKILL.md`
+- **New failure patterns or fixes**: Update `/home/holuser/hol/.cursor/skills/vcf-troubleshooting/SKILL.md`
