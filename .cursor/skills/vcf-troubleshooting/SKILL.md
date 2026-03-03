@@ -798,3 +798,37 @@ done
 **Note**: Service account IDs (e.g., `-9382`, `-7530`, `-5529`, `-1894`) are unique per deployment. Always query `/v1/credentials` to discover the exact names. After resetting in vCenter SSO, restart SDDC Manager services (`systemctl restart operationsmanager commonsvcs domainmanager`) before retrying credential operations.
 
 **Important**: Fix service accounts BEFORE attempting REMEDIATE on any other credentials. SDDC Manager uses these accounts as part of its validation pipeline for ALL credential operations — even ESXi host password checks flow through the vCenter SSO service account.
+
+---
+
+## 20. Kube-apiserver Timeouts and Pods Stuck in Unknown State (VCF Automation)
+
+**Symptom**: VCF Automation pods (in `prelude` namespace) are stuck in `Unknown` state. `kube-controller-manager` logs show `leaderelection lost` and `context deadline exceeded`. `kube-apiserver` logs show `Failed calling webhook ... connect: connection refused` for `capv-webhook-service` and `capi-webhook-service`.
+
+**Diagnosis**:
+```bash
+# Check for Unknown pods
+kubectl get pods -A | grep Unknown
+
+# Check for webhook service endpoints (will be empty if failing)
+kubectl get endpoints -n vmsp-platform capv-webhook-service
+
+# Check kubelet or pod events for CNI errors
+kubectl get events -n kube-system | grep "dial unix /var/run/antrea/cni.sock: connect: no such file or directory"
+```
+
+**Root Cause**: The Antrea CNI socket (`/var/run/antrea/cni.sock`) becomes unavailable or containerd loses track of it. This prevents new pod sandboxes from being created, causing `capv-webhook-service` and `capi-webhook-service` to fail their readiness probes. Because these webhooks are unavailable, `kube-apiserver` times out on API requests, which causes `kube-controller-manager` to lose its leader election lease. Existing pods may be marked as `Unknown` and replicasets won't recreate them because they still exist in the API.
+
+**Fix**:
+```bash
+# 1. Restart containerd and kubelet to restore the CNI socket
+systemctl restart containerd kubelet
+
+# 2. Wait for CAPI/CAPV controllers to become ready
+kubectl rollout status deployment capv-controller-manager -n vmsp-platform --timeout=60s
+
+# 3. Force delete all pods in Unknown state so replicasets can recreate them
+kubectl get pods -A --no-headers | grep Unknown | awk '{print $1, $2}' | while read ns pod; do
+  kubectl delete pod $pod -n $ns --force --grace-period=0
+done
+```
