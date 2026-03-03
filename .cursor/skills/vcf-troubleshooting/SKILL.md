@@ -327,10 +327,23 @@ does not stop the pods.
 
 **Root Cause**: vmon's startup data file is missing/corrupt. vmon logs show `[ReadSvcSubStartupData] No startup information from <service>`.
 
-**Fix**: Check and start during lab startup scripts. Already handled by `check_wcp_vcenter.sh` and `VCFfinal.py` in the startup codebase.
+**Fix**: Check and start during lab startup scripts. Already handled by `check_wcp_vcenter.sh`, `VCFfinal.py`, and `vSphere.py` (TASK 7) in the startup codebase.
+
+**Important**: SSH and bash shell must be enabled on vCenter before these checks can run. The `vSphere.py` module (TASK 6b) now automatically enables SSH and shell via the vCenter REST API (`PUT /api/appliance/access/ssh` and `PUT /api/appliance/access/shell`) before checking autostart services, so this works even on fresh labs where `confighol` has not been run.
 
 ```bash
-# Check and start on each vCenter
+# Enable SSH and shell via REST API (no SSH required)
+VC="vc-mgmt-a.site-a.vcf.lab"
+PASSWORD=$(cat /home/holuser/creds.txt)
+SESSION=$(curl -sk -X POST "https://${VC}/api/session" \
+  -u "administrator@vsphere.local:${PASSWORD}" | tr -d '"')
+curl -sk -X PUT "https://${VC}/api/appliance/access/ssh" \
+  -H "vmware-api-session-id: ${SESSION}" -H "Content-Type: application/json" -d 'true'
+curl -sk -X PUT "https://${VC}/api/appliance/access/shell" \
+  -H "vmware-api-session-id: ${SESSION}" -H "Content-Type: application/json" \
+  -d '{"enabled":true,"timeout":0}'
+
+# Then check and start services on each vCenter
 for svc in vapi-endpoint trustmanagement wcp; do
     STATUS=$(ssh root@vc-mgmt-a.site-a.vcf.lab "vmon-cli --status $svc" | \
              grep RunState | sed 's/.*RunState: //' | head -1)

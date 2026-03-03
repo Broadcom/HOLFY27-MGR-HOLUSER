@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.3 - February 26, 2026
+# Version 2.4 - March 3, 2026
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.4 - 2026-03-03:
+#   - Removed "Broadcom, Inc CA" from expected private CAs (not present in
+#     all VCF 9.1 labs); Firefox CA check now simply lists found private CAs
+#     and only checks for Vault Root CA and per-vCenter VMCAs
 # v2.3 - 2026-02-26:
 #   - Added "Firefox Trusted Private CAs" section: enumerates custom CAs in the
 #     Firefox NSS cert store, verifies expected CAs are present, reports expiry
@@ -1802,12 +1806,10 @@ def _build_expected_ca_list() -> List[str]:
     Sources:
     - Vault Root CA (always expected)
     - One VMCA per vCenter (from [RESOURCES] vCenters in config.ini)
-    - Broadcom VCF Root CA (always expected for VCF labs)
     
     :return: List of expected CA nicknames
     """
     expected = list(EXPECTED_PRIVATE_CAS)
-    expected.append('Broadcom, Inc CA')
 
     if lsf and hasattr(lsf, 'config'):
         try:

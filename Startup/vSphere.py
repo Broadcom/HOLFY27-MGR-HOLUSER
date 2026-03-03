@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # vSphere.py - HOLFY27 Core vSphere Startup Module
-# Version 3.0 - January 2026
+# Version 3.1 - March 2026
 # Author - Burke Azbill and HOL Core Team
 # vSphere infrastructure startup sequence
+#
+# CHANGELOG:
+# v3.1 - 2026-03-03:
+#   - Added TASK 6b: Ensure SSH and bash shell are enabled on vCenters via
+#     REST API before checking autostart services. This handles fresh lab
+#     environments where confighol-9.1.py has not yet been run.
+# v3.0 - 2026-01:
+#   - Initial HOLFY27 release
 
 import os
 import sys
@@ -330,6 +338,113 @@ def main(lsf=None, standalone=False, dry_run=False):
                               total=vc_ready_count, success=vc_ready_count, failed=0)
         dashboard.update_task('vsphere', 'autostart_services', TaskStatus.RUNNING)
         dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 6b: Ensure SSH and bash shell are enabled on vCenters
+    # The autostart services check (TASK 7) requires SSH access to each
+    # vCenter. On fresh lab environments that haven't had confighol run,
+    # SSH may be disabled and the root shell may be the VAMI appliance
+    # shell instead of bash. Use the vCenter REST API to enable SSH and
+    # set the shell, then verify SSH connectivity.
+    #==========================================================================
+    
+    if not dry_run:
+        import time as _time_ssh
+        
+        lsf.write_output('Ensuring SSH and bash shell are enabled on vCenters...')
+        
+        for entry in vcenters:
+            if not entry or entry.strip().startswith('#'):
+                continue
+            
+            parts = entry.split(':')
+            vc_hostname = parts[0].strip()
+            vc_user = parts[2].strip() if len(parts) > 2 else 'administrator@vsphere.local'
+            
+            try:
+                session = requests.Session()
+                session.trust_env = False
+                
+                # Get API session token
+                session_resp = session.post(
+                    f'https://{vc_hostname}/api/session',
+                    auth=(vc_user, lsf.password),
+                    verify=False, timeout=15, proxies=None
+                )
+                if session_resp.status_code != 200:
+                    lsf.write_output(f'  {vc_hostname}: Could not get API session (HTTP {session_resp.status_code}), skipping SSH/shell check')
+                    continue
+                
+                api_token = session_resp.text.strip().strip('"')
+                api_headers = {'vmware-api-session-id': api_token}
+                
+                # Check and enable SSH
+                ssh_resp = session.get(
+                    f'https://{vc_hostname}/api/appliance/access/ssh',
+                    headers=api_headers, verify=False, timeout=15, proxies=None
+                )
+                ssh_enabled = False
+                if ssh_resp.status_code == 200:
+                    ssh_enabled = ssh_resp.json() is True or ssh_resp.json() == True
+                
+                if not ssh_enabled:
+                    lsf.write_output(f'  {vc_hostname}: SSH not enabled - enabling via REST API...')
+                    enable_resp = session.put(
+                        f'https://{vc_hostname}/api/appliance/access/ssh',
+                        headers=api_headers, json=True,
+                        verify=False, timeout=15, proxies=None
+                    )
+                    if enable_resp.status_code in [200, 204]:
+                        lsf.write_output(f'  {vc_hostname}: SSH enabled successfully')
+                    else:
+                        lsf.write_output(f'  {vc_hostname}: WARNING - Failed to enable SSH (HTTP {enable_resp.status_code})')
+                else:
+                    lsf.write_output(f'  {vc_hostname}: SSH already enabled')
+                
+                # Check and enable bash shell
+                shell_resp = session.get(
+                    f'https://{vc_hostname}/api/appliance/access/shell',
+                    headers=api_headers, verify=False, timeout=15, proxies=None
+                )
+                shell_enabled = False
+                if shell_resp.status_code == 200:
+                    shell_data = shell_resp.json()
+                    if isinstance(shell_data, dict):
+                        shell_enabled = shell_data.get('enabled', False)
+                    else:
+                        shell_enabled = shell_data is True or shell_data == True
+                
+                if not shell_enabled:
+                    lsf.write_output(f'  {vc_hostname}: Bash shell not enabled - enabling via REST API...')
+                    shell_enable_resp = session.put(
+                        f'https://{vc_hostname}/api/appliance/access/shell',
+                        headers=api_headers,
+                        json={'enabled': True, 'timeout': 0},
+                        verify=False, timeout=15, proxies=None
+                    )
+                    if shell_enable_resp.status_code in [200, 204]:
+                        lsf.write_output(f'  {vc_hostname}: Bash shell enabled successfully')
+                    else:
+                        lsf.write_output(f'  {vc_hostname}: WARNING - Failed to enable bash shell (HTTP {shell_enable_resp.status_code})')
+                else:
+                    lsf.write_output(f'  {vc_hostname}: Bash shell already enabled')
+                
+                # Also ensure root user has /bin/bash as shell via SSH
+                # (the REST API enables shell access but may not change the login shell)
+                if lsf.test_tcp_port(vc_hostname, 22, timeout=5):
+                    chsh_result = lsf.ssh('chsh -s /bin/bash root 2>/dev/null; echo OK',
+                                          f'root@{vc_hostname}')
+                    if hasattr(chsh_result, 'stdout') and 'OK' in chsh_result.stdout:
+                        lsf.write_output(f'  {vc_hostname}: Root shell set to /bin/bash')
+                    else:
+                        lsf.write_output(f'  {vc_hostname}: Note - chsh not available (shell may already be bash)')
+                
+                # Delete the API session
+                session.delete(f'https://{vc_hostname}/api/session',
+                               headers=api_headers, verify=False, timeout=10, proxies=None)
+                
+            except Exception as e:
+                lsf.write_output(f'  {vc_hostname}: WARNING - SSH/shell enablement check failed: {e}')
     
     #==========================================================================
     # TASK 7: Verify all Autostart vCenter services are Started

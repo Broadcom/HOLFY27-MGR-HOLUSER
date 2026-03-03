@@ -611,11 +611,13 @@ def test_url(url, **kwargs):
         response = session.get(url, verify=verify_ssl, timeout=timeout, proxies=None)
         
         if response.status_code != 200:
-            # 401 Unauthorized from authenticated API endpoints confirms the
-            # service is alive and responding — treat as healthy.
+            # Authenticated API endpoints (CCI, Fleet LCM) reject unauthenticated
+            # requests with various status codes depending on version:
+            #   401 Unauthorized, 403 Forbidden, or 500 Internal Server Error.
+            # Any HTTP response from these endpoints confirms the service is alive.
             is_cci_url = "project.cci.vmware.com/v1alpha2/projects" in url
             is_fleet_lcm_url = "fleet-lcm/v1/" in url
-            if response.status_code == 401 and (is_cci_url or is_fleet_lcm_url):
+            if (is_cci_url or is_fleet_lcm_url) and response.status_code in (401, 403, 500):
                 return True
             return False
         
