@@ -20,18 +20,17 @@
 #   - NSX authorized_keys: now resolves root password BEFORE attempting
 #     mkdir/scp (previously mkdir with wrong password would fail silently,
 #     then scp would also fail, and SDDC Manager lookup was unreliable)
-#   - Browser warning fix: now restarts STS service (vmon-cli --restart sts)
-#     after patching the jar, eliminating the need for a full vCenter reboot
+#   - Removed browser warning fix (vcbrowser.sh integration) — approach does
+#     not reliably work on VCF 9.1 due to JSP compilation and Tomcat caching
 # v2.7 - 2026-03-03:
 #   - NSX SSH start-on-boot: now checks current state before setting, and
 #     verifies state after set — no longer reports failure when already enabled
 #   - NSX Manager/Edge authorized_keys: creates /root/.ssh/ directory before
 #     SCP copy (fixes "Could not copy authorized_keys" on appliances without
 #     /root/.ssh/ directory)
-#   - vCenter browser warning fix: integrated vcbrowser.sh logic natively
-#     into Python (patches isBrowserSupportedVC return false -> true in
-#     websso.js inside libvmidentity-sts-server.jar). Includes idempotency
-#     check — skips if already patched. vCenter reboot required for effect.
+#   - vCenter browser warning fix: removed — approach does not reliably work
+#     on VCF 9.1 (JSP compilation and Tomcat caching prevent the fix from
+#     taking effect)
 #   - MOB enablement: added idempotency check for enableDebugBrowse element
 #     value (not just existence) — safe to re-run without duplicating elements
 #   - enable_vcenter_shell: now checks if bash is already the login shell
@@ -607,147 +606,13 @@ def enable_vcenter_shell(hostname: str, password: str, dry_run: bool = False) ->
         return False
 
 
-def fix_vcenter_browser_warning(hostname: str, password: str,
-                                 dry_run: bool = False) -> bool:
+def configure_vcenter_mob(hostname: str, password: str,
+                          dry_run: bool = False) -> bool:
     """
-    Fix the unsupported browser warning on the vCenter Client login page.
+    Enable the Managed Object Browser (MOB) on vCenter by editing vpxd.cfg.
     
-    The vCenter UI displays a warning banner for Firefox on Linux even
-    though HOL has never seen any issue with this combination. This
-    function patches the websso.js files inside the SSO jar to change
-    ``isBrowserSupportedVC()`` from ``return false`` to ``return true``.
-    
-    Process:
-    1. Copy libvmidentity-sts-server.jar from the vCenter to /tmp/vcsa
-    2. Extract the jar and check if already patched (idempotent)
-    3. Patch websso.js and websso.js.tmpl (sed the 6-space-indented
-       ``return false`` to ``return true`` — the only line in the file
-       with exactly 6 leading spaces before ``return false``)
-    4. Recreate the jar using the VLP Agent's jar utility
-    5. Upload the patched jar back to the vCenter
-    6. Restart the STS service (``vmon-cli --restart sts``) to load
-       the patched jar without requiring a full vCenter reboot
-    
-    :param hostname: vCenter hostname
-    :param password: Root password
-    :param dry_run: If True, preview only
-    :return: True if successful (or already applied)
-    """
-    import shutil
-
-    VCSA_LIB_JAR = '/usr/lib/vmware-sso/vmware-sts/web/lib/libvmidentity-sts-server.jar'
-    LOCAL_WORK_DIR = '/tmp/vcsa'
-    JAR_BINARY = '/home/holuser/hol/vlp-agent/jre/bin/jar'
-
-    if dry_run:
-        lsf.write_output(f'{hostname}: Would fix browser warning in websso.js')
-        return True
-
-    if not os.path.isfile(JAR_BINARY):
-        lsf.write_output(f'{hostname}: WARNING - jar utility not found at {JAR_BINARY}, skipping browser fix')
-        return False
-
-    lsf.write_output(f'{hostname}: Checking vCenter browser warning fix...')
-
-    try:
-        # Clean up and prepare work directory
-        if os.path.isdir(LOCAL_WORK_DIR):
-            shutil.rmtree(LOCAL_WORK_DIR)
-        os.makedirs(LOCAL_WORK_DIR, exist_ok=True)
-
-        # Copy jar from vCenter
-        result = lsf.scp(f'root@{hostname}:{VCSA_LIB_JAR}', LOCAL_WORK_DIR + '/', password)
-        if result.returncode != 0:
-            lsf.write_output(f'{hostname}: FAILED - Could not copy jar from vCenter')
-            return False
-
-        # Extract jar
-        jar_path = os.path.join(LOCAL_WORK_DIR, 'libvmidentity-sts-server.jar')
-        extract_result = lsf.run_command(f'cd {LOCAL_WORK_DIR} && /usr/bin/unzip -q -o {jar_path}')
-        if extract_result.returncode != 0:
-            lsf.write_output(f'{hostname}: FAILED - Could not extract jar')
-            return False
-
-        # Check if already patched by looking for the 6-space "return false" in websso.js
-        websso_path = os.path.join(LOCAL_WORK_DIR, 'resources', 'js', 'websso.js')
-        if not os.path.isfile(websso_path):
-            lsf.write_output(f'{hostname}: WARNING - websso.js not found in jar, skipping browser fix')
-            return False
-
-        with open(websso_path, 'r') as f:
-            websso_content = f.read()
-
-        if '      return true;' in websso_content and '      return false;' not in websso_content:
-            lsf.write_output(f'{hostname}: Browser warning fix already applied')
-            return True
-
-        if '      return false;' not in websso_content:
-            lsf.write_output(f'{hostname}: WARNING - Expected pattern not found in websso.js, skipping')
-            return False
-
-        lsf.write_output(f'{hostname}: Applying browser warning fix...')
-
-        # Patch both websso.js and websso.js.tmpl
-        js_dir = os.path.join(LOCAL_WORK_DIR, 'resources', 'js')
-        for filename in ('websso.js', 'websso.js.tmpl'):
-            filepath = os.path.join(js_dir, filename)
-            if os.path.isfile(filepath):
-                with open(filepath, 'r') as f:
-                    content = f.read()
-                patched = content.replace('      return false;', '      return true;', 1)
-                with open(filepath, 'w') as f:
-                    f.write(patched)
-                lsf.write_output(f'{hostname}: Patched {filename}')
-
-        # Recreate jar (must be done from the extraction directory)
-        os.rename(jar_path, '/tmp/libvmidentity-sts-server.jar.bak')
-        recreate_result = lsf.run_command(
-            f'cd {LOCAL_WORK_DIR} && {JAR_BINARY} cf libvmidentity-sts-server.jar *'
-        )
-        if recreate_result.returncode != 0:
-            lsf.write_output(f'{hostname}: FAILED - Could not recreate jar')
-            return False
-
-        # Upload patched jar back to vCenter
-        result = lsf.scp(jar_path, f'root@{hostname}:{VCSA_LIB_JAR}', password)
-        if result.returncode != 0:
-            lsf.write_output(f'{hostname}: FAILED - Could not upload patched jar')
-            return False
-
-        lsf.write_output(f'{hostname}: SUCCESS - Browser warning fix applied')
-
-        # Restart the STS service to load the patched jar without a full reboot
-        lsf.write_output(f'{hostname}: Restarting vmware-stsd service to apply change...')
-        restart_result = lsf.ssh(
-            'vmon-cli --restart sts', f'root@{hostname}', password)
-        if restart_result.returncode == 0:
-            lsf.write_output(f'{hostname}: STS service restarted - browser fix is now active')
-        else:
-            lsf.write_output(f'{hostname}: WARNING - STS service restart failed; '
-                              'reboot the vCenter to apply the browser fix')
-
-        return True
-
-    except Exception as e:
-        lsf.write_output(f'{hostname}: FAILED - Browser warning fix error: {e}')
-        return False
-    finally:
-        if os.path.isdir(LOCAL_WORK_DIR):
-            shutil.rmtree(LOCAL_WORK_DIR, ignore_errors=True)
-
-
-def configure_vcenter_browser_support(hostname: str, password: str, 
-                                      dry_run: bool = False) -> bool:
-    """
-    Configure browser support and MOB on vCenter.
-    
-    This function:
-    1. Fixes the Firefox/Linux browser warning on the vCenter login page
-       by patching isBrowserSupportedVC() in websso.js
-    2. Enables the Managed Object Browser (MOB) by editing vpxd.cfg
-    
-    Both operations are idempotent — they check current state before
-    making changes and skip if already configured.
+    Idempotent — checks current state before making changes and skips
+    if already configured.
     
     :param hostname: vCenter hostname
     :param password: Root password
@@ -755,12 +620,9 @@ def configure_vcenter_browser_support(hostname: str, password: str,
     :return: True if successful
     """
     if dry_run:
-        lsf.write_output(f'{hostname}: Would configure browser support and MOB')
+        lsf.write_output(f'{hostname}: Would configure MOB')
         return True
 
-    # Fix browser warning (patches websso.js in the SSO jar)
-    fix_vcenter_browser_warning(hostname, password, dry_run)
-    
     # Enable the Managed Object Browser (MOB)
     lsf.write_output(f'{hostname}: Configuring Managed Object Browser...')
     
@@ -1009,10 +871,10 @@ def configure_vcenter(entry: str, auth_keys_file: str, password: str,
             lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', password)
             lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{hostname}', password)
             
-            # Configure browser support and MOB
-            configure_vcenter_browser_support(hostname, password, dry_run)
+            # Enable the Managed Object Browser (MOB)
+            configure_vcenter_mob(hostname, password, dry_run)
         else:
-            lsf.write_output(f'{hostname}: Would configure shell and browser support')
+            lsf.write_output(f'{hostname}: Would configure shell and MOB')
     
     # Step 2: Set password expiration for root
     if not dry_run:
