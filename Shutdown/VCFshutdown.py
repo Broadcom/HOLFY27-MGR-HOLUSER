@@ -2307,6 +2307,25 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
 
             if not dry_run:
                 from pyVmomi import vim as pyvim
+
+                # Re-authenticate to ESXi hosts. Sessions from Phase 17b may
+                # have expired during the vSAN elevator wait (up to 45 min)
+                # which exceeds ESXi's default 30-minute idle session timeout.
+                vcf_write(lsf, 'Re-authenticating to ESXi hosts for audit...')
+                for si in lsf.sis:
+                    try:
+                        connect.Disconnect(si)
+                    except Exception:
+                        pass
+                lsf.sis.clear()
+                lsf.sisvc.clear()
+
+                if mgmt_hosts:
+                    lsf.connect_vcenters(mgmt_hosts)
+                    vcf_write(lsf, f'Reconnected to {len(lsf.sis)} ESXi endpoint(s)')
+                else:
+                    vcf_write(lsf, 'No ESXi hosts configured - skipping audit')
+
                 still_on = []
                 for si in lsf.sis:
                     try:
