@@ -433,6 +433,7 @@ def check_vm_configuration(vms: List, fix_issues: bool = True) -> List[CheckResu
         'vcf-services-platform-template-',    # VCF Services Platform Template VMs
         'SupervisorControlPlaneVM',           # Tanzu Supervisor Control Plane VMs
         'vna-wld01-',                         # VNA Workload VMs
+        'vCLS-',                              # VCLS VMs
     ]
     
     for vm in vms:
