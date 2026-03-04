@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 4.2 - February 2026
+# Version 4.3 - March 2026
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v4.3 Changes:
+# - Added Task 2c2: Supervisor DNS Health Check
+#   After an ungraceful shutdown the kube-dns K8s Endpoint can point to
+#   the kube-dns-lb LoadBalancer external IP (10.1.0.x) instead of the
+#   actual CoreDNS pod IPs (172.16.200.x). This causes the NSX
+#   Distributed Load Balancer on ESXi to forward ClusterIP DNS traffic
+#   to a routed IP, creating an asymmetric path that drops all DNS
+#   responses for vSphere Pods. The new check detects this and patches
+#   the endpoint to point directly to CoreDNS pod IPs.
 
 import os
 import sys
@@ -71,6 +81,132 @@ def verify_nic_connected(lsf, vm_obj, simple=False):
                 lsf.set_network_adapter_connection(vm_obj, nic, True)
     except Exception as e:
         lsf.write_output(f'Error verifying NIC connection for {vm_obj.name}: {e}')
+
+
+def verify_supervisor_dns(lsf, vcenter_host, password, sso_domain='wld.sso',
+                          dry_run=False):
+    """
+    Verify and fix Supervisor kube-dns endpoint configuration.
+
+    After an ungraceful shutdown, the kube-dns K8s Endpoint can point to
+    the kube-dns-lb LoadBalancer external IP (10.1.0.x) instead of the
+    actual CoreDNS pod IPs (172.16.200.x).  When the NSX Distributed
+    Load Balancer on ESXi intercepts ClusterIP traffic for kube-dns and
+    forwards it to the LB IP, the response comes back through the T1
+    Service Router rather than the DLB, creating an asymmetric routing
+    path that drops all DNS responses.  This breaks DNS for every
+    vSphere Pod on the Supervisor.
+
+    The fix is to patch the kube-dns endpoint to point directly to the
+    CoreDNS pod IPs so the DLB forwards to overlay-reachable pods and
+    the response returns symmetrically.
+    """
+    import subprocess
+    import json as _json
+
+    lsf.write_output('='*60)
+    lsf.write_output('Supervisor DNS Health Check')
+    lsf.write_output('='*60)
+
+    if dry_run:
+        lsf.write_output('  Dry run - skipping DNS health check')
+        return True
+
+    try:
+        scp_pwd_result = subprocess.run(
+            ['sshpass', '-p', password, 'ssh', '-o', 'StrictHostKeyChecking=accept-new',
+             f'root@{vcenter_host}',
+             'python3 /usr/lib/vmware-wcp/decryptK8Pwd.py'],
+            capture_output=True, text=True, timeout=15
+        )
+
+        scp_ip = None
+        scp_pwd = None
+        for line in scp_pwd_result.stdout.split('\n'):
+            if 'IP:' in line:
+                scp_ip = line.split('IP:')[1].strip()
+            if 'PWD:' in line:
+                scp_pwd = line.split('PWD:')[1].strip()
+
+        if not scp_ip or not scp_pwd:
+            lsf.write_output('  Could not retrieve SCP credentials - skipping')
+            return True
+
+        def _scp_cmd(cmd, timeout=15):
+            r = subprocess.run(
+                ['sshpass', '-p', scp_pwd, 'ssh',
+                 '-o', 'StrictHostKeyChecking=accept-new',
+                 f'root@{scp_ip}', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+            return r.stdout.strip()
+
+        ep_json = _scp_cmd('kubectl get endpoints -n kube-system kube-dns -o json 2>/dev/null')
+        if not ep_json:
+            lsf.write_output('  Could not query kube-dns endpoint - skipping')
+            return True
+
+        ep_data = _json.loads(ep_json)
+        current_ips = []
+        for subset in ep_data.get('subsets', []):
+            for addr in subset.get('addresses', []):
+                current_ips.append(addr.get('ip', ''))
+
+        coredns_out = _scp_cmd(
+            'kubectl get pods -n kube-system -l k8s-app=kube-dns '
+            '-o jsonpath="{.items[*].status.podIP}" 2>/dev/null'
+        )
+        coredns_ips = [ip for ip in coredns_out.replace('"', '').split() if ip]
+
+        if not coredns_ips:
+            lsf.write_output('  No CoreDNS pods found - skipping')
+            return True
+
+        needs_fix = False
+        for ip in current_ips:
+            if ip not in coredns_ips:
+                needs_fix = True
+                break
+
+        if not needs_fix and set(current_ips) == set(coredns_ips):
+            lsf.write_output(f'  kube-dns endpoint OK (CoreDNS pods: {coredns_ips})')
+            return True
+
+        lsf.write_output(f'  kube-dns endpoint misconfigured:')
+        lsf.write_output(f'    Current: {current_ips}')
+        lsf.write_output(f'    Expected (CoreDNS pods): {coredns_ips}')
+        lsf.write_output(f'  Patching kube-dns endpoint...')
+
+        patch_ep = _json.dumps({
+            'apiVersion': 'v1',
+            'kind': 'Endpoints',
+            'metadata': {'name': 'kube-dns', 'namespace': 'kube-system'},
+            'subsets': [{
+                'addresses': [{'ip': ip} for ip in coredns_ips],
+                'ports': [
+                    {'name': 'dns', 'port': 53, 'protocol': 'UDP'},
+                    {'name': 'dns-tcp', 'port': 53, 'protocol': 'TCP'}
+                ]
+            }]
+        })
+
+        apply_cmd = f"echo '{patch_ep}' | kubectl apply -f - 2>&1"
+        result = _scp_cmd(apply_cmd)
+        lsf.write_output(f'  {result}')
+
+        time.sleep(10)
+
+        verify = _scp_cmd(
+            'kubectl get endpoints -n kube-system kube-dns '
+            '-o jsonpath="{.subsets[0].addresses[*].ip}" 2>/dev/null'
+        )
+        lsf.write_output(f'  Verified kube-dns endpoint IPs: {verify}')
+        return True
+
+    except Exception as e:
+        lsf.write_output(f'  DNS health check error: {e}')
+        lsf.write_output('  Continuing with startup...')
+        return True
 
 
 def check_supervisor_status_api(lsf, vcenter_host, sso_domain='wld.sso'):
@@ -666,6 +802,16 @@ def main(lsf=None, standalone=False, dry_run=False):
                 dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.FAILED, 'See log')
             dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.RUNNING)
             dashboard.generate_html()
+            
+        #----------------------------------------------------------------------
+        # TASK 2c2: POST-VERIFY - Supervisor DNS Health Check
+        # After ungraceful shutdown, the kube-dns endpoint may point to
+        # the LoadBalancer external IP instead of CoreDNS pod IPs,
+        # breaking DNS for all vSphere Pods via asymmetric DLB routing.
+        #----------------------------------------------------------------------
+        if tanzu_verify_ok and wcp_certs_ok and not dry_run:
+            verify_supervisor_dns(lsf, wcp_vcenter, password,
+                                  sso_domain=sso_domain, dry_run=dry_run)
             
     else:
         lsf.write_output('No Tanzu Control Plane VMs configured')
@@ -1330,6 +1476,301 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.update_task('vcffinal', 'vcfa_vms', TaskStatus.COMPLETE)
         dashboard.update_task('vcffinal', 'vcfa_urls', TaskStatus.RUNNING)
         dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 4b: VCF Automation K8s Health Check & Remediation
+    # After the VCF Automation VM is started, the internal K8s cluster may
+    # have issues that prevent the ingress VIP from being available:
+    #   1. kube-vip crash loop: istio-ingressgateway pod fails to start
+    #      (ImagePullBackOff) because the container registry ClusterIP is
+    #      unreachable while Antrea CNI is initializing. kube-vip sees no
+    #      endpoints and releases the VIP, then loses its leader lease and
+    #      crashes. This makes 10.1.1.70 (the auto-a DNS target) unreachable.
+    #   2. RabbitMQ .erlang.cookie permissions: fsGroup:200 in the pod
+    #      security context sets 0660 on the PVC, but Erlang requires 0400.
+    #   3. Prelude deployments at 0 replicas after cold boot.
+    # This task detects and remediates all three conditions.
+    #==========================================================================
+    
+    vcfa_k8s_remediation_ok = True
+    
+    if vcfa_vms_configured and not dry_run:
+        lsf.write_output('='*60)
+        lsf.write_output('VCF Automation K8s Health Check')
+        lsf.write_output('='*60)
+        lsf.write_vpodprogress('VCFA K8s Health', 'GOOD-8')
+        
+        if dashboard:
+            dashboard.update_task('vcffinal', 'vcfa_k8s_health', TaskStatus.RUNNING)
+            dashboard.generate_html()
+        
+        try:
+            import re as _re_k8s
+            
+            password = lsf.get_password()
+            vcfa_k8s_ip = '10.1.1.71'  # VCF 9.0 default
+            vcfa_vip = '10.1.1.70'
+            vcfa_user = 'vmware-system-user'
+            
+            # Auto-detect K8s API IP from known VCF Automation IPs
+            for candidate_ip in ['10.1.1.71', '10.1.1.72']:
+                if lsf.test_tcp_port(candidate_ip, 22, timeout=5):
+                    vcfa_k8s_ip = candidate_ip
+                    break
+            
+            lsf.write_output(f'VCF Automation K8s API node: {vcfa_k8s_ip}')
+            
+            if not lsf.test_tcp_port(vcfa_k8s_ip, 22, timeout=10):
+                lsf.write_output('WARNING: VCF Automation K8s node not reachable via SSH')
+                vcfa_k8s_remediation_ok = False
+            else:
+                # Helper to run commands on auto-a
+                def vcfa_ssh(cmd):
+                    return lsf.ssh(
+                        f"echo '{password}' | sudo -S -i bash -c '{cmd}'",
+                        f'{vcfa_user}@{vcfa_k8s_ip}'
+                    )
+                
+                # ---- Step 1: Check/fix kube-vip VIP ----
+                lsf.write_output('Checking kube-vip VIP status...')
+                vip_check = vcfa_ssh(f'ip addr show eth0 | grep {vcfa_vip}')
+                vip_present = False
+                if hasattr(vip_check, 'stdout') and vip_check.stdout and vcfa_vip in vip_check.stdout:
+                    vip_present = True
+                    lsf.write_output(f'  VIP {vcfa_vip} is present on eth0')
+                else:
+                    lsf.write_output(f'  VIP {vcfa_vip} is MISSING from eth0 - adding manually')
+                    vcfa_ssh(f'ip addr add {vcfa_vip}/32 dev eth0')
+                    time.sleep(2)
+                    # Verify
+                    vip_recheck = vcfa_ssh(f'ip addr show eth0 | grep {vcfa_vip}')
+                    if hasattr(vip_recheck, 'stdout') and vip_recheck.stdout and vcfa_vip in vip_recheck.stdout:
+                        lsf.write_output(f'  VIP {vcfa_vip} added successfully')
+                        vip_present = True
+                    else:
+                        lsf.write_output(f'  WARNING: Failed to add VIP {vcfa_vip}')
+                        vcfa_k8s_remediation_ok = False
+                
+                if not vip_present:
+                    lsf.write_output('Cannot proceed without VIP - skipping K8s checks')
+                else:
+                    # ---- Step 2: Verify kubectl works ----
+                    lsf.write_output('Verifying kubectl access...')
+                    kctl_prefix = 'export KUBECONFIG=/etc/kubernetes/super-admin.conf;'
+                    node_check = vcfa_ssh(f'{kctl_prefix} kubectl get nodes --no-headers 2>&1')
+                    kubectl_ok = False
+                    if hasattr(node_check, 'stdout') and 'Ready' in node_check.stdout:
+                        kubectl_ok = True
+                        lsf.write_output('  kubectl access verified')
+                    else:
+                        lsf.write_output('  kubectl not responding, waiting 30s and retrying...')
+                        time.sleep(30)
+                        node_check2 = vcfa_ssh(f'{kctl_prefix} kubectl get nodes --no-headers 2>&1')
+                        if hasattr(node_check2, 'stdout') and 'Ready' in node_check2.stdout:
+                            kubectl_ok = True
+                            lsf.write_output('  kubectl access verified on retry')
+                        else:
+                            # Try restarting containerd+kubelet
+                            lsf.write_output('  kubectl still failing - restarting containerd and kubelet')
+                            vcfa_ssh('systemctl restart containerd && sleep 3 && systemctl restart kubelet')
+                            time.sleep(30)
+                            # Re-add VIP in case restart cleared it
+                            vcfa_ssh(f'ip addr show eth0 | grep {vcfa_vip} || ip addr add {vcfa_vip}/32 dev eth0')
+                            time.sleep(15)
+                            node_check3 = vcfa_ssh(f'{kctl_prefix} kubectl get nodes --no-headers 2>&1')
+                            if hasattr(node_check3, 'stdout') and 'Ready' in node_check3.stdout:
+                                kubectl_ok = True
+                                lsf.write_output('  kubectl access restored after service restart')
+                            else:
+                                lsf.write_output('  WARNING: kubectl still not working')
+                                vcfa_k8s_remediation_ok = False
+                    
+                    if kubectl_ok:
+                        # ---- Step 3: Check/fix ImagePullBackOff pods ----
+                        lsf.write_output('Checking for ImagePullBackOff pods...')
+                        ipb_check = vcfa_ssh(
+                            f'{kctl_prefix} kubectl get pods -A --no-headers 2>/dev/null '
+                            f'| grep ImagePullBackOff'
+                        )
+                        if hasattr(ipb_check, 'stdout') and ipb_check.stdout and 'ImagePullBackOff' in ipb_check.stdout:
+                            for line in ipb_check.stdout.strip().split('\n'):
+                                if not line.strip():
+                                    continue
+                                cols = line.split()
+                                if len(cols) >= 2:
+                                    ipb_ns, ipb_pod = cols[0], cols[1]
+                                    lsf.write_output(f'  Deleting ImagePullBackOff pod: {ipb_ns}/{ipb_pod}')
+                                    vcfa_ssh(
+                                        f'{kctl_prefix} kubectl delete pod {ipb_pod} -n {ipb_ns} '
+                                        f'--force --grace-period=0 2>/dev/null'
+                                    )
+                            time.sleep(10)
+                        else:
+                            lsf.write_output('  No ImagePullBackOff pods found')
+                        
+                        # Also delete Unknown pods
+                        unknown_check = vcfa_ssh(
+                            f'{kctl_prefix} kubectl get pods -A --no-headers 2>/dev/null '
+                            f'| grep Unknown'
+                        )
+                        if hasattr(unknown_check, 'stdout') and unknown_check.stdout and 'Unknown' in unknown_check.stdout:
+                            for line in unknown_check.stdout.strip().split('\n'):
+                                if not line.strip():
+                                    continue
+                                cols = line.split()
+                                if len(cols) >= 2:
+                                    unk_ns, unk_pod = cols[0], cols[1]
+                                    lsf.write_output(f'  Deleting Unknown pod: {unk_ns}/{unk_pod}')
+                                    vcfa_ssh(
+                                        f'{kctl_prefix} kubectl delete pod {unk_pod} -n {unk_ns} '
+                                        f'--force --grace-period=0 2>/dev/null'
+                                    )
+                        
+                        # ---- Step 4: Check/fix RabbitMQ .erlang.cookie permissions ----
+                        lsf.write_output('Checking RabbitMQ status...')
+                        rmq_check = vcfa_ssh(
+                            f'{kctl_prefix} kubectl get pod rabbitmq-ha-0 -n prelude --no-headers 2>/dev/null'
+                        )
+                        rmq_needs_fix = False
+                        if hasattr(rmq_check, 'stdout') and rmq_check.stdout:
+                            if 'CrashLoopBackOff' in rmq_check.stdout or 'Error' in rmq_check.stdout:
+                                rmq_logs = vcfa_ssh(
+                                    f'{kctl_prefix} kubectl logs rabbitmq-ha-0 -n prelude --tail 10 2>/dev/null'
+                                )
+                                if hasattr(rmq_logs, 'stdout') and 'erlang.cookie must be accessible by owner only' in rmq_logs.stdout:
+                                    rmq_needs_fix = True
+                                    lsf.write_output('  RabbitMQ .erlang.cookie has wrong permissions - fixing')
+                        
+                        if rmq_needs_fix:
+                            # Get the rabbitmq image
+                            rmq_image = ''
+                            rmq_img_check = vcfa_ssh(
+                                f'{kctl_prefix} kubectl get pod rabbitmq-ha-0 -n prelude '
+                                f'-o jsonpath="{{.spec.containers[0].image}}" 2>/dev/null'
+                            )
+                            if hasattr(rmq_img_check, 'stdout') and rmq_img_check.stdout:
+                                rmq_image = rmq_img_check.stdout.strip().split('\n')[-1].strip()
+                            
+                            if rmq_image and 'registry' in rmq_image:
+                                # Deploy fix pod via kubectl run
+                                lsf.write_output(f'  Deploying cookie fix pod...')
+                                vcfa_ssh(
+                                    f'{kctl_prefix} kubectl run rabbitmq-cookie-fix -n prelude '
+                                    f'--image={rmq_image} --restart=Never '
+                                    f'--overrides=\'{{"spec":{{"securityContext":{{"runAsUser":0}},'
+                                    f'"containers":[{{"name":"fix","image":"{rmq_image}",'
+                                    f'"command":["sh","-c","chmod 400 /var/lib/rabbitmq/.erlang.cookie && echo FIXED"],'
+                                    f'"volumeMounts":[{{"name":"rabbit-pvc","mountPath":"/var/lib/rabbitmq"}}]}}],'
+                                    f'"volumes":[{{"name":"rabbit-pvc","persistentVolumeClaim":'
+                                    f'{{"claimName":"rabbit-pvc-rabbitmq-ha-0"}}}}]}}}}\' 2>/dev/null'
+                                )
+                                time.sleep(20)
+                                
+                                # Check fix result
+                                fix_logs = vcfa_ssh(
+                                    f'{kctl_prefix} kubectl logs rabbitmq-cookie-fix -n prelude 2>/dev/null'
+                                )
+                                if hasattr(fix_logs, 'stdout') and 'FIXED' in fix_logs.stdout:
+                                    lsf.write_output('  RabbitMQ cookie permissions fixed')
+                                    vcfa_ssh(f'{kctl_prefix} kubectl delete pod rabbitmq-cookie-fix -n prelude 2>/dev/null')
+                                    vcfa_ssh(f'{kctl_prefix} kubectl delete pod rabbitmq-ha-0 -n prelude 2>/dev/null')
+                                    lsf.write_output('  Restarted rabbitmq-ha-0')
+                                else:
+                                    lsf.write_output('  WARNING: Cookie fix pod did not report success')
+                                    vcfa_ssh(f'{kctl_prefix} kubectl delete pod rabbitmq-cookie-fix -n prelude --force 2>/dev/null')
+                            else:
+                                lsf.write_output('  WARNING: Could not determine RabbitMQ image for fix pod')
+                        else:
+                            if hasattr(rmq_check, 'stdout') and 'Running' in rmq_check.stdout:
+                                lsf.write_output('  RabbitMQ is running normally')
+                            else:
+                                lsf.write_output('  RabbitMQ status check inconclusive')
+                        
+                        # ---- Step 5: Scale up zero-replica prelude deployments ----
+                        lsf.write_output('Checking prelude deployments...')
+                        dep_json = vcfa_ssh(
+                            f'{kctl_prefix} kubectl get deployments -n prelude -o json 2>/dev/null'
+                        )
+                        zero_deps = []
+                        if hasattr(dep_json, 'stdout') and dep_json.stdout:
+                            try:
+                                import json as _json_dep
+                                raw_dep = dep_json.stdout.strip()
+                                json_start_dep = raw_dep.find('{')
+                                if json_start_dep >= 0:
+                                    raw_dep = raw_dep[json_start_dep:]
+                                dep_data = _json_dep.loads(raw_dep)
+                                total_deps = len(dep_data.get('items', []))
+                                for d in dep_data.get('items', []):
+                                    if d['spec'].get('replicas', 1) == 0:
+                                        zero_deps.append(d['metadata']['name'])
+                                lsf.write_output(f'  {len(zero_deps)} of {total_deps} deployments at 0 replicas')
+                            except Exception as dep_err:
+                                lsf.write_output(f'  WARNING: Could not parse deployment JSON: {dep_err}')
+                        
+                        if zero_deps:
+                            lsf.write_output(f'  Scaling up {len(zero_deps)} deployments...')
+                            # Build and execute a scale script to avoid SSH escaping issues
+                            scale_cmds = [f'{kctl_prefix}']
+                            for dep_name in zero_deps:
+                                scale_cmds.append(
+                                    f'kubectl scale deployment {dep_name} -n prelude --replicas=1 2>&1;'
+                                )
+                            # Batch into groups to avoid command-line length limits
+                            batch_size = 10
+                            for i in range(0, len(zero_deps), batch_size):
+                                batch = zero_deps[i:i+batch_size]
+                                batch_cmd = f'{kctl_prefix} ' + ' '.join(
+                                    f'kubectl scale deployment {d} -n prelude --replicas=1 2>/dev/null;'
+                                    for d in batch
+                                )
+                                result = vcfa_ssh(batch_cmd)
+                                scaled_count = 0
+                                if hasattr(result, 'stdout') and result.stdout:
+                                    scaled_count = result.stdout.count('scaled')
+                                lsf.write_output(f'  Batch {i//batch_size + 1}: scaled {scaled_count} deployments')
+                            
+                            # Also check StatefulSets
+                            ss_check = vcfa_ssh(
+                                f'{kctl_prefix} kubectl get statefulsets -n prelude -o json 2>/dev/null'
+                            )
+                            if hasattr(ss_check, 'stdout') and ss_check.stdout:
+                                try:
+                                    raw_ss = ss_check.stdout.strip()
+                                    json_start_ss = raw_ss.find('{')
+                                    if json_start_ss >= 0:
+                                        raw_ss = raw_ss[json_start_ss:]
+                                    ss_data = _json_dep.loads(raw_ss)
+                                    for ss in ss_data.get('items', []):
+                                        ss_name = ss['metadata']['name']
+                                        ss_replicas = ss['spec'].get('replicas', 1)
+                                        ss_ready = ss.get('status', {}).get('readyReplicas', 0)
+                                        if ss_replicas == 0:
+                                            lsf.write_output(f'  Scaling up StatefulSet {ss_name}')
+                                            vcfa_ssh(
+                                                f'{kctl_prefix} kubectl scale statefulset {ss_name} '
+                                                f'-n prelude --replicas=1 2>/dev/null'
+                                            )
+                                except Exception:
+                                    pass
+                            
+                            lsf.write_output('  Prelude deployment scale-up complete')
+                        else:
+                            lsf.write_output('  All prelude deployments already have replicas > 0')
+                
+                lsf.write_output('VCF Automation K8s health check complete')
+                
+        except Exception as k8s_err:
+            lsf.write_output(f'WARNING: VCF Automation K8s health check failed: {k8s_err}')
+            vcfa_k8s_remediation_ok = False
+        
+        if dashboard:
+            if vcfa_k8s_remediation_ok:
+                dashboard.update_task('vcffinal', 'vcfa_k8s_health', TaskStatus.COMPLETE)
+            else:
+                dashboard.update_task('vcffinal', 'vcfa_k8s_health', TaskStatus.FAILED,
+                                      'See log for details')
+            dashboard.generate_html()
     
     #==========================================================================
     # TASK 5: Check VCF Automation URLs

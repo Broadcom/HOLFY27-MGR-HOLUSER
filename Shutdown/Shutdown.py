@@ -583,8 +583,9 @@ VCF Shutdown Phases (for --phase):
     1b    VCF Automation VM fallback (if Fleet API failed)
     2     Connect to vCenters
     2b    Scale Down VCF Component Services (K8s on VSP)
+    3b    Graceful Supervisor Workload Shutdown (VKS, Harbor, etc.)
     3     Stop Workload Control Plane (WCP)
-    4     Shutdown Workload VMs (Tanzu, K8s)
+    4     Shutdown Workload VMs (Tanzu, K8s) + Dynamic Discovery
     5     Shutdown Workload Domain NSX Edges
     6     Shutdown Workload Domain NSX Manager
     7     Shutdown Workload vCenters

@@ -327,10 +327,12 @@ trying to use `custom-columns` or `jsonpath` with dotted keys through SSH. Strip
 
 Graceful shutdown/startup of VSP components is managed by:
 - **Shutdown**: `hol/Shutdown/VCFshutdown.py` Phase 2b (scale down) + Phase 19b (power off VSP VMs)
+- **Supervisor Workloads**: Phase 3b dynamically discovers and shuts down VKS clusters and Supervisor Services (Harbor, etc.) via the SCP K8s API before WCP is stopped
+- **Dynamic VM Discovery**: Phase 4 discovers Supervisor-managed workload VMs from WLD vCenter in addition to regex pattern matching
 - **Startup**: `hol/Startup/VCFfinal.py` Task 2e (scale up + unsuspend postgres)
 - **Config**: `/tmp/config.ini` `[VCFFINAL] vcfcomponents` (format: `namespace:resource_type/name`)
 - **Standalone**: `python3 Shutdown.py --phase 2b` (scale down only)
-- **Dry run**: `python3 Shutdown.py --phase 2b --dry-run`
+- **Dry run**: `python3 Shutdown.py --phase 3b --dry-run` (preview Supervisor workload shutdown)
 
 ## 7. Operations VMs (SSH Enablement)
 
@@ -657,3 +659,5 @@ sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-wld01-a
 31. **CCI Kubernetes API returns HTTP 500 on unauthenticated requests in VCF 9.1 C2**: The CCI endpoint (`/cci/kubernetes/apis/project.cci.vmware.com/v1alpha2/projects`) returns 500 (not 401) when accessed without authentication. Treat 401, 403, and 500 from CCI URLs as evidence the service is alive — any HTTP response confirms the service is running.
 32. **CCI 503 "no healthy upstream" has two root causes**: The `/cci/kubernetes/` path routes to `ccs-k3s` service in prelude namespace via HTTPRoute. The `ccs-k3s-app` has a deep init-container dependency chain: `ccs-k3s` → `ccs-infra-eas` → `provisioning-service` → `project-service` → `ebs-app` → `rabbitmq-ha`. If `rabbitmq-ha-0` is in CrashLoopBackOff (check for `.erlang.cookie` permissions 0660 vs required 0400), fix cookie permissions and restart. If `provisioning-service-app` is stuck at 0/1 Running with no ports listening, check for Spring Boot deadlock in `PrometheusExemplarsAutoConfiguration` via `jcmd 1 Thread.print` — fix by adding `-Dmanagement.prometheus.metrics.export.exemplars.enabled=false` to JAVA_OPTS.
 33. **RabbitMQ `.erlang.cookie` permissions broken by fsGroup**: VCF Automation's `rabbitmq-ha` StatefulSet uses `fsGroup: 200` pod security context. This causes Kubernetes to set group-read/write (0660) on all PVC files including `.erlang.cookie`, but Erlang requires owner-only (0400). Fix by running a temporary root pod to `chmod 400 /var/lib/rabbitmq/.erlang.cookie` on the PVC, then deleting `rabbitmq-ha-0` to restart.
+34. **VCF Automation VIP (10.1.1.70) drops after cold boot**: kube-vip manages both the control plane VIP and LoadBalancer service VIPs on VCF Automation. It watches the `istio-ingressgateway` service endpoints. After cold boot, Antrea CNI takes time to initialize, breaking ClusterIP routing. The istio-ingressgateway pod goes into ImagePullBackOff (can't reach registry ClusterIP). kube-vip detects no endpoints and releases the VIP, then loses its own leader lease and crashes. Fix: manually `ip addr add 10.1.1.70/32 dev eth0`, wait for Antrea to ready, delete ImagePullBackOff pods. `VCFfinal.py` Task 4b automates this.
+35. **VCF Automation kube-scheduler stuck after VIP flap**: When kube-vip releases and re-acquires the VIP rapidly, the kube-scheduler may start with stale RBAC caches (errors like `clusterrole "system:kube-scheduler" not found`) even though the ClusterRoles exist. Pods get stuck in Pending with no events. Fix: restart containerd and kubelet (`systemctl restart containerd && sleep 3 && systemctl restart kubelet`), then re-add VIP if needed.

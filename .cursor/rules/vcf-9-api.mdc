@@ -34,6 +34,10 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 - **SDDC Manager `/v1/resource-locks` API is read-only** — cannot DELETE locks via API. Must use direct `psql` access to `DELETE FROM lock`.
 - **vCenter `/api/session` returns HTTP 201**, not 200. Accept both when checking session creation success.
 - **SCP VMs are EAM-managed on VCF 9.0.x** — `PowerOnVM_Task()` via vCenter returns `NoPermission`. Connect directly to ESXi hosts as `root` to power on SCP VMs.
+- **VCF Automation VIP (10.1.1.70) can drop after cold boot** — kube-vip releases the VIP when istio-ingressgateway has no endpoints (ImagePullBackOff during Antrea CNI init). Fix: `ip addr add 10.1.1.70/32 dev eth0`, restart containerd/kubelet, delete ImagePullBackOff pods. `VCFfinal.py` Task 4b automates this.
+- **Supervisor kube-dns endpoint may point to LB IP** after ungraceful shutdown — causes vSphere Pod DNS to fail via asymmetric NSX DLB routing. Fix: patch endpoint to CoreDNS pod IPs (`172.16.200.x`). `VCFfinal.py` Task 2c2 automates this.
+- **NSX Edge SR STANDBY having `Op_state: down` interfaces is normal** — in `ACTIVE_STANDBY` mode, only the ACTIVE SR brings up its interfaces. Check HA status via NSX Policy API `/policy/api/v1/infra/tier-1s/{id}/locale-services/{id}/ha-config` before diagnosing as broken.
+- **NSX Edge VMs are registered on WLD ESXi hosts** (not management vCenter) — must connect directly to ESXi hosts as `root` to power on/off edge VMs. They're on `esx-06a` (edge-wld01-02a) and `esx-07a` (edge-wld01-01a).
 
 ## Session Knowledge Capture
 

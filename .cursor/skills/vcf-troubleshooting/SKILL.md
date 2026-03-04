@@ -34,6 +34,8 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | vCenter browser warning banner (UNSOLVABLE) | "Unsupported browser" yellow banner on login | JSP compilation/Tomcat caching defeats websso.js patching | 21 |
 | CCI 503 "no healthy upstream" at startup | CCI URL returns 503 instead of 401 JSON | CCI-related prelude deployments at 0 replicas after cold boot | 22 |
 | SCP VMs powered off after shutdown (9.0.x) | Supervisor stuck CONFIGURING/ERROR, SCP VMs poweredOff | EAM-managed VMs not auto-started; vCenter PowerOn denied with NoPermission | 23 |
+| VCF Automation VIP drops after boot | auto-a pings then stops, "no route to host" | kube-vip releases VIP when istio-ingressgateway has no endpoints (ImagePullBackOff) | 24 |
+| Harbor unreachable, Supervisor DNS broken | Harbor pods CrashLoopBackOff with "i/o timeout" on DNS lookups | kube-dns endpoint points to LB IP causing asymmetric DLB routing | 25 |
 
 ---
 
@@ -322,6 +324,25 @@ kubectl annotate components.api.vmsp.vmware.com salt \
 **Note**: vodap ClickHouse statefulsets (`chi-vcf-obs-*`, `chk-vcf-obs-keeper-*`) are managed
 by the clickhouse-operator but must be scaled down separately — stopping the operator alone
 does not stop the pods.
+
+### Supervisor Workload Shutdown (Phase 3b)
+
+Managed by `python3 /home/holuser/hol/Shutdown/Shutdown.py --phase 3b`:
+
+Phase 3b dynamically discovers and gracefully shuts down all Supervisor-managed workloads
+**before** WCP is stopped (Phase 3). This ensures VKS/TKG cluster VMs and Supervisor Service
+pods (Harbor, etc.) drain gracefully instead of being hard-killed when ESXi hosts shut down.
+
+Steps performed:
+1. SSH to WLD vCenter, run `decryptK8Pwd.py` to obtain SCP password and VIP
+2. SSH to SCP VIP, discover TKG/VKS clusters via `kubectl get clusters -A`
+3. Delete discovered clusters (triggers graceful node drain and VM power-off)
+4. Discover Supervisor Service namespaces (e.g., `svc-harbor-domain-c10`)
+5. Scale down all deployments and statefulsets in those namespaces to 0 replicas
+6. Wait 30s for workload VMs to power off
+
+Phase 4 also includes dynamic VM discovery from the WLD vCenter — any Supervisor-managed
+workload VMs not matched by configured regex patterns are automatically found and shut down.
 
 ---
 
@@ -1025,3 +1046,143 @@ After power-on, the Supervisor takes approximately 3-5 minutes to transition fro
 - The K8s VIP for the Supervisor is 10.1.1.85; individual SCP VMs are at 10.1.1.86-88.
 - After SCP VMs boot, `hypercrypt` and `kubelet` services must both reach `active` state before the K8s API becomes available.
 - The `decryptK8Pwd.py` script on the WLD vCenter provides the SCP root password needed for SSH.
+
+---
+
+## 24. VCF Automation VIP Drops After Boot (kube-vip + istio-ingressgateway)
+
+**Symptom**: `auto-a.site-a.vcf.lab` (10.1.1.70) responds to pings for ~30 seconds after boot, then becomes unreachable ("Destination Host Unreachable" or "No route to host"). SSH and HTTPS fail. However, 10.1.1.71 (the actual VM eth0 address) remains reachable.
+
+**Diagnosis**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+# Verify 10.1.1.71 responds but 10.1.1.70 does not
+ping -c 2 -W 2 10.1.1.71  # OK
+ping -c 2 -W 2 10.1.1.70  # Unreachable
+
+# Check if VIP is present on eth0
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i ip addr show eth0 | grep 10.1.1.70"
+# If empty: VIP is missing
+
+# Check kube-vip logs
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i crictl logs --tail 20 \$(crictl ps --name kube-vip -q | head -1) 2>&1"
+# Look for: "[VIP] Releasing the Virtual IP [10.1.1.70]"
+# Look for: "lost leadership, restarting kube-vip"
+```
+
+**Root Cause Chain**:
+
+1. After cold boot, the Antrea CNI agent takes time to initialize. During this window, ClusterIP service routing is broken (`antrea-agent` readiness probe returns HTTP 500).
+2. The `registry.vmsp-platform.svc.cluster.local:5000` ClusterIP is unreachable even though the registry pod is running on its pod IP.
+3. The `istio-ingressgateway` DaemonSet pod in `istio-ingress` namespace needs to pull the `proxyv2:1.24.0` image from the registry. With the ClusterIP broken, this fails with `ImagePullBackOff`.
+4. kube-vip manages the 10.1.1.70 VIP for both the control plane (kube-apiserver) and the LoadBalancer service (istio-ingressgateway). When it detects the istio-ingressgateway endpoint has been removed (pod not running), it **releases the VIP** and logs: `"[endpoints] existing [198.18.0.24] has been removed, no remaining endpoints for leaderElection"`.
+5. With the VIP gone, kube-vip can no longer reach the kube-apiserver (configured at `10.1.1.70:6443` in `super-admin.conf`), loses its leader lease, and crashes with `"lost leadership, restarting kube-vip"`.
+6. The kube-scheduler may also lose its leader lease during this instability, leaving it with stale RBAC caches. New pods get stuck in `Pending` with no scheduling events.
+7. This creates a self-reinforcing crash loop: kube-vip restarts → briefly adds VIP → sees no istio endpoints → releases VIP → loses lease → crashes.
+
+**Fix**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+# 1. Manually add the VIP to break the crash loop
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i ip addr add 10.1.1.70/32 dev eth0 2>/dev/null; \
+   ip addr show eth0 | grep 10.1.1.70"
+
+# 2. Wait for kube-vip to stabilize and kubectl to work
+sleep 15
+
+# 3. Restart containerd+kubelet to clear stuck schedulers and stale containers
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i bash -c 'systemctl restart containerd && sleep 3 && systemctl restart kubelet'"
+
+# 4. Re-add VIP (restart may have cleared it)
+sleep 15
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i bash -c 'ip addr show eth0 | grep 10.1.1.70 || ip addr add 10.1.1.70/32 dev eth0'"
+
+# 5. Wait for antrea-agent readiness (ClusterIP routing)
+sleep 30
+
+# 6. Delete any ImagePullBackOff pods so they retry with working ClusterIP
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
+  "echo '${PASSWORD}' | sudo -S -i bash -c 'export KUBECONFIG=/etc/kubernetes/super-admin.conf; \
+   kubectl get pods -A --no-headers 2>/dev/null | grep ImagePullBackOff | while read ns pod rest; do \
+     kubectl delete pod \$pod -n \$ns --force --grace-period=0 2>/dev/null; done'"
+```
+
+**Key Details**:
+- kube-vip uses the `/etc/kube-vip.hosts` file which maps `kubernetes` to `127.0.0.1` for its own API server access. However, the `super-admin.conf` kubeconfig points to `10.1.1.70:6443`. When kube-vip uses this kubeconfig, losing the VIP means it can't reach the API server.
+- The container restart count on kube-vip (typically >100) is diagnostic — it indicates this crash loop has been happening since boot.
+- The Antrea agent readiness probe returns HTTP 500 while it's connecting to the antrea-controller. Once both antrea-agent containers are Ready, ClusterIP routing works.
+- After the istio-ingressgateway pod starts, kube-vip will acquire the VIP lease properly and the manually-added VIP will be managed by kube-vip going forward.
+- `VCFfinal.py` Task 4b now automatically detects and remediates this condition.
+
+---
+
+## 25. Harbor Unreachable / Supervisor DNS Broken After Cold Boot
+
+**Symptom**: Harbor URL `https://harbor-01a.site-a.vcf.lab` times out. Harbor pods (`harbor-core`, `harbor-nginx`, `harbor-jobservice`) crash with `dial tcp: lookup harbor-core: i/o timeout`. DNS resolution fails for all vSphere Pods on the Supervisor.
+
+**Diagnosis**:
+
+```bash
+# 1. Check kube-dns endpoint - should point to CoreDNS pod IPs (172.16.200.x)
+sshpass -p "$K8S_PWD" ssh root@$SCP_VIP \
+  "kubectl get endpoints -n kube-system kube-dns -o jsonpath='{.subsets[0].addresses[*].ip}'"
+
+# If it shows 10.1.0.4 (or any 10.1.0.x LB IP), that's the problem
+
+# 2. Check NSX DLB pool on ESXi - confirms asymmetric routing
+sshpass -p "$PASSWORD" ssh root@esx-05a.site-a.vcf.lab \
+  "nsxcli -c 'get load-balancer pool <pool-uuid>'"
+# Pool member should show CoreDNS pod IPs, not the LB IP
+
+# 3. Verify CoreDNS pods are running
+sshpass -p "$K8S_PWD" ssh root@$SCP_VIP \
+  "kubectl get pods -n kube-system -l k8s-app=kube-dns -o wide"
+```
+
+**Root Cause**:
+
+The `kube-dns` K8s Service (ClusterIP `10.96.0.10`) has its Endpoint pointing to `10.1.0.4`, which is the `kube-dns-lb` LoadBalancer external IP. The NSX Distributed Load Balancer (DLB) on ESXi intercepts ClusterIP traffic and forwards it to the endpoint IP. When that endpoint is a routed IP (`10.1.0.4`) rather than an overlay IP (`172.16.200.x`), the DNS query goes through the T1 Service Router but the response returns directly to the pod via the overlay, bypassing the DLB's connection tracking. The DLB drops the orphaned session and the pod gets no DNS response.
+
+This configuration is the default in VCF 9.0.x Supervisor deployments but normally works because the NSX T1 SR handles the NAT correctly. After an ungraceful shutdown, the SR on the STANDBY edge node may fail to properly initialize its interfaces, or the routing path becomes inconsistent, causing the asymmetric path to fail.
+
+**Fix**:
+
+```bash
+# Patch kube-dns endpoint to point to CoreDNS pod IPs
+K8S_PWD=$(sshpass -p "$PASSWORD" ssh root@vc-wld01-a.site-a.vcf.lab \
+  "python3 /usr/lib/vmware-wcp/decryptK8Pwd.py" | grep PWD | awk '{print $2}')
+
+COREDNS_IPS=$(sshpass -p "$K8S_PWD" ssh root@$SCP_VIP \
+  "kubectl get pods -n kube-system -l k8s-app=kube-dns \
+   -o jsonpath='{.items[*].status.podIP}'")
+
+# Build and apply the corrected endpoint
+python3 -c "
+import json
+ips = '${COREDNS_IPS}'.split()
+ep = json.dumps({
+    'apiVersion': 'v1', 'kind': 'Endpoints',
+    'metadata': {'name': 'kube-dns', 'namespace': 'kube-system'},
+    'subsets': [{'addresses': [{'ip': ip} for ip in ips],
+                 'ports': [{'name': 'dns', 'port': 53, 'protocol': 'UDP'},
+                           {'name': 'dns-tcp', 'port': 53, 'protocol': 'TCP'}]}]
+})
+print(ep)
+" | sshpass -p "$K8S_PWD" ssh root@$SCP_VIP "kubectl apply -f -"
+```
+
+**Key Details**:
+- The DLB pool on ESXi (`nsxcli -c 'get load-balancer pool <uuid>'`) mirrors the K8s endpoint. Changing the endpoint triggers NCP to update the NSX DLB pool within ~10 seconds.
+- `kube-dns-lb` (LoadBalancer service) has its own separate NSX LB pool that correctly points to CoreDNS pod IPs — only the ClusterIP `kube-dns` endpoint is misconfigured.
+- The STANDBY SR on an NSX Edge having `Op_state: down` interfaces is **normal** for `ACTIVE_STANDBY` mode. The ACTIVE SR on the other edge handles all traffic.
+- A clean shutdown/restart of the NSX edges (via the shutdown script phases 5-7 followed by VCF.py startup) resolves this by ensuring the SR HA state is properly initialized.
+- `VCFfinal.py` Task 2c2 now automatically detects and fixes this condition during startup.
