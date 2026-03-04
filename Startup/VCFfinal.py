@@ -379,6 +379,103 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.generate_html()
         
         #----------------------------------------------------------------------
+        # TASK 2a2: POWER ON - Ensure Supervisor Control Plane VMs are running
+        # On VCF 9.0.x, SCP VMs are EAM-managed on WLD cluster ESXi hosts.
+        # They are powered off during clean shutdown and must be started
+        # before the Supervisor can reach RUNNING/READY state.
+        # vCenter may deny PowerOnVM_Task with NoPermission (EAM restriction),
+        # so we fall back to direct ESXi host connections when needed.
+        # On VCF 9.1.x with VSP cluster, SCP VMs are not present on WLD ESXi
+        # hosts, so this is effectively a no-op.
+        #----------------------------------------------------------------------
+        lsf.write_output('='*60)
+        lsf.write_output('Checking Supervisor Control Plane VM Power State')
+        lsf.write_output('='*60)
+        lsf.write_vpodprogress('SCP VM Power Check', 'GOOD-3')
+
+        try:
+            import ssl as _ssl_scp
+            scp_password = lsf.get_password()
+            scp_ctx = _ssl_scp._create_unverified_context()
+
+            scp_si = connect.SmartConnect(
+                host=wcp_vcenter,
+                user=f'administrator@{sso_domain}',
+                pwd=scp_password,
+                sslContext=scp_ctx
+            )
+            scp_content = scp_si.RetrieveContent()
+            scp_container = scp_content.viewManager.CreateContainerView(
+                scp_content.rootFolder, [vim.VirtualMachine], True
+            )
+
+            scp_vms_off = []
+            for scp_vm in scp_container.view:
+                if 'SupervisorControlPlane' in scp_vm.name:
+                    host_name = scp_vm.runtime.host.name if scp_vm.runtime.host else 'unknown'
+                    lsf.write_output(f'  {scp_vm.name}: power={scp_vm.runtime.powerState}, host={host_name}')
+                    if scp_vm.runtime.powerState != 'poweredOn':
+                        scp_vms_off.append((scp_vm, host_name))
+            scp_container.Destroy()
+
+            if not scp_vms_off:
+                lsf.write_output('All Supervisor Control Plane VMs are already powered on')
+            else:
+                lsf.write_output(f'{len(scp_vms_off)} SCP VM(s) need to be powered on')
+
+                # Try powering on via vCenter first
+                vc_power_failed = False
+                for scp_vm, host_name in scp_vms_off:
+                    try:
+                        scp_vm.PowerOnVM_Task()
+                        lsf.write_output(f'  {scp_vm.name}: PowerOn submitted via vCenter')
+                    except vim.fault.NoPermission:
+                        lsf.write_output(f'  {scp_vm.name}: NoPermission via vCenter (EAM-managed)')
+                        vc_power_failed = True
+                        break
+                    except Exception as scp_err:
+                        lsf.write_output(f'  {scp_vm.name}: PowerOn via vCenter failed: {scp_err}')
+                        vc_power_failed = True
+                        break
+
+                # Fallback: connect directly to ESXi hosts
+                if vc_power_failed:
+                    lsf.write_output('Falling back to direct ESXi host connections for SCP power-on...')
+                    esxi_hosts_needed = set(h for _, h in scp_vms_off)
+
+                    for esxi_host in esxi_hosts_needed:
+                        try:
+                            esxi_si = connect.SmartConnect(
+                                host=esxi_host,
+                                user='root',
+                                pwd=scp_password,
+                                sslContext=scp_ctx
+                            )
+                            esxi_content = esxi_si.RetrieveContent()
+                            esxi_container = esxi_content.viewManager.CreateContainerView(
+                                esxi_content.rootFolder, [vim.VirtualMachine], True
+                            )
+                            for esxi_vm in esxi_container.view:
+                                if 'SupervisorControlPlane' in esxi_vm.name and esxi_vm.runtime.powerState != 'poweredOn':
+                                    try:
+                                        esxi_vm.PowerOnVM_Task()
+                                        lsf.write_output(f'  {esxi_vm.name}: PowerOn submitted via {esxi_host}')
+                                    except Exception as esxi_err:
+                                        lsf.write_output(f'  {esxi_vm.name}: PowerOn via {esxi_host} FAILED: {esxi_err}')
+                            esxi_container.Destroy()
+                            connect.Disconnect(esxi_si)
+                        except Exception as esxi_conn_err:
+                            lsf.write_output(f'  WARNING: Could not connect to {esxi_host}: {esxi_conn_err}')
+
+                lsf.write_output('SCP VM power-on tasks submitted, waiting 60s for boot...')
+                time.sleep(60)
+
+            connect.Disconnect(scp_si)
+        except Exception as scp_task_err:
+            lsf.write_output(f'WARNING: SCP power check/start failed: {scp_task_err}')
+            lsf.write_output('  Continuing to Supervisor status polling...')
+
+        #----------------------------------------------------------------------
         # TASK 2b: VERIFY - Confirm Supervisor is RUNNING via vCenter REST API
         # Instead of checking individual VMs (which requires elevated permissions
         # on system-managed EAM VMs), we use the authoritative vCenter Supervisor

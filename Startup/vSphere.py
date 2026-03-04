@@ -371,7 +371,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                     auth=(vc_user, lsf.password),
                     verify=False, timeout=15, proxies=None
                 )
-                if session_resp.status_code != 200:
+                if session_resp.status_code not in (200, 201):
                     lsf.write_output(f'  {vc_hostname}: Could not get API session (HTTP {session_resp.status_code}), skipping SSH/shell check')
                     continue
                 

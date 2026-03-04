@@ -33,6 +33,7 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | Kube-apiserver timeouts, pods stuck Unknown | Pods in Unknown state, kube-apiserver timeouts | CAPI/CAPV controllers not ready after cold boot | 20 |
 | vCenter browser warning banner (UNSOLVABLE) | "Unsupported browser" yellow banner on login | JSP compilation/Tomcat caching defeats websso.js patching | 21 |
 | CCI 503 "no healthy upstream" at startup | CCI URL returns 503 instead of 401 JSON | CCI-related prelude deployments at 0 replicas after cold boot | 22 |
+| SCP VMs powered off after shutdown (9.0.x) | Supervisor stuck CONFIGURING/ERROR, SCP VMs poweredOff | EAM-managed VMs not auto-started; vCenter PowerOn denied with NoPermission | 23 |
 
 ---
 
@@ -957,3 +958,70 @@ sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-u
 - The RabbitMQ fix survives pod restarts because it modifies the PVC, but a full PVC recreation would re-introduce the issue.
 - The provisioning-service deadlock fix requires patching the deployment's JAVA_OPTS to append `-Dmanagement.prometheus.metrics.export.exemplars.enabled=false`. This disables the `PrometheusExemplarsAutoConfiguration` that causes the circular lock.
 - After both fixes, the full CCI chain takes ~5-8 minutes to cascade through all init container dependency checks.
+
+---
+
+## 23. Supervisor Control Plane VMs Powered Off After Shutdown (VCF 9.0.x)
+
+**Symptom**: Supervisor reports `config_status: CONFIGURING, kubernetes_status: ERROR` after a clean lab shutdown/restart. The CCI URL returns 503 "no healthy upstream". The `check_fix_wcp.sh` script cannot reach the SCP VMs.
+
+**Diagnosis**:
+
+```bash
+# Check SCP VM power state via vCenter API
+PASSWORD=$(cat /home/holuser/creds.txt)
+SESSION=$(curl -sk -X POST "https://vc-wld01-a.site-a.vcf.lab/api/session" \
+  -u "administrator@wld.sso:${PASSWORD}" | tr -d '"')
+curl -sk -H "vmware-api-session-id: ${SESSION}" \
+  "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/namespace-management/clusters" | python3 -m json.tool
+
+# Check via pyVmomi
+python3 -c "
+from pyVim.connect import SmartConnect
+from pyVmomi import vim
+import ssl
+ctx = ssl._create_unverified_context()
+password = open('/home/holuser/creds.txt').read().strip()
+si = SmartConnect(host='vc-wld01-a.site-a.vcf.lab', user='administrator@wld.sso', pwd=password, sslContext=ctx)
+for vm in si.RetrieveContent().viewManager.CreateContainerView(si.RetrieveContent().rootFolder, [vim.VirtualMachine], True).view:
+    if 'SupervisorControlPlane' in vm.name:
+        print(f'{vm.name}: power={vm.runtime.powerState}, host={vm.runtime.host.name}')
+"
+```
+
+**Root Cause**: On VCF 9.0.x, Supervisor Control Plane VMs are EAM-managed and reside on the WLD cluster ESXi hosts (esx-05a through esx-07a). During clean shutdown, these VMs are powered off. However:
+1. The startup scripts (`VCFfinal.py`) only *verified* Supervisor status; they did not contain logic to power on SCP VMs.
+2. Attempting to power on SCP VMs through `vc-wld01-a` with `administrator@wld.sso` fails with `vim.fault.NoPermission` because vCenter's EAM agent restricts direct VM management of its managed VMs.
+3. Restarting the WCP service or spherelet on ESXi hosts does not trigger EAM to power on the VMs.
+
+**Fix**: Connect directly to the individual ESXi hosts that host the SCP VMs and issue `PowerOnVM_Task()` as `root`, bypassing vCenter's EAM restrictions:
+
+```bash
+python3 -c "
+from pyVim.connect import SmartConnect
+from pyVmomi import vim
+import ssl
+
+ctx = ssl._create_unverified_context()
+password = open('/home/holuser/creds.txt').read().strip()
+
+for host in ['esx-05a.site-a.vcf.lab', 'esx-06a.site-a.vcf.lab', 'esx-07a.site-a.vcf.lab']:
+    si = SmartConnect(host=host, user='root', pwd=password, sslContext=ctx)
+    content = si.RetrieveContent()
+    for vm in content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True).view:
+        if 'SupervisorControlPlane' in vm.name and vm.runtime.powerState != 'poweredOn':
+            vm.PowerOnVM_Task()
+            print(f'{vm.name} on {host}: PowerOn submitted')
+"
+```
+
+After power-on, the Supervisor takes approximately 3-5 minutes to transition from CONFIGURING/ERROR through CONFIGURING/WARNING to RUNNING/READY.
+
+**Permanent Fix**: `VCFfinal.py` Task 2a2 now automatically detects powered-off SCP VMs, tries vCenter first, and falls back to direct ESXi host connections when `NoPermission` is encountered. This is safe for VCF 9.1 (where SCP VMs may not exist on WLD ESXi hosts).
+
+**Key Details**:
+- This issue only affects VCF 9.0.x. On VCF 9.1, the Supervisor runs on the VSP cluster which is handled separately.
+- The SCP VMs are on esx-05a, esx-06a, esx-07a in the default Holodeck layout.
+- The K8s VIP for the Supervisor is 10.1.1.85; individual SCP VMs are at 10.1.1.86-88.
+- After SCP VMs boot, `hypercrypt` and `kubelet` services must both reach `active` state before the K8s API becomes available.
+- The `decryptK8Pwd.py` script on the WLD vCenter provides the SCP root password needed for SSH.

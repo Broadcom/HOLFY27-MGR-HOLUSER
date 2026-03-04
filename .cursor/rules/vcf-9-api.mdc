@@ -32,6 +32,8 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 - **SDDC Manager credential REMEDIATE** requires: (1) service accounts fixed in vCenter SSO first, (2) stale locks cleared from `platform.lock` table, (3) resource statuses set to ACTIVE in platform DB. Process one resource at a time (10-task concurrency limit).
 - **SDDC Manager PostgreSQL** is on `127.0.0.1:5432` (TCP, not socket). Password in `/root/.pgpass`. SSH as `vcf` user can run `psql` without root.
 - **SDDC Manager `/v1/resource-locks` API is read-only** — cannot DELETE locks via API. Must use direct `psql` access to `DELETE FROM lock`.
+- **vCenter `/api/session` returns HTTP 201**, not 200. Accept both when checking session creation success.
+- **SCP VMs are EAM-managed on VCF 9.0.x** — `PowerOnVM_Task()` via vCenter returns `NoPermission`. Connect directly to ESXi hosts as `root` to power on SCP VMs.
 
 ## Session Knowledge Capture
 
