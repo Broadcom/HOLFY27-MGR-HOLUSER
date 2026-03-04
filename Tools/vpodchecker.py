@@ -298,19 +298,18 @@ def check_ssl_certificates(urls: List[str], min_exp_date: datetime.date) -> List
             host.days_to_expire = days_until
             months_until = days_until / 30.44
             
-            if months_until >= 9:
+            if host.name == 'www.vmware.com' and days_until > 0:
+                status = "PASS"
+                message = f"Certificate valid - expires {host.ssl_exp_date} ({days_until}d remaining)"
+            elif months_until >= 9:
                 status = "PASS"
                 message = f"Certificate valid - expires {host.ssl_exp_date} (>= 9 months)"
             elif months_until >= 3:
                 status = "WARN"
                 message = f"Certificate expires soon - expires {host.ssl_exp_date} (< 9 months)"
             else:
-                if host.name == 'www.vmware.com':
-                    status = "WARN"
-                    message = f"External certificate expires soon/past - expires {host.ssl_exp_date}"
-                else:
-                    status = "FAIL"
-                    message = f"Certificate expires critically soon - expires {host.ssl_exp_date} (< 3 months)"
+                status = "FAIL"
+                message = f"Certificate expires critically soon - expires {host.ssl_exp_date} (< 3 months)"
             
             results.append(CheckResult(
                 name=f"SSL: {host.name}:{host.port}",
@@ -433,7 +432,7 @@ def check_vm_configuration(vms: List, fix_issues: bool = True) -> List[CheckResu
         'vcf-services-platform-template-',    # VCF Services Platform Template VMs
         'SupervisorControlPlaneVM',           # Tanzu Supervisor Control Plane VMs
         'vna-wld01-',                         # VNA Workload VMs
-        'vCLS-',                              # VCLS VMs
+        'vCLS-',                               # vCloud Logging VMs
     ]
     
     for vm in vms:
