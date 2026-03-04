@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 # Shutdown.py - HOLFY27 Lab Shutdown Orchestration
-# Version 2.1 - February 2026
+# Version 2.2 - 2026-03-04
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # Main shutdown script for graceful lab environment shutdown
 #
+# v 2.2 Changes:
+# - Updated vSAN elevator polling: now polls `/storage/lsom/elevatorRunning`
+#   on each host every 30 seconds until all hosts report `0` (flush complete)
+# - Removed 45-minute timeout safety ceiling: the script now finishes as
+#   soon as all hosts complete the flush. In a quiesced lab environment
+#   (all VMs already shut down), this typically takes **2-10 minutes**
+#   instead of the full 45.
+# - Added `--quick` flag to skip the elevator entirely (faster but less safe)
 # v 2.1 Changes:
 # - Fixed --phase parameter: now correctly runs only the targeted VCF
 #   shutdown phase instead of all phases from that point onward
@@ -564,7 +572,7 @@ if __name__ == '__main__':
 Examples:
     python3 Shutdown.py                    # Full shutdown (all phases)
     python3 Shutdown.py --dry-run          # Preview without changes
-    python3 Shutdown.py --quick            # Skip vSAN wait (faster but less safe)
+    python3 Shutdown.py --quick            # Skip vSAN elevator (faster but less safe)
     python3 Shutdown.py --no-hosts         # Shutdown VMs but leave hosts running
     python3 Shutdown.py --phase 1          # Run only Fleet Operations phase
     python3 Shutdown.py --phase 13         # Run only VCF Operations shutdown
@@ -615,7 +623,7 @@ Configuration:
                         help='Show what would be done without making changes')
     
     parser.add_argument('--quick', '-q', action='store_true',
-                        help='Skip vSAN elevator wait period (faster but less safe)')
+                        help='Skip vSAN elevator entirely (faster but less safe)')
     
     parser.add_argument('--no-hosts', action='store_true',
                         help='Skip ESXi host shutdown (leave hosts running)')

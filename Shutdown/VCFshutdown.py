@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 2.4 - February 2026
+# Version 2.5 - March 2026
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 2.5 Changes:
+# - Phase 19 vSAN elevator now uses active polling instead of a blind
+#   45-minute sleep. After enabling plogRunElevator, the script polls
+#   each host's /storage/lsom/elevatorRunning vsish counter every 30s
+#   and proceeds as soon as all hosts report 0 (flush complete).
+#   The 2700s timeout is retained as a safety ceiling. In a quiesced
+#   lab the flush typically completes in 2-10 minutes.
 #
 # v 2.4 Changes:
 # - Phase 1 now uses fleet-lcm direct API (JWT via VSP Identity Service)
@@ -174,7 +182,7 @@ NSX VM Domain Detection:
 - VMs with "mgmt" in name are treated as Management Domain (Phase 14-15)
 
 vSAN Architecture Detection:
-- OSA (Original Storage Architecture): Requires plogRunElevator and 45-minute wait
+- OSA (Original Storage Architecture): Requires plogRunElevator, polls until flush completes
 - ESA (Express Storage Architecture): Does NOT use plog, elevator wait is skipped
 - Detection via PyVmomi API (vsanHostConfig.vsanEsaEnabled), SSH fallback
 """
@@ -214,9 +222,10 @@ STATUS_FILE = '/lmchol/hol/startup_status.txt'
 # Shutdown log file (mirrors all VCF phase output to shutdown.log)
 SHUTDOWN_LOG = '/home/holuser/hol/shutdown.log'
 
-# vSAN elevator timeout (45 minutes recommended by VMware)
+# vSAN elevator timeout (45 minutes - safety ceiling; active polling finishes sooner)
 VSAN_ELEVATOR_TIMEOUT = 2700  # 45 minutes in seconds
-VSAN_ELEVATOR_CHECK_INTERVAL = 60  # Check every minute
+VSAN_ELEVATOR_POLL_INTERVAL = 30  # Seconds between elevatorRunning polls
+VSAN_ELEVATOR_LOG_INTERVAL = 120  # Seconds between progress log lines
 
 # VM shutdown timeout
 VM_SHUTDOWN_TIMEOUT = 300  # 5 minutes per VM
@@ -588,6 +597,83 @@ def set_vsan_elevator(lsf, host: str, username: str, password: str,
     except Exception as e:
         vcf_write(lsf, f'Error setting vSAN elevator on {host}: {e}')
         return False
+
+
+def check_elevator_running(lsf, host: str, username: str, password: str) -> bool:
+    """
+    Check whether the vSAN elevator is still actively flushing on a host.
+    
+    Reads the vsish counter /storage/lsom/elevatorRunning:
+      1 = elevator is still flushing write cache to capacity tier
+      0 = flush complete (or never started)
+    
+    :param lsf: lsfunctions module reference
+    :param host: ESXi hostname
+    :param username: ESXi username
+    :param password: ESXi password
+    :return: True if the elevator is still running, False if done or unreachable
+    """
+    if not lsf.test_tcp_port(host, 22, timeout=5):
+        return False
+
+    try:
+        cmd = 'vsish -e get /storage/lsom/elevatorRunning 2>/dev/null'
+        result = lsf.ssh(cmd, f'{username}@{host}', password)
+        output = result.stdout if hasattr(result, 'stdout') and result.stdout else ''
+        if isinstance(output, bytes):
+            output = output.decode('utf-8', errors='replace')
+        return output.strip() == '1'
+    except Exception:
+        return False
+
+
+def wait_for_elevator_completion(lsf, esx_hosts: list, username: str,
+                                  password: str, max_wait: int = VSAN_ELEVATOR_TIMEOUT,
+                                  poll_interval: int = VSAN_ELEVATOR_POLL_INTERVAL) -> bool:
+    """
+    Poll all ESXi hosts until the vSAN elevator flush completes on every host,
+    or the safety timeout is reached.
+
+    :param lsf: lsfunctions module reference
+    :param esx_hosts: list of ESXi hostnames
+    :param username: ESXi username
+    :param password: ESXi password
+    :param max_wait: maximum seconds to wait (safety ceiling)
+    :param poll_interval: seconds between polls
+    :return: True if all hosts completed, False on timeout
+    """
+    start = time.time()
+    pending_hosts = set(esx_hosts)
+    last_log = 0
+
+    while pending_hosts and (time.time() - start) < max_wait:
+        elapsed = int(time.time() - start)
+        still_running = set()
+
+        for host in list(pending_hosts):
+            if check_elevator_running(lsf, host, username, password):
+                still_running.add(host)
+            else:
+                vcf_write(lsf, f'  {host}: elevator flush complete ({elapsed}s)')
+
+        pending_hosts = still_running
+
+        if pending_hosts:
+            if elapsed - last_log >= VSAN_ELEVATOR_LOG_INTERVAL or last_log == 0:
+                remaining = int(max_wait - elapsed)
+                vcf_write(lsf, f'  {len(pending_hosts)} host(s) still flushing '
+                          f'({elapsed}s elapsed, {remaining}s max remaining)')
+                last_log = elapsed
+            time.sleep(poll_interval)
+
+    total = int(time.time() - start)
+    if pending_hosts:
+        vcf_write(lsf, f'  Timeout after {total}s - {len(pending_hosts)} host(s) '
+                  f'did not finish: {sorted(pending_hosts)}')
+        return False
+
+    vcf_write(lsf, f'  All hosts finished elevator flush in {total}s')
+    return True
 
 
 def shutdown_host(lsf, host_fqdn: str, username: str, password: str) -> bool:
@@ -2098,7 +2184,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                     is_esa = check_vsan_esa(lsf, test_host, esx_username, password)
                     if is_esa:
                         vcf_write(lsf, f'  vSAN ESA detected on {test_host}')
-                        vcf_write(lsf, '  ESA does not use plog - skipping 45-minute elevator wait')
+                        vcf_write(lsf, '  ESA does not use plog - skipping elevator')
                     else:
                         vcf_write(lsf, f'  vSAN OSA detected on {test_host}')
                         vcf_write(lsf, '  OSA uses plog - elevator wait is required')
@@ -2116,19 +2202,18 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vcf_write(lsf, f'  [{host_count}/{len(esx_hosts)}] Enabling elevator on {host}')
                         set_vsan_elevator(lsf, host, esx_username, password, enable=True)
 
-                    # Wait for vSAN I/O to complete
-                    vcf_write(lsf, f'Starting vSAN I/O flush wait ({vsan_timeout/60:.0f} minutes)...')
-                    vcf_write(lsf, '  This ensures all pending writes are committed to disk (OSA plog)')
+                    # Poll for elevator completion instead of blind wait
+                    vcf_write(lsf, f'Polling vSAN elevator completion (timeout {vsan_timeout/60:.0f}min, '
+                              f'poll every {VSAN_ELEVATOR_POLL_INTERVAL}s)...')
+                    vcf_write(lsf, '  Checking /storage/lsom/elevatorRunning on each host')
 
-                    elapsed = 0
-                    while elapsed < vsan_timeout:
-                        remaining = (vsan_timeout - elapsed) / 60
-                        elapsed_min = elapsed / 60
-                        vcf_write(lsf, f'  vSAN wait: {elapsed_min:.0f}m elapsed, {remaining:.1f}m remaining')
-                        time.sleep(VSAN_ELEVATOR_CHECK_INTERVAL)
-                        elapsed += VSAN_ELEVATOR_CHECK_INTERVAL
+                    wait_for_elevator_completion(
+                        lsf, esx_hosts, esx_username, password,
+                        max_wait=vsan_timeout,
+                        poll_interval=VSAN_ELEVATOR_POLL_INTERVAL,
+                    )
 
-                    vcf_write(lsf, 'vSAN I/O flush wait complete')
+                    vcf_write(lsf, 'vSAN elevator flush complete')
 
                     # Disable vSAN elevator on all hosts
                     vcf_write(lsf, f'Disabling vSAN elevator on {len(esx_hosts)} host(s)...')
