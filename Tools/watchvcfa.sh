@@ -1,6 +1,6 @@
 #!/bin/bash
 # Author: Burke Azbill
-# Version: 1.2
+# Version: 1.3
 # Date: 2026-03-03
 # Script to watch VCF Automation appliance for issues and remediate them
 # This script:
@@ -13,6 +13,8 @@
 # 7. Checks if the vCenter vAPI endpoint is running
 # 8. Checks if the vsphere-csi-controller is running
 # 9. Checks if the CSI controller is running
+# 10. Fixes RabbitMQ .erlang.cookie permissions (fsGroup breaks Erlang requirement)
+# 11. Fixes provisioning-service Spring Boot deadlock (PrometheusExemplarsAutoConfiguration)
 
 #REBOOTS=0
 SEAWEEDPOD="."
@@ -385,6 +387,64 @@ python3 /tmp/del_unknown.py' | tee -a  "${LOGFILE}" >> "${CONSOLELOG}"
       break
     fi
   done
+
+  ###### RabbitMQ .erlang.cookie permissions fix ######
+  # The fsGroup: 200 pod security context causes Kubernetes to set group-read/write (0660)
+  # on all PVC files, but Erlang requires .erlang.cookie to be owner-only (0400).
+  # If RabbitMQ is in CrashLoopBackOff with "Cookie file must be accessible by owner only",
+  # fix the permissions via a temporary root pod.
+  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Checking RabbitMQ health..." | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+  RABBIT_STATUS=$(vcfa_ssh 'kubectl get pods -n prelude rabbitmq-ha-0 --no-headers 2>/dev/null' | awk '{print $3}')
+  if [ "$RABBIT_STATUS" == "CrashLoopBackOff" ] || [ "$RABBIT_STATUS" == "Error" ]; then
+    RABBIT_LOGS=$(vcfa_ssh 'kubectl logs -n prelude rabbitmq-ha-0 --tail=20 2>/dev/null')
+    if echo "$RABBIT_LOGS" | grep -q "Cookie file.*must be accessible by owner only"; then
+      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> RabbitMQ failing due to .erlang.cookie permissions. Fixing..." | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+      vcfa_ssh 'kubectl run rabbitmq-cookie-fix --rm -i --restart=Never -n prelude \
+        --image=registry.vmsp-platform.svc.cluster.local:5000/images/prelude/rabbitmq:9.0.0.0.24701403 \
+        --overrides='"'"'{"spec":{"securityContext":{"runAsUser":0},"containers":[{"name":"rabbitmq-cookie-fix","image":"registry.vmsp-platform.svc.cluster.local:5000/images/prelude/rabbitmq:9.0.0.0.24701403","command":["sh","-c","chmod 400 /var/lib/rabbitmq/.erlang.cookie && echo FIXED"],"volumeMounts":[{"mountPath":"/var/lib/rabbitmq","name":"rabbit-pvc"}]}],"volumes":[{"name":"rabbit-pvc","persistentVolumeClaim":{"claimName":"rabbit-pvc-rabbitmq-ha-0"}}]}}'"'"' 2>/dev/null' | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+      sleep 5
+      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Restarting rabbitmq-ha-0..." | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+      vcfa_ssh 'kubectl delete pod rabbitmq-ha-0 -n prelude 2>/dev/null' | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+      sleep 30
+      vcfa_ssh 'kubectl get pods -n prelude rabbitmq-ha-0 --no-headers 2>/dev/null' | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+    fi
+  else
+    echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> RabbitMQ status: ${RABBIT_STATUS:-not found}" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+  fi
+
+  ###### provisioning-service deadlock fix ######
+  # The provisioning-service-app can hit a deterministic deadlock during Spring Boot
+  # initialization between the main thread and ebs-1 thread, caused by
+  # PrometheusExemplarsAutoConfiguration. Fix by adding JVM flag to disable exemplars.
+  echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Checking provisioning-service for deadlock..." | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+  PROV_READY=$(vcfa_ssh 'kubectl get deployment provisioning-service-app -n prelude -o jsonpath="{.status.readyReplicas}" 2>/dev/null')
+  if [ -z "$PROV_READY" ] || [ "$PROV_READY" == "0" ]; then
+    PROV_JAVA_OPTS=$(vcfa_ssh 'kubectl get deployment provisioning-service-app -n prelude -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"JAVA_OPTS\")].value}" 2>/dev/null')
+    if ! echo "$PROV_JAVA_OPTS" | grep -q "exemplars.enabled=false"; then
+      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> Patching provisioning-service to disable Prometheus exemplars (deadlock fix)..." | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+      vcfa_ssh 'kubectl get deployment provisioning-service-app -n prelude -o json 2>/dev/null' > /tmp/prov-deploy.json
+      python3 -c "
+import json
+with open('/tmp/prov-deploy.json') as f:
+    data = json.load(f)
+fix = '-Dmanagement.prometheus.metrics.export.exemplars.enabled=false'
+for c in data['spec']['template']['spec']['containers']:
+    if c['name'] == 'provisioning-service-app':
+        for env in c.get('env', []):
+            if env['name'] == 'JAVA_OPTS':
+                if fix not in env.get('value', ''):
+                    env['value'] = env['value'].rstrip() + '\n' + fix
+                break
+        break
+with open('/tmp/prov-deploy-patched.json', 'w') as f:
+    json.dump(data, f)
+print('Patched')
+"
+      sshpass -f "${CREDS_FILE}" scp -o StrictHostKeyChecking=no /tmp/prov-deploy-patched.json "${VCFA_USER}@${VCFA_HOST}:/tmp/prov-deploy-patched.json" 2>/dev/null
+      vcfa_ssh 'kubectl apply -f /tmp/prov-deploy-patched.json 2>/dev/null' | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+      echo "[$(date +"%Y-%m-%d %H:%M:%S")]-> provisioning-service patched, new pod will roll out" | tee -a "${LOGFILE}" >> "${CONSOLELOG}"
+    fi
+  fi
 
   ###### Prelude Pods Stuck Volume Mount Recovery ######
   # After fixing stuck volume attachments and/or the CSI controller, pods that were stuck
