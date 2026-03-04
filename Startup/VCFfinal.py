@@ -810,7 +810,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         # breaking DNS for all vSphere Pods via asymmetric DLB routing.
         #----------------------------------------------------------------------
         if tanzu_verify_ok and wcp_certs_ok and not dry_run:
-            verify_supervisor_dns(lsf, wcp_vcenter, password,
+            verify_supervisor_dns(lsf, wcp_vcenter, lsf.get_password(),
                                   sso_domain=sso_domain, dry_run=dry_run)
             
     else:
