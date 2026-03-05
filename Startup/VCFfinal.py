@@ -637,7 +637,7 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_output(f'FATAL: {fail_msg}')
             
             if dashboard:
-                dashboard.update_task('vcffinal', 'tanzu', TaskStatus.FAILED,
+                dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.FAILED,
                                       fail_msg)
                 dashboard.generate_html()
             
@@ -659,11 +659,19 @@ def main(lsf=None, standalone=False, dry_run=False):
                                   'No vCenters configured')
             dashboard.update_task('vcffinal', 'wcp_vcenter', TaskStatus.SKIPPED,
                                   'No vCenters configured')
+            dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
             dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.SKIPPED,
                                   'No vCenters configured')
             dashboard.update_task('vcffinal', 'vcfa_vms', TaskStatus.SKIPPED,
                                   'No vCenters configured')
+            dashboard.update_task('vcffinal', 'vcfa_k8s_health', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
             dashboard.update_task('vcffinal', 'vcfa_urls', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'nsx_passwords', TaskStatus.SKIPPED,
                                   'No vCenters configured')
             dashboard.generate_html()
         lsf.write_output('VCFfinal completed (no VCF resources)')
@@ -1097,8 +1105,22 @@ def main(lsf=None, standalone=False, dry_run=False):
         # breaking DNS for all vSphere Pods via asymmetric DLB routing.
         #----------------------------------------------------------------------
         if tanzu_verify_ok and wcp_certs_ok and not dry_run:
-            verify_supervisor_dns(lsf, wcp_vcenter, lsf.get_password(),
-                                  sso_domain=sso_domain, dry_run=dry_run)
+            if dashboard:
+                dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.RUNNING)
+                dashboard.generate_html()
+            dns_ok = verify_supervisor_dns(lsf, wcp_vcenter, lsf.get_password(),
+                                           sso_domain=sso_domain, dry_run=dry_run)
+            if dashboard:
+                if dns_ok or dns_ok is None:
+                    dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.COMPLETE)
+                else:
+                    dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.FAILED, 'See log')
+                dashboard.generate_html()
+        elif not tanzu_verify_ok or not wcp_certs_ok:
+            if dashboard:
+                dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.SKIPPED,
+                                      'Supervisor not ready')
+                dashboard.generate_html()
 
         #----------------------------------------------------------------------
         # TASK 2c3: POST-VERIFY - Supervisor Service vSphere Pod DNS Fix
@@ -1112,11 +1134,25 @@ def main(lsf=None, standalone=False, dry_run=False):
         #----------------------------------------------------------------------
         svc_dns_namespaces = lsf.get_config_list('VCFFINAL', 'supervisorservicedns')
         if svc_dns_namespaces and tanzu_verify_ok and not dry_run:
-            fix_supervisor_service_dns(lsf, wcp_vcenter, lsf.get_password(),
-                                      namespaces=svc_dns_namespaces,
-                                      sso_domain=sso_domain, dry_run=dry_run)
+            if dashboard:
+                dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.RUNNING)
+                dashboard.generate_html()
+            svc_dns_ok = fix_supervisor_service_dns(lsf, wcp_vcenter, lsf.get_password(),
+                                                    namespaces=svc_dns_namespaces,
+                                                    sso_domain=sso_domain, dry_run=dry_run)
+            if dashboard:
+                if svc_dns_ok or svc_dns_ok is None:
+                    dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.COMPLETE)
+                else:
+                    dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.FAILED, 'See log')
+                dashboard.generate_html()
         elif svc_dns_namespaces and dry_run:
             lsf.write_output(f'Would fix DNS for {len(svc_dns_namespaces)} namespace(s) (dry run)')
+        else:
+            if dashboard:
+                dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.SKIPPED,
+                                      'Not configured')
+                dashboard.generate_html()
 
     else:
         lsf.write_output('No Tanzu Control Plane VMs configured')
@@ -1124,6 +1160,8 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.update_task('vcffinal', 'wcp_vcenter', TaskStatus.SKIPPED, 'Not configured')
             dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.SKIPPED, 'Not configured')
             dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.SKIPPED, 'Not configured')
+            dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.SKIPPED, 'Not configured')
+            dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.SKIPPED, 'Not configured')
             dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.RUNNING)
             dashboard.generate_html()
     
@@ -2519,6 +2557,11 @@ def main(lsf=None, standalone=False, dry_run=False):
                 dashboard.update_task('vcffinal', 'vcfa_k8s_health', TaskStatus.FAILED,
                                       'See log for details')
             dashboard.generate_html()
+    else:
+        if dashboard:
+            dashboard.update_task('vcffinal', 'vcfa_k8s_health', TaskStatus.SKIPPED,
+                                  'VCF Automation not configured')
+            dashboard.generate_html()
     
     #==========================================================================
     # TASK 5: Check VCF Automation URLs
@@ -2659,9 +2702,14 @@ def main(lsf=None, standalone=False, dry_run=False):
     # remediation so the ops-a compliance dashboard shows green.
     #==========================================================================
     
+    if dashboard:
+        dashboard.update_task('vcffinal', 'nsx_passwords', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
     nsx_mgr_entries = lsf.get_config_list('VCF', 'vcfnsxmgr')
     nsx_users = ['admin', 'root', 'audit']
     nsx_expiry_days = 9999
+    nsx_task_failed = False
     password = lsf.get_password()
     
     if nsx_mgr_entries:
@@ -2759,6 +2807,17 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_output('  Would trigger fleet policy compliance check/remediation')
     else:
         lsf.write_output(f'{ops_fqdn} not reachable - skipping fleet policy check')
+    
+    if dashboard:
+        if nsx_mgr_entries:
+            if nsx_task_failed:
+                dashboard.update_task('vcffinal', 'nsx_passwords', TaskStatus.FAILED, 'See log')
+            else:
+                dashboard.update_task('vcffinal', 'nsx_passwords', TaskStatus.COMPLETE)
+        else:
+            dashboard.update_task('vcffinal', 'nsx_passwords', TaskStatus.SKIPPED,
+                                  'No NSX managers configured')
+        dashboard.generate_html()
     
     #==========================================================================
     # Cleanup
