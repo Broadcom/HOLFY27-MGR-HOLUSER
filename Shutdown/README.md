@@ -1,6 +1,6 @@
 # HOL Lab Shutdown Scripts
 
-Version 2.0 - February 2026
+Version 2.1 - 2026-03-04
 
 ## Overview
 
@@ -48,7 +48,7 @@ python3 Shutdown.py
 # Preview mode (no changes made)
 python3 Shutdown.py --dry-run
 
-# Quick shutdown (skip vSAN wait)
+# Quick shutdown (skip vSAN elevator)
 python3 Shutdown.py --quick
 
 # Shutdown VMs only, leave hosts running
@@ -197,7 +197,7 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 | Phase 17 | Mgmt vCenter | Management domain vCenter |
 | Phase 17b | Connect to ESXi | Direct ESXi connections (vCenters now down) |
 | Phase 18 | Host Settings | Set ESXi advanced settings |
-| Phase 19 | vSAN Elevator | Enable elevator, wait 45min, disable (OSA only) |
+| Phase 19 | vSAN Elevator | Enable elevator, poll until flush complete, disable (OSA only) |
 | Phase 19b | VSP Platform VMs | Shutdown VSP VMs |
 | Phase 19c | Pre-ESXi Audit | Find and shutdown straggler VMs |
 | Phase 20 | ESXi Hosts | Shutdown ESXi hosts |
@@ -219,7 +219,7 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 | Option | Short | Description |
 | ------ | ----- | ----------- |
 | `--dry-run` | `-n` | Preview mode - show what would be done without making changes |
-| `--quick` | `-q` | Skip the 45-minute vSAN elevator wait (faster but less safe) |
+| `--quick` | `-q` | Skip the vSAN elevator entirely (faster but less safe) |
 | `--no-hosts` | | Skip ESXi host shutdown (leave hosts running) |
 | `--phase PHASE` | `-p` | Run only a specific VCF shutdown phase |
 | `--version` | `-v` | Show version number |
@@ -347,14 +347,16 @@ In VCF 9.1, many services run as Kubernetes workloads on VSP rather than as stan
 
 Before ESXi hosts can be safely shut down, the vSAN cluster must complete all pending I/O operations. This is done via the "vSAN elevator" process:
 
-1. Enable `plogRunElevator` on all hosts (flushes write cache)
-2. Wait 45 minutes for vSAN to complete all I/O
-3. Disable `plogRunElevator` on all hosts
+1. Enable `plogRunElevator` on all hosts (starts flushing write cache to capacity tier)
+2. Poll `/storage/lsom/elevatorRunning` on each host every 30 seconds
+3. Once all hosts report `0` (flush complete), disable `plogRunElevator`
 4. Proceed with host shutdown
+
+The 45-minute timeout is retained as a safety ceiling, but the script finishes as soon as all hosts complete the flush. In a quiesced lab environment (all VMs already shut down), this typically takes **2-10 minutes** instead of the full 45.
 
 **vSAN ESA** (Express Storage Architecture) does NOT use the plog mechanism and the elevator wait is automatically skipped.
 
-The `--quick` flag skips this wait period but may result in data loss if vSAN has pending operations.
+The `--quick` flag skips the elevator entirely but may result in data loss if vSAN has pending operations.
 
 ## Dependencies
 
@@ -396,8 +398,9 @@ Shutdown logs are written to:
 
 ### vSAN timeout too long
 
-- Use `--quick` flag for faster (but less safe) shutdown
-- Or set `vsan_timeout = 0` in config
+- The elevator now uses active polling and finishes as soon as the flush completes (typically 2-10 minutes in a quiesced lab)
+- If it still takes too long, use `--quick` flag to skip the elevator entirely (less safe)
+- Or set `vsan_timeout = 0` in config to skip
 
 ### Hosts not shutting down
 

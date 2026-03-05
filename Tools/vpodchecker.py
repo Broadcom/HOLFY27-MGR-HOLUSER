@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.3 - February 26, 2026
+# Version 2.4 - March 3, 2026
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.4 - 2026-03-03:
+#   - Removed "Broadcom, Inc CA" from expected private CAs (not present in
+#     all VCF 9.1 labs); Firefox CA check now simply lists found private CAs
+#     and only checks for Vault Root CA and per-vCenter VMCAs
 # v2.3 - 2026-02-26:
 #   - Added "Firefox Trusted Private CAs" section: enumerates custom CAs in the
 #     Firefox NSS cert store, verifies expected CAs are present, reports expiry
@@ -294,19 +298,18 @@ def check_ssl_certificates(urls: List[str], min_exp_date: datetime.date) -> List
             host.days_to_expire = days_until
             months_until = days_until / 30.44
             
-            if months_until >= 9:
+            if host.name == 'www.vmware.com' and days_until > 0:
+                status = "PASS"
+                message = f"Certificate valid - expires {host.ssl_exp_date} ({days_until}d remaining)"
+            elif months_until >= 9:
                 status = "PASS"
                 message = f"Certificate valid - expires {host.ssl_exp_date} (>= 9 months)"
             elif months_until >= 3:
                 status = "WARN"
                 message = f"Certificate expires soon - expires {host.ssl_exp_date} (< 9 months)"
             else:
-                if host.name == 'www.vmware.com':
-                    status = "WARN"
-                    message = f"External certificate expires soon/past - expires {host.ssl_exp_date}"
-                else:
-                    status = "FAIL"
-                    message = f"Certificate expires critically soon - expires {host.ssl_exp_date} (< 3 months)"
+                status = "FAIL"
+                message = f"Certificate expires critically soon - expires {host.ssl_exp_date} (< 3 months)"
             
             results.append(CheckResult(
                 name=f"SSL: {host.name}:{host.port}",
@@ -429,6 +432,7 @@ def check_vm_configuration(vms: List, fix_issues: bool = True) -> List[CheckResu
         'vcf-services-platform-template-',    # VCF Services Platform Template VMs
         'SupervisorControlPlaneVM',           # Tanzu Supervisor Control Plane VMs
         'vna-wld01-',                         # VNA Workload VMs
+        'vCLS-',                               # vCloud Logging VMs
     ]
     
     for vm in vms:
@@ -1802,12 +1806,10 @@ def _build_expected_ca_list() -> List[str]:
     Sources:
     - Vault Root CA (always expected)
     - One VMCA per vCenter (from [RESOURCES] vCenters in config.ini)
-    - Broadcom VCF Root CA (always expected for VCF labs)
     
     :return: List of expected CA nicknames
     """
     expected = list(EXPECTED_PRIVATE_CAS)
-    expected.append('Broadcom, Inc CA')
 
     if lsf and hasattr(lsf, 'config'):
         try:

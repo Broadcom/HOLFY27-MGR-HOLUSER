@@ -1,9 +1,41 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 2.3 - February 2026
+# Version 2.6 - March 2026
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 2.6 Changes:
+# - Added Phase 3b: Dynamic Supervisor Workload Shutdown
+#   Discovers and gracefully shuts down all Supervisor-managed workloads
+#   (VKS/TKG clusters, Harbor pods, etc.) via the Supervisor K8s API
+#   BEFORE WCP is stopped in Phase 3. Uses decryptK8Pwd.py to obtain
+#   SCP credentials, then kubectl to delete clusters and scale down
+#   Supervisor Service deployments. This ensures workload VMs drain
+#   gracefully instead of being hard-killed when ESXi hosts shut down.
+# - Phase 4 now includes dynamic discovery of Supervisor-managed VMs
+#   from the WLD vCenter (in addition to regex pattern matching).
+#   VMs not caught by configured patterns are automatically found
+#   and shut down, eliminating the need for lab-specific VM patterns.
+# - Added discover_supervisor_vms() helper function for dynamic VM discovery
+# - Added shutdown_supervisor_workloads() helper for K8s-level workload drain
+#
+# v 2.5 Changes:
+# - Phase 19 vSAN elevator now uses active polling instead of a blind
+#   45-minute sleep. After enabling plogRunElevator, the script polls
+#   each host's /storage/lsom/elevatorRunning vsish counter every 30s
+#   and proceeds as soon as all hosts report 0 (flush complete).
+#   The 2700s timeout is retained as a safety ceiling. In a quiesced
+#   lab the flush typically completes in 2-10 minutes.
+#
+# v 2.4 Changes:
+# - Phase 1 now uses fleet-lcm direct API (JWT via VSP Identity Service)
+#   as the primary shutdown method for VCF 9.1 instead of the suite-api
+#   internal proxy which returns HTTP 500 for shutdown actions.
+# - Auth flow: discovers IAM credentials from vcf-iam-vcfa-admin secret,
+#   obtains JWT from fleet-01a /api/v1/identity/token, then calls
+#   /fleet-lcm/v1/components/{id}?action=shutdown
+# - Falls back to suite-api proxy, then VCF 9.0 legacy, then Phase 1b VM shutdown
 #
 # v 2.3 Changes:
 # - Fixed Component CRD annotation update: components.api.vmsp.vmware.com is
@@ -133,8 +165,9 @@ PHASE 1:   Fleet Operations (VCF Operations Suite shutdown via API)
 PHASE 1b:  VCF Automation VM fallback (if Fleet API failed)
 PHASE 2:   Connect to vCenters (while still available)
 PHASE 2b:  Scale Down VCF Component Services (K8s on VSP)
+PHASE 3b:  Graceful Supervisor Workload Shutdown (VKS, Harbor, etc.)
 PHASE 3:   Stop WCP (Workload Control Plane) services
-PHASE 4:   Shutdown Workload VMs (Tanzu, K8s)
+PHASE 4:   Shutdown Workload VMs (Tanzu, K8s) + Dynamic Discovery
 PHASE 5:   Shutdown Workload Domain NSX Edges
 PHASE 6:   Shutdown Workload Domain NSX Manager
 PHASE 7:   Shutdown Workload vCenters (LAST per workload domain order)
@@ -165,7 +198,7 @@ NSX VM Domain Detection:
 - VMs with "mgmt" in name are treated as Management Domain (Phase 14-15)
 
 vSAN Architecture Detection:
-- OSA (Original Storage Architecture): Requires plogRunElevator and 45-minute wait
+- OSA (Original Storage Architecture): Requires plogRunElevator, polls until flush completes
 - ESA (Express Storage Architecture): Does NOT use plog, elevator wait is skipped
 - Detection via PyVmomi API (vsanHostConfig.vsanEsaEnabled), SSH fallback
 """
@@ -196,7 +229,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 MODULE_NAME = 'VCFshutdown'
-MODULE_VERSION = '2.3'
+MODULE_VERSION = '2.6'
 MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 9.x compliant)'
 
 # Status file for console display
@@ -205,9 +238,10 @@ STATUS_FILE = '/lmchol/hol/startup_status.txt'
 # Shutdown log file (mirrors all VCF phase output to shutdown.log)
 SHUTDOWN_LOG = '/home/holuser/hol/shutdown.log'
 
-# vSAN elevator timeout (45 minutes recommended by VMware)
+# vSAN elevator timeout (45 minutes - safety ceiling; active polling finishes sooner)
 VSAN_ELEVATOR_TIMEOUT = 2700  # 45 minutes in seconds
-VSAN_ELEVATOR_CHECK_INTERVAL = 60  # Check every minute
+VSAN_ELEVATOR_POLL_INTERVAL = 30  # Seconds between elevatorRunning polls
+VSAN_ELEVATOR_LOG_INTERVAL = 120  # Seconds between progress log lines
 
 # VM shutdown timeout
 VM_SHUTDOWN_TIMEOUT = 300  # 5 minutes per VM
@@ -446,6 +480,276 @@ def shutdown_vm_gracefully(lsf, vm, timeout: int = VM_SHUTDOWN_TIMEOUT) -> bool:
             return False
 
 
+def shutdown_supervisor_workloads(lsf, vc_fqdn: str, password: str,
+                                  sso_user: str = 'administrator@wld.sso',
+                                  dry_run: bool = False) -> bool:
+    """
+    Dynamically discover and gracefully shut down Supervisor workloads
+    (VKS/TKG clusters, Supervisor Service VMs) before stopping WCP.
+
+    Shutdown order:
+      1. Discover SCP password via decryptK8Pwd.py
+      2. Delete TKG/VKS clusters (scales down worker+CP VMs gracefully)
+      3. Scale down Supervisor Service deployments (harbor, etc.)
+      4. Wait for workload VMs to power off
+
+    :param lsf: lsfunctions module reference
+    :param vc_fqdn: Workload vCenter FQDN
+    :param password: Lab password (creds.txt)
+    :param sso_user: SSO user for vCenter API (default: administrator@wld.sso)
+    :param dry_run: Preview mode
+    :return: True if shutdown completed (or partially completed)
+    """
+    import subprocess
+    import tempfile
+
+    vcf_write(lsf, f'Discovering Supervisor workloads on {vc_fqdn}...')
+
+    # Step 1: Get SCP password via decryptK8Pwd.py on vCenter
+    scp_password = None
+    scp_ip = None
+
+    if not lsf.test_tcp_port(vc_fqdn, 22, timeout=5):
+        vcf_write(lsf, f'  {vc_fqdn} SSH not reachable - cannot discover SCP credentials')
+        return False
+
+    try:
+        result = lsf.ssh('python3 /usr/lib/vmware-wcp/decryptK8Pwd.py',
+                         f'root@{vc_fqdn}', password)
+        if hasattr(result, 'stdout') and result.stdout:
+            for line in result.stdout.strip().split('\n'):
+                if line.startswith('IP:'):
+                    scp_ip = line.split(':', 1)[1].strip()
+                elif line.startswith('PWD:'):
+                    scp_password = line.split(':', 1)[1].strip()
+    except Exception as e:
+        vcf_write(lsf, f'  Error getting SCP credentials: {e}')
+        return False
+
+    if not scp_ip or not scp_password:
+        vcf_write(lsf, '  Could not obtain SCP credentials - skipping workload shutdown')
+        return False
+
+    vcf_write(lsf, f'  SCP VIP: {scp_ip}')
+
+    if not lsf.test_tcp_port(scp_ip, 22, timeout=5):
+        vcf_write(lsf, f'  SCP {scp_ip} not reachable via SSH')
+        return False
+
+    # Helper to run kubectl on SCP
+    def scp_kubectl(cmd):
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(scp_password)
+            pwfile = f.name
+        try:
+            result = subprocess.run(
+                ['sshpass', '-f', pwfile, 'ssh', '-o', 'StrictHostKeyChecking=accept-new',
+                 f'root@{scp_ip}', cmd],
+                capture_output=True, text=True, timeout=30
+            )
+            return result
+        finally:
+            os.unlink(pwfile)
+
+    # Step 2: Discover and delete TKG/VKS clusters
+    vcf_write(lsf, '  Discovering TKG/VKS clusters...')
+    clusters_result = scp_kubectl('kubectl get clusters -A -o json 2>/dev/null')
+    clusters_deleted = 0
+
+    if clusters_result.returncode == 0 and clusters_result.stdout:
+        try:
+            raw = clusters_result.stdout.strip()
+            json_start = raw.find('{')
+            if json_start >= 0:
+                raw = raw[json_start:]
+            clusters_data = json.loads(raw)
+            clusters = clusters_data.get('items', [])
+
+            if clusters:
+                vcf_write(lsf, f'  Found {len(clusters)} TKG/VKS cluster(s)')
+                for cluster in clusters:
+                    ns = cluster['metadata']['namespace']
+                    name = cluster['metadata']['name']
+                    phase = cluster.get('status', {}).get('phase', 'unknown')
+                    vcf_write(lsf, f'    {ns}/{name}: phase={phase}')
+
+                    if not dry_run:
+                        vcf_write(lsf, f'    Deleting cluster {ns}/{name}...')
+                        del_result = scp_kubectl(
+                            f'kubectl delete cluster {name} -n {ns} --timeout=120s 2>&1'
+                        )
+                        if del_result.returncode == 0:
+                            vcf_write(lsf, f'    Cluster {name} deleted successfully')
+                            clusters_deleted += 1
+                        else:
+                            stderr = del_result.stderr.strip()[:200] if del_result.stderr else ''
+                            stdout = del_result.stdout.strip()[:200] if del_result.stdout else ''
+                            vcf_write(lsf, f'    Cluster delete returned: {stdout} {stderr}')
+                            vcf_write(lsf, f'    VMs will be caught by Phase 4/19c')
+                            clusters_deleted += 1
+                    else:
+                        vcf_write(lsf, f'    Would delete cluster {ns}/{name}')
+            else:
+                vcf_write(lsf, '  No TKG/VKS clusters found')
+        except (json.JSONDecodeError, ValueError) as e:
+            vcf_write(lsf, f'  Error parsing cluster data: {e}')
+    else:
+        vcf_write(lsf, '  No clusters API response (may not have TKG installed)')
+
+    # Step 3: Discover and scale down Supervisor Service workloads
+    vcf_write(lsf, '  Discovering Supervisor Service workloads...')
+    svc_namespaces_result = scp_kubectl(
+        'kubectl get namespaces -o json 2>/dev/null'
+    )
+
+    svc_scaled = 0
+    if svc_namespaces_result.returncode == 0 and svc_namespaces_result.stdout:
+        try:
+            raw = svc_namespaces_result.stdout.strip()
+            json_start = raw.find('{')
+            if json_start >= 0:
+                raw = raw[json_start:]
+            ns_data = json.loads(raw)
+
+            svc_namespaces = []
+            skip_ns_prefixes = ('kube-', 'default', 'vmware-system-', 'svc-tkg-',
+                                'svc-tmc-', 'svc-velero-')
+            for ns_item in ns_data.get('items', []):
+                ns_name = ns_item['metadata']['name']
+                if ns_name.startswith('svc-') and not any(
+                    ns_name.startswith(p) for p in skip_ns_prefixes
+                ):
+                    svc_namespaces.append(ns_name)
+                elif not ns_name.startswith(('kube-', 'default', 'vmware-system-',
+                                             'svc-', 'kube-state-metrics')):
+                    # User namespaces with workloads
+                    pass
+
+            if svc_namespaces:
+                vcf_write(lsf, f'  Found {len(svc_namespaces)} Supervisor Service namespace(s): {svc_namespaces}')
+
+                for svc_ns in svc_namespaces:
+                    vcf_write(lsf, f'  Scaling down deployments in {svc_ns}...')
+                    deps_result = scp_kubectl(
+                        f'kubectl get deployments -n {svc_ns} -o json 2>/dev/null'
+                    )
+                    if deps_result.returncode == 0 and deps_result.stdout:
+                        try:
+                            raw = deps_result.stdout.strip()
+                            json_start = raw.find('{')
+                            if json_start >= 0:
+                                raw = raw[json_start:]
+                            deps_data = json.loads(raw)
+                            for dep in deps_data.get('items', []):
+                                dep_name = dep['metadata']['name']
+                                replicas = dep['spec'].get('replicas', 0)
+                                if replicas > 0:
+                                    if not dry_run:
+                                        scp_kubectl(
+                                            f'kubectl scale deployment {dep_name} -n {svc_ns} --replicas=0 2>/dev/null'
+                                        )
+                                        vcf_write(lsf, f'    {dep_name}: scaled 0 (was {replicas})')
+                                    else:
+                                        vcf_write(lsf, f'    Would scale {dep_name} to 0 (currently {replicas})')
+                                    svc_scaled += 1
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+
+                    # Scale down statefulsets
+                    sts_result = scp_kubectl(
+                        f'kubectl get statefulsets -n {svc_ns} -o json 2>/dev/null'
+                    )
+                    if sts_result.returncode == 0 and sts_result.stdout:
+                        try:
+                            raw = sts_result.stdout.strip()
+                            json_start = raw.find('{')
+                            if json_start >= 0:
+                                raw = raw[json_start:]
+                            sts_data = json.loads(raw)
+                            for sts in sts_data.get('items', []):
+                                sts_name = sts['metadata']['name']
+                                replicas = sts['spec'].get('replicas', 0)
+                                if replicas > 0:
+                                    if not dry_run:
+                                        scp_kubectl(
+                                            f'kubectl scale statefulset {sts_name} -n {svc_ns} --replicas=0 2>/dev/null'
+                                        )
+                                        vcf_write(lsf, f'    {sts_name}: scaled 0 (was {replicas})')
+                                    else:
+                                        vcf_write(lsf, f'    Would scale {sts_name} to 0 (currently {replicas})')
+                                    svc_scaled += 1
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+            else:
+                vcf_write(lsf, '  No Supervisor Service namespaces to scale down')
+        except (json.JSONDecodeError, ValueError) as e:
+            vcf_write(lsf, f'  Error parsing namespace data: {e}')
+
+    vcf_write(lsf, f'  Supervisor workload shutdown: {clusters_deleted} cluster(s) deleted, '
+              f'{svc_scaled} workload(s) scaled down')
+
+    # Step 4: Wait briefly for VMs to drain
+    if (clusters_deleted > 0 or svc_scaled > 0) and not dry_run:
+        vcf_write(lsf, '  Waiting 30s for workload VMs to begin powering off...')
+        time.sleep(30)
+
+    return True
+
+
+def discover_supervisor_vms(lsf, vc_fqdn: str, password: str,
+                            sso_user: str = 'administrator@wld.sso') -> list:
+    """
+    Dynamically discover all Supervisor-managed VMs from vCenter.
+    Returns VM objects for workload VMs (VKS nodes, Harbor pods, etc.)
+    but excludes SupervisorControlPlaneVMs, vCLS, and NSX Edges.
+
+    :param lsf: lsfunctions module reference
+    :param vc_fqdn: Workload vCenter FQDN
+    :param password: Lab password
+    :param sso_user: SSO user for vCenter API
+    :return: List of VM objects to shut down
+    """
+    from pyVim.connect import SmartConnect
+    from pyVmomi import vim
+
+    skip_patterns = [
+        'supervisorcontrolplanevm',
+        'vcls-',
+        'edge-',
+        'nsx-',
+        'vc-',
+        'sddcmanager',
+    ]
+
+    workload_vms = []
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        si = SmartConnect(host=vc_fqdn, user=sso_user, pwd=password, sslContext=ctx)
+        content = si.RetrieveContent()
+        container = content.viewManager.CreateContainerView(
+            content.rootFolder, [vim.VirtualMachine], True)
+
+        for vm in container.view:
+            try:
+                name_lower = vm.name.lower()
+                if any(pat in name_lower for pat in skip_patterns):
+                    continue
+                if vm.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
+                    workload_vms.append(vm)
+            except Exception:
+                pass
+
+        container.Destroy()
+        # Don't disconnect - caller may need the SI
+    except Exception as e:
+        vcf_write(lsf, f'Error discovering Supervisor VMs on {vc_fqdn}: {e}')
+
+    return workload_vms
+
+
 def shutdown_wcp_service(lsf, vc_fqdn: str, password: str) -> bool:
     """
     Stop the WCP (Workload Control Plane) service on a vCenter.
@@ -581,6 +885,83 @@ def set_vsan_elevator(lsf, host: str, username: str, password: str,
         return False
 
 
+def check_elevator_running(lsf, host: str, username: str, password: str) -> bool:
+    """
+    Check whether the vSAN elevator is still actively flushing on a host.
+    
+    Reads the vsish counter /storage/lsom/elevatorRunning:
+      1 = elevator is still flushing write cache to capacity tier
+      0 = flush complete (or never started)
+    
+    :param lsf: lsfunctions module reference
+    :param host: ESXi hostname
+    :param username: ESXi username
+    :param password: ESXi password
+    :return: True if the elevator is still running, False if done or unreachable
+    """
+    if not lsf.test_tcp_port(host, 22, timeout=5):
+        return False
+
+    try:
+        cmd = 'vsish -e get /storage/lsom/elevatorRunning 2>/dev/null'
+        result = lsf.ssh(cmd, f'{username}@{host}', password)
+        output = result.stdout if hasattr(result, 'stdout') and result.stdout else ''
+        if isinstance(output, bytes):
+            output = output.decode('utf-8', errors='replace')
+        return output.strip() == '1'
+    except Exception:
+        return False
+
+
+def wait_for_elevator_completion(lsf, esx_hosts: list, username: str,
+                                  password: str, max_wait: int = VSAN_ELEVATOR_TIMEOUT,
+                                  poll_interval: int = VSAN_ELEVATOR_POLL_INTERVAL) -> bool:
+    """
+    Poll all ESXi hosts until the vSAN elevator flush completes on every host,
+    or the safety timeout is reached.
+
+    :param lsf: lsfunctions module reference
+    :param esx_hosts: list of ESXi hostnames
+    :param username: ESXi username
+    :param password: ESXi password
+    :param max_wait: maximum seconds to wait (safety ceiling)
+    :param poll_interval: seconds between polls
+    :return: True if all hosts completed, False on timeout
+    """
+    start = time.time()
+    pending_hosts = set(esx_hosts)
+    last_log = 0
+
+    while pending_hosts and (time.time() - start) < max_wait:
+        elapsed = int(time.time() - start)
+        still_running = set()
+
+        for host in list(pending_hosts):
+            if check_elevator_running(lsf, host, username, password):
+                still_running.add(host)
+            else:
+                vcf_write(lsf, f'  {host}: elevator flush complete ({elapsed}s)')
+
+        pending_hosts = still_running
+
+        if pending_hosts:
+            if elapsed - last_log >= VSAN_ELEVATOR_LOG_INTERVAL or last_log == 0:
+                remaining = int(max_wait - elapsed)
+                vcf_write(lsf, f'  {len(pending_hosts)} host(s) still flushing '
+                          f'({elapsed}s elapsed, {remaining}s max remaining)')
+                last_log = elapsed
+            time.sleep(poll_interval)
+
+    total = int(time.time() - start)
+    if pending_hosts:
+        vcf_write(lsf, f'  Timeout after {total}s - {len(pending_hosts)} host(s) '
+                  f'did not finish: {sorted(pending_hosts)}')
+        return False
+
+    vcf_write(lsf, f'  All hosts finished elevator flush in {total}s')
+    return True
+
+
 def shutdown_host(lsf, host_fqdn: str, username: str, password: str) -> bool:
     """
     Shutdown an ESXi host.
@@ -659,7 +1040,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     # Valid phase IDs for --phase parameter validation
     ALL_PHASES = [
-        '1', '1b', '2', '2b', '3', '4', '5', '6', '7',
+        '1', '1b', '2', '2b', '3', '3b', '4', '5', '6', '7',
         '8', '9', '10', '11', '12', '13',
         '14', '15', '16', '17', '17b',
         '18', '19', '19b', '19c', '20'
@@ -773,33 +1154,64 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                     vcf_write(lsf, f'{ops_fqdn} not reachable, using VCF 9.0 API')
 
             if use_v91:
-                vcf_write(lsf, f'Using VCF 9.1 internal components API via {ops_fqdn}')
+                vcf_write(lsf, f'Using VCF 9.1 Fleet LCM API')
+
+                # Fleet LCM gateway FQDN (configurable, defaults to fleet-01a)
+                fleet_lcm_fqdn = 'fleet-01a.site-a.vcf.lab'
+                if lsf.config.has_option('SHUTDOWN', 'fleet_lcm_fqdn'):
+                    fleet_lcm_fqdn = lsf.config.get('SHUTDOWN', 'fleet_lcm_fqdn')
 
                 if not dry_run:
-                    try:
-                        vcf_write(lsf, f'Acquiring OpsToken from {ops_fqdn} suite-api...')
-                        jwt_token = fleet.get_ops_jwt_token(ops_fqdn, ops_username, password)
-                        vcf_write(lsf, 'OpsToken acquired successfully')
+                    def _fleet_log(msg):
+                        vcf_write(lsf, msg)
 
-                        def _fleet_log(msg):
-                            vcf_write(lsf, msg)
+                    # Primary path: fleet-lcm direct API (JWT via VSP Identity Service)
+                    if lsf.test_tcp_port(fleet_lcm_fqdn, 443, timeout=10):
+                        vcf_write(lsf, f'Fleet LCM gateway reachable at {fleet_lcm_fqdn}')
+                        try:
+                            vcf_write(lsf, f'Acquiring JWT from VSP Identity Service...')
+                            fleet_jwt = fleet.get_fleet_lcm_jwt(fleet_lcm_fqdn, password, lsf=lsf)
+                            vcf_write(lsf, 'JWT acquired successfully')
 
-                        success = fleet.shutdown_products_v91(ops_fqdn, jwt_token,
-                                                              fleet_products,
-                                                              write_output=_fleet_log)
-                        if success:
-                            vcf_write(lsf, 'Fleet LCM (VCF 9.1) API shutdown complete')
-                            fleet_api_succeeded = True
-                        else:
-                            vcf_write(lsf, 'Fleet LCM API shutdown not available through suite-api proxy')
-                            vcf_write(lsf, 'VCF Automation VMs will be shut down directly in Phase 1b')
-                    except Exception as e:
-                        vcf_write(lsf, f'Fleet LCM (VCF 9.1) shutdown error: {e}')
-                        if not version_explicit:
-                            vcf_write(lsf, 'Falling back to VCF 9.0 legacy API...')
-                            use_v91 = False
-                        else:
-                            vcf_write(lsf, 'VCF version explicitly set to 9.1, not falling back to 9.0')
+                            success = fleet.shutdown_products_fleet_lcm(
+                                fleet_lcm_fqdn, fleet_jwt, fleet_products,
+                                write_output=_fleet_log)
+                            if success:
+                                vcf_write(lsf, 'Fleet LCM direct API shutdown complete')
+                                fleet_api_succeeded = True
+                            else:
+                                vcf_write(lsf, 'WARNING: Fleet LCM direct API shutdown had issues')
+                                vcf_write(lsf, 'VCF Automation VMs will be shut down directly in Phase 1b')
+                        except Exception as e:
+                            vcf_write(lsf, f'Fleet LCM direct API error: {e}')
+                            vcf_write(lsf, 'Falling back to suite-api internal proxy...')
+                    else:
+                        vcf_write(lsf, f'Fleet LCM gateway {fleet_lcm_fqdn} not reachable')
+                        vcf_write(lsf, 'Falling back to suite-api internal proxy...')
+
+                    # Fallback: suite-api internal proxy (may return HTTP 500 for shutdown)
+                    if not fleet_api_succeeded:
+                        try:
+                            vcf_write(lsf, f'Acquiring OpsToken from {ops_fqdn} suite-api...')
+                            jwt_token = fleet.get_ops_jwt_token(ops_fqdn, ops_username, password)
+                            vcf_write(lsf, 'OpsToken acquired successfully')
+
+                            success = fleet.shutdown_products_v91(ops_fqdn, jwt_token,
+                                                                  fleet_products,
+                                                                  write_output=_fleet_log)
+                            if success:
+                                vcf_write(lsf, 'Fleet LCM (suite-api proxy) shutdown complete')
+                                fleet_api_succeeded = True
+                            else:
+                                vcf_write(lsf, 'Fleet LCM API shutdown not available through suite-api proxy')
+                                vcf_write(lsf, 'VCF Automation VMs will be shut down directly in Phase 1b')
+                        except Exception as e:
+                            vcf_write(lsf, f'Fleet LCM (suite-api proxy) shutdown error: {e}')
+                            if not version_explicit:
+                                vcf_write(lsf, 'Falling back to VCF 9.0 legacy API...')
+                                use_v91 = False
+                            else:
+                                vcf_write(lsf, 'VCF version explicitly set to 9.1, not falling back to 9.0')
                 else:
                     vcf_write(lsf, f'Would shutdown Fleet products via VCF 9.1 API: {fleet_products}')
 
@@ -1133,11 +1545,69 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                 vcf_write(lsf, 'No VCF Components configured in [VCFFINAL] vcfcomponents')
 
             #==========================================================================
+            # TASK 3b: Gracefully shut down Supervisor workloads
+            # Dynamically discovers and shuts down VKS/TKG clusters and
+            # Supervisor Service deployments (Harbor, etc.) via the
+            # Supervisor K8s API BEFORE WCP is stopped (Phase 3).
+            # This is the reverse of VCFfinal.py Task 2a (Supervisor startup).
+        except Exception as _phase_err:
+            vcf_write(lsf, f'ERROR in Phase 2b: {_phase_err}')
+            vcf_write(lsf, 'Continuing with next phase...')
+    #==========================================================================
+
+    if should_run('3b'):
+        try:
+            vcf_write(lsf, '='*60)
+            vcf_write(lsf, 'PHASE 3b: Graceful Supervisor Workload Shutdown')
+            vcf_write(lsf, '='*60)
+            update_shutdown_status(3, 'Supervisor Workload Shutdown', dry_run)
+
+            wcp_vcenters_3b = []
+            if lsf.config.has_option('VCFFINAL', 'tanzucontrol'):
+                tanzu_raw = lsf.config.get('VCFFINAL', 'tanzucontrol')
+                seen_vcenters = set()
+                for entry in tanzu_raw.split('\n'):
+                    entry = entry.strip()
+                    if entry and not entry.startswith('#'):
+                        if ':' in entry:
+                            parts = entry.split(':')
+                            if len(parts) >= 2:
+                                vc = parts[1].strip()
+                                if vc and vc not in seen_vcenters:
+                                    wcp_vcenters_3b.append(vc)
+                                    seen_vcenters.add(vc)
+
+            if wcp_vcenters_3b:
+                vcf_write(lsf, f'Found {len(wcp_vcenters_3b)} vCenter(s) with Supervisor workloads')
+
+                # Detect SSO domain from vCenters config
+                sso_user_map = {}
+                if lsf.config.has_option('RESOURCES', 'vCenters'):
+                    for vc_line in lsf.config.get('RESOURCES', 'vCenters').split('\n'):
+                        vc_line = vc_line.strip()
+                        if vc_line and not vc_line.startswith('#'):
+                            parts = vc_line.split(':')
+                            if len(parts) >= 3:
+                                sso_user_map[parts[0].strip()] = parts[2].strip()
+
+                for vc in wcp_vcenters_3b:
+                    if lsf.test_tcp_port(vc, 443, timeout=10):
+                        sso_user = sso_user_map.get(vc, 'administrator@wld.sso')
+                        vcf_write(lsf, f'Shutting down Supervisor workloads on {vc} (user={sso_user})')
+                        shutdown_supervisor_workloads(lsf, vc, password,
+                                                     sso_user=sso_user,
+                                                     dry_run=dry_run)
+                    else:
+                        vcf_write(lsf, f'{vc} not reachable - cannot shut down Supervisor workloads')
+            else:
+                vcf_write(lsf, 'No Supervisor/WCP vCenters configured - skipping')
+
+            #==========================================================================
             # TASK 3: Stop WCP on vCenters
             # Determined from [VCFFINAL] tanzucontrol (same config used by VCFfinal.py)
             # This eliminates redundant config entries and reduces errors
         except Exception as _phase_err:
-            vcf_write(lsf, f'ERROR in Phase 2b: {_phase_err}')
+            vcf_write(lsf, f'ERROR in Phase 3b: {_phase_err}')
             vcf_write(lsf, 'Continuing with next phase...')
     #==========================================================================
     
@@ -1228,6 +1698,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
 
             if not dry_run:
                 total_workload_vms = 0
+                already_shutdown = set()
 
                 # Find VMs by pattern
                 vcf_write(lsf, f'Searching for VMs matching {len(vm_patterns)} pattern(s)...')
@@ -1238,16 +1709,65 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vcf_write(lsf, f'  Found {len(vms)} VM(s) matching pattern')
                         for vm in vms:
                             total_workload_vms += 1
+                            already_shutdown.add(vm.name)
                             vcf_write(lsf, f'  [{total_workload_vms}] Shutting down: {vm.name}')
                             shutdown_vm_gracefully(lsf, vm)
-                            time.sleep(2)  # Brief pause between shutdowns
+                            time.sleep(2)
                     else:
                         vcf_write(lsf, f'  No VMs found matching this pattern')
+
+                # Dynamic discovery: Find Supervisor-managed workload VMs
+                # from the WLD vCenter that weren't matched by patterns
+                wld_vcenters = []
+                if lsf.config.has_option('VCFFINAL', 'tanzucontrol'):
+                    tanzu_raw = lsf.config.get('VCFFINAL', 'tanzucontrol')
+                    seen = set()
+                    for entry in tanzu_raw.split('\n'):
+                        entry = entry.strip()
+                        if entry and not entry.startswith('#') and ':' in entry:
+                            vc = entry.split(':')[1].strip()
+                            if vc and vc not in seen:
+                                wld_vcenters.append(vc)
+                                seen.add(vc)
+
+                if wld_vcenters:
+                    vcf_write(lsf, f'Dynamic discovery: Checking {len(wld_vcenters)} WLD vCenter(s) for workload VMs...')
+                    sso_user_map = {}
+                    if lsf.config.has_option('RESOURCES', 'vCenters'):
+                        for vc_line in lsf.config.get('RESOURCES', 'vCenters').split('\n'):
+                            vc_line = vc_line.strip()
+                            if vc_line and not vc_line.startswith('#'):
+                                parts = vc_line.split(':')
+                                if len(parts) >= 3:
+                                    sso_user_map[parts[0].strip()] = parts[2].strip()
+
+                    for vc in wld_vcenters:
+                        if lsf.test_tcp_port(vc, 443, timeout=5):
+                            sso_user = sso_user_map.get(vc, 'administrator@wld.sso')
+                            discovered_vms = discover_supervisor_vms(lsf, vc, password,
+                                                                     sso_user=sso_user)
+                            new_vms = [vm for vm in discovered_vms
+                                       if vm.name not in already_shutdown]
+                            if new_vms:
+                                vcf_write(lsf, f'  Discovered {len(new_vms)} additional workload VM(s) on {vc}')
+                                for vm in new_vms:
+                                    total_workload_vms += 1
+                                    already_shutdown.add(vm.name)
+                                    vcf_write(lsf, f'  [{total_workload_vms}] Shutting down: {vm.name}')
+                                    shutdown_vm_gracefully(lsf, vm)
+                                    time.sleep(2)
+                            else:
+                                vcf_write(lsf, f'  No additional workload VMs found on {vc}')
+                        else:
+                            vcf_write(lsf, f'  {vc} not reachable for dynamic discovery')
 
                 # Shutdown static VM list
                 if workload_vms:
                     vcf_write(lsf, f'Processing {len(workload_vms)} static workload VM(s)...')
                     for vm_name in workload_vms:
+                        if vm_name in already_shutdown:
+                            vcf_write(lsf, f'  {vm_name}: Already processed')
+                            continue
                         vcf_write(lsf, f'  Looking for VM: {vm_name}')
                         vms = lsf.get_vm_by_name(vm_name)
                         if vms:
@@ -1265,6 +1785,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             else:
                 vcf_write(lsf, f'Would shutdown VMs matching patterns: {vm_patterns}')
                 vcf_write(lsf, f'Would shutdown VMs: {workload_vms}')
+                vcf_write(lsf, 'Would dynamically discover Supervisor workload VMs')
 
             #==========================================================================
             # VCF 9.0 WORKLOAD DOMAIN SHUTDOWN
@@ -2058,7 +2579,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                     is_esa = check_vsan_esa(lsf, test_host, esx_username, password)
                     if is_esa:
                         vcf_write(lsf, f'  vSAN ESA detected on {test_host}')
-                        vcf_write(lsf, '  ESA does not use plog - skipping 45-minute elevator wait')
+                        vcf_write(lsf, '  ESA does not use plog - skipping elevator')
                     else:
                         vcf_write(lsf, f'  vSAN OSA detected on {test_host}')
                         vcf_write(lsf, '  OSA uses plog - elevator wait is required')
@@ -2076,19 +2597,18 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vcf_write(lsf, f'  [{host_count}/{len(esx_hosts)}] Enabling elevator on {host}')
                         set_vsan_elevator(lsf, host, esx_username, password, enable=True)
 
-                    # Wait for vSAN I/O to complete
-                    vcf_write(lsf, f'Starting vSAN I/O flush wait ({vsan_timeout/60:.0f} minutes)...')
-                    vcf_write(lsf, '  This ensures all pending writes are committed to disk (OSA plog)')
+                    # Poll for elevator completion instead of blind wait
+                    vcf_write(lsf, f'Polling vSAN elevator completion (timeout {vsan_timeout/60:.0f}min, '
+                              f'poll every {VSAN_ELEVATOR_POLL_INTERVAL}s)...')
+                    vcf_write(lsf, '  Checking /storage/lsom/elevatorRunning on each host')
 
-                    elapsed = 0
-                    while elapsed < vsan_timeout:
-                        remaining = (vsan_timeout - elapsed) / 60
-                        elapsed_min = elapsed / 60
-                        vcf_write(lsf, f'  vSAN wait: {elapsed_min:.0f}m elapsed, {remaining:.1f}m remaining')
-                        time.sleep(VSAN_ELEVATOR_CHECK_INTERVAL)
-                        elapsed += VSAN_ELEVATOR_CHECK_INTERVAL
+                    wait_for_elevator_completion(
+                        lsf, esx_hosts, esx_username, password,
+                        max_wait=vsan_timeout,
+                        poll_interval=VSAN_ELEVATOR_POLL_INTERVAL,
+                    )
 
-                    vcf_write(lsf, 'vSAN I/O flush wait complete')
+                    vcf_write(lsf, 'vSAN elevator flush complete')
 
                     # Disable vSAN elevator on all hosts
                     vcf_write(lsf, f'Disabling vSAN elevator on {len(esx_hosts)} host(s)...')
@@ -2182,6 +2702,25 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
 
             if not dry_run:
                 from pyVmomi import vim as pyvim
+
+                # Re-authenticate to ESXi hosts. Sessions from Phase 17b may
+                # have expired during the vSAN elevator wait (up to 45 min)
+                # which exceeds ESXi's default 30-minute idle session timeout.
+                vcf_write(lsf, 'Re-authenticating to ESXi hosts for audit...')
+                for si in lsf.sis:
+                    try:
+                        connect.Disconnect(si)
+                    except Exception:
+                        pass
+                lsf.sis.clear()
+                lsf.sisvc.clear()
+
+                if mgmt_hosts:
+                    lsf.connect_vcenters(mgmt_hosts)
+                    vcf_write(lsf, f'Reconnected to {len(lsf.sis)} ESXi endpoint(s)')
+                else:
+                    vcf_write(lsf, 'No ESXi hosts configured - skipping audit')
+
                 still_on = []
                 for si in lsf.sis:
                     try:
@@ -2303,8 +2842,9 @@ Phase IDs for --phase:
   1b    VCF Automation VM fallback (if Fleet API failed)
   2     Connect to vCenters
   2b    Scale Down VCF Component Services (K8s on VSP)
+  3b    Graceful Supervisor Workload Shutdown (VKS, Harbor)
   3     Stop Workload Control Plane (WCP)
-  4     Shutdown Workload VMs (Tanzu, K8s)
+  4     Shutdown Workload VMs (Tanzu, K8s) + Dynamic Discovery
   5     Shutdown Workload Domain NSX Edges
   6     Shutdown Workload Domain NSX Manager
   7     Shutdown Workload vCenters

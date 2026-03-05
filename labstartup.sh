@@ -1,6 +1,6 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.4 - 2026-02-12
+# Version 3.5 - 2026-02-12
 # Author - Burke Azbill and HOL Core Team
 # Enhanced with NFS-based router communication, DNS import support
 
@@ -137,10 +137,13 @@ use_local_holodeck_ini() {
 
 git_repo_exists() {
     # Validate that a remote git repository exists and is accessible.
-    # Uses a 15-second timeout to prevent hangs when the repo requires auth.
-    # Returns 0 if the repo exists, 1 otherwise.
+    # Uses curl with a 15-second timeout to check HTTP status of the repo URL.
+    # Returns 0 if the repo exists (HTTP 200), 1 otherwise.
     local repo_url="$1"
-    if timeout 15 env GIT_TERMINAL_PROMPT=0 git ls-remote "$repo_url" > /dev/null 2>&1; then
+    local check_url="${repo_url%.git}"
+    local http_status
+    http_status=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" "$check_url" 2>/dev/null)
+    if [ "$http_status" = "200" ]; then
         return 0
     else
         return 1
@@ -685,20 +688,22 @@ echo "$vPod_SKU" > /tmp/vPod_SKU.txt
 [ -d ${lmcholroot} ] && cp /home/holuser/creds.txt /lmchol/home/holuser/Desktop/PASSWORD.txt 2>/dev/null
 
 #==============================================================================
-# START VLP AGENT
+# DETECT ENVIRONMENT (DEV vs PROD)
 #==============================================================================
 
 if [ -f "${holroot}/.vlp-disabled" ]; then
-    log_msg "VLP Agent disabled by offline-ready.py marker. Skipping." "${logfile}"
-elif ! pgrep -f VLPagent.sh > /dev/null 2>&1; then
+    log_msg "VLP Agent disabled by offline-ready.py marker." "${logfile}"
+    VLP_ENABLED=false
+else
     cloud=$(/usr/bin/vmtoolsd --cmd "info-get guestinfo.ovfenv" 2>&1 | grep vlp_org_name | cut -f3 -d: | cut -f2 -d\\)
     if [ "${cloud}" = "" ]; then
-        log_msg "Dev environment. Not starting VLP Agent." "${logfile}"
+        log_msg "Dev environment detected. VLP Agent will not start." "${logfile}"
         echo "NOT REPORTED" > /tmp/cloudinfo.txt
+        VLP_ENABLED=false
     else
-        log_msg "Prod environment. Starting VLP Agent." "${logfile}"
+        log_msg "Prod environment detected. VLP Agent will start after labstartup." "${logfile}"
         echo "$cloud" > /tmp/cloudinfo.txt
-        /home/holuser/hol/Tools/VLPagent.sh &
+        VLP_ENABLED=true
     fi
 fi
 
@@ -942,7 +947,14 @@ date > ${holorouterdir}/gitdone
 
 if [ -f ${configini} ]; then
     runlabstartup
-    /home/holuser/hol/Tools/VLPagent.sh &
+    if [ "${VLP_ENABLED}" = "true" ]; then
+        if crontab -l 2>/dev/null | grep -q 'VLPagent\.sh'; then
+            log_msg "VLPagent.sh found in active crontab — cron will handle agent launch." "${logfile}"
+        else
+            log_msg "VLPagent.sh not in crontab — launching agent from labstartup." "${logfile}"
+            /home/holuser/hol/Tools/VLPagent.sh &
+        fi
+    fi
     log_msg "$0 finished." "${logfile}"
 else
     log_msg "No config.ini on Main Console or vpodrepo. Abort." "${logfile}"

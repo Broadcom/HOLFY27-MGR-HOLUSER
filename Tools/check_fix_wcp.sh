@@ -1,7 +1,7 @@
 #!/bin/bash
 # Author: Burke Azbill
-# Version: 4.0
-# Date: 2026-02-06
+# Version: 4.1
+# Date: 2026-03-04
 # Script to fix Kubernetes certificates and webhooks on Supervisor Control Plane
 # This script:
 # 1. SSH to vCenter and run decryptK8Pwd.py to get SCP credentials
@@ -10,6 +10,7 @@
 # 4. Wait for Kubernetes API to be available (with polling)
 # 5. Delete old certificates and restart webhooks
 # 6. Scale up CCI, ArgoCD, and Harbor services
+# 7. Clean up stale pods (NotFound, ProviderFailed, Unknown) left after cold boot
 #
 # Usage: ./check_fix_wcp.sh [vcenter_host]
 # Example: ./check_fix_wcp.sh vc-wld01-a.site-a.vcf.lab
@@ -147,6 +148,80 @@ check_kubelet_status() {
     local status
     status=$(/usr/bin/sshpass -p "${pwd}" ssh ${SSH_OPTS} "root@${ip}" "systemctl is-active kubelet 2>/dev/null" 2>/dev/null)
     echo "${status}"
+}
+
+# Function to delete stale/failed pods in a namespace and wait for replacements.
+# After a cold boot, spherelet on ESXi hosts can lose track of pods, leaving them
+# in NotFound or ProviderFailed status. The deployment controller won't create
+# replacements while these stale pod objects exist. Deleting them lets the
+# controller schedule fresh pods.
+cleanup_stale_pods() {
+    local namespace=$1
+    local max_wait=${2:-120}  # seconds to wait for healthy pods (default 2 min)
+
+    # Get pods in non-Running states that indicate stale/failed scheduling
+    local stale_pods
+    stale_pods=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+        "kubectl get pods -n ${namespace} --no-headers 2>/dev/null \
+         | grep -E 'NotFound|ProviderFailed|Unknown|ImagePullBackOff' \
+         | awk '{print \$1}'" 2>/dev/null)
+
+    if [[ -z "${stale_pods}" ]]; then
+        return 0
+    fi
+
+    local stale_count
+    stale_count=$(echo "${stale_pods}" | wc -l)
+    log_msg "  Found ${stale_count} stale pod(s) in ${namespace} - deleting..."
+
+    echo "${stale_pods}" | while read -r pod_name; do
+        if [[ -n "${pod_name}" ]]; then
+            /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+                "kubectl delete pod ${pod_name} -n ${namespace} --force --grace-period=0 2>/dev/null" 2>/dev/null
+            log_msg "    Deleted stale pod: ${pod_name}"
+        fi
+    done
+
+    # Wait for deployment controllers to schedule replacements
+    log_msg "  Waiting up to ${max_wait}s for replacement pods in ${namespace}..."
+    local wait_elapsed=0
+    while [[ ${wait_elapsed} -lt ${max_wait} ]]; do
+        sleep 10
+        wait_elapsed=$((wait_elapsed + 10))
+
+        # Check if all deployments in the namespace are ready
+        local not_ready
+        not_ready=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+            "kubectl get deploy -n ${namespace} --no-headers 2>/dev/null \
+             | awk '{split(\$2,a,\"/\"); if (a[1] != a[2]) print \$1}'" 2>/dev/null)
+
+        if [[ -z "${not_ready}" ]]; then
+            log_msg "  All deployments in ${namespace} are ready"
+            return 0
+        fi
+
+        # Also check for any new stale pods that appeared
+        local new_stale
+        new_stale=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+            "kubectl get pods -n ${namespace} --no-headers 2>/dev/null \
+             | grep -E 'NotFound|ProviderFailed|Unknown' \
+             | awk '{print \$1}'" 2>/dev/null)
+
+        if [[ -n "${new_stale}" ]]; then
+            log_msg "  New stale pods detected - deleting..."
+            echo "${new_stale}" | while read -r pod_name; do
+                if [[ -n "${pod_name}" ]]; then
+                    /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+                        "kubectl delete pod ${pod_name} -n ${namespace} --force --grace-period=0 2>/dev/null" 2>/dev/null
+                fi
+            done
+        fi
+
+        log_msg "  Still waiting for deployments: ${not_ready} (${wait_elapsed}s / ${max_wait}s)"
+    done
+
+    log_warn "  Some deployments in ${namespace} may not be fully ready after ${max_wait}s"
+    return 1
 }
 
 log_msg "=========================================="
@@ -442,6 +517,7 @@ CCI_NS=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kube
 if [[ -n "${CCI_NS}" ]]; then
     /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n ${CCI_NS} scale deployment --all --replicas=1" >> "${LOG_FILE}" 2>&1
     log_msg "Scaled CCI deployments in ${CCI_NS}"
+    cleanup_stale_pods "${CCI_NS}" 120
 else
     log_msg "CCI namespace not found - skipping"
 fi
@@ -452,6 +528,7 @@ log_msg "=========================================="
 if /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl get ns argocd >/dev/null 2>&1"; then
     /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n argocd scale deployment --all --replicas=1" >> "${LOG_FILE}" 2>&1
     log_msg "Scaled ArgoCD deployments"
+    cleanup_stale_pods "argocd" 120
 else
     log_msg "ArgoCD namespace not found - skipping"
 fi
@@ -464,6 +541,7 @@ if [[ -n "${HARBOR_NS}" ]]; then
     /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n ${HARBOR_NS} scale sts --all --replicas=1" >> "${LOG_FILE}" 2>&1
     /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n ${HARBOR_NS} scale deployment --all --replicas=1" >> "${LOG_FILE}" 2>&1
     log_msg "Scaled Harbor deployments in ${HARBOR_NS}"
+    cleanup_stale_pods "${HARBOR_NS}" 120
 else
     log_msg "Harbor namespace not found - skipping"
 fi

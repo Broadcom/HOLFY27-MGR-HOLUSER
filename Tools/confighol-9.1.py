@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.3 - February 26, 2026
+# Version 2.8 - March 3, 2026
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -9,6 +9,32 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.8 - 2026-03-03:
+#   - Fully non-interactive: removed all input() prompts for vCenter shell/
+#     browser configuration, NSX Manager configuration, NSX SSH enablement
+#     fallback, Vault CA unavailable, and vCenter CA unavailable — all
+#     operations now proceed automatically (auto-skip on unavailability)
+#   - NSX root password recovery: rewrote get_nsx_root_password_from_sddc
+#     to use direct HTTPS to SDDC Manager API (Basic Auth) instead of
+#     fragile SSH-based token flow. Added diagnostic logging throughout.
+#   - NSX authorized_keys: now resolves root password BEFORE attempting
+#     mkdir/scp (previously mkdir with wrong password would fail silently,
+#     then scp would also fail, and SDDC Manager lookup was unreliable)
+#   - Removed browser warning fix (vcbrowser.sh integration) — approach does
+#     not reliably work on VCF 9.1 due to JSP compilation and Tomcat caching
+# v2.7 - 2026-03-03:
+#   - NSX SSH start-on-boot: now checks current state before setting, and
+#     verifies state after set — no longer reports failure when already enabled
+#   - NSX Manager/Edge authorized_keys: creates /root/.ssh/ directory before
+#     SCP copy (fixes "Could not copy authorized_keys" on appliances without
+#     /root/.ssh/ directory)
+#   - vCenter browser warning fix: removed — approach does not reliably work
+#     on VCF 9.1 (JSP compilation and Tomcat caching prevent the fix from
+#     taking effect)
+#   - MOB enablement: added idempotency check for enableDebugBrowse element
+#     value (not just existence) — safe to re-run without duplicating elements
+#   - enable_vcenter_shell: now checks if bash is already the login shell
+#     via SSH before running the expect script — safe to re-run
 # v2.6 - 2026-02-26:
 #   - vCenter CA import: fixed bug where only the first certificate from each
 #     download.zip was imported (premature break); now imports ALL CA certs
@@ -108,15 +134,15 @@
 #    - Run vpodchecker.py to update L2 VMs (uuid, typematicdelay)
 #
 # USAGE:
-#    python3 confighol.py                    # Full interactive HOLification
+#    python3 confighol.py                    # Full non-interactive HOLification
 #    python3 confighol.py --dry-run          # Preview what would be done
 #    python3 confighol.py --skip-vcshell     # Skip vCenter shell configuration
 #    python3 confighol.py --skip-nsx         # Skip NSX configuration
 #    python3 confighol.py --esx-only         # Only configure ESXi hosts
 #
-# NOTE: Some operations (vCenter shell) may require manual confirmation.
-#       NSX Edge SSH is now enabled automatically via Guest Operations.
-#       See HOLIFICATION.md for details.
+# NOTE: All operations run non-interactively. Unavailable components are
+#       auto-skipped with a warning. NSX Edge SSH is enabled automatically
+#       via Guest Operations. See HOLIFICATION.md for details.
 
 """
 HOLification Tool for vApp Templates
@@ -161,7 +187,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.6'
+SCRIPT_VERSION = '2.8'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -544,11 +570,10 @@ def enable_vcenter_shell(hostname: str, password: str, dry_run: bool = False) ->
     Enable bash shell for root user on vCenter Server.
     
     By default, vCenter uses the VAMI shell which is limited. This function
-    uses an expect script to change root's shell to /bin/bash for easier
-    command-line access.
-    
-    NOTE: This operation can only be run once per vCenter instance.
-    Subsequent runs will fail as the shell is already changed.
+    checks whether bash is already the login shell by running a test command
+    via SSH. If bash is already active, the function returns True without
+    making changes. Otherwise it uses an expect script to change root's
+    shell to /bin/bash.
     
     :param hostname: vCenter hostname
     :param password: Root password
@@ -557,6 +582,12 @@ def enable_vcenter_shell(hostname: str, password: str, dry_run: bool = False) ->
     """
     if dry_run:
         lsf.write_output(f'{hostname}: Would enable bash shell for root')
+        return True
+    
+    # Check if bash shell is already configured by testing SSH command execution
+    check_result = lsf.ssh('echo SHELL_OK', f'root@{hostname}', password)
+    if hasattr(check_result, 'stdout') and 'SHELL_OK' in (check_result.stdout or ''):
+        lsf.write_output(f'{hostname}: Bash shell already enabled')
         return True
     
     expect_script = os.path.expanduser('~/hol/Tools/vcshell.exp')
@@ -575,17 +606,13 @@ def enable_vcenter_shell(hostname: str, password: str, dry_run: bool = False) ->
         return False
 
 
-def configure_vcenter_browser_support(hostname: str, password: str, 
-                                      dry_run: bool = False) -> bool:
+def configure_vcenter_mob(hostname: str, password: str,
+                          dry_run: bool = False) -> bool:
     """
-    Configure browser support message and MOB on vCenter.
+    Enable the Managed Object Browser (MOB) on vCenter by editing vpxd.cfg.
     
-    This function:
-    1. Runs the vcbrowser.sh script to configure browser settings
-    2. Enables the Managed Object Browser (MOB) by editing vpxd.cfg
-    
-    The MOB is useful for API development and troubleshooting but is
-    disabled by default for security reasons.
+    Idempotent — checks current state before making changes and skips
+    if already configured.
     
     :param hostname: vCenter hostname
     :param password: Root password
@@ -593,17 +620,10 @@ def configure_vcenter_browser_support(hostname: str, password: str,
     :return: True if successful
     """
     if dry_run:
-        lsf.write_output(f'{hostname}: Would configure browser support and MOB')
+        lsf.write_output(f'{hostname}: Would configure MOB')
         return True
-    
-    # Run browser support script if it exists
-    browser_script = os.path.expanduser('~/hol/Tools/vcbrowser.sh')
-    if os.path.isfile(browser_script):
-        lsf.write_output(f'{hostname}: Configuring browser support...')
-        lsf.run_command(f'{browser_script} {hostname}')
-    
+
     # Enable the Managed Object Browser (MOB)
-    # Edit /etc/vmware-vpx/vpxd.cfg to add <enableDebugBrowse>true</enableDebugBrowse>
     lsf.write_output(f'{hostname}: Configuring Managed Object Browser...')
     
     try:
@@ -619,25 +639,26 @@ def configure_vcenter_browser_support(hostname: str, password: str,
         if vpxd_element is None:
             vpxd_element = ET.SubElement(root, 'vpxd')
         
-        # Check if MOB is already enabled
+        # Check if MOB is already enabled (idempotent)
         mob_element = vpxd_element.find('enableDebugBrowse')
-        if mob_element is None:
-            # Create and add the MOB enable element
-            mob_element = ET.Element('enableDebugBrowse')
+        if mob_element is not None and mob_element.text == 'true':
+            lsf.write_output(f'{hostname}: MOB already enabled')
+        elif mob_element is not None:
             mob_element.text = 'true'
-            vpxd_element.append(mob_element)
-            
-            # Write modified config
             tree.write(LOCAL_VPXD_CONFIG)
-            
-            # Upload and restart vpxd service
             lsf.scp(LOCAL_VPXD_CONFIG, f'root@{hostname}:{VPXD_CONFIG}', password)
             lsf.write_output(f'{hostname}: Restarting vpxd service...')
             lsf.ssh('service-control --restart vmware-vpxd', f'root@{hostname}', password)
-            
             lsf.write_output(f'{hostname}: MOB enabled successfully')
         else:
-            lsf.write_output(f'{hostname}: MOB already enabled')
+            mob_element = ET.Element('enableDebugBrowse')
+            mob_element.text = 'true'
+            vpxd_element.append(mob_element)
+            tree.write(LOCAL_VPXD_CONFIG)
+            lsf.scp(LOCAL_VPXD_CONFIG, f'root@{hostname}:{VPXD_CONFIG}', password)
+            lsf.write_output(f'{hostname}: Restarting vpxd service...')
+            lsf.ssh('service-control --restart vmware-vpxd', f'root@{hostname}', password)
+            lsf.write_output(f'{hostname}: MOB enabled successfully')
         
         return True
         
@@ -839,23 +860,21 @@ def configure_vcenter(entry: str, auth_keys_file: str, password: str,
     
     success = True
     
-    # Step 1: Enable shell and browser support (interactive)
+    # Step 1: Enable shell, browser support, and authorized_keys
     if not skip_shell:
         if not dry_run:
-            answer = input(f'Enable shell and browser support on {hostname}? (y/n): ')
-            if answer.lower().startswith('y'):
-                # Enable bash shell
-                enable_vcenter_shell(hostname, password, dry_run)
-                
-                # Configure SSH authorized_keys
-                lsf.write_output(f'{hostname}: Copying authorized_keys')
-                lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', password)
-                lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{hostname}', password)
-                
-                # Configure browser support and MOB
-                configure_vcenter_browser_support(hostname, password, dry_run)
+            # Enable bash shell
+            enable_vcenter_shell(hostname, password, dry_run)
+            
+            # Configure SSH authorized_keys
+            lsf.write_output(f'{hostname}: Copying authorized_keys')
+            lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', password)
+            lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{hostname}', password)
+            
+            # Enable the Managed Object Browser (MOB)
+            configure_vcenter_mob(hostname, password, dry_run)
         else:
-            lsf.write_output(f'{hostname}: Would configure shell and browser support')
+            lsf.write_output(f'{hostname}: Would configure shell and MOB')
     
     # Step 2: Set password expiration for root
     if not dry_run:
@@ -887,78 +906,71 @@ def get_nsx_root_password_from_sddc(nsx_fqdn: str, password: str) -> Optional[st
     Retrieve the actual NSX Manager root SSH password from SDDC Manager.
     
     SDDC Manager may have rotated the root password away from the standard
-    lab password. This queries the SDDC Manager credentials API to get the
-    current password.
+    lab password. Uses the SDDC Manager REST API with Basic Auth directly
+    from the console VM (no SSH required).
     
-    :param nsx_fqdn: NSX Manager FQDN (individual node, e.g. nsx-wld01-01a)
+    Matches credentials by checking if the node hostname (with or without
+    domain suffix) appears in the resource name. Also checks the cluster
+    VIP name (e.g. nsx-wld01-01a -> nsx-wld01-a).
+    
+    :param nsx_fqdn: NSX Manager hostname (e.g. nsx-wld01-01a or nsx-wld01-01a.site-a.vcf.lab)
     :param password: Standard lab password (used to auth to SDDC Manager)
     :return: The actual root password, or None if lookup fails
     """
-    sddc_host = 'sddcmanager-a.site-a.vcf.lab'
+    import re
+    sddc_url = 'https://sddcmanager-a.site-a.vcf.lab'
+    
+    # Build list of name patterns to match against SDDC Manager resource names
+    # Strip domain if present to get short hostname
+    short_name = nsx_fqdn.split('.')[0]
+    # Map node name to cluster VIP name: nsx-wld01-01a -> nsx-wld01-a
+    cluster_name = re.sub(r'-\d+([a-z])$', r'-\1', short_name)
+    match_patterns = [short_name, cluster_name]
+    if '.' in nsx_fqdn:
+        match_patterns.append(nsx_fqdn)
     
     try:
-        # Map individual node name to VIP/cluster name for SDDC Manager lookup
-        # e.g. nsx-wld01-01a -> nsx-wld01-a, nsx-mgmt-01a -> nsx-mgmt-a
-        import re
-        # Remove node number suffix (e.g. -01a -> -a) to get cluster VIP name
-        cluster_name = re.sub(r'-\d+a\.', '-a.', nsx_fqdn)
-        if cluster_name == nsx_fqdn:
-            cluster_name = re.sub(r'-\d+b\.', '-b.', nsx_fqdn)
-        
-        # Get SDDC Manager token
-        get_token_cmd = (
-            f'curl -sk -X POST https://localhost/v1/tokens '
-            f'-H "Content-Type: application/json" '
-            f'-d \'{{"username":"admin@local","password":"{password}"}}\''
+        resp = requests.get(
+            f'{sddc_url}/v1/credentials',
+            params={'resourceType': 'NSXT_MANAGER'},
+            auth=('vcf', password),
+            verify=False, timeout=30
         )
-        token_result = lsf.ssh(
-            f'{get_token_cmd} | python3 -c "import json,sys; print(json.load(sys.stdin)[\'accessToken\'])"',
-            f'vcf@{sddc_host}', password)
         
-        if token_result.returncode != 0:
+        if resp.status_code != 200:
+            lsf.write_output(f'{nsx_fqdn}: SDDC Manager credentials API returned {resp.status_code}')
             return None
         
-        token = str(token_result.stdout).strip() if hasattr(token_result, 'stdout') and token_result.stdout else str(token_result).strip()
-        # Extract just the token from output
-        for line in token.split('\n'):
-            line = line.strip()
-            if line and not line.startswith('Warning') and not line.startswith('Welcome') and len(line) > 50:
-                token = line
-                break
+        data = resp.json()
+        elements = data.get('elements', [])
+        lsf.write_output(f'{nsx_fqdn}: SDDC Manager returned {len(elements)} NSX credentials')
         
-        # Query credentials for NSX managers
-        cred_cmd = (
-            f'curl -sk -X GET "https://localhost/v1/credentials?resourceType=NSXT_MANAGER" '
-            f'-H "Authorization: Bearer {token}" '
-            f'-H "Content-Type: application/json"'
-        )
-        cred_result = lsf.ssh(cred_cmd, f'vcf@{sddc_host}', password)
-        
-        if cred_result.returncode != 0:
-            return None
-        
-        import json
-        output = str(cred_result.stdout) if hasattr(cred_result, 'stdout') and cred_result.stdout else str(cred_result)
-        # Find the JSON portion
-        json_start = output.find('{"elements"')
-        if json_start < 0:
-            return None
-        
-        data = json.loads(output[json_start:])
-        
-        for elem in data.get('elements', []):
+        for elem in elements:
             resource = elem.get('resource', {})
             rname = resource.get('resourceName', '')
             cred_type = elem.get('credentialType', '')
             username = elem.get('username', '')
             
             if cred_type == 'SSH' and username == 'root':
-                if cluster_name in rname or nsx_fqdn in rname:
+                if any(pattern in rname for pattern in match_patterns):
+                    lsf.write_output(f'{nsx_fqdn}: Found root credential in SDDC Manager (resource: {rname})')
                     return elem.get('password', None)
+        
+        lsf.write_output(f'{nsx_fqdn}: No matching root SSH credential found in SDDC Manager '
+                          f'(searched for: {match_patterns})')
+        
+        # Log available resource names for debugging
+        root_ssh_resources = [
+            elem.get('resource', {}).get('resourceName', 'unknown')
+            for elem in elements
+            if elem.get('credentialType') == 'SSH' and elem.get('username') == 'root'
+        ]
+        if root_ssh_resources:
+            lsf.write_output(f'{nsx_fqdn}: Available root SSH resources: {root_ssh_resources}')
         
         return None
     except Exception as e:
-        lsf.write_output(f'WARNING: Could not retrieve NSX root password from SDDC Manager: {e}')
+        lsf.write_output(f'{nsx_fqdn}: Could not retrieve root password from SDDC Manager: {e}')
         return None
 
 
@@ -1129,6 +1141,9 @@ def configure_nsx_ssh_start_on_boot(hostname: str, password: str,
     - set service ssh start-on-boot
     
     Uses -T flag to disable PTY allocation (required for NSX Edge CLI).
+    If the setting is already enabled, the command may return a non-zero
+    exit code — we verify via 'get service ssh start-on-boot' and treat
+    an already-enabled state as success.
     
     PREREQUISITE: SSH must already be enabled on the NSX appliance.
     
@@ -1141,6 +1156,16 @@ def configure_nsx_ssh_start_on_boot(hostname: str, password: str,
         lsf.write_output(f'{hostname}: Would configure SSH start-on-boot')
         return True
     
+    # Check current state first
+    check_result = nsx_cli_ssh('get service ssh start-on-boot', hostname, password)
+    check_output = ''
+    if hasattr(check_result, 'stdout') and check_result.stdout:
+        check_output = check_result.stdout.strip().lower()
+    
+    if 'true' in check_output or 'enabled' in check_output:
+        lsf.write_output(f'{hostname}: SSH start-on-boot already enabled')
+        return True
+    
     lsf.write_output(f'{hostname}: Configuring SSH start-on-boot...')
     
     result = nsx_cli_ssh('set service ssh start-on-boot', hostname, password)
@@ -1148,9 +1173,19 @@ def configure_nsx_ssh_start_on_boot(hostname: str, password: str,
     if result.returncode == 0:
         lsf.write_output(f'{hostname}: SSH start-on-boot configured')
         return True
-    else:
-        lsf.write_output(f'{hostname}: WARNING - Failed to configure start-on-boot')
-        return False
+    
+    # The set command may fail if already set — verify actual state
+    verify_result = nsx_cli_ssh('get service ssh start-on-boot', hostname, password)
+    verify_output = ''
+    if hasattr(verify_result, 'stdout') and verify_result.stdout:
+        verify_output = verify_result.stdout.strip().lower()
+    
+    if 'true' in verify_output or 'enabled' in verify_output:
+        lsf.write_output(f'{hostname}: SSH start-on-boot already enabled (set command returned non-zero but state is correct)')
+        return True
+    
+    lsf.write_output(f'{hostname}: WARNING - Failed to configure start-on-boot')
+    return False
 
 
 def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
@@ -1176,38 +1211,48 @@ def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
     
     # Step 1: Try to enable SSH via API (only NSX Managers support this)
     if not enable_nsx_ssh_via_api(hostname, 'admin', password, dry_run):
-        lsf.write_output(f'{hostname}: WARNING - API SSH enablement failed')
-        if not dry_run:
-            lsf.write_output(f'{hostname}: Please enable SSH manually via vSphere Remote Console:')
-            lsf.write_output(f'{hostname}:   1. Login as admin')
-            lsf.write_output(f'{hostname}:   2. Run: start service ssh')
-            lsf.write_output(f'{hostname}:   3. Run: set service ssh start-on-boot')
-            answer = input(f'{hostname}: Is SSH enabled now? (y/n): ')
-            if not answer.lower().startswith('y'):
-                lsf.write_output(f'{hostname}: Skipping configuration - SSH not enabled')
-                return False
+        lsf.write_output(f'{hostname}: WARNING - API SSH enablement failed, continuing with remaining steps')
+        if not lsf.test_tcp_port(hostname, 22):
+            lsf.write_output(f'{hostname}: FAILED - SSH port 22 not reachable, skipping configuration')
+            return False
 
     if not dry_run:
         # Give SSH service time to start
         time.sleep(3)
         
-        # Determine root password (may have been rotated by SDDC Manager)
+        # Step 2: Resolve the actual root password before any root SSH operations.
+        # SDDC Manager may have rotated root's password away from the standard
+        # lab password. Test SSH first, then fall back to SDDC Manager lookup.
         root_password = password
-        lsf.write_output(f'{hostname}: Copying authorized_keys...')
-        result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', password)
-        if result.returncode != 0:
+        lsf.write_output(f'{hostname}: Testing root SSH access...')
+        test_result = lsf.ssh('echo SSH_OK', f'root@{hostname}', password)
+        
+        if test_result.returncode != 0 or 'SSH_OK' not in str(getattr(test_result, 'stdout', '')):
             lsf.write_output(f'{hostname}: Standard password failed for root SSH - checking SDDC Manager...')
             sddc_root_pw = get_nsx_root_password_from_sddc(hostname, password)
+            
             if sddc_root_pw and sddc_root_pw != password:
                 lsf.write_output(f'{hostname}: Found rotated root password in SDDC Manager')
-                # Reset to standard password via NSX API
+                # Try to reset root password back to standard via NSX API (user 0 = root)
                 if reset_nsx_root_password(hostname, password, sddc_root_pw, password):
                     root_password = password
+                    lsf.write_output(f'{hostname}: Root password reset to standard')
                     time.sleep(3)
-                    result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', root_password)
                 else:
+                    # Reset failed — use the SDDC Manager password directly
                     root_password = sddc_root_pw
-                    result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', root_password)
+                    lsf.write_output(f'{hostname}: Using SDDC Manager password for root')
+            elif sddc_root_pw and sddc_root_pw == password:
+                lsf.write_output(f'{hostname}: SDDC Manager has same password - SSH may have another issue')
+            else:
+                lsf.write_output(f'{hostname}: Could not resolve root password from SDDC Manager')
+        else:
+            lsf.write_output(f'{hostname}: Root SSH access confirmed with standard password')
+        
+        # Step 2b: Copy authorized_keys using the resolved root password
+        lsf.write_output(f'{hostname}: Copying authorized_keys...')
+        lsf.ssh('mkdir -p /root/.ssh && chmod 700 /root/.ssh', f'root@{hostname}', root_password)
+        result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', root_password)
         
         if result.returncode == 0:
             lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied')
@@ -1450,7 +1495,9 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
             lsf.write_output(f'{hostname}: SSH already running')
         
         # Step 2: Copy authorized_keys for root user
+        # NSX Edges may not have /root/.ssh/ directory — create it first
         lsf.write_output(f'{hostname}: Copying authorized_keys for root...')
+        lsf.ssh('mkdir -p /root/.ssh && chmod 700 /root/.ssh', f'root@{hostname}', password)
         result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', password)
         if result.returncode == 0:
             lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied')
@@ -1671,13 +1718,6 @@ def configure_nsx_components(auth_keys_file: str, password: str,
             # Format: nsxmgr_hostname:esxhost
             parts = entry.split(':')
             nsxmgr = parts[0].strip()
-            
-            if not dry_run:
-                # Interactive prompt - SSH can be enabled via API for NSX Managers
-                answer = input(f'Configure NSX Manager {nsxmgr}? (y/n): ')
-                if not answer.lower().startswith('y'):
-                    lsf.write_output(f'{nsxmgr}: Skipping')
-                    continue
             
             if not configure_nsx_manager(nsxmgr, auth_keys_file, password, dry_run):
                 success = False
@@ -2162,43 +2202,14 @@ def check_vault_accessible(vault_url: str = VAULT_URL,
 
 def prompt_vault_unavailable(message: str) -> str:
     """
-    Prompt user for action when Vault CA is not accessible.
-    
-    Presents options to:
-    - [S]kip: Continue without importing Vault CA
-    - [R]etry: Try checking Vault again (user may have fixed it)
-    - [F]ail: Exit the script with an error
+    Handle Vault CA not accessible — auto-skip for non-interactive execution.
     
     :param message: Error message describing why Vault is not accessible
-    :return: User's choice: 'skip', 'retry', or 'fail'
+    :return: Always 'skip' for non-interactive mode
     """
-    print('')
-    print('!' * 60)
-    print('  WARNING: Vault PKI CA Certificate Not Accessible')
-    print('!' * 60)
-    print('')
-    print(f'  {message}')
-    print('')
-    print('  The Vault root CA certificate is used to establish trust')
-    print('  for VCF component certificates in Firefox on the console VM.')
-    print('')
-    print('  Options:')
-    print('    [S]kip  - Continue without importing Vault CA')
-    print('              (Firefox will show certificate warnings)')
-    print('    [R]etry - Check Vault again (if you have fixed the issue)')
-    print('    [F]ail  - Exit the script with an error')
-    print('')
-    
-    while True:
-        choice = input('  Enter choice [S/R/F]: ').strip().upper()
-        if choice in ['S', 'SKIP']:
-            return 'skip'
-        elif choice in ['R', 'RETRY']:
-            return 'retry'
-        elif choice in ['F', 'FAIL']:
-            return 'fail'
-        else:
-            print('  Invalid choice. Please enter S, R, or F.')
+    lsf.write_output(f'WARNING: Vault PKI CA Certificate Not Accessible - {message}')
+    lsf.write_output('Auto-skipping Vault CA import (non-interactive mode)')
+    return 'skip'
 
 
 def download_vault_ca_certificate(vault_url: str = VAULT_URL, 
@@ -2626,36 +2637,15 @@ def download_vcenter_ca_certificates(vcenter_hostname: str) -> Optional[list]:
 
 def prompt_vcenter_unavailable(vcenter_hostname: str, message: str) -> str:
     """
-    Prompt user for action when a vCenter CA is not accessible.
+    Handle vCenter CA not accessible — auto-skip for non-interactive execution.
     
     :param vcenter_hostname: The vCenter that is not accessible
     :param message: Error message describing the issue
-    :return: User's choice: 'skip', 'retry', or 'fail'
+    :return: Always 'skip' for non-interactive mode
     """
-    print('')
-    print('!' * 60)
-    print(f'  WARNING: vCenter CA Certificate Not Accessible')
-    print('!' * 60)
-    print('')
-    print(f'  vCenter: {vcenter_hostname}')
-    print(f'  {message}')
-    print('')
-    print('  Options:')
-    print('    [S]kip  - Skip this vCenter and continue')
-    print('    [R]etry - Check this vCenter again')
-    print('    [F]ail  - Exit the script with an error')
-    print('')
-    
-    while True:
-        choice = input('  Enter choice [S/R/F]: ').strip().upper()
-        if choice in ['S', 'SKIP']:
-            return 'skip'
-        elif choice in ['R', 'RETRY']:
-            return 'retry'
-        elif choice in ['F', 'FAIL']:
-            return 'fail'
-        else:
-            print('  Invalid choice. Please enter S, R, or F.')
+    lsf.write_output(f'WARNING: vCenter {vcenter_hostname} CA not accessible - {message}')
+    lsf.write_output(f'Auto-skipping vCenter {vcenter_hostname} (non-interactive mode)')
+    return 'skip'
 
 
 def configure_vcenter_ca_for_firefox(dry_run: bool = False) -> bool:

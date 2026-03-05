@@ -1,0 +1,40 @@
+---
+description: Automatically capture new knowledge at the end of troubleshooting or exploration sessions
+alwaysApply: true
+---
+# Session Knowledge Capture Protocol
+
+At the end of any session where you performed **troubleshooting, API exploration, or script development** in this VCF lab environment, you MUST offer to update the relevant knowledge base files before ending. This ensures that every new discovery is captured for future sessions.
+
+## When to Trigger
+
+Trigger this protocol when ALL of the following are true:
+- The session involved **diagnosing or resolving** a VCF-related issue, OR exploring a new API/pattern
+- You discovered something **not already documented** in the existing skill files
+- The user has not explicitly declined knowledge capture
+
+## What to Update
+
+Review your session for any of the following new learnings:
+
+| Learning Type | Target File |
+| --- | --- |
+| New API endpoint, auth flow, or credential | `.cursor/skills/vcf-9-api/SKILL.md` |
+| New failure pattern, root cause, or fix | `.cursor/skills/vcf-troubleshooting/SKILL.md` |
+| New pitfall, version difference, or gotcha | Both skills (Pitfalls section + relevant troubleshooting section) |
+| New environment detail (IPs, hostnames, paths) | `.cursor/skills/vcf-9-api/SKILL.md` (Architecture section) |
+
+## How to Update
+
+1. **Check existing content first** — read the target skill file to avoid duplicating what's already documented
+2. **Add new issues** to the Table of Known Issues (troubleshooting) or Critical Pitfalls (API)
+3. **Add detailed sections** with Symptom, Diagnosis, Root Cause, and Fix subsections
+4. **Update the skill description** in the YAML frontmatter if new keywords are needed for skill matching
+5. **Keep the `.mdc` rule lean** — only add quick-reference reminders there, not detailed procedures
+
+## Format Standards
+
+- Troubleshooting sections follow the pattern: `## N. Title` with `**Symptom**`, `**Diagnosis**` (with code block), `**Root Cause**`, `**Fix**` (with code block)
+- API sections follow the pattern: `## N. Title` with code blocks showing curl/python examples
+- Pitfalls are one-line entries: `N. **Bold summary**: Detail explanation.`
+- NEVER store passwords. Instead, provide details on how or where to obtain them
