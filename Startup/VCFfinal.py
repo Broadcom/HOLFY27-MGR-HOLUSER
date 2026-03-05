@@ -1479,17 +1479,22 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     #==========================================================================
     # TASK 4b: VCF Automation K8s Health Check & Remediation
-    # After the VCF Automation VM is started, the internal K8s cluster may
-    # have issues that prevent the ingress VIP from being available:
-    #   1. kube-vip crash loop: istio-ingressgateway pod fails to start
-    #      (ImagePullBackOff) because the container registry ClusterIP is
-    #      unreachable while Antrea CNI is initializing. kube-vip sees no
-    #      endpoints and releases the VIP, then loses its leader lease and
-    #      crashes. This makes 10.1.1.70 (the auto-a DNS target) unreachable.
-    #   2. RabbitMQ .erlang.cookie permissions: fsGroup:200 in the pod
-    #      security context sets 0660 on the PVC, but Erlang requires 0400.
-    #   3. Prelude deployments at 0 replicas after cold boot.
-    # This task detects and remediates all three conditions.
+    # Consolidated from the former watchvcfa.sh script and original health
+    # check. After the VCF Automation VM is started, the internal K8s
+    # cluster may have issues that prevent services from coming up:
+    #   1. kube-vip crash loop: VIP released when istio-ingressgateway
+    #      fails to start (ImagePullBackOff during Antrea CNI init).
+    #   2. Containerd Ready,SchedulingDisabled: node cordoned by stale state.
+    #   3. CAPI/CAPV webhook failure: CNI socket issue prevents pod sandboxes.
+    #   4. kube-scheduler stuck at 0/1 Running.
+    #   5. Stale seaweedfs-master-0 pod blocking other pods.
+    #   6. Stuck volume attachments with deletionTimestamp.
+    #   7. vCenter vAPI endpoint stopped (CSI controller dependency).
+    #   8. CSI controller CrashLoopBackOff (leases, password, CRD errors).
+    #   9. RabbitMQ .erlang.cookie permissions (fsGroup breaks Erlang).
+    #  10. provisioning-service Spring Boot deadlock.
+    #  11. Prelude deployments/statefulsets at 0 replicas after cold boot.
+    #  12. Prelude pods stuck in ContainerCreating after volume/CSI fixes.
     #==========================================================================
     
     vcfa_k8s_remediation_ok = True
@@ -1505,12 +1510,13 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.generate_html()
         
         try:
-            import re as _re_k8s
+            import json as _json_k8s
             
             password = lsf.get_password()
             vcfa_k8s_ip = '10.1.1.71'  # VCF 9.0 default
             vcfa_vip = '10.1.1.70'
             vcfa_user = 'vmware-system-user'
+            vcenter_host = 'vc-mgmt-a.site-a.vcf.lab'
             
             # Auto-detect K8s API IP from known VCF Automation IPs
             for candidate_ip in ['10.1.1.71', '10.1.1.72']:
@@ -1531,20 +1537,25 @@ def main(lsf=None, standalone=False, dry_run=False):
                         f'{vcfa_user}@{vcfa_k8s_ip}'
                     )
                 
+                def _get_stdout(result):
+                    """Extract stdout string from ssh result, or empty string."""
+                    if hasattr(result, 'stdout') and result.stdout:
+                        return result.stdout
+                    return ''
+                
                 # ---- Step 1: Check/fix kube-vip VIP ----
                 lsf.write_output('Checking kube-vip VIP status...')
                 vip_check = vcfa_ssh(f'ip addr show eth0 | grep {vcfa_vip}')
                 vip_present = False
-                if hasattr(vip_check, 'stdout') and vip_check.stdout and vcfa_vip in vip_check.stdout:
+                if vcfa_vip in _get_stdout(vip_check):
                     vip_present = True
                     lsf.write_output(f'  VIP {vcfa_vip} is present on eth0')
                 else:
                     lsf.write_output(f'  VIP {vcfa_vip} is MISSING from eth0 - adding manually')
                     vcfa_ssh(f'ip addr add {vcfa_vip}/32 dev eth0')
                     time.sleep(2)
-                    # Verify
                     vip_recheck = vcfa_ssh(f'ip addr show eth0 | grep {vcfa_vip}')
-                    if hasattr(vip_recheck, 'stdout') and vip_recheck.stdout and vcfa_vip in vip_recheck.stdout:
+                    if vcfa_vip in _get_stdout(vip_recheck):
                         lsf.write_output(f'  VIP {vcfa_vip} added successfully')
                         vip_present = True
                     else:
@@ -1559,26 +1570,25 @@ def main(lsf=None, standalone=False, dry_run=False):
                     kctl_prefix = 'export KUBECONFIG=/etc/kubernetes/super-admin.conf;'
                     node_check = vcfa_ssh(f'{kctl_prefix} kubectl get nodes --no-headers 2>&1')
                     kubectl_ok = False
-                    if hasattr(node_check, 'stdout') and 'Ready' in node_check.stdout:
+                    node_stdout = _get_stdout(node_check)
+                    if 'Ready' in node_stdout:
                         kubectl_ok = True
                         lsf.write_output('  kubectl access verified')
                     else:
                         lsf.write_output('  kubectl not responding, waiting 30s and retrying...')
                         time.sleep(30)
                         node_check2 = vcfa_ssh(f'{kctl_prefix} kubectl get nodes --no-headers 2>&1')
-                        if hasattr(node_check2, 'stdout') and 'Ready' in node_check2.stdout:
+                        if 'Ready' in _get_stdout(node_check2):
                             kubectl_ok = True
                             lsf.write_output('  kubectl access verified on retry')
                         else:
-                            # Try restarting containerd+kubelet
                             lsf.write_output('  kubectl still failing - restarting containerd and kubelet')
                             vcfa_ssh('systemctl restart containerd && sleep 3 && systemctl restart kubelet')
                             time.sleep(30)
-                            # Re-add VIP in case restart cleared it
                             vcfa_ssh(f'ip addr show eth0 | grep {vcfa_vip} || ip addr add {vcfa_vip}/32 dev eth0')
                             time.sleep(15)
                             node_check3 = vcfa_ssh(f'{kctl_prefix} kubectl get nodes --no-headers 2>&1')
-                            if hasattr(node_check3, 'stdout') and 'Ready' in node_check3.stdout:
+                            if 'Ready' in _get_stdout(node_check3):
                                 kubectl_ok = True
                                 lsf.write_output('  kubectl access restored after service restart')
                             else:
@@ -1586,14 +1596,162 @@ def main(lsf=None, standalone=False, dry_run=False):
                                 vcfa_k8s_remediation_ok = False
                     
                     if kubectl_ok:
-                        # ---- Step 3: Check/fix ImagePullBackOff pods ----
+                        # Track whether volume attachments or CSI were fixed
+                        # (used later to recover stuck prelude pods)
+                        stuck_va_fixed = False
+                        csi_fixed = False
+                        
+                        # ---- Step 3: Containerd Ready,SchedulingDisabled fix ----
+                        lsf.write_output('Checking for node Ready,SchedulingDisabled...')
+                        for attempt in range(3):
+                            nd_out = _get_stdout(
+                                vcfa_ssh(f'{kctl_prefix} kubectl get nodes --no-headers 2>&1')
+                            )
+                            if 'Ready,SchedulingDisabled' not in nd_out:
+                                if attempt == 0:
+                                    lsf.write_output('  Node scheduling status OK')
+                                break
+                            lsf.write_output(f'  Node is Ready,SchedulingDisabled (attempt {attempt+1}/3)')
+                            # Try uncordon first (cheapest fix), escalate to containerd restart
+                            for line in nd_out.strip().split('\n'):
+                                if 'SchedulingDisabled' in line:
+                                    node_name = line.split()[0]
+                                    lsf.write_output(f'  Uncordoning node {node_name}')
+                                    vcfa_ssh(f'{kctl_prefix} kubectl uncordon {node_name}')
+                            time.sleep(5)
+                            # Recheck after uncordon
+                            nd_recheck = _get_stdout(
+                                vcfa_ssh(f'{kctl_prefix} kubectl get nodes --no-headers 2>&1')
+                            )
+                            if 'Ready,SchedulingDisabled' not in nd_recheck:
+                                lsf.write_output('  Node scheduling resolved after uncordon')
+                                break
+                            if attempt >= 1:
+                                lsf.write_output('  Uncordon did not resolve, restarting containerd...')
+                                vcfa_ssh('systemctl restart containerd')
+                                time.sleep(10)
+                        
+                        # ---- Step 4: CAPI/CAPV controller health ----
+                        lsf.write_output('Checking CAPI/CAPV controller health...')
+                        
+                        def _check_capi_capv_ready():
+                            capv_out = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl get deployment capv-controller-manager '
+                                f'-n vmsp-platform -o jsonpath="{{.status.readyReplicas}}" 2>/dev/null'
+                            )).strip()
+                            capi_out = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl get deployment capi-controller-manager '
+                                f'-n vmsp-platform -o jsonpath="{{.status.readyReplicas}}" 2>/dev/null'
+                            )).strip()
+                            capv_val = capv_out.split('\n')[-1].strip() if capv_out else ''
+                            capi_val = capi_out.split('\n')[-1].strip() if capi_out else ''
+                            return (capv_val and capv_val != '0'), (capi_val and capi_val != '0')
+                        
+                        capv_ok, capi_ok = _check_capi_capv_ready()
+                        if capv_ok and capi_ok:
+                            lsf.write_output('  CAPI/CAPV controllers are ready')
+                        else:
+                            # Controllers may just be starting — check for actual pod failures
+                            # before restarting services
+                            lsf.write_output('  CAPI/CAPV controllers not ready yet, checking pod status...')
+                            capv_pod_out = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl get pods -n vmsp-platform --no-headers 2>/dev/null '
+                                f'| grep -E "capv-controller|capi-controller"'
+                            ))
+                            pods_crashing = any(
+                                state in capv_pod_out
+                                for state in ['CrashLoopBackOff', 'Error', 'ImagePullBackOff', 'CreateContainerError']
+                            )
+                            if pods_crashing:
+                                lsf.write_output('  CAPI/CAPV pods in failure state - restarting containerd and kubelet')
+                                vcfa_ssh('systemctl restart containerd kubelet')
+                                time.sleep(30)
+                                lsf.write_output('  Waiting for CAPI/CAPV controllers to recover...')
+                                vcfa_ssh(
+                                    f'{kctl_prefix} kubectl rollout status deployment '
+                                    f'capv-controller-manager -n vmsp-platform --timeout=60s 2>/dev/null'
+                                )
+                            else:
+                                # Pods exist but aren't ready yet — give them time to converge
+                                lsf.write_output('  CAPI/CAPV pods are starting, waiting up to 60s for readiness...')
+                                for _wait in range(4):
+                                    time.sleep(15)
+                                    capv_ok, capi_ok = _check_capi_capv_ready()
+                                    if capv_ok and capi_ok:
+                                        lsf.write_output('  CAPI/CAPV controllers became ready')
+                                        break
+                                else:
+                                    lsf.write_output('  CAPI/CAPV controllers still not ready after 60s (will continue)')
+                        
+                        # ---- Step 5: kube-scheduler check/fix ----
+                        lsf.write_output('Checking kube-scheduler...')
+                        for attempt in range(3):
+                            sched_out = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl get pods -n kube-system --no-headers 2>/dev/null '
+                                f'| grep kube-scheduler'
+                            ))
+                            if '0/1' not in sched_out:
+                                if attempt == 0:
+                                    lsf.write_output('  kube-scheduler is running')
+                                else:
+                                    lsf.write_output('  kube-scheduler recovered')
+                                break
+                            if attempt == 0:
+                                # First detection: wait 30s for natural recovery before intervening
+                                lsf.write_output('  kube-scheduler is 0/1, waiting 30s for recovery...')
+                                time.sleep(30)
+                            else:
+                                lsf.write_output(f'  kube-scheduler still 0/1 (attempt {attempt+1}/3) - restarting containerd')
+                                vcfa_ssh('systemctl restart containerd')
+                                time.sleep(30)
+                        
+                        # ---- Step 6: Stale seaweedfs-master-0 pod ----
+                        lsf.write_output('Checking seaweedfs-master-0 for stale pod (>1hr old)...')
+                        for attempt in range(3):
+                            sw_out = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl get pod seaweedfs-master-0 '
+                                f'-n vmsp-platform -o json 2>/dev/null'
+                            ))
+                            sw_json_start = sw_out.find('{')
+                            if sw_json_start < 0:
+                                lsf.write_output('  seaweedfs-master-0 pod not found or not parseable')
+                                break
+                            try:
+                                sw_data = _json_k8s.loads(sw_out[sw_json_start:])
+                                import datetime
+                                created = sw_data.get('metadata', {}).get('creationTimestamp', '')
+                                if created:
+                                    created_dt = datetime.datetime.strptime(
+                                        created, '%Y-%m-%dT%H:%M:%SZ'
+                                    ).replace(tzinfo=datetime.timezone.utc)
+                                    age_secs = (datetime.datetime.now(datetime.timezone.utc) - created_dt).total_seconds()
+                                    if age_secs > 3600:
+                                        lsf.write_output(f'  Stale seaweedfs-master-0 found ({int(age_secs)}s old), deleting...')
+                                        vcfa_ssh(
+                                            f'{kctl_prefix} kubectl delete pod seaweedfs-master-0 '
+                                            f'-n vmsp-platform 2>/dev/null'
+                                        )
+                                        time.sleep(5)
+                                        continue
+                                    else:
+                                        lsf.write_output(f'  seaweedfs-master-0 is fresh ({int(age_secs)}s old)')
+                                        break
+                                else:
+                                    lsf.write_output('  Could not determine seaweedfs-master-0 age')
+                                    break
+                            except Exception:
+                                lsf.write_output('  Could not parse seaweedfs-master-0 pod JSON')
+                                break
+                        
+                        # ---- Step 7: ImagePullBackOff pods ----
                         lsf.write_output('Checking for ImagePullBackOff pods...')
                         ipb_check = vcfa_ssh(
                             f'{kctl_prefix} kubectl get pods -A --no-headers 2>/dev/null '
                             f'| grep ImagePullBackOff'
                         )
-                        if hasattr(ipb_check, 'stdout') and ipb_check.stdout and 'ImagePullBackOff' in ipb_check.stdout:
-                            for line in ipb_check.stdout.strip().split('\n'):
+                        ipb_out = _get_stdout(ipb_check)
+                        if 'ImagePullBackOff' in ipb_out:
+                            for line in ipb_out.strip().split('\n'):
                                 if not line.strip():
                                     continue
                                 cols = line.split()
@@ -1608,13 +1766,17 @@ def main(lsf=None, standalone=False, dry_run=False):
                         else:
                             lsf.write_output('  No ImagePullBackOff pods found')
                         
-                        # Also delete Unknown pods
+                        # ---- Step 8: Unknown pods ----
+                        lsf.write_output('Checking for Unknown pods...')
                         unknown_check = vcfa_ssh(
                             f'{kctl_prefix} kubectl get pods -A --no-headers 2>/dev/null '
                             f'| grep Unknown'
                         )
-                        if hasattr(unknown_check, 'stdout') and unknown_check.stdout and 'Unknown' in unknown_check.stdout:
-                            for line in unknown_check.stdout.strip().split('\n'):
+                        unk_out = _get_stdout(unknown_check)
+                        if 'Unknown' in unk_out:
+                            unk_count = len([l for l in unk_out.strip().split('\n') if l.strip()])
+                            lsf.write_output(f'  Found {unk_count} pods in Unknown state, force deleting...')
+                            for line in unk_out.strip().split('\n'):
                                 if not line.strip():
                                     continue
                                 cols = line.split()
@@ -1625,35 +1787,231 @@ def main(lsf=None, standalone=False, dry_run=False):
                                         f'{kctl_prefix} kubectl delete pod {unk_pod} -n {unk_ns} '
                                         f'--force --grace-period=0 2>/dev/null'
                                     )
+                        else:
+                            lsf.write_output('  No Unknown pods found')
                         
-                        # ---- Step 4: Check/fix RabbitMQ .erlang.cookie permissions ----
+                        # ---- Step 9: Stuck volume attachments ----
+                        lsf.write_output('Checking for stuck volume attachments...')
+                        for attempt in range(3):
+                            va_out = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl get volumeattachments -o json 2>/dev/null'
+                            ))
+                            va_json_start = va_out.find('{')
+                            if va_json_start < 0:
+                                break
+                            try:
+                                va_data = _json_k8s.loads(va_out[va_json_start:])
+                                stuck_vas = [
+                                    item['metadata']['name']
+                                    for item in va_data.get('items', [])
+                                    if item.get('metadata', {}).get('deletionTimestamp')
+                                ]
+                            except Exception:
+                                lsf.write_output('  Could not parse volume attachment JSON')
+                                break
+                            
+                            if not stuck_vas:
+                                if attempt == 0:
+                                    lsf.write_output('  No stuck volume attachments found')
+                                break
+                            
+                            lsf.write_output(f'  Found {len(stuck_vas)} stuck volume attachment(s), removing finalizers...')
+                            for va_name in stuck_vas:
+                                lsf.write_output(f'  Removing finalizer from: {va_name}')
+                                vcfa_ssh(
+                                    f'{kctl_prefix} kubectl patch volumeattachment {va_name} '
+                                    f'-p \'{{"metadata":{{"finalizers":null}}}}\' --type=merge 2>/dev/null'
+                                )
+                            stuck_va_fixed = True
+                            time.sleep(5)
+                        
+                        # ---- Step 10: vCenter vAPI endpoint service ----
+                        lsf.write_output('Checking vCenter vAPI endpoint service...')
+                        vapi_check = lsf.run_command(
+                            f'curl -s -k -o /dev/null -w "%{{http_code}}" '
+                            f'"https://{vcenter_host}/rest/com/vmware/cis/session"',
+                            timeout=15
+                        )
+                        vapi_status = _get_stdout(vapi_check).strip()
+                        if vapi_status == '503':
+                            lsf.write_output('  vAPI endpoint returning 503 - starting service...')
+                            lsf.ssh(
+                                'service-control --start vmware-vapi-endpoint',
+                                f'root@{vcenter_host}'
+                            )
+                            time.sleep(10)
+                            vapi_recheck = lsf.run_command(
+                                f'curl -s -k -o /dev/null -w "%{{http_code}}" '
+                                f'"https://{vcenter_host}/rest/com/vmware/cis/session"',
+                                timeout=15
+                            )
+                            vapi_status2 = _get_stdout(vapi_recheck).strip()
+                            if vapi_status2 != '503':
+                                lsf.write_output(f'  vAPI endpoint started successfully (HTTP {vapi_status2})')
+                            else:
+                                lsf.write_output('  WARNING: vAPI endpoint still returning 503')
+                        else:
+                            lsf.write_output(f'  vAPI endpoint is responding (HTTP {vapi_status})')
+                        
+                        # ---- Step 11: CSI controller health ----
+                        lsf.write_output('Checking vsphere-csi-controller health...')
+                        csi_ready_out = _get_stdout(vcfa_ssh(
+                            f'{kctl_prefix} kubectl get pods -n kube-system '
+                            f'-l app=vsphere-csi-controller '
+                            f'-o jsonpath="{{.items[0].status.containerStatuses[*].ready}}" 2>/dev/null'
+                        ))
+                        if 'false' not in csi_ready_out and csi_ready_out.strip():
+                            lsf.write_output('  CSI controller is healthy')
+                        else:
+                            # CSI not fully ready — diagnose before taking action
+                            lsf.write_output('  CSI controller not fully ready, diagnosing...')
+                            
+                            csi_pod_name = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl get pods -n kube-system '
+                                f'-l app=vsphere-csi-controller '
+                                f'-o jsonpath="{{.items[0].metadata.name}}" 2>/dev/null'
+                            )).strip().split('\n')[-1].strip()
+                            
+                            # Check pod status to distinguish "still starting" from "actually broken"
+                            csi_pod_status = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl get pods -n kube-system '
+                                f'-l app=vsphere-csi-controller --no-headers 2>/dev/null'
+                            ))
+                            csi_is_crashing = any(
+                                state in csi_pod_status
+                                for state in ['CrashLoopBackOff', 'Error', 'CreateContainerError']
+                            )
+                            
+                            csi_remediation_taken = False
+                            
+                            if csi_is_crashing and csi_pod_name:
+                                # Pod is in a failure state — check specific root causes
+                                
+                                # Check for stale leases held by non-existent pods
+                                lease_out = _get_stdout(vcfa_ssh(
+                                    f'{kctl_prefix} kubectl get leases -n kube-system -o json 2>/dev/null'
+                                ))
+                                lease_json_start = lease_out.find('{')
+                                if lease_json_start >= 0:
+                                    try:
+                                        lease_data = _json_k8s.loads(lease_out[lease_json_start:])
+                                        for lease_item in lease_data.get('items', []):
+                                            holder = lease_item.get('spec', {}).get('holderIdentity', '')
+                                            lease_name = lease_item.get('metadata', {}).get('name', '')
+                                            if ('vsphere-csi-controller' in holder and
+                                                    holder != csi_pod_name and csi_pod_name):
+                                                lsf.write_output(f'  Deleting stale CSI lease: {lease_name}')
+                                                vcfa_ssh(
+                                                    f'{kctl_prefix} kubectl delete lease {lease_name} '
+                                                    f'-n kube-system 2>/dev/null'
+                                                )
+                                                csi_remediation_taken = True
+                                    except Exception:
+                                        pass
+                                
+                                # Check if CSI controller is failing due to vCenter password
+                                csi_log_out = _get_stdout(vcfa_ssh(
+                                    f'{kctl_prefix} kubectl logs -n kube-system {csi_pod_name} '
+                                    f'-c vsphere-csi-controller --tail=20 2>/dev/null'
+                                ))
+                                if 'Cannot complete login due to an incorrect user name or password' in csi_log_out:
+                                    lsf.write_output('  CSI controller failing due to vCenter password - fixing via dir-cli...')
+                                    csi_conf_decoded = _get_stdout(vcfa_ssh(
+                                        f'{kctl_prefix} kubectl get secret vsphere-config-secret '
+                                        f'-n kube-system -o jsonpath="{{.data.csi-vsphere\\.conf}}" '
+                                        f'2>/dev/null | base64 -d | grep user'
+                                    ))
+                                    csi_cloud_pass = _get_stdout(vcfa_ssh(
+                                        f'{kctl_prefix} kubectl get secret vsphere-cloud-secret '
+                                        f'-n kube-system -o jsonpath='
+                                        f'"{{.data.vc-mgmt-a\\.site-a\\.vcf\\.lab\\.password}}" 2>/dev/null '
+                                        f'| base64 -d'
+                                    )).strip().split('\n')[-1].strip()
+                                    
+                                    if csi_conf_decoded and csi_cloud_pass:
+                                        import re as _re_csi
+                                        csi_user_match = _re_csi.search(r'"([^"]+@[^"]+)"', csi_conf_decoded)
+                                        if csi_user_match:
+                                            csi_account = csi_user_match.group(1).split('@')[0]
+                                            lsf.write_output(f'  Resetting password for {csi_account} via dir-cli')
+                                            lsf.ssh(
+                                                f'/usr/lib/vmware-vmafd/bin/dir-cli password reset '
+                                                f'--account {csi_account} --new \'{csi_cloud_pass}\' '
+                                                f'--login administrator@vsphere.local --password \'{password}\'',
+                                                f'root@{vcenter_host}'
+                                            )
+                                            csi_remediation_taken = True
+                                
+                                # Only force-delete if we found and fixed a root cause,
+                                # or if the pod is in CrashLoopBackOff (won't recover on its own)
+                                if csi_remediation_taken or 'CrashLoopBackOff' in csi_pod_status:
+                                    lsf.write_output(f'  Force-deleting CSI controller pod: {csi_pod_name}')
+                                    vcfa_ssh(
+                                        f'{kctl_prefix} kubectl delete pod {csi_pod_name} -n kube-system '
+                                        f'--grace-period=0 --force 2>/dev/null'
+                                    )
+                                    csi_fixed = True
+                                    time.sleep(30)
+                                    
+                                    lsf.write_output('  Waiting for new CSI controller pod...')
+                                    for wait_s in range(0, 120, 15):
+                                        new_csi_out = _get_stdout(vcfa_ssh(
+                                            f'{kctl_prefix} kubectl get pods -n kube-system '
+                                            f'-l app=vsphere-csi-controller --no-headers 2>/dev/null '
+                                            f'| grep -v Terminating'
+                                        ))
+                                        if '7/7' in new_csi_out:
+                                            lsf.write_output('  CSI controller is now fully ready (7/7)')
+                                            break
+                                        ready_col = ''
+                                        for ln in new_csi_out.strip().split('\n'):
+                                            parts = ln.split()
+                                            if len(parts) >= 2:
+                                                ready_col = parts[1]
+                                        lsf.write_output(f'  CSI controller status: {ready_col or "pending"} ({wait_s}/120s)')
+                                        time.sleep(15)
+                                else:
+                                    lsf.write_output('  CSI pod in Error state but no actionable root cause found, skipping force-delete')
+                            else:
+                                # Pod exists but is still initializing — give it time
+                                lsf.write_output('  CSI controller pods are starting, waiting up to 60s...')
+                                for _csi_wait in range(4):
+                                    time.sleep(15)
+                                    csi_recheck = _get_stdout(vcfa_ssh(
+                                        f'{kctl_prefix} kubectl get pods -n kube-system '
+                                        f'-l app=vsphere-csi-controller '
+                                        f'-o jsonpath="{{.items[0].status.containerStatuses[*].ready}}" 2>/dev/null'
+                                    ))
+                                    if 'false' not in csi_recheck and csi_recheck.strip():
+                                        lsf.write_output('  CSI controller became ready')
+                                        break
+                                else:
+                                    lsf.write_output('  CSI controller still initializing after 60s (will continue)')
+                        
+                        # ---- Step 12: RabbitMQ .erlang.cookie permissions ----
                         lsf.write_output('Checking RabbitMQ status...')
                         rmq_check = vcfa_ssh(
                             f'{kctl_prefix} kubectl get pod rabbitmq-ha-0 -n prelude --no-headers 2>/dev/null'
                         )
+                        rmq_out = _get_stdout(rmq_check)
                         rmq_needs_fix = False
-                        if hasattr(rmq_check, 'stdout') and rmq_check.stdout:
-                            if 'CrashLoopBackOff' in rmq_check.stdout or 'Error' in rmq_check.stdout:
-                                rmq_logs = vcfa_ssh(
-                                    f'{kctl_prefix} kubectl logs rabbitmq-ha-0 -n prelude --tail 10 2>/dev/null'
-                                )
-                                if hasattr(rmq_logs, 'stdout') and 'erlang.cookie must be accessible by owner only' in rmq_logs.stdout:
-                                    rmq_needs_fix = True
-                                    lsf.write_output('  RabbitMQ .erlang.cookie has wrong permissions - fixing')
+                        if 'CrashLoopBackOff' in rmq_out or 'Error' in rmq_out:
+                            rmq_logs = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl logs rabbitmq-ha-0 -n prelude --tail 10 2>/dev/null'
+                            ))
+                            if 'erlang.cookie' in rmq_logs and 'accessible by owner only' in rmq_logs:
+                                rmq_needs_fix = True
+                                lsf.write_output('  RabbitMQ .erlang.cookie has wrong permissions - fixing')
                         
                         if rmq_needs_fix:
-                            # Get the rabbitmq image
-                            rmq_image = ''
-                            rmq_img_check = vcfa_ssh(
+                            rmq_img_out = _get_stdout(vcfa_ssh(
                                 f'{kctl_prefix} kubectl get pod rabbitmq-ha-0 -n prelude '
                                 f'-o jsonpath="{{.spec.containers[0].image}}" 2>/dev/null'
-                            )
-                            if hasattr(rmq_img_check, 'stdout') and rmq_img_check.stdout:
-                                rmq_image = rmq_img_check.stdout.strip().split('\n')[-1].strip()
+                            ))
+                            rmq_image = rmq_img_out.strip().split('\n')[-1].strip() if rmq_img_out else ''
                             
                             if rmq_image and 'registry' in rmq_image:
-                                # Deploy fix pod via kubectl run
-                                lsf.write_output(f'  Deploying cookie fix pod...')
+                                lsf.write_output('  Deploying cookie fix pod...')
                                 vcfa_ssh(
                                     f'{kctl_prefix} kubectl run rabbitmq-cookie-fix -n prelude '
                                     f'--image={rmq_image} --restart=Never '
@@ -1666,11 +2024,10 @@ def main(lsf=None, standalone=False, dry_run=False):
                                 )
                                 time.sleep(20)
                                 
-                                # Check fix result
-                                fix_logs = vcfa_ssh(
+                                fix_logs = _get_stdout(vcfa_ssh(
                                     f'{kctl_prefix} kubectl logs rabbitmq-cookie-fix -n prelude 2>/dev/null'
-                                )
-                                if hasattr(fix_logs, 'stdout') and 'FIXED' in fix_logs.stdout:
+                                ))
+                                if 'FIXED' in fix_logs:
                                     lsf.write_output('  RabbitMQ cookie permissions fixed')
                                     vcfa_ssh(f'{kctl_prefix} kubectl delete pod rabbitmq-cookie-fix -n prelude 2>/dev/null')
                                     vcfa_ssh(f'{kctl_prefix} kubectl delete pod rabbitmq-ha-0 -n prelude 2>/dev/null')
@@ -1680,26 +2037,97 @@ def main(lsf=None, standalone=False, dry_run=False):
                                     vcfa_ssh(f'{kctl_prefix} kubectl delete pod rabbitmq-cookie-fix -n prelude --force 2>/dev/null')
                             else:
                                 lsf.write_output('  WARNING: Could not determine RabbitMQ image for fix pod')
+                        elif 'Running' in rmq_out:
+                            lsf.write_output('  RabbitMQ is running normally')
                         else:
-                            if hasattr(rmq_check, 'stdout') and 'Running' in rmq_check.stdout:
-                                lsf.write_output('  RabbitMQ is running normally')
-                            else:
-                                lsf.write_output('  RabbitMQ status check inconclusive')
+                            lsf.write_output(f'  RabbitMQ status: {rmq_out.split()[2] if len(rmq_out.split()) > 2 else "not found"}')
                         
-                        # ---- Step 5: Scale up zero-replica prelude deployments ----
+                        # ---- Step 13: provisioning-service deadlock fix ----
+                        lsf.write_output('Checking provisioning-service for deadlock...')
+                        prov_raw = _get_stdout(vcfa_ssh(
+                            f'{kctl_prefix} kubectl get deployment provisioning-service-app '
+                            f'-n prelude -o jsonpath="{{.status.readyReplicas}}" 2>/dev/null'
+                        ))
+                        prov_ready_out = prov_raw.strip().split('\n')[-1].strip() if prov_raw.strip() else ''
+                        
+                        if prov_ready_out and prov_ready_out != '0':
+                            lsf.write_output('  provisioning-service is ready')
+                        else:
+                            # Not ready — but only patch if the pod is actually stuck, not just starting
+                            prov_pod_out = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl get pods -n prelude --no-headers 2>/dev/null '
+                                f'| grep provisioning-service-app'
+                            ))
+                            prov_is_failing = any(
+                                state in prov_pod_out
+                                for state in ['CrashLoopBackOff', 'Error', 'CreateContainerError']
+                            )
+                            if not prov_is_failing and prov_pod_out.strip():
+                                lsf.write_output('  provisioning-service is still starting (not in failure state)')
+                            else:
+                                prov_java_opts = _get_stdout(vcfa_ssh(
+                                    f'{kctl_prefix} kubectl get deployment provisioning-service-app '
+                                    f'-n prelude -o jsonpath='
+                                    f'"{{.spec.template.spec.containers[0].env[?(@.name==\\"JAVA_OPTS\\")].value}}" '
+                                    f'2>/dev/null'
+                                ))
+                                if 'exemplars.enabled=false' in prov_java_opts:
+                                    lsf.write_output('  provisioning-service already has exemplars fix applied')
+                                elif not prov_pod_out.strip():
+                                    lsf.write_output('  provisioning-service pod not found (deployment may be at 0 replicas)')
+                                else:
+                                    lsf.write_output('  Patching provisioning-service to disable Prometheus exemplars...')
+                                    prov_dep_out = _get_stdout(vcfa_ssh(
+                                        f'{kctl_prefix} kubectl get deployment provisioning-service-app '
+                                        f'-n prelude -o json 2>/dev/null'
+                                    ))
+                                    prov_json_start = prov_dep_out.find('{')
+                                    if prov_json_start >= 0:
+                                        try:
+                                            prov_data = _json_k8s.loads(prov_dep_out[prov_json_start:])
+                                            fix_flag = '-Dmanagement.prometheus.metrics.export.exemplars.enabled=false'
+                                            for container in prov_data.get('spec', {}).get('template', {}).get('spec', {}).get('containers', []):
+                                                if container.get('name') == 'provisioning-service-app':
+                                                    for env_var in container.get('env', []):
+                                                        if env_var.get('name') == 'JAVA_OPTS':
+                                                            if fix_flag not in env_var.get('value', ''):
+                                                                env_var['value'] = env_var['value'].rstrip() + '\n' + fix_flag
+                                                            break
+                                                    break
+                                            
+                                            import tempfile
+                                            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp_f:
+                                                _json_k8s.dump(prov_data, tmp_f)
+                                                tmp_path = tmp_f.name
+                                            
+                                            lsf.run_command(
+                                                f'sshpass -p "{password}" scp -o StrictHostKeyChecking=no '
+                                                f'{tmp_path} {vcfa_user}@{vcfa_k8s_ip}:/tmp/prov-deploy-patched.json'
+                                            )
+                                            vcfa_ssh(f'{kctl_prefix} kubectl apply -f /tmp/prov-deploy-patched.json 2>/dev/null')
+                                            lsf.write_output('  provisioning-service patched, new pod will roll out')
+                                            
+                                            try:
+                                                os.unlink(tmp_path)
+                                            except Exception:
+                                                pass
+                                        except Exception as prov_err:
+                                            lsf.write_output(f'  WARNING: Could not patch provisioning-service: {prov_err}')
+                        
+                        # ---- Step 14: Scale up zero-replica prelude deployments ----
                         lsf.write_output('Checking prelude deployments...')
                         dep_json = vcfa_ssh(
                             f'{kctl_prefix} kubectl get deployments -n prelude -o json 2>/dev/null'
                         )
                         zero_deps = []
-                        if hasattr(dep_json, 'stdout') and dep_json.stdout:
+                        dep_out = _get_stdout(dep_json)
+                        if dep_out:
                             try:
-                                import json as _json_dep
-                                raw_dep = dep_json.stdout.strip()
+                                raw_dep = dep_out.strip()
                                 json_start_dep = raw_dep.find('{')
                                 if json_start_dep >= 0:
                                     raw_dep = raw_dep[json_start_dep:]
-                                dep_data = _json_dep.loads(raw_dep)
+                                dep_data = _json_k8s.loads(raw_dep)
                                 total_deps = len(dep_data.get('items', []))
                                 for d in dep_data.get('items', []):
                                     if d['spec'].get('replicas', 1) == 0:
@@ -1710,13 +2138,6 @@ def main(lsf=None, standalone=False, dry_run=False):
                         
                         if zero_deps:
                             lsf.write_output(f'  Scaling up {len(zero_deps)} deployments...')
-                            # Build and execute a scale script to avoid SSH escaping issues
-                            scale_cmds = [f'{kctl_prefix}']
-                            for dep_name in zero_deps:
-                                scale_cmds.append(
-                                    f'kubectl scale deployment {dep_name} -n prelude --replicas=1 2>&1;'
-                                )
-                            # Batch into groups to avoid command-line length limits
                             batch_size = 10
                             for i in range(0, len(zero_deps), batch_size):
                                 batch = zero_deps[i:i+batch_size]
@@ -1725,27 +2146,24 @@ def main(lsf=None, standalone=False, dry_run=False):
                                     for d in batch
                                 )
                                 result = vcfa_ssh(batch_cmd)
-                                scaled_count = 0
-                                if hasattr(result, 'stdout') and result.stdout:
-                                    scaled_count = result.stdout.count('scaled')
+                                scaled_count = _get_stdout(result).count('scaled')
                                 lsf.write_output(f'  Batch {i//batch_size + 1}: scaled {scaled_count} deployments')
                             
                             # Also check StatefulSets
                             ss_check = vcfa_ssh(
                                 f'{kctl_prefix} kubectl get statefulsets -n prelude -o json 2>/dev/null'
                             )
-                            if hasattr(ss_check, 'stdout') and ss_check.stdout:
+                            ss_out = _get_stdout(ss_check)
+                            if ss_out:
                                 try:
-                                    raw_ss = ss_check.stdout.strip()
+                                    raw_ss = ss_out.strip()
                                     json_start_ss = raw_ss.find('{')
                                     if json_start_ss >= 0:
                                         raw_ss = raw_ss[json_start_ss:]
-                                    ss_data = _json_dep.loads(raw_ss)
+                                    ss_data = _json_k8s.loads(raw_ss)
                                     for ss in ss_data.get('items', []):
                                         ss_name = ss['metadata']['name']
-                                        ss_replicas = ss['spec'].get('replicas', 1)
-                                        ss_ready = ss.get('status', {}).get('readyReplicas', 0)
-                                        if ss_replicas == 0:
+                                        if ss['spec'].get('replicas', 1) == 0:
                                             lsf.write_output(f'  Scaling up StatefulSet {ss_name}')
                                             vcfa_ssh(
                                                 f'{kctl_prefix} kubectl scale statefulset {ss_name} '
@@ -1757,6 +2175,31 @@ def main(lsf=None, standalone=False, dry_run=False):
                             lsf.write_output('  Prelude deployment scale-up complete')
                         else:
                             lsf.write_output('  All prelude deployments already have replicas > 0')
+                        
+                        # ---- Step 15: Recover prelude pods stuck after volume/CSI fixes ----
+                        if stuck_va_fixed or csi_fixed:
+                            lsf.write_output('Volume attachments or CSI controller were fixed, checking prelude pods...')
+                            time.sleep(10)
+                            
+                            stuck_pods_out = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl get pods -n prelude --no-headers 2>/dev/null '
+                                f'| grep -E "ContainerCreating|Init:"'
+                            ))
+                            if stuck_pods_out.strip():
+                                stuck_pod_names = [
+                                    line.split()[0] for line in stuck_pods_out.strip().split('\n')
+                                    if line.strip() and len(line.split()) >= 1
+                                ]
+                                lsf.write_output(f'  Found {len(stuck_pod_names)} stuck prelude pods, deleting for fresh mount...')
+                                for sp_name in stuck_pod_names:
+                                    lsf.write_output(f'  Deleting stuck pod: {sp_name}')
+                                    vcfa_ssh(
+                                        f'{kctl_prefix} kubectl delete pod {sp_name} -n prelude 2>/dev/null'
+                                    )
+                                lsf.write_output('  Waiting 60s for pods to recreate with fresh volume mounts...')
+                                time.sleep(60)
+                            else:
+                                lsf.write_output('  No stuck prelude pods found, services should recover normally')
                 
                 lsf.write_output('VCF Automation K8s health check complete')
                 
@@ -1793,11 +2236,6 @@ def main(lsf=None, standalone=False, dry_run=False):
         vcfapwcheck_script = '/home/holuser/hol/Tools/vcfapwcheck.sh'
         if os.path.isfile(vcfapwcheck_script) and not dry_run:
             lsf.run_command(vcfapwcheck_script)
-        
-        # Run the watchvcfa script to make sure the seaweedfs-master-0 pod is not stale
-        watchvcfa_script = '/home/holuser/hol/Tools/watchvcfa.sh'
-        if os.path.isfile(watchvcfa_script) and not dry_run:
-            lsf.run_command(watchvcfa_script)
         
         # vraurls already retrieved above
         
