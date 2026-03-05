@@ -2,6 +2,11 @@
 # Author: Burke Azbill
 # Version: 1.3
 # Date: 2026-03-03
+#
+# DEPRECATED: This script's functionality has been consolidated into the
+# VCF Automation K8s Health Check (Task 4b) in VCFfinal.py. It is no longer
+# called during lab startup. This file is retained for reference only.
+#
 # Script to watch VCF Automation appliance for issues and remediate them
 # This script:
 # 1. Checks if the VCFA host is reachable via SSH
