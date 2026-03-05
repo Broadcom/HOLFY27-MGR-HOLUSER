@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 4.3 - March 2026
+# Version 4.4 - March 2026
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v4.4 Changes:
+# - Added Task 2c3: Supervisor Service vSphere Pod DNS Fix
+#   On retrofitted VCF 9.0.x labs with the new Photon/FRR holorouter,
+#   the NSX DLB cannot route to CoreDNS pod IPs (172.16.200.x) inside
+#   the SCP Antrea overlay, breaking DNS for all vSphere Pods.  Task 2c3
+#   detects this by checking dnsPolicy on workloads in namespaces listed
+#   in config.ini [VCFFINAL] supervisorservicedns, then patches them to
+#   use the kube-dns-lb LoadBalancer VIP.  To prevent kapp from reverting
+#   the patch during its 10-minute reconciliation cycle, it also injects
+#   kapp rebase rules into the carvel-services-overlay secret.
 #
 # v4.3 Changes:
 # - Added Task 2c2: Supervisor DNS Health Check
@@ -205,6 +216,282 @@ def verify_supervisor_dns(lsf, vcenter_host, password, sso_domain='wld.sso',
 
     except Exception as e:
         lsf.write_output(f'  DNS health check error: {e}')
+        lsf.write_output('  Continuing with startup...')
+        return True
+
+
+def fix_supervisor_service_dns(lsf, vcenter_host, password, namespaces,
+                               sso_domain='wld.sso', dry_run=False):
+    """
+    Fix DNS for vSphere Pods in Supervisor Service namespaces.
+
+    On VCF 9.0.x labs retrofitted with the new Photon/FRR holorouter, the
+    NSX Distributed Load Balancer on ESXi correctly DNATs kube-dns ClusterIP
+    traffic (10.96.0.10) to CoreDNS pod IPs (172.16.200.x), but those IPs
+    live inside the Antrea CNI overlay of the SCP VMs and are unreachable
+    from the ESXi datapath.  This means every vSphere Pod's DNS lookup via
+    ClusterIP silently times out.
+
+    The fix has two parts:
+
+    1. Add kapp rebase rules to the shared carvel-services-overlay secret
+       so that kapp preserves dnsPolicy/dnsConfig fields on Deployments and
+       StatefulSets across reconciliation cycles (which run every 10 min).
+
+    2. Patch the affected Deployments/StatefulSets with dnsPolicy: None
+       pointing to the kube-dns-lb LoadBalancer external VIP, which routes
+       DNS through the NSX Edge LB (a path that works).
+
+    The function is idempotent: if DNS already works or the dnsPolicy is
+    already overridden, nothing is changed.
+
+    :param lsf: lsfunctions module
+    :param vcenter_host: WLD vCenter FQDN (for SCP credential retrieval)
+    :param password: vCenter root password
+    :param namespaces: list of Supervisor Service namespace names to fix
+    :param sso_domain: SSO domain (default 'wld.sso')
+    :param dry_run: if True, only report what would be done
+    """
+    import subprocess
+    import json as _json
+    import base64
+
+    lsf.write_output('=' * 60)
+    lsf.write_output('Supervisor Service DNS Fix')
+    lsf.write_output('=' * 60)
+
+    if not namespaces:
+        lsf.write_output('  No namespaces configured - skipping')
+        return True
+
+    if dry_run:
+        lsf.write_output(f'  Dry run - would check {len(namespaces)} namespace(s)')
+        return True
+
+    try:
+        scp_pwd_result = subprocess.run(
+            ['sshpass', '-p', password, 'ssh', '-o', 'StrictHostKeyChecking=accept-new',
+             f'root@{vcenter_host}',
+             'python3 /usr/lib/vmware-wcp/decryptK8Pwd.py'],
+            capture_output=True, text=True, timeout=15
+        )
+
+        scp_ip = None
+        scp_pwd = None
+        for line in scp_pwd_result.stdout.split('\n'):
+            if 'IP:' in line:
+                scp_ip = line.split('IP:')[1].strip()
+            if 'PWD:' in line:
+                scp_pwd = line.split('PWD:')[1].strip()
+
+        if not scp_ip or not scp_pwd:
+            lsf.write_output('  Could not retrieve SCP credentials - skipping')
+            return True
+
+        def _scp(cmd, timeout=30):
+            r = subprocess.run(
+                ['sshpass', '-p', scp_pwd, 'ssh',
+                 '-o', 'StrictHostKeyChecking=accept-new',
+                 f'root@{scp_ip}', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+            return r.stdout.strip()
+
+        # ---- Discover kube-dns-lb external VIP ----
+        dns_lb_ip = _scp(
+            'kubectl get svc kube-dns-lb -n kube-system '
+            '-o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>/dev/null'
+        ).replace('"', '').strip()
+
+        if not dns_lb_ip:
+            lsf.write_output('  kube-dns-lb LoadBalancer VIP not found - skipping')
+            return True
+
+        lsf.write_output(f'  kube-dns-lb VIP: {dns_lb_ip}')
+
+        # ---- Determine which namespaces actually need fixing ----
+        namespaces_to_fix = []
+        for ns in namespaces:
+            ns = ns.strip()
+            if not ns:
+                continue
+
+            lsf.write_output(f'  Checking namespace {ns}...')
+
+            current_dns = _scp(
+                f'kubectl get deployments -n {ns} '
+                f'-o jsonpath="{{.items[0].spec.template.spec.dnsPolicy}}" 2>/dev/null'
+            ).replace('"', '').strip()
+
+            if current_dns == 'None':
+                lsf.write_output(f'    dnsPolicy already overridden - OK')
+                continue
+
+            namespaces_to_fix.append(ns)
+            lsf.write_output(f'    ClusterIP DNS override needed')
+
+        if not namespaces_to_fix:
+            lsf.write_output('  All namespaces already fixed or healthy')
+            return True
+
+        # ---- Step 1: Ensure kapp rebase rules preserve dnsPolicy/dnsConfig ----
+        # The carvel-services-overlay secret contains kapp Config rebaseRules
+        # shared by all Supervisor Service Apps.  Adding rules for dnsPolicy
+        # and dnsConfig tells kapp to keep those fields from the live resource
+        # instead of overwriting them from the rendered template.
+        lsf.write_output('  Ensuring kapp rebase rules for DNS fields...')
+
+        overlay_b64 = _scp(
+            'kubectl get secret carvel-services-overlay '
+            '-n vmware-system-supervisor-services '
+            '-o jsonpath="{.data.carvel-services-overlay\\.yml}" 2>/dev/null'
+        ).replace('"', '').strip()
+
+        rebase_needed = False
+        if overlay_b64:
+            try:
+                overlay_text = base64.b64decode(overlay_b64).decode('utf-8')
+                if 'dnsPolicy' not in overlay_text:
+                    rebase_needed = True
+            except Exception:
+                rebase_needed = True
+        else:
+            rebase_needed = True
+
+        if rebase_needed:
+            lsf.write_output('    Adding dnsPolicy/dnsConfig rebase rules...')
+            dns_rebase_block = (
+                '- paths:\n'
+                '  - [spec, template, spec, dnsPolicy]\n'
+                '  - [spec, template, spec, dnsConfig]\n'
+                '  type: copy\n'
+                '  sources: [existing, new]\n'
+                '  resourceMatchers:\n'
+                '  - apiVersionKindMatcher: {apiVersion: apps/v1, kind: Deployment}\n'
+                '- paths:\n'
+                '  - [spec, template, spec, dnsPolicy]\n'
+                '  - [spec, template, spec, dnsConfig]\n'
+                '  type: copy\n'
+                '  sources: [existing, new]\n'
+                '  resourceMatchers:\n'
+                '  - apiVersionKindMatcher: {apiVersion: apps/v1, kind: StatefulSet}\n'
+            )
+            try:
+                overlay_text = base64.b64decode(overlay_b64).decode('utf-8')
+            except Exception:
+                overlay_text = ''
+
+            if overlay_text:
+                # Append before trailing comments
+                lines = overlay_text.rstrip().split('\n')
+                insert_idx = len(lines)
+                for i in range(len(lines) - 1, -1, -1):
+                    stripped = lines[i].strip()
+                    if stripped.startswith('#!') or stripped == '':
+                        insert_idx = i
+                    else:
+                        break
+                new_lines = lines[:insert_idx] + dns_rebase_block.rstrip().split('\n') + lines[insert_idx:]
+                updated_overlay = '\n'.join(new_lines) + '\n'
+            else:
+                updated_overlay = (
+                    '---\n'
+                    'apiVersion: kapp.k14s.io/v1alpha1\n'
+                    'kind: Config\n\n'
+                    'rebaseRules:\n' + dns_rebase_block
+                )
+
+            updated_b64 = base64.b64encode(updated_overlay.encode('utf-8')).decode('ascii')
+            patch_result = _scp(
+                f"kubectl patch secret carvel-services-overlay "
+                f"-n vmware-system-supervisor-services "
+                f"--type=merge -p '{{\"data\":{{\"carvel-services-overlay.yml\":\"{updated_b64}\"}}}}' 2>&1"
+            )
+            lsf.write_output(f'    {patch_result}')
+        else:
+            lsf.write_output('    Rebase rules already present')
+
+        # ---- Step 2: Patch workloads in each namespace ----
+        for ns in namespaces_to_fix:
+            lsf.write_output(f'  Fixing namespace {ns}...')
+
+            patch = _json.dumps({
+                'spec': {'template': {'spec': {
+                    'dnsPolicy': 'None',
+                    'dnsConfig': {
+                        'nameservers': [dns_lb_ip],
+                        'searches': [
+                            f'{ns}.svc.cluster.local',
+                            'svc.cluster.local',
+                            'cluster.local'
+                        ],
+                        'options': [{'name': 'ndots', 'value': '5'}]
+                    }
+                }}}
+            })
+
+            dep_names = _scp(
+                f'kubectl get deployments -n {ns} '
+                f'-o jsonpath="{{.items[*].metadata.name}}" 2>/dev/null'
+            ).replace('"', '').split()
+
+            for dep in dep_names:
+                result = _scp(
+                    f"kubectl patch deployment {dep} -n {ns} "
+                    f"-p '{patch}' 2>&1"
+                )
+                lsf.write_output(f'    Deployment {dep}: {result}')
+
+            ss_names = _scp(
+                f'kubectl get statefulsets -n {ns} '
+                f'-o jsonpath="{{.items[*].metadata.name}}" 2>/dev/null'
+            ).replace('"', '').split()
+
+            for ss in ss_names:
+                result = _scp(
+                    f"kubectl patch statefulset {ss} -n {ns} "
+                    f"-p '{patch}' 2>&1"
+                )
+                lsf.write_output(f'    StatefulSet {ss}: {result}')
+
+            # ---- Wait for rollout ----
+            lsf.write_output(f'    Waiting for rollout (up to 5 min)...')
+            time.sleep(30)
+
+            _scp(
+                f'kubectl delete pods -n {ns} '
+                f'--field-selector=status.phase=Failed 2>/dev/null || true'
+            )
+
+            all_ready = False
+            for attempt in range(10):
+                not_ready = _scp(
+                    f'kubectl get pods -n {ns} --no-headers 2>/dev/null | '
+                    f'grep -v Running | grep -v Completed | grep -v Terminating | wc -l'
+                ).strip()
+                try:
+                    if int(not_ready) == 0:
+                        all_ready = True
+                        break
+                except ValueError:
+                    pass
+                time.sleep(30)
+
+            if all_ready:
+                lsf.write_output(f'    All pods in {ns} are Running')
+            else:
+                lsf.write_output(f'    WARNING: Some pods in {ns} not yet Running')
+                pods_out = _scp(
+                    f'kubectl get pods -n {ns} --no-headers 2>/dev/null | '
+                    f'grep -v Running | grep -v Completed | grep -v Terminating'
+                )
+                if pods_out:
+                    lsf.write_output(f'    {pods_out}')
+
+        return True
+
+    except Exception as e:
+        lsf.write_output(f'  Supervisor Service DNS fix error: {e}')
         lsf.write_output('  Continuing with startup...')
         return True
 
@@ -812,7 +1099,25 @@ def main(lsf=None, standalone=False, dry_run=False):
         if tanzu_verify_ok and wcp_certs_ok and not dry_run:
             verify_supervisor_dns(lsf, wcp_vcenter, lsf.get_password(),
                                   sso_domain=sso_domain, dry_run=dry_run)
-            
+
+        #----------------------------------------------------------------------
+        # TASK 2c3: POST-VERIFY - Supervisor Service vSphere Pod DNS Fix
+        # On retrofitted labs where the NSX DLB cannot route to CoreDNS
+        # pod IPs (172.16.200.x) inside the SCP Antrea overlay, vSphere
+        # Pod DNS via ClusterIP silently times out.  This patches affected
+        # Supervisor Service workloads to use the kube-dns-lb LoadBalancer
+        # VIP instead, and injects kapp rebase rules into the shared
+        # carvel-services-overlay secret so the fix survives reconciliation.
+        # Only runs if supervisorservicedns is configured in [VCFFINAL].
+        #----------------------------------------------------------------------
+        svc_dns_namespaces = lsf.get_config_list('VCFFINAL', 'supervisorservicedns')
+        if svc_dns_namespaces and tanzu_verify_ok and not dry_run:
+            fix_supervisor_service_dns(lsf, wcp_vcenter, lsf.get_password(),
+                                      namespaces=svc_dns_namespaces,
+                                      sso_domain=sso_domain, dry_run=dry_run)
+        elif svc_dns_namespaces and dry_run:
+            lsf.write_output(f'Would fix DNS for {len(svc_dns_namespaces)} namespace(s) (dry run)')
+
     else:
         lsf.write_output('No Tanzu Control Plane VMs configured')
         if dashboard:
