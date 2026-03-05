@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 # status_dashboard.py - HOLFY27 Lab Startup Status Dashboard
-# Version 1.0 - January 2026
+# Version 1.1 - 2026-03-05
+# Changes:
+# - Added Task 2c3: Supervisor Service vSphere Pod DNS Fix
+#   On retrofitted VCF 9.0.x labs with the new Photon/FRR holorouter,
+#   the NSX DLB cannot route to CoreDNS pod IPs (172.16.200.x) inside
+#   the SCP Antrea overlay, breaking DNS for all vSphere Pods.  Task 2c3
+#   detects this by checking dnsPolicy on workloads in namespaces listed
+#   in config.ini [VCFFINAL] supervisorservicedns, then patches them to
+#   use the kube-dns-lb LoadBalancer VIP.  To prevent kapp from reverting
+#   the patch during its 10-minute reconciliation cycle, it also injects
+#   kapp rebase rules into the carvel-services-overlay secret.
 # Author - Burke Azbill and HOL Core Team
 # Generates an auto-refreshing HTML status page for lab startup monitoring
 
@@ -155,10 +165,9 @@ class StatusDashboard:
             ('prelim', '1. Preliminary Checks (prelim.py)', [
                 ('readme', 'README Sync', 'Copy README to console desktop'),
                 ('update_manager', 'Update Manager', 'Disable Ubuntu update popups'),
-                ('dns', 'DNS Health Checks', 'Verify DNS resolution for all sites'),
-                ('dns_import', 'DNS Record Import', 'Import custom DNS records'),
                 ('firewall', 'Firewall Verification', 'Confirm firewall is active'),
                 ('proxy_filter', 'Proxy Filter', 'Verify proxy filtering is active'),
+                ('odyssey_cleanup', 'Odyssey Cleanup', 'Clean previous Odyssey installation files'),
             ]),
             
             # Group 2: ESXi.py - ESXi Host Verification
@@ -226,15 +235,19 @@ class StatusDashboard:
             
             # Group 10: VCFfinal.py - VCF Final Tasks
             ('vcffinal', '10. VCF Final Tasks (VCFfinal.py)', [
-                ('wcp_vcenter', 'WCP vCenter Services', 'Verify vCenter WCP services (trustmanagement, wcp)'),
-                ('tanzu_control', 'Tanzu Control Plane', 'Verify Supervisor Control Plane status'),
+                ('wcp_vcenter', 'WCP vCenter Services', 'Check/start vapi-endpoint, trustmanagement, wcp'),
+                ('tanzu_control', 'Supervisor Control Plane', 'Power on SCP VMs, verify Supervisor RUNNING'),
                 ('wcp_certs', 'WCP Certificate Fix', 'Fix Kubernetes certificates and webhooks'),
+                ('wcp_dns', 'Supervisor DNS Check', 'Verify kube-dns endpoint points to CoreDNS pods'),
+                ('svc_dns', 'Supervisor Service DNS', 'Patch vSphere Pod DNS for Supervisor Services'),
                 ('tanzu_deploy', 'Tanzu Deployment', 'Run Tanzu deployment scripts'),
                 ('vsp_vms', 'VSP Platform VMs', 'Start and verify VSP Platform virtual machines'),
                 ('vcf_components', 'VCF Components', 'Scale up VCF components on VSP management cluster'),
                 ('vcfa_vms', 'VCF Automation VMs', 'Start VCF Automation virtual machines'),
+                ('vcfa_k8s_health', 'VCFA K8s Health Check', 'Remediate VCF Automation K8s cluster issues'),
                 ('vcfa_urls', 'VCF Automation URL Verification', 'Verify VCF Automation URLs'),
                 ('vcf_component_urls', 'VCF Component URL Checks', 'Verify VCF Component URLs'),
+                ('nsx_passwords', 'NSX Password Config', 'Clear NSX password expiration'),
             ]),
             
             # Group 11: final.py - Final Checks
@@ -247,9 +260,7 @@ class StatusDashboard:
             
             # Group 12: odyssey.py - Odyssey Installation
             ('odyssey', '12. Odyssey Installation (odyssey.py)', [
-                ('cleanup', 'Odyssey Cleanup', 'Remove existing Odyssey files'),
                 ('install', 'Odyssey Install', 'Download and install Odyssey client'),
-                ('shortcut', 'Desktop Shortcut', 'Create desktop shortcut'),
             ]),
         ]
         
@@ -1124,12 +1135,10 @@ if __name__ == '__main__':
             # Group 1: prelim - complete with counts
             dashboard.update_task('prelim', 'readme', 'complete', total=1, success=1)
             dashboard.update_task('prelim', 'update_manager', 'complete', total=2, success=2)
-            dashboard.update_task('prelim', 'dns', 'complete', 'All zones resolved', 
-                                  total=3, success=3)
-            dashboard.update_task('prelim', 'dns_import', 'complete', 
-                                  total=5, success=5)
             dashboard.update_task('prelim', 'firewall', 'complete')
             dashboard.update_task('prelim', 'proxy_filter', 'complete')
+            dashboard.update_task('prelim', 'odyssey_cleanup', 'complete',
+                                  total=3, success=3)
             
             # Group 2: esxi - complete with host counts
             dashboard.update_task('esxi', 'host_check', 'complete', 

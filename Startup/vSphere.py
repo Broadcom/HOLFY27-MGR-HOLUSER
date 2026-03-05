@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # vSphere.py - HOLFY27 Core vSphere Startup Module
-# Version 3.1 - March 2026
+# Version 3.2 - March 2026
 # Author - Burke Azbill and HOL Core Team
 # vSphere infrastructure startup sequence
 #
 # CHANGELOG:
+# v3.2 - 2026-03-05:
+#   - TASK 5: Added retry logic for SuppressShellWarning when vCenter License
+#     Service is not yet available during cold boot (NotEnoughLicenses fault).
 # v3.1 - 2026-03-03:
 #   - Added TASK 6b: Ensure SSH and bash shell are enabled on vCenters via
 #     REST API before checking autostart services. This handles fresh lab
@@ -47,7 +50,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     :param dry_run: Whether to skip actual changes
     """
     from pyVim import connect
-    from pyVmomi import vim
+    from pyVmomi import vim, vmodl
     
     if lsf is None:
         import lsfunctions as lsf
@@ -287,20 +290,38 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     shell_warning_count = 0
     shell_warning_failed = 0
+    SHELL_WARN_MAX_RETRIES = 5
+    SHELL_WARN_RETRY_DELAY = 10  # seconds
     if not dry_run:
+        import time as _time_shell
         esxhosts = lsf.get_all_hosts()
         for host in esxhosts:
-            try:
-                option_manager = host.configManager.advancedOption
-                option = vim.option.OptionValue(
-                    key='UserVars.SuppressShellWarning',
-                    value=1
-                )
-                lsf.write_output(f'Suppressing shell warning on {host.name}')
-                option_manager.UpdateOptions(changedValue=[option])
-                shell_warning_count += 1
-            except Exception as e:
-                lsf.write_output(f'Could not suppress shell warning on {host.name}: {e}')
+            option_manager = host.configManager.advancedOption
+            option = vim.option.OptionValue(
+                key='UserVars.SuppressShellWarning',
+                value=1
+            )
+            succeeded = False
+            for attempt in range(1, SHELL_WARN_MAX_RETRIES + 1):
+                try:
+                    lsf.write_output(f'Suppressing shell warning on {host.name}')
+                    option_manager.UpdateOptions(changedValue=[option])
+                    shell_warning_count += 1
+                    succeeded = True
+                    break
+                except vmodl.fault.NotEnoughLicenses:
+                    if attempt < SHELL_WARN_MAX_RETRIES:
+                        lsf.write_output(
+                            f'  License Service not yet available for {host.name}, '
+                            f'retrying in {SHELL_WARN_RETRY_DELAY}s ({attempt}/{SHELL_WARN_MAX_RETRIES})...'
+                        )
+                        _time_shell.sleep(SHELL_WARN_RETRY_DELAY)
+                    else:
+                        lsf.write_output(f'Could not suppress shell warning on {host.name}: License Service unavailable after {SHELL_WARN_MAX_RETRIES} retries')
+                except Exception as e:
+                    lsf.write_output(f'Could not suppress shell warning on {host.name}: {e}')
+                    break
+            if not succeeded:
                 shell_warning_failed += 1
     
     if dashboard:
