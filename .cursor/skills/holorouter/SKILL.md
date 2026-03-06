@@ -138,7 +138,8 @@ kubectl create secret tls newhost-vcf-lab-tls \
 | Admin | `akadmin` / creds.txt password |
 | API Token | Stored in `/root/authentik/bootstrap-token.txt` on router |
 | Manifests | `/root/authentik/` on router |
-| Data | `/opt/authentik-data/postgres/` on host |
+| Data (DB) | `/opt/authentik-data/postgres/` on host |
+| Data (Files) | `/opt/authentik-data/files/` on host, mounted at `/data` in server + worker pods |
 
 **Users:** akadmin, provider-admin, tenant-admin, tenant-user, holuser (all use creds.txt password)
 
