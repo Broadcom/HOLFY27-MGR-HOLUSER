@@ -622,6 +622,67 @@ sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-wld01-a
 | suite-api lifecycle actions | HTTP 500 (not supported) | HTTP 500 (not supported) — use fleet-lcm direct API |
 | VCF Automation `sudo` | NOPASSWD | Password required (`echo pw \| sudo -S -i`) |
 
+## 14. VSP & Supervisor Proxy Configuration
+
+### Supervisor Proxy (via vCenter API)
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+WLD_VC="vc-wld01-a.site-a.vcf.lab"
+
+# Get session
+SESSION=$(curl -sk -X POST "https://${WLD_VC}/api/session" \
+  -u "administrator@wld.sso:${PASSWORD}" | tr -d '"')
+
+# Find Supervisor cluster ID
+CLUSTER_ID=$(curl -sk -H "vmware-api-session-id: ${SESSION}" \
+  "https://${WLD_VC}/api/vcenter/namespace-management/clusters" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['cluster'])")
+
+# Configure proxy (both HTTP and HTTPS in one call)
+curl -sk -X PATCH -H "vmware-api-session-id: ${SESSION}" \
+  -H "Content-Type: application/json" \
+  "https://${WLD_VC}/api/vcenter/namespace-management/clusters/${CLUSTER_ID}" \
+  -d '{
+    "cluster_proxy_config": {
+      "proxy_settings_source": "CLUSTER_CONFIGURED",
+      "http_proxy_config": "http://10.1.1.1:3128",
+      "https_proxy_config": "http://10.1.1.1:3128"
+    }
+  }'
+```
+
+### VSP Node Proxy (Photon OS)
+
+VSP nodes are Photon OS 5.0 VMs. Configure proxy at four levels:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+PROXY="http://10.1.1.1:3128"
+NO_PROXY="localhost,127.0.0.1,10.1.1.0/24,10.96.0.0/12,172.16.0.0/12,.site-a.vcf.lab,.svc,.cluster.local,.svc.cluster.local,10.1.0.0/24,registry.vmsp-platform.svc.cluster.local"
+
+# Discover VSP node IPs from control plane
+VSP_NODES=$(sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T \
+  vmware-system-user@10.1.1.142 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type==\"InternalIP\")].address}{\" \"}{end}'" 2>/dev/null)
+
+# For each node, configure:
+# 1. /etc/sysconfig/proxy (Photon proxy framework)
+# 2. /etc/environment (system-wide env vars)
+# 3. /etc/systemd/system/containerd.service.d/http-proxy.conf
+# 4. /etc/systemd/system/kubelet.service.d/http-proxy.conf
+# 5. systemctl daemon-reload
+```
+
+### Proxy Settings Reference
+
+| Setting | Value |
+| --- | --- |
+| Proxy server | `http://10.1.1.1:3128` (holorouter Squid) |
+| NO_PROXY | `localhost,127.0.0.1,10.1.1.0/24,10.96.0.0/12,172.16.0.0/12,.site-a.vcf.lab,.svc,.cluster.local,.svc.cluster.local,10.1.0.0/24,registry.vmsp-platform.svc.cluster.local` |
+| Supervisor source | `CLUSTER_CONFIGURED` (overrides `VC_INHERITED` default) |
+| Automated by | `confighol-9.1.py` v2.9+ (Step 9) |
+
 ## Critical Pitfalls Discovered
 
 1. **NSX user IDs are numeric**: `/api/v1/node/users/admin` = 404. Use `/api/v1/node/users/10000`.
@@ -661,3 +722,6 @@ sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-wld01-a
 33. **RabbitMQ `.erlang.cookie` permissions broken by fsGroup**: VCF Automation's `rabbitmq-ha` StatefulSet uses `fsGroup: 200` pod security context. This causes Kubernetes to set group-read/write (0660) on all PVC files including `.erlang.cookie`, but Erlang requires owner-only (0400). Fix by running a temporary root pod to `chmod 400 /var/lib/rabbitmq/.erlang.cookie` on the PVC, then deleting `rabbitmq-ha-0` to restart.
 34. **VCF Automation VIP (10.1.1.70) drops after cold boot**: kube-vip manages both the control plane VIP and LoadBalancer service VIPs on VCF Automation. It watches the `istio-ingressgateway` service endpoints. After cold boot, Antrea CNI takes time to initialize, breaking ClusterIP routing. The istio-ingressgateway pod goes into ImagePullBackOff (can't reach registry ClusterIP). kube-vip detects no endpoints and releases the VIP, then loses its own leader lease and crashes. Fix: manually `ip addr add 10.1.1.70/32 dev eth0`, wait for Antrea to ready, delete ImagePullBackOff pods. `VCFfinal.py` Task 4b automates this.
 35. **VCF Automation kube-scheduler stuck after VIP flap**: When kube-vip releases and re-acquires the VIP rapidly, the kube-scheduler may start with stale RBAC caches (errors like `clusterrole "system:kube-scheduler" not found`) even though the ClusterRoles exist. Pods get stuck in Pending with no events. Fix: restart containerd and kubelet (`systemctl restart containerd && sleep 3 && systemctl restart kubelet`), then re-add VIP if needed.
+36. **VSP nodes are Photon OS 5.0 with proxy framework**: VSP cluster nodes use `/etc/sysconfig/proxy` (Photon standard) and `/etc/profile.d/proxy.sh` for shell proxy env. Proxy is disabled by default (`PROXY_ENABLED="no"`). To enable: set `PROXY_ENABLED="yes"` with `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in `/etc/sysconfig/proxy`, add vars to `/etc/environment`, and create systemd drop-in files for containerd and kubelet at `/etc/systemd/system/{containerd,kubelet}.service.d/http-proxy.conf`. Run `systemctl daemon-reload` after.
+37. **Supervisor proxy configured via vCenter namespace-management API**: Use `PATCH /api/vcenter/namespace-management/clusters/{cluster_id}` with `cluster_proxy_config.proxy_settings_source: "CLUSTER_CONFIGURED"` and `http_proxy_config`/`https_proxy_config` fields. The Supervisor inherits from vCenter by default (`VC_INHERITED`). The `no_proxy_config` field is NOT supported in the PATCH — no_proxy is auto-populated in the `wcp-proxy-config` K8s secret on the SCP. Setting both HTTP and HTTPS proxy must be done in a single PATCH call.
+38. **VSP node images are all internal**: All container images on VSP nodes come from `registry.vmsp-platform.svc.cluster.local:5000`. The proxy NO_PROXY list must include this registry to avoid routing internal pulls through the proxy. The containerd `config_path` is `/etc/containerd/certs.d` with entries for `127.0.0.1:30000`, `localhost:5000`, and the internal registry.
