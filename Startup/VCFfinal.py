@@ -1215,68 +1215,68 @@ def main(lsf=None, standalone=False, dry_run=False):
                     lsf.write_output(f'WARNING: Failed to connect to vCenter(s): {", ".join(failed_vcs)}')
             
             if vspvms and not dry_run and not vsp_vms_errors:
-                lsf.write_output(f'Processing {len(vspvms)} VSP Platform VMs...')
+                lsf.write_output(f'Processing {len(vspvms)} VSP Platform VM entries...')
                 lsf.write_vpodprogress('VSP Platform VMs', 'GOOD-3')
                 
-                # Check if all VSP VMs are already running with Tools active
-                all_running = True
+                # Resolve all regex/name patterns to actual VM objects once
+                resolved_vsp_vms = []
                 for vspvm in vspvms:
                     parts = vspvm.split(':')
                     vmname = parts[0].strip()
                     try:
                         vms = lsf.get_vm_match(vmname)
-                        if not vms:
-                            all_running = False
-                            break
-                        for vm in vms:
+                        if vms:
+                            for vm in vms:
+                                resolved_vsp_vms.append(vm)
+                                lsf.write_output(f'  Resolved: {vmname} -> {vm.name}')
+                        else:
+                            lsf.write_output(f'  Warning: No VMs matched pattern "{vmname}"')
+                    except Exception as e:
+                        lsf.write_output(f'  Warning: Error resolving pattern "{vmname}": {e}')
+                
+                if not resolved_vsp_vms:
+                    lsf.write_output('No VSP Platform VMs found after resolving patterns')
+                else:
+                    lsf.write_output(f'Resolved {len(resolved_vsp_vms)} VSP Platform VMs')
+                    
+                    # Check if all VSP VMs are already running with Tools active
+                    all_running = True
+                    for vm in resolved_vsp_vms:
+                        try:
                             if vm.runtime.powerState != 'poweredOn':
                                 all_running = False
                                 break
-                            try:
-                                if vm.summary.guest.toolsRunningStatus != 'guestToolsRunning':
-                                    all_running = False
-                                    break
-                            except Exception:
+                            if vm.summary.guest.toolsRunningStatus != 'guestToolsRunning':
                                 all_running = False
                                 break
-                        if not all_running:
+                        except Exception:
+                            all_running = False
                             break
-                    except Exception:
-                        all_running = False
-                        break
-                
-                if all_running:
-                    lsf.write_output('All VSP Platform VMs already running with Tools active - skipping startup')
-                else:
-                    # Connect NICs before starting
-                    for vspvm in vspvms:
-                        parts = vspvm.split(':')
-                        vmname = parts[0].strip()
-                        try:
-                            vms = lsf.get_vm_match(vmname)
-                            for vm in vms:
+                    
+                    if all_running:
+                        lsf.write_output('All VSP Platform VMs already running with Tools active - skipping startup')
+                    else:
+                        # Connect NICs before starting
+                        for vm in resolved_vsp_vms:
+                            try:
                                 if vm.runtime.powerState != 'poweredOn':
                                     verify_nic_connected(lsf, vm, simple=True)
                                 else:
                                     lsf.write_output(f'{vm.name} already powered on, skipping NIC connect')
-                        except Exception as e:
-                            lsf.write_output(f'Warning: Error checking NICs for {vmname}: {e}')
-                    
-                    # Start the VMs
-                    try:
-                        lsf.start_nested(vspvms)
-                    except Exception as e:
-                        error_msg = f'Failed to start VSP Platform VMs: {e}'
-                        lsf.write_output(error_msg)
-                        vsp_vms_errors.append(error_msg)
-                    
-                    # After starting, verify VMs are actually powered on and tools running
-                    for vspvm in vspvms:
-                        parts = vspvm.split(':')
-                        vmname = parts[0].strip()
+                            except Exception as e:
+                                lsf.write_output(f'Warning: Error checking NICs for {vm.name}: {e}')
+                        
+                        # Start the VMs
                         try:
-                            vms = lsf.get_vm_match(vmname)
-                            for vm in vms:
+                            lsf.start_nested(vspvms)
+                        except Exception as e:
+                            error_msg = f'Failed to start VSP Platform VMs: {e}'
+                            lsf.write_output(error_msg)
+                            vsp_vms_errors.append(error_msg)
+                        
+                        # After starting, verify VMs are actually powered on and tools running
+                        for vm in resolved_vsp_vms:
+                            try:
                                 # Ensure VM is powered on
                                 max_power_attempts = 10
                                 power_attempt = 0
@@ -1299,7 +1299,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                                             break
                                     except Exception:
                                         pass
-                                    lsf.write_output(f'Waiting for Tools in {vmname}...')
+                                    lsf.write_output(f'Waiting for Tools in {vm.name}...')
                                     lsf.labstartup_sleep(lsf.sleep_seconds)
                                     tools_attempt += 1
                                 
@@ -1308,9 +1308,9 @@ def main(lsf=None, standalone=False, dry_run=False):
                                     verify_nic_connected(lsf, vm, simple=False)
                                 except Exception as nic_err:
                                     lsf.write_output(f'Warning: Post-start NIC verification failed for {vm.name}: {nic_err}')
-                                
-                        except Exception as e:
-                            lsf.write_output(f'Warning: Error waiting for {vmname}: {e}')
+                            
+                            except Exception as e:
+                                lsf.write_output(f'Warning: Error waiting for {vm.name}: {e}')
                 
                 lsf.write_output('VSP Platform VMs processing complete')
         else:
@@ -1733,36 +1733,48 @@ def main(lsf=None, standalone=False, dry_run=False):
             
             # vravms already retrieved above to check if configured
             if vravms and not dry_run and not vcfa_vms_errors:
-                lsf.write_output(f'Processing {len(vravms)} VCF Automation VMs...')
+                lsf.write_output(f'Processing {len(vravms)} VCF Automation VM entries...')
                 lsf.write_vpodprogress('Starting VCF Automation VMs', 'GOOD-8')
                 
-                # Before starting, verify NICs are set to start connected
+                # Resolve all regex/name patterns to actual VM objects once
+                resolved_vcfa_vms = []
                 for vravm in vravms:
                     parts = vravm.split(':')
                     vmname = parts[0].strip()
                     try:
                         vms = lsf.get_vm_match(vmname)
-                        for vm in vms:
-                            verify_nic_connected(lsf, vm, simple=True)
+                        if vms:
+                            for vm in vms:
+                                resolved_vcfa_vms.append(vm)
+                                lsf.write_output(f'  Resolved: {vmname} -> {vm.name}')
+                        else:
+                            lsf.write_output(f'  Warning: No VMs matched pattern "{vmname}"')
                     except Exception as e:
-                        error_msg = str(e)
-                        lsf.write_output(f'Warning: Error checking NICs for {vmname}: {error_msg}')
+                        lsf.write_output(f'  Warning: Error resolving pattern "{vmname}": {e}')
                 
-                # Start the VMs
-                try:
-                    lsf.start_nested(vravms)
-                except Exception as e:
-                    error_msg = f'Failed to start VCF Automation VMs: {e}'
-                    lsf.write_output(error_msg)
-                    vcfa_vms_errors.append(error_msg)
-                
-                # After starting, verify VMs are actually powered on and tools running
-                for vravm in vravms:
-                    parts = vravm.split(':')
-                    vmname = parts[0].strip()
+                if not resolved_vcfa_vms:
+                    lsf.write_output('No VCF Automation VMs found after resolving patterns')
+                else:
+                    lsf.write_output(f'Resolved {len(resolved_vcfa_vms)} VCF Automation VMs')
+                    
+                    # Before starting, verify NICs are set to start connected
+                    for vm in resolved_vcfa_vms:
+                        try:
+                            verify_nic_connected(lsf, vm, simple=True)
+                        except Exception as e:
+                            lsf.write_output(f'Warning: Error checking NICs for {vm.name}: {e}')
+                    
+                    # Start the VMs
                     try:
-                        vms = lsf.get_vm_match(vmname)
-                        for vm in vms:
+                        lsf.start_nested(vravms)
+                    except Exception as e:
+                        error_msg = f'Failed to start VCF Automation VMs: {e}'
+                        lsf.write_output(error_msg)
+                        vcfa_vms_errors.append(error_msg)
+                    
+                    # After starting, verify VMs are actually powered on and tools running
+                    for vm in resolved_vcfa_vms:
+                        try:
                             # Ensure VM is powered on
                             max_power_attempts = 10
                             power_attempt = 0
@@ -1785,7 +1797,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                                         break
                                 except Exception:
                                     pass
-                                lsf.write_output(f'Waiting for Tools in {vmname}...')
+                                lsf.write_output(f'Waiting for Tools in {vm.name}...')
                                 lsf.labstartup_sleep(lsf.sleep_seconds)
                                 tools_attempt += 1
                             
@@ -1794,10 +1806,9 @@ def main(lsf=None, standalone=False, dry_run=False):
                                 verify_nic_connected(lsf, vm, simple=False)
                             except Exception as nic_err:
                                 lsf.write_output(f'Warning: Post-start NIC verification failed for {vm.name}: {nic_err}')
-                            
-                    except Exception as e:
-                        error_msg = str(e)
-                        lsf.write_output(f'Warning: Error waiting for {vmname}: {error_msg}')
+                        
+                        except Exception as e:
+                            lsf.write_output(f'Warning: Error waiting for {vm.name}: {e}')
                 
                 lsf.write_output('VCF Automation VMs processing complete')
         else:
