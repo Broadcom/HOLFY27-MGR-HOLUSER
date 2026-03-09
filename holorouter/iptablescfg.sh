@@ -1,7 +1,8 @@
-#!/bin/sh
+#!/bin/bash
 
 # DEFAULT HOL FIREWALL RULESET
-# version 08-April 2025
+# version 2026-03-09
+# version 01-December 2025 - added Broadcom package repository rule
 
 # clear any existing rules
 iptables --flush
@@ -120,17 +121,24 @@ iptables -A FORWARD -s 172.16.0.0/12 -d 10.0.0.0/8      -j ACCEPT
 iptables -A FORWARD -s 10.0.0.0/8 -d 192.168.0.0/16     -j ACCEPT
 iptables -A FORWARD -s 10.0.0.0/8 -d 172.16.0.0/12      -j ACCEPT
 iptables -A FORWARD -s 10.0.0.0/8 -d 10.0.0.0/8         -j ACCEPT
+
+# Allow VSP Node outbound
+iptables -I FORWARD 1 -m iprange --src-range 10.1.1.141-10.1.1.160 -p tcp --dport 443 -j ACCEPT
+
 # Allow access to Broadcom package repository
-#This new rule automatically resolves the domain name projects.packages.broadcom.com to its current IP addresses and adds a corresponding iptables ACCEPT rule for each IP address in the FORWARD chain.
+# This new rule automatically resolves the domain name projects.packages.broadcom.com to 
+# its current IP addresses and adds a corresponding iptables ACCEPT rule for each IP address in the FORWARD chain.
 for ip in $(dig +short projects.packages.broadcom.com | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b")
 do
-  iptables -A FORWARD -d "$ip" -j ACCEPT
+   iptables -A FORWARD -d "$ip" -j ACCEPT
+done
+for ip in $(dig +short vcf.dmz-edge.packages.broadcom.com | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b")
+do
+   iptables -A FORWARD -d "$ip" -j ACCEPT
 done
 
 ### LAB-SPECIFIC RULES
-ip6tables -P FORWARD ACCEPT
-ip6tables -P INPUT ACCEPT
-ip6tables -P OUTPUT ACCEPT
+
 # (add your rules here)
 
 ### END RULES
@@ -139,4 +147,4 @@ ip6tables -P OUTPUT ACCEPT
 iptables -P FORWARD DROP
 
 # indicate that iptables has run
-echo "" > ~holuser/firewall
+true > /home/holuser/firewall
