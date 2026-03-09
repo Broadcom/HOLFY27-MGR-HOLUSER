@@ -168,6 +168,7 @@ class StatusDashboard:
                 ('firewall', 'Firewall Verification', 'Confirm firewall is active'),
                 ('proxy_filter', 'Proxy Filter', 'Verify proxy filtering is active'),
                 ('odyssey_cleanup', 'Odyssey Cleanup', 'Clean previous Odyssey installation files'),
+                ('vscode_proxy', 'VS Code Proxy', 'Configure VS Code proxy on console for Marketplace access'),
             ]),
             
             # Group 2: ESXi.py - ESXi Host Verification
@@ -1139,6 +1140,7 @@ if __name__ == '__main__':
             dashboard.update_task('prelim', 'proxy_filter', 'complete')
             dashboard.update_task('prelim', 'odyssey_cleanup', 'complete',
                                   total=3, success=3)
+            dashboard.update_task('prelim', 'vscode_proxy', 'complete')
             
             # Group 2: esxi - complete with host counts
             dashboard.update_task('esxi', 'host_check', 'complete', 

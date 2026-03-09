@@ -6,6 +6,7 @@
 
 import os
 import sys
+import json
 import argparse
 
 # Add hol directory to path
@@ -218,6 +219,112 @@ def main(lsf=None, standalone=False, dry_run=False):
     if dashboard:
         dashboard.update_task('prelim', 'odyssey_cleanup', 'complete')
         dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 5: Configure VS Code Proxy on Console
+    #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('prelim', 'vscode_proxy', 'running')
+        dashboard.generate_html()
+    
+    enable_vscode_proxy = lsf.config.getboolean('VPOD', 'enablevscodeproxy', fallback=True)
+    
+    if enable_vscode_proxy:
+        lsf.write_output('Configuring VS Code proxy on console...')
+        
+        if not dry_run:
+            console_host = 'root@console.site-a.vcf.lab'
+            
+            PROXY_URL = 'http://10.1.1.1:3128'
+            NO_PROXY_LIST = [
+                'localhost',
+                '127.0.0.1',
+                '10.1.1.0/24',
+                '10.1.0.0/24',
+                '10.96.0.0/12',
+                '172.16.0.0/12',
+                '198.18.0.0/16',
+                '*.site-a.vcf.lab',
+                '*.svc',
+                '*.cluster.local',
+                '*.svc.cluster.local',
+                'registry.vmsp-platform.svc.cluster.local',
+            ]
+            
+            vscode_settings_dir = '/home/holuser/.config/Code/User'
+            vscode_settings_file = f'{vscode_settings_dir}/settings.json'
+            
+            proxy_settings = {
+                'http.proxy': PROXY_URL,
+                'http.proxyStrictSSL': False,
+                'http.noProxy': NO_PROXY_LIST,
+                'editor.fontFamily': "'MesloLGM Nerd Font','Droid Sans Mono', monospace",
+                'debug.console.fontFamily': "'MesloLGM Nerd Font','Droid Sans Mono', monospace",
+            }
+            
+            mkdir_cmd = f'mkdir -p {vscode_settings_dir}'
+            result = lsf.ssh(mkdir_cmd, console_host)
+            if result.returncode != 0:
+                lsf.write_output(f'Could not create VS Code settings directory: {result.stderr}')
+            
+            # Read existing settings from console via SCP to preserve user prefs
+            tmp_settings = '/tmp/vscode_settings.json'
+            scp_down = lsf.scp(
+                f'{console_host}:{vscode_settings_file}',
+                tmp_settings
+            )
+            
+            existing_settings = {}
+            if scp_down.returncode == 0 and os.path.isfile(tmp_settings):
+                try:
+                    with open(tmp_settings, 'r') as f:
+                        existing_settings = json.loads(f.read())
+                except (json.JSONDecodeError, ValueError):
+                    lsf.write_output('Existing VS Code settings.json is invalid, creating new one')
+                    existing_settings = {}
+            
+            existing_settings.update(proxy_settings)
+            
+            # Write merged settings to temp file, then SCP to console
+            # (avoids double-quote mangling through SSH command wrapping)
+            try:
+                with open(tmp_settings, 'w') as f:
+                    json.dump(existing_settings, f, indent=4)
+            except Exception as e:
+                lsf.write_output(f'Could not write temp settings file: {e}')
+            
+            scp_up = lsf.scp(
+                tmp_settings,
+                f'{console_host}:{vscode_settings_file}'
+            )
+            
+            if scp_up.returncode == 0:
+                lsf.write_output(f'VS Code proxy configured: {PROXY_URL}')
+                lsf.write_output(f'VS Code noProxy: {len(NO_PROXY_LIST)} entries')
+            else:
+                lsf.write_output(f'Could not write VS Code settings: {scp_up.stderr}')
+            
+            chown_cmd = f'chown -R holuser:holuser {vscode_settings_dir}'
+            lsf.ssh(chown_cmd, console_host)
+            
+            # Clean up temp file
+            try:
+                os.remove(tmp_settings)
+            except Exception:
+                pass
+        else:
+            lsf.write_output('Would configure VS Code proxy on console')
+        
+        if dashboard:
+            dashboard.update_task('prelim', 'vscode_proxy', 'complete')
+            dashboard.generate_html()
+    else:
+        lsf.write_output('VS Code proxy configuration disabled (enablevscodeproxy = false)')
+        if dashboard:
+            dashboard.update_task('prelim', 'vscode_proxy', 'skipped',
+                                  'Disabled by enablevscodeproxy = false')
+            dashboard.generate_html()
     
     ##=========================================================================
     ## End Core Team code
