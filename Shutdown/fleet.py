@@ -105,16 +105,27 @@ V91_TASK_MAX_WAIT = 1800     # 30 minutes max wait for shutdown workflow
 V91_TOKEN_TIMEOUT = 30       # seconds for suite-api token acquisition
 
 # VCF 9.0 product name -> VCF 9.1 component type mapping
-# Actual types from /suite-api/internal/components/:
-#   VCFA (VCF Automation), NI (Operations for Networks), OPS (Operations/vROps),
-#   LI (Operations for Logs), FDS (Fleet Depot Service), VSP, VIDB,
-#   SALT_MASTER, SALT_RAAS, FLEET_LCM, SDDC_LCM
+# suite-api internal proxy types (/suite-api/internal/components/):
+#   VCFA, NI, OPS, LI, FDS, VSP, VIDB, SALT_MASTER, SALT_RAAS, FLEET_LCM, SDDC_LCM
+# fleet-lcm direct API types (/fleet-lcm/v1/components):
+#   VCFA, OPS_NETWORKS, OPS, OPS_LOGS, VCF_FLEET_DEPOT, VSP, VIDB,
+#   SALT, SALT_RAAS, VCF_FLEET_LCM, VCF_SDDC_LCM, OPS_DATA_PLATFORM,
+#   VCFMS_METRICS_STORE, TELEMETRY_ACCEPTOR
 PRODUCT_TO_COMPONENT_TYPE = {
     'vra':   'VCFA',
     'vrni':  'NI',
     'vrops': 'OPS',
     'vrli':  'LI',
     'vrlcm': 'FLEET_LCM',
+}
+
+# fleet-lcm direct API uses different type names than suite-api
+PRODUCT_TO_FLEET_LCM_TYPE = {
+    'vra':   'VCFA',
+    'vrni':  'OPS_NETWORKS',
+    'vrops': 'OPS',
+    'vrli':  'OPS_LOGS',
+    'vrlcm': 'VCF_FLEET_LCM',
 }
 
 #==============================================================================
@@ -580,6 +591,9 @@ def get_ops_jwt_token(ops_fqdn: str, username: str, password: str,
     used with the "OpsToken <token>" Authorization header for internal API
     access at /suite-api/internal/*.
     
+    Tries authSource 'local' first, then 'localItem' as a fallback (the
+    correct value varies between VCF 9.0/9.1 builds).
+    
     :param ops_fqdn: VCF Operations Manager FQDN (e.g., ops-a.site-a.vcf.lab)
     :param username: Local admin username (e.g., admin)
     :param password: Admin password
@@ -588,30 +602,36 @@ def get_ops_jwt_token(ops_fqdn: str, username: str, password: str,
     :raises: Exception on authentication failure
     """
     url = f'https://{ops_fqdn}/suite-api/api/auth/token/acquire'
-    payload = {
-        'username': username,
-        'password': password,
-        'authSource': 'local'
-    }
     headers = {
         'Accept': 'application/json',
         'Content-Type': 'application/json'
     }
 
-    try:
-        response = requests.post(url, json=payload, headers=headers,
-                                 verify=verify, timeout=V91_TOKEN_TIMEOUT)
-        response.raise_for_status()
-        token = response.json().get('token')
-        if not token:
-            raise ValueError('No token in suite-api response')
-        return token
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"Failed to acquire ops JWT token: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"JWT token acquisition error: {e}")
-        raise
+    last_error = None
+    for auth_source in ('local', 'localItem'):
+        payload = {
+            'username': username,
+            'password': password,
+            'authSource': auth_source
+        }
+        try:
+            response = requests.post(url, json=payload, headers=headers,
+                                     verify=verify, timeout=V91_TOKEN_TIMEOUT)
+            response.raise_for_status()
+            token = response.json().get('token')
+            if token:
+                return token
+        except requests.exceptions.HTTPError as e:
+            last_error = e
+            continue
+        except Exception as e:
+            last_error = e
+            continue
+
+    if last_error:
+        logger.error(f"Failed to acquire ops JWT token with both authSources: {last_error}")
+        raise last_error
+    raise ValueError('No token in suite-api response with any authSource')
 
 #==============================================================================
 # VCF 9.1 - API HELPERS
@@ -1339,9 +1359,9 @@ def shutdown_products_fleet_lcm(fleet_fqdn: str, token: str,
     all_success = True
 
     for product in products:
-        component_type = PRODUCT_TO_COMPONENT_TYPE.get(product)
+        component_type = PRODUCT_TO_FLEET_LCM_TYPE.get(product)
         if not component_type:
-            _log(f'Skipping {product} - no component type mapping')
+            _log(f'Skipping {product} - no fleet-lcm component type mapping')
             continue
 
         comp = find_component_by_type(components, component_type)
