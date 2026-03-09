@@ -1815,7 +1815,6 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             update_shutdown_status(5, 'Shutdown Workload NSX Edges', dry_run)
 
             # Get all NSX edges from [VCF] vcfnsxedges (primary source)
-            # Format: edge-name:esxhost (we only need the edge name)
             all_nsx_edges = []
             if lsf.config.has_option('VCF', 'vcfnsxedges'):
                 edges_raw = lsf.config.get('VCF', 'vcfnsxedges')
@@ -1865,7 +1864,6 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             update_shutdown_status(6, 'Shutdown Workload NSX Manager', dry_run)
 
             # Get all NSX managers from [VCF] vcfnsxmgr (primary source)
-            # Format: nsx-name:esxhost (we only need the NSX manager name)
             all_nsx_mgr = []
             if lsf.config.has_option('VCF', 'vcfnsxmgr'):
                 mgr_raw = lsf.config.get('VCF', 'vcfnsxmgr')
@@ -1916,7 +1914,6 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             update_shutdown_status(7, 'Shutdown Workload vCenters', dry_run)
 
             # Get all vCenters from [VCF] vcfvCenter (primary source)
-            # Format: vcenter-name:esxhost (we only need the vCenter name)
             # Filter for workload vCenters (contain "wld" in name)
             all_vcenters = []
             if lsf.config.has_option('VCF', 'vcfvCenter'):
@@ -2286,7 +2283,6 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             update_shutdown_status(14, 'Shutdown Mgmt NSX Edges', dry_run)
 
             # Get all NSX edges from [VCF] vcfnsxedges (primary source)
-            # Format: edge-name:esxhost (we only need the edge name)
             # Note: all_nsx_edges was already populated in Phase 5, but we rebuild
             # here to ensure we have the full list in case Phase 5 was skipped
             all_nsx_edges = []
@@ -2340,7 +2336,6 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             update_shutdown_status(15, 'Shutdown Mgmt NSX Manager', dry_run)
 
             # Get all NSX managers from [VCF] vcfnsxmgr (primary source)
-            # Format: nsx-name:esxhost (we only need the NSX manager name)
             # Note: all_nsx_mgr was already populated in Phase 6, but we rebuild
             # here to ensure we have the full list in case Phase 6 was skipped
             all_nsx_mgr = []
@@ -2433,7 +2428,6 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             update_shutdown_status(17, 'Shutdown Management vCenter', dry_run)
 
             # Get all vCenters from [VCF] vcfvCenter (primary source)
-            # Format: vcenter-name:esxhost (we only need the vCenter name)
             # Filter for management vCenters (contain "mgmt" in name)
             all_vcenters_mgmt = []
             if lsf.config.has_option('VCF', 'vcfvCenter'):

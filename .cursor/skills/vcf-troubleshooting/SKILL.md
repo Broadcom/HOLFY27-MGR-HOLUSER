@@ -1,6 +1,6 @@
 ---
 name: vcf-troubleshooting
-description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, and SDDC Manager credential remediation failures. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, or password remediation failures.
+description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, and VSP cluster image pull failures. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, or containerd NO_PROXY.
 ---
 
 # VCF 9.x Troubleshooting Guide
@@ -36,6 +36,7 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | SCP VMs powered off after shutdown (9.0.x) | Supervisor stuck CONFIGURING/ERROR, SCP VMs poweredOff | EAM-managed VMs not auto-started; vCenter PowerOn denied with NoPermission | 23 |
 | VCF Automation VIP drops after boot | auto-a pings then stops, "no route to host" | kube-vip releases VIP when istio-ingressgateway has no endpoints (ImagePullBackOff) | 24 |
 | Harbor unreachable, Supervisor DNS broken | Harbor pods CrashLoopBackOff with "i/o timeout" on DNS lookups | kube-dns endpoint points to LB IP causing asymmetric DLB routing | 25 |
+| VSP image pulls fail after boot | All VSP pods in ImagePullBackOff, Fleet LCM/Ops Logs HTTP 500 | VSP service CIDR `198.18.128.0/17` not in NO_PROXY; containerd routes internal pulls through Squid proxy | 26 |
 
 ---
 
@@ -1186,3 +1187,86 @@ print(ep)
 - The STANDBY SR on an NSX Edge having `Op_state: down` interfaces is **normal** for `ACTIVE_STANDBY` mode. The ACTIVE SR on the other edge handles all traffic.
 - A clean shutdown/restart of the NSX edges (via the shutdown script phases 5-7 followed by VCF.py startup) resolves this by ensuring the SR HA state is properly initialized.
 - `VCFfinal.py` Task 2c2 now automatically detects and fixes this condition during startup.
+
+---
+
+## 26. VSP Cluster Image Pull Failures After Cold Boot (Service CIDR Not in NO_PROXY)
+
+**Symptom**: All VCF component pods on the VSP cluster (salt, raas, fleet-lcm, sddc-lcm, vidb, vodap, ops-logs, telemetry, etc.) stuck in `ImagePullBackOff` or `ErrImagePull` after lab startup. Fleet LCM API returns HTTP 500. VCF Ops for Logs returns HTTP 500. Lab startup fails at URL checks with 30-minute timeout.
+
+**Diagnosis**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+
+# Check for image pull failures
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.142 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get pods -A --no-headers 2>/dev/null" 2>/dev/null \
+  | grep -E 'ImagePullBackOff|ErrImagePull'
+
+# Verify: works without proxy
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.142 \
+  "echo '${PASSWORD}' | sudo -S -i curl -sk --noproxy '*' https://198.18.128.16:5000/v2/_catalog 2>&1" 2>/dev/null | head -1
+
+# Check service CIDR
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.142 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl cluster-info dump 2>/dev/null" 2>/dev/null | grep service-cluster-ip-range
+# Shows: --service-cluster-ip-range=198.18.128.0/17
+```
+
+**Root Cause**: The VSP cluster uses a non-standard Kubernetes service CIDR (`198.18.128.0/17`) instead of the typical `10.96.0.0/12`. Containerd resolves `registry.vmsp-platform.svc.cluster.local` to ClusterIP `198.18.128.16` and then makes the HTTPS request. When containerd has `HTTPS_PROXY=http://10.1.1.1:3128` configured but `NO_PROXY` does not include `198.18.0.0/16`, the request is proxied through the holorouter Squid proxy. Squid rejects CONNECT to private IPs with `ERR_ACCESS_DENIED` (HTTP 403 "Forbidden").
+
+The `confighol-9.1.py` proxy configuration step included hostname `registry.vmsp-platform.svc.cluster.local` in NO_PROXY, but containerd bypasses hostname-based NO_PROXY matching after resolving the hostname to an IP. The IP `198.18.128.16` must also be covered by CIDR in NO_PROXY.
+
+**Fix**:
+
+```bash
+PASSWORD=$(cat /home/holuser/creds.txt)
+NEW_NO_PROXY="localhost,127.0.0.1,10.1.1.0/24,10.96.0.0/12,172.16.0.0/12,198.18.0.0/16,.site-a.vcf.lab,.svc,.cluster.local,.svc.cluster.local,10.1.0.0/24,registry.vmsp-platform.svc.cluster.local"
+
+# Get all VSP node IPs
+VSP_NODES=$(sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.142 \
+  "echo '${PASSWORD}' | sudo -S -i kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type==\"InternalIP\")].address}{\" \"}{end}'" 2>/dev/null)
+
+# Create proxy config locally then SCP to each node
+cat > /tmp/containerd-proxy.conf << EOF
+[Service]
+Environment="HTTP_PROXY=http://10.1.1.1:3128"
+Environment="HTTPS_PROXY=http://10.1.1.1:3128"
+Environment="NO_PROXY=${NEW_NO_PROXY}"
+EOF
+
+for NODE_IP in $VSP_NODES; do
+  sshpass -p "${PASSWORD}" scp -o StrictHostKeyChecking=accept-new \
+    /tmp/containerd-proxy.conf vmware-system-user@${NODE_IP}:/tmp/containerd-proxy.conf
+  sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@${NODE_IP} \
+    "echo '${PASSWORD}' | sudo -S cp /tmp/containerd-proxy.conf /etc/systemd/system/containerd.service.d/http-proxy.conf && \
+     echo '${PASSWORD}' | sudo -S systemctl daemon-reload && \
+     echo '${PASSWORD}' | sudo -S systemctl restart containerd && \
+     sleep 3 && echo '${PASSWORD}' | sudo -S systemctl restart kubelet"
+done
+
+# Force-delete all stuck pods (SCP script to avoid SSH escaping issues)
+cat > /tmp/fix-pods.sh << 'SCRIPT'
+#!/bin/bash
+export KUBECONFIG=/etc/kubernetes/super-admin.conf
+kubectl get pods -A --no-headers 2>/dev/null | grep -E 'ImagePullBackOff|ErrImagePull|CrashLoopBackOff' | while IFS= read -r line; do
+    ns=$(echo "$line" | awk '{print $1}')
+    pod=$(echo "$line" | awk '{print $2}')
+    kubectl delete pod "$pod" -n "$ns" --force --grace-period=0 2>/dev/null &
+done
+wait
+SCRIPT
+sshpass -p "${PASSWORD}" scp -o StrictHostKeyChecking=accept-new \
+  /tmp/fix-pods.sh vmware-system-user@10.1.1.142:/tmp/fix-pods.sh
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.142 \
+  "echo '${PASSWORD}' | sudo -S -i bash /tmp/fix-pods.sh"
+```
+
+**Permanent Fix**: `confighol-9.1.py` Step 9 updated to include `198.18.0.0/16` in the NO_PROXY list for all VSP node proxy configurations.
+
+**Key Details**:
+- The VSP cluster service CIDR `198.18.128.0/17` is unique to VCF 9.1 and not covered by the standard `10.96.0.0/12` that Kubernetes typically uses.
+- The `containerd` hosts.toml at `/etc/containerd/certs.d/registry.vmsp-platform.svc.cluster.local:5000/hosts.toml` specifies `host."https://198.18.128.16:5000"` with a CA cert, confirming the ClusterIP is used for image pulls.
+- Writing files to VSP nodes via `bash -c` heredoc through SSH+sudo layers often fails silently (produces 0-byte files). Use `scp` to transfer config files to `/tmp` and then `cp` to the final location.
+- After fixing containerd proxy, pods in `ImagePullBackOff` have very long backoff timers (5+ minutes after hours of failures). Force-deleting them ensures immediate retry.

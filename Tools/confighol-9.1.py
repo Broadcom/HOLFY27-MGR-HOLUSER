@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.8 - March 3, 2026
+# Version 2.9 - March 6, 2026
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -9,6 +9,13 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.9 - 2026-03-06:
+#   - VSP & Supervisor proxy: configures HTTP/HTTPS proxy on all VSP cluster
+#     nodes (Photon OS) and the Supervisor via vCenter API. Enables outbound
+#     internet access through holorouter Squid proxy (10.1.1.1:3128).
+#     Dynamically discovers VSP node IPs via kubectl, configures
+#     /etc/sysconfig/proxy, /etc/environment, containerd and kubelet
+#     systemd drop-in files with appropriate NO_PROXY list.
 # v2.8 - 2026-03-03:
 #   - Fully non-interactive: removed all input() prompts for vCenter shell/
 #     browser configuration, NSX Manager configuration, NSX SSH enablement
@@ -129,7 +136,17 @@
 #    - Disables auto-rotation for all service credentials
 #    - Prevents failed password rotation tasks after template deployment
 #
-# 7. Final Steps:
+# 7. VSP & Supervisor Proxy Configuration:
+#    - Configures Supervisor HTTP/HTTPS proxy via vCenter API
+#      (CLUSTER_CONFIGURED mode on WLD vCenter namespace-management API)
+#    - Discovers VSP cluster node IPs via kubectl on the control plane VIP
+#    - Configures OS-level proxy on each VSP node (Photon OS):
+#      /etc/sysconfig/proxy, /etc/environment, containerd and kubelet
+#      systemd drop-in files for HTTP_PROXY/HTTPS_PROXY/NO_PROXY
+#    - Proxy: holorouter Squid at http://10.1.1.1:3128
+#    - NO_PROXY includes internal subnets, service CIDRs, internal registry
+#
+# 8. Final Steps:
 #    - Clear ARP cache on console and router
 #    - Run vpodchecker.py to update L2 VMs (uuid, typematicdelay)
 #
@@ -187,7 +204,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.8'
+SCRIPT_VERSION = '2.9'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -1715,7 +1732,6 @@ def configure_nsx_components(auth_keys_file: str, password: str,
             if not entry or entry.strip().startswith('#'):
                 continue
             
-            # Format: nsxmgr_hostname:esxhost
             parts = entry.split(':')
             nsxmgr = parts[0].strip()
             
@@ -1733,7 +1749,6 @@ def configure_nsx_components(auth_keys_file: str, password: str,
             if not entry or entry.strip().startswith('#'):
                 continue
             
-            # Format: nsxedge_hostname:esxhost
             parts = entry.split(':')
             nsxedge = parts[0].strip()
             esx_host = parts[1].strip() if len(parts) > 1 else ''
@@ -1962,7 +1977,17 @@ def configure_operations_vms(auth_keys_file: str, password: str,
             parts = vm.split(':')
             vm_name = parts[0].strip()
             vcenter = parts[1].strip() if len(parts) > 1 else ''
-            ops_vms.append((vm_name, vcenter))
+            
+            if '.*' in vm_name or vm_name.endswith('*'):
+                resolved = lsf.get_vm_match(vm_name)
+                if resolved:
+                    for rvm in resolved:
+                        if 'ops' in rvm.name.lower():
+                            ops_vms.append((rvm.name, vcenter))
+                else:
+                    lsf.write_output(f'Pattern "{vm_name}" matched no VMs in vCenter')
+            else:
+                ops_vms.append((vm_name, vcenter))
     
     if not ops_vms:
         lsf.write_output('No Operations VMs found in config')
@@ -3362,6 +3387,275 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
 # FINAL CLEANUP
 #==============================================================================
 
+def configure_vsp_proxy(dry_run: bool = False) -> bool:
+    """
+    Configure HTTP/HTTPS proxy on VSP cluster nodes and Supervisor.
+
+    The VSP (VCF Services Runtime) cluster nodes are Photon OS VMs that
+    run VCF component services (Salt, Fleet LCM, Depot, etc.) as K8s
+    workloads. The Supervisor runs on a separate set of control plane VMs
+    managed by vCenter WCP.
+
+    In the Holodeck lab environment, outbound internet access requires the
+    Squid proxy on holorouter (10.1.1.1:3128). This function configures:
+
+    1. Supervisor proxy via the vCenter namespace-management API
+       (CLUSTER_CONFIGURED mode with http and https proxy)
+    2. VSP node OS-level proxy (/etc/sysconfig/proxy, /etc/environment)
+    3. VSP node containerd systemd drop-in for image pulls
+    4. VSP node kubelet systemd drop-in for API server communication
+
+    The no_proxy list includes all internal subnets, service CIDRs, the
+    internal container registry, and the .site-a.vcf.lab domain.
+    """
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    PROXY_URL = 'http://10.1.1.1:3128'
+    NO_PROXY = (
+        'localhost,127.0.0.1,10.1.1.0/24,10.96.0.0/12,172.16.0.0/12,'
+        '198.18.0.0/16,'
+        '.site-a.vcf.lab,.svc,.cluster.local,.svc.cluster.local,'
+        '10.1.0.0/24,registry.vmsp-platform.svc.cluster.local'
+    )
+    VSP_SSH_USER = 'vmware-system-user'
+
+    lsf.write_output('')
+    lsf.write_output('=' * 60)
+    lsf.write_output('VSP & Supervisor Proxy Configuration')
+    lsf.write_output('=' * 60)
+
+    password = lsf.get_password()
+    success = True
+
+    # --- Part 1: Configure Supervisor proxy via vCenter API ---
+    wld_vcenter = None
+    supervisor_cluster_id = None
+    wld_sso_user = 'administrator@wld.sso'
+
+    if 'VCF' in lsf.config:
+        vc_entries = lsf.config.get('VCF', 'vcfvCenter', fallback='').strip().split('\n')
+        for entry in vc_entries:
+            entry = entry.strip()
+            if not entry or entry.startswith('#'):
+                continue
+            vc_name = entry.split(':')[0].strip()
+            if 'wld' in vc_name.lower():
+                wld_vcenter = f'{vc_name}.site-a.vcf.lab'
+                break
+
+    if not wld_vcenter:
+        wld_vcenter = 'vc-wld01-a.site-a.vcf.lab'
+
+    lsf.write_output(f'Supervisor proxy: Configuring via {wld_vcenter}')
+
+    if dry_run:
+        lsf.write_output(f'Would configure Supervisor proxy on {wld_vcenter}')
+        lsf.write_output(f'  HTTP proxy:  {PROXY_URL}')
+        lsf.write_output(f'  HTTPS proxy: {PROXY_URL}')
+    else:
+        if not lsf.test_ping(wld_vcenter):
+            lsf.write_output(f'{wld_vcenter}: Not reachable - skipping Supervisor proxy')
+        else:
+            try:
+                session_resp = requests.post(
+                    f'https://{wld_vcenter}/api/session',
+                    auth=(wld_sso_user, password),
+                    verify=False, timeout=15
+                )
+                if session_resp.status_code not in (200, 201):
+                    lsf.write_output(f'{wld_vcenter}: Failed to create session (HTTP {session_resp.status_code})')
+                    success = False
+                else:
+                    session_id = session_resp.text.strip('"')
+                    headers = {
+                        'vmware-api-session-id': session_id,
+                        'Content-Type': 'application/json'
+                    }
+
+                    clusters_resp = requests.get(
+                        f'https://{wld_vcenter}/api/vcenter/namespace-management/clusters',
+                        headers=headers, verify=False, timeout=15
+                    )
+                    if clusters_resp.status_code == 200:
+                        clusters = clusters_resp.json()
+                        if clusters:
+                            supervisor_cluster_id = clusters[0].get('cluster')
+                            lsf.write_output(f'Found Supervisor cluster: {supervisor_cluster_id}')
+                        else:
+                            lsf.write_output('No Supervisor clusters found')
+                    else:
+                        lsf.write_output(f'Failed to list Supervisor clusters (HTTP {clusters_resp.status_code})')
+
+                    if supervisor_cluster_id:
+                        proxy_body = {
+                            'cluster_proxy_config': {
+                                'proxy_settings_source': 'CLUSTER_CONFIGURED',
+                                'http_proxy_config': PROXY_URL,
+                                'https_proxy_config': PROXY_URL,
+                            }
+                        }
+                        patch_resp = requests.patch(
+                            f'https://{wld_vcenter}/api/vcenter/namespace-management/clusters/{supervisor_cluster_id}',
+                            headers=headers, json=proxy_body, verify=False, timeout=30
+                        )
+                        if patch_resp.status_code == 204:
+                            lsf.write_output(f'SUCCESS - Supervisor proxy configured (HTTP+HTTPS: {PROXY_URL})')
+                        else:
+                            lsf.write_output(f'WARNING - Supervisor proxy PATCH returned HTTP {patch_resp.status_code}')
+                            lsf.write_output(f'  Response: {patch_resp.text[:200]}')
+                            success = False
+            except Exception as e:
+                lsf.write_output(f'{wld_vcenter}: Error configuring Supervisor proxy: {e}')
+                success = False
+
+    # --- Part 2: Configure VSP cluster nodes ---
+    lsf.write_output('')
+    lsf.write_output('VSP nodes: Discovering cluster nodes...')
+
+    vsp_cp_vip = '10.1.1.142'
+    vsp_node_ips = []
+
+    if dry_run:
+        lsf.write_output(f'Would SSH to {vsp_cp_vip} to discover VSP node IPs')
+        lsf.write_output(f'Would configure proxy on each VSP node:')
+        lsf.write_output(f'  /etc/sysconfig/proxy (PROXY_ENABLED=yes)')
+        lsf.write_output(f'  /etc/environment (http_proxy, https_proxy, no_proxy)')
+        lsf.write_output(f'  /etc/systemd/system/containerd.service.d/http-proxy.conf')
+        lsf.write_output(f'  /etc/systemd/system/kubelet.service.d/http-proxy.conf')
+        return True
+
+    if not lsf.test_ping(vsp_cp_vip):
+        lsf.write_output(f'{vsp_cp_vip}: VSP control plane VIP not reachable - skipping')
+        return True
+
+    discover_cmd = (
+        f"echo '{password}' | sudo -S -i "
+        f"kubectl get nodes -o jsonpath='{{range .items[*]}}{{.status.addresses[?(@.type==\"InternalIP\")].address}}{{\" \"}}{{end}}'"
+    )
+    result = lsf.ssh(discover_cmd, f'{VSP_SSH_USER}@{vsp_cp_vip}', password)
+    if result.returncode == 0:
+        raw_output = result.stdout.strip() if hasattr(result, 'stdout') else ''
+        if not raw_output and hasattr(result, 'output'):
+            raw_output = result.output.strip()
+        for line in raw_output.split('\n'):
+            for token in line.split():
+                token = token.strip()
+                if token and token[0].isdigit() and '.' in token:
+                    vsp_node_ips.append(token)
+
+    if not vsp_node_ips:
+        lsf.write_output('WARNING: Could not discover VSP node IPs, falling back to SSH probing')
+        for candidate_ip in ['10.1.1.143', '10.1.1.141', '10.1.1.144',
+                             '10.1.1.145', '10.1.1.146', '10.1.1.147']:
+            if lsf.test_ping(candidate_ip):
+                test = lsf.ssh('hostname', f'{VSP_SSH_USER}@{candidate_ip}', password)
+                if test.returncode == 0:
+                    vsp_node_ips.append(candidate_ip)
+
+    if not vsp_node_ips:
+        lsf.write_output('WARNING: No VSP nodes found - skipping proxy configuration')
+        return True
+
+    lsf.write_output(f'Found {len(vsp_node_ips)} VSP nodes: {", ".join(vsp_node_ips)}')
+
+    proxy_script = f'''#!/bin/bash
+PROXY_URL="{PROXY_URL}"
+NO_PROXY="{NO_PROXY}"
+
+cat > /etc/sysconfig/proxy << 'PROXYEOF'
+PROXY_ENABLED="yes"
+HTTP_PROXY="{PROXY_URL}"
+HTTPS_PROXY="{PROXY_URL}"
+FTP_PROXY=""
+GOPHER_PROXY=""
+SOCKS_PROXY=""
+SOCKS5_SERVER=""
+NO_PROXY="{NO_PROXY}"
+PROXYEOF
+
+if ! grep -q 'http_proxy=' /etc/environment 2>/dev/null; then
+    cat >> /etc/environment << 'ENVEOF'
+http_proxy={PROXY_URL}
+https_proxy={PROXY_URL}
+no_proxy={NO_PROXY}
+HTTP_PROXY={PROXY_URL}
+HTTPS_PROXY={PROXY_URL}
+NO_PROXY={NO_PROXY}
+ENVEOF
+fi
+
+mkdir -p /etc/systemd/system/containerd.service.d
+cat > /etc/systemd/system/containerd.service.d/http-proxy.conf << 'CTDEOF'
+[Service]
+Environment="HTTP_PROXY={PROXY_URL}"
+Environment="HTTPS_PROXY={PROXY_URL}"
+Environment="NO_PROXY={NO_PROXY}"
+CTDEOF
+
+mkdir -p /etc/systemd/system/kubelet.service.d
+cat > /etc/systemd/system/kubelet.service.d/http-proxy.conf << 'KUBEOF'
+[Service]
+Environment="HTTP_PROXY={PROXY_URL}"
+Environment="HTTPS_PROXY={PROXY_URL}"
+Environment="NO_PROXY={NO_PROXY}"
+KUBEOF
+
+systemctl daemon-reload
+echo "PROXY_CONFIGURED"
+'''
+
+    script_path = '/tmp/confighol_vsp_proxy.sh'
+    try:
+        with open(script_path, 'w') as f:
+            f.write(proxy_script)
+        os.chmod(script_path, 0o755)
+    except Exception as e:
+        lsf.write_output(f'ERROR: Failed to write proxy script: {e}')
+        return False
+
+    for node_ip in vsp_node_ips:
+        lsf.write_output(f'{node_ip}: Configuring proxy...')
+
+        scp_result = lsf.scp(script_path, f'{VSP_SSH_USER}@{node_ip}:/tmp/confighol_vsp_proxy.sh', password)
+        if scp_result.returncode != 0:
+            lsf.write_output(f'{node_ip}: FAILED - Could not copy proxy script')
+            success = False
+            continue
+
+        run_cmd = f"echo '{password}' | sudo -S bash /tmp/confighol_vsp_proxy.sh"
+        run_result = lsf.ssh(run_cmd, f'{VSP_SSH_USER}@{node_ip}', password)
+
+        output = ''
+        if hasattr(run_result, 'stdout'):
+            output = run_result.stdout
+        elif hasattr(run_result, 'output'):
+            output = run_result.output
+
+        if run_result.returncode == 0 and 'PROXY_CONFIGURED' in str(output):
+            lsf.write_output(f'{node_ip}: SUCCESS - Proxy configured')
+        elif run_result.returncode == 0:
+            lsf.write_output(f'{node_ip}: Proxy script executed (exit 0)')
+        else:
+            lsf.write_output(f'{node_ip}: WARNING - Proxy script returned exit code {run_result.returncode}')
+            success = False
+
+        lsf.ssh(f"echo '{password}' | sudo -S rm -f /tmp/confighol_vsp_proxy.sh",
+                f'{VSP_SSH_USER}@{node_ip}', password)
+
+    try:
+        os.remove(script_path)
+    except OSError:
+        pass
+
+    if success:
+        lsf.write_output('VSP & Supervisor proxy configuration complete')
+    else:
+        lsf.write_output('VSP & Supervisor proxy configuration completed with warnings')
+
+    return success
+
+
 def perform_final_cleanup(dry_run: bool = False) -> bool:
     """
     Perform final cleanup tasks after HOLification.
@@ -3421,7 +3715,8 @@ def main():
     6. VCF Automation VMs configuration (uses vmware-system-user)
     7. Operations VMs configuration
     8. Disable SDDC Manager auto-rotate policies (prevents post-deployment failures)
-    9. Final cleanup
+    9. Configure VSP & Supervisor proxy (enables outbound internet via holorouter proxy)
+    10. Final cleanup
     """
     parser = argparse.ArgumentParser(
         description='HOLFY27 vApp HOLification Tool',
@@ -3563,7 +3858,11 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
     # Creates "MaxExpiration" policy, assigns ALL inventory (MANAGEMENT + INSTANCE), remediates
     configure_vcf_fleet_password_policy(args.dry_run)
     
-    # Step 9: Final cleanup
+    # Step 9: Configure VSP & Supervisor proxy
+    # Enables proxy on VSP cluster nodes and Supervisor for outbound internet access
+    configure_vsp_proxy(args.dry_run)
+    
+    # Step 10: Final cleanup
     perform_final_cleanup(args.dry_run)
     
     # Print summary
