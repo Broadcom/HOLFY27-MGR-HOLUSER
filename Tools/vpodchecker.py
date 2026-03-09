@@ -2221,7 +2221,7 @@ def main():
                     for entry in nsxmgrs_raw:
                         if not entry or entry.strip().startswith('#'):
                             continue
-                        # NSX Manager entries may have format: hostname:esxhost
+                        # NSX Manager entries are just hostnames (legacy format had :esxhost suffix)
                         hostname = entry.split(':')[0].strip()
                         if hostname:
                             urls.append(f'https://{hostname}')

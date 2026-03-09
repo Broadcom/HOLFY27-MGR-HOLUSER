@@ -1732,7 +1732,6 @@ def configure_nsx_components(auth_keys_file: str, password: str,
             if not entry or entry.strip().startswith('#'):
                 continue
             
-            # Format: nsxmgr_hostname:esxhost
             parts = entry.split(':')
             nsxmgr = parts[0].strip()
             
@@ -1750,7 +1749,6 @@ def configure_nsx_components(auth_keys_file: str, password: str,
             if not entry or entry.strip().startswith('#'):
                 continue
             
-            # Format: nsxedge_hostname:esxhost
             parts = entry.split(':')
             nsxedge = parts[0].strip()
             esx_host = parts[1].strip() if len(parts) > 1 else ''
