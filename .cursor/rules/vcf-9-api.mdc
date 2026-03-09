@@ -38,6 +38,10 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 - **Supervisor kube-dns endpoint may point to LB IP** after ungraceful shutdown — causes vSphere Pod DNS to fail via asymmetric NSX DLB routing. Fix: patch endpoint to CoreDNS pod IPs (`172.16.200.x`). `VCFfinal.py` Task 2c2 automates this.
 - **NSX Edge SR STANDBY having `Op_state: down` interfaces is normal** — in `ACTIVE_STANDBY` mode, only the ACTIVE SR brings up its interfaces. Check HA status via NSX Policy API `/policy/api/v1/infra/tier-1s/{id}/locale-services/{id}/ha-config` before diagnosing as broken.
 - **NSX Edge VMs are registered on WLD ESXi hosts** (not management vCenter) — must connect directly to ESXi hosts as `root` to power on/off edge VMs. They're on `esx-06a` (edge-wld01-02a) and `esx-07a` (edge-wld01-01a).
+- **VSP service CIDR is `198.18.128.0/17`** — not the standard `10.96.0.0/12`. Must include `198.18.0.0/16` in NO_PROXY for containerd/kubelet on VSP nodes, otherwise image pulls from the internal registry (`198.18.128.16:5000`) get routed through Squid proxy and fail with 403.
+- **Fleet LCM direct API uses different type names** than suite-api proxy: `NI`→`OPS_NETWORKS`, `LI`→`OPS_LOGS`, `FLEET_LCM`→`VCF_FLEET_LCM`, `SDDC_LCM`→`VCF_SDDC_LCM`.
+- **Fleet LCM shutdown returns HTTP 202** with a `taskId` — poll via `GET /fleet-lcm/v1/tasks/{taskId}`.
+- **OpsToken authSource varies** in VCF 9.1 builds — try both `local` and `localItem`.
 
 ## Session Knowledge Capture
 
