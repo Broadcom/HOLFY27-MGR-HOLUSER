@@ -1,6 +1,8 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.5 - 2026-02-12
+# Version 3.6 - 2026-03-09
+# Changes:
+# - Updated to include ohmyposh console files override logic
 # Author - Burke Azbill and HOL Core Team
 # Enhanced with NFS-based router communication, DNS import support
 
@@ -506,6 +508,13 @@ push_console_files_nfs() {
             conky-startup.sh)
                 if cp "$src_file" "${conky_dest}/${filename}" 2>/dev/null; then
                     log_msg "${src_label}: console/${filename} -> .conky/" "${logfile}"
+                fi
+                ;;
+            *.omp.json)
+                local omp_dest="/lmchol/home/holuser/.config/ohmyposh"
+                mkdir -p "${omp_dest}" 2>/dev/null
+                if cp "$src_file" "${omp_dest}/${filename}" 2>/dev/null; then
+                    log_msg "${src_label}: console/${filename} -> .config/ohmyposh/" "${logfile}"
                 fi
                 ;;
             .gitkeep)
