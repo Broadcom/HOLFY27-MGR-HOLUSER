@@ -1867,9 +1867,19 @@ def configure_operations_vms(auth_keys_file: str, password: str,
         if not vm or vm.strip().startswith('#'):
             continue
         if 'ops' in vm.lower():
-            # Format: vmname:vcenter
             parts = vm.split(':')
-            ops_vms.append(parts[0].strip())
+            vm_name = parts[0].strip()
+            
+            if '.*' in vm_name or vm_name.endswith('*'):
+                resolved = lsf.get_vm_match(vm_name)
+                if resolved:
+                    for rvm in resolved:
+                        if 'ops' in rvm.name.lower():
+                            ops_vms.append(rvm.name)
+                else:
+                    lsf.write_output(f'Pattern "{vm_name}" matched no VMs in vCenter')
+            else:
+                ops_vms.append(vm_name)
     
     if not ops_vms:
         lsf.write_output('No Operations VMs found in config')
@@ -2780,6 +2790,13 @@ def get_ops_hostname() -> Optional[str]:
         if not entry or entry.startswith('#'):
             continue
         hostname = entry.split(':')[0].strip()
+        if '.*' in hostname or hostname.endswith('*'):
+            resolved = lsf.get_vm_match(hostname)
+            if resolved:
+                for rvm in resolved:
+                    if rvm.name.startswith('ops-'):
+                        return rvm.name
+            continue
         if hostname.startswith('ops-'):
             return hostname
     

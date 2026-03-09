@@ -163,10 +163,29 @@ curl -sf -X POST "${API}/core/users/" \
 ```
 
 **Forward-Auth Configuration:**
-- Proxy Provider: `traefik-forward-auth` (PK=1, mode=forward_single)
-- Application: `traefik-dashboard`
-- Outpost: Embedded outpost with `authentik_host=https://auth.vcf.lab`
 - Traefik Middleware: `authentik-forward-auth` in `traefik` namespace
+- Outpost: Embedded outpost with `authentik_host=https://auth.vcf.lab`
+- Protected services (all use proxy providers in `forward_single` mode):
+
+| Application | Slug | Provider | External Host |
+| --- | --- | --- | --- |
+| Traefik Dashboard | `traefik-dashboard` | `traefik-forward-auth` | `https://traefik.vcf.lab` |
+| Technitium DNS | `technitium-dns` | `technitium-forward-auth` | `https://dns.vcf.lab` |
+| Vault | `vault` | `vault-forward-auth` | `https://vault.vcf.lab` |
+
+Each IngressRoute includes the outpost callback route (`/outpost.goauthentik.io/` path at priority 15).
+
+**Vault OIDC Integration (optional):**
+- OAuth2 Provider: `vault-oidc` (client_id=`vault-oidc`)
+- Application: `vault-oidc` (slug)
+- Discovery URL: `https://auth.vcf.lab/application/o/vault-oidc/`
+- Vault auth method: `oidc` with default role
+- Client secret stored in `/root/authentik/bootstrap-token.txt`
+
+**Install Script:** `/home/holuser/hol/Tools/Authentik/install_authentik.sh`
+- `--vault-oidc` flag enables Vault OIDC non-interactively
+- `--no-vault-oidc` flag skips Vault OIDC non-interactively
+- Validates DNS entries for dns.vcf.lab, auth.vcf.lab, traefik.vcf.lab, vault.vcf.lab before deployment
 
 ### FRR-K8s (namespace: `default`)
 

@@ -1979,7 +1979,17 @@ def configure_operations_vms(auth_keys_file: str, password: str,
             parts = vm.split(':')
             vm_name = parts[0].strip()
             vcenter = parts[1].strip() if len(parts) > 1 else ''
-            ops_vms.append((vm_name, vcenter))
+            
+            if '.*' in vm_name or vm_name.endswith('*'):
+                resolved = lsf.get_vm_match(vm_name)
+                if resolved:
+                    for rvm in resolved:
+                        if 'ops' in rvm.name.lower():
+                            ops_vms.append((rvm.name, vcenter))
+                else:
+                    lsf.write_output(f'Pattern "{vm_name}" matched no VMs in vCenter')
+            else:
+                ops_vms.append((vm_name, vcenter))
     
     if not ops_vms:
         lsf.write_output('No Operations VMs found in config')
