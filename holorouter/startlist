@@ -1,2 +1,10 @@
 github.com
 hashicorp.com
+
+# VS Code Marketplace (required for extension browsing/install)
+marketplace.visualstudio.com
+visualstudio.com
+vsassets.io
+vscode-unpkg.net
+vscode-cdn.net
+vscode.dev
