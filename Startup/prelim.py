@@ -228,7 +228,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('prelim', 'vscode_proxy', 'running')
         dashboard.generate_html()
     
-    enable_vscode_proxy = lsf.config.getboolean('VPOD', 'enablevscodeproxy', fallback=True)
+    enable_vscode_proxy = lsf.config.getboolean('VPOD', 'enablevscodeproxy', fallback=False)
     
     if enable_vscode_proxy:
         lsf.write_output('Configuring VS Code proxy on console...')
