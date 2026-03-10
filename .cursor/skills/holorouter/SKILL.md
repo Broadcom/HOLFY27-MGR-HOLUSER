@@ -93,7 +93,7 @@ curl -s "http://localhost:5380/api/zones/list?token=${TOKEN}&pageNumber=1&zonesP
 | --- | --- |
 | Deployment | Helm chart `vault` v0.32.0 (Vault v1.21.2), StatefulSet |
 | Web UI | `https://vault.vcf.lab` (via Traefik), also `http://10.1.1.1:32000` (NodePort) |
-| Root Token | creds.txt password  |
+| Root Token | creds.txt password (also stored in `/root/vault-keys/init.json`) |
 | Unseal Key | `/root/vault-keys/init.json` |
 | PKI Engine | Mounted at `pki/`, CA: "vcf.lab Root Authority" (valid until 2036) |
 | PKI Role | `holodeck` - allows `*.vcf.lab` subdomains, max TTL 9528h (397 days) |

@@ -228,7 +228,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('prelim', 'vscode_proxy', 'running')
         dashboard.generate_html()
     
-    enable_vscode_proxy = lsf.config.getboolean('VPOD', 'enablevscodeproxy', fallback=True)
+    enable_vscode_proxy = lsf.config.getboolean('VPOD', 'enablevscodeproxy', fallback=False)
     
     if enable_vscode_proxy:
         lsf.write_output('Configuring VS Code proxy on console...')
@@ -461,25 +461,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     # # Alternatively, use the helper to search in standard locations:
     # # result = lsf.run_ansible_from_repo('site.yml')
     
-    ## Example 7: Run Salt Configuration
-    ## ----------------------------------
-    ## Execute a Salt state from the vpodrepo
-    #
-    # state_name = 'webserver'  # Will look for webserver.sls in vpodrepo/salt/
-    # 
-    # try:
-    #     result = lsf.run_salt_from_repo(state_name, test_mode=False)
-    #     if result.returncode == 0:
-    #         lsf.write_output(f'Salt state {state_name} applied successfully')
-    #     else:
-    #         lsf.write_output(f'Salt state {state_name} failed: {result.stderr}')
-    # except FileNotFoundError as e:
-    #     lsf.write_output(f'Salt state not found: {e}')
-    # 
-    # # Or run with test mode to see what would change:
-    # # result = lsf.run_salt_from_repo('webserver', test_mode=True)
-    
-    ## Example 8: Run Custom Script
+    ## Example 7: Run Custom Script
     ## ----------------------------
     ## Execute a custom script from the vpodrepo (auto-detects type by extension)
     #
