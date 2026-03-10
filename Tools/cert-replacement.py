@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VCF Certificate Management Script
+VCF Certificate Management Script (VCF 9.1 Cycle 4)
 
 This script manages certificates for VCF infrastructure components by:
 1. Generating CSRs (via SDDC Manager API for managed resources, or locally for others)
@@ -9,41 +9,64 @@ This script manages certificates for VCF infrastructure components by:
 
 Certificate Replacement Workflow:
 
-For SDDC Manager-managed resources (SDDC Manager, vCenter, NSX Manager):
+For SDDC Manager-managed resources (SDDC Manager, vCenter, NSX Manager, ESXi):
   1. Generate CSR on the component via SDDC Manager API
   2. Retrieve CSR from SDDC Manager
   3. Sign CSR with HashiCorp Vault PKI
   4. Upload signed certificate chain via SDDC Manager API
   5. SDDC Manager applies the certificate to the component
 
-For non-SDDC-managed resources (VCF Operations, VCF Automation, etc.):
+For non-SDDC-managed resources (VCF Operations, VCF Automation, Ops Logs, etc.):
   1. Generate CSR locally
   2. Sign CSR with HashiCorp Vault PKI
   3. Replace certificate via component-specific method (SSH/API)
 
 VCF Components Managed:
-- sddcmanager-a.site-a.vcf.lab (SDDC Manager) - SDDC Manager API [AUTOMATED]
-- vc-mgmt-a.site-a.vcf.lab (vCenter) - SDDC Manager API [AUTOMATED]
-- nsx-mgmt-a.site-a.vcf.lab (NSX Manager) - SDDC Manager API [AUTOMATED]
-- ops-a.site-a.vcf.lab (VCF Operations) - SSH replacement [MANUAL]
-- auto-a.site-a.vcf.lab (VCF Automation) - VCF Operations Manager [MANUAL]
-- opsnet-a.site-a.vcf.lab (VCF Operations for Networks) - SSH TBD [MANUAL]
+
+  Management Domain:
+  - sddcmanager-a.site-a.vcf.lab   (SDDC Manager)       - SDDC Manager API  [AUTOMATED]
+  - vc-mgmt-a.site-a.vcf.lab       (Mgmt vCenter)       - SDDC Manager API  [AUTOMATED]
+  - nsx-mgmt-a.site-a.vcf.lab      (Mgmt NSX VIP)       - SDDC Manager API  [AUTOMATED]
+  - nsx-mgmt-01a.site-a.vcf.lab    (Mgmt NSX Node)      - SDDC Manager API  [AUTOMATED]
+  - ops-a.site-a.vcf.lab           (VCF Operations)      - SSH replacement   [AUTOMATED]
+
+  Workload Domain:
+  - vc-wld01-a.site-a.vcf.lab      (WLD vCenter)        - SDDC Manager API  [AUTOMATED]
+  - nsx-wld01-a.site-a.vcf.lab     (WLD NSX VIP)        - SDDC Manager API  [AUTOMATED]
+  - nsx-wld01-01a.site-a.vcf.lab   (WLD NSX Node)       - SDDC Manager API  [AUTOMATED]
+
+  VCF Services:
+  - auto-a.site-a.vcf.lab          (VCF Automation)      - SSH/K8s           [MANUAL]
+  - auto-platform-a.site-a.vcf.lab (VCFA Platform)       - SSH/K8s           [MANUAL]
+  - opslogs-a.site-a.vcf.lab       (Ops for Logs)        - SSH/K8s           [MANUAL]
+  - opsnet-a.site-a.vcf.lab        (Ops for Networks)    - API only          [MANUAL]
+
+  VSP Gateway Endpoints (managed by VSP cluster, cert ref via Ops Locker):
+  - vsp-01a.site-a.vcf.lab         (VSP Gateway)
+  - fleet-01a.site-a.vcf.lab       (Fleet Gateway)
+  - instance-01a.site-a.vcf.lab    (Instance Gateway)
 
 Security: Credentials can be provided via:
 - Environment variables (VCF_PASS)
 - /home/holuser/creds.txt (fallback for password)
 
+Vault Token: Obtained fresh from creds.txt (root token) or Vault auth.
+
 Default Credentials by Target and Access Method:
-+------------------+-----------------------------+--------------------+
-| Target           | API User                    | SSH User           |
-+------------------+-----------------------------+--------------------+
-| sddcmanager-a    | administrator@vsphere.local | vcf / root         |
-| vc-mgmt-a        | administrator@vsphere.local | root               |
-| nsx-mgmt-a       | admin                       | admin              |
-| ops-a            | admin                       | root               |
-| auto-a           | admin                       | vmware-system-user |
-| opsnet-a         | admin                       | root (TBD)         |
-+------------------+-----------------------------+--------------------+
++--------------------+-----------------------------+--------------------+
+| Target             | API User                    | SSH User           |
++--------------------+-----------------------------+--------------------+
+| sddcmanager-a      | admin@local (Bearer)        | vcf                |
+| vc-mgmt-a          | administrator@vsphere.local | root               |
+| vc-wld01-a         | administrator@wld.sso       | root               |
+| nsx-mgmt-01a       | admin                       | admin              |
+| nsx-wld01-01a      | admin                       | admin              |
+| ops-a              | admin (OpsToken, local)     | root               |
+| auto-a             | admin                       | vmware-system-user |
+| auto-platform-a    | -                           | vmware-system-user |
+| opslogs-a          | admin                       | vmware-system-user |
+| opsnet-a           | admin                       | (SSH unavailable)  |
++--------------------+-----------------------------+--------------------+
 """
 
 import os
@@ -56,6 +79,9 @@ import subprocess
 import tempfile
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
+
+import ipaddress
+import socket
 
 import requests
 import urllib3
@@ -83,11 +109,20 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # =============================================================================
 
 DEFAULT_VCF_TARGETS = [
+    # Management Domain (SDDC Manager-managed)
     'sddcmanager-a.site-a.vcf.lab',
     'vc-mgmt-a.site-a.vcf.lab',
     'nsx-mgmt-a.site-a.vcf.lab',
+    'nsx-mgmt-01a.site-a.vcf.lab',
+    # Workload Domain (SDDC Manager-managed)
+    'vc-wld01-a.site-a.vcf.lab',
+    'nsx-wld01-a.site-a.vcf.lab',
+    'nsx-wld01-01a.site-a.vcf.lab',
+    # VCF Operations & Services (non-SDDC-managed)
     'ops-a.site-a.vcf.lab',
     'auto-a.site-a.vcf.lab',
+    'auto-platform-a.site-a.vcf.lab',
+    'opslogs-a.site-a.vcf.lab',
     'opsnet-a.site-a.vcf.lab',
 ]
 
@@ -98,24 +133,36 @@ DEFAULT_VCF_TARGETS = [
 
 DEFAULT_CREDENTIALS = {
     'sddcmanager': {
-        'api': 'administrator@vsphere.local',
-        'ssh': 'root',  # root required for certificate replacement
+        'api': 'admin@local',
+        'ssh': 'vcf',
     },
-    'ops-': {  # VCF Operations (ops-a)
+    'ops-': {
         'api': 'admin',
         'ssh': 'root',
     },
-    'opsnet': {  # VCF Operations for Networks (opsnet-a) - SSH user TBD
+    'opslogs': {
         'api': 'admin',
-        'ssh': 'root',  # placeholder - may need to be updated
+        'ssh': 'vmware-system-user',
     },
-    'auto': {  # VCF Automation (auto-a)
+    'opsnet': {
         'api': 'admin',
-        'ssh': 'vmware-system-user',  # has NOPASSWD sudo access
+        'ssh': None,  # SSH not available on opsnet
+    },
+    'auto-platform': {
+        'api': 'admin',
+        'ssh': 'vmware-system-user',
+    },
+    'auto': {
+        'api': 'admin',
+        'ssh': 'vmware-system-user',
     },
     'nsx': {
         'api': 'admin',
         'ssh': 'admin',
+    },
+    'vc-wld': {
+        'api': 'administrator@wld.sso',
+        'ssh': 'root',
     },
     'vc-': {
         'api': 'administrator@vsphere.local',
@@ -123,6 +170,22 @@ DEFAULT_CREDENTIALS = {
     },
     'vcenter': {
         'api': 'administrator@vsphere.local',
+        'ssh': 'root',
+    },
+    'vsp-': {
+        'api': 'admin',
+        'ssh': 'vmware-system-user',
+    },
+    'fleet-': {
+        'api': 'admin',
+        'ssh': 'vmware-system-user',
+    },
+    'instance-': {
+        'api': 'admin',
+        'ssh': 'vmware-system-user',
+    },
+    'esx-': {
+        'api': 'root',
         'ssh': 'root',
     },
     'default': {
@@ -248,18 +311,41 @@ class VaultCertificateManager:
         self.vault_mount = vault_mount
         self.cert_ttl = cert_ttl
         
+    @staticmethod
+    def _is_ip_address(value: str) -> bool:
+        """Check if a string is an IP address."""
+        try:
+            ipaddress.ip_address(value)
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def resolve_fqdn_to_ip(fqdn: str) -> Optional[str]:
+        """Resolve an FQDN to its IP address via DNS."""
+        try:
+            return socket.gethostbyname(fqdn)
+        except socket.gaierror:
+            logger.debug(f"  Could not resolve {fqdn} to an IP address")
+            return None
+
     def generate_csr(
         self,
         common_name: str,
         organization: str = "VMware",
-        organizational_unit: str = "Hands-on Labs",
+        organizational_unit: str = "Hands On Labs",
         country: str = "US",
         state: str = "California",
         locality: str = "Palo Alto",
         key_size: int = 2048,
         san_list: Optional[List[str]] = None
     ) -> Tuple[str, str]:
-        """Generate a CSR and private key locally."""
+        """
+        Generate a CSR and private key locally.
+
+        san_list entries are auto-classified: IP addresses become IPAddress SANs,
+        hostnames become DNSName SANs.
+        """
         try:
             logger.info(f"Generating CSR for CN={common_name}...")
             
@@ -281,7 +367,12 @@ class VaultCertificateManager:
             csr_builder = x509.CertificateSigningRequestBuilder().subject_name(subject)
             
             if san_list:
-                san_entries = [x509.DNSName(san) for san in san_list]
+                san_entries = []
+                for san in san_list:
+                    if self._is_ip_address(san):
+                        san_entries.append(x509.IPAddress(ipaddress.ip_address(san)))
+                    else:
+                        san_entries.append(x509.DNSName(san))
                 csr_builder = csr_builder.add_extension(
                     x509.SubjectAlternativeName(san_entries),
                     critical=False
@@ -303,7 +394,7 @@ class VaultCertificateManager:
             logger.error(f"Failed to generate CSR: {e}")
             raise
     
-    def sign_csr(self, csr_pem: str, common_name: str) -> Optional[str]:
+    def sign_csr(self, csr_pem: str, common_name: str, ip_sans: Optional[List[str]] = None) -> Optional[str]:
         """Sign a CSR using HashiCorp Vault PKI."""
         try:
             url = f"{self.vault_url}/v1/{self.vault_mount}/sign/{self.vault_role}"
@@ -315,6 +406,9 @@ class VaultCertificateManager:
                 "format": "pem_bundle",
                 "ttl": self.cert_ttl
             }
+            if ip_sans:
+                payload["ip_sans"] = ",".join(ip_sans)
+                logger.info(f"  IP SANs: {', '.join(ip_sans)}")
             headers = {"X-Vault-Token": self.vault_token}
             
             resp = requests.post(url, json=payload, headers=headers, timeout=30, verify=False)
@@ -357,15 +451,24 @@ class VaultCertificateManager:
             return None
     
     def generate_certificate(self, fqdn: str) -> Optional[Tuple[str, str]]:
-        """Generate and sign a certificate for the given FQDN."""
-        # Generate CSR
+        """Generate and sign a certificate for the given FQDN, including its IP in the SAN."""
+        san_list = [fqdn]
+        ip_sans = []
+
+        ip_addr = self.resolve_fqdn_to_ip(fqdn)
+        if ip_addr:
+            san_list.append(ip_addr)
+            ip_sans.append(ip_addr)
+            logger.info(f"  Resolved {fqdn} -> {ip_addr} (added to SAN)")
+        else:
+            logger.warning(f"  Could not resolve {fqdn} - certificate will only have DNS SAN")
+
         csr_pem, key_pem = self.generate_csr(
             common_name=fqdn,
-            san_list=[fqdn]
+            san_list=san_list
         )
         
-        # Sign with Vault
-        cert_pem = self.sign_csr(csr_pem, fqdn)
+        cert_pem = self.sign_csr(csr_pem, fqdn, ip_sans=ip_sans or None)
         if not cert_pem:
             return None
         
@@ -385,14 +488,21 @@ class SDDCManagerAPI:
     """
     
     # Resource type mapping for SDDC Manager API
+    # Only resource types that SDDC Manager can generate CSRs for and replace certs
     RESOURCE_TYPES = {
         'sddcmanager': 'SDDC_MANAGER',
         'vc-': 'VCENTER',
         'vcenter': 'VCENTER',
-        'nsx': 'NSXT_MANAGER',
-        'ops': None,  # Not managed by SDDC Manager
-        'auto': None,  # VCF Automation - managed separately
-        'opsnet': None,  # VCF Operations for Networks - managed separately
+        'nsx-mgmt': 'NSXT_MANAGER',
+        'nsx-wld': 'NSXT_MANAGER',
+        'esx-': 'ESXI',
+        'ops-': None,     # VCF Operations - cert managed via SSH
+        'opslogs': None,  # Ops for Logs - cert managed via VSP/Locker
+        'opsnet': None,   # Ops for Networks - cert managed via VSP/Locker
+        'auto': None,     # VCF Automation - cert managed via K8s
+        'vsp-': None,     # VSP Gateway - cert managed via VSP cluster
+        'fleet-': None,   # Fleet Gateway - cert managed via VSP cluster
+        'instance-': None,  # Instance Gateway - cert managed via VSP cluster
     }
     
     def __init__(self, sddc_manager_url: str, username: str, password: str, verify_ssl: bool = False):
@@ -404,9 +514,10 @@ class SDDCManagerAPI:
         self.session.verify = verify_ssl
         self.token: Optional[str] = None
         self.domain_id: Optional[str] = None
+        self._domains_cache: Optional[List[Dict]] = None
         
     def get_token(self) -> Optional[str]:
-        """Authenticate and get access token."""
+        """Authenticate and get access token via Bearer token."""
         url = f"{self.base_url}/v1/tokens"
         payload = {
             "username": self.username,
@@ -422,6 +533,7 @@ class SDDCManagerAPI:
                 return self.token
             else:
                 logger.error(f"SDDC Manager auth failed: {resp.status_code}")
+                logger.debug(f"  Response: {resp.text[:200]}")
                 return None
         except Exception as e:
             logger.error(f"SDDC Manager auth failed: {e}")
@@ -435,30 +547,60 @@ class SDDCManagerAPI:
             "Accept": "application/json"
         }
     
-    def get_domain_id(self) -> Optional[str]:
-        """Get the management domain ID."""
-        if self.domain_id:
-            return self.domain_id
-            
+    def _load_domains(self) -> List[Dict]:
+        """Load and cache all VCF domains."""
+        if self._domains_cache is not None:
+            return self._domains_cache
+
         if not self.token:
             if not self.get_token():
-                return None
-        
+                return []
+
         url = f"{self.base_url}/v1/domains"
         try:
             resp = self.session.get(url, headers=self.get_headers(), timeout=30)
             if resp.status_code == 200:
-                data = resp.json()
-                for domain in data.get('elements', []):
-                    if domain.get('type') == 'MANAGEMENT':
-                        self.domain_id = domain.get('id')
-                        logger.debug(f"Found management domain: {self.domain_id}")
-                        return self.domain_id
-            logger.error("Could not find management domain")
-            return None
+                self._domains_cache = resp.json().get('elements', [])
+                return self._domains_cache
         except Exception as e:
             logger.error(f"Failed to get domains: {e}")
-            return None
+        return []
+
+    def get_domain_id(self) -> Optional[str]:
+        """Get the management domain ID."""
+        if self.domain_id:
+            return self.domain_id
+
+        for domain in self._load_domains():
+            if domain.get('type') == 'MANAGEMENT':
+                self.domain_id = domain.get('id')
+                logger.debug(f"Found management domain: {self.domain_id}")
+                return self.domain_id
+
+        logger.error("Could not find management domain")
+        return None
+
+    def get_domain_id_for_fqdn(self, fqdn: str) -> Optional[str]:
+        """Determine which domain a resource belongs to by checking resource certificates."""
+        if not self.token:
+            if not self.get_token():
+                return None
+
+        for domain in self._load_domains():
+            domain_id = domain.get('id')
+            url = f"{self.base_url}/v1/domains/{domain_id}/resource-certificates"
+            try:
+                resp = self.session.get(url, headers=self.get_headers(), timeout=30)
+                if resp.status_code == 200:
+                    for el in resp.json().get('elements', []):
+                        if el.get('resourceName', '').lower() == fqdn.lower():
+                            logger.debug(f"  {fqdn} belongs to domain {domain.get('name')} ({domain_id})")
+                            return domain_id
+            except Exception:
+                continue
+
+        logger.debug(f"  {fqdn} not found in any domain resource certificates")
+        return self.get_domain_id()
     
     def get_resource_type(self, fqdn: str) -> Optional[str]:
         """Determine the resource type for a given FQDN."""
@@ -477,22 +619,15 @@ class SDDCManagerAPI:
         Generate a CSR for a resource via SDDC Manager API.
         
         The CSR is generated on the remote component (not locally).
-        
-        Args:
-            fqdn: The FQDN of the resource
-            resource_type: The type of resource (SDDC_MANAGER, VCENTER, NSXT_MANAGER)
-            dry_run: If True, don't actually generate
-            
-        Returns:
-            Tuple of (success, task_id)
+        Automatically determines the correct domain for the resource.
         """
-        domain_id = self.get_domain_id()
+        domain_id = self.get_domain_id_for_fqdn(fqdn)
         if not domain_id:
-            logger.error("  Cannot get domain ID")
+            logger.error("  Cannot determine domain for resource")
             return False, None
         
         logger.info(f"  Generating CSR via SDDC Manager API...")
-        logger.info(f"  Resource: {fqdn} ({resource_type})")
+        logger.info(f"  Resource: {fqdn} ({resource_type}), Domain: {domain_id}")
         
         if dry_run:
             logger.info("  [DRY RUN] Would call PUT /v1/domains/{id}/csrs")
@@ -542,16 +677,8 @@ class SDDCManagerAPI:
             return False, None
     
     def get_csr(self, fqdn: str) -> Optional[str]:
-        """
-        Get the CSR content for a resource.
-        
-        Args:
-            fqdn: The FQDN of the resource
-            
-        Returns:
-            The PEM-encoded CSR or None
-        """
-        domain_id = self.get_domain_id()
+        """Get the CSR content for a resource from the correct domain."""
+        domain_id = self.get_domain_id_for_fqdn(fqdn)
         if not domain_id:
             return None
         
@@ -563,7 +690,7 @@ class SDDCManagerAPI:
                 data = resp.json()
                 for element in data.get('elements', []):
                     resource = element.get('resource', {})
-                    if resource.get('fqdn') == fqdn:
+                    if resource.get('fqdn', '').lower() == fqdn.lower():
                         return element.get('csrEncodedContent')
             return None
         except Exception as e:
@@ -573,23 +700,16 @@ class SDDCManagerAPI:
     def replace_certificate(self, fqdn: str, cert_chain: str, dry_run: bool = False) -> Tuple[bool, Optional[str]]:
         """
         Replace certificate for a VCF component using SDDC Manager API.
-        
-        Args:
-            fqdn: The FQDN of the resource
-            cert_chain: The full certificate chain (PEM encoded)
-            dry_run: If True, don't actually replace
-            
-        Returns:
-            Tuple of (success, task_id)
+        Automatically determines the correct domain for the resource.
         """
         resource_type = self.get_resource_type(fqdn)
         if not resource_type:
             logger.warning(f"  {fqdn} is not managed by SDDC Manager API")
             return False, None
         
-        domain_id = self.get_domain_id()
+        domain_id = self.get_domain_id_for_fqdn(fqdn)
         if not domain_id:
-            logger.error("  Cannot get domain ID")
+            logger.error("  Cannot determine domain for resource")
             return False, None
         
         logger.info(f"  Replacing certificate via SDDC Manager API...")
@@ -696,7 +816,7 @@ class SDDCManagerCertReplacer:
         self.password = password
         self.ssh_user = get_credentials_for_target(fqdn, 'ssh')
         
-    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> bool:
+    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> str:
         """Replace SDDC Manager certificate via SSH."""
         logger.info(f"Replacing certificate on SDDC Manager: {self.fqdn}")
         logger.info(f"  SSH User: {self.ssh_user}")
@@ -705,7 +825,7 @@ class SDDCManagerCertReplacer:
         
         if dry_run:
             logger.info("[DRY RUN] Would replace certificate via SSH")
-            return True
+            return "SUCCESS"
         
         try:
             # Create temp files
@@ -734,18 +854,18 @@ class SDDCManagerCertReplacer:
                 logger.info(f"  ║   chmod 640 {self.KEY_PATH}")
                 logger.info(f"  ║   systemctl reload nginx")
                 logger.info(f"  ╚═══════════════════════════════════════════════════════════════╝")
-                return True  # Certificate generated successfully, just needs manual installation
+                return "WARNING"  # Certificate generated successfully, just needs manual installation
             
             # Copy files to SDDC Manager
             logger.info("  Copying certificate to SDDC Manager...")
             if not scp_file_to_host(self.fqdn, self.ssh_user, self.password, cert_path, "/tmp/new_cert.crt"):
                 logger.error("  Failed to copy certificate")
-                return False
+                return "FAILED"
             
             logger.info("  Copying private key to SDDC Manager...")
             if not scp_file_to_host(self.fqdn, self.ssh_user, self.password, key_path, "/tmp/new_key.key"):
                 logger.error("  Failed to copy private key")
-                return False
+                return "FAILED"
             
             # Backup and replace certificates (root user - no sudo needed)
             commands = [
@@ -766,7 +886,7 @@ class SDDCManagerCertReplacer:
                 if not success:
                     logger.error(f"  Command failed: {cmd}")
                     logger.error(f"  Output: {output}")
-                    return False
+                    return "FAILED"
             
             # Restart nginx
             logger.info("  Restarting nginx service...")
@@ -778,14 +898,14 @@ class SDDCManagerCertReplacer:
             
             if success:
                 logger.info("✓ SDDC Manager certificate replaced successfully")
-                return True
+                return "SUCCESS"
             else:
                 logger.warning(f"  Nginx reload warning: {output}")
-                return True  # Certificate was replaced, reload might show warning
+                return "SUCCESS"  # Certificate was replaced, reload might show warning
             
         except Exception as e:
             logger.error(f"Failed to replace SDDC Manager certificate: {e}")
-            return False
+            return "FAILED"
         finally:
             # Cleanup temp files
             try:
@@ -803,14 +923,14 @@ class VCFOperationsCertReplacer:
         self.password = password
         self.ssh_user = get_credentials_for_target(fqdn, 'ssh')
         
-    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> bool:
+    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> str:
         """Replace VCF Operations certificate via SSH."""
         logger.info(f"Replacing certificate on VCF Operations: {self.fqdn}")
         logger.info(f"  SSH User: {self.ssh_user}")
         
         if dry_run:
             logger.info("[DRY RUN] Would replace certificate via SSH")
-            return True
+            return "SUCCESS"
         
         try:
             # Create temp files
@@ -826,12 +946,12 @@ class VCFOperationsCertReplacer:
             logger.info("  Copying certificate...")
             if not scp_file_to_host(self.fqdn, self.ssh_user, self.password, cert_path, "/tmp/new_cert.pem"):
                 logger.error("  Failed to copy certificate")
-                return False
+                return "FAILED"
             
             logger.info("  Copying private key...")
             if not scp_file_to_host(self.fqdn, self.ssh_user, self.password, key_path, "/tmp/new_key.pem"):
                 logger.error("  Failed to copy private key")
-                return False
+                return "FAILED"
             
             # VCF Operations certificate replacement commands
             # Note: Actual paths may vary - this is a generic approach
@@ -848,11 +968,11 @@ class VCFOperationsCertReplacer:
             
             logger.info("✓ VCF Operations certificate files copied")
             logger.info("  NOTE: Manual service restart may be required")
-            return True
+            return "SUCCESS"
             
         except Exception as e:
             logger.error(f"Failed to replace VCF Operations certificate: {e}")
-            return False
+            return "FAILED"
         finally:
             try:
                 os.unlink(cert_path)
@@ -875,7 +995,7 @@ class VCFAutomationCertReplacer:
         self.password = password
         self.ssh_user = get_credentials_for_target(fqdn, 'ssh')
         
-    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> bool:
+    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> str:
         """
         Prepare certificate for VCF Automation replacement.
         
@@ -888,7 +1008,7 @@ class VCFAutomationCertReplacer:
         
         if dry_run:
             logger.info("[DRY RUN] Would prepare certificate for VCF Automation")
-            return True
+            return "SUCCESS"
         
         # Save certificate for manual import
         cert_dir = Path("/tmp/vcf-certs")
@@ -914,7 +1034,7 @@ class VCFAutomationCertReplacer:
         logger.info("  5. Select the Automation environment")
         logger.info("  6. Click Replace Certificate and select the imported cert")
         
-        return True
+        return "WARNING"
 
 
 class NSXManagerCertReplacer:
@@ -928,14 +1048,14 @@ class NSXManagerCertReplacer:
         self.session.verify = False
         self.session.auth = (self.api_user, password)
         
-    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> bool:
+    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> str:
         """Replace NSX Manager certificate via NSX API."""
         logger.info(f"Replacing certificate on NSX Manager: {self.fqdn}")
         logger.info(f"  API User: {self.api_user}")
         
         if dry_run:
             logger.info("[DRY RUN] Would replace certificate via NSX API")
-            return True
+            return "SUCCESS"
         
         try:
             # NSX Manager certificate import with private key
@@ -970,7 +1090,7 @@ class NSXManagerCertReplacer:
                     if apply_resp.status_code == 200:
                         logger.info("✓ NSX Manager certificate replaced successfully")
                         logger.info("  NOTE: NSX services may restart - allow 2-3 minutes")
-                        return True
+                        return "SUCCESS"
                     else:
                         logger.error(f"  Failed to apply certificate: {apply_resp.status_code}")
                         try:
@@ -992,10 +1112,10 @@ class NSXManagerCertReplacer:
                         logger.info(f"  ║   System > Certificates > Import > Certificate with Private Key")
                         logger.info(f"  ║   Then: System > Certificates > (select) > Replace Cluster Cert")
                         logger.info(f"  ╚═══════════════════════════════════════════════════════════════╝")
-                        return True  # Cert generated successfully
+                        return "WARNING"  # Cert generated successfully
                 else:
                     logger.error("  No certificate ID returned from import")
-                    return False
+                    return "FAILED"
                         
             else:
                 logger.error(f"  Failed to import certificate: {resp.status_code}")
@@ -1016,11 +1136,11 @@ class NSXManagerCertReplacer:
                 logger.info(f"  ║   System > Certificates > Import > Certificate with Private Key")
                 logger.info(f"  ║   Then: System > Certificates > (select) > Replace Cluster Cert")
                 logger.info(f"  ╚═══════════════════════════════════════════════════════════════╝")
-                return True  # Cert generated successfully
+                return "WARNING"  # Cert generated successfully
                 
         except Exception as e:
             logger.error(f"Failed to replace NSX certificate: {e}")
-            return False
+            return "FAILED"
 
 
 class VCenterCertReplacer:
@@ -1031,14 +1151,14 @@ class VCenterCertReplacer:
         self.password = password
         self.ssh_user = get_credentials_for_target(fqdn, 'ssh')
         
-    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> bool:
+    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> str:
         """Replace vCenter certificate via SSH."""
         logger.info(f"Replacing certificate on vCenter: {self.fqdn}")
         logger.info(f"  SSH User: {self.ssh_user}")
         
         if dry_run:
             logger.info("[DRY RUN] Would replace certificate via SSH")
-            return True
+            return "SUCCESS"
         
         try:
             # Create temp files
@@ -1060,7 +1180,7 @@ class VCenterCertReplacer:
                     logger.info("✓ vCenter certificate files copied to /tmp/")
                     logger.info("  NOTE: Use certificate-manager to complete replacement")
                     logger.info("  Run: /usr/lib/vmware-vmca/bin/certificate-manager")
-                    return True
+                    return "WARNING"
             
             # If we get here, SCP failed - show manual instructions
             logger.warning(f"  SCP connection failed - manual replacement required")
@@ -1076,11 +1196,11 @@ class VCenterCertReplacer:
             logger.info(f"  ║   /usr/lib/vmware-vmca/bin/certificate-manager")
             logger.info(f"  ╚═══════════════════════════════════════════════════════════════╝")
             
-            return True
+            return "WARNING"
             
         except Exception as e:
             logger.error(f"Failed to copy vCenter certificate: {e}")
-            return False
+            return "FAILED"
         finally:
             try:
                 os.unlink(cert_path)
@@ -1093,27 +1213,66 @@ class VCenterCertReplacer:
 # Main Certificate Replacement Function
 # =============================================================================
 
+class GenericCertSaver:
+    """
+    Saves certificates locally for targets that don't support direct replacement.
+    Used for VSP gateway endpoints, opsnet, and other API-only targets.
+    """
+
+    def __init__(self, fqdn: str, password: str):
+        self.fqdn = fqdn
+        self.password = password
+
+    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> str:
+        """Save certificate locally and provide instructions."""
+        logger.info(f"Saving certificate for: {self.fqdn}")
+
+        if dry_run:
+            logger.info("[DRY RUN] Would save certificate locally")
+            return "SUCCESS"
+
+        cert_dir = Path("/tmp/vcf-certs")
+        cert_dir.mkdir(exist_ok=True)
+
+        cert_file = cert_dir / f"{self.fqdn}.crt"
+        key_file = cert_dir / f"{self.fqdn}.key"
+
+        cert_file.write_text(cert_pem)
+        key_file.write_text(key_pem)
+        key_file.chmod(0o600)
+
+        logger.info(f"  ✓ Certificate saved: {cert_file}")
+        logger.info(f"  ✓ Private key saved: {key_file}")
+        logger.info(f"  NOTE: This target's certificate is managed by the VSP cluster or fleet.")
+        logger.info(f"        Manual import via VCF Operations Locker may be required.")
+        return "WARNING"
+
+
 def get_replacer_for_target(fqdn: str, password: str):
     """Get the appropriate certificate replacer for a target."""
     fqdn_lower = fqdn.lower()
     
     if 'sddcmanager' in fqdn_lower:
         return SDDCManagerCertReplacer(fqdn, password)
+    elif 'auto-platform' in fqdn_lower:
+        return VCFAutomationCertReplacer(fqdn, password)
     elif 'auto-' in fqdn_lower or 'auto.' in fqdn_lower:
         return VCFAutomationCertReplacer(fqdn, password)
+    elif 'opslogs' in fqdn_lower:
+        return VCFOperationsCertReplacer(fqdn, password)
     elif 'ops-' in fqdn_lower or 'ops.' in fqdn_lower:
         return VCFOperationsCertReplacer(fqdn, password)
     elif 'opsnet' in fqdn_lower:
-        # VCF Operations for Networks - SSH user TBD
-        logger.warning(f"opsnet SSH credentials not yet configured, using generic approach")
-        return VCFOperationsCertReplacer(fqdn, password)
+        return GenericCertSaver(fqdn, password)
     elif 'nsx' in fqdn_lower:
         return NSXManagerCertReplacer(fqdn, password)
     elif 'vc-' in fqdn_lower or 'vcenter' in fqdn_lower:
         return VCenterCertReplacer(fqdn, password)
+    elif any(prefix in fqdn_lower for prefix in ('vsp-', 'fleet-', 'instance-')):
+        return GenericCertSaver(fqdn, password)
     else:
-        logger.warning(f"No specific replacer for {fqdn}, using generic SSH")
-        return SDDCManagerCertReplacer(fqdn, password)
+        logger.warning(f"No specific replacer for {fqdn}, saving locally")
+        return GenericCertSaver(fqdn, password)
 
 
 def process_certificate(
@@ -1123,7 +1282,7 @@ def process_certificate(
     sddc_api: Optional[SDDCManagerAPI] = None,
     ops_trust_manager = None,
     dry_run: bool = False
-) -> bool:
+) -> str:
     """
     Generate, sign, and replace certificate for a VCF component.
     
@@ -1156,7 +1315,7 @@ def process_certificate(
         
     except Exception as e:
         logger.error(f"Error processing certificate for {fqdn}: {e}", exc_info=True)
-        return False
+        return "FAILED"
 
 
 def _process_sddc_managed_certificate(
@@ -1165,7 +1324,7 @@ def _process_sddc_managed_certificate(
     vault_manager: VaultCertificateManager,
     cert_dir: Path,
     dry_run: bool = False
-) -> bool:
+) -> str:
     """
     Process certificate for SDDC Manager-managed resources.
     
@@ -1183,13 +1342,13 @@ def _process_sddc_managed_certificate(
     
     if not success:
         logger.error("  Failed to initiate CSR generation")
-        return False
+        return "FAILED"
     
     if csr_task_id and not dry_run:
         # Wait for CSR generation to complete
         if not sddc_api.wait_for_task(csr_task_id, timeout=120):
             logger.error("  CSR generation task failed")
-            return False
+            return "FAILED"
     
     # Step 2: Get the CSR content
     if not dry_run:
@@ -1197,7 +1356,7 @@ def _process_sddc_managed_certificate(
         csr_pem = sddc_api.get_csr(fqdn)
         if not csr_pem:
             logger.error("  Failed to retrieve CSR")
-            return False
+            return "FAILED"
         logger.info("  ✓ CSR retrieved successfully")
     else:
         logger.info("  [DRY RUN] Would retrieve CSR from SDDC Manager")
@@ -1209,7 +1368,7 @@ def _process_sddc_managed_certificate(
         cert_chain = vault_manager.sign_csr(csr_pem, fqdn)
         if not cert_chain:
             logger.error("  Failed to sign CSR with Vault")
-            return False
+            return "FAILED"
         logger.info("  ✓ CSR signed successfully")
         
         # Save certificate locally for reference
@@ -1226,16 +1385,16 @@ def _process_sddc_managed_certificate(
     
     if not success:
         logger.error("  Failed to initiate certificate replacement")
-        return False
+        return "FAILED"
     
     if replace_task_id and not dry_run:
         # Wait for certificate replacement to complete
         if not sddc_api.wait_for_task(replace_task_id, timeout=600):
             logger.error("  Certificate replacement task failed")
-            return False
+            return "FAILED"
     
     logger.info(f"✓ Successfully replaced certificate for {fqdn}")
-    return True
+    return "SUCCESS"
 
 
 def _process_non_sddc_certificate(
@@ -1245,7 +1404,7 @@ def _process_non_sddc_certificate(
     ops_trust_manager,
     cert_dir: Path,
     dry_run: bool = False
-) -> bool:
+) -> str:
     """
     Process certificate for non-SDDC-managed resources.
     
@@ -1258,7 +1417,7 @@ def _process_non_sddc_certificate(
     result = vault_manager.generate_certificate(fqdn)
     if not result:
         logger.error(f"  Failed to generate certificate for {fqdn}")
-        return False
+        return "FAILED"
     
     cert_pem, key_pem = result
     
@@ -1288,14 +1447,16 @@ def _process_non_sddc_certificate(
     # Step 4: Replace certificate on component
     logger.info("  Step 4: Replacing certificate on component...")
     replacer = get_replacer_for_target(fqdn, password)
-    replacement_success = replacer.replace(cert_pem, key_pem, dry_run=dry_run)
+    replacement_status = replacer.replace(cert_pem, key_pem, dry_run=dry_run)
     
-    if replacement_success:
+    if replacement_status == "SUCCESS":
         logger.info(f"✓ Successfully replaced certificate for {fqdn}")
-    else:
+    elif replacement_status == "WARNING":
         logger.warning(f"⚠ Certificate generated but replacement may need manual action for {fqdn}")
+    else:
+        logger.error(f"Failed to replace certificate for {fqdn}")
     
-    return True  # Certificate was generated successfully
+    return replacement_status
 
 
 # =============================================================================
@@ -1315,12 +1476,63 @@ def load_password_from_file(filepath: str = "/home/holuser/creds.txt") -> Option
     return None
 
 
+def get_fresh_vault_token(vault_url: str, password: str) -> Optional[str]:
+    """
+    Get a fresh Vault token. Tries creds.txt password as root token first,
+    then falls back to reading init.json from the holorouter.
+    """
+    # The Vault root token in Holodeck labs is the creds.txt password
+    try:
+        resp = requests.get(
+            f"{vault_url}/v1/auth/token/lookup-self",
+            headers={"X-Vault-Token": password},
+            timeout=10,
+            verify=False
+        )
+        if resp.status_code == 200:
+            data = resp.json().get('data', {})
+            logger.info(f"Vault token valid (type: {data.get('display_name', 'unknown')})")
+            return password
+    except Exception as e:
+        logger.debug(f"Vault token lookup failed: {e}")
+
+    # Fallback: try to read root token from router's init.json
+    try:
+        cmd = [
+            'sshpass', '-p', password,
+            'ssh', '-o', 'StrictHostKeyChecking=accept-new',
+            '-o', 'PubkeyAuthentication=no',
+            '-o', 'LogLevel=ERROR',
+            'root@router',
+            'cat /root/vault-keys/init.json'
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            init_data = json.loads(result.stdout)
+            root_token = init_data.get('root_token', '')
+            if root_token:
+                verify = requests.get(
+                    f"{vault_url}/v1/auth/token/lookup-self",
+                    headers={"X-Vault-Token": root_token},
+                    timeout=10,
+                    verify=False
+                )
+                if verify.status_code == 200:
+                    logger.info("Vault token obtained from router init.json")
+                    return root_token
+    except Exception as e:
+        logger.debug(f"Vault init.json fallback failed: {e}")
+
+    logger.error("Could not obtain a valid Vault token")
+    return None
+
+
 def load_config(config_path: Optional[str] = None) -> Dict:
     """Load configuration from file or environment variables."""
     config = {
         'sddc_manager_url': 'https://sddcmanager-a.site-a.vcf.lab',
         'vault_url': 'http://10.1.1.1:32000',
-        'vault_token': 'holodeck',
+        'vault_token': None,  # obtained fresh at runtime
         'vault_role': 'holodeck',
         'vault_mount': 'pki',
         'cert_ttl': '17520h',  # 2 years
@@ -1352,6 +1564,13 @@ def load_config(config_path: Optional[str] = None) -> Dict:
         if file_password:
             config['vcf_pass'] = file_password
             logger.info("Loaded VCF password from /home/holuser/creds.txt")
+
+    # Get fresh Vault token if not explicitly provided
+    if not config.get('vault_token'):
+        vault_url = config.get('vault_url', 'http://10.1.1.1:32000')
+        password = config.get('vcf_pass', '')
+        if password:
+            config['vault_token'] = get_fresh_vault_token(vault_url, password)
     
     return config
 
@@ -1376,16 +1595,29 @@ Examples:
   # Dry run (no actual changes)
   python cert-replacement.py --all --dry-run
 
-  # Specify certificate TTL (default: 2 years)
-  python cert-replacement.py --all --ttl 17520h
+  # Specify certificate TTL (default: 2 years / 17520h)
+  python cert-replacement.py --all --ttl 8760h
 
-Default VCF Targets:
-  - sddcmanager-a.site-a.vcf.lab  (SDDC Manager - SSH replacement)
-  - vc-mgmt-a.site-a.vcf.lab      (vCenter - SSH/manual)
-  - nsx-mgmt-a.site-a.vcf.lab     (NSX Manager - API replacement)
-  - ops-a.site-a.vcf.lab          (VCF Operations - SSH replacement)
+Default VCF Targets (VCF 9.1 Cycle 4):
+  Management Domain (SDDC Manager-managed):
+  - sddcmanager-a.site-a.vcf.lab      (SDDC Manager)
+  - vc-mgmt-a.site-a.vcf.lab          (Mgmt vCenter)
+  - nsx-mgmt-a.site-a.vcf.lab         (Mgmt NSX VIP)
+  - nsx-mgmt-01a.site-a.vcf.lab       (Mgmt NSX Node)
 
-Certificate signing uses HashiCorp Vault PKI with 1-year TTL by default.
+  Workload Domain (SDDC Manager-managed):
+  - vc-wld01-a.site-a.vcf.lab         (WLD vCenter)
+  - nsx-wld01-a.site-a.vcf.lab        (WLD NSX VIP)
+  - nsx-wld01-01a.site-a.vcf.lab      (WLD NSX Node)
+
+  Non-SDDC-managed:
+  - ops-a.site-a.vcf.lab              (VCF Operations)
+  - auto-a.site-a.vcf.lab             (VCF Automation)
+  - auto-platform-a.site-a.vcf.lab    (VCFA Platform)
+  - opslogs-a.site-a.vcf.lab          (Ops for Logs)
+  - opsnet-a.site-a.vcf.lab           (Ops for Networks)
+
+Vault token is obtained fresh from /home/holuser/creds.txt or router init.json.
         """
     )
     
@@ -1426,7 +1658,7 @@ Certificate signing uses HashiCorp Vault PKI with 1-year TTL by default.
     config['cert_ttl'] = args.ttl
     
     # Validate required configuration
-    required = ['vcf_pass', 'vault_url', 'vault_token', 'vault_role']
+    required = ['vcf_pass', 'vault_url', 'vault_role']
     missing = [key for key in required if not config.get(key)]
     
     if missing:
@@ -1434,8 +1666,14 @@ Certificate signing uses HashiCorp Vault PKI with 1-year TTL by default.
         logger.error("Set password in /home/holuser/creds.txt or via --vcf-pass")
         sys.exit(1)
     
+    # Validate Vault token
+    if not config.get('vault_token'):
+        logger.error("Cannot obtain a valid Vault token. Check Vault health and creds.txt.")
+        sys.exit(1)
+
     logger.info(f"Vault URL: {config['vault_url']}")
     logger.info(f"Vault Role: {config['vault_role']}")
+    logger.info(f"Vault Token: {'✓ valid' if config['vault_token'] else '✗ missing'}")
     logger.info(f"Certificate TTL: {config['cert_ttl']}")
     
     if args.dry_run:
@@ -1456,7 +1694,7 @@ Certificate signing uses HashiCorp Vault PKI with 1-year TTL by default.
     
     sddc_api = SDDCManagerAPI(
         sddc_manager_url=sddc_manager_url,
-        username=get_credentials_for_target('sddcmanager', 'api'),
+        username='admin@local',
         password=config['vcf_pass'],
         verify_ssl=False
     )
@@ -1468,6 +1706,9 @@ Certificate signing uses HashiCorp Vault PKI with 1-year TTL by default.
         domain_id = sddc_api.get_domain_id()
         if domain_id:
             logger.info(f"  Management Domain ID: {domain_id}")
+        domains = sddc_api._load_domains()
+        for d in domains:
+            logger.info(f"  Domain: {d.get('name', '?')} ({d.get('type', '?')}) ID: {d.get('id', '?')}")
     else:
         logger.warning("⚠ SDDC Manager connection failed - will use fallback methods")
         sddc_api = None
@@ -1489,31 +1730,41 @@ Certificate signing uses HashiCorp Vault PKI with 1-year TTL by default.
     # Process certificates
     results = {}
     for fqdn in targets:
-        success = process_certificate(
+        result_status = process_certificate(
             fqdn=fqdn,
             password=config['vcf_pass'],
             vault_manager=vault_manager,
             sddc_api=sddc_api,
             dry_run=args.dry_run
         )
-        results[fqdn] = success
+        results[fqdn] = result_status
     
     # Summary
     print("\n" + "=" * 60)
     print("CERTIFICATE REPLACEMENT SUMMARY")
     print("=" * 60)
-    successful = sum(1 for v in results.values() if v)
+    successful = sum(1 for v in results.values() if v == "SUCCESS")
+    warnings = sum(1 for v in results.values() if v == "WARNING")
     total = len(results)
-    print(f"Successfully processed: {successful}/{total}")
+    print(f"Fully Successful: {successful}/{total}")
+    if warnings > 0:
+        print(f"Requires Manual Action: {warnings}/{total}")
     print()
-    for fqdn, success in results.items():
-        status = "✓ SUCCESS" if success else "✗ FAILED"
+    for fqdn, result_status in results.items():
+        if result_status == "SUCCESS":
+            status = "✓ SUCCESS"
+        elif result_status == "WARNING":
+            status = "⚠ WARNING (Manual Action Required)"
+        else:
+            status = "✗ FAILED"
         print(f"  {status}: {fqdn}")
     
     print()
     print("Certificates saved to: /tmp/vcf-certs/")
     
-    sys.exit(0 if successful == total else 1)
+    # Exit with 0 if there are no failures (SUCCESS and WARNING are both non-failures)
+    failed = sum(1 for v in results.values() if v == "FAILED")
+    sys.exit(0 if failed == 0 else 1)
 
 
 if __name__ == "__main__":

@@ -41,7 +41,12 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 - **VSP service CIDR is `198.18.128.0/17`** — not the standard `10.96.0.0/12`. Must include `198.18.0.0/16` in NO_PROXY for containerd/kubelet on VSP nodes, otherwise image pulls from the internal registry (`198.18.128.16:5000`) get routed through Squid proxy and fail with 403.
 - **Fleet LCM direct API uses different type names** than suite-api proxy: `NI`→`OPS_NETWORKS`, `LI`→`OPS_LOGS`, `FLEET_LCM`→`VCF_FLEET_LCM`, `SDDC_LCM`→`VCF_SDDC_LCM`.
 - **Fleet LCM shutdown returns HTTP 202** with a `taskId` — poll via `GET /fleet-lcm/v1/tasks/{taskId}`.
-- **OpsToken authSource varies** in VCF 9.1 builds — try both `local` and `localItem`.
+- **OpsToken authSource varies** in VCF 9.1 builds — try both `local` and `localItem`. VCF 9.1 C4 uses `local`.
+- **Vault root token is creds.txt password** — not `"holodeck"`. Verify with `curl -sk -H "X-Vault-Token: $(cat /home/holuser/creds.txt)" http://10.1.1.1:32000/v1/auth/token/lookup-self`.
+- **Vault PKI role `holodeck` default max_ttl is 720h (30 days)** — update to 17520h for 2-year certs via `POST /v1/pki/roles/holodeck`.
+- **SDDC Manager Bearer token auth** uses `admin@local` username for `/v1/tokens`. Not `vcf` or `administrator@vsphere.local`.
+- **opslogs-a SSH user is `vmware-system-user`** — root and admin are rejected. opsnet-a has no SSH access at all.
+- **auto-platform-a.site-a.vcf.lab (10.1.1.69)** is a separate VM from auto-a (10.1.1.70). SSH: `vmware-system-user`.
 
 ## Session Knowledge Capture
 
