@@ -816,7 +816,7 @@ class SDDCManagerCertReplacer:
         self.password = password
         self.ssh_user = get_credentials_for_target(fqdn, 'ssh')
         
-    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> bool:
+    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> str:
         """Replace SDDC Manager certificate via SSH."""
         logger.info(f"Replacing certificate on SDDC Manager: {self.fqdn}")
         logger.info(f"  SSH User: {self.ssh_user}")
@@ -825,7 +825,7 @@ class SDDCManagerCertReplacer:
         
         if dry_run:
             logger.info("[DRY RUN] Would replace certificate via SSH")
-            return True
+            return "SUCCESS"
         
         try:
             # Create temp files
@@ -854,18 +854,18 @@ class SDDCManagerCertReplacer:
                 logger.info(f"  ║   chmod 640 {self.KEY_PATH}")
                 logger.info(f"  ║   systemctl reload nginx")
                 logger.info(f"  ╚═══════════════════════════════════════════════════════════════╝")
-                return True  # Certificate generated successfully, just needs manual installation
+                return "WARNING"  # Certificate generated successfully, just needs manual installation
             
             # Copy files to SDDC Manager
             logger.info("  Copying certificate to SDDC Manager...")
             if not scp_file_to_host(self.fqdn, self.ssh_user, self.password, cert_path, "/tmp/new_cert.crt"):
                 logger.error("  Failed to copy certificate")
-                return False
+                return "FAILED"
             
             logger.info("  Copying private key to SDDC Manager...")
             if not scp_file_to_host(self.fqdn, self.ssh_user, self.password, key_path, "/tmp/new_key.key"):
                 logger.error("  Failed to copy private key")
-                return False
+                return "FAILED"
             
             # Backup and replace certificates (root user - no sudo needed)
             commands = [
@@ -886,7 +886,7 @@ class SDDCManagerCertReplacer:
                 if not success:
                     logger.error(f"  Command failed: {cmd}")
                     logger.error(f"  Output: {output}")
-                    return False
+                    return "FAILED"
             
             # Restart nginx
             logger.info("  Restarting nginx service...")
@@ -898,14 +898,14 @@ class SDDCManagerCertReplacer:
             
             if success:
                 logger.info("✓ SDDC Manager certificate replaced successfully")
-                return True
+                return "SUCCESS"
             else:
                 logger.warning(f"  Nginx reload warning: {output}")
-                return True  # Certificate was replaced, reload might show warning
+                return "SUCCESS"  # Certificate was replaced, reload might show warning
             
         except Exception as e:
             logger.error(f"Failed to replace SDDC Manager certificate: {e}")
-            return False
+            return "FAILED"
         finally:
             # Cleanup temp files
             try:
@@ -923,14 +923,14 @@ class VCFOperationsCertReplacer:
         self.password = password
         self.ssh_user = get_credentials_for_target(fqdn, 'ssh')
         
-    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> bool:
+    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> str:
         """Replace VCF Operations certificate via SSH."""
         logger.info(f"Replacing certificate on VCF Operations: {self.fqdn}")
         logger.info(f"  SSH User: {self.ssh_user}")
         
         if dry_run:
             logger.info("[DRY RUN] Would replace certificate via SSH")
-            return True
+            return "SUCCESS"
         
         try:
             # Create temp files
@@ -946,12 +946,12 @@ class VCFOperationsCertReplacer:
             logger.info("  Copying certificate...")
             if not scp_file_to_host(self.fqdn, self.ssh_user, self.password, cert_path, "/tmp/new_cert.pem"):
                 logger.error("  Failed to copy certificate")
-                return False
+                return "FAILED"
             
             logger.info("  Copying private key...")
             if not scp_file_to_host(self.fqdn, self.ssh_user, self.password, key_path, "/tmp/new_key.pem"):
                 logger.error("  Failed to copy private key")
-                return False
+                return "FAILED"
             
             # VCF Operations certificate replacement commands
             # Note: Actual paths may vary - this is a generic approach
@@ -968,11 +968,11 @@ class VCFOperationsCertReplacer:
             
             logger.info("✓ VCF Operations certificate files copied")
             logger.info("  NOTE: Manual service restart may be required")
-            return True
+            return "SUCCESS"
             
         except Exception as e:
             logger.error(f"Failed to replace VCF Operations certificate: {e}")
-            return False
+            return "FAILED"
         finally:
             try:
                 os.unlink(cert_path)
@@ -995,7 +995,7 @@ class VCFAutomationCertReplacer:
         self.password = password
         self.ssh_user = get_credentials_for_target(fqdn, 'ssh')
         
-    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> bool:
+    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> str:
         """
         Prepare certificate for VCF Automation replacement.
         
@@ -1008,7 +1008,7 @@ class VCFAutomationCertReplacer:
         
         if dry_run:
             logger.info("[DRY RUN] Would prepare certificate for VCF Automation")
-            return True
+            return "SUCCESS"
         
         # Save certificate for manual import
         cert_dir = Path("/tmp/vcf-certs")
@@ -1034,7 +1034,7 @@ class VCFAutomationCertReplacer:
         logger.info("  5. Select the Automation environment")
         logger.info("  6. Click Replace Certificate and select the imported cert")
         
-        return True
+        return "WARNING"
 
 
 class NSXManagerCertReplacer:
@@ -1048,14 +1048,14 @@ class NSXManagerCertReplacer:
         self.session.verify = False
         self.session.auth = (self.api_user, password)
         
-    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> bool:
+    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> str:
         """Replace NSX Manager certificate via NSX API."""
         logger.info(f"Replacing certificate on NSX Manager: {self.fqdn}")
         logger.info(f"  API User: {self.api_user}")
         
         if dry_run:
             logger.info("[DRY RUN] Would replace certificate via NSX API")
-            return True
+            return "SUCCESS"
         
         try:
             # NSX Manager certificate import with private key
@@ -1090,7 +1090,7 @@ class NSXManagerCertReplacer:
                     if apply_resp.status_code == 200:
                         logger.info("✓ NSX Manager certificate replaced successfully")
                         logger.info("  NOTE: NSX services may restart - allow 2-3 minutes")
-                        return True
+                        return "SUCCESS"
                     else:
                         logger.error(f"  Failed to apply certificate: {apply_resp.status_code}")
                         try:
@@ -1112,10 +1112,10 @@ class NSXManagerCertReplacer:
                         logger.info(f"  ║   System > Certificates > Import > Certificate with Private Key")
                         logger.info(f"  ║   Then: System > Certificates > (select) > Replace Cluster Cert")
                         logger.info(f"  ╚═══════════════════════════════════════════════════════════════╝")
-                        return True  # Cert generated successfully
+                        return "WARNING"  # Cert generated successfully
                 else:
                     logger.error("  No certificate ID returned from import")
-                    return False
+                    return "FAILED"
                         
             else:
                 logger.error(f"  Failed to import certificate: {resp.status_code}")
@@ -1136,11 +1136,11 @@ class NSXManagerCertReplacer:
                 logger.info(f"  ║   System > Certificates > Import > Certificate with Private Key")
                 logger.info(f"  ║   Then: System > Certificates > (select) > Replace Cluster Cert")
                 logger.info(f"  ╚═══════════════════════════════════════════════════════════════╝")
-                return True  # Cert generated successfully
+                return "WARNING"  # Cert generated successfully
                 
         except Exception as e:
             logger.error(f"Failed to replace NSX certificate: {e}")
-            return False
+            return "FAILED"
 
 
 class VCenterCertReplacer:
@@ -1151,14 +1151,14 @@ class VCenterCertReplacer:
         self.password = password
         self.ssh_user = get_credentials_for_target(fqdn, 'ssh')
         
-    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> bool:
+    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> str:
         """Replace vCenter certificate via SSH."""
         logger.info(f"Replacing certificate on vCenter: {self.fqdn}")
         logger.info(f"  SSH User: {self.ssh_user}")
         
         if dry_run:
             logger.info("[DRY RUN] Would replace certificate via SSH")
-            return True
+            return "SUCCESS"
         
         try:
             # Create temp files
@@ -1180,7 +1180,7 @@ class VCenterCertReplacer:
                     logger.info("✓ vCenter certificate files copied to /tmp/")
                     logger.info("  NOTE: Use certificate-manager to complete replacement")
                     logger.info("  Run: /usr/lib/vmware-vmca/bin/certificate-manager")
-                    return True
+                    return "WARNING"
             
             # If we get here, SCP failed - show manual instructions
             logger.warning(f"  SCP connection failed - manual replacement required")
@@ -1196,11 +1196,11 @@ class VCenterCertReplacer:
             logger.info(f"  ║   /usr/lib/vmware-vmca/bin/certificate-manager")
             logger.info(f"  ╚═══════════════════════════════════════════════════════════════╝")
             
-            return True
+            return "WARNING"
             
         except Exception as e:
             logger.error(f"Failed to copy vCenter certificate: {e}")
-            return False
+            return "FAILED"
         finally:
             try:
                 os.unlink(cert_path)
@@ -1223,13 +1223,13 @@ class GenericCertSaver:
         self.fqdn = fqdn
         self.password = password
 
-    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> bool:
+    def replace(self, cert_pem: str, key_pem: str, dry_run: bool = False) -> str:
         """Save certificate locally and provide instructions."""
         logger.info(f"Saving certificate for: {self.fqdn}")
 
         if dry_run:
             logger.info("[DRY RUN] Would save certificate locally")
-            return True
+            return "SUCCESS"
 
         cert_dir = Path("/tmp/vcf-certs")
         cert_dir.mkdir(exist_ok=True)
@@ -1245,7 +1245,7 @@ class GenericCertSaver:
         logger.info(f"  ✓ Private key saved: {key_file}")
         logger.info(f"  NOTE: This target's certificate is managed by the VSP cluster or fleet.")
         logger.info(f"        Manual import via VCF Operations Locker may be required.")
-        return True
+        return "WARNING"
 
 
 def get_replacer_for_target(fqdn: str, password: str):
@@ -1282,7 +1282,7 @@ def process_certificate(
     sddc_api: Optional[SDDCManagerAPI] = None,
     ops_trust_manager = None,
     dry_run: bool = False
-) -> bool:
+) -> str:
     """
     Generate, sign, and replace certificate for a VCF component.
     
@@ -1315,7 +1315,7 @@ def process_certificate(
         
     except Exception as e:
         logger.error(f"Error processing certificate for {fqdn}: {e}", exc_info=True)
-        return False
+        return "FAILED"
 
 
 def _process_sddc_managed_certificate(
@@ -1324,7 +1324,7 @@ def _process_sddc_managed_certificate(
     vault_manager: VaultCertificateManager,
     cert_dir: Path,
     dry_run: bool = False
-) -> bool:
+) -> str:
     """
     Process certificate for SDDC Manager-managed resources.
     
@@ -1342,13 +1342,13 @@ def _process_sddc_managed_certificate(
     
     if not success:
         logger.error("  Failed to initiate CSR generation")
-        return False
+        return "FAILED"
     
     if csr_task_id and not dry_run:
         # Wait for CSR generation to complete
         if not sddc_api.wait_for_task(csr_task_id, timeout=120):
             logger.error("  CSR generation task failed")
-            return False
+            return "FAILED"
     
     # Step 2: Get the CSR content
     if not dry_run:
@@ -1356,7 +1356,7 @@ def _process_sddc_managed_certificate(
         csr_pem = sddc_api.get_csr(fqdn)
         if not csr_pem:
             logger.error("  Failed to retrieve CSR")
-            return False
+            return "FAILED"
         logger.info("  ✓ CSR retrieved successfully")
     else:
         logger.info("  [DRY RUN] Would retrieve CSR from SDDC Manager")
@@ -1368,7 +1368,7 @@ def _process_sddc_managed_certificate(
         cert_chain = vault_manager.sign_csr(csr_pem, fqdn)
         if not cert_chain:
             logger.error("  Failed to sign CSR with Vault")
-            return False
+            return "FAILED"
         logger.info("  ✓ CSR signed successfully")
         
         # Save certificate locally for reference
@@ -1385,16 +1385,16 @@ def _process_sddc_managed_certificate(
     
     if not success:
         logger.error("  Failed to initiate certificate replacement")
-        return False
+        return "FAILED"
     
     if replace_task_id and not dry_run:
         # Wait for certificate replacement to complete
         if not sddc_api.wait_for_task(replace_task_id, timeout=600):
             logger.error("  Certificate replacement task failed")
-            return False
+            return "FAILED"
     
     logger.info(f"✓ Successfully replaced certificate for {fqdn}")
-    return True
+    return "SUCCESS"
 
 
 def _process_non_sddc_certificate(
@@ -1404,7 +1404,7 @@ def _process_non_sddc_certificate(
     ops_trust_manager,
     cert_dir: Path,
     dry_run: bool = False
-) -> bool:
+) -> str:
     """
     Process certificate for non-SDDC-managed resources.
     
@@ -1417,7 +1417,7 @@ def _process_non_sddc_certificate(
     result = vault_manager.generate_certificate(fqdn)
     if not result:
         logger.error(f"  Failed to generate certificate for {fqdn}")
-        return False
+        return "FAILED"
     
     cert_pem, key_pem = result
     
@@ -1447,14 +1447,16 @@ def _process_non_sddc_certificate(
     # Step 4: Replace certificate on component
     logger.info("  Step 4: Replacing certificate on component...")
     replacer = get_replacer_for_target(fqdn, password)
-    replacement_success = replacer.replace(cert_pem, key_pem, dry_run=dry_run)
+    replacement_status = replacer.replace(cert_pem, key_pem, dry_run=dry_run)
     
-    if replacement_success:
+    if replacement_status == "SUCCESS":
         logger.info(f"✓ Successfully replaced certificate for {fqdn}")
-    else:
+    elif replacement_status == "WARNING":
         logger.warning(f"⚠ Certificate generated but replacement may need manual action for {fqdn}")
+    else:
+        logger.error(f"Failed to replace certificate for {fqdn}")
     
-    return True  # Certificate was generated successfully
+    return replacement_status
 
 
 # =============================================================================
@@ -1728,31 +1730,41 @@ Vault token is obtained fresh from /home/holuser/creds.txt or router init.json.
     # Process certificates
     results = {}
     for fqdn in targets:
-        success = process_certificate(
+        result_status = process_certificate(
             fqdn=fqdn,
             password=config['vcf_pass'],
             vault_manager=vault_manager,
             sddc_api=sddc_api,
             dry_run=args.dry_run
         )
-        results[fqdn] = success
+        results[fqdn] = result_status
     
     # Summary
     print("\n" + "=" * 60)
     print("CERTIFICATE REPLACEMENT SUMMARY")
     print("=" * 60)
-    successful = sum(1 for v in results.values() if v)
+    successful = sum(1 for v in results.values() if v == "SUCCESS")
+    warnings = sum(1 for v in results.values() if v == "WARNING")
     total = len(results)
-    print(f"Successfully processed: {successful}/{total}")
+    print(f"Fully Successful: {successful}/{total}")
+    if warnings > 0:
+        print(f"Requires Manual Action: {warnings}/{total}")
     print()
-    for fqdn, success in results.items():
-        status = "✓ SUCCESS" if success else "✗ FAILED"
+    for fqdn, result_status in results.items():
+        if result_status == "SUCCESS":
+            status = "✓ SUCCESS"
+        elif result_status == "WARNING":
+            status = "⚠ WARNING (Manual Action Required)"
+        else:
+            status = "✗ FAILED"
         print(f"  {status}: {fqdn}")
     
     print()
     print("Certificates saved to: /tmp/vcf-certs/")
     
-    sys.exit(0 if successful == total else 1)
+    # Exit with 0 if there are no failures (SUCCESS and WARNING are both non-failures)
+    failed = sum(1 for v in results.values() if v == "FAILED")
+    sys.exit(0 if failed == 0 else 1)
 
 
 if __name__ == "__main__":
