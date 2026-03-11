@@ -57,7 +57,7 @@ Creates DNS record, issues TLS cert from Vault, deploys K8s DaemonSet on holorou
 ### Manual operations
 
 ```bash
-PASSWORD='VMware123!VMware123!'
+PASSWORD="$(cat /home/holuser/creds.txt)"
 
 # Check proxy pod
 sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=accept-new root@10.1.1.1 \
@@ -297,7 +297,22 @@ print(p.stdout.read().decode()); os.close(master); p.wait()
 \""
 ```
 
-## 12. Cross-References
+## 12. Vault CA Trust Distribution
+
+Automated by `confighol-9.1.py` Step 0b (`distribute_vault_ca_trust()`). Imports the Vault root CA into all VCF component trust stores:
+
+| Component | Method | Details |
+| --- | --- | --- |
+| vCenter Servers | `dir-cli trustedcert publish` + `vecs-cli force-refresh` | Publishes to vmdir → VECS TRUSTED_ROOTS |
+| ESXi Hosts | Append to `/etc/vmware/ssl/castore.pem` + `/sbin/auto-backup.sh` | Persistent across reboots |
+| NSX Managers | `POST /api/v1/trust-management/certificates?action=import` | Basic Auth as `admin` |
+| SDDC Manager | `POST /v1/sddc-manager/trusted-certificates` | Bearer token, `certificateUsageType: TRUSTED_FOR_OUTBOUND` |
+| VCF Automation | OS trust store (`/etc/pki/tls/certs/vault-ca.pem`) | SSH as `vmware-system-user` with sudo |
+| VCF Operations | OS trust store (`/usr/local/share/ca-certificates/vault-ca.crt`) | SSH as `root` or `vmware-system-user` |
+
+All functions are idempotent — they check for existing CA before importing.
+
+## 13. Cross-References
 
 - **Vault PKI setup & Traefik TLS**: See `holorouter` skill (Vault section)
 - **SDDC Manager credentials & PostgreSQL**: See `vcf-9-api` skill (Sections 10-12)

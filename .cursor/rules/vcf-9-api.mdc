@@ -59,6 +59,7 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 - **VCF Ops cert mgmt task status API returns HTTP 500** — poll `certificates/query` for issuer change instead.
 - **PKCS#7 `serialize_certificates()` reorders certs** — DER SET OF sorting puts CA before leaf. Must use custom `build_ordered_pkcs7()` for SDDC Manager compatibility (`certs[0]` = leaf, `certs[1]` = CA).
 - **Vault `sign-verbatim` preserves full CSR subject DN** — `sign/{role}` strips O/OU/C/L/ST fields. Always use `sign-verbatim/{role}` for SDDC Manager CSRs.
+- **Vault CA trust distribution** automated by `confighol-9.1.py` Step 0b — imports Vault root CA into vCenter VECS (`dir-cli trustedcert publish`), ESXi castore.pem, NSX trust-management API, SDDC Manager trusted-certificates API, and Linux appliance OS trust stores.
 - **SDDC Manager PostgreSQL** — Password in `/root/.pgpass` (SSH as `vcf`, use Python `pty.openpty()` to `su` to root). TCP on `127.0.0.1:5432`, database `operationsmanager`.
 
 ## Session Knowledge Capture

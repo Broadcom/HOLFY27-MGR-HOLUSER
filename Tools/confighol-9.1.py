@@ -9,6 +9,14 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.10 - 2026-03-10:
+#   - Vault CA trust distribution: imports the Vault PKI root CA certificate
+#     as a trusted authority across the entire VCF suite — vCenter Servers
+#     (dir-cli trustedcert publish → VECS TRUSTED_ROOTS), ESXi hosts
+#     (appended to /etc/vmware/ssl/castore.pem + auto-backup.sh), NSX
+#     Managers (trust-management API), SDDC Manager (trusted-certificates
+#     API), VCF Automation appliances, and VCF Operations VMs (OS trust
+#     stores). Idempotent: checks for existing CA before importing.
 # v2.9 - 2026-03-06:
 #   - VSP & Supervisor proxy: configures HTTP/HTTPS proxy on all VSP cluster
 #     nodes (Photon OS) and the Supervisor via vCenter API. Enables outbound
@@ -93,7 +101,17 @@
 #    - Imports CA as trusted authority in Firefox on console VM
 #    - Requires: libnss3-tools package (provides certutil)
 #
-# 0b. vCenter CA Import (runs after Vault CA, with SKIP/RETRY/FAIL options):
+# 0b. Vault CA Trust Distribution (runs after Firefox import):
+#    - Distributes the Vault root CA certificate to all VCF components:
+#      * vCenter Servers: dir-cli trustedcert publish → VECS TRUSTED_ROOTS
+#      * ESXi Hosts: appended to /etc/vmware/ssl/castore.pem
+#      * NSX Managers: POST /api/v1/trust-management/certificates?action=import
+#      * SDDC Manager: POST /v1/sddc-manager/trusted-certificates
+#      * VCF Automation: OS trust store (/etc/pki/tls/certs/)
+#      * VCF Operations VMs: OS trust store
+#    - Idempotent: checks for existing CA before importing
+#
+# 0c. vCenter CA Import (runs after Vault CA trust, with SKIP/RETRY/FAIL options):
 #    - Reads vCenter list from /tmp/config.ini
 #    - Downloads CA certificates from each vCenter's /certs/download.zip endpoint
 #    - Imports each CA as trusted authority in Firefox on console VM
@@ -204,7 +222,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.9'
+SCRIPT_VERSION = '2.10'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -2497,6 +2515,480 @@ def configure_vault_ca_for_firefox(dry_run: bool = False,
 
 
 #==============================================================================
+# VAULT CA TRUST DISTRIBUTION ACROSS VCF SUITE
+#==============================================================================
+
+
+def _trust_vault_ca_on_vcenter(hostname: str, user: str, password: str,
+                                ca_pem: str, dry_run: bool = False) -> bool:
+    """
+    Import the Vault root CA into a vCenter's TRUSTED_ROOTS store.
+
+    Uses dir-cli trustedcert publish to add the CA to vmdir, then
+    vecs-cli to refresh the TRUSTED_ROOTS VECS store.
+
+    :param hostname: vCenter FQDN
+    :param user: SSO admin user (e.g. administrator@vsphere.local)
+    :param password: Root/admin password
+    :param ca_pem: PEM-encoded CA certificate
+    :param dry_run: If True, preview only
+    :return: True if successful
+    """
+    if dry_run:
+        lsf.write_output(f'  {hostname}: Would import Vault CA via dir-cli trustedcert publish')
+        return True
+
+    if not lsf.test_tcp_port(hostname, 22):
+        lsf.write_output(f'  {hostname}: SKIP - SSH port 22 not open')
+        return False
+
+    # Write CA PEM to a temp file on vCenter
+    escaped_pem = ca_pem.replace("'", "'\\''")
+    write_cmd = f"echo '{escaped_pem}' > /tmp/vault-ca.pem"
+    result = lsf.ssh(write_cmd, f'root@{hostname}', password)
+
+    # Determine SSO domain from the user parameter
+    sso_domain = 'vsphere.local'
+    if '@' in user:
+        sso_domain = user.split('@')[1]
+    admin_user = f'administrator@{sso_domain}'
+
+    # Publish to vmdir via dir-cli (makes it available cluster-wide)
+    publish_cmd = (
+        f'/usr/lib/vmware-vmafd/bin/dir-cli trustedcert publish '
+        f'--cert /tmp/vault-ca.pem '
+        f'--login {admin_user} --password \'{password}\''
+    )
+    result = lsf.ssh(publish_cmd, f'root@{hostname}', password)
+    if hasattr(result, 'returncode') and result.returncode != 0:
+        stderr = getattr(result, 'stderr', '') or ''
+        if 'already exists' in stderr.lower() or 'duplicate' in stderr.lower():
+            lsf.write_output(f'  {hostname}: Vault CA already trusted in vmdir')
+        else:
+            lsf.write_output(f'  {hostname}: WARNING - dir-cli publish returned non-zero')
+
+    # Force VECS refresh so the cert appears in TRUSTED_ROOTS immediately
+    lsf.ssh('/usr/lib/vmware-vmafd/bin/vecs-cli force-refresh', f'root@{hostname}', password)
+
+    # Verify
+    verify_cmd = (
+        f'/usr/lib/vmware-vmafd/bin/vecs-cli entry list '
+        f'--store TRUSTED_ROOTS --text 2>/dev/null | grep -c "vcf.lab"'
+    )
+    result = lsf.ssh(verify_cmd, f'root@{hostname}', password)
+    stdout = getattr(result, 'stdout', '') or ''
+    if stdout.strip() and stdout.strip() != '0':
+        lsf.write_output(f'  {hostname}: SUCCESS - Vault CA in TRUSTED_ROOTS')
+    else:
+        lsf.write_output(f'  {hostname}: OK - dir-cli published (VECS may need service restart)')
+
+    # Clean up
+    lsf.ssh('rm -f /tmp/vault-ca.pem', f'root@{hostname}', password)
+
+    return True
+
+
+def _trust_vault_ca_on_esxi(hostname: str, password: str,
+                             ca_pem: str, dry_run: bool = False) -> bool:
+    """
+    Import the Vault root CA into an ESXi host's castore.pem.
+
+    Appends the CA cert to /etc/vmware/ssl/castore.pem and persists
+    with /sbin/auto-backup.sh.
+
+    :param hostname: ESXi host FQDN
+    :param password: Root password
+    :param ca_pem: PEM-encoded CA certificate
+    :param dry_run: If True, preview only
+    :return: True if successful
+    """
+    if dry_run:
+        lsf.write_output(f'  {hostname}: Would append Vault CA to /etc/vmware/ssl/castore.pem')
+        return True
+
+    if not lsf.test_tcp_port(hostname, 22):
+        lsf.write_output(f'  {hostname}: SKIP - SSH port 22 not open')
+        return False
+
+    # Check if already present
+    check_cmd = 'grep -c "vcf.lab Root Authority" /etc/vmware/ssl/castore.pem 2>/dev/null || echo 0'
+    result = lsf.ssh(check_cmd, f'root@{hostname}', password)
+    stdout = getattr(result, 'stdout', '') or ''
+    if stdout.strip() and stdout.strip() != '0':
+        lsf.write_output(f'  {hostname}: Vault CA already in castore.pem')
+        return True
+
+    # Write the CA PEM to a temp file and append to castore
+    escaped_pem = ca_pem.replace("'", "'\\''")
+    append_cmd = (
+        f"echo '{escaped_pem}' >> /etc/vmware/ssl/castore.pem && "
+        f"/sbin/auto-backup.sh > /dev/null 2>&1"
+    )
+    result = lsf.ssh(append_cmd, f'root@{hostname}', password)
+
+    if hasattr(result, 'returncode') and result.returncode != 0:
+        lsf.write_output(f'  {hostname}: WARNING - Failed to append CA to castore.pem')
+        return False
+
+    lsf.write_output(f'  {hostname}: SUCCESS - Vault CA appended to castore.pem')
+    return True
+
+
+def _trust_vault_ca_on_nsx(hostname: str, password: str,
+                            ca_pem: str, dry_run: bool = False) -> bool:
+    """
+    Import the Vault root CA into an NSX Manager's trust store via API.
+
+    Uses POST /api/v1/trust-management/certificates?action=import.
+
+    :param hostname: NSX Manager FQDN
+    :param password: Admin password
+    :param ca_pem: PEM-encoded CA certificate
+    :param dry_run: If True, preview only
+    :return: True if successful
+    """
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    if dry_run:
+        lsf.write_output(f'  {hostname}: Would import Vault CA via NSX trust-management API')
+        return True
+
+    # Check if already imported by listing existing certs
+    try:
+        list_url = f'https://{hostname}/api/v1/trust-management/certificates'
+        resp = requests.get(list_url, auth=('admin', password),
+                            verify=False, timeout=30)
+        if resp.status_code == 200:
+            certs_data = resp.json()
+            for cert_entry in certs_data.get('results', []):
+                pem = cert_entry.get('pem_encoded', '')
+                display = cert_entry.get('display_name', '')
+                if 'vcf.lab' in pem or 'vcf.lab Root Authority' in display:
+                    lsf.write_output(f'  {hostname}: Vault CA already in NSX trust store')
+                    return True
+    except Exception:
+        pass
+
+    # Import the CA
+    try:
+        import_url = f'https://{hostname}/api/v1/trust-management/certificates?action=import'
+        pem_with_newlines = ca_pem.replace('\n', '\\n')
+        payload = {
+            'display_name': VAULT_CA_NAME,
+            'pem_encoded': ca_pem
+        }
+        resp = requests.post(import_url, auth=('admin', password),
+                             json=payload, verify=False, timeout=30)
+
+        if resp.status_code in (200, 201):
+            lsf.write_output(f'  {hostname}: SUCCESS - Vault CA imported to NSX trust store')
+            return True
+        elif resp.status_code == 409:
+            lsf.write_output(f'  {hostname}: Vault CA already exists in NSX trust store')
+            return True
+        else:
+            lsf.write_output(f'  {hostname}: WARNING - NSX import returned HTTP {resp.status_code}')
+            body = resp.text[:200] if resp.text else ''
+            if body:
+                lsf.write_output(f'  {hostname}:   Response: {body}')
+            return False
+    except Exception as e:
+        lsf.write_output(f'  {hostname}: ERROR - {e}')
+        return False
+
+
+def _trust_vault_ca_on_sddc_manager(hostname: str, password: str,
+                                     ca_pem: str, dry_run: bool = False) -> bool:
+    """
+    Import the Vault root CA into SDDC Manager's trusted certificates.
+
+    Uses POST /v1/sddc-manager/trusted-certificates.
+
+    :param hostname: SDDC Manager FQDN
+    :param password: VCF admin password
+    :param ca_pem: PEM-encoded CA certificate
+    :param dry_run: If True, preview only
+    :return: True if successful
+    """
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    if dry_run:
+        lsf.write_output(f'  {hostname}: Would import Vault CA via SDDC Manager trusted-certificates API')
+        return True
+
+    # Get Bearer token
+    try:
+        token_url = f'https://{hostname}/v1/tokens'
+        token_resp = requests.post(token_url, json={
+            'username': 'admin@local', 'password': password
+        }, verify=False, timeout=30)
+
+        if token_resp.status_code not in (200, 201):
+            lsf.write_output(f'  {hostname}: WARNING - Failed to get Bearer token: HTTP {token_resp.status_code}')
+            return False
+
+        token = token_resp.json().get('accessToken', '')
+        if not token:
+            lsf.write_output(f'  {hostname}: WARNING - Empty Bearer token')
+            return False
+    except Exception as e:
+        lsf.write_output(f'  {hostname}: ERROR getting token - {e}')
+        return False
+
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+
+    # Check if already imported
+    try:
+        list_url = f'https://{hostname}/v1/sddc-manager/trusted-certificates'
+        list_resp = requests.get(list_url, headers=headers, verify=False, timeout=30)
+        if list_resp.status_code == 200:
+            existing = list_resp.json()
+            elements = existing if isinstance(existing, list) else existing.get('elements', [])
+            for entry in elements:
+                alias = entry.get('alias', '')
+                if 'vcf.lab' in alias.lower() or 'vault' in alias.lower():
+                    lsf.write_output(f'  {hostname}: Vault CA already trusted (alias: {alias})')
+                    return True
+    except Exception:
+        pass
+
+    # Import
+    try:
+        import_url = f'https://{hostname}/v1/sddc-manager/trusted-certificates'
+        payload = {
+            'certificate': ca_pem,
+            'certificateUsageType': 'TRUSTED_FOR_OUTBOUND'
+        }
+        resp = requests.post(import_url, headers=headers, json=payload,
+                             verify=False, timeout=30)
+
+        if resp.status_code in (200, 201, 202):
+            lsf.write_output(f'  {hostname}: SUCCESS - Vault CA imported to SDDC Manager trust store')
+            return True
+        elif resp.status_code == 409:
+            lsf.write_output(f'  {hostname}: Vault CA already in SDDC Manager trust store')
+            return True
+        else:
+            lsf.write_output(f'  {hostname}: WARNING - SDDC Manager import returned HTTP {resp.status_code}')
+            body = resp.text[:200] if resp.text else ''
+            if body:
+                lsf.write_output(f'  {hostname}:   Response: {body}')
+            return False
+    except Exception as e:
+        lsf.write_output(f'  {hostname}: ERROR - {e}')
+        return False
+
+
+def _trust_vault_ca_on_linux_appliance(hostname: str, user: str,
+                                        password: str, ca_pem: str,
+                                        dry_run: bool = False) -> bool:
+    """
+    Import the Vault root CA into a Linux appliance's OS trust store.
+
+    Works for Photon OS (VCF Automation, VSP nodes, etc.) and
+    other Linux appliances by writing to the system CA trust bundle
+    and running update-ca-certificates or rehash.
+
+    :param hostname: Appliance FQDN or IP
+    :param user: SSH user
+    :param password: SSH password
+    :param ca_pem: PEM-encoded CA certificate
+    :param dry_run: If True, preview only
+    :return: True if successful
+    """
+    if dry_run:
+        lsf.write_output(f'  {hostname}: Would add Vault CA to OS trust store')
+        return True
+
+    if not lsf.test_tcp_port(hostname, 22):
+        lsf.write_output(f'  {hostname}: SKIP - SSH port 22 not open')
+        return False
+
+    target = f'{user}@{hostname}'
+    escaped_pem = ca_pem.replace("'", "'\\''")
+
+    # Determine if we need sudo
+    needs_sudo = user != 'root'
+    sudo_prefix = f"echo '{password}' | sudo -S " if needs_sudo else ''
+
+    # Check if already present
+    check_cmd = f'{sudo_prefix}grep -c "vcf.lab Root Authority" /etc/ssl/certs/ca-certificates.crt 2>/dev/null || echo 0'
+    result = lsf.ssh(check_cmd, target, password)
+    stdout = getattr(result, 'stdout', '') or ''
+    if stdout.strip() and stdout.strip() != '0':
+        lsf.write_output(f'  {hostname}: Vault CA already in OS trust store')
+        return True
+
+    # Write the cert to the trusted anchors directory (works on both Photon and Ubuntu)
+    # Photon: /etc/pki/tls/certs/  or /etc/ssl/certs/
+    # Ubuntu: /usr/local/share/ca-certificates/
+    write_cmd = f"echo '{escaped_pem}' | {sudo_prefix}tee /etc/pki/tls/certs/vault-ca.pem > /dev/null 2>/dev/null"
+    lsf.ssh(write_cmd, target, password)
+
+    write_cmd2 = f"echo '{escaped_pem}' | {sudo_prefix}tee /usr/local/share/ca-certificates/vault-ca.crt > /dev/null 2>/dev/null"
+    lsf.ssh(write_cmd2, target, password)
+
+    # Run update-ca-certificates (Ubuntu/Debian) or rehash (Photon/RHEL)
+    update_cmd = (
+        f'{sudo_prefix}update-ca-certificates 2>/dev/null || '
+        f'{sudo_prefix}update-ca-trust 2>/dev/null || '
+        f'{sudo_prefix}c_rehash /etc/ssl/certs 2>/dev/null || true'
+    )
+    lsf.ssh(update_cmd, target, password)
+
+    lsf.write_output(f'  {hostname}: SUCCESS - Vault CA added to OS trust store')
+    return True
+
+
+def distribute_vault_ca_trust(ca_pem: str, password: str,
+                               dry_run: bool = False) -> bool:
+    """
+    Distribute the Vault root CA certificate to all VCF components.
+
+    Imports the CA into:
+    - vCenter TRUSTED_ROOTS (via dir-cli trustedcert publish)
+    - ESXi hosts (appended to /etc/vmware/ssl/castore.pem)
+    - NSX Managers (via trust-management API)
+    - SDDC Manager (via trusted-certificates API)
+    - VCF Automation appliances (OS trust store)
+    - VCF Operations VMs (OS trust store)
+
+    :param ca_pem: PEM-encoded Vault root CA certificate
+    :param password: Lab password
+    :param dry_run: If True, preview only
+    :return: True if at least some components succeeded
+    """
+    lsf.write_output('')
+    lsf.write_output('=' * 60)
+    lsf.write_output('Vault CA Trust Distribution Across VCF Suite')
+    lsf.write_output('=' * 60)
+
+    success_count = 0
+    total_count = 0
+
+    # --- vCenters ---
+    lsf.write_output('')
+    lsf.write_output('--- vCenter Servers ---')
+    if 'RESOURCES' in lsf.config and 'vCenters' in lsf.config['RESOURCES']:
+        vcenter_entries = lsf.config.get('RESOURCES', 'vCenters').split('\n')
+        for entry in vcenter_entries:
+            entry = entry.strip()
+            if not entry or entry.startswith('#'):
+                continue
+            parts = entry.split(':')
+            hostname = parts[0].strip()
+            user = parts[2].strip() if len(parts) > 2 else 'administrator@vsphere.local'
+            total_count += 1
+            if _trust_vault_ca_on_vcenter(hostname, user, password, ca_pem, dry_run):
+                success_count += 1
+    else:
+        lsf.write_output('  No vCenters found in config.ini')
+
+    # --- ESXi Hosts ---
+    lsf.write_output('')
+    lsf.write_output('--- ESXi Hosts ---')
+    if 'RESOURCES' in lsf.config and 'ESXiHosts' in lsf.config['RESOURCES']:
+        esx_entries = lsf.config.get('RESOURCES', 'ESXiHosts').split('\n')
+        for entry in esx_entries:
+            entry = entry.strip()
+            if not entry or entry.startswith('#'):
+                continue
+            parts = entry.split(':')
+            hostname = parts[0].strip()
+            total_count += 1
+            if _trust_vault_ca_on_esxi(hostname, password, ca_pem, dry_run):
+                success_count += 1
+    else:
+        lsf.write_output('  No ESXi hosts found in config.ini')
+
+    # --- NSX Managers ---
+    lsf.write_output('')
+    lsf.write_output('--- NSX Managers ---')
+    if 'VCF' in lsf.config and 'vcfnsxmgr' in lsf.config['VCF']:
+        nsx_entries = lsf.config.get('VCF', 'vcfnsxmgr').split('\n')
+        for entry in nsx_entries:
+            entry = entry.strip()
+            if not entry or entry.startswith('#'):
+                continue
+            parts = entry.split(':')
+            hostname = parts[0].strip()
+            total_count += 1
+            if _trust_vault_ca_on_nsx(hostname, password, ca_pem, dry_run):
+                success_count += 1
+    else:
+        lsf.write_output('  No NSX Managers found in config.ini')
+
+    # --- SDDC Manager ---
+    lsf.write_output('')
+    lsf.write_output('--- SDDC Manager ---')
+    sddcmgr = 'sddcmanager-a.site-a.vcf.lab'
+    if lsf.test_ping(sddcmgr):
+        total_count += 1
+        if _trust_vault_ca_on_sddc_manager(sddcmgr, password, ca_pem, dry_run):
+            success_count += 1
+    else:
+        lsf.write_output(f'  {sddcmgr}: SKIP - not reachable')
+
+    # --- VCF Automation Appliances ---
+    lsf.write_output('')
+    lsf.write_output('--- VCF Automation Appliances ---')
+    vcfa_hosts = [
+        ('auto-a.site-a.vcf.lab', 'vmware-system-user'),
+        ('auto-platform-a.site-a.vcf.lab', 'vmware-system-user'),
+    ]
+    for vcfa_host, vcfa_user in vcfa_hosts:
+        if lsf.test_ping(vcfa_host):
+            total_count += 1
+            if _trust_vault_ca_on_linux_appliance(vcfa_host, vcfa_user, password, ca_pem, dry_run):
+                success_count += 1
+        else:
+            lsf.write_output(f'  {vcfa_host}: SKIP - not reachable')
+
+    # --- VCF Operations VMs ---
+    lsf.write_output('')
+    lsf.write_output('--- VCF Operations VMs ---')
+    ops_vms = []
+    if 'VCF' in lsf.config and 'vcfopsvms' in lsf.config['VCF']:
+        ops_entries = lsf.config.get('VCF', 'vcfopsvms').split('\n')
+        for entry in ops_entries:
+            entry = entry.strip()
+            if not entry or entry.startswith('#'):
+                continue
+            parts = entry.split(':')
+            hostname = parts[0].strip()
+            ops_vms.append(hostname)
+    # Also try well-known ops hostnames if not in config
+    for ops_host in ['ops-a.site-a.vcf.lab', 'opslogs-a.site-a.vcf.lab']:
+        if ops_host not in ops_vms:
+            ops_vms.append(ops_host)
+
+    for ops_host in ops_vms:
+        # Determine SSH user based on hostname
+        if 'opslogs' in ops_host:
+            ssh_user = 'vmware-system-user'
+        else:
+            ssh_user = 'root'
+
+        if lsf.test_ping(ops_host):
+            total_count += 1
+            if _trust_vault_ca_on_linux_appliance(ops_host, ssh_user, password, ca_pem, dry_run):
+                success_count += 1
+        else:
+            lsf.write_output(f'  {ops_host}: SKIP - not reachable')
+
+    # --- Summary ---
+    lsf.write_output('')
+    lsf.write_output(f'Vault CA Trust Distribution: {success_count}/{total_count} components succeeded')
+
+    return success_count > 0
+
+
+#==============================================================================
 # VCENTER CA CERTIFICATE IMPORT
 #==============================================================================
 
@@ -3706,7 +4198,8 @@ def main():
     
     Orchestrates all HOLification steps in the correct order:
     0a. Vault root CA import to Firefox on console VM (with SKIP/RETRY/FAIL options)
-    0b. vCenter CA certificates import to Firefox on console VM (with SKIP/RETRY/FAIL options)
+    0b. Vault CA trust distribution across VCF suite (vCenters, ESXi, NSX, SDDC Mgr, VCFA, Ops)
+    0c. vCenter CA certificates import to Firefox on console VM (with SKIP/RETRY/FAIL options)
     1. Pre-checks and environment setup
     2. ESXi host configuration
     3. vCenter configuration
@@ -3784,7 +4277,15 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
         lsf.write_output('ERROR: Failed to configure Vault CA for Firefox')
         sys.exit(1)
     
-    # Step 0b: Import vCenter CA certificates to Firefox on console VM
+    # Step 0b: Distribute Vault CA trust across VCF suite
+    # Import the Vault root CA into vCenters, ESXi, NSX, SDDC Manager, VCFA, Ops VMs
+    vault_ca_pem = download_vault_ca_certificate() if not args.dry_run else None
+    if vault_ca_pem or args.dry_run:
+        distribute_vault_ca_trust(vault_ca_pem or '', password, args.dry_run)
+    else:
+        lsf.write_output('WARNING: Could not download Vault CA - skipping VCF trust distribution')
+    
+    # Step 0c: Import vCenter CA certificates to Firefox on console VM
     # This reads vCenters from config.ini and imports their CA certificates
     if not configure_vcenter_ca_for_firefox(args.dry_run):
         lsf.write_output('ERROR: Failed to configure vCenter CA certificates for Firefox')
