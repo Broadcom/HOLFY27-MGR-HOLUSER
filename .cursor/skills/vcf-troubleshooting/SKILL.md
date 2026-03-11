@@ -1428,3 +1428,67 @@ grep "Retrust for NSX failed" /var/log/vmware/vcf/operationsmanager/operationsma
 **Root Cause**: After vCenter certificate replacement, SDDC Manager performs ReTrust operations against NSX Managers to update their trust stores. This can fail transiently when vCenter services are still restarting or when the new certificate hasn't propagated to all endpoints. The actual certificate replacement and installation on vCenter are successful — only the post-install NSX trust update fails.
 
 **Fix**: Usually resolves on a retry. From the SDDC Manager UI, re-select the vCenter and click "Install Certificates" again. The ReTrust operation will retry. If the certificate dates already show the new values, the cert is installed correctly and only the trust relationship needs refreshing.
+
+## 31. NSX Compute Manager DOWN After vCenter Certificate Replacement (Double-Cert Bug)
+
+**Symptom**: NSX Managers show compute managers as `connection_status: DOWN` and `registration_status: REGISTERED_WITH_ERRORS` with error code `7059`: "Unable to connect to the compute manager as its trusted root certificate cannot be found." PUT to re-register returns HTTP 400 error `90348`: "Failed to import the trusted root certificate for compute manager."
+
+**Diagnosis**:
+
+```bash
+# Check compute manager status
+curl -sk -u "admin:$PASSWORD" \
+  "https://nsx-mgmt-01a.site-a.vcf.lab/api/v1/fabric/compute-managers/$CM_ID/status" | python3 -m json.tool
+
+# Check NSX error logs for the real cause
+ssh root@nsx-mgmt-01a.site-a.vcf.lab \
+  'grep "MP2179\|90348\|multiple certificates" /var/log/proton/nsxapi.log | tail -5'
+
+# Check vCenter TRUSTED_ROOTS for double-cert entries
+ssh root@vc-mgmt-a.site-a.vcf.lab \
+  'for alias in $(/usr/lib/vmware-vmafd/bin/vecs-cli entry list --store TRUSTED_ROOTS | grep Alias | awk -F":\t" "{print \$2}" | xargs); do
+     count=$(/usr/lib/vmware-vmafd/bin/vecs-cli entry getcert --store TRUSTED_ROOTS --alias "$alias" | grep -c "BEGIN CERTIFICATE")
+     subject=$(/usr/lib/vmware-vmafd/bin/vecs-cli entry getcert --store TRUSTED_ROOTS --alias "$alias" | openssl x509 -noout -subject 2>/dev/null)
+     echo "$alias: $count cert(s) - $subject"
+   done'
+```
+
+**Root Cause**: `dir-cli trustedcert publish` silently appends a duplicate PEM into the same vmdir entry when called twice with the same certificate, creating a multi-cert PEM under a single alias. When NSX tries to import trusted roots from vCenter during compute manager registration, `TrustStoreServiceImpl` rejects the PEM with error `MP2179`: "This certificate PEM contains multiple certificates." This cascades to error `90348` and the compute manager goes DOWN.
+
+**Fix**:
+
+```bash
+# 1. Download the clean single-cert PEM
+VAULT_CA=$(curl -sk http://10.1.1.1:32000/v1/pki/ca/pem)
+
+# 2. Unpublish the corrupted double-cert entry from vmdir
+ssh root@vc-mgmt-a.site-a.vcf.lab "
+  echo '$VAULT_CA' > /tmp/vault-ca-single.pem
+  /usr/lib/vmware-vmafd/bin/dir-cli trustedcert unpublish \
+    --cert /tmp/vault-ca-single.pem \
+    --login administrator@vsphere.local --password '$PASSWORD'
+  /usr/lib/vmware-vmafd/bin/vecs-cli force-refresh
+"
+
+# 3. Republish as a clean single-cert entry
+ssh root@vc-mgmt-a.site-a.vcf.lab "
+  /usr/lib/vmware-vmafd/bin/dir-cli trustedcert publish \
+    --cert /tmp/vault-ca-single.pem \
+    --login administrator@vsphere.local --password '$PASSWORD'
+  /usr/lib/vmware-vmafd/bin/vecs-cli force-refresh
+  rm -f /tmp/vault-ca-single.pem
+"
+
+# 4. Import Vault CA into NSX trust store (if not already present)
+curl -sk -u "admin:$PASSWORD" -X POST \
+  'https://nsx-mgmt-01a.site-a.vcf.lab/api/v1/trust-management/certificates?action=import' \
+  -H 'Content-Type: application/json' \
+  -d '{"display_name":"vcf.lab Root Authority","pem_encoded":"'"$VAULT_CA"'"}'
+
+# 5. Re-register compute manager with new thumbprint
+THUMB=$(echo | openssl s_client -connect vc-mgmt-a.site-a.vcf.lab:443 2>/dev/null \
+  | openssl x509 -fingerprint -sha256 -noout | sed 's/sha256 Fingerprint=//')
+# GET compute manager, modify credential.thumbprint, PUT back
+```
+
+**Prevention**: Always check `dir-cli trustedcert list | grep -c 'vcf.lab Root Authority'` before calling `dir-cli trustedcert publish`. The `confighol-9.1.py` v2.11+ includes this guard.

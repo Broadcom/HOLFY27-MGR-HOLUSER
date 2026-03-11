@@ -312,10 +312,36 @@ Automated by `confighol-9.1.py` Step 0b (`distribute_vault_ca_trust()`). Imports
 
 All functions are idempotent — they check for existing CA before importing.
 
-## 13. Cross-References
+**Critical pitfall**: `dir-cli trustedcert publish` silently appends a duplicate PEM when the cert already exists in vmdir, creating a multi-cert entry. NSX's `TrustStoreServiceImpl` rejects multi-cert PEMs (error `MP2179`), breaking compute-manager re-registration. Always check with `dir-cli trustedcert list | grep 'vcf.lab Root Authority'` before publishing. See `vcf-troubleshooting` skill Section 31.
+
+## 13. NSX Compute Manager Re-registration After Certificate Replacement
+
+After vCenter SSL certificates are replaced, NSX compute managers go `DOWN` because their trust chain no longer validates. The fix requires:
+
+1. **Import Vault CA** into NSX trust store (done by Step 12 above)
+2. **Fix double-cert entries** in vCenter TRUSTED_ROOTS if present (see troubleshooting Section 31)
+3. **PUT compute manager** with the vCenter's current SHA-256 thumbprint:
+
+```bash
+# Get the new thumbprint
+THUMB=$(echo | openssl s_client -connect vc-mgmt-a.site-a.vcf.lab:443 2>/dev/null \
+  | openssl x509 -fingerprint -sha256 -noout | sed 's/sha256 Fingerprint=//')
+
+# GET compute manager, set credential.thumbprint, PUT back
+curl -sk -u "admin:$PASSWORD" -X PUT \
+  "https://nsx-mgmt-01a.site-a.vcf.lab/api/v1/fabric/compute-managers/$CM_ID" \
+  -H 'Content-Type: application/json' \
+  -d '{ ... "credential": { "credential_type": "UsernamePasswordLoginCredential",
+        "username": "administrator@vsphere.local", "password": "...",
+        "thumbprint": "'$THUMB'" }, ... }'
+```
+
+`confighol-9.1.py` v2.11+ automates this via `_nsx_reregister_compute_managers()`, called after the trust distribution step. The function skips compute managers already in `UP/REGISTERED` state.
+
+## 14. Cross-References
 
 - **Vault PKI setup & Traefik TLS**: See `holorouter` skill (Vault section)
 - **SDDC Manager credentials & PostgreSQL**: See `vcf-9-api` skill (Sections 10-12)
-- **Certificate troubleshooting issues 27-30**: See `vcf-troubleshooting` skill
+- **Certificate troubleshooting issues 27-31**: See `vcf-troubleshooting` skill
 - **Proxy source code & deployment docs**: See `Tools/CertsrvProxy/README.md`
 - **VCF Operations cert mgmt API**: See `vcf-9-api` skill (Section 15)
