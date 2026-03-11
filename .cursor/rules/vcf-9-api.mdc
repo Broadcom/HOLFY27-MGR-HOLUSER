@@ -47,9 +47,23 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 - **SDDC Manager Bearer token auth** uses `admin@local` username for `/v1/tokens`. Not `vcf` or `administrator@vsphere.local`.
 - **opslogs-a SSH user is `vmware-system-user`** — root and admin are rejected. opsnet-a has no SSH access at all.
 - **auto-platform-a.site-a.vcf.lab (10.1.1.69)** is a separate VM from auto-a (10.1.1.70). SSH: `vmware-system-user`.
+- **SDDC Manager Microsoft CA proxy** at `https://ca.vcf.lab/certsrv` — impersonates Microsoft ADCS, forwards to Vault PKI on holorouter. Template names in `certrqxt.asp` must use `<Option Value="OID;TemplateName">` format for SDDC Manager's Java regex parser.
+- **Technitium DNS requires `vcf.lab` zone** for `ca.vcf.lab` records — only `site-a.vcf.lab` and `site-b.vcf.lab` exist by default.
+- **pyOpenSSL PKCS7 class removed** in v25+ — use `cryptography.hazmat.primitives.serialization.pkcs7.serialize_certificates()` instead.
+- **VCF Operations CA validation does NOT follow 301 redirects** — certsrv proxy must serve content directly (HTTP 200) for `/certsrv` without trailing slash. VCF Ops Java client treats 301 as failure.
+- **SDDC Manager `PUT /v1/certificate-authorities`** requires both `password` and `secret` fields in `microsoftCertificateAuthoritySpec`. Omitting `secret` returns HTTP 400.
+- **VCF Ops cert mgmt repo endpoint requires `page`/`pageSize` params** — without them, returns HTTP 500. Response key is `vcfRepositoryCertificates` with `certId` field.
+- **VCF Ops cert mgmt CSR PEM uses spaces not newlines** — must normalize before Vault signing. Field name is `csr` under `certificateSignatureInfo`.
+- **VCF Ops cert replace orchestrator**: VROPS (vidb, opslogs, opsnet, fleet/instance/vsp runtimes) completes in minutes. VRSLCM (auto-a, auto-platform-a, ops-a) depends on fleet-upgrade-service health.
+- **Fleet-upgrade-service internal error blocks VRSLCM cert replace** — tasks stay `NOT_STARTED`. CSR/sign/import still succeed; complete via VCF Operations UI.
+- **VCF Ops cert mgmt task status API returns HTTP 500** — poll `certificates/query` for issuer change instead.
+- **PKCS#7 `serialize_certificates()` reorders certs** — DER SET OF sorting puts CA before leaf. Must use custom `build_ordered_pkcs7()` for SDDC Manager compatibility (`certs[0]` = leaf, `certs[1]` = CA).
+- **Vault `sign-verbatim` preserves full CSR subject DN** — `sign/{role}` strips O/OU/C/L/ST fields. Always use `sign-verbatim/{role}` for SDDC Manager CSRs.
+- **SDDC Manager PostgreSQL** — Password in `/root/.pgpass` (SSH as `vcf`, use Python `pty.openpty()` to `su` to root). TCP on `127.0.0.1:5432`, database `operationsmanager`.
 
 ## Session Knowledge Capture
 
 At the end of any session involving VCF troubleshooting or API exploration, review what was learned and update the relevant skill files:
 - **New API patterns or credentials**: Update `/home/holuser/hol/.cursor/skills/vcf-9-api/SKILL.md`
 - **New failure patterns or fixes**: Update `/home/holuser/hol/.cursor/skills/vcf-troubleshooting/SKILL.md`
+- **Certificate operations (proxy, Vault, PKCS#7, SDDC Manager cert workflow)**: Update `/home/holuser/hol/.cursor/skills/vcf-certs/SKILL.md`

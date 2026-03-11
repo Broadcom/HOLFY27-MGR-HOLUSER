@@ -304,6 +304,49 @@ And add the outpost callback route (higher priority):
       port: 9000
 ```
 
+### Certsrv Proxy - Microsoft CA for Vault PKI (namespace: `default`)
+
+| Item | Detail |
+| --- | --- |
+| Deployment | K8s DaemonSet with hostNetwork (python:3.11-slim) |
+| Purpose | Impersonates Microsoft ADCS certsrv, forwards CSR signing to Vault PKI |
+| Listen Port | 443 (beta/standalone TLS) or 8900 (behind Traefik) |
+| Hostname | `ca.vcf.lab` -> 10.1.1.1 (Technitium DNS, vcf.lab zone) |
+| Auth | Basic Auth (any username, password = creds.txt) |
+| Vault Role | `pki/sign/holodeck` on http://127.0.0.1:32000 |
+| Files on Router | `/root/certsrv-proxy/` (script, TLS cert/key, creds.txt) |
+| Source | `/home/holuser/hol/Tools/CertsrvProxy/` on manager VM |
+
+**Endpoints implemented:**
+
+| Path | Method | Description |
+| --- | --- | --- |
+| `/certsrv/` | GET | Credential check (200 OK / 401) |
+| `/certsrv/certrqxt.asp` | GET | Template list (Option Value format with OID;Name) |
+| `/certsrv/certfnsh.asp` | POST | CSR submission (returns HTML with ReqID) |
+| `/certsrv/certnew.cer` | GET | Certificate retrieval (issued or CA cert) |
+| `/certsrv/certcarc.asp` | GET | CA renewal count (`nRenewals=0`) |
+| `/certsrv/certnew.p7b` | GET | CA chain (PKCS#7 DER format) |
+
+**Three deployment modes:**
+1. `install_certsrv_proxy-beta.sh` -- Standalone TLS on port 443 (no Traefik needed)
+2. `install_certsrv_proxy.sh` -- HTTP on port 8900 behind Traefik
+3. `docker/` -- Docker Compose with optional TLS toggle
+
+**SDDC Manager integration:**
+
+```bash
+curl -sk -X PUT "https://sddcmanager-a.site-a.vcf.lab/v1/certificate-authorities" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"microsoftCertificateAuthoritySpec":{"username":"admin@vcf.lab","secret":"<password>","serverUrl":"https://ca.vcf.lab/certsrv","templateName":"VCFWebServer"}}'
+```
+
+**Key implementation details:**
+- Template validation by SDDC Manager requires `<Option Value="OID;TemplateName">` format in `certrqxt.asp`
+- PKCS#7 built using `cryptography.hazmat.primitives.serialization.pkcs7.serialize_certificates()` (pyOpenSSL PKCS7 class removed in newer versions)
+- DNS record must be in a `vcf.lab` zone (not `site-a.vcf.lab`) -- the installer creates this zone if needed
+- In-memory cert store -- certificates are lost on pod restart
+
 ## Console VM (Firefox)
 
 - **Profile path:** `~/snap/firefox/common/.mozilla/firefox/hu6lbvyx.default/`

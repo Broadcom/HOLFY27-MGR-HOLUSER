@@ -37,6 +37,10 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | VCF Automation VIP drops after boot | auto-a pings then stops, "no route to host" | kube-vip releases VIP when istio-ingressgateway has no endpoints (ImagePullBackOff) | 24 |
 | Harbor unreachable, Supervisor DNS broken | Harbor pods CrashLoopBackOff with "i/o timeout" on DNS lookups | kube-dns endpoint points to LB IP causing asymmetric DLB routing | 25 |
 | VSP image pulls fail after boot | All VSP pods in ImagePullBackOff, Fleet LCM/Ops Logs HTTP 500 | VSP service CIDR `198.18.128.0/17` not in NO_PROXY; containerd routes internal pulls through Squid proxy | 26 |
+| VCF Ops Fleet Mgmt rejects Microsoft CA | "Failed to update certificate authorities" in UI | certsrv proxy returns 301 for `/certsrv`; VCF Ops Java client does not follow redirects | 27 |
+| certsrv-proxy Address already in use | Pod CrashLoopBackOff with `OSError: [Errno 98]` | Orphaned Python process on host still bound to port 443 after force pod delete | 28 |
+| SDDC Manager "Public key mismatch" on cert install | "Public key in CSR and server certificate are not matching" | PKCS#7 DER encoding sorts SET OF elements, putting CA cert before leaf cert | 29 |
+| NSX ReTrust fails after vCenter cert replacement | "Failed to import the trusted root certificate for compute manager" | NSX tries to re-trust vCenter while services are still restarting; transient timing issue | 30 |
 
 ---
 
@@ -1270,3 +1274,157 @@ sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-u
 - The `containerd` hosts.toml at `/etc/containerd/certs.d/registry.vmsp-platform.svc.cluster.local:5000/hosts.toml` specifies `host."https://198.18.128.16:5000"` with a CA cert, confirming the ClusterIP is used for image pulls.
 - Writing files to VSP nodes via `bash -c` heredoc through SSH+sudo layers often fails silently (produces 0-byte files). Use `scp` to transfer config files to `/tmp` and then `cp` to the final location.
 - After fixing containerd proxy, pods in `ImagePullBackOff` have very long backoff timers (5+ minutes after hours of failures). Force-deleting them ensures immediate retry.
+
+---
+
+> **Certificate-related issues 27-30**: For the complete certificate management guide (Vault PKI, MSADCS proxy, PKCS#7 ordering, SDDC Manager workflows), see the consolidated `vcf-certs` skill.
+
+## 27. VCF Operations Fleet Management Rejects MSADCS Proxy as Microsoft CA
+
+**Symptom**: VCF Operations Fleet Management UI shows "Failed to update certificate authorities" when configuring the MSADCS Proxy (`https://ca.vcf.lab/certsrv`) as a Microsoft CA. SDDC Manager API (`PUT /v1/certificate-authorities`) succeeds, but the UI reports failure.
+
+**Diagnosis**:
+
+```bash
+# Check certsrv-proxy logs on the holorouter
+ssh root@router kubectl logs -l app=certsrv-proxy --tail=50
+
+# Look for 301 redirects from VCF Operations IP (10.1.1.30)
+# Example log line showing the problem:
+# [2026-03-11 15:00:01] INFO 10.1.1.30 "GET /certsrv HTTP/1.1" 301 -
+```
+
+VCF Operations (`ops-a.site-a.vcf.lab`, IP `10.1.1.30`) sends `GET /certsrv` (without trailing slash) to validate the CA. If the proxy returns `301 Moved Permanently` redirecting to `/certsrv/`, the VCF Operations Java HTTP client does not follow the redirect and treats it as a validation failure. SDDC Manager (`10.1.1.5`) validates via `GET /certsrv/certrqxt.asp` which returns 200 directly — that's why SDDC Manager succeeds while VCF Operations fails.
+
+**Root Cause**: The proxy's `do_GET` handler was redirecting `/certsrv` to `/certsrv/` with a 301. VCF Operations' Java HTTP client does not follow 301 redirects during CA validation.
+
+**Fix**: Modify the proxy to serve the home page content directly for `/certsrv` and `/certsrv/default.asp` instead of redirecting:
+
+```python
+# In do_GET handler, serve content directly for these paths:
+if path in ('/certsrv', '/certsrv/default.asp', ''):
+    self._send_html(200, CERTSRV_HOME_HTML)
+    return
+```
+
+After fixing, redeploy the proxy script and restart the pod:
+
+```bash
+sshpass -p "${PASSWORD}" scp -o StrictHostKeyChecking=accept-new \
+  certsrv_proxy-beta.py root@router:/root/certsrv-proxy/certsrv_proxy-beta.py
+sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@router \
+  "kubectl delete pod -l app=certsrv-proxy --force --grace-period=0"
+```
+
+Verify fix:
+
+```bash
+# Must return 200, not 301
+curl -sk -u 'admin:password' -o /dev/null -w '%{http_code}' https://ca.vcf.lab/certsrv
+```
+
+## 28. certsrv-proxy "Address Already in Use" After Pod Restart
+
+**Symptom**: After force-deleting the certsrv-proxy pod (`kubectl delete pod --force --grace-period=0`), the new pod enters CrashLoopBackOff with `OSError: [Errno 98] Address already in use`.
+
+**Diagnosis**:
+
+```bash
+# Check pod logs
+ssh root@router kubectl logs -l app=certsrv-proxy
+
+# Check what process is holding port 443
+ssh root@router ss -tlnp | grep :443
+```
+
+**Root Cause**: When using `hostNetwork: true` and `--force --grace-period=0`, the old Python process on the host may not be terminated before the new pod tries to bind to the same port. The DaemonSet's hostNetwork mode means the container process binds directly to the host's network namespace.
+
+**Fix**: Manually kill the orphaned process, then delete the pod again:
+
+```bash
+# Find the PID holding port 443
+ssh root@router ss -tlnp | grep :443
+# Kill it
+ssh root@router kill -9 <pid>
+# Delete the pod to trigger a clean restart
+ssh root@router kubectl delete pod -l app=certsrv-proxy --force --grace-period=0
+```
+
+**Prevention**: Use a graceful pod deletion (without `--force --grace-period=0`) when possible, or add a `preStop` hook to the container spec that kills the Python process cleanly.
+
+## 20. Fleet-Managed Certificate Replacement Stuck at NOT_STARTED
+
+**Symptom**: VCF Operations Certificate Management API accepts the replace request (HTTP 200/202) and returns a task ID, but the certificate never changes. The task's `subTasksDetails` shows `status: NOT_STARTED` with `orchestratorType: VRSLCM`. Affected components: VCF Automation (`auto-a`, `auto-platform-a`) and VCF Operations (`ops-a`).
+
+**Diagnosis**:
+
+```bash
+# Check fleet-upgrade-service health
+PASSWORD=$(cat /home/holuser/creds.txt)
+curl -sk -u "admin:$PASSWORD" \
+  'https://fleet-01a.site-a.vcf.lab/fleet-lcm/v1/certificates' 2>/dev/null | python3 -m json.tool
+# If response contains "VCF_LCM_500_INTERNAL_SERVER_ERROR" and
+# "Internal Server Error for service fleet-upgrade-service", the service is down
+```
+
+**Root Cause**: The VRSLCM orchestrator delegates VCF Automation and VCF Operations certificate replacements to the `fleet-upgrade-service` running on the VSP cluster (fleet-01a). When this service has an internal error, replacement tasks remain in `NOT_STARTED` state indefinitely. Other components (VCF services runtimes, Identity broker, Log management, Ops for Networks) use the `VROPS` orchestrator instead and complete normally.
+
+**Workaround**:
+1. The CSR, signing, and import steps complete successfully via API
+2. The signed certificate is available in the VCF Operations certificate repository
+3. Use the VCF Operations UI manually: `Manage > Fleet Management > Certificates > Replace With Imported Certificate`
+4. Select the Vault-signed cert from the repository and apply to the target
+
+**Note**: Components using the VROPS orchestrator (vidb-a, opslogs-a, opsnet-a, fleet-01a, instance-01a, vsp-01a) replace certificates successfully via API without needing the fleet-upgrade-service.
+
+## 29. SDDC Manager "Public Key Mismatch" During Certificate Installation
+
+**Symptom**: SDDC Manager certificate installation fails with `"Public key in CSR and server certificate are not matching."` The log shows `SslCertValidator` comparing the CSR against `CN=vcf.lab Root Authority` (the CA cert) instead of the issued leaf cert.
+
+**Diagnosis**:
+
+```bash
+# Check operationsmanager log on SDDC Manager
+ssh vcf@sddcmanager-a.site-a.vcf.lab
+grep "Public key mismatch" /var/log/vmware/vcf/operationsmanager/operationsmanager.log | tail -5
+# Look for: "Public key mismatch in CSR (CN=...) and provided certificate (CN=vcf.lab Root Authority)"
+```
+
+**Root Cause**: Python's `cryptography` library's `pkcs7.serialize_certificates()` uses strict DER encoding, which requires SET OF elements to be sorted by their encoded byte values. This reorders certificates inside the PKCS#7 structure regardless of the order passed to the function. SDDC Manager's `CertificateOperationOrchestratorImpl.generateCertificate()` method calls `getCertificateChain()` which returns `X509Certificate[]` from parsing the PKCS#7, then takes `certs[0]` as the signed certificate and `certs[1..]` as the CA chain. When DER sorting puts the CA cert first, SDDC Manager treats it as the signed cert and the public key comparison fails.
+
+**Fix**: Replace `serialize_certificates()` with a custom `build_ordered_pkcs7()` function that manually constructs the PKCS#7 ASN.1 structure, preserving certificate insertion order. The certificates field uses tag `0xA0` (context [0] constructed) and the leaf cert DER bytes must appear before the CA cert DER bytes.
+
+```python
+def build_ordered_pkcs7(cert_der_list: list[bytes]) -> bytes:
+    """Build PKCS#7 SignedData preserving certificate order."""
+    oid_signed_data = bytes([0x06,0x09,0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x07,0x02])
+    oid_data = bytes([0x06,0x09,0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x07,0x01])
+    version = bytes([0x02,0x01,0x01])
+    digest_algs = bytes([0x31,0x00])
+    content_info = bytes([0x30]) + _der_length(len(oid_data)) + oid_data
+    certs_content = b''.join(cert_der_list)
+    certs_field = bytes([0xa0]) + _der_length(len(certs_content)) + certs_content
+    signer_infos = bytes([0x31,0x00])
+    sd = version + digest_algs + content_info + certs_field + signer_infos
+    signed_data = bytes([0x30]) + _der_length(len(sd)) + sd
+    explicit0 = bytes([0xa0]) + _der_length(len(signed_data)) + signed_data
+    outer = oid_signed_data + explicit0
+    return bytes([0x30]) + _der_length(len(outer)) + outer
+```
+
+**Verification**: Test the PKCS#7 output with Java's `CertificateFactory.generateCertificates()` on the SDDC Manager to confirm `certs[0]` is the leaf cert.
+
+## 30. NSX ReTrust Failure After vCenter Certificate Replacement
+
+**Symptom**: SDDC Manager reports `CERTIFICATE_RETRUST_OPERATION_FAILED` after successfully replacing the vCenter certificate. NSX Manager returns HTTP 400 with error `"Failed to import the trusted root certificate for compute manager"`.
+
+**Diagnosis**:
+
+```bash
+ssh vcf@sddcmanager-a.site-a.vcf.lab
+grep "Retrust for NSX failed" /var/log/vmware/vcf/operationsmanager/operationsmanager.log | tail -3
+```
+
+**Root Cause**: After vCenter certificate replacement, SDDC Manager performs ReTrust operations against NSX Managers to update their trust stores. This can fail transiently when vCenter services are still restarting or when the new certificate hasn't propagated to all endpoints. The actual certificate replacement and installation on vCenter are successful — only the post-install NSX trust update fails.
+
+**Fix**: Usually resolves on a retry. From the SDDC Manager UI, re-select the vCenter and click "Install Certificates" again. The ReTrust operation will retry. If the certificate dates already show the new values, the cert is installed correctly and only the trust relationship needs refreshing.

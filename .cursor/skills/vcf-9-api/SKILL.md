@@ -683,6 +683,159 @@ VSP_NODES=$(sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T 
 | Supervisor source | `CLUSTER_CONFIGURED` (overrides `VC_INHERITED` default) |
 | Automated by | `confighol-9.1.py` v2.9+ (Step 9) |
 
+## 15. VCF Operations Certificate Management API
+
+> **Consolidated reference**: For the complete certificate management guide (MSADCS proxy, SDDC Manager cert workflow, Vault signing, PKCS#7 ordering, troubleshooting), see the `vcf-certs` skill.
+
+The VCF Operations internal API manages TLS certificates for fleet-managed components (VCF Automation, Log Management, Operations for Networks, Identity Broker, VCF services runtimes).
+
+### Authentication
+
+```python
+import requests
+requests.packages.urllib3.disable_warnings()
+
+OPS = "ops-a.site-a.vcf.lab"
+PASSWORD = open("/home/holuser/creds.txt").read().strip()
+
+# Acquire OpsToken (try "local" first, then "localItem")
+resp = requests.post(f"https://{OPS}/suite-api/api/auth/token/acquire",
+    json={"username": "admin", "authSource": "local", "password": PASSWORD},
+    verify=False)
+token = resp.json()["token"]
+
+session = requests.Session()
+session.verify = False
+session.headers.update({
+    "Authorization": f"OpsToken {token}",
+    "Content-Type": "application/json",
+    "X-vRealizeOps-API-use-unsupported": "true"
+})
+
+# CRITICAL: Initialize the cert management session by calling the internal endpoint
+session.post(f"https://{OPS}/vcf-operations/rest/ops/internal/certificatemanagement/certificates/query",
+    json={"vcfComponent": "VCF_MANAGEMENT", "vcfComponentType": "ARIA"})
+```
+
+### Query Certificates
+
+```python
+resp = session.post(
+    f"https://{OPS}/suite-api/internal/certificatemanagement/certificates/query",
+    json={"vcfComponent": "VCF_MANAGEMENT", "vcfComponentType": "ARIA"})
+# Response key: "vcfCertificateModels" (list of all cert types)
+certs = resp.json()["vcfCertificateModels"]
+tls_certs = [c for c in certs if c["category"] == "TLS_CERT"]
+# Key fields: certificateResourceKey, applianceIp, issuedToCommonName, issuedBy,
+#   displayApplianceType, displayStatus, appliance (enum like ARIA_AUTOMATION)
+```
+
+### Generate CSR
+
+```python
+payload = {
+    "commonCsrData": {
+        "country": "US", "email": "", "keySize": "KEY_2048",
+        "keyAlgorithm": "RSA", "locality": "Palo Alto",
+        "organization": "Broadcom", "orgUnit": "vcfms", "state": "CA"
+    },
+    "componentCsrData": [{
+        "certificateId": "<certificateResourceKey>",
+        "commonName": "target-fqdn",
+        "subjectAltNames": {"dns": ["target-fqdn"], "ip": ["10.1.1.X"]}
+    }]
+}
+resp = session.post(f"https://{OPS}/suite-api/internal/certificatemanagement/csrs", json=payload)
+# CRITICAL: keySize must be enum: UNKNOWN, KEY_2048, KEY_3072, KEY_4096
+```
+
+### List CSRs
+
+```python
+resp = session.get(f"https://{OPS}/suite-api/internal/certificatemanagement/csrs")
+# Response key: "certificateSignatureInfo" (NOT "csrDetails")
+# CSR PEM is in "csr" field (NOT "csrContent")
+# CSR uses spaces instead of newlines — MUST normalize before Vault signing
+```
+
+### Import Signed Certificate
+
+```python
+payload = {
+    "certificates": [{
+        "name": "vault-target-timestamp",
+        "source": "PASTE",
+        "certificate": server_cert_pem + "\n" + ca_cert_pem
+    }]
+}
+resp = session.put(
+    f"https://{OPS}/suite-api/internal/certificatemanagement/repository/certificates/import",
+    json=payload)
+```
+
+### List Repository Certificates
+
+```python
+# CRITICAL: page and pageSize params are REQUIRED, otherwise returns HTTP 500
+resp = session.get(
+    f"https://{OPS}/suite-api/internal/certificatemanagement/repository/certificates",
+    params={"page": 0, "pageSize": 100})
+# Response key: "vcfRepositoryCertificates" (NOT "repositoryCertificateModels")
+# Cert ID field: "certId" (NOT "certificateId")
+# Key fields: certId, name, commonName, issuer, inUse, caType
+```
+
+### Replace Certificate
+
+```python
+payload = {
+    "caType": "EXTERNAL_CA",
+    "certificatesMapping": [{
+        "certificateId": "<certificateResourceKey from query>",
+        "importedCertificateId": "<certId from repo>"
+    }]
+}
+resp = session.put(
+    f"https://{OPS}/suite-api/internal/certificatemanagement/certificates/replace",
+    json=payload)
+# Response includes subTasksDetails with orchestratorType (VROPS or VRSLCM)
+```
+
+### Orchestrator Types and Limitations
+
+| Component | Orchestrator | Behavior |
+| --- | --- | --- |
+| VCF services runtime (fleet-01a, instance-01a, vsp-01a) | VROPS | Replacement completes within minutes |
+| Identity broker (vidb-a) | VROPS | Replacement completes within minutes |
+| Log management (opslogs-a) | VROPS | Replacement completes within minutes |
+| VCF Ops for networks (opsnet-a) | VROPS | Replacement completes within minutes |
+| VCF Automation (auto-a, auto-platform-a) | VRSLCM | Depends on fleet-upgrade-service health |
+| VCF Operations (ops-a) | VRSLCM | Depends on fleet-upgrade-service health |
+
+**VRSLCM orchestrator limitation**: The VRSLCM orchestrator delegates to the `fleet-upgrade-service` running on the VSP cluster. If this service is unhealthy (returns `VCF_LCM_500_INTERNAL_SERVER_ERROR`), replacement tasks stay at `NOT_STARTED` indefinitely. The CSR/sign/import steps succeed but the final replacement never executes.
+
+### Task Status API (Unreliable)
+
+```python
+# Task status endpoint returns HTTP 500 for most tasks
+resp = session.get(f"https://{OPS}/suite-api/internal/certificatemanagement/tasks/{task_id}")
+# Workaround: Poll the certificate query endpoint and check issuedBy field change
+```
+
+### Fleet-Managed Targets and Certificate Keys
+
+| Target | Component | Certificate Key |
+| --- | --- | --- |
+| auto-a.site-a.vcf.lab | ARIA_AUTOMATION | e10c3710-b85f-32b8-bdfb-6185932903f1 |
+| auto-platform-a.site-a.vcf.lab | ARIA_AUTOMATION | a3ac49bf-a649-3232-9b17-8cab0fda02f5 |
+| ops-a.site-a.vcf.lab | ARIA_OPERATION | 8a3c3ddc-ce65-35ff-a3a1-7fc5005134f3 |
+| opslogs-a.site-a.vcf.lab | ARIA_LOGS | e0cc9b82-b58e-3200-9baf-5ca052a80128 |
+| vidb-a.site-a.vcf.lab | V_IDB | a5348e66-3817-3507-925e-03f6efc2b5ad |
+| fleet-01a.site-a.vcf.lab | VMSP_PLATFORM | 869fe28e-d4c8-36cd-b811-bf819f1416e3 |
+| instance-01a.site-a.vcf.lab | VMSP_PLATFORM | 9885f72c-b252-38bf-a4fe-c2c86a8212fa |
+| vsp-01a.site-a.vcf.lab | VMSP_PLATFORM | f054476f-d26e-3279-b46c-4dfcc1f0f12e |
+| opsnet-a (10.1.1.60) | ARIA_NETWORK | 29cfd82e-dec4-30f1-83a2-2c68ab59dac5 |
+
 ## Critical Pitfalls Discovered
 
 1. **NSX user IDs are numeric**: `/api/v1/node/users/admin` = 404. Use `/api/v1/node/users/10000`.
@@ -740,3 +893,22 @@ VSP_NODES=$(sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T 
 51. **opsnet-a.site-a.vcf.lab has no SSH access**: VCF Operations for Networks (opsnet-a) does not accept SSH connections from any user (root, admin, vmware-system-user all fail). It is accessible only via HTTPS. Certificate is managed via the VSP cluster Ops Locker.
 52. **NSX Edge VMs (vna-wld01-*) are unreachable on port 443**: In VCF 9.1 C4, the NSX Edge transport nodes are named `vna-wld01-01a` and `vna-wld01-02a` (not `edge-*`). They do not expose HTTPS on port 443 from the management network.
 53. **VCF 9.1 C4 VSP cluster has 6 nodes**: The VSP cluster in this build has 6 nodes (IPs: 10.1.1.141, 10.1.1.143, 10.1.1.144, 10.1.1.145, 10.1.1.146, 10.1.1.147) with control plane VIP at 10.1.1.142.
+54. **SDDC Manager Microsoft CA proxy (certsrv)**: See the `vcf-certs` skill for complete proxy documentation, deployment, PKCS#7 ordering, and SDDC Manager cert workflow. Source files in `Tools/CertsrvProxy/`.
+55. **SDDC Manager certsrv template validation requires `OID;Name` format**: The `MicrosoftCaService.java` class uses regex `<Option Value="(.+)">.+?</Option>` (case-insensitive) to extract templates from `certrqxt.asp`, then splits the Value by `;` and takes `[1]` as the template name. Template options MUST use `<Option Value="1.3.6.1.4.1.311.21.8.X;TemplateName">Display Name</Option>` format.
+56. **pyOpenSSL `PKCS7` class removed in v25+**: `OpenSSL.crypto.PKCS7()` raises `AttributeError` on pyOpenSSL 25.x+ (bundled with cryptography 46.x). Use `cryptography.hazmat.primitives.serialization.pkcs7.serialize_certificates()` instead.
+57. **Technitium DNS `vcf.lab` zone must be created for `ca.vcf.lab`**: Only `site-a.vcf.lab` and `site-b.vcf.lab` zones exist by default. A `vcf.lab` zone must be created via `api/zones/create?zone=vcf.lab&type=Primary` before adding `ca.vcf.lab` A records. This does not affect subzone delegation.
+58. **VCF Operations Fleet Management CA validation does NOT follow 301 redirects**: When configuring a Microsoft CA, VCF Operations sends `GET /certsrv` (without trailing slash). If the server responds with `301 Moved Permanently` to `/certsrv/`, VCF Operations' Java HTTP client does not follow the redirect and reports "Failed to update certificate authorities". The certsrv proxy must serve content directly (HTTP 200) for both `/certsrv` and `/certsrv/` — no redirects.
+59. **SDDC Manager CA `secret` field required for PUT**: The `PUT /v1/certificate-authorities` body requires `microsoftCertificateAuthoritySpec.secret` in addition to `password`. Omitting `secret` returns HTTP 400 "Secret in Microsoft certificate authority spec cannot be null or blank". Both fields should be set to the same password value.
+60. **SDDC Manager cert generation uses PKCS#7 retrieval**: After `POST /certsrv/certfnsh.asp`, SDDC Manager parses the HTML for `certnew.cer\?ReqID=(\d+)&amp` (expects HTML entity `&amp;`, not raw `&`), then fetches the signed cert chain via `GET /certsrv/certnew.p7b?ReqID=<id>&Enc=b64` (PKCS#7 format). The proxy must support ReqID-based lookups on the `/certnew.p7b` endpoint, not just `CACert`.
+61. **SDDC Manager certfnsh.asp POST uses Apache HttpClient `UrlEncodedFormEntity`**: The POST body uses proper URL encoding where `+` in base64 CSR data is encoded as `%2B`. The proxy must use `urllib.parse.parse_qs()` (not manual `split('&')` + `unquote_plus()`) to preserve `+` characters in CSR data. `unquote_plus()` converts `+` to space, corrupting base64.
+62. **Python `.format()` unsafe on HTML with CSS**: Pre-built HTML templates containing CSS `{...}` braces (e.g., `:root { --bg: ... }`) will crash Python's `str.format()` with `KeyError`. Use `str.replace()` with a safe placeholder like `{{ERROR}}` instead.
+60. **VCF Operations cert mgmt CSR response uses `certificateSignatureInfo` key**: The `GET .../csrs` endpoint returns CSRs under `certificateSignatureInfo` (not `csrDetails`). CSR PEM is in the `csr` field (not `csrContent`). CSR PEM uses spaces instead of newlines — must normalize (replace spaces with newlines, fix BEGIN/END markers) before sending to Vault for signing.
+61. **VCF Operations cert mgmt repo requires `page`/`pageSize` params**: The `GET .../repository/certificates` endpoint returns HTTP 500 without query parameters. Must pass `?page=0&pageSize=100`. Response uses `vcfRepositoryCertificates` key (not `repositoryCertificateModels`). Cert ID field is `certId` (not `certificateId`).
+62. **VCF Operations cert replace orchestrator types**: VROPS orchestrator handles VCF services runtimes (fleet-01a, instance-01a, vsp-01a), Identity broker, Log management, and Ops for Networks — these complete in minutes. VRSLCM orchestrator handles VCF Automation and VCF Operations — depends on `fleet-upgrade-service` health. If unhealthy, tasks remain `NOT_STARTED` indefinitely.
+63. **VCF Operations cert mgmt task status API returns HTTP 500**: The `GET .../tasks/{taskId}` endpoint consistently returns HTTP 500 "Internal Server error, cause unknown" for most tasks. Workaround: poll `certificates/query` and check `issuedBy` field for issuer change, or poll `repository/certificates` to confirm import.
+64. **VCF Operations cert mgmt CSR generation `keySize` is enum**: The `commonCsrData.keySize` field must be an enum value (`KEY_2048`, `KEY_3072`, or `KEY_4096`), not a plain number string like `"4096"`. Using `"4096"` returns HTTP 400 "Could not map [4096] to KeySize".
+65. **Vault PKI role `holodeck` needs `allow_any_name` and `enforce_hostnames: false`**: To sign CSRs with arbitrary CNs (like `VCFA`, `OPS_LOGS`, `VIDB`), the Vault PKI role must have `allow_any_name: true` and `enforce_hostnames: false`. Default role rejects non-hostname CNs with "common name ... not allowed by this role".
+66. **VCF Operations cert mgmt query requires POST with body**: The query certificates endpoint is POST (not GET) and requires body `{"vcfComponent": "VCF_MANAGEMENT", "vcfComponentType": "ARIA"}`. An empty body returns 0 results.
+67. **PKCS#7 DER encoding reorders certificates**: Python's `cryptography.hazmat.primitives.serialization.pkcs7.serialize_certificates()` uses strict DER which sorts SET OF elements by encoded byte value, destroying certificate order. SDDC Manager's `CertificateOperationOrchestratorImpl` takes `certs[0]` as signed cert and `certs[1..]` as CA chain from the PKCS#7 response. Use a custom ASN.1 builder (`build_ordered_pkcs7()`) that constructs the `[0] IMPLICIT` certificates field directly from concatenated DER bytes to preserve leaf-first ordering. Java's `CertificateFactory.generateCertificates()` preserves the order from the raw ASN.1 structure.
+68. **SDDC Manager `sign-verbatim` required for full subject DN**: Vault's `pki/sign/{role}` strips subject DN fields (O, OU, C, L, ST) when the role has empty arrays for those fields. Use `pki/sign-verbatim/{role}` instead to preserve the full CSR subject DN. Also add `ext_key_usage: ['ServerAuth', 'ClientAuth']` and `key_usage: ['DigitalSignature', 'KeyAgreement', 'KeyEncipherment']` to the payload.
+69. **SDDC Manager PostgreSQL password location**: On SDDC Manager, use `su` to root (requires TTY via `pty.openpty()` in Python) then read `/root/.pgpass`. Format: `localhost:*:*:postgres:<password>`. Database `operationsmanager` contains task/execution tables but cert data is in-memory during workflows. Use `PGPASSWORD=... psql -h 127.0.0.1 -U postgres -d operationsmanager` for queries.
