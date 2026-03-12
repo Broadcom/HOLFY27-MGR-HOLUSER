@@ -42,15 +42,21 @@ VCF Components Managed:
   - nsx-wld01-01a.site-a.vcf.lab   (WLD NSX Node)       [AUTOMATED]
 
   Fleet-managed (VCF Operations Certificate Management API):
-  - ops-a.site-a.vcf.lab           (VCF Operations)      [AUTOMATED]
-  - auto-a.site-a.vcf.lab          (VCF Automation)      [AUTOMATED]
-  - auto-platform-a.site-a.vcf.lab (VCFA Platform)       [AUTOMATED]
+  - ops-a.site-a.vcf.lab           (VCF Operations)      [AUTOMATED*]
+  - auto-a.site-a.vcf.lab          (VCF Automation)      [AUTOMATED*]
+  - auto-platform-a.site-a.vcf.lab (VCFA Platform)       [AUTOMATED*]
   - opslogs-a.site-a.vcf.lab       (Log management)      [AUTOMATED]
   - opsnet-a.site-a.vcf.lab        (VCF Ops for networks)[AUTOMATED]
   - vidb-a.site-a.vcf.lab          (Identity broker)     [AUTOMATED]
   - fleet-01a.site-a.vcf.lab       (VCF services runtime)[AUTOMATED]
   - instance-01a.site-a.vcf.lab    (VCF services runtime)[AUTOMATED]
   - vsp-01a.site-a.vcf.lab         (VCF services runtime)[AUTOMATED]
+
+  * VRSLCM orchestrator dependency: VCF Automation and VCF Operations cert
+    replacements require the VRSLCM orchestrator (via fleet-upgrade-service).
+    If this service is unhealthy, the CSR/sign/import steps succeed but the
+    final replacement hangs. In that case, use the VCF Operations UI manually:
+    Fleet Management > Certificates > Replace With Imported Certificate.
 
 Security: Credentials can be provided via:
 - Environment variables (VCF_PASS)
@@ -1089,6 +1095,16 @@ class VCFOpsCertManagementAPI:
         Replace an active certificate with an imported one from the repository.
         Returns task ID on success.
         """
+        result = self.replace_certificate_with_details(cert_resource_key, repo_cert_id)
+        if result:
+            return result.get('id')
+        return None
+
+    def replace_certificate_with_details(self, cert_resource_key: str, repo_cert_id: str) -> Optional[Dict]:
+        """
+        Replace an active certificate with an imported one from the repository.
+        Returns full task response dict (including subTasksDetails with orchestratorType).
+        """
         url = f"{self.ops_url}/suite-api/internal/certificatemanagement/certificates/replace"
         payload = {
             "caType": "EXTERNAL_CA",
@@ -1103,7 +1119,7 @@ class VCFOpsCertManagementAPI:
                 task = resp.json()
                 task_id = task.get('id')
                 logger.info(f"  Certificate replace task: {task_id}")
-                return task_id
+                return task
             else:
                 logger.error(f"  Certificate replace failed: {resp.status_code}")
                 logger.error(f"  Response: {resp.text[:500]}")
@@ -1578,6 +1594,373 @@ class VCenterCertReplacer:
 # Main Certificate Replacement Function
 # =============================================================================
 
+# =============================================================================
+# NSX Compute Manager Re-registration After Certificate Replacement
+# =============================================================================
+
+class NSXComputeManagerFixer:
+    """
+    Fixes NSX compute manager trust issues after vCenter/NSX certificate replacement.
+
+    After vCenter SSL certificates are replaced with Vault-signed certs, NSX compute
+    managers go DOWN because:
+    1. The Vault CA may have a double-cert entry in vCenter TRUSTED_ROOTS (caused by
+       dir-cli trustedcert publish being called twice), which NSX rejects (MP2179)
+    2. The vCenter thumbprint stored in NSX no longer matches the new certificate
+    3. The Vault CA may not be in the NSX trust store
+
+    This class performs three remediation steps:
+    - Fix double-cert entries in vCenter TRUSTED_ROOTS
+    - Import Vault CA into NSX trust stores (idempotent)
+    - Re-register compute managers with the new vCenter thumbprint
+    """
+
+    VCENTER_NSX_PAIRS = [
+        {
+            'vcenter_fqdn': 'vc-mgmt-a.site-a.vcf.lab',
+            'vcenter_sso_user': 'administrator@vsphere.local',
+            'vcenter_sso_domain': 'vsphere.local',
+            'nsx_fqdn': 'nsx-mgmt-01a.site-a.vcf.lab',
+        },
+        {
+            'vcenter_fqdn': 'vc-wld01-a.site-a.vcf.lab',
+            'vcenter_sso_user': 'administrator@wld.sso',
+            'vcenter_sso_domain': 'wld.sso',
+            'nsx_fqdn': 'nsx-wld01-01a.site-a.vcf.lab',
+        },
+    ]
+
+    def __init__(self, password: str, vault_url: str, vault_token: str):
+        self.password = password
+        self.vault_url = vault_url.rstrip('/')
+        self.vault_token = vault_token
+
+    def _get_vault_ca_pem(self) -> Optional[str]:
+        """Get the Vault root CA PEM."""
+        try:
+            resp = requests.get(f"{self.vault_url}/v1/pki/ca/pem", timeout=10, verify=False)
+            if resp.status_code == 200:
+                return resp.text.strip()
+        except Exception as e:
+            logger.error(f"  Failed to get Vault CA: {e}")
+        return None
+
+    def _get_vcenter_thumbprint(self, fqdn: str) -> Optional[str]:
+        """Get the SHA-256 thumbprint of a vCenter's current SSL certificate."""
+        try:
+            result = subprocess.run(
+                ['bash', '-c',
+                 f'echo | openssl s_client -connect {fqdn}:443 2>/dev/null '
+                 f'| openssl x509 -fingerprint -sha256 -noout '
+                 f'| sed "s/sha256 Fingerprint=//"'],
+                capture_output=True, text=True, timeout=15
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception as e:
+            logger.error(f"  Failed to get thumbprint for {fqdn}: {e}")
+        return None
+
+    def fix_vcenter_trusted_roots(self, vcenter_fqdn: str, sso_user: str) -> bool:
+        """
+        Fix double-cert entries for Vault CA in vCenter TRUSTED_ROOTS.
+
+        dir-cli trustedcert publish silently appends a duplicate PEM when called
+        twice with the same cert. NSX rejects multi-cert PEMs with MP2179.
+        """
+        logger.info(f"  Checking TRUSTED_ROOTS on {vcenter_fqdn} for double-cert entries...")
+
+        vault_ca = self._get_vault_ca_pem()
+        if not vault_ca:
+            return False
+
+        # Check for double-cert entries
+        ok, output = run_ssh_command(
+            vcenter_fqdn, 'root', self.password,
+            'for alias in $(/usr/lib/vmware-vmafd/bin/vecs-cli entry list --store TRUSTED_ROOTS '
+            '| grep Alias | awk -F":\\t" \'{print $2}\' | xargs); do '
+            'count=$(/usr/lib/vmware-vmafd/bin/vecs-cli entry getcert --store TRUSTED_ROOTS '
+            '--alias "$alias" | grep -c "BEGIN CERTIFICATE"); '
+            'subject=$(/usr/lib/vmware-vmafd/bin/vecs-cli entry getcert --store TRUSTED_ROOTS '
+            '--alias "$alias" | openssl x509 -noout -subject 2>/dev/null); '
+            'echo "$alias|$count|$subject"; done',
+            timeout=30
+        )
+
+        if not ok:
+            logger.warning(f"  Could not check TRUSTED_ROOTS on {vcenter_fqdn}: {output}")
+            return False
+
+        has_double_cert = False
+        for line in output.strip().splitlines():
+            parts = line.strip().split('|')
+            if len(parts) >= 2:
+                alias, count = parts[0].strip(), parts[1].strip()
+                if count == '2' and 'Root Authority' in line:
+                    has_double_cert = True
+                    logger.warning(f"  Double-cert found: alias={alias} ({count} certs)")
+
+        if not has_double_cert:
+            logger.info(f"  No double-cert entries found on {vcenter_fqdn}")
+            return True
+
+        # Write Vault CA to temp file on vCenter, unpublish, republish
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
+            f.write(vault_ca + '\n')
+            local_ca_path = f.name
+
+        try:
+            scp_file_to_host(vcenter_fqdn, 'root', self.password, local_ca_path,
+                             '/tmp/vault-ca-single.pem')
+
+            sso_admin = sso_user
+            logger.info(f"  Unpublishing double-cert entry...")
+            ok, out = run_ssh_command(vcenter_fqdn, 'root', self.password,
+                f"/usr/lib/vmware-vmafd/bin/dir-cli trustedcert unpublish "
+                f"--cert /tmp/vault-ca-single.pem "
+                f"--login {sso_admin} --password '{self.password}'",
+                timeout=30)
+            if not ok:
+                logger.error(f"  Unpublish failed: {out}")
+                return False
+
+            logger.info(f"  Republishing as single-cert entry...")
+            ok, out = run_ssh_command(vcenter_fqdn, 'root', self.password,
+                f"/usr/lib/vmware-vmafd/bin/dir-cli trustedcert publish "
+                f"--cert /tmp/vault-ca-single.pem "
+                f"--login {sso_admin} --password '{self.password}'",
+                timeout=30)
+            if not ok:
+                logger.error(f"  Republish failed: {out}")
+                return False
+
+            run_ssh_command(vcenter_fqdn, 'root', self.password,
+                '/usr/lib/vmware-vmafd/bin/vecs-cli force-refresh', timeout=15)
+            run_ssh_command(vcenter_fqdn, 'root', self.password,
+                'rm -f /tmp/vault-ca-single.pem', timeout=10)
+
+            logger.info(f"  Fixed double-cert entry on {vcenter_fqdn}")
+            return True
+        finally:
+            os.unlink(local_ca_path)
+
+    def ensure_vault_ca_in_nsx(self, nsx_fqdn: str) -> bool:
+        """Import Vault CA into NSX trust store if not already present."""
+        vault_ca = self._get_vault_ca_pem()
+        if not vault_ca:
+            return False
+
+        session = requests.Session()
+        session.verify = False
+        session.auth = ('admin', self.password)
+
+        try:
+            resp = session.post(
+                f'https://{nsx_fqdn}/api/v1/trust-management/certificates?action=import',
+                json={'display_name': 'vcf.lab Root Authority', 'pem_encoded': vault_ca},
+                timeout=30
+            )
+            if resp.status_code in [200, 201]:
+                results = resp.json().get('results', [])
+                if results:
+                    logger.info(f"  Imported Vault CA into {nsx_fqdn} (ID: {results[0].get('id')})")
+                return True
+            elif resp.status_code == 400 and 'already exists' in resp.text.lower():
+                logger.info(f"  Vault CA already in {nsx_fqdn} trust store")
+                return True
+            else:
+                logger.warning(f"  Vault CA import to {nsx_fqdn}: {resp.status_code} {resp.text[:200]}")
+                return resp.status_code == 409  # conflict = already exists
+        except Exception as e:
+            logger.error(f"  Failed to import Vault CA into {nsx_fqdn}: {e}")
+            return False
+
+    def reregister_compute_managers(self, nsx_fqdn: str, vcenter_fqdn: str,
+                                     sso_user: str) -> bool:
+        """Re-register compute managers on an NSX manager with the new vCenter thumbprint."""
+        thumbprint = self._get_vcenter_thumbprint(vcenter_fqdn)
+        if not thumbprint:
+            logger.error(f"  Could not get thumbprint for {vcenter_fqdn}")
+            return False
+
+        session = requests.Session()
+        session.verify = False
+        session.auth = ('admin', self.password)
+
+        # Find compute managers for this vCenter
+        try:
+            resp = session.get(
+                f'https://{nsx_fqdn}/api/v1/fabric/compute-managers',
+                timeout=30
+            )
+            if resp.status_code != 200:
+                logger.error(f"  Failed to list compute managers: {resp.status_code}")
+                return False
+
+            cms = resp.json().get('results', [])
+        except Exception as e:
+            logger.error(f"  Failed to list compute managers: {e}")
+            return False
+
+        all_ok = True
+        for cm in cms:
+            cm_server = cm.get('server', '')
+            cm_id = cm.get('id', '')
+
+            if cm_server.lower() != vcenter_fqdn.lower():
+                continue
+
+            # Check if already UP/REGISTERED
+            try:
+                status_resp = session.get(
+                    f'https://{nsx_fqdn}/api/v1/fabric/compute-managers/{cm_id}/status',
+                    timeout=30
+                )
+                if status_resp.status_code == 200:
+                    status_data = status_resp.json()
+                    conn_status = status_data.get('connection_status', '')
+                    reg_status = status_data.get('registration_status', '')
+                    if conn_status == 'UP' and reg_status == 'REGISTERED':
+                        logger.info(f"  Compute manager {cm_server} already UP/REGISTERED on {nsx_fqdn}")
+                        continue
+                    logger.info(f"  Compute manager {cm_server}: {conn_status}/{reg_status} - re-registering...")
+            except Exception:
+                pass
+
+            # Build update payload - strip read-only fields and set new credential
+            update_payload = {k: v for k, v in cm.items()
+                             if k not in ('_create_time', '_create_user',
+                                          '_last_modified_time', '_last_modified_user',
+                                          '_protection', '_system_owned',
+                                          'certificate', 'origin_properties')}
+            update_payload['credential'] = {
+                'credential_type': 'UsernamePasswordLoginCredential',
+                'username': sso_user,
+                'password': self.password,
+                'thumbprint': thumbprint
+            }
+
+            try:
+                put_resp = session.put(
+                    f'https://{nsx_fqdn}/api/v1/fabric/compute-managers/{cm_id}',
+                    json=update_payload,
+                    timeout=60
+                )
+                if put_resp.status_code == 200:
+                    new_rev = put_resp.json().get('_revision', '?')
+                    logger.info(f"  Re-registered {cm_server} on {nsx_fqdn} (revision: {new_rev})")
+                else:
+                    error_msg = ''
+                    try:
+                        error_msg = put_resp.json().get('error_message', put_resp.text[:200])
+                    except Exception:
+                        error_msg = put_resp.text[:200]
+                    logger.error(f"  Failed to re-register {cm_server}: {put_resp.status_code} - {error_msg}")
+                    all_ok = False
+            except Exception as e:
+                logger.error(f"  Failed to re-register {cm_server}: {e}")
+                all_ok = False
+
+        return all_ok
+
+    def verify_compute_managers(self, nsx_fqdn: str, vcenter_fqdn: str,
+                                 timeout: int = 60) -> bool:
+        """Poll compute manager status until UP/REGISTERED or timeout."""
+        session = requests.Session()
+        session.verify = False
+        session.auth = ('admin', self.password)
+
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                resp = session.get(
+                    f'https://{nsx_fqdn}/api/v1/fabric/compute-managers',
+                    timeout=30
+                )
+                if resp.status_code != 200:
+                    time.sleep(10)
+                    continue
+
+                for cm in resp.json().get('results', []):
+                    if cm.get('server', '').lower() != vcenter_fqdn.lower():
+                        continue
+
+                    cm_id = cm.get('id')
+                    status_resp = session.get(
+                        f'https://{nsx_fqdn}/api/v1/fabric/compute-managers/{cm_id}/status',
+                        timeout=30
+                    )
+                    if status_resp.status_code == 200:
+                        data = status_resp.json()
+                        if (data.get('connection_status') == 'UP'
+                                and data.get('registration_status') == 'REGISTERED'):
+                            logger.info(f"  Compute manager {vcenter_fqdn} is UP/REGISTERED on {nsx_fqdn}")
+                            return True
+            except Exception:
+                pass
+            time.sleep(10)
+
+        logger.warning(f"  Compute manager {vcenter_fqdn} not UP on {nsx_fqdn} after {timeout}s")
+        return False
+
+    def fix_all(self, replaced_targets: List[str], dry_run: bool = False) -> Dict[str, str]:
+        """
+        Fix NSX compute managers for all vCenter/NSX pairs where the vCenter
+        or NSX certificate was replaced.
+
+        Only runs for pairs where at least one of the vCenter or NSX FQDNs
+        appears in replaced_targets (indicating their cert was changed).
+        """
+        # Determine which pairs need fixing
+        pairs_to_fix = []
+        replaced_lower = {t.lower() for t in replaced_targets}
+
+        for pair in self.VCENTER_NSX_PAIRS:
+            vc = pair['vcenter_fqdn'].lower()
+            nsx = pair['nsx_fqdn'].lower()
+            # Also match the VIP FQDN patterns
+            nsx_vip = nsx.replace('-01a.', '-a.').replace('-01a.', '-a.')
+            if vc in replaced_lower or nsx in replaced_lower or nsx_vip in replaced_lower:
+                pairs_to_fix.append(pair)
+
+        if not pairs_to_fix:
+            logger.info("No vCenter/NSX certificate replacements detected - skipping compute manager fix")
+            return {}
+
+        logger.info("=" * 60)
+        logger.info("POST-REPLACEMENT: Fixing NSX Compute Manager Trust")
+        logger.info("=" * 60)
+
+        results = {}
+        for pair in pairs_to_fix:
+            vc_fqdn = pair['vcenter_fqdn']
+            nsx_fqdn = pair['nsx_fqdn']
+            sso_user = pair['vcenter_sso_user']
+
+            logger.info(f"\nFixing {nsx_fqdn} -> {vc_fqdn}")
+
+            if dry_run:
+                logger.info(f"  [DRY RUN] Would fix TRUSTED_ROOTS, import Vault CA, re-register CM")
+                results[f"{nsx_fqdn}->{vc_fqdn}"] = "DRY_RUN"
+                continue
+
+            # Step 1: Fix double-cert entries in vCenter TRUSTED_ROOTS
+            self.fix_vcenter_trusted_roots(vc_fqdn, sso_user)
+
+            # Step 2: Ensure Vault CA is in NSX trust store
+            self.ensure_vault_ca_in_nsx(nsx_fqdn)
+
+            # Step 3: Re-register compute managers with new thumbprint
+            self.reregister_compute_managers(nsx_fqdn, vc_fqdn, sso_user)
+
+            # Step 4: Verify status
+            if self.verify_compute_managers(nsx_fqdn, vc_fqdn, timeout=60):
+                results[f"{nsx_fqdn}->{vc_fqdn}"] = "SUCCESS"
+            else:
+                results[f"{nsx_fqdn}->{vc_fqdn}"] = "WARNING"
+
+        return results
+
 class GenericCertSaver:
     """
     Saves certificates locally for targets that don't support direct replacement.
@@ -1647,9 +2030,14 @@ class FleetCertReplacer:
             return "FAILED"
 
         cert_key = cert_info.get('certificateResourceKey')
-        common_name = cert_info.get('issuedToCommonName', self.fqdn)
         appliance_ip = cert_info.get('applianceIp', '')
         display_type = cert_info.get('displayApplianceType', '')
+        api_cn = cert_info.get('issuedToCommonName', '')
+
+        # CN must always be a valid FQDN, never an internal identifier like VCFA/OPS_LOGS
+        common_name = self.fqdn
+        if api_cn and api_cn != self.fqdn:
+            logger.info(f"  Overriding API CN '{api_cn}' with FQDN '{self.fqdn}'")
 
         logger.info(f"  Component: {display_type}")
         logger.info(f"  Appliance: {appliance_ip}")
@@ -1676,8 +2064,27 @@ class FleetCertReplacer:
         # Step 1: Check for existing CSR or generate a new one
         csr_pem = self.ops_cert_api.get_csr_for_ip(appliance_ip)
         if csr_pem:
-            logger.info("  Step 1: Reusing existing CSR from fleet API")
-        else:
+            # Validate existing CSR has FQDN as CN, not an internal identifier
+            try:
+                csr_normalized = csr_pem
+                if '\n' not in csr_normalized and ' ' in csr_normalized:
+                    csr_normalized = csr_normalized.replace(' ', '\n')
+                    csr_normalized = csr_normalized.replace('-----BEGIN\nCERTIFICATE\nREQUEST-----',
+                                                            '-----BEGIN CERTIFICATE REQUEST-----')
+                    csr_normalized = csr_normalized.replace('-----END\nCERTIFICATE\nREQUEST-----',
+                                                            '-----END CERTIFICATE REQUEST-----')
+                csr_obj = x509.load_pem_x509_csr(csr_normalized.encode())
+                csr_cn = csr_obj.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+                if csr_cn == self.fqdn:
+                    logger.info(f"  Step 1: Reusing existing CSR (CN={csr_cn})")
+                else:
+                    logger.info(f"  Step 1: Discarding stale CSR (CN={csr_cn} != {self.fqdn}), generating new one")
+                    csr_pem = None
+            except Exception as e:
+                logger.warning(f"  Could not validate existing CSR CN: {e}")
+                csr_pem = None
+
+        if not csr_pem:
             logger.info("  Step 1: Generating CSR via fleet API...")
             task_id = self.ops_cert_api.generate_csr(
                 fqdn=self.fqdn,
@@ -1758,10 +2165,16 @@ class FleetCertReplacer:
 
         # Step 5: Replace active cert
         logger.info("  Step 5: Replacing active certificate...")
-        replace_task_id = self.ops_cert_api.replace_certificate(cert_key, repo_cert_id)
-        if not replace_task_id:
+        replace_result = self.ops_cert_api.replace_certificate_with_details(cert_key, repo_cert_id)
+        if not replace_result:
             logger.error("  Failed to initiate certificate replacement")
             return "FAILED"
+
+        replace_task_id = replace_result.get('id')
+        orchestrator = 'unknown'
+        for sub in replace_result.get('subTasksDetails', []):
+            orchestrator = sub.get('orchestratorType', orchestrator)
+        logger.info(f"  Replace orchestrator: {orchestrator}")
 
         # Wait for replacement to complete by polling the cert list for issuer change
         logger.info("  Waiting for replacement to complete...")
@@ -1776,7 +2189,12 @@ class FleetCertReplacer:
                     break
             logger.debug(f"  Replacement in progress (attempt {attempt + 1}/60)...")
         else:
-            logger.warning("  Replacement task may still be running — check VCF Operations UI")
+            if orchestrator == 'VRSLCM':
+                logger.warning(f"  VRSLCM orchestrator did not complete replacement for {self.fqdn}")
+                logger.warning("  The signed certificate has been imported to the repository.")
+                logger.warning("  To complete: VCF Operations UI > Fleet Management > Certificates > Replace")
+            else:
+                logger.warning("  Replacement task may still be running — check VCF Operations UI")
             return "WARNING"
 
         logger.info(f"  Fleet certificate replacement completed for {self.fqdn}")
@@ -2317,6 +2735,16 @@ Vault token is obtained fresh from /home/holuser/creds.txt or router init.json.
         )
         results[fqdn] = result_status
     
+    # Post-replacement: Fix NSX compute manager trust after vCenter/NSX cert changes
+    successful_targets = [fqdn for fqdn, status in results.items()
+                          if status in ('SUCCESS', 'WARNING')]
+    nsx_cm_fixer = NSXComputeManagerFixer(
+        password=config['vcf_pass'],
+        vault_url=config['vault_url'],
+        vault_token=config['vault_token']
+    )
+    cm_results = nsx_cm_fixer.fix_all(successful_targets, dry_run=args.dry_run)
+
     # Summary
     print("\n" + "=" * 60)
     print("CERTIFICATE REPLACEMENT SUMMARY")
@@ -2336,6 +2764,17 @@ Vault token is obtained fresh from /home/holuser/creds.txt or router init.json.
         else:
             status = "✗ FAILED"
         print(f"  {status}: {fqdn}")
+
+    if cm_results:
+        print()
+        print("NSX Compute Manager Trust Fix:")
+        for pair_key, cm_status in cm_results.items():
+            if cm_status == "SUCCESS":
+                print(f"  ✓ {pair_key}")
+            elif cm_status == "DRY_RUN":
+                print(f"  ○ {pair_key} (dry run)")
+            else:
+                print(f"  ⚠ {pair_key} ({cm_status})")
     
     print()
     print("Certificates saved to: /tmp/vcf-certs/")

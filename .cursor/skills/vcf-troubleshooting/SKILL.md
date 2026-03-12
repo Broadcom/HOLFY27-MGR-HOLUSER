@@ -41,6 +41,7 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | certsrv-proxy Address already in use | Pod CrashLoopBackOff with `OSError: [Errno 98]` | Orphaned Python process on host still bound to port 443 after force pod delete | 28 |
 | SDDC Manager "Public key mismatch" on cert install | "Public key in CSR and server certificate are not matching" | PKCS#7 DER encoding sorts SET OF elements, putting CA cert before leaf cert | 29 |
 | NSX ReTrust fails after vCenter cert replacement | "Failed to import the trusted root certificate for compute manager" | NSX tries to re-trust vCenter while services are still restarting; transient timing issue | 30 |
+| NSX Compute Manager DOWN after vCenter cert replacement | `connection_status: DOWN`, `REGISTERED_WITH_ERRORS`, error 7059/MP2179 | `dir-cli trustedcert publish` double-cert in TRUSTED_ROOTS; NSX rejects multi-cert PEM | 31 |
 
 ---
 
@@ -563,29 +564,14 @@ CSI_USER=$(sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmwa
    -n kube-system -o jsonpath='{.data.csi-vsphere\.conf}' 2>/dev/null" | base64 -d | grep user | awk -F'"' '{print $2}')
 CSI_ACCOUNT=$(echo "$CSI_USER" | cut -d@ -f1)
 
-# 2. Reset the password in vCenter SSO (use dir-cli, NOT the REST API)
-sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-mgmt-a.site-a.vcf.lab \
-  "/usr/lib/vmware-vmafd/bin/dir-cli password reset --account ${CSI_ACCOUNT} \
-   --new 'NEW_PASSWORD_HERE' --login administrator@vsphere.local --password '${PASSWORD}'"
-
-# 3. Also set password to never expire
-sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-mgmt-a.site-a.vcf.lab \
-  "/usr/lib/vmware-vmafd/bin/dir-cli user modify --account ${CSI_ACCOUNT} \
-   --password-never-expires --login administrator@vsphere.local --password '${PASSWORD}'"
-
-# 4. Update the K8s secrets on auto-a with the new password
-# Generate new config content, base64 encode, and patch both secrets:
-#   - vsphere-config-secret (csi-vsphere.conf key)
-#   - vsphere-cloud-secret (vc-mgmt-a.site-a.vcf.lab.password key)
-
-# 5. Restart CSI pods
+# 2. Reset password + set never-expire (see vcf-9-api skill Section 8 for dir-cli syntax)
+# 3. Update both K8s secrets: vsphere-config-secret and vsphere-cloud-secret
+# 4. Restart CSI pods:
 sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.71 \
   "echo '${PASSWORD}' | sudo -S -i bash -c '\
    kubectl delete pod -n kube-system -l app=vsphere-csi-controller --force; \
    kubectl delete pod -n kube-system -l app=vsphere-csi-node --force'"
 ```
-
-**Key Detail**: `dir-cli` on vCenter is at `/usr/lib/vmware-vmafd/bin/dir-cli`. The `user modify` subcommand does NOT support changing passwords — you must use `password reset`. The `user modify --password-never-expires` only controls expiration policy.
 
 ---
 
@@ -678,169 +664,113 @@ sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-u
 
 ---
 
-## 16. SDDC Manager Credentials All Showing UNKNOWN Status
+## SDDC Manager Credential Troubleshooting (Sections 16-19)
 
-**Symptom**: SDDC Manager UI (Inventory > Passwords) shows all 43 credentials with `UNKNOWN` account status. The GUI displays password warning/error icons for multiple resources.
-
-**Diagnosis**:
+Sections 16-19 all use the same SDDC Manager Bearer token and PostgreSQL access. See `vcf-9-api` skill Sections 9 and 11 for connection details.
 
 ```bash
+# Shared setup for sections 16-19
 PASSWORD=$(cat /home/holuser/creds.txt)
 SDDC="sddcmanager-a.site-a.vcf.lab"
-
 TOKEN=$(curl -sk -X POST "https://${SDDC}/v1/tokens" \
   -H "Content-Type: application/json" \
   -d "{\"username\":\"admin@local\",\"password\":\"${PASSWORD}\"}" \
   | python3 -c "import json,sys; print(json.load(sys.stdin).get('accessToken',''))")
-
-curl -sk -H "Authorization: Bearer ${TOKEN}" \
-  "https://${SDDC}/v1/credentials" | python3 -c "
-import json,sys
-creds = json.load(sys.stdin).get('elements', [])
-for c in creds:
-    print(f\"{c['resource']['resourceName']:40s} {c['username']:50s} {c.get('accountStatus','?')}\")
-print(f'Total: {len(creds)} credentials')
-"
+# PostgreSQL: SSH as vcf, PGPASSWORD from /root/.pgpass, psql -h 127.0.0.1 -U postgres -d platform
 ```
 
-**Root Cause**: This is a compound failure with multiple interdependent causes:
-1. SDDC Manager's SSO service accounts (`svc-sddcmanager-a-vc-*`) have incorrect passwords in vCenter SSO, so SDDC Manager cannot authenticate to vCenters to validate any credentials.
-2. Previous failed credential operations left stale resource locks in the database, blocking new operations.
-3. Resource statuses are stuck in `ERROR` or `ACTIVATING`, preventing credential validation.
+---
 
-**Fix** (must be done in this order):
+## 16. SDDC Manager Credentials All Showing UNKNOWN Status
 
-1. **Reset vCenter SSO service account passwords** — see Section 19
-2. **Clear stale resource locks** — see Section 17
-3. **Fix resource statuses** — see Section 18
-4. **Run REMEDIATE operations** one resource at a time (not all at once to avoid the 10-task concurrency limit)
+**Symptom**: All 43 credentials show `UNKNOWN` in SDDC Manager UI.
+
+**Diagnosis**: Use token above to query `/v1/credentials` and check `accountStatus` fields.
+
+**Root Cause**: Compound failure: (1) SSO service accounts have wrong passwords, (2) stale resource locks, (3) resource statuses stuck in ERROR/ACTIVATING.
+
+**Fix** (in order):
+1. Reset SSO service account passwords — Section 19
+2. Clear stale resource locks — Section 17
+3. Fix resource statuses — Section 18
+4. Run REMEDIATE one resource at a time (10-task concurrency limit)
 
 ---
 
 ## 17. SDDC Manager REMEDIATE Blocked by Stale Resource Locks
 
-**Symptom**: `PATCH /v1/credentials` with `operationType: REMEDIATE` fails with "Unable to acquire resource level lock(s)."
+**Symptom**: REMEDIATE fails with "Unable to acquire resource level lock(s)."
 
-**Diagnosis**:
+**Root Cause**: Failed/timed-out credential operations leave entries in `platform.lock`. The `/v1/resource-locks` API is read-only — cannot DELETE via API.
 
-```bash
-# Check for existing locks (API endpoint is read-only)
-curl -sk -H "Authorization: Bearer ${TOKEN}" \
-  "https://${SDDC}/v1/resource-locks"
-```
-
-**Root Cause**: Failed, cancelled, or timed-out credential operations leave lock entries in the `platform.lock` database table. The `/v1/resource-locks` API does NOT support DELETE — locks can only be cleared via direct database access.
-
-**Fix**:
+**Fix** (using PostgreSQL access from shared setup above):
 
 ```bash
-PASSWORD=$(cat /home/holuser/creds.txt)
-
 sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T \
   vcf@sddcmanager-a.site-a.vcf.lab \
-  "export PGPASSWORD='iHk0JKypNFrR9C5iOI2PmBmUCfSbdrjFxaGoxEEFz3w='; \
+  "export PGPASSWORD='<from /root/.pgpass>'; \
    /usr/pgsql/15/bin/psql -h 127.0.0.1 -U postgres -d platform \
    -c 'SELECT * FROM lock' \
    -c 'DELETE FROM lock'"
 ```
 
-**Note**: The PostgreSQL password is found in `/root/.pgpass` on SDDC Manager. It may differ per deployment. SSH as `vcf` user can run `psql` directly without needing root.
-
 ---
 
 ## 18. SDDC Manager REMEDIATE Fails — Resources Not Ready
 
-**Symptom**: `PATCH /v1/credentials` with `operationType: REMEDIATE` fails with "Resources [esx-01a.site-a.vcf.lab] are not available/ready."
+**Symptom**: REMEDIATE fails with "Resources [...] are not available/ready."
 
-**Diagnosis**:
+**Diagnosis**: Check `/v1/hosts`, `/v1/nsxt-clusters`, `/v1/vcenters` for non-ACTIVE statuses.
 
-```bash
-# Check resource statuses via API
-curl -sk -H "Authorization: Bearer ${TOKEN}" \
-  "https://${SDDC}/v1/hosts" | python3 -c "
-import json,sys
-for h in json.load(sys.stdin).get('elements', []):
-    print(f\"{h['fqdn']:40s} status={h['status']}\")
-"
+**Root Cause**: Resource statuses stuck in `ERROR`/`ACTIVATING` in platform DB after failed ops or lab restarts.
 
-# Similarly check NSX and vCenter
-curl -sk -H "Authorization: Bearer ${TOKEN}" "https://${SDDC}/v1/nsxt-clusters"
-curl -sk -H "Authorization: Bearer ${TOKEN}" "https://${SDDC}/v1/vcenters"
-```
-
-**Root Cause**: SDDC Manager's internal database tracks resource statuses. After failed credential operations or lab restarts, resources can get stuck in `ERROR`, `ACTIVATING`, or other non-`ACTIVE` states. The credential validation pre-check rejects operations on non-ACTIVE resources, even if the actual components are reachable.
-
-**Fix**:
+**Fix** (using PostgreSQL access from shared setup):
 
 ```bash
-PASSWORD=$(cat /home/holuser/creds.txt)
-
 sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T \
   vcf@sddcmanager-a.site-a.vcf.lab \
-  "export PGPASSWORD='iHk0JKypNFrR9C5iOI2PmBmUCfSbdrjFxaGoxEEFz3w='; \
+  "export PGPASSWORD='<from /root/.pgpass>'; \
    /usr/pgsql/15/bin/psql -h 127.0.0.1 -U postgres -d platform \
    -c \"UPDATE host SET status = 'ACTIVE' WHERE status != 'ACTIVE'\" \
    -c \"UPDATE nsxt SET status = 'ACTIVE' WHERE status != 'ACTIVE'\" \
    -c \"UPDATE vcenter SET status = 'ACTIVE' WHERE status != 'ACTIVE'\" \
    -c \"UPDATE nsxt_edge_cluster SET status = 'ACTIVE' WHERE status != 'ACTIVE'\" \
    -c \"UPDATE domain SET status = 'ACTIVE' WHERE status != 'ACTIVE'\""
-```
 
-After updating, restart SDDC Manager services:
-
-```bash
-# Requires root (via expect or su) on SDDC Manager
-systemctl restart operationsmanager commonsvcs domainmanager
+# Then restart SDDC Manager services
+# (requires root via expect/su): systemctl restart operationsmanager commonsvcs domainmanager
 ```
 
 ---
 
 ## 19. SDDC Manager REMEDIATE Fails — SSO Service Account Login Error
 
-**Symptom**: `PATCH /v1/credentials` with `operationType: REMEDIATE` fails with "Cannot complete login due to incorrect credentials: ... svc-sddcmanager-a-vc-mgmt-a-9382@vsphere.local"
+**Symptom**: REMEDIATE fails with "Cannot complete login due to incorrect credentials: ... svc-sddcmanager-a-vc-*"
 
-**Diagnosis**: SDDC Manager uses vCenter SSO service accounts to authenticate to vCenters during credential validation. These service accounts are managed in vCenter's SSO directory, NOT in SDDC Manager's credential store.
+**Root Cause**: SSO service account passwords in SDDC Manager DB don't match vCenter SSO. Happens after lab resets or DB restores.
 
-```bash
-PASSWORD=$(cat /home/holuser/creds.txt)
+**Important**: Fix service accounts FIRST — SDDC Manager uses them for ALL credential validation, even ESXi host passwords.
 
-# List SDDC Manager's service accounts
-curl -sk -H "Authorization: Bearer ${TOKEN}" \
-  "https://${SDDC}/v1/credentials" | python3 -c "
-import json,sys
-for el in json.load(sys.stdin).get('elements', []):
-    if el['username'].startswith('svc-'):
-        print(f\"{el['resource']['resourceName']:40s} {el['username']}\")
-"
-```
-
-**Root Cause**: The service account passwords stored in SDDC Manager's database no longer match what vCenter SSO expects. This can happen after lab resets, SDDC Manager DB restores, or manual password changes.
-
-**Fix**: Reset each service account's password in vCenter SSO using `dir-cli`, then update SDDC Manager's credential via REMEDIATE.
+**Fix**: Query `/v1/credentials` to find `svc-*` accounts (IDs are unique per deployment), then reset via `dir-cli`:
 
 ```bash
-PASSWORD=$(cat /home/holuser/creds.txt)
-
-# Management vCenter service accounts (SSO domain: vsphere.local)
-for acct in svc-sddcmanager-a-vc-mgmt-a-9382 svc-nsx-mgmt-a-vc-mgmt-a-5529; do
+# Management vCenter (SSO domain: vsphere.local)
+for acct in svc-sddcmanager-a-vc-mgmt-a-XXXX svc-nsx-mgmt-a-vc-mgmt-a-XXXX; do
   sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-mgmt-a.site-a.vcf.lab \
     "/usr/lib/vmware-vmafd/bin/dir-cli password reset \
      --account ${acct} --new '${PASSWORD}' \
      --login administrator@vsphere.local --password '${PASSWORD}'"
 done
 
-# Workload vCenter service accounts (SSO domain: wld.sso)
-for acct in svc-sddcmanager-a-vc-wld01-a-7530 svc-nsx-wld01-a-vc-wld01-a-1894; do
+# Workload vCenter (SSO domain: wld.sso)
+for acct in svc-sddcmanager-a-vc-wld01-a-XXXX svc-nsx-wld01-a-vc-wld01-a-XXXX; do
   sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new root@vc-wld01-a.site-a.vcf.lab \
     "/usr/lib/vmware-vmafd/bin/dir-cli password reset \
      --account ${acct} --new '${PASSWORD}' \
      --login administrator@wld.sso --password '${PASSWORD}'"
 done
+# Then: systemctl restart operationsmanager commonsvcs domainmanager
 ```
-
-**Note**: Service account IDs (e.g., `-9382`, `-7530`, `-5529`, `-1894`) are unique per deployment. Always query `/v1/credentials` to discover the exact names. After resetting in vCenter SSO, restart SDDC Manager services (`systemctl restart operationsmanager commonsvcs domainmanager`) before retrying credential operations.
-
-**Important**: Fix service accounts BEFORE attempting REMEDIATE on any other credentials. SDDC Manager uses these accounts as part of its validation pipeline for ALL credential operations — even ESXi host password checks flow through the vCenter SSO service account.
 
 ---
 
@@ -1352,32 +1282,9 @@ ssh root@router kubectl delete pod -l app=certsrv-proxy --force --grace-period=0
 
 **Prevention**: Use a graceful pod deletion (without `--force --grace-period=0`) when possible, or add a `preStop` hook to the container spec that kills the Python process cleanly.
 
-## 20. Fleet-Managed Certificate Replacement Stuck at NOT_STARTED
-
-**Symptom**: VCF Operations Certificate Management API accepts the replace request (HTTP 200/202) and returns a task ID, but the certificate never changes. The task's `subTasksDetails` shows `status: NOT_STARTED` with `orchestratorType: VRSLCM`. Affected components: VCF Automation (`auto-a`, `auto-platform-a`) and VCF Operations (`ops-a`).
-
-**Diagnosis**:
-
-```bash
-# Check fleet-upgrade-service health
-PASSWORD=$(cat /home/holuser/creds.txt)
-curl -sk -u "admin:$PASSWORD" \
-  'https://fleet-01a.site-a.vcf.lab/fleet-lcm/v1/certificates' 2>/dev/null | python3 -m json.tool
-# If response contains "VCF_LCM_500_INTERNAL_SERVER_ERROR" and
-# "Internal Server Error for service fleet-upgrade-service", the service is down
-```
-
-**Root Cause**: The VRSLCM orchestrator delegates VCF Automation and VCF Operations certificate replacements to the `fleet-upgrade-service` running on the VSP cluster (fleet-01a). When this service has an internal error, replacement tasks remain in `NOT_STARTED` state indefinitely. Other components (VCF services runtimes, Identity broker, Log management, Ops for Networks) use the `VROPS` orchestrator instead and complete normally.
-
-**Workaround**:
-1. The CSR, signing, and import steps complete successfully via API
-2. The signed certificate is available in the VCF Operations certificate repository
-3. Use the VCF Operations UI manually: `Manage > Fleet Management > Certificates > Replace With Imported Certificate`
-4. Select the Vault-signed cert from the repository and apply to the target
-
-**Note**: Components using the VROPS orchestrator (vidb-a, opslogs-a, opsnet-a, fleet-01a, instance-01a, vsp-01a) replace certificates successfully via API without needing the fleet-upgrade-service.
-
 ## 29. SDDC Manager "Public Key Mismatch" During Certificate Installation
+
+> **Note**: Fleet-managed cert replacement stuck at NOT_STARTED is covered in `vcf-certs` skill Section 9 and `vcf-9-api` skill Section 15 (orchestrator types).
 
 **Symptom**: SDDC Manager certificate installation fails with `"Public key in CSR and server certificate are not matching."` The log shows `SslCertValidator` comparing the CSR against `CN=vcf.lab Root Authority` (the CA cert) instead of the issued leaf cert.
 
@@ -1492,3 +1399,7 @@ THUMB=$(echo | openssl s_client -connect vc-mgmt-a.site-a.vcf.lab:443 2>/dev/nul
 ```
 
 **Prevention**: Always check `dir-cli trustedcert list | grep -c 'vcf.lab Root Authority'` before calling `dir-cli trustedcert publish`. The `confighol-9.1.py` v2.11+ includes this guard.
+
+**Automated Fix**: `cert-replacement.py` (in `Tools/`) includes `NSXComputeManagerFixer` which automatically runs after vCenter/NSX certificate replacements. It fixes double-cert entries, ensures Vault CA is in NSX trust stores, and re-registers compute managers with the new thumbprint. Must also fix WLD vCenter (SSO admin: `administrator@wld.sso`) — both vCenters can have the double-cert issue.
+
+**Key detail for re-registration PUT**: Strip read-only fields (`_create_time`, `_create_user`, `_last_modified_time`, `_last_modified_user`, `_protection`, `_system_owned`, `certificate`, `origin_properties`) from the GET response before PUTting back. Include full credential block: `credential_type`, `username`, `password`, and the new `thumbprint`.

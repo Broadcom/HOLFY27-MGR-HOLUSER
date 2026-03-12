@@ -338,6 +338,21 @@ curl -sk -u "admin:$PASSWORD" -X PUT \
 
 `confighol-9.1.py` v2.11+ automates this via `_nsx_reregister_compute_managers()`, called after the trust distribution step. The function skips compute managers already in `UP/REGISTERED` state.
 
+`cert-replacement.py` (in `Tools/`) automates this via `NSXComputeManagerFixer` class, which runs automatically after any vCenter or NSX certificate replacement. It:
+
+1. Detects which vCenter/NSX pairs had their certificates replaced
+2. Fixes double-cert entries in vCenter TRUSTED_ROOTS (unpublish + republish)
+3. Ensures Vault CA is imported into NSX trust stores
+4. Re-registers compute managers with the new SHA-256 thumbprint
+5. Verifies UP/REGISTERED status within 60s
+
+**Key implementation details**:
+
+- The PUT to re-register requires stripping read-only fields (`_create_time`, `_create_user`, `_last_modified_time`, `_last_modified_user`, `_protection`, `_system_owned`, `certificate`, `origin_properties`) from the GET response
+- Credential must include `credential_type`, `username`, `password`, AND `thumbprint`
+- WLD vCenter uses `administrator@wld.sso`, not `administrator@vsphere.local`
+- The fix runs for both mgmt and WLD pairs when `--all` is used
+
 ## 14. Cross-References
 
 - **Vault PKI setup & Traefik TLS**: See `holorouter` skill (Vault section)

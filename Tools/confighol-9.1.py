@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.9 - March 6, 2026
+# Version 2.11 - March 11, 2026
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -9,6 +9,16 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.11 - 2026-03-11:
+#   - Fixed: vCenter Vault CA trust import now checks vmdir for existing cert
+#     before calling dir-cli trustedcert publish. The publish command silently
+#     appends a duplicate PEM into the same vmdir entry when called twice,
+#     creating a multi-cert PEM that breaks NSX compute-manager re-registration
+#     (NSX TrustStoreServiceImpl error MP2179).
+#   - Added: NSX compute-manager re-registration step after Vault CA trust
+#     distribution. PUTs each compute manager with the vCenter's current
+#     SHA-256 thumbprint so NSX re-validates the connection with the updated
+#     trust chain. Skips compute managers already in UP/REGISTERED state.
 # v2.10 - 2026-03-10:
 #   - Vault CA trust distribution: imports the Vault PKI root CA certificate
 #     as a trusted authority across the entire VCF suite — vCenter Servers
@@ -109,7 +119,8 @@
 #      * SDDC Manager: POST /v1/sddc-manager/trusted-certificates
 #      * VCF Automation: OS trust store (/etc/pki/tls/certs/)
 #      * VCF Operations VMs: OS trust store
-#    - Idempotent: checks for existing CA before importing
+#    - Re-registers NSX compute managers with updated vCenter thumbprints
+#    - Idempotent: checks for existing CA before importing; skips UP compute managers
 #
 # 0c. vCenter CA Import (runs after Vault CA trust, with SKIP/RETRY/FAIL options):
 #    - Reads vCenter list from /tmp/config.ini
@@ -2542,16 +2553,32 @@ def _trust_vault_ca_on_vcenter(hostname: str, user: str, password: str,
         lsf.write_output(f'  {hostname}: SKIP - SSH port 22 not open')
         return False
 
-    # Write CA PEM to a temp file on vCenter
-    escaped_pem = ca_pem.replace("'", "'\\''")
-    write_cmd = f"echo '{escaped_pem}' > /tmp/vault-ca.pem"
-    result = lsf.ssh(write_cmd, f'root@{hostname}', password)
-
     # Determine SSO domain from the user parameter
     sso_domain = 'vsphere.local'
     if '@' in user:
         sso_domain = user.split('@')[1]
     admin_user = f'administrator@{sso_domain}'
+
+    # Check if the Vault CA is already published in vmdir (prevents double-cert bug).
+    # dir-cli trustedcert publish silently appends a duplicate PEM into the same
+    # vmdir entry when called twice, creating a multi-cert PEM that breaks NSX
+    # compute-manager re-registration (NSX TrustStoreServiceImpl error MP2179).
+    check_cmd = (
+        f"/usr/lib/vmware-vmafd/bin/dir-cli trustedcert list "
+        f"--login {admin_user} --password '{password}' 2>/dev/null "
+        f"| grep -c 'vcf.lab Root Authority'"
+    )
+    result = lsf.ssh(check_cmd, f'root@{hostname}', password)
+    stdout = getattr(result, 'stdout', '') or ''
+    if stdout.strip() and stdout.strip() != '0':
+        lsf.write_output(f'  {hostname}: Vault CA already trusted in vmdir')
+        lsf.ssh('/usr/lib/vmware-vmafd/bin/vecs-cli force-refresh', f'root@{hostname}', password)
+        return True
+
+    # Write CA PEM to a temp file on vCenter
+    escaped_pem = ca_pem.replace("'", "'\\''")
+    write_cmd = f"echo '{escaped_pem}' > /tmp/vault-ca.pem"
+    lsf.ssh(write_cmd, f'root@{hostname}', password)
 
     # Publish to vmdir via dir-cli (makes it available cluster-wide)
     publish_cmd = (
@@ -2561,26 +2588,12 @@ def _trust_vault_ca_on_vcenter(hostname: str, user: str, password: str,
     )
     result = lsf.ssh(publish_cmd, f'root@{hostname}', password)
     if hasattr(result, 'returncode') and result.returncode != 0:
-        stderr = getattr(result, 'stderr', '') or ''
-        if 'already exists' in stderr.lower() or 'duplicate' in stderr.lower():
-            lsf.write_output(f'  {hostname}: Vault CA already trusted in vmdir')
-        else:
-            lsf.write_output(f'  {hostname}: WARNING - dir-cli publish returned non-zero')
+        lsf.write_output(f'  {hostname}: WARNING - dir-cli publish returned non-zero')
 
     # Force VECS refresh so the cert appears in TRUSTED_ROOTS immediately
     lsf.ssh('/usr/lib/vmware-vmafd/bin/vecs-cli force-refresh', f'root@{hostname}', password)
 
-    # Verify
-    verify_cmd = (
-        f'/usr/lib/vmware-vmafd/bin/vecs-cli entry list '
-        f'--store TRUSTED_ROOTS --text 2>/dev/null | grep -c "vcf.lab"'
-    )
-    result = lsf.ssh(verify_cmd, f'root@{hostname}', password)
-    stdout = getattr(result, 'stdout', '') or ''
-    if stdout.strip() and stdout.strip() != '0':
-        lsf.write_output(f'  {hostname}: SUCCESS - Vault CA in TRUSTED_ROOTS')
-    else:
-        lsf.write_output(f'  {hostname}: OK - dir-cli published (VECS may need service restart)')
+    lsf.write_output(f'  {hostname}: SUCCESS - Vault CA published to TRUSTED_ROOTS')
 
     # Clean up
     lsf.ssh('rm -f /tmp/vault-ca.pem', f'root@{hostname}', password)
@@ -2693,6 +2706,108 @@ def _trust_vault_ca_on_nsx(hostname: str, password: str,
             if body:
                 lsf.write_output(f'  {hostname}:   Response: {body}')
             return False
+    except Exception as e:
+        lsf.write_output(f'  {hostname}: ERROR - {e}')
+        return False
+
+
+def _nsx_reregister_compute_managers(hostname: str, password: str,
+                                      lab_password: str,
+                                      dry_run: bool = False) -> bool:
+    """
+    Re-register all compute managers in an NSX Manager to pick up new
+    vCenter certificate trust chains.
+
+    After a vCenter SSL cert is replaced, NSX compute managers go DOWN
+    because the trusted root cert no longer matches. This PUTs each
+    compute manager with the new vCenter SHA-256 thumbprint, forcing NSX
+    to re-validate the connection.
+
+    :param hostname: NSX Manager FQDN
+    :param password: NSX admin password
+    :param lab_password: vCenter admin password (used in the credential payload)
+    :param dry_run: If True, preview only
+    :return: True if all compute managers were re-registered
+    """
+    import urllib3, ssl, socket, hashlib
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    if dry_run:
+        lsf.write_output(f'  {hostname}: Would re-register compute managers')
+        return True
+
+    try:
+        base = f'https://{hostname}/api/v1/fabric/compute-managers'
+        auth = ('admin', password)
+        r = requests.get(base, auth=auth, verify=False, timeout=30)
+        if r.status_code != 200:
+            lsf.write_output(f'  {hostname}: WARNING - failed to list compute managers (HTTP {r.status_code})')
+            return False
+
+        cms = r.json().get('results', [])
+        if not cms:
+            lsf.write_output(f'  {hostname}: No compute managers found')
+            return True
+
+        all_ok = True
+        for cm in cms:
+            cm_id = cm['id']
+            vc_server = cm.get('server', 'unknown')
+
+            # Check if this CM is already UP
+            status_r = requests.get(f'{base}/{cm_id}/status', auth=auth, verify=False, timeout=30)
+            if status_r.status_code == 200:
+                status = status_r.json()
+                if status.get('connection_status') == 'UP' and status.get('registration_status') == 'REGISTERED':
+                    if not status.get('registration_errors') and not status.get('connection_errors'):
+                        lsf.write_output(f'  {hostname}: {vc_server} already UP and REGISTERED')
+                        continue
+
+            # Get the current SHA-256 thumbprint of the vCenter
+            try:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with ctx.wrap_socket(socket.socket(), server_hostname=vc_server) as sock:
+                    sock.settimeout(10)
+                    sock.connect((vc_server, 443))
+                    der = sock.getpeercert(binary_form=True)
+                digest = hashlib.sha256(der).hexdigest().upper()
+                thumb = ':'.join(digest[i:i+2] for i in range(0, len(digest), 2))
+            except Exception as e:
+                lsf.write_output(f'  {hostname}: WARNING - cannot get thumbprint for {vc_server}: {e}')
+                all_ok = False
+                continue
+
+            # Determine the SSO admin user from the existing credential
+            sso_user = 'administrator@vsphere.local'
+            existing_cred = cm.get('credential', {})
+            if existing_cred.get('username'):
+                sso_user = existing_cred['username']
+
+            # Build the PUT payload
+            for k in ['_create_time', '_create_user', '_last_modified_time',
+                       '_last_modified_user', '_protection', '_system_owned',
+                       'origin_properties', 'certificate']:
+                cm.pop(k, None)
+
+            cm['credential'] = {
+                'credential_type': 'UsernamePasswordLoginCredential',
+                'username': sso_user,
+                'password': lab_password,
+                'thumbprint': thumb
+            }
+
+            r2 = requests.put(f'{base}/{cm_id}', auth=auth, json=cm,
+                              verify=False, timeout=60)
+            if r2.status_code in (200, 201):
+                lsf.write_output(f'  {hostname}: {vc_server} re-registered (rev={r2.json().get("_revision")})')
+            else:
+                body = r2.text[:200] if r2.text else ''
+                lsf.write_output(f'  {hostname}: WARNING - {vc_server} re-register returned HTTP {r2.status_code}: {body}')
+                all_ok = False
+
+        return all_ok
     except Exception as e:
         lsf.write_output(f'  {hostname}: ERROR - {e}')
         return False
@@ -2909,6 +3024,7 @@ def distribute_vault_ca_trust(ca_pem: str, password: str,
     # --- NSX Managers ---
     lsf.write_output('')
     lsf.write_output('--- NSX Managers ---')
+    nsx_hostnames = []
     if 'VCF' in lsf.config and 'vcfnsxmgr' in lsf.config['VCF']:
         nsx_entries = lsf.config.get('VCF', 'vcfnsxmgr').split('\n')
         for entry in nsx_entries:
@@ -2917,11 +3033,21 @@ def distribute_vault_ca_trust(ca_pem: str, password: str,
                 continue
             parts = entry.split(':')
             hostname = parts[0].strip()
+            nsx_hostnames.append(hostname)
             total_count += 1
             if _trust_vault_ca_on_nsx(hostname, password, ca_pem, dry_run):
                 success_count += 1
     else:
         lsf.write_output('  No NSX Managers found in config.ini')
+
+    # --- NSX Compute Manager Re-registration ---
+    # After importing the Vault CA into NSX and vCenter trust stores, NSX
+    # compute managers need to be re-registered (PUT) so NSX re-validates
+    # the vCenter connection with the updated trust chain.
+    lsf.write_output('')
+    lsf.write_output('--- NSX Compute Manager Re-registration ---')
+    for hostname in nsx_hostnames:
+        _nsx_reregister_compute_managers(hostname, password, password, dry_run)
 
     # --- SDDC Manager ---
     lsf.write_output('')
