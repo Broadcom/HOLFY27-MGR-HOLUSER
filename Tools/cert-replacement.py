@@ -89,6 +89,7 @@ import argparse
 import time
 import re
 import subprocess
+import shutil
 import tempfile
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
@@ -2778,7 +2779,20 @@ Vault token is obtained fresh from /home/holuser/creds.txt or router init.json.
     
     print()
     print("Certificates saved to: /tmp/vcf-certs/")
-    
+
+    # Copy certs to /lmchol/tmp if it exists and is writable
+    lmchol_dest = Path("/lmchol/tmp")
+    if lmchol_dest.is_dir() and os.access(str(lmchol_dest), os.W_OK):
+        src = Path("/tmp/vcf-certs")
+        dst = lmchol_dest / "vcf-certs"
+        try:
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+            print(f"Certificates also copied to: {dst}/")
+        except Exception as e:
+            logger.warning(f"Failed to copy certs to {dst}: {e}")
+
     # Exit with 0 if there are no failures (SUCCESS and WARNING are both non-failures)
     failed = sum(1 for v in results.values() if v == "FAILED")
     sys.exit(0 if failed == 0 else 1)
