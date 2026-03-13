@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Author: Kevin Tebear, Burke Azbill and HOL Core Team
+# Version: 1.0
+# Date: 2026-03-13
 """
 VCF Certificate Management Script (VCF 9.1 Cycle 4)
 
