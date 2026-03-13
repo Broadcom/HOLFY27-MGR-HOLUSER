@@ -1775,7 +1775,7 @@ def configure_nsx_components(auth_keys_file: str, password: str,
         vcfnsxedges = lsf.config.get('VCF', 'vcfnsxedges').split('\n')
         
         for entry in vcfnsxedges:
-            if not entry or entry.strip().startswith('#'):
+            if not entry or entry.strip().startswith('#') or entry.strip().startswith('vna-'):
                 continue
             
             parts = entry.split(':')
