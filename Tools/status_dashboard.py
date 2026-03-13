@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
 # status_dashboard.py - HOLFY27 Lab Startup Status Dashboard
-# Version 1.1 - 2026-03-05
-# Changes:
-# - Added Task 2c3: Supervisor Service vSphere Pod DNS Fix
-#   On retrofitted VCF 9.0.x labs with the new Photon/FRR holorouter,
-#   the NSX DLB cannot route to CoreDNS pod IPs (172.16.200.x) inside
-#   the SCP Antrea overlay, breaking DNS for all vSphere Pods.  Task 2c3
-#   detects this by checking dnsPolicy on workloads in namespaces listed
-#   in config.ini [VCFFINAL] supervisorservicedns, then patches them to
-#   use the kube-dns-lb LoadBalancer VIP.  To prevent kapp from reverting
-#   the patch during its 10-minute reconciliation cycle, it also injects
-#   kapp rebase rules into the carvel-services-overlay secret.
+# Version 1.2 - 2026-03-05
 # Author - Burke Azbill and HOL Core Team
 # Generates an auto-refreshing HTML status page for lab startup monitoring
 
@@ -169,6 +159,7 @@ class StatusDashboard:
                 ('proxy_filter', 'Proxy Filter', 'Verify proxy filtering is active'),
                 ('odyssey_cleanup', 'Odyssey Cleanup', 'Clean previous Odyssey installation files'),
                 ('vscode_proxy', 'VS Code Proxy', 'Configure VS Code proxy on console for Marketplace access'),
+                ('lab_files', 'Lab Files', 'Push lab files to console'),
             ]),
             
             # Group 2: ESXi.py - ESXi Host Verification

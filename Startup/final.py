@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # final.py - HOLFY27 Core Final Lab Checks
-# Version 3.0 - January 2026
+# Version 3.1 - 2026-03-13
 # Author - Burke Azbill and HOL Core Team
 # Final lab startup checks and cleanup
 
@@ -274,6 +274,28 @@ def main(lsf=None, standalone=False, dry_run=False):
         except Exception as e:
             lsf.write_output(f'Could not clear vCenter alarms: {e}')
     
+
+    #==========================================================================
+    # TASK 9: Run Lab Update script
+    #==========================================================================
+    
+    # Run the lab-update.sh script from the vpodrepo folder if it exists:
+    lab_update_script = f"{lsf.vpod_repo}/lab-update.sh"
+    if os.path.isfile(lab_update_script):
+        lsf.write_output(f"Running lab-update.sh from {lab_update_script}")
+        lsf.run_command(f"chmod +x {lab_update_script}")
+        lsf.run_command(f"/bin/bash {lab_update_script}")
+        lsf.write_output("Finished Lab updates")
+    
+    # Run the lab-update.py script from the vpodrepo folder if it exists:
+    lab_update_python_script = f"{lsf.vpod_repo}/lab-update.py"
+    if os.path.isfile(lab_update_python_script):
+        lsf.write_output(f"Running lab-update.py from {lab_update_python_script}")
+        lsf.run_command(f"chmod +x {lab_update_python_script}")
+        lsf.run_command(f"/usr/bin/python3 {lab_update_python_script}")
+        lsf.write_output("Finished Lab updates")
+    
+
     ##=========================================================================
     ## End Core Team code
     ##=========================================================================

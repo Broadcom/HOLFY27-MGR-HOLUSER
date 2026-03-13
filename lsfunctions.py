@@ -1,8 +1,8 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.3 - February 2026
+# Version 3.4 - 2026-03-13
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
-# Enhanced with LabType support, NFS router communication, Ansible/Salt, tdns-mgr integration
+# Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
 
 import os
 import subprocess
@@ -1973,6 +1973,40 @@ def parse_labsku(sku, lab_type_override: str = None):
         if vpod_repo:
             write_output(f'VPodRepo path: {vpod_repo}')
             write_output(f'Git URL: {git_url}')
+
+#==============================================================================
+# PUSH LAB FILES TO CONSOLE
+#==============================================================================
+
+def push_lab_files_to_console():
+    """
+    Copy lab-specific router files from vpodrepo to console
+    """
+    sku_files_dir = f'{vpod_repo}/files'
+    console_files_dir = f'{mc}/home/holuser/Documents/files'
+    if not os.path.isdir(sku_files_dir):
+        write_output('No vpodrepo/files directory found')
+        return False
+    
+    if not os.path.isdir(console_files_dir):
+        os.makedirs(console_files_dir, exist_ok=True)
+    
+    # Copy files to console
+    for item in os.listdir(sku_files_dir):
+        src = os.path.join(sku_files_dir, item)
+        dst = os.path.join(console_files_dir, item)
+        if os.path.isfile(src):
+            try:
+                shutil.copy(src, dst)
+                write_output(f'Copied {item} to console files directory')
+            except Exception as e:
+                write_output(f'Failed to copy {item} to console files directory: {e}')
+        elif os.path.isdir(src):
+            if os.path.exists(dst):
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+    
+    return True
 
 #==============================================================================
 # MISC HELPERS
