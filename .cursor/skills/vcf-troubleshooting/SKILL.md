@@ -1403,3 +1403,61 @@ THUMB=$(echo | openssl s_client -connect vc-mgmt-a.site-a.vcf.lab:443 2>/dev/nul
 **Automated Fix**: `cert-replacement.py` (in `Tools/`) includes `NSXComputeManagerFixer` which automatically runs after vCenter/NSX certificate replacements. It fixes double-cert entries, ensures Vault CA is in NSX trust stores, and re-registers compute managers with the new thumbprint. Must also fix WLD vCenter (SSO admin: `administrator@wld.sso`) — both vCenters can have the double-cert issue.
 
 **Key detail for re-registration PUT**: Strip read-only fields (`_create_time`, `_create_user`, `_last_modified_time`, `_last_modified_user`, `_protection`, `_system_owned`, `certificate`, `origin_properties`) from the GET response before PUTting back. Include full credential block: `credential_type`, `username`, `password`, and the new `thumbprint`.
+
+## 32. VCF Operations Fleet Management Cannot Replace SDDC Manager Certificate (API Compatibility)
+
+**Symptom**: Using VCF Operations Fleet Management UI → selecting SDDC Manager → "Generate CSRs" (works) → "Replace With Configured CA Certificate" fails immediately with:
+```
+CertificateGenericException: Certificate task REPLACE_CERTIFICATE for sddcmanager-a.site-a.vcf.lab has failed.
+Error message: Unable to generate Certificate using an existing CSR for sddcmanager-a.site-a.vcf.lab
+Caught exception: java.lang.reflect.UndeclaredThrowableException
+```
+
+**Diagnosis**:
+```bash
+# Check SDDC Manager logs for the real error
+ssh vcf@sddcmanager-a.site-a.vcf.lab \
+  "grep 'Cannot deserialize.*ResourceCertificateSpec\|REST_INVALID_API_INPUT' \
+   /var/log/vmware/vcf/operationsmanager/operationsmanager.log | tail -5"
+# Output: Cannot deserialize value of type ArrayList<ResourceCertificateSpec> from Object value
+```
+
+**Root Cause**: VCF Operations' `ReplaceCertificateTask` calls `PUT /v1/domains/{id}/resource-certificates` with `resources` as a JSON object `{...}` but SDDC Manager 9.x expects an array `[...]`. SDDC Manager returns HTTP 400, which the LCM plugin wraps as `UndeclaredThrowableException`. This is a version compatibility bug between VCF Operations Fleet LCM plugin and SDDC Manager 9.x API.
+
+**Fix**: Bypass VCF Operations and replace the certificate directly via the SDDC Manager API. The correct body for the install endpoint is an **array** of `ResourceCertificateSpec`:
+
+```bash
+# Full replacement workflow (assumes CSR already generated via SDDC Manager UI or API)
+PASSWORD=$(cat /home/holuser/creds.txt)
+DOMAIN_ID="6e8d8359-f0c2-4dd4-a23d-6613945351b2"
+
+TOKEN=$(curl -sk -X POST "https://sddcmanager-a.site-a.vcf.lab/v1/tokens" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"admin@local\",\"password\":\"$PASSWORD\"}" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['accessToken'])")
+
+# 1. Get existing CSR
+CSR=$(curl -sk -H "Authorization: Bearer $TOKEN" \
+  "https://sddcmanager-a.site-a.vcf.lab/v1/domains/$DOMAIN_ID/csrs" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['elements'][0]['csrEncodedContent'])")
+
+# 2. Normalize CSR (fix spacing) and sign with Vault sign-verbatim
+# (see vcf-certs SKILL.md Section 6 for normalize_csr_pem() and sign-verbatim usage)
+
+# 3. Build ordered PKCS#7 (leaf first, CA second) - see vcf-certs SKILL.md Section 7
+
+# 4. Install via SDDC Manager API — body MUST be a JSON array
+curl -sk -X PUT "https://sddcmanager-a.site-a.vcf.lab/v1/domains/$DOMAIN_ID/resource-certificates" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "[{
+    \"caType\": \"MICROSOFT\",
+    \"certificateChain\": \"<PKCS7_PEM_HERE>\",
+    \"resourceFqdn\": \"sddcmanager-a.site-a.vcf.lab\",
+    \"resourceType\": \"SDDC_MANAGER\"
+  }]"
+# Returns HTTP 202 with {"id":"...","status":"IN_PROGRESS"}
+# Poll GET /v1/tasks/{id} until status=Successful (~3-5 minutes)
+```
+
+**Note**: SDDC Manager restarts services during install — the HTTPS connection may drop temporarily. The `status: Successful` confirmation is visible once SDDC Manager comes back up. The new cert issuer changes from `VMCA` to `CN=vcf.lab Root Authority`.

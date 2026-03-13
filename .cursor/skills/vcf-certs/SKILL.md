@@ -239,6 +239,54 @@ For fleet-managed components (auto-a, ops-a, opslogs-a, vidb-a, fleet-01a, etc.)
 
 VRSLCM tasks remain `NOT_STARTED` indefinitely if `fleet-upgrade-service` is down. Workaround: use VCF Operations UI manually.
 
+### VCF Ops Cannot Replace SDDC Manager Certificate — API Compatibility Bug
+
+**Symptom**: VCF Operations Fleet Management `Replace With Configured CA Certificate` for `sddcmanager-a` fails with:
+```
+CertificateGenericException: Certificate task REPLACE_CERTIFICATE for sddcmanager-a.site-a.vcf.lab has failed.
+Unable to generate Certificate using an existing CSR. Caught exception: java.lang.reflect.UndeclaredThrowableException
+```
+
+**Root Cause**: VCF Operations' `ReplaceCertificateTask` calls SDDC Manager's `PUT /v1/domains/{id}/resource-certificates` API with the `resources` field as a JSON **object** (`{"fqdn":...,"type":...}`), but SDDC Manager 9.x expects `resources` as a JSON **array** (`[{"fqdn":...,"type":...}]`). SDDC Manager returns `REST_INVALID_API_INPUT` / `ANNOTATIONS_MISMATCH` because it cannot deserialize `ArrayList<ResourceCertificateSpec>` from an Object value. The Java `UndeclaredThrowableException` wraps this HTTP 400 response.
+
+**Verification**: Check SDDC Manager log:
+```bash
+ssh vcf@sddcmanager-a.site-a.vcf.lab \
+  "grep 'Cannot deserialize.*ResourceCertificateSpec\|REST_INVALID_API_INPUT' \
+   /var/log/vmware/vcf/operationsmanager/operationsmanager.log | tail -5"
+```
+
+**Workaround**: Replace the SDDC Manager certificate directly via SDDC Manager API (bypassing VCF Operations):
+
+```python
+# The correct API uses an ARRAY of ResourceCertificateSpec objects
+# Each spec needs: caType, certificateChain (PKCS#7 PEM), resourceFqdn, resourceType
+
+# Install endpoint (after getting/signing the CSR):
+# PUT /v1/domains/{domain_id}/resource-certificates
+# Body: [{"caType":"MICROSOFT","certificateChain":"<PKCS7 PEM>","resourceFqdn":"sddcmanager-a.site-a.vcf.lab","resourceType":"SDDC_MANAGER"}]
+
+curl -sk -X PUT "https://sddcmanager-a.site-a.vcf.lab/v1/domains/$DOMAIN_ID/resource-certificates" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "[{
+    \"caType\": \"MICROSOFT\",
+    \"certificateChain\": \"<PKCS7_PEM_HERE>\",
+    \"resourceFqdn\": \"sddcmanager-a.site-a.vcf.lab\",
+    \"resourceType\": \"SDDC_MANAGER\"
+  }]"
+# Returns HTTP 202 with taskId
+```
+
+**Full automation script**: `/tmp/install_sddc_cert2.py` (covers token, CSR fetch, Vault signing, PKCS#7 build, and install in one script).
+
+**Steps for complete SDDC Manager cert replacement via API**:
+1. CSR must already be generated (check with `GET /v1/domains/{id}/csrs` — must return an element)
+2. Get CSR PEM, normalize it (add proper newlines), sign with Vault `sign-verbatim/holodeck`
+3. Build ordered PKCS#7 with `build_ordered_pkcs7([leaf_der, ca_der])` — leaf first
+4. `PUT /v1/domains/{id}/resource-certificates` with array body → HTTP 202 with task ID
+5. Poll `GET /v1/tasks/{task_id}` until `status: Successful` (~3-5 min; SDDC Manager restarts services)
+
 ## 10. Troubleshooting Reference
 
 ### Certificate Generation Failed — "No certificate data found"

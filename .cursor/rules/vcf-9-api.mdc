@@ -57,6 +57,8 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 - **VCF Ops cert replace orchestrator**: VROPS (vidb, opslogs, opsnet, fleet/instance/vsp runtimes) completes in minutes. VRSLCM (auto-a, auto-platform-a, ops-a) depends on fleet-upgrade-service health.
 - **Fleet-upgrade-service internal error blocks VRSLCM cert replace** — tasks stay `NOT_STARTED`. CSR/sign/import still succeed; complete via VCF Operations UI.
 - **VCF Ops cert mgmt task status API returns HTTP 500** — poll `certificates/query` for issuer change instead.
+- **VCF Ops cannot replace SDDC Manager cert via Fleet UI** — `ReplaceCertificateTask` sends `resources` as JSON object but SDDC Manager 9.x requires array. SDDC Manager returns HTTP 400/`REST_INVALID_API_INPUT`. Bypass: use `PUT /v1/domains/{id}/resource-certificates` directly with body `[{"caType":"MICROSOFT","certificateChain":"<PKCS7_PEM>","resourceFqdn":"sddcmanager-a.site-a.vcf.lab","resourceType":"SDDC_MANAGER"}]`. See vcf-troubleshooting skill Section 32.
+- **SDDC Manager resource-certificate install body must be a JSON array** — `PUT /v1/domains/{id}/resource-certificates` expects `ArrayList<ResourceCertificateSpec>`, so the body must be `[{...}]` not `{...}`. CSR must be pre-generated. Returns HTTP 202; poll `/v1/tasks/{id}` for ~3-5 min.
 - **PKCS#7 `serialize_certificates()` reorders certs** — DER SET OF sorting puts CA before leaf. Must use custom `build_ordered_pkcs7()` for SDDC Manager compatibility (`certs[0]` = leaf, `certs[1]` = CA).
 - **Vault `sign-verbatim` preserves full CSR subject DN** — `sign/{role}` strips O/OU/C/L/ST fields. Always use `sign-verbatim/{role}` for SDDC Manager CSRs.
 - **Vault CA trust distribution** automated by `confighol-9.1.py` Step 0b — imports Vault root CA into vCenter VECS (`dir-cli trustedcert publish`), ESXi castore.pem, NSX trust-management API, SDDC Manager trusted-certificates API, and Linux appliance OS trust stores. Also re-registers NSX compute managers with updated vCenter thumbprints.
@@ -66,6 +68,7 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 ## Session Knowledge Capture
 
 At the end of any session involving VCF troubleshooting or API exploration, review what was learned and update the relevant skill files:
+
 - **New API patterns or credentials**: Update `/home/holuser/hol/.cursor/skills/vcf-9-api/SKILL.md`
 - **New failure patterns or fixes**: Update `/home/holuser/hol/.cursor/skills/vcf-troubleshooting/SKILL.md`
 - **Certificate operations (proxy, Vault, PKCS#7, SDDC Manager cert workflow)**: Update `/home/holuser/hol/.cursor/skills/vcf-certs/SKILL.md`
