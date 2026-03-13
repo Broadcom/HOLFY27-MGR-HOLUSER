@@ -269,6 +269,12 @@ Orphaned Python process holds port 443 after force pod delete. Fix: `kill -9 <pi
 
 CSR PEM malformed (no newlines). Apply `normalize_csr_pem()` (Section 6).
 
+### Firefox NSS Database Missing vCenter CA
+
+**Symptom**: After running `confighol-9.1.py`, the WLD vCenter CA is missing from Firefox's certificate manager, but the Vault CA is present.
+**Root Cause**: The script extracts CA certs from vCenter's `/certs/download.zip`. It generates a Firefox nickname using the `O=` (Organization) field. If `O=` is missing (like on the Vault CA), it falls back to `{vcenter_hostname} CA`. Since the actual WLD vCenter CA has `O=vc-wld01-a.site-a.vcf.lab`, both the WLD CA and the Vault CA get the exact same nickname (`vc-wld01-a.site-a.vcf.lab CA`). The script's import logic deletes existing certs with the same nickname before importing, causing the Vault CA to overwrite the WLD CA.
+**Fix**: Fall back to the `CN=` (Common Name) field if `O=` is missing. This ensures the Vault CA gets its proper nickname (`vcf.lab Root Authority`) and doesn't collide with the vCenter CA.
+
 ## 11. Diagnostic Commands
 
 ```bash

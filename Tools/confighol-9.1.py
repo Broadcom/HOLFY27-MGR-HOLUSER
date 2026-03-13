@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.11 - March 11, 2026
+# Version 2.12 - 2026-03-13
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -9,6 +9,9 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.12 - 2026-03-13:
+#   - Fixed: vCenter CA import now handles CN= format in certificate subject
+#     (e.g. "CN = vc-mgmt-a.site-a.vcf.lab, O = VMware, Inc.")
 # v2.11 - 2026-03-11:
 #   - Fixed: vCenter Vault CA trust import now checks vmdir for existing cert
 #     before calling dir-cli trustedcert publish. The publish command silently
@@ -3260,6 +3263,10 @@ def download_vcenter_ca_certificates(vcenter_hostname: str) -> Optional[list]:
                             # Strip surrounding quotes that openssl may include
                             org = org.strip('"')
                             cert_name = f"{org} CA"
+                        elif 'CN = ' in subject:
+                            cn = subject.split('CN = ')[1].split(',')[0].strip()
+                            cn = cn.strip('"')
+                            cert_name = cn
                 except Exception:
                     pass
                 
