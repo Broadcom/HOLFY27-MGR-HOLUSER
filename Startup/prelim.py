@@ -330,9 +330,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     ## TASK 6: PUSH LAB FILES TO CONSOLE
     ##=========================================================================
     
-    lsf.write_output('Pushing lab files to console...')
     lsf.push_lab_files_to_console()
-    lsf.write_output('Lab files pushed to console')
     
     if dashboard:
         dashboard.update_task('prelim', 'lab_files', 'complete')

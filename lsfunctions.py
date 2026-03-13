@@ -1987,7 +1987,9 @@ def push_lab_files_to_console():
     if not os.path.isdir(sku_files_dir):
         write_output('No vpodrepo/files directory found')
         return False
-    
+    else:
+        write_output('Pushing lab files to console...')
+
     if not os.path.isdir(console_files_dir):
         os.makedirs(console_files_dir, exist_ok=True)
     
@@ -2005,7 +2007,8 @@ def push_lab_files_to_console():
             if os.path.exists(dst):
                 shutil.rmtree(dst)
             shutil.copytree(src, dst)
-    
+
+    write_output('Lab files pushed to console')
     return True
 
 #==============================================================================
