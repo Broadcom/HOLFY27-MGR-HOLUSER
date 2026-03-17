@@ -64,6 +64,7 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 - **Vault CA trust distribution** automated by `confighol-9.1.py` Step 0b — imports Vault root CA into vCenter VECS (`dir-cli trustedcert publish`), ESXi castore.pem, NSX trust-management API, SDDC Manager trusted-certificates API, and Linux appliance OS trust stores. Also re-registers NSX compute managers with updated vCenter thumbprints.
 - **`dir-cli trustedcert publish` silently creates double-cert entries** — calling it when the cert already exists in vmdir appends a duplicate PEM. NSX rejects multi-cert PEMs (error `MP2179`), breaking compute-manager registration. Always check `dir-cli trustedcert list` first.
 - **SDDC Manager PostgreSQL** — Password in `/root/.pgpass` (SSH as `vcf`, use Python `pty.openpty()` to `su` to root). TCP on `127.0.0.1:5432`, database `operationsmanager`.
+- **MSADCS Proxy PKCS#7 PEM headers** — Real Microsoft ADCS wraps base64 PKCS#7 in `-----BEGIN CERTIFICATE-----`/`-----END CERTIFICATE-----` (NOT `BEGIN PKCS7`). SDDC Manager's Java `CertificateFactory` expects this exact format. Using `BEGIN PKCS7` causes "Generate Signed Certificates" to fail silently. The `.cer` endpoint also uses `Content-Type: text/html` in real ADCS, not `application/pkix-cert`.
 
 ## Session Knowledge Capture
 

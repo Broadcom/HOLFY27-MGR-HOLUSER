@@ -223,7 +223,7 @@ Understanding the Java code path is essential for debugging:
 ### Key proxy protocol requirements
 
 - `certfnsh.asp` POST body: URL-encoded form, use `parse_qs()` not `unquote_plus()` (preserves `+` in base64)
-- `certnew.p7b` response must be PEM-wrapped: `-----BEGIN PKCS7-----\n<base64 64-char lines>\n-----END PKCS7-----`
+- `certnew.p7b` response must be PEM-wrapped: `-----BEGIN CERTIFICATE-----\n<base64 64-char lines>\n-----END CERTIFICATE-----` (NOT `BEGIN PKCS7` — real MS ADCS uses CERTIFICATE headers for base64 PKCS#7 and SDDC Manager expects this)
 - `certrqxt.asp` template options: `<Option Value="1.3.6.1.4.1.311.21.8.X;TemplateName">Display Name</Option>`
 
 ## 9. VCF Operations Fleet Management — Certificate Replacement
@@ -291,7 +291,7 @@ curl -sk -X PUT "https://sddcmanager-a.site-a.vcf.lab/v1/domains/$DOMAIN_ID/reso
 
 ### Certificate Generation Failed — "No certificate data found"
 
-PKCS#7 response was raw base64 without PEM headers. Proxy must wrap in `-----BEGIN PKCS7-----` / `-----END PKCS7-----` with 64-char line breaks.
+PKCS#7 response was raw base64 without PEM headers. Proxy must wrap base64 PKCS#7 DER in `-----BEGIN CERTIFICATE-----` / `-----END CERTIFICATE-----` with 64-char line breaks. Real Microsoft ADCS uses CERTIFICATE PEM headers (not PKCS7 headers) for the base64-encoded PKCS#7 response at `certnew.p7b?Enc=b64`. Using `-----BEGIN PKCS7-----` causes SDDC Manager's Java `CertificateFactory` to fail parsing. The `.cer` endpoint should also return `Content-Type: text/html` (matching real ADCS behavior).
 
 ### Certificate Validation Failed — "Public key mismatch"
 
