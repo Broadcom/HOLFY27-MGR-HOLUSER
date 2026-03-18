@@ -1,8 +1,9 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.6 - 2026-03-09
+# Version 3.7 - 2026-03-18
 # Changes:
-# - Updated to include ohmyposh console files override logic
+# - Added functionality to set branch to "ft" if the first 3 characters of the content of /tmp/deploymentpool.txt is "FT-"
+# - Added functionality to git stash local changes for prod.
 # Author - Burke Azbill and HOL Core Team
 # Enhanced with NFS-based router communication, DNS import support
 
@@ -165,16 +166,25 @@ git_pull() {
     fi
 
     # stash uncommitted changes if not running in HOL-Dev
-    if [ "$branch" = "main" ]; then
-        log_msg "git stash local changes for prod." "${logfile}"
-        git stash >> ${logfile}
-    else
-        log_msg "Not doing git stash due to HOL-Dev." "${logfile}"
-    fi
+    # if [ "$branch" = "main" ]; then
+    #     log_msg "git stash local changes for prod." "${logfile}"
+    #     git stash >> ${logfile}
+    # else
+    #     log_msg "Not doing git stash due to HOL-Dev." "${logfile}"
+    # fi
+
+    log_msg "git stash local changes:" "${logfile}"
+    git stash >> ${logfile}
+
     while true; do
         if [ "$ctr" -gt 30 ]; then
             log_msg "Could not perform git pull. Will attempt LabStartup with existing code." "${logfile}"
             break
+        fi
+        # if $branch is ft but checkout fails, then set branch to main
+        # Prevents error if ft branch does not exist
+        if [ "$branch" = "ft" ] && ! git checkout $branch >> ${logfile} 2>&1; then
+            branch="main"
         fi
         git checkout $branch >> ${logfile} 2>&1
         if timeout 30 env GIT_TERMINAL_PROMPT=0 git pull origin $branch >> ${logfile} 2>&1; then
@@ -812,6 +822,10 @@ cloud=$(/usr/bin/vmtoolsd --cmd 'info-get guestinfo.ovfEnv' 2>&1)
 holdev=$(echo "${cloud}" | grep -i dev)
 if [ "${cloud}" = "No value found" ] || [ -n "${holdev}" ]; then
     branch="dev"
+elif [ "$(head -c 3 /tmp/deploymentpool.txt)" = "FT-" ]; then
+    # FunctionlTesting Branch override:
+    # If the first 3 characters of the contentof /tmp/deploymentpool.txt is "FT-", then set the branch to "FT"
+    branch="ft"
 else
     branch="main"
 fi
