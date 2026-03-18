@@ -27,9 +27,11 @@ ssh_with_fallback() {
     local host=$2
     shift 2
     local cmd=("$@")
-    
+    # clear stale ssh keys before proceeding
+    ssh-keygen -R "${host}" 
+
     # Try key-based authentication first
-    if ssh -o ConnectTimeout=5 -o BatchMode=yes "${user}@${host}" "${cmd[@]}" 2>/dev/null; then
+    if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes "${user}@${host}" "${cmd[@]}" 2>/dev/null; then
         return 0
     fi
     
@@ -37,7 +39,7 @@ ssh_with_fallback() {
     if [[ -f "${CREDS_FILE}" ]]; then
         local password
         password=$(cat "${CREDS_FILE}")
-        /usr/bin/sshpass -p "${password}" ssh "${user}@${host}" "${cmd[@]}"
+        /usr/bin/sshpass -p "${password}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 "${user}@${host}" "${cmd[@]}"
     else
         echo "ERROR: Key-based authentication failed and credentials file not found at ${CREDS_FILE}" >> "${LOG_FILE}"
         return 1
