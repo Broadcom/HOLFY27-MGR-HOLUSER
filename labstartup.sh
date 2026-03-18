@@ -822,9 +822,10 @@ cloud=$(/usr/bin/vmtoolsd --cmd 'info-get guestinfo.ovfEnv' 2>&1)
 holdev=$(echo "${cloud}" | grep -i dev)
 if [ "${cloud}" = "No value found" ] || [ -n "${holdev}" ]; then
     branch="dev"
-elif [ "$(head -c 3 /tmp/deploymentpool.txt)" = "FT-" ]; then
-    # FunctionlTesting Branch override:
-    # If the first 3 characters of the contentof /tmp/deploymentpool.txt is "FT-", then set the branch to "FT"
+    # if /tmp/deploymentpool.txt exists and the first 3 characters are "FT-", then set the branch to "ft"
+    # You can have VLP create the /tmp/deploymentpool.txt by adding the following to your vmscript:
+    # echo $(echo $1 | cut -f5 -d ':'|  cut -f1 -d'}') > /tmp/deploymentpool.txt
+elif [ -f /tmp/deploymentpool.txt ] && [ "$(head -c 3 /tmp/deploymentpool.txt)" = "FT-" ]; then
     branch="ft"
 else
     branch="main"
