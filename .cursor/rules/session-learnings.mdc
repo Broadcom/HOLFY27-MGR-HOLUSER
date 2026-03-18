@@ -23,6 +23,7 @@ Review your session for any of the following new learnings:
 | New failure pattern, root cause, or fix | `.cursor/skills/vcf-troubleshooting/SKILL.md` |
 | New pitfall, version difference, or gotcha | Both skills (Pitfalls section + relevant troubleshooting section) |
 | New environment detail (IPs, hostnames, paths) | `.cursor/skills/vcf-9-api/SKILL.md` (Architecture section) |
+| Certificate ops (proxy, Vault PKI, PKCS#7, SDDC cert workflow) | `.cursor/skills/vcf-certs/SKILL.md` |
 
 ## How to Update
 

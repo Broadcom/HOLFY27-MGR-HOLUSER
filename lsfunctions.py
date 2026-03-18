@@ -1,8 +1,8 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.3 - February 2026
+# Version 3.4 - 2026-03-13
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
-# Enhanced with LabType support, NFS router communication, Ansible/Salt, tdns-mgr integration
+# Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
 
 import os
 import subprocess
@@ -716,6 +716,142 @@ def start_vm(vm):
             write_output(f'Failed to power on {vm.name}: {e}')
             return False
     return True
+
+
+def is_vm_powered_on(vm) -> bool:
+    """
+    Check if a VM is powered on.
+    
+    :param vm: VM object
+    :return: True if powered on
+    """
+    try:
+        return vm.runtime.powerState == vim.VirtualMachinePowerState.poweredOn
+    except Exception:
+        return False
+
+
+def delete_vm(vm) -> bool:
+    """
+    Forcefully delete a VM from vCenter.
+    
+    :param vm: VM object
+    :return: True if deletion succeeded
+    """
+    vm_name = vm.name
+    write_output(f'{vm_name}: Deleting from vCenter')
+    try:
+        if vm.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
+            write_output(f'{vm_name}: Powering off before deletion')
+            task = vm.PowerOffVM_Task()
+            WaitForTask(task)
+            
+        task = vm.Destroy_Task()
+        WaitForTask(task)
+        write_output(f'{vm_name}: Successfully deleted')
+        return True
+    except Exception as e:
+        write_output(f'{vm_name}: Failed to delete: {e}')
+        return False
+
+
+def shutdown_vm_gracefully(vm, timeout: int = 300) -> bool:
+    """
+    Gracefully shutdown a VM using VMware Tools if available.
+    Logs progress heartbeats.
+    
+    :param vm: VM object
+    :param timeout: Maximum time to wait for shutdown
+    :return: True if shutdown succeeded or VM was already off
+    """
+    import time
+    
+    vm_name = vm.name
+    
+    # Check current power state
+    try:
+        power_state = vm.runtime.powerState
+    except Exception as e:
+        write_output(f'{vm_name}: Unable to check power state: {e}')
+        return False
+    
+    # Already powered off?
+    if power_state == vim.VirtualMachinePowerState.poweredOff:
+        write_output(f'{vm_name}: Already powered off - skipping')
+        return True
+    
+    # Suspended?
+    if power_state == vim.VirtualMachinePowerState.suspended:
+        write_output(f'{vm_name}: VM is suspended, powering off')
+        try:
+            task = vm.PowerOffVM_Task()
+            WaitForTask(task)
+            return True
+        except Exception as e:
+            write_output(f'{vm_name}: Failed to power off suspended VM: {e}')
+            return False
+    
+    # VM is powered on - proceed with shutdown
+    write_output(f'{vm_name}: Currently powered on, initiating shutdown')
+    
+    # Check VMware Tools status
+    try:
+        tools_status = vm.guest.toolsRunningStatus
+        write_output(f'{vm_name}: VMware Tools status: {tools_status}')
+    except Exception:
+        tools_status = 'guestToolsNotRunning'
+        write_output(f'{vm_name}: Unable to check Tools status, assuming not running')
+    
+    try:
+        if tools_status == 'guestToolsRunning':
+            write_output(f'{vm_name}: Initiating graceful guest shutdown')
+            try:
+                vm.ShutdownGuest()
+            except vim.fault.ToolsUnavailable:
+                # Race condition: toolsRunningStatus was stale (common with
+                # K8s pod VMs). Fall back to PowerOffVM_Task immediately.
+                write_output(f'{vm_name}: Tools reported running but unavailable '
+                          f'(stale status), forcing power off')
+                task = vm.PowerOffVM_Task()
+                WaitForTask(task)
+                write_output(f'{vm_name}: Powered off successfully')
+                return True
+        else:
+            write_output(f'{vm_name}: No VMware Tools available, forcing power off')
+            task = vm.PowerOffVM_Task()
+            WaitForTask(task)
+            write_output(f'{vm_name}: Powered off successfully')
+            return True
+        
+        # Wait for graceful shutdown with heartbeat progress
+        start_time = time.time()
+        last_heartbeat = start_time
+        while (time.time() - start_time) < timeout:
+            try:
+                if vm.runtime.powerState == vim.VirtualMachinePowerState.poweredOff:
+                    elapsed = int(time.time() - start_time)
+                    write_output(f'{vm_name}: Powered off successfully ({elapsed}s)')
+                    return True
+            except Exception:
+                pass
+            
+            # Log progress heartbeat every 30 seconds
+            if (time.time() - last_heartbeat) >= 30:
+                elapsed = int(time.time() - start_time)
+                write_output(f'{vm_name}: Still waiting for shutdown... ({elapsed}s)')
+                last_heartbeat = time.time()
+                
+            time.sleep(5)
+            
+        write_output(f'{vm_name}: Graceful shutdown timed out after {timeout}s, forcing power off')
+        task = vm.PowerOffVM_Task()
+        WaitForTask(task)
+        write_output(f'{vm_name}: Powered off successfully')
+        return True
+        
+    except Exception as e:
+        write_output(f'{vm_name}: Shutdown failed: {e}')
+        return False
 
 
 #==============================================================================
@@ -1837,6 +1973,43 @@ def parse_labsku(sku, lab_type_override: str = None):
         if vpod_repo:
             write_output(f'VPodRepo path: {vpod_repo}')
             write_output(f'Git URL: {git_url}')
+
+#==============================================================================
+# PUSH LAB FILES TO CONSOLE
+#==============================================================================
+
+def push_lab_files_to_console():
+    """
+    Copy lab-specific router files from vpodrepo to console
+    """
+    sku_files_dir = f'{vpod_repo}/files'
+    console_files_dir = f'{mc}/home/holuser/Documents/files'
+    if not os.path.isdir(sku_files_dir):
+        write_output('No vpodrepo/files directory found')
+        return False
+    else:
+        write_output('Pushing lab files to console...')
+
+    if not os.path.isdir(console_files_dir):
+        os.makedirs(console_files_dir, exist_ok=True)
+    
+    # Copy files to console
+    for item in os.listdir(sku_files_dir):
+        src = os.path.join(sku_files_dir, item)
+        dst = os.path.join(console_files_dir, item)
+        if os.path.isfile(src):
+            try:
+                shutil.copy(src, dst)
+                write_output(f'Copied {item} to console files directory')
+            except Exception as e:
+                write_output(f'Failed to copy {item} to console files directory: {e}')
+        elif os.path.isdir(src):
+            if os.path.exists(dst):
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+
+    write_output('Lab files pushed to console')
+    return True
 
 #==============================================================================
 # MISC HELPERS
