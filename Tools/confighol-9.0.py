@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.0.py - HOLFY27 vApp HOLification Tool
-# Version 2.2 - March 2026
+# Version 2.3 - 2026-03-13
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -9,6 +9,9 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.3 - 2026-03-13:
+#   - Fixed: vCenter CA import now handles CN= format in certificate subject
+#     (e.g. "CN = vc-mgmt-a.site-a.vcf.lab, O = VMware, Inc.")
 # v2.2 - 2026-03-02:
 #   - VCF Operations Fleet CA: extract from TLS chain and import to Firefox
 #   - vCenter CA: import ALL certs from download.zip (not just the first),
@@ -2529,6 +2532,10 @@ def download_vcenter_ca_certificates(vcenter_hostname: str) -> Optional[list]:
                             org = subject.split('O = ')[1].split(',')[0].strip()
                             org = org.strip('"')
                             cert_name = f"{org} CA"
+                        elif 'CN = ' in subject:
+                            cn = subject.split('CN = ')[1].split(',')[0].strip()
+                            cn = cn.strip('"')
+                            cert_name = cn
                 except Exception:
                     pass
                 

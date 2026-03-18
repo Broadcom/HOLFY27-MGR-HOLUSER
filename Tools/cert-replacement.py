@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Author: Kevin Tebear, Burke Azbill and HOL Core Team
+# Version: 1.0
+# Date: 2026-03-13
 """
 VCF Certificate Management Script (VCF 9.1 Cycle 4)
 
@@ -16,35 +19,47 @@ For SDDC Manager-managed resources (SDDC Manager, vCenter, NSX Manager, ESXi):
   4. Upload signed certificate chain via SDDC Manager API
   5. SDDC Manager applies the certificate to the component
 
-For non-SDDC-managed resources (VCF Operations, VCF Automation, Ops Logs, etc.):
+For fleet-managed resources (VCF Operations, Automation, Logs, Networks, etc.):
+  1. Generate CSR via VCF Operations Certificate Management API
+  2. Download CSR from API
+  3. Sign CSR with HashiCorp Vault PKI
+  4. Import signed certificate to VCF Operations repository
+  5. Replace active certificate via API
+
+For non-managed resources:
   1. Generate CSR locally
   2. Sign CSR with HashiCorp Vault PKI
   3. Replace certificate via component-specific method (SSH/API)
 
 VCF Components Managed:
 
-  Management Domain:
-  - sddcmanager-a.site-a.vcf.lab   (SDDC Manager)       - SDDC Manager API  [AUTOMATED]
-  - vc-mgmt-a.site-a.vcf.lab       (Mgmt vCenter)       - SDDC Manager API  [AUTOMATED]
-  - nsx-mgmt-a.site-a.vcf.lab      (Mgmt NSX VIP)       - SDDC Manager API  [AUTOMATED]
-  - nsx-mgmt-01a.site-a.vcf.lab    (Mgmt NSX Node)      - SDDC Manager API  [AUTOMATED]
-  - ops-a.site-a.vcf.lab           (VCF Operations)      - SSH replacement   [AUTOMATED]
+  Management Domain (SDDC Manager API):
+  - sddcmanager-a.site-a.vcf.lab   (SDDC Manager)       [AUTOMATED]
+  - vc-mgmt-a.site-a.vcf.lab       (Mgmt vCenter)       [AUTOMATED]
+  - nsx-mgmt-a.site-a.vcf.lab      (Mgmt NSX VIP)       [AUTOMATED]
+  - nsx-mgmt-01a.site-a.vcf.lab    (Mgmt NSX Node)      [AUTOMATED]
 
-  Workload Domain:
-  - vc-wld01-a.site-a.vcf.lab      (WLD vCenter)        - SDDC Manager API  [AUTOMATED]
-  - nsx-wld01-a.site-a.vcf.lab     (WLD NSX VIP)        - SDDC Manager API  [AUTOMATED]
-  - nsx-wld01-01a.site-a.vcf.lab   (WLD NSX Node)       - SDDC Manager API  [AUTOMATED]
+  Workload Domain (SDDC Manager API):
+  - vc-wld01-a.site-a.vcf.lab      (WLD vCenter)        [AUTOMATED]
+  - nsx-wld01-a.site-a.vcf.lab     (WLD NSX VIP)        [AUTOMATED]
+  - nsx-wld01-01a.site-a.vcf.lab   (WLD NSX Node)       [AUTOMATED]
 
-  VCF Services:
-  - auto-a.site-a.vcf.lab          (VCF Automation)      - SSH/K8s           [MANUAL]
-  - auto-platform-a.site-a.vcf.lab (VCFA Platform)       - SSH/K8s           [MANUAL]
-  - opslogs-a.site-a.vcf.lab       (Ops for Logs)        - SSH/K8s           [MANUAL]
-  - opsnet-a.site-a.vcf.lab        (Ops for Networks)    - API only          [MANUAL]
+  Fleet-managed (VCF Operations Certificate Management API):
+  - ops-a.site-a.vcf.lab           (VCF Operations)      [AUTOMATED*]
+  - auto-a.site-a.vcf.lab          (VCF Automation)      [AUTOMATED*]
+  - auto-platform-a.site-a.vcf.lab (VCFA Platform)       [AUTOMATED*]
+  - opslogs-a.site-a.vcf.lab       (Log management)      [AUTOMATED]
+  - opsnet-a.site-a.vcf.lab        (VCF Ops for networks)[AUTOMATED]
+  - vidb-a.site-a.vcf.lab          (Identity broker)     [AUTOMATED]
+  - fleet-01a.site-a.vcf.lab       (VCF services runtime)[AUTOMATED]
+  - instance-01a.site-a.vcf.lab    (VCF services runtime)[AUTOMATED]
+  - vsp-01a.site-a.vcf.lab         (VCF services runtime)[AUTOMATED]
 
-  VSP Gateway Endpoints (managed by VSP cluster, cert ref via Ops Locker):
-  - vsp-01a.site-a.vcf.lab         (VSP Gateway)
-  - fleet-01a.site-a.vcf.lab       (Fleet Gateway)
-  - instance-01a.site-a.vcf.lab    (Instance Gateway)
+  * VRSLCM orchestrator dependency: VCF Automation and VCF Operations cert
+    replacements require the VRSLCM orchestrator (via fleet-upgrade-service).
+    If this service is unhealthy, the CSR/sign/import steps succeed but the
+    final replacement hangs. In that case, use the VCF Operations UI manually:
+    Fleet Management > Certificates > Replace With Imported Certificate.
 
 Security: Credentials can be provided via:
 - Environment variables (VCF_PASS)
@@ -75,7 +90,9 @@ import json
 import logging
 import argparse
 import time
+import re
 import subprocess
+import shutil
 import tempfile
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
@@ -118,12 +135,16 @@ DEFAULT_VCF_TARGETS = [
     'vc-wld01-a.site-a.vcf.lab',
     'nsx-wld01-a.site-a.vcf.lab',
     'nsx-wld01-01a.site-a.vcf.lab',
-    # VCF Operations & Services (non-SDDC-managed)
+    # Fleet-managed (VCF Operations Certificate Management API)
     'ops-a.site-a.vcf.lab',
     'auto-a.site-a.vcf.lab',
     'auto-platform-a.site-a.vcf.lab',
     'opslogs-a.site-a.vcf.lab',
     'opsnet-a.site-a.vcf.lab',
+    'vidb-a.site-a.vcf.lab',
+    'fleet-01a.site-a.vcf.lab',
+    'instance-01a.site-a.vcf.lab',
+    'vsp-01a.site-a.vcf.lab',
 ]
 
 
@@ -181,6 +202,10 @@ DEFAULT_CREDENTIALS = {
         'ssh': 'vmware-system-user',
     },
     'instance-': {
+        'api': 'admin',
+        'ssh': 'vmware-system-user',
+    },
+    'vidb': {
         'api': 'admin',
         'ssh': 'vmware-system-user',
     },
@@ -802,6 +827,366 @@ class SDDCManagerAPI:
 
 
 # =============================================================================
+# VCF Operations Fleet Certificate Management API
+# =============================================================================
+
+class VCFOpsCertManagementAPI:
+    """
+    Client for the VCF Operations Fleet Certificate Management API.
+
+    Uses two base paths depending on operation:
+      - suite-api/internal/certificatemanagement (OpsToken, for queries and CSR listing)
+      - vcf-operations/rest/ops/internal/certificatemanagement (session cookie, for mutations)
+
+    Authentication: OpsToken acquired via suite-api/api/auth/token/acquire, then a session
+    cookie is obtained by calling the internal API endpoint.
+    """
+
+    FLEET_CERT_TARGETS = {
+        'auto-a.site-a.vcf.lab':          '10.1.1.70',
+        'auto-platform-a.site-a.vcf.lab': '10.1.1.69',
+        'ops-a.site-a.vcf.lab':           '10.1.1.30',
+        'opslogs-a.site-a.vcf.lab':       '10.1.1.50',
+        'vidb-a.site-a.vcf.lab':          '10.1.1.66',
+        'fleet-01a.site-a.vcf.lab':       '10.1.1.143',
+        'instance-01a.site-a.vcf.lab':    '10.1.1.145',
+        'vsp-01a.site-a.vcf.lab':         '10.1.1.141',
+        'opsnet-a.site-a.vcf.lab':        '10.1.1.60',
+    }
+
+    def __init__(self, ops_url: str, username: str, password: str):
+        self.ops_url = ops_url.rstrip('/')
+        self.username = username
+        self.password = password
+        self.session = requests.Session()
+        self.session.verify = False
+        self.ops_token: Optional[str] = None
+        self._cert_cache: Optional[List[Dict]] = None
+
+    def acquire_ops_token(self) -> Optional[str]:
+        """Acquire an OpsToken from the suite-api auth endpoint."""
+        url = f"{self.ops_url}/suite-api/api/auth/token/acquire"
+        for auth_source in ['local', 'localItem']:
+            try:
+                resp = self.session.post(url, json={
+                    "username": self.username,
+                    "password": self.password,
+                    "authSource": auth_source
+                }, timeout=30)
+                if resp.status_code == 200:
+                    self.ops_token = resp.json().get('token')
+                    if self.ops_token:
+                        logger.debug(f"OpsToken acquired (authSource={auth_source})")
+                        self._setup_session_headers()
+                        return self.ops_token
+            except Exception:
+                continue
+        logger.error("Failed to acquire OpsToken")
+        return None
+
+    def _setup_session_headers(self):
+        """Set standard headers on the session after token acquisition."""
+        self.session.headers.update({
+            'Authorization': f'OpsToken {self.ops_token}',
+            'X-vRealizeOps-API-use-unsupported': 'true',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        })
+
+    def _establish_internal_session(self):
+        """
+        Hit the internal certificatemanagement endpoint once to establish
+        session cookies that the vcf-operations/rest/ops/internal path requires.
+        """
+        url = f"{self.ops_url}/vcf-operations/rest/ops/internal/certificatemanagement/certificates/query"
+        try:
+            self.session.post(url, json={
+                "vcfComponent": "VCF_MANAGEMENT",
+                "vcfComponentType": "ARIA"
+            }, timeout=30)
+        except Exception:
+            pass
+
+    def connect(self) -> bool:
+        """Acquire token and establish session. Returns True on success."""
+        if not self.acquire_ops_token():
+            return False
+        self._establish_internal_session()
+        return True
+
+    def query_certificates(self, force_refresh: bool = False) -> List[Dict]:
+        """Query all fleet-managed TLS certificates."""
+        if self._cert_cache and not force_refresh:
+            return self._cert_cache
+
+        url = f"{self.ops_url}/suite-api/internal/certificatemanagement/certificates/query"
+        try:
+            resp = self.session.post(url, json={
+                "vcfComponent": "VCF_MANAGEMENT",
+                "vcfComponentType": "ARIA"
+            }, timeout=30)
+            if resp.status_code == 200:
+                all_certs = resp.json().get('vcfCertificateModels', [])
+                self._cert_cache = [c for c in all_certs if c.get('category') == 'TLS_CERT']
+                return self._cert_cache
+        except Exception as e:
+            logger.error(f"Failed to query certificates: {e}")
+        return []
+
+    def get_cert_key_for_target(self, fqdn: str) -> Optional[str]:
+        """Find the certificateResourceKey for a given FQDN or IP."""
+        certs = self.query_certificates()
+        fqdn_lower = fqdn.lower()
+
+        ip_addr = self.FLEET_CERT_TARGETS.get(fqdn_lower)
+        if not ip_addr:
+            try:
+                ip_addr = socket.gethostbyname(fqdn)
+            except socket.gaierror:
+                pass
+
+        for cert in certs:
+            cert_ip = cert.get('applianceIp', '').lower()
+            if cert_ip == fqdn_lower or cert_ip == ip_addr:
+                return cert.get('certificateResourceKey')
+
+        return None
+
+    def get_cert_info_for_target(self, fqdn: str) -> Optional[Dict]:
+        """Get full certificate info for a target."""
+        certs = self.query_certificates()
+        fqdn_lower = fqdn.lower()
+
+        ip_addr = self.FLEET_CERT_TARGETS.get(fqdn_lower)
+        if not ip_addr:
+            try:
+                ip_addr = socket.gethostbyname(fqdn)
+            except socket.gaierror:
+                pass
+
+        for cert in certs:
+            cert_ip = cert.get('applianceIp', '').lower()
+            if cert_ip == fqdn_lower or cert_ip == ip_addr:
+                return cert
+
+        return None
+
+    def is_fleet_managed(self, fqdn: str) -> bool:
+        """Check if a target is managed by the fleet certificate management API."""
+        return self.get_cert_key_for_target(fqdn) is not None
+
+    def generate_csr(self, fqdn: str, cert_resource_key: str,
+                     common_name: str, dns_sans: List[str],
+                     ip_sans: List[str]) -> Optional[str]:
+        """
+        Generate a CSR via the fleet certificate management API.
+        Returns a task ID on success.
+        """
+        url = f"{self.ops_url}/suite-api/internal/certificatemanagement/csrs"
+        payload = {
+            "commonCsrData": {
+                "country": "US",
+                "email": "",
+                "keySize": "KEY_2048",
+                "keyAlgorithm": "RSA",
+                "locality": "Palo Alto",
+                "organization": "Broadcom",
+                "orgUnit": "vcfms",
+                "state": "CA"
+            },
+            "componentCsrData": [{
+                "certificateId": cert_resource_key,
+                "commonName": common_name,
+                "subjectAltNames": {
+                    "dns": dns_sans,
+                    "ip": ip_sans
+                }
+            }]
+        }
+        try:
+            resp = self.session.post(url, json=payload, timeout=60)
+            if resp.status_code == 200:
+                task = resp.json()
+                task_id = task.get('id')
+                logger.info(f"  CSR generation task: {task_id}")
+                return task_id
+            else:
+                logger.error(f"  CSR generation failed: {resp.status_code}")
+                logger.error(f"  Response: {resp.text[:500]}")
+                return None
+        except Exception as e:
+            logger.error(f"  CSR generation failed: {e}")
+            return None
+
+    def get_csrs(self) -> List[Dict]:
+        """List all generated CSRs."""
+        url = f"{self.ops_url}/suite-api/internal/certificatemanagement/csrs"
+        try:
+            resp = self.session.get(url, params={"page": 0, "pageSize": 50}, timeout=30)
+            if resp.status_code == 200:
+                return resp.json().get('certificateSignatureInfo', [])
+        except Exception as e:
+            logger.error(f"  Failed to list CSRs: {e}")
+        return []
+
+    def get_csr_for_ip(self, ip_or_hostname: str) -> Optional[str]:
+        """Get the CSR PEM content for a specific appliance (by IP or FQDN)."""
+        targets = {ip_or_hostname.lower()}
+        ip = self.FLEET_CERT_TARGETS.get(ip_or_hostname.lower())
+        if ip:
+            targets.add(ip)
+        try:
+            resolved = socket.gethostbyname(ip_or_hostname)
+            targets.add(resolved)
+        except socket.gaierror:
+            pass
+
+        for csr in self.get_csrs():
+            hostname = csr.get('applianceHostname', '').lower()
+            if hostname in targets:
+                return csr.get('csr')
+        return None
+
+    def import_certificate(self, cert_name: str, cert_chain_pem: str) -> Optional[str]:
+        """
+        Import a signed certificate into the VCF Operations certificate repository.
+        cert_chain_pem should contain the server cert followed by the CA cert.
+        Returns task ID on success.
+        """
+        url = f"{self.ops_url}/suite-api/internal/certificatemanagement/repository/certificates/import"
+        payload = {
+            "certificates": [{
+                "name": cert_name,
+                "source": "PASTE",
+                "certificate": cert_chain_pem
+            }]
+        }
+        try:
+            resp = self.session.put(url, json=payload, timeout=60)
+            if resp.status_code == 200:
+                task = resp.json()
+                task_id = task.get('id')
+                logger.info(f"  Certificate import task: {task_id}")
+                return task_id
+            else:
+                logger.error(f"  Certificate import failed: {resp.status_code}")
+                logger.error(f"  Response: {resp.text[:500]}")
+                return None
+        except Exception as e:
+            logger.error(f"  Certificate import failed: {e}")
+            return None
+
+    def list_repo_certificates(self) -> List[Dict]:
+        """List all certificates in the repository."""
+        url = f"{self.ops_url}/suite-api/internal/certificatemanagement/repository/certificates"
+        try:
+            resp = self.session.get(url, params={"page": 0, "pageSize": 50}, timeout=30)
+            if resp.status_code == 200:
+                return resp.json().get('vcfRepositoryCertificates', [])
+        except Exception as e:
+            logger.error(f"  Failed to list repo certificates: {e}")
+        return []
+
+    def find_repo_cert_by_name(self, cert_name: str) -> Optional[str]:
+        """Find a repository certificate ID by name."""
+        for cert in self.list_repo_certificates():
+            if cert.get('name') == cert_name:
+                return cert.get('certId')
+        return None
+
+    def replace_certificate(self, cert_resource_key: str, repo_cert_id: str) -> Optional[str]:
+        """
+        Replace an active certificate with an imported one from the repository.
+        Returns task ID on success.
+        """
+        result = self.replace_certificate_with_details(cert_resource_key, repo_cert_id)
+        if result:
+            return result.get('id')
+        return None
+
+    def replace_certificate_with_details(self, cert_resource_key: str, repo_cert_id: str) -> Optional[Dict]:
+        """
+        Replace an active certificate with an imported one from the repository.
+        Returns full task response dict (including subTasksDetails with orchestratorType).
+        """
+        url = f"{self.ops_url}/suite-api/internal/certificatemanagement/certificates/replace"
+        payload = {
+            "caType": "EXTERNAL_CA",
+            "certificatesMapping": [{
+                "certificateId": cert_resource_key,
+                "importedCertificateId": repo_cert_id
+            }]
+        }
+        try:
+            resp = self.session.put(url, json=payload, timeout=60)
+            if resp.status_code in [200, 202]:
+                task = resp.json()
+                task_id = task.get('id')
+                logger.info(f"  Certificate replace task: {task_id}")
+                return task
+            else:
+                logger.error(f"  Certificate replace failed: {resp.status_code}")
+                logger.error(f"  Response: {resp.text[:500]}")
+                return None
+        except Exception as e:
+            logger.error(f"  Certificate replace failed: {e}")
+            return None
+
+    def wait_for_task(self, task_id: str, timeout: int = 300, poll_interval: int = 10) -> bool:
+        """Poll a certificate management task until completion."""
+        if not task_id:
+            return True
+
+        url = f"{self.ops_url}/suite-api/internal/certificatemanagement/tasks/{task_id}"
+        start_time = time.time()
+        logger.info(f"  Waiting for task {task_id[:12]}...")
+
+        while time.time() - start_time < timeout:
+            try:
+                resp = self.session.get(url, timeout=30)
+                if resp.status_code == 200:
+                    task = resp.json()
+                    status = task.get('status', '')
+                    summary = task.get('subTasksSummary', {})
+
+                    if status == 'COMPLETED':
+                        failed = summary.get('failed', 0)
+                        if failed > 0:
+                            logger.error(f"  Task completed with {failed} failures")
+                            for sub in task.get('subTasksDetails', []):
+                                if sub.get('status') == 'FAILED':
+                                    logger.error(f"    {sub.get('appliance')}: {sub.get('message')}")
+                            return False
+                        logger.info(f"  Task completed successfully")
+                        return True
+                    elif status in ('IN_PROGRESS', 'NOT_STARTED'):
+                        elapsed = int(time.time() - start_time)
+                        completed = summary.get('completed', 0)
+                        total = summary.get('total', 0)
+                        logger.debug(f"  Task {status} ({completed}/{total} subtasks, {elapsed}s)")
+                        time.sleep(poll_interval)
+                    elif status == 'FAILED':
+                        logger.error(f"  Task failed")
+                        for sub in task.get('subTasksDetails', []):
+                            if sub.get('status') == 'FAILED':
+                                logger.error(f"    {sub.get('appliance')}: {sub.get('message')}")
+                        return False
+                    else:
+                        time.sleep(poll_interval)
+                elif resp.status_code == 500:
+                    time.sleep(poll_interval)
+                else:
+                    logger.warning(f"  Unexpected task poll status: {resp.status_code}")
+                    time.sleep(poll_interval)
+            except Exception as e:
+                logger.warning(f"  Task poll error: {e}")
+                time.sleep(poll_interval)
+
+        logger.error(f"  Task timed out after {timeout}s")
+        return False
+
+
+# =============================================================================
 # Component-Specific Certificate Replacement (Legacy/Fallback)
 # =============================================================================
 
@@ -1213,6 +1598,373 @@ class VCenterCertReplacer:
 # Main Certificate Replacement Function
 # =============================================================================
 
+# =============================================================================
+# NSX Compute Manager Re-registration After Certificate Replacement
+# =============================================================================
+
+class NSXComputeManagerFixer:
+    """
+    Fixes NSX compute manager trust issues after vCenter/NSX certificate replacement.
+
+    After vCenter SSL certificates are replaced with Vault-signed certs, NSX compute
+    managers go DOWN because:
+    1. The Vault CA may have a double-cert entry in vCenter TRUSTED_ROOTS (caused by
+       dir-cli trustedcert publish being called twice), which NSX rejects (MP2179)
+    2. The vCenter thumbprint stored in NSX no longer matches the new certificate
+    3. The Vault CA may not be in the NSX trust store
+
+    This class performs three remediation steps:
+    - Fix double-cert entries in vCenter TRUSTED_ROOTS
+    - Import Vault CA into NSX trust stores (idempotent)
+    - Re-register compute managers with the new vCenter thumbprint
+    """
+
+    VCENTER_NSX_PAIRS = [
+        {
+            'vcenter_fqdn': 'vc-mgmt-a.site-a.vcf.lab',
+            'vcenter_sso_user': 'administrator@vsphere.local',
+            'vcenter_sso_domain': 'vsphere.local',
+            'nsx_fqdn': 'nsx-mgmt-01a.site-a.vcf.lab',
+        },
+        {
+            'vcenter_fqdn': 'vc-wld01-a.site-a.vcf.lab',
+            'vcenter_sso_user': 'administrator@wld.sso',
+            'vcenter_sso_domain': 'wld.sso',
+            'nsx_fqdn': 'nsx-wld01-01a.site-a.vcf.lab',
+        },
+    ]
+
+    def __init__(self, password: str, vault_url: str, vault_token: str):
+        self.password = password
+        self.vault_url = vault_url.rstrip('/')
+        self.vault_token = vault_token
+
+    def _get_vault_ca_pem(self) -> Optional[str]:
+        """Get the Vault root CA PEM."""
+        try:
+            resp = requests.get(f"{self.vault_url}/v1/pki/ca/pem", timeout=10, verify=False)
+            if resp.status_code == 200:
+                return resp.text.strip()
+        except Exception as e:
+            logger.error(f"  Failed to get Vault CA: {e}")
+        return None
+
+    def _get_vcenter_thumbprint(self, fqdn: str) -> Optional[str]:
+        """Get the SHA-256 thumbprint of a vCenter's current SSL certificate."""
+        try:
+            result = subprocess.run(
+                ['bash', '-c',
+                 f'echo | openssl s_client -connect {fqdn}:443 2>/dev/null '
+                 f'| openssl x509 -fingerprint -sha256 -noout '
+                 f'| sed "s/sha256 Fingerprint=//"'],
+                capture_output=True, text=True, timeout=15
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception as e:
+            logger.error(f"  Failed to get thumbprint for {fqdn}: {e}")
+        return None
+
+    def fix_vcenter_trusted_roots(self, vcenter_fqdn: str, sso_user: str) -> bool:
+        """
+        Fix double-cert entries for Vault CA in vCenter TRUSTED_ROOTS.
+
+        dir-cli trustedcert publish silently appends a duplicate PEM when called
+        twice with the same cert. NSX rejects multi-cert PEMs with MP2179.
+        """
+        logger.info(f"  Checking TRUSTED_ROOTS on {vcenter_fqdn} for double-cert entries...")
+
+        vault_ca = self._get_vault_ca_pem()
+        if not vault_ca:
+            return False
+
+        # Check for double-cert entries
+        ok, output = run_ssh_command(
+            vcenter_fqdn, 'root', self.password,
+            'for alias in $(/usr/lib/vmware-vmafd/bin/vecs-cli entry list --store TRUSTED_ROOTS '
+            '| grep Alias | awk -F":\\t" \'{print $2}\' | xargs); do '
+            'count=$(/usr/lib/vmware-vmafd/bin/vecs-cli entry getcert --store TRUSTED_ROOTS '
+            '--alias "$alias" | grep -c "BEGIN CERTIFICATE"); '
+            'subject=$(/usr/lib/vmware-vmafd/bin/vecs-cli entry getcert --store TRUSTED_ROOTS '
+            '--alias "$alias" | openssl x509 -noout -subject 2>/dev/null); '
+            'echo "$alias|$count|$subject"; done',
+            timeout=30
+        )
+
+        if not ok:
+            logger.warning(f"  Could not check TRUSTED_ROOTS on {vcenter_fqdn}: {output}")
+            return False
+
+        has_double_cert = False
+        for line in output.strip().splitlines():
+            parts = line.strip().split('|')
+            if len(parts) >= 2:
+                alias, count = parts[0].strip(), parts[1].strip()
+                if count == '2' and 'Root Authority' in line:
+                    has_double_cert = True
+                    logger.warning(f"  Double-cert found: alias={alias} ({count} certs)")
+
+        if not has_double_cert:
+            logger.info(f"  No double-cert entries found on {vcenter_fqdn}")
+            return True
+
+        # Write Vault CA to temp file on vCenter, unpublish, republish
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
+            f.write(vault_ca + '\n')
+            local_ca_path = f.name
+
+        try:
+            scp_file_to_host(vcenter_fqdn, 'root', self.password, local_ca_path,
+                             '/tmp/vault-ca-single.pem')
+
+            sso_admin = sso_user
+            logger.info(f"  Unpublishing double-cert entry...")
+            ok, out = run_ssh_command(vcenter_fqdn, 'root', self.password,
+                f"/usr/lib/vmware-vmafd/bin/dir-cli trustedcert unpublish "
+                f"--cert /tmp/vault-ca-single.pem "
+                f"--login {sso_admin} --password '{self.password}'",
+                timeout=30)
+            if not ok:
+                logger.error(f"  Unpublish failed: {out}")
+                return False
+
+            logger.info(f"  Republishing as single-cert entry...")
+            ok, out = run_ssh_command(vcenter_fqdn, 'root', self.password,
+                f"/usr/lib/vmware-vmafd/bin/dir-cli trustedcert publish "
+                f"--cert /tmp/vault-ca-single.pem "
+                f"--login {sso_admin} --password '{self.password}'",
+                timeout=30)
+            if not ok:
+                logger.error(f"  Republish failed: {out}")
+                return False
+
+            run_ssh_command(vcenter_fqdn, 'root', self.password,
+                '/usr/lib/vmware-vmafd/bin/vecs-cli force-refresh', timeout=15)
+            run_ssh_command(vcenter_fqdn, 'root', self.password,
+                'rm -f /tmp/vault-ca-single.pem', timeout=10)
+
+            logger.info(f"  Fixed double-cert entry on {vcenter_fqdn}")
+            return True
+        finally:
+            os.unlink(local_ca_path)
+
+    def ensure_vault_ca_in_nsx(self, nsx_fqdn: str) -> bool:
+        """Import Vault CA into NSX trust store if not already present."""
+        vault_ca = self._get_vault_ca_pem()
+        if not vault_ca:
+            return False
+
+        session = requests.Session()
+        session.verify = False
+        session.auth = ('admin', self.password)
+
+        try:
+            resp = session.post(
+                f'https://{nsx_fqdn}/api/v1/trust-management/certificates?action=import',
+                json={'display_name': 'vcf.lab Root Authority', 'pem_encoded': vault_ca},
+                timeout=30
+            )
+            if resp.status_code in [200, 201]:
+                results = resp.json().get('results', [])
+                if results:
+                    logger.info(f"  Imported Vault CA into {nsx_fqdn} (ID: {results[0].get('id')})")
+                return True
+            elif resp.status_code == 400 and 'already exists' in resp.text.lower():
+                logger.info(f"  Vault CA already in {nsx_fqdn} trust store")
+                return True
+            else:
+                logger.warning(f"  Vault CA import to {nsx_fqdn}: {resp.status_code} {resp.text[:200]}")
+                return resp.status_code == 409  # conflict = already exists
+        except Exception as e:
+            logger.error(f"  Failed to import Vault CA into {nsx_fqdn}: {e}")
+            return False
+
+    def reregister_compute_managers(self, nsx_fqdn: str, vcenter_fqdn: str,
+                                     sso_user: str) -> bool:
+        """Re-register compute managers on an NSX manager with the new vCenter thumbprint."""
+        thumbprint = self._get_vcenter_thumbprint(vcenter_fqdn)
+        if not thumbprint:
+            logger.error(f"  Could not get thumbprint for {vcenter_fqdn}")
+            return False
+
+        session = requests.Session()
+        session.verify = False
+        session.auth = ('admin', self.password)
+
+        # Find compute managers for this vCenter
+        try:
+            resp = session.get(
+                f'https://{nsx_fqdn}/api/v1/fabric/compute-managers',
+                timeout=30
+            )
+            if resp.status_code != 200:
+                logger.error(f"  Failed to list compute managers: {resp.status_code}")
+                return False
+
+            cms = resp.json().get('results', [])
+        except Exception as e:
+            logger.error(f"  Failed to list compute managers: {e}")
+            return False
+
+        all_ok = True
+        for cm in cms:
+            cm_server = cm.get('server', '')
+            cm_id = cm.get('id', '')
+
+            if cm_server.lower() != vcenter_fqdn.lower():
+                continue
+
+            # Check if already UP/REGISTERED
+            try:
+                status_resp = session.get(
+                    f'https://{nsx_fqdn}/api/v1/fabric/compute-managers/{cm_id}/status',
+                    timeout=30
+                )
+                if status_resp.status_code == 200:
+                    status_data = status_resp.json()
+                    conn_status = status_data.get('connection_status', '')
+                    reg_status = status_data.get('registration_status', '')
+                    if conn_status == 'UP' and reg_status == 'REGISTERED':
+                        logger.info(f"  Compute manager {cm_server} already UP/REGISTERED on {nsx_fqdn}")
+                        continue
+                    logger.info(f"  Compute manager {cm_server}: {conn_status}/{reg_status} - re-registering...")
+            except Exception:
+                pass
+
+            # Build update payload - strip read-only fields and set new credential
+            update_payload = {k: v for k, v in cm.items()
+                             if k not in ('_create_time', '_create_user',
+                                          '_last_modified_time', '_last_modified_user',
+                                          '_protection', '_system_owned',
+                                          'certificate', 'origin_properties')}
+            update_payload['credential'] = {
+                'credential_type': 'UsernamePasswordLoginCredential',
+                'username': sso_user,
+                'password': self.password,
+                'thumbprint': thumbprint
+            }
+
+            try:
+                put_resp = session.put(
+                    f'https://{nsx_fqdn}/api/v1/fabric/compute-managers/{cm_id}',
+                    json=update_payload,
+                    timeout=60
+                )
+                if put_resp.status_code == 200:
+                    new_rev = put_resp.json().get('_revision', '?')
+                    logger.info(f"  Re-registered {cm_server} on {nsx_fqdn} (revision: {new_rev})")
+                else:
+                    error_msg = ''
+                    try:
+                        error_msg = put_resp.json().get('error_message', put_resp.text[:200])
+                    except Exception:
+                        error_msg = put_resp.text[:200]
+                    logger.error(f"  Failed to re-register {cm_server}: {put_resp.status_code} - {error_msg}")
+                    all_ok = False
+            except Exception as e:
+                logger.error(f"  Failed to re-register {cm_server}: {e}")
+                all_ok = False
+
+        return all_ok
+
+    def verify_compute_managers(self, nsx_fqdn: str, vcenter_fqdn: str,
+                                 timeout: int = 60) -> bool:
+        """Poll compute manager status until UP/REGISTERED or timeout."""
+        session = requests.Session()
+        session.verify = False
+        session.auth = ('admin', self.password)
+
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                resp = session.get(
+                    f'https://{nsx_fqdn}/api/v1/fabric/compute-managers',
+                    timeout=30
+                )
+                if resp.status_code != 200:
+                    time.sleep(10)
+                    continue
+
+                for cm in resp.json().get('results', []):
+                    if cm.get('server', '').lower() != vcenter_fqdn.lower():
+                        continue
+
+                    cm_id = cm.get('id')
+                    status_resp = session.get(
+                        f'https://{nsx_fqdn}/api/v1/fabric/compute-managers/{cm_id}/status',
+                        timeout=30
+                    )
+                    if status_resp.status_code == 200:
+                        data = status_resp.json()
+                        if (data.get('connection_status') == 'UP'
+                                and data.get('registration_status') == 'REGISTERED'):
+                            logger.info(f"  Compute manager {vcenter_fqdn} is UP/REGISTERED on {nsx_fqdn}")
+                            return True
+            except Exception:
+                pass
+            time.sleep(10)
+
+        logger.warning(f"  Compute manager {vcenter_fqdn} not UP on {nsx_fqdn} after {timeout}s")
+        return False
+
+    def fix_all(self, replaced_targets: List[str], dry_run: bool = False) -> Dict[str, str]:
+        """
+        Fix NSX compute managers for all vCenter/NSX pairs where the vCenter
+        or NSX certificate was replaced.
+
+        Only runs for pairs where at least one of the vCenter or NSX FQDNs
+        appears in replaced_targets (indicating their cert was changed).
+        """
+        # Determine which pairs need fixing
+        pairs_to_fix = []
+        replaced_lower = {t.lower() for t in replaced_targets}
+
+        for pair in self.VCENTER_NSX_PAIRS:
+            vc = pair['vcenter_fqdn'].lower()
+            nsx = pair['nsx_fqdn'].lower()
+            # Also match the VIP FQDN patterns
+            nsx_vip = nsx.replace('-01a.', '-a.').replace('-01a.', '-a.')
+            if vc in replaced_lower or nsx in replaced_lower or nsx_vip in replaced_lower:
+                pairs_to_fix.append(pair)
+
+        if not pairs_to_fix:
+            logger.info("No vCenter/NSX certificate replacements detected - skipping compute manager fix")
+            return {}
+
+        logger.info("=" * 60)
+        logger.info("POST-REPLACEMENT: Fixing NSX Compute Manager Trust")
+        logger.info("=" * 60)
+
+        results = {}
+        for pair in pairs_to_fix:
+            vc_fqdn = pair['vcenter_fqdn']
+            nsx_fqdn = pair['nsx_fqdn']
+            sso_user = pair['vcenter_sso_user']
+
+            logger.info(f"\nFixing {nsx_fqdn} -> {vc_fqdn}")
+
+            if dry_run:
+                logger.info(f"  [DRY RUN] Would fix TRUSTED_ROOTS, import Vault CA, re-register CM")
+                results[f"{nsx_fqdn}->{vc_fqdn}"] = "DRY_RUN"
+                continue
+
+            # Step 1: Fix double-cert entries in vCenter TRUSTED_ROOTS
+            self.fix_vcenter_trusted_roots(vc_fqdn, sso_user)
+
+            # Step 2: Ensure Vault CA is in NSX trust store
+            self.ensure_vault_ca_in_nsx(nsx_fqdn)
+
+            # Step 3: Re-register compute managers with new thumbprint
+            self.reregister_compute_managers(nsx_fqdn, vc_fqdn, sso_user)
+
+            # Step 4: Verify status
+            if self.verify_compute_managers(nsx_fqdn, vc_fqdn, timeout=60):
+                results[f"{nsx_fqdn}->{vc_fqdn}"] = "SUCCESS"
+            else:
+                results[f"{nsx_fqdn}->{vc_fqdn}"] = "WARNING"
+
+        return results
+
 class GenericCertSaver:
     """
     Saves certificates locally for targets that don't support direct replacement.
@@ -1248,10 +2000,225 @@ class GenericCertSaver:
         return "WARNING"
 
 
-def get_replacer_for_target(fqdn: str, password: str):
+class FleetCertReplacer:
+    """
+    Replaces certificates on fleet-managed targets using the VCF Operations
+    certificate management API (suite-api/internal/certificatemanagement).
+
+    5-step workflow:
+      1. Generate CSR via API
+      2. Download CSR from API
+      3. Sign CSR with Vault PKI
+      4. Import signed cert to repository
+      5. Replace active cert with imported cert
+    """
+
+    def __init__(self, fqdn: str, password: str, ops_cert_api: 'VCFOpsCertManagementAPI',
+                 vault_manager: 'VaultCertificateManager'):
+        self.fqdn = fqdn
+        self.password = password
+        self.ops_cert_api = ops_cert_api
+        self.vault_manager = vault_manager
+
+    def replace(self, cert_pem: str = None, key_pem: str = None, dry_run: bool = False) -> str:
+        """
+        Execute the full 5-step fleet certificate replacement workflow.
+        cert_pem/key_pem are ignored — the CSR is generated by the API and
+        signed by Vault within this method.
+        """
+        logger.info(f"Fleet certificate replacement for: {self.fqdn}")
+
+        cert_info = self.ops_cert_api.get_cert_info_for_target(self.fqdn)
+        if not cert_info:
+            logger.error(f"  Target {self.fqdn} not found in fleet certificate list")
+            return "FAILED"
+
+        cert_key = cert_info.get('certificateResourceKey')
+        appliance_ip = cert_info.get('applianceIp', '')
+        display_type = cert_info.get('displayApplianceType', '')
+        api_cn = cert_info.get('issuedToCommonName', '')
+
+        # CN must always be a valid FQDN, never an internal identifier like VCFA/OPS_LOGS
+        common_name = self.fqdn
+        if api_cn and api_cn != self.fqdn:
+            logger.info(f"  Overriding API CN '{api_cn}' with FQDN '{self.fqdn}'")
+
+        logger.info(f"  Component: {display_type}")
+        logger.info(f"  Appliance: {appliance_ip}")
+        logger.info(f"  CN: {common_name}")
+        logger.info(f"  Cert key: {cert_key}")
+
+        dns_sans = [self.fqdn]
+        ip_sans = []
+        known_ip = VCFOpsCertManagementAPI.FLEET_CERT_TARGETS.get(self.fqdn.lower())
+        if known_ip:
+            ip_sans.append(known_ip)
+        elif appliance_ip and VaultCertificateManager._is_ip_address(appliance_ip):
+            ip_sans.append(appliance_ip)
+        resolved_ip = VaultCertificateManager.resolve_fqdn_to_ip(self.fqdn)
+        if resolved_ip and resolved_ip not in ip_sans:
+            ip_sans.append(resolved_ip)
+
+        if dry_run:
+            logger.info(f"  [DRY RUN] Would execute 5-step fleet cert replacement")
+            logger.info(f"    DNS SANs: {dns_sans}")
+            logger.info(f"    IP SANs: {ip_sans}")
+            return "SUCCESS"
+
+        # Step 1: Check for existing CSR or generate a new one
+        csr_pem = self.ops_cert_api.get_csr_for_ip(appliance_ip)
+        if csr_pem:
+            # Validate existing CSR has FQDN as CN, not an internal identifier
+            try:
+                csr_normalized = csr_pem
+                if '\n' not in csr_normalized and ' ' in csr_normalized:
+                    csr_normalized = csr_normalized.replace(' ', '\n')
+                    csr_normalized = csr_normalized.replace('-----BEGIN\nCERTIFICATE\nREQUEST-----',
+                                                            '-----BEGIN CERTIFICATE REQUEST-----')
+                    csr_normalized = csr_normalized.replace('-----END\nCERTIFICATE\nREQUEST-----',
+                                                            '-----END CERTIFICATE REQUEST-----')
+                csr_obj = x509.load_pem_x509_csr(csr_normalized.encode())
+                csr_cn = csr_obj.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+                if csr_cn == self.fqdn:
+                    logger.info(f"  Step 1: Reusing existing CSR (CN={csr_cn})")
+                else:
+                    logger.info(f"  Step 1: Discarding stale CSR (CN={csr_cn} != {self.fqdn}), generating new one")
+                    csr_pem = None
+            except Exception as e:
+                logger.warning(f"  Could not validate existing CSR CN: {e}")
+                csr_pem = None
+
+        if not csr_pem:
+            logger.info("  Step 1: Generating CSR via fleet API...")
+            task_id = self.ops_cert_api.generate_csr(
+                fqdn=self.fqdn,
+                cert_resource_key=cert_key,
+                common_name=common_name,
+                dns_sans=dns_sans,
+                ip_sans=ip_sans
+            )
+            if not task_id:
+                logger.error("  Failed to generate CSR")
+                return "FAILED"
+
+            # Step 2: Wait for CSR to become available (poll CSR list)
+            logger.info("  Step 2: Waiting for CSR to become available...")
+            for attempt in range(18):
+                time.sleep(10)
+                csr_pem = self.ops_cert_api.get_csr_for_ip(appliance_ip)
+                if csr_pem:
+                    break
+                logger.debug(f"  CSR not ready yet (attempt {attempt + 1}/18)...")
+
+        if not csr_pem:
+            logger.error(f"  CSR not found for {appliance_ip} after 3 minutes")
+            return "FAILED"
+
+        # The API returns CSR with spaces instead of newlines — fix it
+        if '\n' not in csr_pem and ' ' in csr_pem:
+            csr_pem = csr_pem.replace(' ', '\n')
+            csr_pem = csr_pem.replace('-----BEGIN\nCERTIFICATE\nREQUEST-----',
+                                      '-----BEGIN CERTIFICATE REQUEST-----')
+            csr_pem = csr_pem.replace('-----END\nCERTIFICATE\nREQUEST-----',
+                                      '-----END CERTIFICATE REQUEST-----')
+        logger.info(f"  CSR retrieved ({len(csr_pem)} bytes)")
+
+        # Step 3: Sign CSR with Vault
+        logger.info("  Step 3: Signing CSR with Vault PKI...")
+        signed_cert = self.vault_manager.sign_csr(csr_pem, common_name, ip_sans=ip_sans or None)
+        if not signed_cert:
+            logger.error("  Failed to sign CSR with Vault")
+            return "FAILED"
+
+        cert_blocks = re.findall(
+            r'(-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----)',
+            signed_cert, re.DOTALL
+        )
+        if len(cert_blocks) >= 2:
+            server_cert = cert_blocks[0]
+            ca_cert = "\n".join(cert_blocks[1:])
+            full_chain = server_cert + "\n" + ca_cert
+        else:
+            full_chain = signed_cert
+
+        cert_dir = Path("/tmp/vcf-certs")
+        cert_dir.mkdir(exist_ok=True)
+        (cert_dir / f"{self.fqdn}.crt").write_text(signed_cert)
+
+        # Step 4: Import signed cert to repository
+        cert_name = f"vault-{self.fqdn.split('.')[0]}-{int(time.time())}"
+        logger.info(f"  Step 4: Importing signed cert as '{cert_name}'...")
+        import_task_id = self.ops_cert_api.import_certificate(cert_name, full_chain)
+        if not import_task_id:
+            logger.error("  Failed to import certificate")
+            return "FAILED"
+
+        # Wait for cert to appear in the repository
+        repo_cert_id = None
+        for attempt in range(18):
+            time.sleep(10)
+            repo_cert_id = self.ops_cert_api.find_repo_cert_by_name(cert_name)
+            if repo_cert_id:
+                break
+            logger.debug(f"  Cert not in repo yet (attempt {attempt + 1}/18)...")
+
+        if not repo_cert_id:
+            logger.error(f"  Imported cert '{cert_name}' not found in repository after 3 minutes")
+            return "FAILED"
+        logger.info(f"  Imported cert ID: {repo_cert_id}")
+
+        # Step 5: Replace active cert
+        logger.info("  Step 5: Replacing active certificate...")
+        replace_result = self.ops_cert_api.replace_certificate_with_details(cert_key, repo_cert_id)
+        if not replace_result:
+            logger.error("  Failed to initiate certificate replacement")
+            return "FAILED"
+
+        replace_task_id = replace_result.get('id')
+        orchestrator = 'unknown'
+        for sub in replace_result.get('subTasksDetails', []):
+            orchestrator = sub.get('orchestratorType', orchestrator)
+        logger.info(f"  Replace orchestrator: {orchestrator}")
+
+        # Wait for replacement to complete by polling the cert list for issuer change
+        logger.info("  Waiting for replacement to complete...")
+        for attempt in range(60):
+            time.sleep(10)
+            self.ops_cert_api._cert_cache = None
+            updated_info = self.ops_cert_api.get_cert_info_for_target(self.fqdn)
+            if updated_info:
+                issuer = updated_info.get('issuedBy', '')
+                if 'vcf.lab Root Authority' in issuer:
+                    logger.info(f"  Certificate replaced (issuer: {issuer})")
+                    break
+            logger.debug(f"  Replacement in progress (attempt {attempt + 1}/60)...")
+        else:
+            if orchestrator == 'VRSLCM':
+                logger.warning(f"  VRSLCM orchestrator did not complete replacement for {self.fqdn}")
+                logger.warning("  The signed certificate has been imported to the repository.")
+                logger.warning("  To complete: VCF Operations UI > Fleet Management > Certificates > Replace")
+            else:
+                logger.warning("  Replacement task may still be running — check VCF Operations UI")
+            return "WARNING"
+
+        logger.info(f"  Fleet certificate replacement completed for {self.fqdn}")
+        return "SUCCESS"
+
+
+def get_replacer_for_target(fqdn: str, password: str,
+                            ops_cert_api: Optional['VCFOpsCertManagementAPI'] = None,
+                            vault_manager: Optional['VaultCertificateManager'] = None):
     """Get the appropriate certificate replacer for a target."""
     fqdn_lower = fqdn.lower()
-    
+
+    fleet_prefixes = (
+        'auto-platform', 'auto-', 'auto.', 'ops-', 'ops.', 'opslogs',
+        'opsnet', 'vidb', 'vsp-', 'fleet-', 'instance-',
+    )
+    if ops_cert_api and vault_manager and any(p in fqdn_lower for p in fleet_prefixes):
+        if ops_cert_api.is_fleet_managed(fqdn):
+            return FleetCertReplacer(fqdn, password, ops_cert_api, vault_manager)
+
     if 'sddcmanager' in fqdn_lower:
         return SDDCManagerCertReplacer(fqdn, password)
     elif 'auto-platform' in fqdn_lower:
@@ -1268,7 +2235,7 @@ def get_replacer_for_target(fqdn: str, password: str):
         return NSXManagerCertReplacer(fqdn, password)
     elif 'vc-' in fqdn_lower or 'vcenter' in fqdn_lower:
         return VCenterCertReplacer(fqdn, password)
-    elif any(prefix in fqdn_lower for prefix in ('vsp-', 'fleet-', 'instance-')):
+    elif any(prefix in fqdn_lower for prefix in ('vsp-', 'fleet-', 'instance-', 'vidb')):
         return GenericCertSaver(fqdn, password)
     else:
         logger.warning(f"No specific replacer for {fqdn}, saving locally")
@@ -1280,39 +2247,34 @@ def process_certificate(
     password: str,
     vault_manager: VaultCertificateManager,
     sddc_api: Optional[SDDCManagerAPI] = None,
+    ops_cert_api: Optional[VCFOpsCertManagementAPI] = None,
     ops_trust_manager = None,
     dry_run: bool = False
 ) -> str:
     """
     Generate, sign, and replace certificate for a VCF component.
-    
-    Workflow for SDDC-managed resources (SDDC Manager, vCenter, NSX):
-    1. Generate CSR via SDDC Manager API (on the remote component)
-    2. Get the CSR from SDDC Manager
-    3. Sign the CSR with HashiCorp Vault PKI
-    4. Upload the signed certificate chain via SDDC Manager API
-    5. SDDC Manager applies the certificate to the component
-    
-    Workflow for non-SDDC-managed resources (VCF Operations, etc.):
-    1. Generate CSR locally
-    2. Sign with Vault PKI  
-    3. Import to VCF Operations trust store
-    4. Use component-specific replacement (SSH/API)
+
+    Workflow selection (in priority order):
+    1. SDDC-managed: CSR via SDDC Manager API, sign with Vault, upload via API
+    2. Fleet-managed: CSR via Fleet Cert API, sign with Vault, import+replace via API
+    3. Non-managed: local CSR, sign with Vault, component-specific replacement
     """
     logger.info("=" * 60)
     logger.info(f"Processing certificate for: {fqdn}")
     logger.info("=" * 60)
-    
+
     cert_dir = Path("/tmp/vcf-certs")
     cert_dir.mkdir(exist_ok=True)
-    
+
     try:
-        # Check if this resource is managed by SDDC Manager
         if sddc_api and sddc_api.is_sddc_managed(fqdn):
             return _process_sddc_managed_certificate(fqdn, sddc_api, vault_manager, cert_dir, dry_run)
-        else:
-            return _process_non_sddc_certificate(fqdn, password, vault_manager, ops_trust_manager, cert_dir, dry_run)
-        
+
+        if ops_cert_api and ops_cert_api.is_fleet_managed(fqdn):
+            return _process_fleet_certificate(fqdn, password, vault_manager, ops_cert_api, cert_dir, dry_run)
+
+        return _process_non_sddc_certificate(fqdn, password, vault_manager, ops_trust_manager, cert_dir, dry_run)
+
     except Exception as e:
         logger.error(f"Error processing certificate for {fqdn}: {e}", exc_info=True)
         return "FAILED"
@@ -1395,6 +2357,24 @@ def _process_sddc_managed_certificate(
     
     logger.info(f"✓ Successfully replaced certificate for {fqdn}")
     return "SUCCESS"
+
+
+def _process_fleet_certificate(
+    fqdn: str,
+    password: str,
+    vault_manager: VaultCertificateManager,
+    ops_cert_api: VCFOpsCertManagementAPI,
+    cert_dir: Path,
+    dry_run: bool = False
+) -> str:
+    """
+    Process certificate for fleet-managed resources using the 5-step API workflow.
+    The FleetCertReplacer handles all steps internally.
+    """
+    logger.info("  Fleet-managed resource (VCF Operations Certificate Management API)")
+
+    replacer = FleetCertReplacer(fqdn, password, ops_cert_api, vault_manager)
+    return replacer.replace(dry_run=dry_run)
 
 
 def _process_non_sddc_certificate(
@@ -1610,12 +2590,16 @@ Default VCF Targets (VCF 9.1 Cycle 4):
   - nsx-wld01-a.site-a.vcf.lab        (WLD NSX VIP)
   - nsx-wld01-01a.site-a.vcf.lab      (WLD NSX Node)
 
-  Non-SDDC-managed:
+  Fleet-managed (VCF Operations Certificate Management API):
   - ops-a.site-a.vcf.lab              (VCF Operations)
   - auto-a.site-a.vcf.lab             (VCF Automation)
   - auto-platform-a.site-a.vcf.lab    (VCFA Platform)
-  - opslogs-a.site-a.vcf.lab          (Ops for Logs)
-  - opsnet-a.site-a.vcf.lab           (Ops for Networks)
+  - opslogs-a.site-a.vcf.lab          (Log management)
+  - opsnet-a.site-a.vcf.lab           (VCF Ops for networks)
+  - vidb-a.site-a.vcf.lab             (Identity broker)
+  - fleet-01a.site-a.vcf.lab          (VCF services runtime)
+  - instance-01a.site-a.vcf.lab       (VCF services runtime)
+  - vsp-01a.site-a.vcf.lab            (VCF services runtime)
 
 Vault token is obtained fresh from /home/holuser/creds.txt or router init.json.
         """
@@ -1712,7 +2696,22 @@ Vault token is obtained fresh from /home/holuser/creds.txt or router init.json.
     else:
         logger.warning("⚠ SDDC Manager connection failed - will use fallback methods")
         sddc_api = None
-    
+
+    # Initialize VCF Operations Certificate Management API for fleet-managed targets
+    ops_cert_api = VCFOpsCertManagementAPI(
+        ops_url='https://ops-a.site-a.vcf.lab',
+        username='admin',
+        password=config['vcf_pass']
+    )
+
+    logger.info("Connecting to VCF Operations Certificate Management API...")
+    if ops_cert_api.connect():
+        certs = ops_cert_api.query_certificates()
+        logger.info(f"✓ VCF Operations connection successful ({len(certs)} TLS certs)")
+    else:
+        logger.warning("⚠ VCF Operations connection failed - fleet targets will use fallback methods")
+        ops_cert_api = None
+
     # Determine targets
     targets = []
     if args.all:
@@ -1735,10 +2734,21 @@ Vault token is obtained fresh from /home/holuser/creds.txt or router init.json.
             password=config['vcf_pass'],
             vault_manager=vault_manager,
             sddc_api=sddc_api,
+            ops_cert_api=ops_cert_api,
             dry_run=args.dry_run
         )
         results[fqdn] = result_status
     
+    # Post-replacement: Fix NSX compute manager trust after vCenter/NSX cert changes
+    successful_targets = [fqdn for fqdn, status in results.items()
+                          if status in ('SUCCESS', 'WARNING')]
+    nsx_cm_fixer = NSXComputeManagerFixer(
+        password=config['vcf_pass'],
+        vault_url=config['vault_url'],
+        vault_token=config['vault_token']
+    )
+    cm_results = nsx_cm_fixer.fix_all(successful_targets, dry_run=args.dry_run)
+
     # Summary
     print("\n" + "=" * 60)
     print("CERTIFICATE REPLACEMENT SUMMARY")
@@ -1758,10 +2768,34 @@ Vault token is obtained fresh from /home/holuser/creds.txt or router init.json.
         else:
             status = "✗ FAILED"
         print(f"  {status}: {fqdn}")
+
+    if cm_results:
+        print()
+        print("NSX Compute Manager Trust Fix:")
+        for pair_key, cm_status in cm_results.items():
+            if cm_status == "SUCCESS":
+                print(f"  ✓ {pair_key}")
+            elif cm_status == "DRY_RUN":
+                print(f"  ○ {pair_key} (dry run)")
+            else:
+                print(f"  ⚠ {pair_key} ({cm_status})")
     
     print()
     print("Certificates saved to: /tmp/vcf-certs/")
-    
+
+    # Copy certs to /lmchol/tmp if it exists and is writable
+    lmchol_dest = Path("/lmchol/tmp")
+    if lmchol_dest.is_dir() and os.access(str(lmchol_dest), os.W_OK):
+        src = Path("/tmp/vcf-certs")
+        dst = lmchol_dest / "vcf-certs"
+        try:
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+            print(f"Certificates also copied to: {dst}/")
+        except Exception as e:
+            logger.warning(f"Failed to copy certs to {dst}: {e}")
+
     # Exit with 0 if there are no failures (SUCCESS and WARNING are both non-failures)
     failed = sum(1 for v in results.values() if v == "FAILED")
     sys.exit(0 if failed == 0 else 1)

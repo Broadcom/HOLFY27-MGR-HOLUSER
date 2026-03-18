@@ -343,141 +343,17 @@ def shutdown_vms_by_names(lsf, vm_names: list, dry_run: bool = False,
         if vms:
             for vm in vms:
                 processed += 1
-                shutdown_vm_gracefully(lsf, vm)
+                lsf.shutdown_vm_gracefully(vm)
                 time.sleep(5)
         else:
             vcf_write(lsf, f'    VM not found')
     return processed
 
 
-def is_vm_powered_on(vm) -> bool:
-    """
-    Check if a VM is powered on.
-    
-    :param vm: VM object
-    :return: True if powered on
-    """
-    from pyVmomi import vim
-    try:
-        return vm.runtime.powerState == vim.VirtualMachinePowerState.poweredOn
-    except Exception:
-        return False
 
 
-def shutdown_vm_gracefully(lsf, vm, timeout: int = VM_SHUTDOWN_TIMEOUT) -> bool:
-    """
-    Gracefully shutdown a VM using VMware Tools if available.
-    Logs progress heartbeats so shutdown.log never sits idle >60s.
-    
-    :param lsf: lsfunctions module reference
-    :param vm: VM object
-    :param timeout: Maximum time to wait for shutdown
-    :return: True if shutdown succeeded or VM was already off
-    """
-    from pyVmomi import vim
-    
-    vm_name = vm.name
-    
-    # Check current power state
-    try:
-        power_state = vm.runtime.powerState
-    except Exception as e:
-        vcf_write(lsf, f'{vm_name}: Unable to check power state: {e}')
-        return False
-    
-    # Already powered off?
-    if power_state == vim.VirtualMachinePowerState.poweredOff:
-        vcf_write(lsf, f'{vm_name}: Already powered off - skipping')
-        return True
-    
-    # Suspended?
-    if power_state == vim.VirtualMachinePowerState.suspended:
-        vcf_write(lsf, f'{vm_name}: VM is suspended, powering off')
-        try:
-            task = vm.PowerOffVM_Task()
-            from pyVim.task import WaitForTask
-            WaitForTask(task)
-            return True
-        except Exception as e:
-            vcf_write(lsf, f'{vm_name}: Failed to power off suspended VM: {e}')
-            return False
-    
-    # VM is powered on - proceed with shutdown
-    vcf_write(lsf, f'{vm_name}: Currently powered on, initiating shutdown')
-    
-    # Check VMware Tools status
-    try:
-        tools_status = vm.guest.toolsRunningStatus
-        vcf_write(lsf, f'{vm_name}: VMware Tools status: {tools_status}')
-    except Exception:
-        tools_status = 'guestToolsNotRunning'
-        vcf_write(lsf, f'{vm_name}: Unable to check Tools status, assuming not running')
-    
-    try:
-        if tools_status == 'guestToolsRunning':
-            vcf_write(lsf, f'{vm_name}: Initiating graceful guest shutdown')
-            try:
-                vm.ShutdownGuest()
-            except vim.fault.ToolsUnavailable:
-                # Race condition: toolsRunningStatus was stale (common with
-                # K8s pod VMs). Fall back to PowerOffVM_Task immediately.
-                vcf_write(lsf, f'{vm_name}: Tools reported running but unavailable '
-                          f'(stale status), forcing power off')
-                task = vm.PowerOffVM_Task()
-                from pyVim.task import WaitForTask
-                WaitForTask(task)
-                vcf_write(lsf, f'{vm_name}: Powered off successfully')
-                return True
-        else:
-            vcf_write(lsf, f'{vm_name}: No VMware Tools available, forcing power off')
-            task = vm.PowerOffVM_Task()
-            from pyVim.task import WaitForTask
-            WaitForTask(task)
-            vcf_write(lsf, f'{vm_name}: Powered off successfully')
-            return True
-        
-        # Wait for graceful shutdown with heartbeat progress
-        start_time = time.time()
-        last_heartbeat = start_time
-        while (time.time() - start_time) < timeout:
-            try:
-                if vm.runtime.powerState == vim.VirtualMachinePowerState.poweredOff:
-                    elapsed = int(time.time() - start_time)
-                    vcf_write(lsf, f'{vm_name}: Powered off successfully ({elapsed}s)')
-                    return True
-            except Exception:
-                pass
-            
-            # Heartbeat: log progress so shutdown.log doesn't appear idle
-            now = time.time()
-            if (now - last_heartbeat) >= HEARTBEAT_INTERVAL:
-                elapsed = int(now - start_time)
-                remaining = timeout - elapsed
-                vcf_write(lsf, f'{vm_name}: Waiting for guest shutdown... '
-                          f'({elapsed}s elapsed, {remaining}s remaining)')
-                last_heartbeat = now
-            
-            time.sleep(VM_SHUTDOWN_POLL_INTERVAL)
-        
-        # Timeout - force power off
-        vcf_write(lsf, f'{vm_name}: Graceful shutdown timeout ({timeout}s), forcing power off')
-        task = vm.PowerOffVM_Task()
-        from pyVim.task import WaitForTask
-        WaitForTask(task)
-        vcf_write(lsf, f'{vm_name}: Powered off successfully (forced)')
-        return True
-        
-    except Exception as e:
-        vcf_write(lsf, f'{vm_name}: Error during shutdown: {e}')
-        try:
-            task = vm.PowerOffVM_Task()
-            from pyVim.task import WaitForTask
-            WaitForTask(task)
-            vcf_write(lsf, f'{vm_name}: Powered off successfully (forced after error)')
-            return True
-        except Exception as e2:
-            vcf_write(lsf, f'{vm_name}: Force power off failed: {e2}')
-            return False
+
+
 
 
 def shutdown_supervisor_workloads(lsf, vc_fqdn: str, password: str,
@@ -1298,7 +1174,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                                     if 'sddcmanager' in vm.name.lower():
                                         vcf_write(lsf, f'  {vm.name}: Skipping (handled in Phase 16)')
                                         continue
-                                    shutdown_vm_gracefully(lsf, vm)
+                                    lsf.shutdown_vm_gracefully(vm)
                                     time.sleep(5)
                             else:
                                 vcf_write(lsf, f'  No VMs found matching pattern')
@@ -1689,6 +1565,13 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                 vm_patterns = [p.strip() for p in patterns_raw.split('\n') 
                               if p.strip() and not p.strip().startswith('#')]
 
+            # Delete VMs specifically designated for deletion
+            vms_to_delete = []
+            if lsf.config.has_option('SHUTDOWN', 'vms_to_delete'):
+                del_raw = lsf.config.get('SHUTDOWN', 'vms_to_delete')
+                vms_to_delete = [v.strip() for v in del_raw.split('\n')
+                                 if v.strip() and not v.strip().startswith('#')]
+
             # Static VM list (specific VMs to shutdown)
             workload_vms = []
             if lsf.config.has_option('SHUTDOWN', 'workload_vms'):
@@ -1699,6 +1582,20 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             if not dry_run:
                 total_workload_vms = 0
                 already_shutdown = set()
+
+                # Process VMs for deletion first
+                if vms_to_delete:
+                    vcf_write(lsf, f'Searching for VMs to delete matching {len(vms_to_delete)} pattern(s)...')
+                    for pattern in vms_to_delete:
+                        vcf_write(lsf, f'  Delete Pattern: {pattern}')
+                        vms = get_vms_by_regex(lsf, pattern)
+                        if vms:
+                            vcf_write(lsf, f'  Found {len(vms)} VM(s) to delete')
+                            for vm in vms:
+                                already_shutdown.add(vm.name)
+                                lsf.delete_vm(vm)
+                        else:
+                            vcf_write(lsf, f'  No VMs found matching this pattern to delete')
 
                 # Find VMs by pattern
                 vcf_write(lsf, f'Searching for VMs matching {len(vm_patterns)} pattern(s)...')
@@ -1711,7 +1608,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                             total_workload_vms += 1
                             already_shutdown.add(vm.name)
                             vcf_write(lsf, f'  [{total_workload_vms}] Shutting down: {vm.name}')
-                            shutdown_vm_gracefully(lsf, vm)
+                            lsf.shutdown_vm_gracefully(vm)
                             time.sleep(2)
                     else:
                         vcf_write(lsf, f'  No VMs found matching this pattern')
@@ -1754,7 +1651,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                                     total_workload_vms += 1
                                     already_shutdown.add(vm.name)
                                     vcf_write(lsf, f'  [{total_workload_vms}] Shutting down: {vm.name}')
-                                    shutdown_vm_gracefully(lsf, vm)
+                                    lsf.shutdown_vm_gracefully(vm)
                                     time.sleep(2)
                             else:
                                 vcf_write(lsf, f'  No additional workload VMs found on {vc}')
@@ -1774,7 +1671,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                             for vm in vms:
                                 total_workload_vms += 1
                                 vcf_write(lsf, f'  [{total_workload_vms}] Shutting down: {vm.name}')
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(2)
                         else:
                             vcf_write(lsf, f'  VM not found: {vm_name}')
@@ -1783,6 +1680,8 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
 
                 vcf_write(lsf, f'Workload VM shutdown complete: {total_workload_vms} VM(s) processed')
             else:
+                if vms_to_delete:
+                    vcf_write(lsf, f'Would delete VMs matching patterns: {vms_to_delete}')
                 vcf_write(lsf, f'Would shutdown VMs matching patterns: {vm_patterns}')
                 vcf_write(lsf, f'Would shutdown VMs: {workload_vms}')
                 vcf_write(lsf, 'Would dynamically discover Supervisor workload VMs')
@@ -1837,7 +1736,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vms = lsf.get_vm_by_name(edge_name)
                         if vms:
                             for vm in vms:
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(2)
                         else:
                             vcf_write(lsf, f'    NSX Edge VM not found')
@@ -1886,7 +1785,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vms = lsf.get_vm_by_name(mgr_name)
                         if vms:
                             for vm in vms:
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(5)
                         else:
                             vcf_write(lsf, f'    NSX Manager VM not found')
@@ -1940,7 +1839,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vms = lsf.get_vm_by_name(vc_name)
                         if vms:
                             for vm in vms:
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(10)  # Longer pause for vCenter
                         else:
                             vcf_write(lsf, f'    vCenter VM not found (may not exist in this lab)')
@@ -2052,7 +1951,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                             vcf_write(lsf, f'  Found {len(vms)} VM(s) matching pattern')
                             for vm in vms:
                                 found_count += 1
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(5)
                         else:
                             vcf_write(lsf, f'  No VMs found matching pattern')
@@ -2093,7 +1992,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vms = lsf.get_vm_by_name(vm_name)
                         if vms:
                             for vm in vms:
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(5)
                         else:
                             vcf_write(lsf, f'    VM not found')
@@ -2134,7 +2033,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vms = lsf.get_vm_by_name(vm_name)
                         if vms:
                             for vm in vms:
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(5)
                         else:
                             vcf_write(lsf, f'    VM not found')
@@ -2174,7 +2073,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vms = lsf.get_vm_by_name(vm_name)
                         if vms:
                             for vm in vms:
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(5)
                         else:
                             vcf_write(lsf, f'    VM not found')
@@ -2214,7 +2113,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vms = lsf.get_vm_by_name(vm_name)
                         if vms:
                             for vm in vms:
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(5)
                         else:
                             vcf_write(lsf, f'    VM not found')
@@ -2256,7 +2155,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vms = lsf.get_vm_by_name(vm_name)
                         if vms:
                             for vm in vms:
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(5)
                         else:
                             vcf_write(lsf, f'    VM not found')
@@ -2309,7 +2208,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vms = lsf.get_vm_by_name(edge_name)
                         if vms:
                             for vm in vms:
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(2)
                         else:
                             vcf_write(lsf, f'    Management NSX Edge VM not found')
@@ -2362,7 +2261,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vms = lsf.get_vm_by_name(mgr_name)
                         if vms:
                             for vm in vms:
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(5)
                         else:
                             vcf_write(lsf, f'    Management NSX Manager VM not found')
@@ -2402,7 +2301,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vms = lsf.get_vm_by_name(vm_name)
                         if vms:
                             for vm in vms:
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(10)  # Longer pause for SDDC Manager
                         else:
                             vcf_write(lsf, f'    SDDC Manager VM not found')
@@ -2451,7 +2350,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         vms = lsf.get_vm_by_name(vm_name)
                         if vms:
                             for vm in vms:
-                                shutdown_vm_gracefully(lsf, vm)
+                                lsf.shutdown_vm_gracefully(vm)
                                 time.sleep(10)  # Longer pause for vCenter
                         else:
                             vcf_write(lsf, f'    Management vCenter VM not found')
@@ -2660,8 +2559,8 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                         if vms:
                             vcf_write(lsf, f'  Found {len(vms)} VM(s)')
                             for vm in vms:
-                                if is_vm_powered_on(vm):
-                                    shutdown_vm_gracefully(lsf, vm)
+                                if lsf.is_vm_powered_on(vm):
+                                    lsf.shutdown_vm_gracefully(vm)
                                     vsp_shutdown_count += 1
                                     time.sleep(5)
                                 else:
@@ -2743,7 +2642,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                             skipped_count += 1
                         else:
                             vcf_write(lsf, f'  {vm.name}: STRAGGLER - attempting graceful shutdown')
-                            shutdown_vm_gracefully(lsf, vm)
+                            lsf.shutdown_vm_gracefully(vm)
                             straggler_count += 1
                             time.sleep(3)
                     vcf_write(lsf, f'Audit complete: {straggler_count} stragglers shut down, {skipped_count} infrastructure VMs skipped')

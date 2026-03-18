@@ -429,7 +429,7 @@ def check_vm_configuration(vms: List, fix_issues: bool = True) -> List[CheckResu
     
     # System VMs that should be skipped - these cannot be modified
     SKIP_VM_PATTERNS = [
-        'vcf-services-platform-template-',    # VCF Services Platform Template VMs
+        'vcf-services-',    # VCF Services Platform Template VMs
         'SupervisorControlPlaneVM',           # Tanzu Supervisor Control Plane VMs
         'vna-wld01-',                         # VNA Workload VMs
         'vCLS-',                               # vCloud Logging VMs
