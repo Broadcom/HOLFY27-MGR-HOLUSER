@@ -1,8 +1,25 @@
-# Instructions
+# ATE Startup Overrides
 
-Place ATE specific override scripts here that will apply to ALL ATE deployments.
+Place ATE (Advanced Technical Enablement / Livefire) startup module overrides here. These apply to **all ATE labs**.
 
-1. Copy the appropriate module(s) *.py script from the Startup folder and place in this folder
-2. Update the ATE/Startup/*.py script with your custom code
+For lab-specific overrides (a single SKU), place them in your vpodrepo instead.
 
-For lab specific overrides, those should be placed in your vpodrepo.
+See [OVERRIDE-HIERARCHY.md](../../OVERRIDE-HIERARCHY.md) for full documentation on the 5-tier override system.
+
+## How to Override a Module
+
+1. Copy the core module you want to customize:
+
+  ```bash
+  cp ../../Startup/VCFfinal.py ./VCFfinal.py
+  ```
+
+2. Edit your copy. Place custom code in the `CUSTOM` section at the bottom of the module.
+
+3. Commit to this repo. The override takes effect on next boot for all ATE labs.
+
+## ATE-Specific Notes
+
+- ATE labs use firewall but **no proxy filtering** (`proxy_filter: False` in `Tools/labtypes.py`)
+- Instructor-led labs may need additional service checks in `services.py`
+- Consider overriding `final.py` to adjust `labcheckinterval` for longer lab sessions
