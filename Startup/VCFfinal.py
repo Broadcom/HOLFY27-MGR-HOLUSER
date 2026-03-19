@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 4.5 - 2026-03-19
+# Version 4.4 - March 2026
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
 #
-# v4.5 Changes:
-# - Update scaling of pods logic
 # v4.4 Changes:
 # - Added Task 2c3: Supervisor Service vSphere Pod DNS Fix
 #   On retrofitted VCF 9.0.x labs with the new Photon/FRR holorouter,

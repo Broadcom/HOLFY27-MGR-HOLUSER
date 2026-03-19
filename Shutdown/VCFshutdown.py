@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 2.7 - 2026-03-19
+# Version 2.6 - March 2026
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
-#
-# v 2.7 Changes:
-# - Update scaling of pods logic
 #
 # v 2.6 Changes:
 # - Added Phase 3b: Dynamic Supervisor Workload Shutdown
