@@ -830,21 +830,21 @@ Items below are unique pitfalls NOT already covered in the detailed sections abo
 37. **`auto-platform-a` (10.1.1.69)**: Separate VM from auto-a (10.1.1.70). SSH: `vmware-system-user`.
 38. **`opslogs-a` SSH user is `vmware-system-user`**: Not `root` or `admin`.
 39. **`opsnet-a` has no SSH access**: HTTPS only.
-51. **VCF 9.1 C4 credentials API requires Bearer token**: Basic Auth (`-u vcf:password`) returns 0 elements. Use `POST /v1/tokens` with `admin@local` to get `accessToken`, then `Authorization: Bearer <token>`.
-52. **VNA Edge root passwords are rotated by SDDC Manager**: VNA edge root passwords differ from the standard lab password. Query `/v1/credentials?resourceType=NSXT_EDGE` with Bearer token to retrieve rotated passwords.
-53. **VNA Edge STANDBY has unreachable management IP**: In `ACTIVE_STANDBY` HA, the standby VNA edge's management IP (e.g. 10.1.1.197) is not pingable. SSH operations will fail, but NSX Manager REST API (password expiration, SSH enable) still works.
+40. **VCF 9.1 C4 credentials API requires Bearer token**: Basic Auth (`-u vcf:password`) returns 0 elements. Use `POST /v1/tokens` with `admin@local` to get `accessToken`, then `Authorization: Bearer <token>`.
+41. **VNA Edge root passwords are rotated by SDDC Manager**: VNA edge root passwords differ from the standard lab password. Query `/v1/credentials?resourceType=NSXT_EDGE` with Bearer token to retrieve rotated passwords.
+42. **VNA Edge STANDBY has unreachable management IP**: In `ACTIVE_STANDBY` HA, the standby VNA edge's management IP (e.g. 10.1.1.197) is not pingable. SSH operations will fail, but NSX Manager REST API (password expiration, SSH enable) still works.
 
 ### Certificate Operations (see `vcf-certs` skill for full details)
-40. **PKCS#7 DER encoding reorders certs**: Use custom `build_ordered_pkcs7()`.
-41. **Use `sign-verbatim`, not `sign`**: Vault `pki/sign/{role}` strips subject DN fields.
-42. **certsrv template format**: `<Option Value="OID;TemplateName">`.
-43. **`certfnsh.asp` POST encoding**: Use `parse_qs()`, not `unquote_plus()` (corrupts base64 `+`).
-44. **VCF Ops CA validation rejects 301 redirects**: Serve `/certsrv` directly as HTTP 200.
-45. **`PUT /v1/certificate-authorities` requires both `password` AND `secret` fields**.
-46. **pyOpenSSL `PKCS7` class removed in v25+**: Use `cryptography.hazmat.primitives.serialization.pkcs7.serialize_certificates()`.
-47. **Python `.format()` unsafe on HTML with CSS braces**: Use `str.replace()` instead.
+43. **PKCS#7 DER encoding reorders certs**: Use custom `build_ordered_pkcs7()`.
+44. **Use `sign-verbatim`, not `sign`**: Vault `pki/sign/{role}` strips subject DN fields.
+45. **certsrv template format**: `<Option Value="OID;TemplateName">`.
+46. **`certfnsh.asp` POST encoding**: Use `parse_qs()`, not `unquote_plus()` (corrupts base64 `+`).
+47. **VCF Ops CA validation rejects 301 redirects**: Serve `/certsrv` directly as HTTP 200.
+48. **`PUT /v1/certificate-authorities` requires both `password` AND `secret` fields**.
+49. **pyOpenSSL `PKCS7` class removed in v25+**: Use `cryptography.hazmat.primitives.serialization.pkcs7.serialize_certificates()`.
+50. **Python `.format()` unsafe on HTML with CSS braces**: Use `str.replace()` instead.
 
 ### Vault
-48. **Root token is creds.txt password** (not `"holodeck"`).
-49. **PKI role `holodeck` default max_ttl is 720h**: Update to `17520h` for 2-year certs. Needs `allow_any_name: true`, `enforce_hostnames: false`.
-50. **Technitium DNS needs `vcf.lab` zone** for `ca.vcf.lab` records (only `site-a.vcf.lab` exists by default).
+51. **Root token is creds.txt password** (not `"holodeck"`).
+52. **PKI role `holodeck` default max_ttl is 720h**: Update to `17520h` for 2-year certs. Needs `allow_any_name: true`, `enforce_hostnames: false`.
+53. **Technitium DNS needs `vcf.lab` zone** for `ca.vcf.lab` records (only `site-a.vcf.lab` exists by default).

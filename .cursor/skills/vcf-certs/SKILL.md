@@ -5,7 +5,7 @@ description: Manage SSL/TLS certificate lifecycle in VCF 9.x Holodeck labs. Cove
 
 # VCF 9.x Certificate Management
 
-Consolidated guide for all certificate operations in the Holodeck VCF lab. Passwords in `/home/holuser/creds.txt`. Proxy source in `Tools/CertsrvProxy/`.
+Consolidated guide for all certificate operations in the Holodeck VCF lab. Passwords in `/home/holuser/creds.txt`. Proxy source in `/home/holuser/hol/Tools/CertsrvProxy/`.
 
 ## Architecture Overview
 
@@ -100,6 +100,8 @@ curl -sk -X PUT "https://$SDDC/v1/certificate-authorities" \
 ```
 
 **Critical**: Both `password` AND `secret` fields required (HTTP 400 without `secret`).
+
+*(Note to Agent: If modifying the curl payload above, consider using Python `requests` or `jq` to build the JSON safely to avoid bash escaping issues with nested quotes).*
 
 ## 4. SDDC Manager — Certificate Workflow (UI)
 
@@ -228,7 +230,7 @@ Understanding the Java code path is essential for debugging:
 
 ## 9. VCF Operations Fleet Management — Certificate Replacement
 
-For fleet-managed components (auto-a, ops-a, opslogs-a, vidb-a, fleet-01a, etc.). See `vcf-9-api` skill Section 15 for the full API reference.
+For fleet-managed components (auto-a, ops-a, opslogs-a, vidb-a, fleet-01a, etc.). See `.cursor/skills/vcf-9-api/SKILL.md` Section 15 for the full API reference.
 
 **Key orchestrator split**:
 
@@ -256,7 +258,7 @@ ssh vcf@sddcmanager-a.site-a.vcf.lab \
    /var/log/vmware/vcf/operationsmanager/operationsmanager.log | tail -5"
 ```
 
-**Workaround**: Replace the SDDC Manager certificate directly via SDDC Manager API (bypassing VCF Operations):
+**Workaround**: When replacing the SDDC Manager certificate, **do not** use the VCF Ops UI/API. Instead, immediately execute `/home/holuser/hol/Tools/install_sddc_cert.py` (if available) or use the following API payload directly via SDDC Manager API (bypassing VCF Operations):
 
 ```python
 # The correct API uses an ARRAY of ResourceCertificateSpec objects
@@ -278,7 +280,7 @@ curl -sk -X PUT "https://sddcmanager-a.site-a.vcf.lab/v1/domains/$DOMAIN_ID/reso
 # Returns HTTP 202 with taskId
 ```
 
-**Full automation script**: `/tmp/install_sddc_cert2.py` (covers token, CSR fetch, Vault signing, PKCS#7 build, and install in one script).
+**Full automation script**: `/home/holuser/hol/Tools/install_sddc_cert.py` (covers token, CSR fetch, Vault signing, PKCS#7 build, and install in one script).
 
 **Steps for complete SDDC Manager cert replacement via API**:
 1. CSR must already be generated (check with `GET /v1/domains/{id}/csrs` — must return an element)
@@ -319,7 +321,7 @@ CSR PEM malformed (no newlines). Apply `normalize_csr_pem()` (Section 6).
 
 ### Firefox NSS Database Missing vCenter CA
 
-**Symptom**: After running `confighol-9.1.py`, the WLD vCenter CA is missing from Firefox's certificate manager, but the Vault CA is present.
+**Symptom**: After running `/home/holuser/hol/Tools/confighol-9.1.py`, the WLD vCenter CA is missing from Firefox's certificate manager, but the Vault CA is present.
 **Root Cause**: The script extracts CA certs from vCenter's `/certs/download.zip`. It generates a Firefox nickname using the `O=` (Organization) field. If `O=` is missing (like on the Vault CA), it falls back to `{vcenter_hostname} CA`. Since the actual WLD vCenter CA has `O=vc-wld01-a.site-a.vcf.lab`, both the WLD CA and the Vault CA get the exact same nickname (`vc-wld01-a.site-a.vcf.lab CA`). The script's import logic deletes existing certs with the same nickname before importing, causing the Vault CA to overwrite the WLD CA.
 **Fix**: Fall back to the `CN=` (Common Name) field if `O=` is missing. This ensures the Vault CA gets its proper nickname (`vcf.lab Root Authority`) and doesn't collide with the vCenter CA.
 
@@ -340,20 +342,22 @@ curl -sk -u "admin:$PASSWORD" "https://ca.vcf.lab/certsrv/certnew.p7b?ReqID=1&En
 # certs[0] MUST be the leaf cert, certs[1] the CA
 
 # SDDC Manager PostgreSQL access (for lock clearing)
-sshpass -p "$PASSWORD" ssh vcf@sddcmanager-a.site-a.vcf.lab \
-  "python3 -c \"
-import subprocess, pty, os, time
+# Note to Agent: Write this to a local python script and execute via SSH to avoid quoting issues
+cat << 'EOF' > /tmp/pgpass_fetch.py
+import subprocess, pty, os, time, sys
+password = sys.argv[1]
 master, slave = pty.openpty()
 p = subprocess.Popen(['su', '-', 'root', '-c', 'cat /root/.pgpass'], stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 os.close(slave); time.sleep(1)
-os.write(master, b'$PASSWORD\n'); time.sleep(1)
+os.write(master, password.encode() + b'\n'); time.sleep(1)
 print(p.stdout.read().decode()); os.close(master); p.wait()
-\""
+EOF
+sshpass -p "$PASSWORD" ssh vcf@sddcmanager-a.site-a.vcf.lab "python3 - $PASSWORD" < /tmp/pgpass_fetch.py
 ```
 
 ## 12. Vault CA Trust Distribution
 
-Automated by `confighol-9.1.py` Step 0b (`distribute_vault_ca_trust()`). Imports the Vault root CA into all VCF component trust stores:
+Automated by `/home/holuser/hol/Tools/confighol-9.1.py` Step 0b (`distribute_vault_ca_trust()`). Imports the Vault root CA into all VCF component trust stores:
 
 | Component | Method | Details |
 | --- | --- | --- |
@@ -366,7 +370,7 @@ Automated by `confighol-9.1.py` Step 0b (`distribute_vault_ca_trust()`). Imports
 
 All functions are idempotent — they check for existing CA before importing.
 
-**Critical pitfall**: `dir-cli trustedcert publish` silently appends a duplicate PEM when the cert already exists in vmdir, creating a multi-cert entry. NSX's `TrustStoreServiceImpl` rejects multi-cert PEMs (error `MP2179`), breaking compute-manager re-registration. Always check with `dir-cli trustedcert list | grep 'vcf.lab Root Authority'` before publishing. See `vcf-troubleshooting` skill Section 31.
+**Critical pitfall**: `dir-cli trustedcert publish` silently appends a duplicate PEM when the cert already exists in vmdir, creating a multi-cert entry. NSX's `TrustStoreServiceImpl` rejects multi-cert PEMs (error `MP2179`), breaking compute-manager re-registration. Always check with `dir-cli trustedcert list | grep 'vcf.lab Root Authority'` before publishing. See `.cursor/skills/vcf-troubleshooting/SKILL.md` Section 31.
 
 ## 13. NSX Compute Manager Re-registration After Certificate Replacement
 
@@ -390,9 +394,9 @@ curl -sk -u "admin:$PASSWORD" -X PUT \
         "thumbprint": "'$THUMB'" }, ... }'
 ```
 
-`confighol-9.1.py` v2.11+ automates this via `_nsx_reregister_compute_managers()`, called after the trust distribution step. The function skips compute managers already in `UP/REGISTERED` state.
+`/home/holuser/hol/Tools/confighol-9.1.py` v2.11+ automates this via `_nsx_reregister_compute_managers()`, called after the trust distribution step. The function skips compute managers already in `UP/REGISTERED` state.
 
-`cert-replacement.py` (in `Tools/`) automates this via `NSXComputeManagerFixer` class, which runs automatically after any vCenter or NSX certificate replacement. It:
+`/home/holuser/hol/Tools/cert-replacement.py` automates this via `NSXComputeManagerFixer` class, which runs automatically after any vCenter or NSX certificate replacement. It:
 
 1. Detects which vCenter/NSX pairs had their certificates replaced
 2. Fixes double-cert entries in vCenter TRUSTED_ROOTS (unpublish + republish)
@@ -409,8 +413,8 @@ curl -sk -u "admin:$PASSWORD" -X PUT \
 
 ## 14. Cross-References
 
-- **Vault PKI setup & Traefik TLS**: See `holorouter` skill (Vault section)
-- **SDDC Manager credentials & PostgreSQL**: See `vcf-9-api` skill (Sections 10-12)
-- **Certificate troubleshooting issues 27-31**: See `vcf-troubleshooting` skill
-- **Proxy source code & deployment docs**: See `Tools/CertsrvProxy/README.md`
-- **VCF Operations cert mgmt API**: See `vcf-9-api` skill (Section 15)
+- **Vault PKI setup & Traefik TLS**: See `.cursor/skills/holorouter/SKILL.md` (Vault section)
+- **SDDC Manager credentials & PostgreSQL**: See `.cursor/skills/vcf-9-api/SKILL.md` (Sections 10-12)
+- **Certificate troubleshooting issues 27-31**: See `.cursor/skills/vcf-troubleshooting/SKILL.md`
+- **Proxy source code & deployment docs**: See `/home/holuser/hol/Tools/CertsrvProxy/README.md`
+- **VCF Operations cert mgmt API**: See `.cursor/skills/vcf-9-api/SKILL.md` (Section 15)
