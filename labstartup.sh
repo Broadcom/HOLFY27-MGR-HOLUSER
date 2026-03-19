@@ -820,8 +820,7 @@ fi
 # Determine branch
 cloud=$(/usr/bin/vmtoolsd --cmd 'info-get guestinfo.ovfEnv' 2>&1)
 holdev=$(echo "${cloud}" | grep -i dev)
-# sleep 20 seconds to allow VLP to create the /tmp/deploymentpool.txt
-sleep 20
+
 if [ "${cloud}" = "No value found" ] || [ -n "${holdev}" ]; then
     branch="dev"
     # if /tmp/deploymentpool.txt exists and the first 3 characters are "FT-", then set the branch to "ft"

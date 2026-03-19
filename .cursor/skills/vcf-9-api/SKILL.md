@@ -12,7 +12,7 @@ This environment is a **Holodeck nested virtualization lab** running VCF 9.0 or 
 | Component | Hostname | Username | Auth Method |
 | --- | --- | --- | --- |
 | SDDC Manager | `sddcmanager-a.site-a.vcf.lab` | `vcf` | Basic Auth |
-| VCF Operations | `ops-a.site-a.vcf.lab` | `admin` (authSource: `localItem`) | OpsToken |
+| VCF Operations | `ops-a.site-a.vcf.lab` | `admin` (authSource: try `local` then `localItem`) | OpsToken |
 | NSX Manager (Mgmt) | `nsx-mgmt-01a.site-a.vcf.lab` | `admin` | Basic Auth |
 | NSX Manager (WLD) | `nsx-wld01-01a.site-a.vcf.lab` | `admin` | Basic Auth |
 | vCenter (Mgmt) | `vc-mgmt-a.site-a.vcf.lab` | `administrator@vsphere.local` | Session Token |
@@ -76,7 +76,7 @@ PASSWORD = open("/home/holuser/creds.txt").read().strip()
 # Step 1: Acquire OpsToken
 token_resp = requests.post(
     f"https://{OPS}/suite-api/api/auth/token/acquire",
-    json={"username": "admin", "password": PASSWORD, "authSource": "localItem"},
+    json={"username": "admin", "password": PASSWORD, "authSource": "local"},  # try "localItem" if 401
     headers={"X-vRealizeOps-API-use-unsupported": "true"},
     verify=False
 )
@@ -830,6 +830,9 @@ Items below are unique pitfalls NOT already covered in the detailed sections abo
 37. **`auto-platform-a` (10.1.1.69)**: Separate VM from auto-a (10.1.1.70). SSH: `vmware-system-user`.
 38. **`opslogs-a` SSH user is `vmware-system-user`**: Not `root` or `admin`.
 39. **`opsnet-a` has no SSH access**: HTTPS only.
+51. **VCF 9.1 C4 credentials API requires Bearer token**: Basic Auth (`-u vcf:password`) returns 0 elements. Use `POST /v1/tokens` with `admin@local` to get `accessToken`, then `Authorization: Bearer <token>`.
+52. **VNA Edge root passwords are rotated by SDDC Manager**: VNA edge root passwords differ from the standard lab password. Query `/v1/credentials?resourceType=NSXT_EDGE` with Bearer token to retrieve rotated passwords.
+53. **VNA Edge STANDBY has unreachable management IP**: In `ACTIVE_STANDBY` HA, the standby VNA edge's management IP (e.g. 10.1.1.197) is not pingable. SSH operations will fail, but NSX Manager REST API (password expiration, SSH enable) still works.
 
 ### Certificate Operations (see `vcf-certs` skill for full details)
 40. **PKCS#7 DER encoding reorders certs**: Use custom `build_ordered_pkcs7()`.

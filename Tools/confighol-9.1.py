@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.12 - 2026-03-13
+# Version 2.13 - 2026-03-13
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -9,6 +9,34 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.13 - 2026-03-19:
+#   - Fixed: NSX Edge entries with vna- prefix (VCF 9.1 naming) were skipped
+#     due to an earlier build filter in configure_nsx_components. Removed vna- exclusion.
+#   - Fixed: _get_nsx_manager_for_edge now matches both edge- and vna- prefixed
+#     edge hostnames (e.g. vna-wld01-01a -> nsx-wld01-01a).
+#   - Fixed: VCF Automation VM auto-a was not configured because it was not in
+#     the vravms config. Now also discovers VCF Automation VMs from vraurls
+#     (e.g. auto-a.site-a.vcf.lab) in the [VCFFINAL] section.
+#   - Fixed: Operations VMs now discovered from vcfcomponenturls in addition to
+#     [RESOURCES] VMs section, picking up opslogs-a and other Ops VMs.
+#   - Fixed: Operations VMs with vmware-system-user SSH (opslogs-a) now handled
+#     correctly with sudo-based chage, authorized_keys copy via sudo, and
+#     password expiration for both vmware-system-user and root accounts.
+#   - Fixed: opsnet VMs (no SSH access) now skipped gracefully instead of
+#     reporting authentication failures.
+#   - Fixed: NSX Edge configure_nsx_edge now handles unreachable STANDBY edges
+#     gracefully — skips SSH-based operations but still sets password expiration
+#     via NSX Manager REST API.
+#   - Fixed: SDDC Manager credentials API now uses Bearer token auth (required
+#     for VCF 9.1 C4 — Basic Auth returns empty results). Affects NSX root
+#     password recovery via get_nsx_root_password_from_sddc.
+#   - Fixed: NSX Edge SSH authorized_keys copy now recovers rotated root
+#     passwords from SDDC Manager (resource_type=NSXT_EDGE) when standard
+#     lab password fails.
+#   - Added: auto-platform-a host isolation on vc-mgmt-a / cluster-mgmt-01a.
+#     Creates DRS VM-Host groups and mandatory affinity/anti-affinity rules
+#     to ensure auto-platform-a-* is the only VM on its dedicated host.
+#     Migrates any co-located VMs to another host.
 # v2.12 - 2026-03-13:
 #   - Fixed: vCenter CA import now handles CN= format in certificate subject
 #     (e.g. "CN = vc-mgmt-a.site-a.vcf.lab, O = VMware, Inc.")
@@ -236,7 +264,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.10'
+SCRIPT_VERSION = '2.13'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -853,6 +881,226 @@ def configure_vcenter_password_policies(hostname: str, user: str, password: str,
         return False
 
 
+def configure_auto_platform_isolation(hostname: str, user: str, password: str,
+                                       dry_run: bool = False) -> bool:
+    """
+    Ensure auto-platform-a-* VM runs alone on its host via DRS rules.
+
+    Creates VM/Host groups and a VM-Host affinity rule so that
+    auto-platform-a-* is pinned to a dedicated host, then vMotions any
+    other VMs off that host. A second anti-affinity rule prevents all
+    other cluster VMs from landing on the same host.
+
+    Only applies to vc-mgmt-a / cluster-mgmt-01a.
+
+    :param hostname: vCenter hostname (only vc-mgmt-a is processed)
+    :param user: vCenter SSO user
+    :param password: vCenter password
+    :param dry_run: If True, preview only
+    :return: True if successful
+    """
+    if 'vc-mgmt-a' not in hostname:
+        return True
+
+    lsf.write_output(f'{hostname}: Configuring auto-platform-a host isolation...')
+
+    if dry_run:
+        lsf.write_output(f'{hostname}: Would create DRS groups/rules for auto-platform-a isolation')
+        return True
+
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        si = connect.SmartConnect(host=hostname, user=user, pwd=password,
+                                  sslContext=context)
+        content = si.RetrieveContent()
+
+        container = content.viewManager.CreateContainerView(
+            content.rootFolder, [vim.ClusterComputeResource], True)
+        cluster = None
+        for c in container.view:
+            if c.name == 'cluster-mgmt-01a':
+                cluster = c
+                break
+        container.Destroy()
+
+        if not cluster:
+            lsf.write_output(f'{hostname}: WARNING - cluster-mgmt-01a not found')
+            connect.Disconnect(si)
+            return False
+
+        # Find auto-platform-a VM
+        auto_vm = None
+        for vm in cluster.resourcePool.vm if hasattr(cluster, 'resourcePool') else []:
+            if vm.name.startswith('auto-platform-a'):
+                auto_vm = vm
+                break
+        if not auto_vm:
+            all_vms_view = content.viewManager.CreateContainerView(
+                content.rootFolder, [vim.VirtualMachine], True)
+            for vm in all_vms_view.view:
+                if vm.name.startswith('auto-platform-a'):
+                    auto_vm = vm
+                    break
+            all_vms_view.Destroy()
+
+        if not auto_vm:
+            lsf.write_output(f'{hostname}: WARNING - auto-platform-a VM not found')
+            connect.Disconnect(si)
+            return False
+
+        auto_host = auto_vm.runtime.host
+        lsf.write_output(f'{hostname}: Found {auto_vm.name} on {auto_host.name}')
+
+        # -- Build existing group/rule index --
+        existing_groups = {g.name: g for g in cluster.configurationEx.group}
+        existing_rules = {r.name: r for r in cluster.configurationEx.rule}
+
+        VM_GROUP = 'auto-platform-VMs'
+        HOST_GROUP = 'auto-platform-Hosts'
+        AFFINITY_RULE = 'auto-platform-must-run-on-host'
+        ANTIAFFINITY_RULE = 'other-VMs-must-not-run-on-auto-platform-host'
+        OTHER_VM_GROUP = 'non-auto-platform-VMs'
+
+        # Collect VMs that should NOT be on auto_host
+        other_vms_on_host = [v for v in auto_host.vm
+                             if v.name != auto_vm.name
+                             and v.runtime.powerState == 'poweredOn']
+
+        # -- Step 1: Create / update groups --
+        group_specs = []
+
+        # VM group: auto-platform-a VM
+        vm_group_spec = vim.cluster.GroupSpec()
+        if VM_GROUP in existing_groups:
+            vm_group_spec.operation = 'edit'
+        else:
+            vm_group_spec.operation = 'add'
+        vm_group = vim.cluster.VmGroup()
+        vm_group.name = VM_GROUP
+        vm_group.vm = [auto_vm]
+        vm_group_spec.info = vm_group
+        group_specs.append(vm_group_spec)
+
+        # Host group: the single dedicated host
+        host_group_spec = vim.cluster.GroupSpec()
+        if HOST_GROUP in existing_groups:
+            host_group_spec.operation = 'edit'
+        else:
+            host_group_spec.operation = 'add'
+        host_group = vim.cluster.HostGroup()
+        host_group.name = HOST_GROUP
+        host_group.host = [auto_host]
+        host_group_spec.info = host_group
+        group_specs.append(host_group_spec)
+
+        # VM group: every other powered-on VM in the cluster
+        all_other_vms = []
+        for h in cluster.host:
+            for v in h.vm:
+                if not v.name.startswith('auto-platform-a'):
+                    all_other_vms.append(v)
+        other_vm_group_spec = vim.cluster.GroupSpec()
+        if OTHER_VM_GROUP in existing_groups:
+            other_vm_group_spec.operation = 'edit'
+        else:
+            other_vm_group_spec.operation = 'add'
+        other_vm_group = vim.cluster.VmGroup()
+        other_vm_group.name = OTHER_VM_GROUP
+        other_vm_group.vm = all_other_vms
+        other_vm_group_spec.info = other_vm_group
+        group_specs.append(other_vm_group_spec)
+
+        # Apply group changes
+        spec = vim.cluster.ConfigSpecEx()
+        spec.groupSpec = group_specs
+        task = cluster.ReconfigureComputeResource_Task(spec, True)
+        WaitForTask(task)
+        lsf.write_output(f'{hostname}: SUCCESS - DRS groups created/updated')
+
+        # -- Step 2: Create / update rules --
+        # Re-read cluster config to get current rule keys after group changes
+        current_rules = {r.name: r for r in cluster.configurationEx.rule}
+        rule_specs = []
+
+        # Must-run-on rule: auto-platform-a -> dedicated host
+        affinity_spec = vim.cluster.RuleSpec()
+        affinity_rule = vim.cluster.VmHostRuleInfo()
+        affinity_rule.name = AFFINITY_RULE
+        affinity_rule.enabled = True
+        affinity_rule.mandatory = True
+        affinity_rule.vmGroupName = VM_GROUP
+        affinity_rule.affineHostGroupName = HOST_GROUP
+        if AFFINITY_RULE in current_rules:
+            affinity_spec.operation = 'edit'
+            affinity_rule.key = current_rules[AFFINITY_RULE].key
+        else:
+            affinity_spec.operation = 'add'
+        affinity_spec.info = affinity_rule
+        rule_specs.append(affinity_spec)
+
+        # Must-not-run-on rule: all other VMs cannot be on that host
+        anti_spec = vim.cluster.RuleSpec()
+        anti_rule = vim.cluster.VmHostRuleInfo()
+        anti_rule.name = ANTIAFFINITY_RULE
+        anti_rule.enabled = True
+        anti_rule.mandatory = True
+        anti_rule.vmGroupName = OTHER_VM_GROUP
+        anti_rule.antiAffineHostGroupName = HOST_GROUP
+        if ANTIAFFINITY_RULE in current_rules:
+            anti_spec.operation = 'edit'
+            anti_rule.key = current_rules[ANTIAFFINITY_RULE].key
+        else:
+            anti_spec.operation = 'add'
+        anti_spec.info = anti_rule
+        rule_specs.append(anti_spec)
+
+        spec2 = vim.cluster.ConfigSpecEx()
+        spec2.rulesSpec = rule_specs
+        task2 = cluster.ReconfigureComputeResource_Task(spec2, True)
+        WaitForTask(task2)
+        lsf.write_output(f'{hostname}: SUCCESS - DRS rules created/updated')
+
+        # -- Step 3: Migrate other VMs off the dedicated host --
+        if other_vms_on_host:
+            # Pick a destination host (any other host in the cluster)
+            dest_hosts = [h for h in cluster.host if h != auto_host]
+            if dest_hosts:
+                dest_host = dest_hosts[0]
+                for vm in other_vms_on_host:
+                    lsf.write_output(
+                        f'{hostname}: Migrating {vm.name} from '
+                        f'{auto_host.name} to {dest_host.name}...')
+                    try:
+                        relocate_spec = vim.vm.RelocateSpec()
+                        relocate_spec.host = dest_host
+                        migrate_task = vm.RelocateVM_Task(relocate_spec)
+                        WaitForTask(migrate_task)
+                        lsf.write_output(
+                            f'{hostname}: SUCCESS - {vm.name} migrated to '
+                            f'{dest_host.name}')
+                    except Exception as mig_err:
+                        lsf.write_output(
+                            f'{hostname}: WARNING - Could not migrate '
+                            f'{vm.name}: {mig_err}')
+            else:
+                lsf.write_output(
+                    f'{hostname}: WARNING - No alternative host for migration')
+        else:
+            lsf.write_output(
+                f'{hostname}: {auto_vm.name} already sole VM on {auto_host.name}')
+
+        connect.Disconnect(si)
+        lsf.write_output(f'{hostname}: auto-platform-a host isolation configured')
+        return True
+
+    except Exception as e:
+        lsf.write_output(
+            f'{hostname}: ERROR configuring auto-platform-a isolation: {e}')
+        return False
+
+
 def configure_vcenter_password_policies_powershell(hostname: str, user: str, 
                                                     password: str) -> bool:
     """
@@ -935,6 +1183,9 @@ def configure_vcenter(entry: str, auth_keys_file: str, password: str,
     # Step 3: Configure password policies and cluster settings
     configure_vcenter_password_policies(hostname, user, password, dry_run)
     
+    # Step 3b: Isolate auto-platform-a to a dedicated host (vc-mgmt-a only)
+    configure_auto_platform_isolation(hostname, user, password, dry_run)
+    
     # Step 4: Clear ARP cache
     if not dry_run:
         lsf.write_output(f'{hostname}: Clearing ARP cache')
@@ -950,41 +1201,75 @@ def configure_vcenter(entry: str, auth_keys_file: str, password: str,
 # NSX CONFIGURATION FUNCTIONS
 #==============================================================================
 
-def get_nsx_root_password_from_sddc(nsx_fqdn: str, password: str) -> Optional[str]:
+def _get_sddc_bearer_token(password: str) -> Optional[str]:
     """
-    Retrieve the actual NSX Manager root SSH password from SDDC Manager.
+    Acquire a Bearer token from SDDC Manager.
+    
+    VCF 9.1 C4 requires Bearer token auth for the credentials API
+    (Basic Auth returns empty results).
+    
+    :param password: Standard lab password
+    :return: Bearer token string, or None if auth fails
+    """
+    sddc_url = 'https://sddcmanager-a.site-a.vcf.lab'
+    try:
+        resp = requests.post(
+            f'{sddc_url}/v1/tokens',
+            json={'username': 'admin@local', 'password': password},
+            headers={'Content-Type': 'application/json'},
+            verify=False, timeout=30
+        )
+        if resp.status_code in (200, 201):
+            return resp.json().get('accessToken')
+    except Exception:
+        pass
+    return None
+
+
+def get_nsx_root_password_from_sddc(nsx_fqdn: str, password: str,
+                                     resource_type: str = 'NSXT_MANAGER') -> Optional[str]:
+    """
+    Retrieve the actual NSX root SSH password from SDDC Manager.
     
     SDDC Manager may have rotated the root password away from the standard
-    lab password. Uses the SDDC Manager REST API with Basic Auth directly
-    from the console VM (no SSH required).
+    lab password. Uses Bearer token auth (required for VCF 9.1 C4).
     
     Matches credentials by checking if the node hostname (with or without
     domain suffix) appears in the resource name. Also checks the cluster
     VIP name (e.g. nsx-wld01-01a -> nsx-wld01-a).
     
-    :param nsx_fqdn: NSX Manager hostname (e.g. nsx-wld01-01a or nsx-wld01-01a.site-a.vcf.lab)
+    :param nsx_fqdn: NSX hostname (e.g. nsx-wld01-01a or vna-wld01-01a.site-a.vcf.lab)
     :param password: Standard lab password (used to auth to SDDC Manager)
+    :param resource_type: SDDC Manager resource type (NSXT_MANAGER or NSXT_EDGE)
     :return: The actual root password, or None if lookup fails
     """
     import re
     sddc_url = 'https://sddcmanager-a.site-a.vcf.lab'
     
-    # Build list of name patterns to match against SDDC Manager resource names
-    # Strip domain if present to get short hostname
     short_name = nsx_fqdn.split('.')[0]
-    # Map node name to cluster VIP name: nsx-wld01-01a -> nsx-wld01-a
     cluster_name = re.sub(r'-\d+([a-z])$', r'-\1', short_name)
     match_patterns = [short_name, cluster_name]
     if '.' in nsx_fqdn:
         match_patterns.append(nsx_fqdn)
     
     try:
-        resp = requests.get(
-            f'{sddc_url}/v1/credentials',
-            params={'resourceType': 'NSXT_MANAGER'},
-            auth=('vcf', password),
-            verify=False, timeout=30
-        )
+        # Try Bearer token auth first (required for VCF 9.1 C4)
+        token = _get_sddc_bearer_token(password)
+        if token:
+            resp = requests.get(
+                f'{sddc_url}/v1/credentials',
+                params={'resourceType': resource_type},
+                headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'},
+                verify=False, timeout=30
+            )
+        else:
+            # Fallback to Basic Auth for older VCF versions
+            resp = requests.get(
+                f'{sddc_url}/v1/credentials',
+                params={'resourceType': resource_type},
+                auth=('vcf', password),
+                verify=False, timeout=30
+            )
         
         if resp.status_code != 200:
             lsf.write_output(f'{nsx_fqdn}: SDDC Manager credentials API returned {resp.status_code}')
@@ -992,7 +1277,7 @@ def get_nsx_root_password_from_sddc(nsx_fqdn: str, password: str) -> Optional[st
         
         data = resp.json()
         elements = data.get('elements', [])
-        lsf.write_output(f'{nsx_fqdn}: SDDC Manager returned {len(elements)} NSX credentials')
+        lsf.write_output(f'{nsx_fqdn}: SDDC Manager returned {len(elements)} {resource_type} credentials')
         
         for elem in elements:
             resource = elem.get('resource', {})
@@ -1008,7 +1293,6 @@ def get_nsx_root_password_from_sddc(nsx_fqdn: str, password: str) -> Optional[st
         lsf.write_output(f'{nsx_fqdn}: No matching root SSH credential found in SDDC Manager '
                           f'(searched for: {match_patterns})')
         
-        # Log available resource names for debugging
         root_ssh_resources = [
             elem.get('resource', {}).get('resourceName', 'unknown')
             for elem in elements
@@ -1357,8 +1641,8 @@ def _get_nsx_manager_for_edge(edge_hostname: str) -> Optional[str]:
         parts = entry.split(':')
         nsx_managers.append(parts[0].strip())
     
-    # Try name-based matching: edge-wld01-01a -> nsx-wld01-*
-    edge_match = re.match(r'edge-(\w+)-\d+', edge_hostname)
+    # Try name-based matching: edge-wld01-01a or vna-wld01-01a -> nsx-wld01-*
+    edge_match = re.match(r'(?:edge|vna)-(\w+)-\d+', edge_hostname)
     if edge_match:
         edge_domain = edge_match.group(1)
         for mgr in nsx_managers:
@@ -1522,50 +1806,64 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
     success = True
     
     if not dry_run:
+        nsx_mgr = _get_nsx_manager_for_edge(hostname)
+        ssh_reachable = False
+        
         # Step 1: Enable SSH via NSX Manager API if not already running
         if not lsf.test_tcp_port(hostname, 22):
             lsf.write_output(f'{hostname}: SSH not running - enabling via NSX Manager API...')
-            nsx_mgr = _get_nsx_manager_for_edge(hostname)
             if not nsx_mgr:
                 lsf.write_output(f'{hostname}: FAILED - Could not determine NSX Manager for this edge')
                 return False
             
             if not enable_nsx_edge_ssh_via_api(hostname, nsx_mgr, password, dry_run):
-                lsf.write_output(f'{hostname}: FAILED - Could not enable SSH via NSX Manager API')
-                lsf.write_output(f'{hostname}:         Enable SSH manually via NSX Manager UI or console:')
-                lsf.write_output(f'{hostname}:           Login as admin, run: start service ssh')
-                lsf.write_output(f'{hostname}:           Then run: set service ssh start-on-boot')
-                return False
-            time.sleep(5)
-            if not lsf.test_tcp_port(hostname, 22):
-                lsf.write_output(f'{hostname}: FAILED - SSH still not reachable after API enable')
-                return False
+                lsf.write_output(f'{hostname}: WARNING - Could not enable SSH via NSX Manager API')
+            else:
+                time.sleep(5)
+            
+            if lsf.test_tcp_port(hostname, 22):
+                ssh_reachable = True
+            else:
+                lsf.write_output(f'{hostname}: WARNING - SSH not reachable (STANDBY edge or mgmt IP unreachable)')
+                lsf.write_output(f'{hostname}:         Password expiration will still be set via NSX Manager API')
         else:
             lsf.write_output(f'{hostname}: SSH already running')
+            ssh_reachable = True
         
-        # Step 2: Copy authorized_keys for root user
-        # NSX Edges may not have /root/.ssh/ directory — create it first
-        lsf.write_output(f'{hostname}: Copying authorized_keys for root...')
-        lsf.ssh('mkdir -p /root/.ssh && chmod 700 /root/.ssh', f'root@{hostname}', password)
-        result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', password)
-        if result.returncode == 0:
-            lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied')
-            chmod_result = lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{hostname}', password)
-            if chmod_result.returncode == 0:
-                lsf.write_output(f'{hostname}: SUCCESS - Permissions set on authorized_keys')
+        if ssh_reachable:
+            # Step 2: Copy authorized_keys for root user
+            # VNA edges may have rotated root passwords — try standard first,
+            # then look up rotated password from SDDC Manager
+            root_password = password
+            lsf.write_output(f'{hostname}: Copying authorized_keys for root...')
+            lsf.ssh('mkdir -p /root/.ssh && chmod 700 /root/.ssh', f'root@{hostname}', root_password)
+            result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', root_password)
+            if result.returncode != 0 and (result.returncode == 255 or 'permission denied' in str(result.stderr).lower()):
+                lsf.write_output(f'{hostname}: Standard password failed - checking SDDC Manager for rotated password...')
+                rotated_pw = get_nsx_root_password_from_sddc(hostname, password, resource_type='NSXT_EDGE')
+                if rotated_pw:
+                    root_password = rotated_pw
+                    lsf.ssh('mkdir -p /root/.ssh && chmod 700 /root/.ssh', f'root@{hostname}', root_password)
+                    result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', root_password)
+            
+            if result.returncode == 0:
+                lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied')
+                chmod_result = lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{hostname}', root_password)
+                if chmod_result.returncode == 0:
+                    lsf.write_output(f'{hostname}: SUCCESS - Permissions set on authorized_keys')
+                else:
+                    lsf.write_output(f'{hostname}: WARNING - Failed to set permissions')
             else:
-                lsf.write_output(f'{hostname}: WARNING - Failed to set permissions')
-        else:
-            lsf.write_output(f'{hostname}: FAILED - Could not copy authorized_keys')
-            if result.returncode == 255:
-                lsf.write_output(f'{hostname}:         SSH connection failed despite enable attempt')
-            success = False
-        
-        # Step 3: Configure SSH to start on boot via NSX CLI
-        configure_nsx_ssh_start_on_boot(hostname, password, dry_run)
+                lsf.write_output(f'{hostname}: FAILED - Could not copy authorized_keys')
+                if result.returncode == 255:
+                    lsf.write_output(f'{hostname}:         SSH connection failed despite enable attempt')
+                success = False
+            
+            # Step 3: Configure SSH to start on boot via NSX CLI
+            configure_nsx_ssh_start_on_boot(hostname, root_password, dry_run)
         
         # Step 4: Set password expiration via NSX Manager transport node API
-        nsx_mgr = _get_nsx_manager_for_edge(hostname)
+        # This works even if SSH is unreachable (uses NSX Manager REST API)
         if nsx_mgr:
             set_nsx_edge_password_expiration(hostname, nsx_mgr, password,
                                               NSX_PASSWORD_EXPIRY_DAYS, dry_run)
@@ -1623,22 +1921,38 @@ def configure_aria_automation_vms(auth_keys_file: str, password: str,
     success = True
     
     import re
+    from urllib.parse import urlparse
+    
+    # Collect hostnames from vravms config
+    hostnames_to_configure = []
     for vravm in vravms:
-        # VMs may have format: vmname:vcenter
         parts = vravm.split(':')
         hostname = parts[0].strip()
-        
-        # Strip wildcard/regex patterns (e.g., "auto-platform-a.*" -> "auto-platform-a")
-        # These patterns are used for VM name matching in vSphere but are not valid hostnames
-        hostname = re.sub(r'\.\*$', '', hostname)   # Remove trailing .*
-        hostname = re.sub(r'\*$', '', hostname)      # Remove trailing *
-        hostname = hostname.rstrip('.')              # Remove trailing dots
-        
-        # Only process VMs starting with 'auto-' (VCF Automation)
-        if not hostname.lower().startswith('auto-'):
-            lsf.write_output(f'{hostname}: Skipping - Name does not start with "auto-"')
-            continue
-        
+        hostname = re.sub(r'\.\*$', '', hostname)
+        hostname = re.sub(r'\*$', '', hostname)
+        hostname = hostname.rstrip('.')
+        if hostname.lower().startswith('auto-'):
+            hostnames_to_configure.append(hostname)
+    
+    # Also discover VCF Automation VMs from vraurls (e.g. auto-a.site-a.vcf.lab)
+    if lsf.config.has_option('VCFFINAL', 'vraurls'):
+        vraurls_raw = lsf.config.get('VCFFINAL', 'vraurls').strip()
+        for line in vraurls_raw.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            url = line.split(',')[0].strip()
+            try:
+                parsed = urlparse(url)
+                fqdn = parsed.hostname
+                if fqdn and fqdn.startswith('auto-'):
+                    short = fqdn.split('.')[0]
+                    if short not in [h.split('.')[0] for h in hostnames_to_configure]:
+                        hostnames_to_configure.append(fqdn)
+            except Exception:
+                pass
+    
+    for hostname in hostnames_to_configure:
         if not configure_aria_automation(hostname, auth_keys_file, password, dry_run):
             success = False
     
@@ -1778,7 +2092,7 @@ def configure_nsx_components(auth_keys_file: str, password: str,
         vcfnsxedges = lsf.config.get('VCF', 'vcfnsxedges').split('\n')
         
         for entry in vcfnsxedges:
-            if not entry or entry.strip().startswith('#') or entry.strip().startswith('vna-'):
+            if not entry or entry.strip().startswith('#'):
                 continue
             
             parts = entry.split(':')
@@ -1996,11 +2310,11 @@ def configure_operations_vms(auth_keys_file: str, password: str,
     :return: True if successful
     """
     if 'VMs' not in lsf.config['RESOURCES']:
-        lsf.write_output('No Operations VMs defined in config')
-        return True
+        lsf.write_output('No VMs section in RESOURCES config')
     
-    vms_raw = lsf.config.get('RESOURCES', 'VMs').split('\n')
+    vms_raw = lsf.config.get('RESOURCES', 'VMs', fallback='').split('\n')
     ops_vms = []
+    seen_short = set()
     
     for vm in vms_raw:
         if not vm or vm.strip().startswith('#'):
@@ -2015,11 +2329,43 @@ def configure_operations_vms(auth_keys_file: str, password: str,
                 if resolved:
                     for rvm in resolved:
                         if 'ops' in rvm.name.lower():
-                            ops_vms.append((rvm.name, vcenter))
+                            short = rvm.name.split('.')[0]
+                            if short not in seen_short:
+                                ops_vms.append((rvm.name, vcenter))
+                                seen_short.add(short)
                 else:
                     lsf.write_output(f'Pattern "{vm_name}" matched no VMs in vCenter')
             else:
-                ops_vms.append((vm_name, vcenter))
+                short = vm_name.split('.')[0]
+                if short not in seen_short:
+                    ops_vms.append((vm_name, vcenter))
+                    seen_short.add(short)
+    
+    # Also discover Ops VMs from vcfcomponenturls (e.g. opslogs-a.site-a.vcf.lab)
+    if lsf.config.has_section('VCFFINAL') and lsf.config.has_option('VCFFINAL', 'vcfcomponenturls'):
+        from urllib.parse import urlparse
+        comp_urls = lsf.config.get('VCFFINAL', 'vcfcomponenturls').split('\n')
+        default_vc = ''
+        if lsf.config.has_option('RESOURCES', 'vCenters'):
+            for vc_line in lsf.config.get('RESOURCES', 'vCenters').split('\n'):
+                if vc_line and not vc_line.strip().startswith('#'):
+                    default_vc = vc_line.split(':')[0].strip()
+                    break
+        for line in comp_urls:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            url = line.split(',')[0].strip()
+            try:
+                parsed = urlparse(url)
+                fqdn = parsed.hostname
+                if fqdn and 'ops' in fqdn.lower():
+                    short = fqdn.split('.')[0]
+                    if short not in seen_short:
+                        ops_vms.append((fqdn, default_vc))
+                        seen_short.add(short)
+            except Exception:
+                pass
     
     if not ops_vms:
         lsf.write_output('No Operations VMs found in config')
@@ -2048,8 +2394,18 @@ def configure_operations_vms(auth_keys_file: str, password: str,
         lsf.write_output(f'{opsvm}: Starting configuration...')
         vm_success = True
         
+        # opsnet VMs have no SSH access — skip entirely
+        if 'opsnet' in opsvm.lower():
+            lsf.write_output(f'{opsvm}: SKIPPING - opsnet VMs do not support SSH access')
+            continue
+        
+        # opslogs VMs use vmware-system-user; others use root
+        if 'opslogs' in opsvm.lower():
+            ssh_user = 'vmware-system-user'
+        else:
+            ssh_user = 'root'
+        
         if not dry_run:
-            # First, check if the host is reachable
             lsf.write_output(f'{opsvm}: Checking connectivity...')
             if not lsf.test_ping(opsvm):
                 lsf.write_output(f'{opsvm}: SKIPPING - Host is not reachable (ping failed)')
@@ -2057,11 +2413,9 @@ def configure_operations_vms(auth_keys_file: str, password: str,
                 continue
             lsf.write_output(f'{opsvm}: SUCCESS - Host is reachable')
             
-            # Check if SSH port is open; if not, enable via Guest Operations
             if not lsf.test_tcp_port(opsvm, 22):
                 lsf.write_output(f'{opsvm}: SSH port 22 is not open - enabling via Guest Operations...')
                 if vcenter:
-                    # Determine the vCenter user for this vCenter
                     vc_user = default_vcenter_user
                     if lsf.config.has_option('RESOURCES', 'vCenters'):
                         for vc_line in lsf.config.get('RESOURCES', 'vCenters').split('\n'):
@@ -2086,48 +2440,73 @@ def configure_operations_vms(auth_keys_file: str, password: str,
             else:
                 lsf.write_output(f'{opsvm}: SUCCESS - SSH port 22 is open')
             
-            # Set non-expiring password for root
-            lsf.write_output(f'{opsvm}: Setting non-expiring password for root...')
-            result = lsf.ssh('chage -M -1 root', f'root@{opsvm}', password)
-            if result.returncode == 0:
-                lsf.write_output(f'{opsvm}: SUCCESS - Non-expiring password set for root')
-            elif result.returncode == 255:
-                lsf.write_output(f'{opsvm}: FAILED - SSH connection failed')
-                lsf.write_output(f'{opsvm}:         User: root, Password provided: {"yes" if password else "no"}')
-                lsf.write_output(f'{opsvm}:         This may indicate invalid credentials')
-                vm_success = False
-            elif 'permission denied' in str(result.stderr).lower():
-                lsf.write_output(f'{opsvm}: FAILED - Permission denied (invalid credentials)')
-                lsf.write_output(f'{opsvm}:         User: root')
-                vm_success = False
-            else:
-                lsf.write_output(f'{opsvm}: FAILED - chage command failed (exit code: {result.returncode})')
-                if result.stderr:
-                    lsf.write_output(f'{opsvm}:         Error: {str(result.stderr).strip()[:100]}')
-                vm_success = False
-            
-            # Copy authorized_keys
-            lsf.write_output(f'{opsvm}: Copying authorized_keys...')
-            result = lsf.scp(auth_keys_file, f'root@{opsvm}:{LINUX_AUTH_FILE}', password)
-            if result.returncode == 0:
-                lsf.write_output(f'{opsvm}: SUCCESS - authorized_keys copied')
-                # Set proper permissions
-                chmod_result = lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{opsvm}', password)
-                if chmod_result.returncode == 0:
-                    lsf.write_output(f'{opsvm}: SUCCESS - authorized_keys permissions set (chmod 600)')
+            if ssh_user == 'root':
+                # Direct root SSH
+                lsf.write_output(f'{opsvm}: Setting non-expiring password for root...')
+                result = lsf.ssh('chage -M -1 root', f'root@{opsvm}', password)
+                if result.returncode == 0:
+                    lsf.write_output(f'{opsvm}: SUCCESS - Non-expiring password set for root')
+                elif result.returncode == 255:
+                    lsf.write_output(f'{opsvm}: FAILED - SSH connection failed')
+                    lsf.write_output(f'{opsvm}:         User: root, Password provided: {"yes" if password else "no"}')
+                    vm_success = False
+                elif 'permission denied' in str(result.stderr).lower():
+                    lsf.write_output(f'{opsvm}: FAILED - Permission denied (invalid credentials)')
+                    vm_success = False
                 else:
-                    lsf.write_output(f'{opsvm}: WARNING - Failed to set permissions on authorized_keys')
-            elif result.returncode == 255 or 'permission denied' in str(result.stderr).lower():
-                lsf.write_output(f'{opsvm}: FAILED - SCP failed (authentication error)')
-                lsf.write_output(f'{opsvm}:         User: root, Password provided: {"yes" if password else "no"}')
-                vm_success = False
+                    lsf.write_output(f'{opsvm}: FAILED - chage command failed (exit code: {result.returncode})')
+                    vm_success = False
+                
+                lsf.write_output(f'{opsvm}: Copying authorized_keys...')
+                result = lsf.scp(auth_keys_file, f'root@{opsvm}:{LINUX_AUTH_FILE}', password)
+                if result.returncode == 0:
+                    lsf.write_output(f'{opsvm}: SUCCESS - authorized_keys copied')
+                    chmod_result = lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{opsvm}', password)
+                    if chmod_result.returncode == 0:
+                        lsf.write_output(f'{opsvm}: SUCCESS - authorized_keys permissions set (chmod 600)')
+                    else:
+                        lsf.write_output(f'{opsvm}: WARNING - Failed to set permissions on authorized_keys')
+                elif result.returncode == 255 or 'permission denied' in str(result.stderr).lower():
+                    lsf.write_output(f'{opsvm}: FAILED - SCP failed (authentication error)')
+                    vm_success = False
+                else:
+                    lsf.write_output(f'{opsvm}: FAILED - SCP failed (exit code: {result.returncode})')
+                    vm_success = False
             else:
-                lsf.write_output(f'{opsvm}: FAILED - SCP failed (exit code: {result.returncode})')
-                if result.stderr:
-                    lsf.write_output(f'{opsvm}:         Error: {str(result.stderr).strip()[:100]}')
-                vm_success = False
+                # vmware-system-user SSH with sudo
+                user_auth_file = f'/home/{ssh_user}/.ssh/authorized_keys'
+                
+                for account in [ssh_user, 'root']:
+                    lsf.write_output(f'{opsvm}: Setting non-expiring password for {account}...')
+                    chage_cmd = f"echo '{password}' | sudo -S chage -M -1 {account}"
+                    result = lsf.ssh(chage_cmd, f'{ssh_user}@{opsvm}', password)
+                    if result.returncode == 0:
+                        lsf.write_output(f'{opsvm}: SUCCESS - Non-expiring password set for {account}')
+                    else:
+                        lsf.write_output(f'{opsvm}: WARNING - Failed to set password for {account}')
+                        vm_success = False
+                
+                lsf.write_output(f'{opsvm}: Copying authorized_keys for {ssh_user}...')
+                result = lsf.scp(auth_keys_file, f'{ssh_user}@{opsvm}:{user_auth_file}', password)
+                if result.returncode == 0:
+                    lsf.write_output(f'{opsvm}: SUCCESS - authorized_keys copied for {ssh_user}')
+                    lsf.ssh(f'chmod 600 {user_auth_file}', f'{ssh_user}@{opsvm}', password)
+                else:
+                    lsf.write_output(f'{opsvm}: FAILED - Could not copy authorized_keys for {ssh_user}')
+                    vm_success = False
+                
+                lsf.write_output(f'{opsvm}: Copying authorized_keys for root via sudo...')
+                sudo_cmd = (
+                    f"echo '{password}' | sudo -S mkdir -p /root/.ssh && "
+                    f"echo '{password}' | sudo -S cp {user_auth_file} /root/.ssh/authorized_keys && "
+                    f"echo '{password}' | sudo -S chmod 600 /root/.ssh/authorized_keys"
+                )
+                result = lsf.ssh(sudo_cmd, f'{ssh_user}@{opsvm}', password)
+                if result.returncode == 0:
+                    lsf.write_output(f'{opsvm}: SUCCESS - authorized_keys copied for root')
+                else:
+                    lsf.write_output(f'{opsvm}: WARNING - Failed to copy authorized_keys for root')
             
-            # Summary for this VM
             if vm_success:
                 lsf.write_output(f'{opsvm}: Configuration completed successfully')
             else:
@@ -2136,8 +2515,8 @@ def configure_operations_vms(auth_keys_file: str, password: str,
         else:
             lsf.write_output(f'{opsvm}: Would check connectivity (ping, SSH port)')
             lsf.write_output(f'{opsvm}: Would enable SSH via Guest Operations if not running')
-            lsf.write_output(f'{opsvm}: Would set non-expiring password for root')
-            lsf.write_output(f'{opsvm}: Would copy authorized_keys to {LINUX_AUTH_FILE}')
+            lsf.write_output(f'{opsvm}: Would set non-expiring password (SSH user: {ssh_user})')
+            lsf.write_output(f'{opsvm}: Would copy authorized_keys')
     
     return overall_success
 
