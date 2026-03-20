@@ -7,6 +7,22 @@ import os
 import importlib.util
 from typing import List, Optional, Dict, Any
 
+_DEFAULT_SEQUENCE: List[str] = [
+    'prelim',
+    'ESXi',
+    'VCF',
+    'VVF',
+    'vSphere',
+    'pings',
+    'services',
+    'Kubernetes',
+    'urls',
+    'VCFfinal',
+    'final',
+    'odyssey'
+]
+
+
 class LabTypeLoader:
     """
     Manages lab-type specific startup module loading and execution.
@@ -19,22 +35,7 @@ class LabTypeLoader:
     - EDU: Education - Training environments
     """
     
-    # Default startup sequence shared by all lab types.
-    # To customize a specific lab type, override its entry in STARTUP_SEQUENCE below.
-    _DEFAULT_SEQUENCE: List[str] = [
-        'prelim',
-        'ESXi',
-        'VCF',
-        'VVF',
-        'vSphere',
-        'pings',
-        'services',
-        'Kubernetes',
-        'urls',
-        'VCFfinal',
-        'final',
-        'odyssey'
-    ]
+    _DEFAULT_SEQUENCE = _DEFAULT_SEQUENCE
 
     # Per-labtype startup sequences. All default to _DEFAULT_SEQUENCE.
     # Override a specific lab type here when its sequence actually differs.
