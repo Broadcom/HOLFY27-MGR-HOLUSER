@@ -65,11 +65,16 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 - **`dir-cli trustedcert publish` silently creates double-cert entries** — calling it when the cert already exists in vmdir appends a duplicate PEM. NSX rejects multi-cert PEMs (error `MP2179`), breaking compute-manager registration. Always check `dir-cli trustedcert list` first.
 - **SDDC Manager PostgreSQL** — Password in `/root/.pgpass` (SSH as `vcf`, use Python `pty.openpty()` to `su` to root). TCP on `127.0.0.1:5432`, database `operationsmanager`.
 - **MSADCS Proxy PKCS#7 PEM headers** — Real Microsoft ADCS wraps base64 PKCS#7 in `-----BEGIN CERTIFICATE-----`/`-----END CERTIFICATE-----` (NOT `BEGIN PKCS7`). SDDC Manager's Java `CertificateFactory` expects this exact format. Using `BEGIN PKCS7` causes "Generate Signed Certificates" to fail silently. The `.cer` endpoint also uses `Content-Type: text/html` in real ADCS, not `application/pkix-cert`.
+- **VCF 9.1 C4 credentials API requires Bearer token** — Basic Auth (`-u vcf:password`) returns 0 elements on VCF 9.1 C4. Must use `POST /v1/tokens` with `admin@local` to get `accessToken`, then `Authorization: Bearer <token>`.
+- **VNA Edge root passwords are rotated** — SDDC Manager rotates VNA edge root passwords. Query `/v1/credentials?resourceType=NSXT_EDGE` with Bearer token to get the actual password. Standard lab password will fail for root SSH.
+- **VNA Edge STANDBY has unreachable mgmt IP** — The standby VNA edge's management IP is not pingable in `ACTIVE_STANDBY` HA. SSH operations fail, but NSX Manager REST API still works for password expiration and SSH enable.
+- **VCF 9.1 C4 NSX Edge naming is `vna-` prefix** — NSX Edges in VCF 9.1 C4 are named `vna-wld01-01a`, `vna-wld01-02a` (not `edge-`). Map to NSX Manager using the domain segment: `vna-wld01-01a` -> `nsx-wld01-01a`.
 
 ## Session Knowledge Capture
 
 At the end of any session involving VCF troubleshooting or API exploration, review what was learned and update the relevant skill files:
 
+- **Holorouter**: Update `/home/holuser/hol/.cursor/skills/holorouter/SKILL.md`
 - **New API patterns or credentials**: Update `/home/holuser/hol/.cursor/skills/vcf-9-api/SKILL.md`
 - **New failure patterns or fixes**: Update `/home/holuser/hol/.cursor/skills/vcf-troubleshooting/SKILL.md`
 - **Certificate operations (proxy, Vault, PKCS#7, SDDC Manager cert workflow)**: Update `/home/holuser/hol/.cursor/skills/vcf-certs/SKILL.md`

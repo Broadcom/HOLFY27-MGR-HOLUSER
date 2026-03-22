@@ -1,0 +1,24 @@
+# HOLFY27-MGR-HOLUSER Python Dependencies
+# Generated from import analysis of the full codebase.
+# Pin to specific versions after verifying on a working lab with: pip freeze
+#
+# Install: pip install -r requirements.txt
+
+# HTTP client — used by lsfunctions, startup modules, shutdown, tools
+requests>=2.31.0
+urllib3>=2.0.0
+
+# VMware vSphere automation — vCenter/ESXi connections (lsfunctions, VCF.py, confighol)
+pyvmomi>=8.0.0
+
+# Windows remote execution — pypsexec (lsfunctions)
+pypsexec>=0.3.0
+
+# System monitoring — process checks (lsfunctions)
+psutil>=5.9.0
+
+# X.509 / PKI — certificate management (cert-replacement.py)
+cryptography>=42.0.0
+
+# ---------- Development / Testing ----------
+pytest>=7.0.0

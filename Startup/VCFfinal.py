@@ -1461,7 +1461,9 @@ def main(lsf=None, standalone=False, dry_run=False):
                 # Zalando postgres operator honours this label and keeps the
                 # statefulset at 0 replicas regardless of manual scaling.  We must:
                 #   1. Remove the suspended label from the PostgresInstance CRD
-                #   2. Patch the Zalando postgresql CRD numberOfInstances back to 1
+                #   2. Restore the Zalando postgresql CRD numberOfInstances to its
+                #      intended value (saved as annotation vcf.lab/original-instances
+                #      by the shutdown script, defaulting to 1 if not present)
                 # Both steps are required: removing the label alone isn't sufficient
                 # because the operator previously set numberOfInstances=0 and won't
                 # automatically restore it when the label is removed.
@@ -1494,18 +1496,31 @@ def main(lsf=None, standalone=False, dry_run=False):
                                     f'{pg_name} -n {pg_ns} database.vmsp.vmware.com/suspended-'
                                 )
 
-                            # Always ensure Zalando numberOfInstances is 1
+                            # Read the Zalando CRD to get current numberOfInstances
+                            # and the saved annotation with the intended value
                             zalando_check = vsp_kubectl(
                                 f'kubectl get postgresqls.acid.zalan.do {pg_name} -n {pg_ns} '
-                                f'-o jsonpath="{{.spec.numberOfInstances}}" 2>/dev/null'
+                                f'-o json 2>/dev/null'
                             )
-                            current_instances = ''
+                            current_instances = 0
+                            intended_instances = 1
                             if hasattr(zalando_check, 'stdout') and zalando_check.stdout:
-                                current_instances = zalando_check.stdout.strip().split('\n')[-1].strip()
+                                raw_z = zalando_check.stdout.strip()
+                                json_start_z = raw_z.find('{')
+                                if json_start_z >= 0:
+                                    raw_z = raw_z[json_start_z:]
+                                try:
+                                    z_data = _json_pg.loads(raw_z)
+                                    current_instances = z_data.get('spec', {}).get('numberOfInstances', 0)
+                                    anno_val = z_data.get('metadata', {}).get('annotations', {}).get('vcf.lab/original-instances', '')
+                                    if anno_val.isdigit() and int(anno_val) > 0:
+                                        intended_instances = int(anno_val)
+                                except (ValueError, _json_pg.JSONDecodeError):
+                                    pass
 
-                            if current_instances != '1':
-                                lsf.write_output(f'  Scaling Zalando postgres {pg_ns}/{pg_name} to 1 instance (was {current_instances})')
-                                patch_json = '{"spec":{"numberOfInstances":1}}'
+                            if current_instances < intended_instances:
+                                lsf.write_output(f'  Scaling Zalando postgres {pg_ns}/{pg_name} to {intended_instances} instance(s) (was {current_instances})')
+                                patch_json = f'{{"spec":{{"numberOfInstances":{intended_instances}}}}}'
                                 vsp_kubectl(
                                     f"kubectl patch postgresqls.acid.zalan.do {pg_name} -n {pg_ns} "
                                     f"--type=merge -p '{patch_json}'"
@@ -1533,21 +1548,33 @@ def main(lsf=None, standalone=False, dry_run=False):
                     namespace = parts[0].strip()
                     resource = parts[1].strip()  # e.g. "deployment/salt-master"
                     
-                    # Check current replica count before scaling
-                    check_cmd = f'kubectl get {resource} -n {namespace} -o jsonpath="{{.spec.replicas}}"'
+                    # Read current replicas and the saved annotation with intended value
+                    check_cmd = f'kubectl get {resource} -n {namespace} -o json 2>/dev/null'
                     check_result = vsp_kubectl(check_cmd)
-                    current_replicas = ''
+                    current_replicas = 0
+                    intended_replicas = 1
                     if hasattr(check_result, 'stdout') and check_result.stdout:
-                        current_replicas = check_result.stdout.strip().split('\n')[-1].strip()
+                        try:
+                            import json as _json_comp
+                            raw_comp = check_result.stdout.strip()
+                            json_start_comp = raw_comp.find('{')
+                            if json_start_comp >= 0:
+                                raw_comp = raw_comp[json_start_comp:]
+                            comp_data = _json_comp.loads(raw_comp)
+                            current_replicas = comp_data.get('spec', {}).get('replicas', 0)
+                            anno_val = comp_data.get('metadata', {}).get('annotations', {}).get('vcf.lab/original-replicas', '')
+                            if anno_val.isdigit() and int(anno_val) > 0:
+                                intended_replicas = int(anno_val)
+                        except (ValueError, Exception):
+                            pass
                     
-                    if current_replicas == '1' or (current_replicas.isdigit() and int(current_replicas) > 0):
+                    if current_replicas >= intended_replicas:
                         lsf.write_output(f'  {namespace}/{resource}: already running (replicas={current_replicas})')
                         vcf_comp_already_running += 1
                         continue
                     
-                    # Scale to 1 replica
-                    scale_cmd = f'kubectl scale {resource} -n {namespace} --replicas=1'
-                    lsf.write_output(f'  Scaling up: {namespace}/{resource}')
+                    scale_cmd = f'kubectl scale {resource} -n {namespace} --replicas={intended_replicas}'
+                    lsf.write_output(f'  Scaling up: {namespace}/{resource} to {intended_replicas} (was {current_replicas})')
                     scale_result = vsp_kubectl(scale_cmd)
                     
                     if hasattr(scale_result, 'stdout') and 'scaled' in scale_result.stdout:
@@ -2469,6 +2496,11 @@ def main(lsf=None, standalone=False, dry_run=False):
                                             lsf.write_output(f'  WARNING: Could not patch provisioning-service: {prov_err}')
                         
                         # ---- Step 14: Scale up zero-replica prelude deployments ----
+                        # For each deployment, check if it has a saved
+                        # vcf.lab/original-replicas annotation (set during a
+                        # previous startup when it was healthy). If not, default
+                        # to 1. Save the annotation on healthy deployments so
+                        # future startups can restore the correct value.
                         lsf.write_output('Checking prelude deployments...')
                         dep_json = vcfa_ssh(
                             f'{kctl_prefix} kubectl get deployments -n prelude -o json 2>/dev/null'
@@ -2484,8 +2516,21 @@ def main(lsf=None, standalone=False, dry_run=False):
                                 dep_data = _json_k8s.loads(raw_dep)
                                 total_deps = len(dep_data.get('items', []))
                                 for d in dep_data.get('items', []):
-                                    if d['spec'].get('replicas', 1) == 0:
-                                        zero_deps.append(d['metadata']['name'])
+                                    d_name = d['metadata']['name']
+                                    d_replicas = d['spec'].get('replicas', 1)
+                                    d_annos = d.get('metadata', {}).get('annotations', {}) or {}
+                                    saved_val = d_annos.get('vcf.lab/original-replicas', '')
+                                    if d_replicas == 0:
+                                        intended = int(saved_val) if saved_val.isdigit() and int(saved_val) > 0 else 1
+                                        zero_deps.append((d_name, intended))
+                                    elif d_replicas > 0:
+                                        # Save current healthy replica count for future restores
+                                        if saved_val != str(d_replicas):
+                                            vcfa_ssh(
+                                                f'{kctl_prefix} kubectl annotate deployment {d_name} '
+                                                f'-n prelude vcf.lab/original-replicas={d_replicas} '
+                                                f'--overwrite 2>/dev/null'
+                                            )
                                 lsf.write_output(f'  {len(zero_deps)} of {total_deps} deployments at 0 replicas')
                             except Exception as dep_err:
                                 lsf.write_output(f'  WARNING: Could not parse deployment JSON: {dep_err}')
@@ -2496,8 +2541,8 @@ def main(lsf=None, standalone=False, dry_run=False):
                             for i in range(0, len(zero_deps), batch_size):
                                 batch = zero_deps[i:i+batch_size]
                                 batch_cmd = f'{kctl_prefix} ' + ' '.join(
-                                    f'kubectl scale deployment {d} -n prelude --replicas=1 2>/dev/null;'
-                                    for d in batch
+                                    f'kubectl scale deployment {d_name} -n prelude --replicas={d_intended} 2>/dev/null;'
+                                    for d_name, d_intended in batch
                                 )
                                 result = vcfa_ssh(batch_cmd)
                                 scaled_count = _get_stdout(result).count('scaled')
@@ -2517,12 +2562,23 @@ def main(lsf=None, standalone=False, dry_run=False):
                                     ss_data = _json_k8s.loads(raw_ss)
                                     for ss in ss_data.get('items', []):
                                         ss_name = ss['metadata']['name']
-                                        if ss['spec'].get('replicas', 1) == 0:
-                                            lsf.write_output(f'  Scaling up StatefulSet {ss_name}')
+                                        ss_replicas = ss['spec'].get('replicas', 1)
+                                        ss_annos = ss.get('metadata', {}).get('annotations', {}) or {}
+                                        ss_saved = ss_annos.get('vcf.lab/original-replicas', '')
+                                        if ss_replicas == 0:
+                                            ss_intended = int(ss_saved) if ss_saved.isdigit() and int(ss_saved) > 0 else 1
+                                            lsf.write_output(f'  Scaling up StatefulSet {ss_name} to {ss_intended} (was 0)')
                                             vcfa_ssh(
                                                 f'{kctl_prefix} kubectl scale statefulset {ss_name} '
-                                                f'-n prelude --replicas=1 2>/dev/null'
+                                                f'-n prelude --replicas={ss_intended} 2>/dev/null'
                                             )
+                                        elif ss_replicas > 0:
+                                            if ss_saved != str(ss_replicas):
+                                                vcfa_ssh(
+                                                    f'{kctl_prefix} kubectl annotate statefulset {ss_name} '
+                                                    f'-n prelude vcf.lab/original-replicas={ss_replicas} '
+                                                    f'--overwrite 2>/dev/null'
+                                                )
                                 except Exception:
                                     pass
                             

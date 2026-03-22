@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.4 - March 3, 2026
+# Version 2.5 - March 19, 2026
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.5 - 2026-03-19:
+#   - Fixed _get_nsx_manager_for_edge_check() to support VCF 9.1 C4 'vna-'
+#     prefixed edge names in addition to 'edge-' prefix
+#   - Added _acquire_ops_token() helper that tries both 'local' and 'localItem'
+#     authSource values for VCF Operations token acquisition, improving
+#     portability across VCF 9.x builds
 # v2.4 - 2026-03-03:
 #   - Removed "Broadcom, Inc CA" from expected private CAs (not present in
 #     all VCF 9.1 labs); Firefox CA check now simply lists found private CAs
@@ -134,6 +140,7 @@ class ValidationReport:
     password_expiration_checks: List[CheckResult] = field(default_factory=list)
     fleet_password_policy_checks: List[CheckResult] = field(default_factory=list)
     firefox_ca_checks: List[CheckResult] = field(default_factory=list)
+    drs_isolation_checks: List[CheckResult] = field(default_factory=list)
     overall_status: str = "PASS"
     
     def to_dict(self) -> Dict:
@@ -517,6 +524,42 @@ def check_vm_configuration(vms: List, fix_issues: bool = True) -> List[CheckResu
 
 
 #==============================================================================
+# VCF OPERATIONS TOKEN HELPER
+#==============================================================================
+
+def _acquire_ops_token(ops_fqdn: str, password: str) -> Optional[str]:
+    """
+    Acquire an OpsToken from VCF Operations, trying both authSource values.
+    
+    VCF 9.1 C4 uses 'local'; other builds may use 'localItem'.
+    
+    :param ops_fqdn: VCF Operations FQDN
+    :param password: Admin password
+    :return: Token string, or None on failure
+    """
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    api_base = f"https://{ops_fqdn}/suite-api"
+    for auth_source in ("local", "localItem"):
+        try:
+            resp = requests.post(
+                f"{api_base}/api/auth/token/acquire",
+                json={"username": "admin", "password": password,
+                      "authSource": auth_source},
+                headers={"Accept": "application/json",
+                          "Content-Type": "application/json"},
+                verify=False, timeout=30
+            )
+            if resp.status_code == 200:
+                return resp.json().get("token")
+        except Exception:
+            continue
+    return None
+
+
+#==============================================================================
 # LICENSE CHECKS
 #==============================================================================
 
@@ -693,20 +736,12 @@ def check_vcf_operations_license() -> List[CheckResult]:
     password = lsf.get_password()
     api_base = f"https://{ops_fqdn}/suite-api"
     
-    try:
-        token_resp = requests.post(
-            f"{api_base}/api/auth/token/acquire",
-            json={"username": "admin", "password": password, "authSource": "local"},
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            verify=False, timeout=30
-        )
-        token_resp.raise_for_status()
-        token = token_resp.json()["token"]
-    except Exception as e:
+    token = _acquire_ops_token(ops_fqdn, password)
+    if not token:
         results.append(CheckResult(
             name=f"VCF Operations: {ops_fqdn}",
             status="WARN",
-            message=f"Could not authenticate: {str(e)[:60]}"
+            message="Could not authenticate (tried local and localItem)"
         ))
         return results
     
@@ -1240,11 +1275,14 @@ def _get_nsx_manager_for_edge_check(edge_hostname: str) -> Optional[str]:
     """
     Determine which NSX Manager manages a given edge node by name convention.
     
-    Edge names follow the pattern edge-{domain}-{num}{site} where domain
-    matches the NSX Manager pattern nsx-{domain}-{num}{site}.
+    Edge/VNA names follow patterns like:
+        edge-{domain}-{num}{site}  (VCF 9.0)
+        vna-{domain}-{num}{site}   (VCF 9.1 C4)
+    The domain segment maps to the NSX Manager: nsx-{domain}-{num}{site}.
     For example: edge-wld01-01a -> nsx-wld01-01a
+                 vna-wld01-01a  -> nsx-wld01-01a
     
-    :param edge_hostname: NSX Edge hostname (e.g. edge-wld01-01a)
+    :param edge_hostname: NSX Edge/VNA hostname (e.g. edge-wld01-01a, vna-wld01-02a)
     :return: NSX Manager FQDN, or None if not found
     """
     if not lsf or not lsf.config.has_section('VCF'):
@@ -1259,7 +1297,7 @@ def _get_nsx_manager_for_edge_check(edge_hostname: str) -> Optional[str]:
             continue
         nsx_managers.append(entry.split(':')[0].strip())
 
-    edge_match = re.match(r'edge-(\w+)-\d+', edge_hostname)
+    edge_match = re.match(r'(?:edge|vna)-(\w+)-\d+', edge_hostname)
     if edge_match:
         edge_domain = edge_match.group(1)
         for mgr in nsx_managers:
@@ -1997,21 +2035,12 @@ def check_vcf_password_policies() -> List[CheckResult]:
     base_url = f"https://{ops_fqdn}"
     api_base = f"{base_url}/suite-api"
     
-    # Authenticate to get OpsToken
-    try:
-        token_resp = requests.post(
-            f"{api_base}/api/auth/token/acquire",
-            json={"username": "admin", "password": password, "authSource": "local"},
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            verify=False, timeout=30
-        )
-        token_resp.raise_for_status()
-        token = token_resp.json()["token"]
-    except Exception as e:
+    token = _acquire_ops_token(ops_fqdn, password)
+    if not token:
         return [CheckResult(
             name="VCF Password Policies",
             status="WARN",
-            message=f"Could not authenticate to VCF Operations: {str(e)[:60]}"
+            message="Could not authenticate to VCF Operations (tried local and localItem)"
         )]
     
     headers = {
@@ -2140,6 +2169,187 @@ def check_vcf_password_policies() -> List[CheckResult]:
                 }
             ))
     
+    return results
+
+
+#==============================================================================
+# DRS ISOLATION CHECK - auto-platform-a host isolation
+#==============================================================================
+
+def check_auto_platform_isolation() -> List[CheckResult]:
+    """
+    Verify that auto-platform-a-* is the sole VM on its host and that
+    mandatory DRS VM-Host rules enforce this isolation on cluster-mgmt-01a.
+
+    Checks:
+    1. auto-platform-a-* VM exists and is powered on
+    2. No other powered-on VMs share the same ESXi host
+    3. A VM group containing auto-platform-a-* exists
+    4. A host group for the dedicated host exists
+    5. A mandatory must-run-on affinity rule links VM group to host group
+    6. A mandatory must-NOT-run-on anti-affinity rule keeps other VMs away
+    """
+    results: List[CheckResult] = []
+
+    if not PYVMOMI_AVAILABLE or not lsf or not lsf.sis:
+        results.append(CheckResult(
+            name='DRS Isolation: auto-platform-a',
+            status='SKIPPED',
+            message='vSphere connection not available'))
+        return results
+
+    try:
+        si = lsf.sis[0]
+        content = si.RetrieveContent()
+
+        container = content.viewManager.CreateContainerView(
+            content.rootFolder, [vim.ClusterComputeResource], True)
+        cluster = None
+        for c in container.view:
+            if c.name == 'cluster-mgmt-01a':
+                cluster = c
+                break
+        container.Destroy()
+
+        if not cluster:
+            results.append(CheckResult(
+                name='DRS Isolation: auto-platform-a',
+                status='SKIPPED',
+                message='cluster-mgmt-01a not found'))
+            return results
+
+        # Locate auto-platform-a VM
+        auto_vm = None
+        auto_host = None
+        vm_view = content.viewManager.CreateContainerView(
+            content.rootFolder, [vim.VirtualMachine], True)
+        for vm in vm_view.view:
+            if vm.name.startswith('auto-platform-a'):
+                auto_vm = vm
+                auto_host = vm.runtime.host
+                break
+        vm_view.Destroy()
+
+        if not auto_vm:
+            results.append(CheckResult(
+                name='DRS Isolation: auto-platform-a',
+                status='FAIL',
+                message='auto-platform-a VM not found'))
+            return results
+
+        # Check 1: sole VM on host
+        other_vms = [v.name for v in auto_host.vm
+                     if v.name != auto_vm.name
+                     and v.runtime.powerState == 'poweredOn']
+
+        if other_vms:
+            results.append(CheckResult(
+                name=f'DRS Isolation: {auto_vm.name} sole on host',
+                status='FAIL',
+                message=(f'{auto_vm.name} shares {auto_host.name} with '
+                         f'{len(other_vms)} other VM(s): {", ".join(other_vms)}')))
+        else:
+            results.append(CheckResult(
+                name=f'DRS Isolation: {auto_vm.name} sole on host',
+                status='PASS',
+                message=(f'{auto_vm.name} is the only powered-on VM on '
+                         f'{auto_host.name}')))
+
+        # Index groups and rules
+        groups = {g.name: g for g in cluster.configurationEx.group}
+        rules = {r.name: r for r in cluster.configurationEx.rule}
+
+        VM_GROUP = 'auto-platform-VMs'
+        HOST_GROUP = 'auto-platform-Hosts'
+        AFFINITY_RULE = 'auto-platform-must-run-on-host'
+        ANTIAFFINITY_RULE = 'other-VMs-must-not-run-on-auto-platform-host'
+
+        # Check 2: VM group
+        if VM_GROUP in groups:
+            g = groups[VM_GROUP]
+            vm_names = [v.name for v in (g.vm or [])]
+            has_auto = any(n.startswith('auto-platform-a') for n in vm_names)
+            if has_auto:
+                results.append(CheckResult(
+                    name=f'DRS Group: {VM_GROUP}',
+                    status='PASS',
+                    message=f'Contains {", ".join(vm_names)}'))
+            else:
+                results.append(CheckResult(
+                    name=f'DRS Group: {VM_GROUP}',
+                    status='FAIL',
+                    message=f'Group exists but missing auto-platform-a VM'))
+        else:
+            results.append(CheckResult(
+                name=f'DRS Group: {VM_GROUP}',
+                status='FAIL',
+                message='VM group does not exist'))
+
+        # Check 3: Host group
+        if HOST_GROUP in groups:
+            g = groups[HOST_GROUP]
+            host_names = [h.name for h in (g.host or [])]
+            results.append(CheckResult(
+                name=f'DRS Group: {HOST_GROUP}',
+                status='PASS',
+                message=f'Contains {", ".join(host_names)}'))
+        else:
+            results.append(CheckResult(
+                name=f'DRS Group: {HOST_GROUP}',
+                status='FAIL',
+                message='Host group does not exist'))
+
+        # Check 4: must-run-on affinity rule
+        if AFFINITY_RULE in rules:
+            r = rules[AFFINITY_RULE]
+            ok = (r.enabled and r.mandatory
+                  and getattr(r, 'vmGroupName', '') == VM_GROUP
+                  and getattr(r, 'affineHostGroupName', '') == HOST_GROUP)
+            if ok:
+                results.append(CheckResult(
+                    name=f'DRS Rule: {AFFINITY_RULE}',
+                    status='PASS',
+                    message='Mandatory must-run-on rule active'))
+            else:
+                results.append(CheckResult(
+                    name=f'DRS Rule: {AFFINITY_RULE}',
+                    status='FAIL',
+                    message=(f'Rule misconfigured (enabled={r.enabled}, '
+                             f'mandatory={r.mandatory})')))
+        else:
+            results.append(CheckResult(
+                name=f'DRS Rule: {AFFINITY_RULE}',
+                status='FAIL',
+                message='Affinity rule does not exist'))
+
+        # Check 5: must-NOT-run-on anti-affinity rule
+        if ANTIAFFINITY_RULE in rules:
+            r = rules[ANTIAFFINITY_RULE]
+            ok = (r.enabled and r.mandatory
+                  and getattr(r, 'antiAffineHostGroupName', '') == HOST_GROUP)
+            if ok:
+                results.append(CheckResult(
+                    name=f'DRS Rule: anti-affinity',
+                    status='PASS',
+                    message='Mandatory anti-affinity rule active'))
+            else:
+                results.append(CheckResult(
+                    name=f'DRS Rule: anti-affinity',
+                    status='FAIL',
+                    message=(f'Rule misconfigured (enabled={r.enabled}, '
+                             f'mandatory={r.mandatory})')))
+        else:
+            results.append(CheckResult(
+                name=f'DRS Rule: anti-affinity',
+                status='FAIL',
+                message='Anti-affinity rule does not exist'))
+
+    except Exception as e:
+        results.append(CheckResult(
+            name='DRS Isolation: auto-platform-a',
+            status='FAIL',
+            message=f'Check failed: {e}'))
+
     return results
 
 
@@ -2288,6 +2498,14 @@ def main():
             except Exception as e:
                 print(f"VM config check failed: {e}")
             
+            # DRS isolation check for auto-platform-a
+            print("\nChecking auto-platform-a host isolation...")
+            try:
+                report.drs_isolation_checks = check_auto_platform_isolation()
+                print_results_table("DRS HOST ISOLATION", report.drs_isolation_checks)
+            except Exception as e:
+                print(f"DRS isolation check failed: {e}")
+            
             # License checks (all vCenter entities including every ESXi host)
             print("\nChecking licenses...")
             try:
@@ -2345,7 +2563,8 @@ def main():
         report.vm_resource_checks +
         report.password_expiration_checks +
         report.fleet_password_policy_checks +
-        report.firefox_ca_checks
+        report.firefox_ca_checks +
+        report.drs_isolation_checks
     )
     
     if any(c.status == 'FAIL' for c in all_checks):

@@ -75,6 +75,8 @@ helm upgrade traefik traefik/traefik -n traefik -f /root/traefik-values.yaml
 
 **Technitium API pattern:**
 
+*(Note to Agent: If modifying the token extraction or JSON payloads, consider writing a full python `requests` script to avoid bash/JSON escaping hell).*
+
 ```bash
 PASSWORD=$(cat /home/holuser/creds.txt)
 # Login and get token
@@ -234,6 +236,8 @@ kubectl exec -n vault-pki-lab vault-0 -- sh -c \
 
 3. **Extract and store as K8s secret:**
 
+*(Note to Agent: Avoid generating this inline Python script with modified contents, as it can easily lead to quotation and escaping errors in a shell environment. Create a standalone `.py` file instead if you need to manipulate the JSON structure).*
+
 ```bash
 cd /root/traefik-certs
 python3 -c "
@@ -329,9 +333,9 @@ And add the outpost callback route (higher priority):
 | `/certsrv/certnew.p7b` | GET | CA chain (PKCS#7 DER format) |
 
 **Three deployment modes:**
-1. `install_certsrv_proxy-beta.sh` -- Standalone TLS on port 443 (no Traefik needed)
-2. `install_certsrv_proxy.sh` -- HTTP on port 8900 behind Traefik
-3. `docker/` -- Docker Compose with optional TLS toggle
+1. `/home/holuser/hol/Tools/CertsrvProxy/install_certsrv_proxy-beta.sh` -- Standalone TLS on port 443 (no Traefik needed)
+2. `/home/holuser/hol/Tools/CertsrvProxy/install_certsrv_proxy.sh` -- HTTP on port 8900 behind Traefik
+3. `/home/holuser/hol/Tools/CertsrvProxy/docker/` -- Docker Compose with optional TLS toggle
 
 **SDDC Manager integration:**
 

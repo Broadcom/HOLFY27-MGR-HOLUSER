@@ -522,6 +522,10 @@ def shutdown_supervisor_workloads(lsf, vc_fqdn: str, password: str,
                                 if replicas > 0:
                                     if not dry_run:
                                         scp_kubectl(
+                                            f'kubectl annotate deployment {dep_name} -n {svc_ns} '
+                                            f'vcf.lab/original-replicas={replicas} --overwrite 2>/dev/null'
+                                        )
+                                        scp_kubectl(
                                             f'kubectl scale deployment {dep_name} -n {svc_ns} --replicas=0 2>/dev/null'
                                         )
                                         vcf_write(lsf, f'    {dep_name}: scaled 0 (was {replicas})')
@@ -547,6 +551,10 @@ def shutdown_supervisor_workloads(lsf, vc_fqdn: str, password: str,
                                 replicas = sts['spec'].get('replicas', 0)
                                 if replicas > 0:
                                     if not dry_run:
+                                        scp_kubectl(
+                                            f'kubectl annotate statefulset {sts_name} -n {svc_ns} '
+                                            f'vcf.lab/original-replicas={replicas} --overwrite 2>/dev/null'
+                                        )
                                         scp_kubectl(
                                             f'kubectl scale statefulset {sts_name} -n {svc_ns} --replicas=0 2>/dev/null'
                                         )
@@ -1308,6 +1316,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                             return lsf.ssh(ssh_cmd, f'{vsp_user}@{vsp_control_plane_ip}')
 
                         # Scale down each component to 0 replicas (reverse order from startup)
+                        # Save original replica count as annotation so startup can restore it
                         scaled_down = 0
                         already_stopped = 0
                         errors = 0
@@ -1333,6 +1342,13 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                                 vcf_write(lsf, f'  {namespace}/{resource}: already stopped (replicas=0)')
                                 already_stopped += 1
                                 continue
+
+                            # Save current replica count as annotation for startup restore
+                            if current_replicas.isdigit() and int(current_replicas) > 0:
+                                vsp_kubectl(
+                                    f"kubectl annotate {resource} -n {namespace} "
+                                    f"vcf.lab/original-replicas={current_replicas} --overwrite"
+                                )
 
                             vcf_write(lsf, f'  Scaling down: {namespace}/{resource} (was replicas={current_replicas})')
                             scale_cmd = f'kubectl scale {resource} -n {namespace} --replicas=0'
@@ -1380,10 +1396,11 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                                     vcf_write(lsf, f'  WARNING: Could not parse component JSON: {je}')
 
                         # Suspend postgres instances (reverse of startup unsuspend)
-                        # Two-step process:
+                        # Three-step process:
                         #   1. Set suspended label on PostgresInstance CRD
-                        #   2. Scale Zalando postgres CRD numberOfInstances to 0
-                        # Both are needed for clean shutdown and matching startup unsuspend.
+                        #   2. Save current numberOfInstances as annotation for restore
+                        #   3. Scale Zalando postgres CRD numberOfInstances to 0
+                        # All steps are needed for clean shutdown and matching startup unsuspend.
                         vcf_write(lsf, '  Suspending Postgres instances...')
                         pg_check = vsp_kubectl(
                             'kubectl get postgresinstances.database.vmsp.vmware.com -A '
@@ -1402,6 +1419,20 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                                         vsp_kubectl(
                                             f'kubectl label postgresinstances.database.vmsp.vmware.com '
                                             f'{pg_name} -n {pg_ns} database.vmsp.vmware.com/suspended=true --overwrite'
+                                        )
+                                        # Save current numberOfInstances so startup can restore it
+                                        cur_inst_check = vsp_kubectl(
+                                            f'kubectl get postgresqls.acid.zalan.do {pg_name} -n {pg_ns} '
+                                            f'-o jsonpath="{{.spec.numberOfInstances}}" 2>/dev/null'
+                                        )
+                                        cur_instances = '1'
+                                        if hasattr(cur_inst_check, 'stdout') and cur_inst_check.stdout:
+                                            val = cur_inst_check.stdout.strip().split('\n')[-1].strip()
+                                            if val.isdigit() and int(val) > 0:
+                                                cur_instances = val
+                                        vsp_kubectl(
+                                            f"kubectl annotate postgresqls.acid.zalan.do {pg_name} -n {pg_ns} "
+                                            f"vcf.lab/original-instances={cur_instances} --overwrite"
                                         )
                                         patch_json = '{"spec":{"numberOfInstances":0}}'
                                         vsp_kubectl(
