@@ -66,6 +66,8 @@ kubectl logs -n kube-system kubectl-plugin-vsphere-<id> -c kubectl-plugin-vspher
 
 **Fix**:
 
+*(Note to Agent: When running complex python/json parsing over SSH, consider writing a local `.py` script and executing it remotely to avoid bash quoting issues).*
+
 ```bash
 # Fix the Jinja template for persistence
 sed -i '/proxy_pass.*fds_file_depot_host_port/i\            resolver 127.0.0.53;' \
@@ -358,9 +360,9 @@ workload VMs not matched by configured regex patterns are automatically found an
 
 **Root Cause**: vmon's startup data file is missing/corrupt. vmon logs show `[ReadSvcSubStartupData] No startup information from <service>`.
 
-**Fix**: Check and start during lab startup scripts. Already handled by `check_wcp_vcenter.sh`, `VCFfinal.py`, and `vSphere.py` (TASK 7) in the startup codebase.
+**Fix**: Check and start during lab startup scripts. Already handled by `/home/holuser/hol/Tools/check_wcp_vcenter.sh`, `/home/holuser/hol/Startup/VCFfinal.py`, and `/home/holuser/hol/Startup/vSphere.py` (TASK 7) in the startup codebase.
 
-**Important**: SSH and bash shell must be enabled on vCenter before these checks can run. The `vSphere.py` module (TASK 6b) now automatically enables SSH and shell via the vCenter REST API (`PUT /api/appliance/access/ssh` and `PUT /api/appliance/access/shell`) before checking autostart services, so this works even on fresh labs where `confighol` has not been run.
+**Important**: SSH and bash shell must be enabled on vCenter before these checks can run. The `/home/holuser/hol/Startup/vSphere.py` module (TASK 6b) now automatically enables SSH and shell via the vCenter REST API (`PUT /api/appliance/access/ssh` and `PUT /api/appliance/access/shell`) before checking autostart services, so this works even on fresh labs where `confighol` has not been run.
 
 ```bash
 # Enable SSH and shell via REST API (no SSH required)
@@ -484,6 +486,8 @@ External Network
 **Symptom**: In VCF Operations UI (`ops-a` > Build > Lifecycle), VCF Management shows "not currently functional." Direct curl to `https://fleet-01a.site-a.vcf.lab/fleet-lcm/v1/components` returns HTTP 500.
 
 **Diagnosis**:
+
+*(Note to Agent: It is safer to write this script to a temporary `.py` file locally and execute it via SSH rather than dealing with nested quotes).*
 
 ```bash
 PASSWORD=$(cat /home/holuser/creds.txt)
@@ -705,6 +709,8 @@ TOKEN=$(curl -sk -X POST "https://${SDDC}/v1/tokens" \
 
 **Fix** (using PostgreSQL access from shared setup above):
 
+*(Note to Agent: Write these psql commands to a local `.sh` script and execute it via `ssh < script.sh` to avoid nested quote parsing errors).*
+
 ```bash
 sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T \
   vcf@sddcmanager-a.site-a.vcf.lab \
@@ -725,6 +731,8 @@ sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T \
 **Root Cause**: Resource statuses stuck in `ERROR`/`ACTIVATING` in platform DB after failed ops or lab restarts.
 
 **Fix** (using PostgreSQL access from shared setup):
+
+*(Note to Agent: Write these psql commands to a local `.sh` script and execute it via `ssh < script.sh` to avoid nested quote parsing errors).*
 
 ```bash
 sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T \
@@ -919,7 +927,7 @@ sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-u
 
 ## 23. Supervisor Control Plane VMs Powered Off After Shutdown (VCF 9.0.x)
 
-**Symptom**: Supervisor reports `config_status: CONFIGURING, kubernetes_status: ERROR` after a clean lab shutdown/restart. The CCI URL returns 503 "no healthy upstream". The `check_fix_wcp.sh` script cannot reach the SCP VMs.
+**Symptom**: Supervisor reports `config_status: CONFIGURING, kubernetes_status: ERROR` after a clean lab shutdown/restart. The CCI URL returns 503 "no healthy upstream". The `/home/holuser/hol/Tools/check_fix_wcp.sh` script cannot reach the SCP VMs.
 
 **Diagnosis**:
 
@@ -973,7 +981,7 @@ for host in ['esx-05a.site-a.vcf.lab', 'esx-06a.site-a.vcf.lab', 'esx-07a.site-a
 
 After power-on, the Supervisor takes approximately 3-5 minutes to transition from CONFIGURING/ERROR through CONFIGURING/WARNING to RUNNING/READY.
 
-**Permanent Fix**: `VCFfinal.py` Task 2a2 now automatically detects powered-off SCP VMs, tries vCenter first, and falls back to direct ESXi host connections when `NoPermission` is encountered. This is safe for VCF 9.1 (where SCP VMs may not exist on WLD ESXi hosts).
+**Permanent Fix**: `/home/holuser/hol/Startup/VCFfinal.py` Task 2a2 now automatically detects powered-off SCP VMs, tries vCenter first, and falls back to direct ESXi host connections when `NoPermission` is encountered. This is safe for VCF 9.1 (where SCP VMs may not exist on WLD ESXi hosts).
 
 **Key Details**:
 - This issue only affects VCF 9.0.x. On VCF 9.1, the Supervisor runs on the VSP cluster which is handled separately.
@@ -1056,7 +1064,7 @@ sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-u
 - The container restart count on kube-vip (typically >100) is diagnostic — it indicates this crash loop has been happening since boot.
 - The Antrea agent readiness probe returns HTTP 500 while it's connecting to the antrea-controller. Once both antrea-agent containers are Ready, ClusterIP routing works.
 - After the istio-ingressgateway pod starts, kube-vip will acquire the VIP lease properly and the manually-added VIP will be managed by kube-vip going forward.
-- `VCFfinal.py` Task 4b now automatically detects and remediates this condition.
+- `/home/holuser/hol/Startup/VCFfinal.py` Task 4b now automatically detects and remediates this condition.
 
 ---
 
@@ -1120,7 +1128,7 @@ print(ep)
 - `kube-dns-lb` (LoadBalancer service) has its own separate NSX LB pool that correctly points to CoreDNS pod IPs — only the ClusterIP `kube-dns` endpoint is misconfigured.
 - The STANDBY SR on an NSX Edge having `Op_state: down` interfaces is **normal** for `ACTIVE_STANDBY` mode. The ACTIVE SR on the other edge handles all traffic.
 - A clean shutdown/restart of the NSX edges (via the shutdown script phases 5-7 followed by VCF.py startup) resolves this by ensuring the SR HA state is properly initialized.
-- `VCFfinal.py` Task 2c2 now automatically detects and fixes this condition during startup.
+- `/home/holuser/hol/Startup/VCFfinal.py` Task 2c2 now automatically detects and fixes this condition during startup.
 
 ---
 
@@ -1197,7 +1205,7 @@ sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-u
   "echo '${PASSWORD}' | sudo -S -i bash /tmp/fix-pods.sh"
 ```
 
-**Permanent Fix**: `confighol-9.1.py` Step 9 updated to include `198.18.0.0/16` in the NO_PROXY list for all VSP node proxy configurations.
+**Permanent Fix**: `/home/holuser/hol/Tools/confighol-9.1.py` Step 9 updated to include `198.18.0.0/16` in the NO_PROXY list for all VSP node proxy configurations.
 
 **Key Details**:
 - The VSP cluster service CIDR `198.18.128.0/17` is unique to VCF 9.1 and not covered by the standard `10.96.0.0/12` that Kubernetes typically uses.
@@ -1398,9 +1406,9 @@ THUMB=$(echo | openssl s_client -connect vc-mgmt-a.site-a.vcf.lab:443 2>/dev/nul
 # GET compute manager, modify credential.thumbprint, PUT back
 ```
 
-**Prevention**: Always check `dir-cli trustedcert list | grep -c 'vcf.lab Root Authority'` before calling `dir-cli trustedcert publish`. The `confighol-9.1.py` v2.11+ includes this guard.
+**Prevention**: Always check `dir-cli trustedcert list | grep -c 'vcf.lab Root Authority'` before calling `dir-cli trustedcert publish`. The `/home/holuser/hol/Tools/confighol-9.1.py` v2.11+ includes this guard.
 
-**Automated Fix**: `cert-replacement.py` (in `Tools/`) includes `NSXComputeManagerFixer` which automatically runs after vCenter/NSX certificate replacements. It fixes double-cert entries, ensures Vault CA is in NSX trust stores, and re-registers compute managers with the new thumbprint. Must also fix WLD vCenter (SSO admin: `administrator@wld.sso`) — both vCenters can have the double-cert issue.
+**Automated Fix**: `/home/holuser/hol/Tools/cert-replacement.py` (in `Tools/`) includes `NSXComputeManagerFixer` which automatically runs after vCenter/NSX certificate replacements. It fixes double-cert entries, ensures Vault CA is in NSX trust stores, and re-registers compute managers with the new thumbprint. Must also fix WLD vCenter (SSO admin: `administrator@wld.sso`) — both vCenters can have the double-cert issue.
 
 **Key detail for re-registration PUT**: Strip read-only fields (`_create_time`, `_create_user`, `_last_modified_time`, `_last_modified_user`, `_protection`, `_system_owned`, `certificate`, `origin_properties`) from the GET response before PUTting back. Include full credential block: `credential_type`, `username`, `password`, and the new `thumbprint`.
 
@@ -1447,6 +1455,7 @@ CSR=$(curl -sk -H "Authorization: Bearer $TOKEN" \
 # 3. Build ordered PKCS#7 (leaf first, CA second) - see vcf-certs SKILL.md Section 7
 
 # 4. Install via SDDC Manager API — body MUST be a JSON array
+# *(Note to Agent: If modifying the curl payload above, construct the JSON safely using Python `requests` or `jq` instead of struggling with bash strings).*
 curl -sk -X PUT "https://sddcmanager-a.site-a.vcf.lab/v1/domains/$DOMAIN_ID/resource-certificates" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \

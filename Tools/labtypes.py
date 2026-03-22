@@ -7,6 +7,22 @@ import os
 import importlib.util
 from typing import List, Optional, Dict, Any
 
+_DEFAULT_SEQUENCE: List[str] = [
+    'prelim',
+    'ESXi',
+    'VCF',
+    'VVF',
+    'vSphere',
+    'pings',
+    'services',
+    'Kubernetes',
+    'urls',
+    'VCFfinal',
+    'final',
+    'odyssey'
+]
+
+
 class LabTypeLoader:
     """
     Manages lab-type specific startup module loading and execution.
@@ -19,79 +35,13 @@ class LabTypeLoader:
     - EDU: Education - Training environments
     """
     
-    # Define startup sequences for each lab type
-    # Keys are UPPERCASE to match the normalization in __init__
+    _DEFAULT_SEQUENCE = _DEFAULT_SEQUENCE
+
+    # Per-labtype startup sequences. All default to _DEFAULT_SEQUENCE.
+    # Override a specific lab type here when its sequence actually differs.
+    # Example: 'DISCOVERY': ['prelim', 'ESXi', 'VCF', 'vSphere', 'urls', 'final']
     STARTUP_SEQUENCE: Dict[str, List[str]] = {
-        'HOL': [
-            'prelim',
-            'ESXi',
-            'VCF',
-            'VVF',
-            'vSphere',
-            'pings',
-            'services',
-            'Kubernetes',
-            'urls',
-            'VCFfinal',
-            'final',
-            'odyssey'
-        ],
-        'DISCOVERY': [
-            'prelim',
-            'ESXi',
-            'VCF',
-            'VVF',
-            'vSphere',
-            'pings',
-            'services',
-            'Kubernetes',
-            'urls',
-            'VCFfinal',
-            'final',
-            'odyssey'
-        ],
-        'VXP': [
-            'prelim',
-            'ESXi',
-            'VCF',
-            'VVF',
-            'vSphere',
-            'pings',
-            'services',
-            'Kubernetes',
-            'urls',
-            'VCFfinal',
-            'final',
-            'odyssey'
-        ],
-        'ATE': [
-            'prelim',
-            'ESXi',
-            'VCF',
-            'VVF',
-            'vSphere',
-            'pings',
-            'services',
-            'Kubernetes',
-            'urls',
-            'VCFfinal',
-            'final',
-            'odyssey'
-        ],
-        'EDU': [
-            'prelim',
-            'ESXi',
-            'VCF',
-            'VVF',
-            'vSphere',
-            'pings',
-            'services',
-            'Kubernetes',
-            'urls',
-            'VCFfinal',
-            'final',
-            'odyssey'
-        ]
+        lt: list(_DEFAULT_SEQUENCE) for lt in ('HOL', 'DISCOVERY', 'VXP', 'ATE', 'EDU')
     }
     
     # Lab type descriptions and configuration
@@ -147,8 +97,8 @@ class LabTypeLoader:
         self.holroot = holroot
         self.vpod_repo = vpod_repo
         
-        # Validate lab type
-        if self.labtype not in self.STARTUP_SEQUENCE:
+        # Validate lab type — accept any type registered in LABTYPE_INFO
+        if self.labtype not in self.LABTYPE_INFO:
             print(f'WARNING: Unknown labtype {self.labtype}, defaulting to HOL')
             self.labtype = 'HOL'
     
@@ -253,8 +203,8 @@ class LabTypeLoader:
         return module, module_path
     
     def get_startup_sequence(self) -> List[str]:
-        """Get the startup sequence for current labtype"""
-        return self.STARTUP_SEQUENCE.get(self.labtype, self.STARTUP_SEQUENCE['HOL'])
+        """Get the startup sequence for current labtype, falling back to default"""
+        return self.STARTUP_SEQUENCE.get(self.labtype, list(self._DEFAULT_SEQUENCE))
     
     def run_startup(self, lsf):
         """

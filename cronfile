@@ -6,4 +6,4 @@
 #   2. Execute labstartup.sh to begin lab initialization
 #   3. Start VLP Agent in background (if in production)
 
-@reboot export PATH=/home/holuser/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/holuser/ovftool:/usr/lib/jvm/jdk-17//bin; export PYTHONPATH=/usr/lib/python3/dist-packages:/home/holuser/hol; /home/holuser/hol/gitpull.sh; /home/holuser/hol/labstartup.sh; /home/holuser/hol/Tools/VLPagent.sh &
+@reboot export PATH=/home/holuser/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/holuser/ovftool:/usr/lib/jvm/jdk-17//bin; export PYTHONPATH=/usr/lib/python3/dist-packages:/home/holuser/hol; /home/holuser/hol/gitpull.sh; /home/holuser/hol/Tools/VLPagent.sh & /home/holuser/hol/labstartup.sh
