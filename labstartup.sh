@@ -567,9 +567,15 @@ push_console_files_nfs() {
         done
     fi
     
+    # Push Tools to console:
+    if cp /home/holuser/hol/Tools/hol-ssl* "/lmchol/hol/Tools/" 2>/dev/null; then
+        log_msg "hol-ssl*: -> Console hol/Tools/" "${logfile}"
+    fi
+    
     # Ensure scripts are executable on the console
     chmod +x "${desktop_dest}/conkywatch.sh" 2>/dev/null
     chmod +x "${conky_dest}/conky-startup.sh" 2>/dev/null
+    chmod +x "/lmchol/hol/Tools/hol-ssl.py" 2>/dev/null
     
     log_msg "Console file push complete" "${logfile}"
 }
