@@ -38,6 +38,9 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | Harbor unreachable, Supervisor DNS broken | Harbor pods CrashLoopBackOff with "i/o timeout" on DNS lookups | kube-dns endpoint points to LB IP causing asymmetric DLB routing | 25 |
 | VSP image pulls fail after boot | All VSP pods in ImagePullBackOff, Fleet LCM/Ops Logs HTTP 500 | VSP service CIDR `198.18.128.0/17` not in NO_PROXY; containerd routes internal pulls through Squid proxy | 26 |
 | VCF Ops Fleet Mgmt rejects Microsoft CA | "Failed to update certificate authorities" in UI | certsrv proxy returns 301 for `/certsrv`; VCF Ops Java client does not follow redirects | 27 |
+| Fleet LCM SHUTDOWN HTTP 400 for OPS | vrops/OPS returns UnsupportedOperation | VCF Operations cannot shut itself down via its own API | 33 |
+| Phase 4 ManagedObjectNotFound | VM disappears between discovery and shutdown | Race between Phase 3b cluster deletion and Phase 4 VM enumeration | 34 |
+| SCP VM straggler in Phase 19c | SupervisorControlPlaneVM found powered on in audit | EAM-managed VM; cannot be shut down via vCenter API (expected) | 35 |
 | certsrv-proxy Address already in use | Pod CrashLoopBackOff with `OSError: [Errno 98]` | Orphaned Python process on host still bound to port 443 after force pod delete | 28 |
 | SDDC Manager "Public key mismatch" on cert install | "Public key in CSR and server certificate are not matching" | PKCS#7 DER encoding sorts SET OF elements, putting CA cert before leaf cert | 29 |
 | NSX ReTrust fails after vCenter cert replacement | "Failed to import the trusted root certificate for compute manager" | NSX tries to re-trust vCenter while services are still restarting; transient timing issue | 30 |
@@ -1470,3 +1473,42 @@ curl -sk -X PUT "https://sddcmanager-a.site-a.vcf.lab/v1/domains/$DOMAIN_ID/reso
 ```
 
 **Note**: SDDC Manager restarts services during install — the HTTPS connection may drop temporarily. The `status: Successful` confirmation is visible once SDDC Manager comes back up. The new cert issuer changes from `VMCA` to `CN=vcf.lab Root Authority`.
+
+## 33. Fleet LCM SHUTDOWN Returns HTTP 400 for VCF Operations (OPS)
+
+**Symptom**: During `Shutdown.py` Phase 1, the Fleet LCM direct API returns HTTP 400 with `VCF_LCM_400_INVALID_REQUEST` / `UnsupportedOperation` when trying to shut down the `OPS` (vrops / VCF Operations) component.
+
+**Diagnosis**:
+```
+Shutting down vrops (OPS): ops-a.site-a.vcf.lab...
+  Shutdown action returned HTTP 400
+  {"code":"VCF_LCM_400_INVALID_REQUEST","message":{"id":"com.broadcom.vcf.lcm.UnsupportedOperation",
+   "defaultMessage":"Operation 'SHUTDOWN' is not supported for component 'VCF Operations'."}}
+```
+
+**Root Cause**: VCF Operations (ops-a) is the control plane for the Fleet LCM APIs themselves. It cannot shut itself down through its own API. The SHUTDOWN workflow is only supported for leaf components (VCFA, OPS_NETWORKS, OPS_LOGS, etc.).
+
+**Fix**: The `OPS` component type is now in the `FLEET_LCM_SHUTDOWN_UNSUPPORTED` set in `fleet.py` (v2.3+). Its HTTP 400 is treated as expected (not a failure), preventing unnecessary Phase 1b fallback. VCF Operations VMs are shut down directly via VM power-off in Phase 13.
+
+## 34. Phase 4 ManagedObjectNotFound During Workload VM Shutdown
+
+**Symptom**: `Shutdown.py` Phase 4 throws `vmodl.fault.ManagedObjectNotFound` for a VM that was discovered by `get_vms_by_regex()` but no longer exists when `shutdown_vm_gracefully()` tries to access it.
+
+**Diagnosis**:
+```
+ERROR in Phase 4: (vmodl.fault.ManagedObjectNotFound) {
+   msg = "The object 'vim.VirtualMachine:vm-2003' has already been deleted..."
+}
+```
+
+**Root Cause**: Race condition between Phase 3b (which deletes VKS/TKG clusters via `kubectl delete cluster`) and Phase 4 (which enumerates VMs via vCenter). The cluster controller deletes worker VMs asynchronously, so a VM can disappear between discovery and shutdown attempt.
+
+**Fix**: `lib/vsphere.py` `shutdown_vm_gracefully()` and `delete_vm()` now catch `vmodl.fault.ManagedObjectNotFound` when accessing `vm.name` and `vm.runtime.powerState`. If the VM no longer exists, the function returns `True` (treating it as already shut down) instead of raising an exception that aborts the entire phase.
+
+## 35. SupervisorControlPlaneVM Detected as Straggler in Phase 19c
+
+**Symptom**: Phase 19c (Pre-ESXi Shutdown Audit) finds `SupervisorControlPlaneVM (1)` still powered on and shuts it down as a "straggler."
+
+**Root Cause**: SCP VMs are EAM-managed (Enterprise Application Manager). They cannot be shut down via vCenter API — `PowerOffVM_Task()` returns `NoPermission`. Phase 3 stops the WCP service but does not power off the SCP VMs. Phase 4 intentionally excludes them. The SCP VM remains running until the ESXi host is shut down or until Phase 19c catches it via direct ESXi host connection (bypassing EAM permissions).
+
+**Resolution**: This is **expected behavior** — not a bug. Phase 19c is specifically designed to catch VMs like this that can only be shut down via direct ESXi access after vCenter is offline.

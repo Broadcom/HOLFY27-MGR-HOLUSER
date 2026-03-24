@@ -848,3 +848,9 @@ Items below are unique pitfalls NOT already covered in the detailed sections abo
 51. **Root token is creds.txt password** (not `"holodeck"`).
 52. **PKI role `holodeck` default max_ttl is 720h**: Update to `17520h` for 2-year certs. Needs `allow_any_name: true`, `enforce_hostnames: false`.
 53. **Technitium DNS needs `vcf.lab` zone** for `ca.vcf.lab` records (only `site-a.vcf.lab` exists by default).
+
+### Fleet LCM Shutdown API
+54. **OPS component SHUTDOWN returns HTTP 400**: `VCF_LCM_400_INVALID_REQUEST` / `UnsupportedOperation`. VCF Operations is the control-plane itself; shut down via VM power-off in Phase 13 instead.
+55. **VCFA shutdown takes ~21 minutes via Fleet LCM**: The `shutdown_component_ref` stage stays PENDING for ~17 min while K8s workloads drain, then `persist_sddc_lcm_components_ref` takes ~4 min.
+56. **OPS_NETWORKS (vrni) shutdown takes ~8 minutes**: Progresses through `flip_nodes_status_join_task_ref` then `persist_sddc_lcm_components_ref`.
+57. **OPS_LOGS (vrli) shutdown takes ~8 minutes**: Same pattern as vrni.
