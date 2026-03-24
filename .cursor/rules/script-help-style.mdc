@@ -1,0 +1,24 @@
+---
+description: Enforce the standard HOL help screen style for CLI scripts in Python and Bash
+globs: "**/*.{py,sh}"
+alwaysApply: false
+---
+
+# Script Help Screen Standard
+
+When creating or modifying CLI scripts that accept arguments or display help:
+
+1. **Use the `script-help-style` skill** — read `.cursor/skills/script-help-style/SKILL.md` and follow it for all help output formatting.
+
+2. **Required behavior:**
+   - Running the script with no arguments shows styled help (not a traceback or argparse default)
+   - `-h` / `--help` shows the same styled help
+   - Parse errors print `ERROR: <message>` then show the styled help
+   - Help exits with code 0
+   - ANSI colors are disabled when stdout is not a TTY
+
+3. **Never use default argparse help.** Always use `add_help=False` with a custom `show_help()` function in Python. Never rely on argparse's auto-generated usage/help output.
+
+4. **Section order:** Banner → USAGE → OPTIONS → EXAMPLES → (additional sections)
+
+5. **Color palette:** CYAN borders, BLUE title, GREEN flags/comments, YELLOW examples header, BOLD section headers. Gate all colors on terminal detection.
