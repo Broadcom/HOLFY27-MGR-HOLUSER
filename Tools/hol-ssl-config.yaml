@@ -1,0 +1,33 @@
+# version 2.2 - 2026-03-24
+#
+# Configuration for issuing SSL certificates via HashiCorp Vault PKI
+# Used by hol-ssl.py to request certificates from Vault's PKI secrets engine
+#
+
+# Vault PKI Configuration
+# Connection details and authentication for the Vault PKI backend
+VAULT:
+  url: "http://10.1.1.1:32000"
+  token_file: "/home/holuser/creds.txt"        # File containing the Vault authentication token
+  pki_mount: "pki"                              # Vault PKI secrets engine mount path
+  pki_role: "holodeck"                          # Vault PKI role used to issue certificates
+
+# Subject Alternative Names (SANs)
+# These values populate the certificate's SAN extension.
+# The -n/--hostname argument sets the Common Name (CN) and is always required.
+# The -f/--fqdn and -i/--ip arguments override fqdn.1 and ip_address.1 respectively.
+# Add additional SAN entries below as needed (fqdn.2, ip_address.2, etc.).
+SAN:
+  ip_address.1: "10.0.0.1"                      # IP SAN (quote to prevent YAML type coercion)
+  # fqdn.1: "alias.vcf.lab"                     # Additional DNS SAN (CN is added automatically)
+  # ip_address.2: "10.0.0.2"                    # Add more SANs as needed (fqdn.N, ip_address.N)
+
+# Certificate Configuration
+# Controls key generation and output parameters for issued certificates.
+# ttl: 398 days is the maximum duration Firefox considers valid (Mozilla Root Store Policy).
+CERT:
+  key_type: "rsa"                                # Key algorithm: rsa or ec
+  key_bits: 2048                                 # RSA: 2048/4096  EC: 256 (P-256) or 384 (P-384)
+  ttl: "398d"                                    # Certificate lifetime (398 days = Firefox max)
+  cert_dir: "/hol/ssl"                           # Output directory for all generated files
+  pfx_password_file: "/home/holuser/creds.txt"   # Password for PFX/JKS files (reads first line)
