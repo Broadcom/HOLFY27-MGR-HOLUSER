@@ -819,6 +819,7 @@ if [ "$vPod_SKU" = "HOL-BADSKU" ]; then
     fi
     date > ${holorouterdir}/gitdone
     push_router_files_nfs
+    push_console_files_nfs
     runlabstartup
     exit 0
 fi
