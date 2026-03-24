@@ -577,6 +577,24 @@ push_console_files_nfs() {
     chmod +x "${conky_dest}/conky-startup.sh" 2>/dev/null
     chmod +x "/lmchol/hol/Tools/hol-ssl.py" 2>/dev/null
     
+    # Now make sure the user-agent override is present in the Firefox profile:
+    log_msg "Making sure user-agent override is present in Firefox profile." "${logfile}"
+    FIREFOX_DIR="/lmchol/home/holuser/snap/firefox/common/.mozilla/firefox"
+    PREF_LINE='user_pref("general.useragent.override", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36");'
+
+    if [[ -d "$FIREFOX_DIR" ]]; then
+      USER_JS=$(find "$FIREFOX_DIR" -maxdepth 2 -name "user.js" | head -n 1)
+        # If USER_JS is found, check if the user-agent override is present
+        if [[ -n "$USER_JS" ]]; then
+            if grep -qF 'general.useragent.override' "$USER_JS"; then
+                log_msg "user-agent override already present in Firefox profile — no changes needed." "${logfile}"
+            else
+                log_msg "user-agent override added to Firefox profile." "${logfile}"
+                echo "$PREF_LINE" >> "$USER_JS"
+            fi  
+        fi
+    fi
+
     log_msg "Console file push complete" "${logfile}"
 }
 
