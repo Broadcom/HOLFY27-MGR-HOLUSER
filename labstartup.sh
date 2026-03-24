@@ -581,7 +581,7 @@ push_console_files_nfs() {
     log_msg "Making sure user-agent override is present in Firefox profile." "${logfile}"
     FIREFOX_DIR="/lmchol/home/holuser/snap/firefox/common/.mozilla/firefox"
     PREF_LINE='user_pref("general.useragent.override", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36");'
-
+    PREF_LINE_2='user_pref("accessibility.force_disabled", 1);'
     if [[ -d "$FIREFOX_DIR" ]]; then
       USER_JS=$(find "$FIREFOX_DIR" -maxdepth 2 -name "user.js" | head -n 1)
         # If USER_JS is found, check if the user-agent override is present
@@ -591,7 +591,13 @@ push_console_files_nfs() {
             else
                 log_msg "user-agent override added to Firefox profile." "${logfile}"
                 echo "$PREF_LINE" >> "$USER_JS"
-            fi  
+            fi
+            if grep -qF 'accessibility.force_disabled' "$USER_JS"; then
+                log_msg "accessibility.force_disabled override already present in Firefox profile — no changes needed." "${logfile}"
+            else
+                log_msg "accessibility.force_disabled override added to Firefox profile." "${logfile}"
+                echo "$PREF_LINE_2" >> "$USER_JS"
+            fi
         fi
     fi
 
