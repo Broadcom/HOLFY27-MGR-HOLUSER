@@ -844,6 +844,13 @@ if [ "$vPod_SKU" = "HOL-BADSKU" ]; then
     date > ${holorouterdir}/gitdone
     push_router_files_nfs
     push_console_files_nfs
+    if [ -f ${configini} ]; then
+        if cp /tmp/config.ini /lmchol/tmp/config.ini 2>&1; then
+            log_msg "Copied config.ini to /lmchol/tmp/config.ini" "${logfile}"
+        else
+            log_error "Failed to copy config.ini to /lmchol/tmp/config.ini" "${logfile}"
+        fi
+    fi
     runlabstartup
     exit 0
 fi
@@ -1002,7 +1009,11 @@ date > ${holorouterdir}/gitdone
 #==============================================================================
 
 if [ -f ${configini} ]; then
-    cp ${configini} /lmchol/${configini} 2>/dev/null
+    if cp /tmp/config.ini /lmchol/tmp/config.ini 2>&1; then
+        log_msg "Copied config.ini to /lmchol/tmp/config.ini" "${logfile}"
+    else
+        log_error "Failed to copy config.ini to /lmchol/tmp/config.ini" "${logfile}"
+    fi
     runlabstartup
     if [ "${VLP_ENABLED}" = "true" ]; then
         if crontab -l 2>/dev/null | grep -q 'VLPagent\.sh'; then
