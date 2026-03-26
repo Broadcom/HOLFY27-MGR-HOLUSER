@@ -1,6 +1,6 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.7 - 2026-03-18
+# Version 3.8 - 2026-03-26
 # Changes:
 # - Added functionality to set branch to "ft" if the first 3 characters of the content of /tmp/deploymentpool.txt is "FT-"
 # - Added functionality to git stash local changes for prod.
@@ -988,8 +988,8 @@ if [ "$LMC" = true ] && [ "$1" != "labcheck" ]; then
     push_console_files_nfs
 fi
 
-# Set up Cursor IDE symlinks (skills, rules, MCP) from hol repo
-if [ -x "${holroot}/console/setup-cursor.sh" ] && [ "$1" != "labcheck" ]; then
+# Set up Cursor IDE symlinks (skills, rules, MCP) if working in dev environment
+if [ -x "${holroot}/console/setup-cursor.sh" ] && [ "$1" != "labcheck" ] && [ "${branch}" = "dev" ]; then
     ${holroot}/console/setup-cursor.sh >> ${logfile} 2>&1
 fi
 
@@ -1002,6 +1002,7 @@ date > ${holorouterdir}/gitdone
 #==============================================================================
 
 if [ -f ${configini} ]; then
+    cp ${configini} /lmchol/${configini} 2>/dev/null
     runlabstartup
     if [ "${VLP_ENABLED}" = "true" ]; then
         if crontab -l 2>/dev/null | grep -q 'VLPagent\.sh'; then

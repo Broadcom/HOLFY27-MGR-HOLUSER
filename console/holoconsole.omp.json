@@ -196,16 +196,6 @@
           "properties": {
             "always_enabled": true
           }
-        },
-        {
-          "type": "time",
-          "style": "diamond",
-          "foreground": "#000000",
-          "background": "#d3d7cf",
-          "template": " {{ .CurrentDate | date .Format }} \uf017 ",
-          "properties": {
-            "time_format": "3:04:05 PM"
-          }
         }
       ]
     },
