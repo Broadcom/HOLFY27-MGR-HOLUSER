@@ -31,7 +31,7 @@ This environment is a **Holodeck nested virtualization lab** running VCF 9.0 or 
 | NSX Managers | `admin` (CLI), `root` (bash) | Root may be rotated by SDDC Manager. Check `/v1/credentials` |
 | NSX Edges | `admin` (CLI), `root` (bash) | Use `-T` flag (no PTY) for inline commands |
 | VCF Automation | `vmware-system-user` | `sudo -S -i` (9.1 requires password). DNS: `auto-a.site-a.vcf.lab` resolves to `10.1.1.70` |
-| Operations VMs | `root` | SSH disabled by default. Enable via vSphere Guest Operations API |
+| Operations VMs | varies | `root` on ops-a/opslcm-a; `vmware-system-user` on opslogs-a; no SSH on opsnet-a |
 | VSP Worker Nodes | `vmware-system-user` | `sudo -S -i` with password from creds.txt |
 | Console VM | `holuser` | Ubuntu 24.04 Gnome desktop. `su` for root |
 
@@ -334,9 +334,32 @@ Graceful shutdown/startup of VSP components is managed by:
 - **Standalone**: `python3 Shutdown.py --phase 2b` (scale down only)
 - **Dry run**: `python3 Shutdown.py --phase 3b --dry-run` (preview Supervisor workload shutdown)
 
-## 7. Operations VMs (SSH Enablement)
+## 7. Operations VMs (SSH Access)
 
-SSH is disabled by default on Operations VMs. Enable via vSphere Guest Operations API:
+SSH access varies by Operations VM:
+
+| VM | SSH User | Notes |
+| --- | --- | --- |
+| `ops-a` | `root` | SSH usually enabled; password from creds.txt |
+| `opslcm-a` | `root` | SSH usually enabled |
+| `opsdata-01a` | `root` | SSH usually enabled |
+| `opslogs-a` | `vmware-system-user` | `root` and `admin` rejected |
+| `opsnet-a` | N/A | No SSH access at all — HTTPS API only |
+
+When scripting Operations VM configuration, try multiple users:
+
+```bash
+# Try root first, then vmware-system-user
+for user in root vmware-system-user; do
+    if sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no \
+       -o ConnectTimeout=10 $user@$OPSVM "echo SSH_OK" 2>/dev/null | grep -q SSH_OK; then
+        echo "SSH works as $user"
+        break
+    fi
+done
+```
+
+If SSH is disabled by default, enable via vSphere Guest Operations API:
 
 ```python
 from pyVim.connect import SmartConnect
@@ -794,6 +817,7 @@ Items below are unique pitfalls NOT already covered in the detailed sections abo
 9. **SSH/shell can be enabled via REST API**: `PUT /api/appliance/access/ssh` (body: `true`) without needing SSH first.
 10. **SSH host keys change on upgrade**: Use `ssh-keygen -R` and `-o StrictHostKeyChecking=accept-new`.
 11. **`vapi-endpoint` and `trustmanagement` frequently STOPPED** after cold boot — always verify/start via `vmon-cli`.
+12. **Fresh vCenter has VAMI shell + PAM blocking sshpass**: Root login shell is `/opt/vmware/bin/appliancesh` and `/etc/pam.d/sshd` includes `pam_mgmt_cli.so`. Fix via pyVmomi Guest Operations on ESXi: `usermod -s /bin/bash root`, rewrite `/etc/pam.d/sshd`, restart sshd. See vcf-troubleshooting Section 36.
 
 ### VCF Automation
 12. **Sudo changed in 9.1**: No longer NOPASSWD. Use `echo 'pw' | sudo -S -i`.
@@ -833,6 +857,12 @@ Items below are unique pitfalls NOT already covered in the detailed sections abo
 40. **VCF 9.1 C4 credentials API requires Bearer token**: Basic Auth (`-u vcf:password`) returns 0 elements. Use `POST /v1/tokens` with `admin@local` to get `accessToken`, then `Authorization: Bearer <token>`.
 41. **VNA Edge root passwords are rotated by SDDC Manager**: VNA edge root passwords differ from the standard lab password. Query `/v1/credentials?resourceType=NSXT_EDGE` with Bearer token to retrieve rotated passwords.
 42. **VNA Edge STANDBY has unreachable management IP**: In `ACTIVE_STANDBY` HA, the standby VNA edge's management IP (e.g. 10.1.1.197) is not pingable. SSH operations will fail, but NSX Manager REST API (password expiration, SSH enable) still works.
+43. **SDDC Manager API returns HTTP 502/503 after service restart**: After `systemctl restart operationsmanager commonsvcs domainmanager`, the `/v1/tokens` endpoint recovers first (~10s) but `/v1/credentials` may return HTTP 502 for up to 60s. Always implement a retry loop (e.g. 6 attempts, 10s sleep) when querying credentials immediately after a service restart.
+44. **Operations VMs SSH user varies by VM**: `ops-a` and `opslcm-a` accept `root`, `opslogs-a` accepts only `vmware-system-user`, `opsnet-a` has no SSH at all. When scripting, try `root` first, then `vmware-system-user`, and skip VMs where both fail.
+
+### lsfunctions Library
+45. **`lsf.run_command(cmd)` splits on spaces**: It internally calls `cmd.split()` which mangles quoted passwords. `sshpass -p "MyP@ss!"` becomes `['sshpass', '-p', '"MyP@ss!"']` with literal quote chars in the password arg. Use `subprocess.run(cmd, shell=True)` directly for any command containing passwords.
+46. **`lsf.ssh()` / `lsf.scp()` return objects with potentially missing `.stderr`**: On failure, use `getattr(result, 'stderr', '') or ''` instead of `result.stderr` to avoid `AttributeError`.
 
 ### Certificate Operations (see `vcf-certs` skill for full details)
 43. **PKCS#7 DER encoding reorders certs**: Use custom `build_ordered_pkcs7()`.
@@ -854,3 +884,8 @@ Items below are unique pitfalls NOT already covered in the detailed sections abo
 55. **VCFA shutdown takes ~21 minutes via Fleet LCM**: The `shutdown_component_ref` stage stays PENDING for ~17 min while K8s workloads drain, then `persist_sddc_lcm_components_ref` takes ~4 min.
 56. **OPS_NETWORKS (vrni) shutdown takes ~8 minutes**: Progresses through `flip_nodes_status_join_task_ref` then `persist_sddc_lcm_components_ref`.
 57. **OPS_LOGS (vrli) shutdown takes ~8 minutes**: Same pattern as vrni.
+
+### SDDC Manager Task Concurrency
+58. **Auto-rotate disable HTTP 403 "10 concurrent"**: Stale `task_metadata` + `entity_and_task` + `task_and_entity_type_and_entity` in platform DB, plus `processing_task` in domainmanager DB, consume the 10-task concurrency limit. Must DELETE all these records and restart services. See vcf-troubleshooting Section 37.
+59. **`/v1/tasks` vs `/v1/credentials/tasks`**: `/v1/credentials/tasks` shows credential-specific task status. `/v1/tasks` shows ALL SDDC Manager tasks computed from platform DB tables. Stale tasks appear only in `/v1/tasks` and cannot be cancelled via API.
+60. **Operations VM passwords may be rotated**: SDDC Manager rotates passwords on Operations VMs (ops-a, opscollector-01a, opslcm-a). Query `/v1/credentials` (no resourceType filter) and match by hostname to retrieve actual passwords.

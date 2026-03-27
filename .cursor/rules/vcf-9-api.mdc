@@ -72,6 +72,12 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 - **VNA Edge root passwords are rotated** — SDDC Manager rotates VNA edge root passwords. Query `/v1/credentials?resourceType=NSXT_EDGE` with Bearer token to get the actual password. Standard lab password will fail for root SSH.
 - **VNA Edge STANDBY has unreachable mgmt IP** — The standby VNA edge's management IP is not pingable in `ACTIVE_STANDBY` HA. SSH operations fail, but NSX Manager REST API still works for password expiration and SSH enable.
 - **VCF 9.1 C4 NSX Edge naming is `vna-` prefix** — NSX Edges in VCF 9.1 C4 are named `vna-wld01-01a`, `vna-wld01-02a` (not `edge-`). Map to NSX Manager using the domain segment: `vna-wld01-01a` -> `nsx-wld01-01a`.
+- **Fresh vCenter SSH broken (VAMI shell + PAM)** — Root login shell is VAMI appliancesh and `pam_mgmt_cli.so` blocks sshpass. Fix via pyVmomi Guest Operations on ESXi: `usermod -s /bin/bash root`, rewrite `/etc/pam.d/sshd`, restart sshd. See vcf-troubleshooting SKILL.md Section 36.
+- **`lsf.run_command(cmd)` splits quoted passwords** — `cmd.split()` mangles `sshpass -p "password"` by including literal quote chars. Use `subprocess.run(cmd, shell=True)` directly for password-based commands.
+- **SDDC Manager API 502/503 after service restart** — `/v1/credentials` may return HTTP 502 for up to 60s after `systemctl restart`. Implement retry loop (6 attempts, 10s sleep) before failing.
+- **Operations VMs SSH user varies** — `ops-a`/`opslcm-a` accept `root`; `opslogs-a` only accepts `vmware-system-user`; `opsnet-a` has no SSH. Try both users, skip on failure.
+- **SDDC Manager auto-rotate HTTP 403 "10 concurrent"** — Stale `task_metadata`/`entity_and_task`/`task_and_entity_type_and_entity` in platform DB plus `processing_task` in domainmanager DB block credential operations. Must DELETE all entries and restart `operationsmanager`, `commonsvcs`, `domainmanager` services. See vcf-troubleshooting Section 37.
+- **Operations VM passwords rotated by SDDC Manager** — `ops-a`, `opscollector-01a`, `opslcm-a` root passwords may be rotated. Query `/v1/credentials` with Bearer token and match by hostname to retrieve actual password. Reset to lab standard via `chpasswd` after connecting.
 
 ## Session Knowledge Capture
 
