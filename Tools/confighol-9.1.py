@@ -1831,36 +1831,39 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
             ssh_reachable = True
         
         if ssh_reachable:
-            # Step 2: Copy authorized_keys for root user
-            # VNA edges may have rotated root passwords — try standard first,
-            # then look up rotated password from SDDC Manager
-            root_password = password
-            lsf.write_output(f'{hostname}: Copying authorized_keys for root...')
-            lsf.ssh('mkdir -p /root/.ssh && chmod 700 /root/.ssh', f'root@{hostname}', root_password)
-            result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', root_password)
-            if result.returncode != 0 and (result.returncode == 255 or 'permission denied' in str(result.stderr).lower()):
-                lsf.write_output(f'{hostname}: Standard password failed - checking SDDC Manager for rotated password...')
-                rotated_pw = get_nsx_root_password_from_sddc(hostname, password, resource_type='NSXT_EDGE')
-                if rotated_pw:
-                    root_password = rotated_pw
-                    lsf.ssh('mkdir -p /root/.ssh && chmod 700 /root/.ssh', f'root@{hostname}', root_password)
-                    result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', root_password)
-            
-            if result.returncode == 0:
-                lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied')
-                chmod_result = lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{hostname}', root_password)
-                if chmod_result.returncode == 0:
-                    lsf.write_output(f'{hostname}: SUCCESS - Permissions set on authorized_keys')
-                else:
-                    lsf.write_output(f'{hostname}: WARNING - Failed to set permissions')
+            # Step 2: Copy authorized_keys for root user (skip for vna- edges as they use restricted shell)
+            if hostname.startswith('vna-'):
+                lsf.write_output(f'{hostname}: Skipping authorized_keys copy (vna- edges do not support direct root SSH keys)')
             else:
-                lsf.write_output(f'{hostname}: FAILED - Could not copy authorized_keys')
-                if result.returncode == 255:
-                    lsf.write_output(f'{hostname}:         SSH connection failed despite enable attempt')
-                success = False
+                # VNA edges may have rotated root passwords — try standard first,
+                # then look up rotated password from SDDC Manager
+                root_password = password
+                lsf.write_output(f'{hostname}: Copying authorized_keys for root...')
+                lsf.ssh('mkdir -p /root/.ssh && chmod 700 /root/.ssh', f'root@{hostname}', root_password)
+                result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', root_password)
+                if result.returncode != 0 and (result.returncode == 255 or 'permission denied' in str(result.stderr).lower()):
+                    lsf.write_output(f'{hostname}: Standard password failed - checking SDDC Manager for rotated password...')
+                    rotated_pw = get_nsx_root_password_from_sddc(hostname, password, resource_type='NSXT_EDGE')
+                    if rotated_pw:
+                        root_password = rotated_pw
+                        lsf.ssh('mkdir -p /root/.ssh && chmod 700 /root/.ssh', f'root@{hostname}', root_password)
+                        result = lsf.scp(auth_keys_file, f'root@{hostname}:{LINUX_AUTH_FILE}', root_password)
+                
+                if result.returncode == 0:
+                    lsf.write_output(f'{hostname}: SUCCESS - authorized_keys copied')
+                    chmod_result = lsf.ssh(f'chmod 600 {LINUX_AUTH_FILE}', f'root@{hostname}', root_password)
+                    if chmod_result.returncode == 0:
+                        lsf.write_output(f'{hostname}: SUCCESS - Permissions set on authorized_keys')
+                    else:
+                        lsf.write_output(f'{hostname}: WARNING - Failed to set permissions')
+                else:
+                    lsf.write_output(f'{hostname}: FAILED - Could not copy authorized_keys')
+                    if result.returncode == 255:
+                        lsf.write_output(f'{hostname}:         SSH connection failed despite enable attempt')
+                    success = False
             
             # Step 3: Configure SSH to start on boot via NSX CLI
-            configure_nsx_ssh_start_on_boot(hostname, root_password, dry_run)
+            configure_nsx_ssh_start_on_boot(hostname, password, dry_run)
         
         # Step 4: Set password expiration via NSX Manager transport node API
         # This works even if SSH is unreachable (uses NSX Manager REST API)
