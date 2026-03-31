@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-MSADCS Proxy - Production (Behind Traefik)
+VCF CA Proxy - Production
 
-Impersonates a Microsoft ADCS Certificate Authority Web Enrollment server
-and translates requests to HashiCorp Vault PKI API calls.
+This software is not developed, endorsed, or affiliated with Microsoft Corporation. 
+It provides a certsrv-compatible interface for interoperability with products that 
+expect a Microsoft ADCS Web Enrollment endpoint, and translates requests to 
+HashiCorp Vault PKI API calls.
 
 This production version runs plain HTTP on port 8900 (configurable).
-TLS termination is handled by Traefik via an IngressRoute for ca.vcf.lab.
+TLS termination is handled by Reverse Proxy via an IngressRoute for ca.vcf.lab.
 
 Implements the certsrv protocol endpoints:
   GET  /certsrv/              - Home page (Welcome)
@@ -34,10 +36,12 @@ import argparse
 import base64
 import json
 import logging
+import os
 import re
 import sys
 import threading
 import time
+import secrets
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote_plus
@@ -45,7 +49,8 @@ from urllib.parse import urlparse, parse_qs, unquote_plus
 import requests
 import urllib3
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -77,31 +82,95 @@ class CertStore:
             return self._certs.get(req_id)
 
 
+class KeyStore:
+    """Thread-safe in-memory store for generated Private Keys and CSRs."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data = {}
+
+    def store(self, serial: str, key_pem: str, csr_pem: str):
+        with self._lock:
+            self._data[serial] = {
+                'key': key_pem,
+                'csr': csr_pem
+            }
+
+    def get(self, serial: str) -> dict | None:
+        with self._lock:
+            return self._data.get(serial)
+
+
+class SessionManager:
+    """Thread-safe in-memory session store."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sessions = {}
+
+    def create_session(self, username: str) -> str:
+        session_id = secrets.token_urlsafe(32)
+        with self._lock:
+            self._sessions[session_id] = {
+                'username': username,
+                'created': time.time()
+            }
+        return session_id
+
+    def get_username(self, session_id: str) -> str | None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return None
+            if time.time() - session['created'] > 86400:  # 24 hour expiry
+                del self._sessions[session_id]
+                return None
+            return session['username']
+
+
 class VaultPKIClient:
     """Vault PKI client for CSR signing, CA cert retrieval, listing, and revocation."""
 
     def __init__(self, vault_url: str, vault_token: str,
-                 pki_mount: str = 'pki', pki_role: str = 'holodeck',
-                 cert_ttl: str = '17520h', skip_verify: bool = True):
+                 pki_mount: str = 'pki', default_pki_role: str = 'holodeck',
+                 cert_ttl: str = '17520h', skip_verify: bool = True,
+                 role_mapping: dict = None):
         self.vault_url = vault_url.rstrip('/')
         self.vault_token = vault_token
         self.pki_mount = pki_mount
-        self.pki_role = pki_role
+        self.default_pki_role = default_pki_role
         self.cert_ttl = cert_ttl
         self.verify = not skip_verify
         self._cert_cache = None
         self._cert_cache_time = 0
+        self.role_mapping = role_mapping or {}
 
     def _headers(self):
         return {'X-Vault-Token': self.vault_token}
 
-    def sign_csr(self, csr_pem: str, common_name: str) -> str | None:
+    def _get_role_for_template(self, template_name: str) -> str:
+        """Resolve the Vault PKI role based on the requested AD CS template."""
+        if not template_name or template_name == 'Unknown':
+            return self.default_pki_role
+        # Try direct match
+        if template_name in self.role_mapping:
+            return self.role_mapping[template_name]
+        # Try case-insensitive match
+        template_lower = template_name.lower()
+        for k, v in self.role_mapping.items():
+            if k.lower() == template_lower:
+                return v
+        # Fallback
+        return self.default_pki_role
+
+    def sign_csr(self, csr_pem: str, common_name: str, template_name: str = None) -> str | None:
         """Sign a CSR and return the PEM certificate bundle (cert + CA chain).
 
         Uses the sign-verbatim endpoint to preserve the full CSR subject DN
         (O, OU, C, ST, L) which SDDC Manager validates during installation.
         """
-        url = f'{self.vault_url}/v1/{self.pki_mount}/sign-verbatim/{self.pki_role}'
+        role = self._get_role_for_template(template_name)
+        url = f'{self.vault_url}/v1/{self.pki_mount}/sign-verbatim/{role}'
         payload = {
             'csr': csr_pem,
             'format': 'pem_bundle',
@@ -130,9 +199,10 @@ class VaultPKIClient:
             logger.error('Vault sign error: %s', e)
             return None
 
-    def issue_certificate(self, common_name: str) -> dict | None:
+    def issue_certificate(self, common_name: str, template_name: str = None) -> dict | None:
         """Issue a certificate via Vault (generates key + cert). Returns full Vault response data."""
-        url = f'{self.vault_url}/v1/{self.pki_mount}/issue/{self.pki_role}'
+        role = self._get_role_for_template(template_name)
+        url = f'{self.vault_url}/v1/{self.pki_mount}/issue/{role}'
         payload = {
             'common_name': common_name,
             'format': 'pem_bundle',
@@ -161,6 +231,20 @@ class VaultPKIClient:
             return None
         except Exception as e:
             logger.error('Vault CA cert error: %s', e)
+            return None
+
+    def get_crl(self, encoding: str = 'der') -> bytes | None:
+        """Retrieve the CRL from Vault in the specified format ('der' or 'pem')."""
+        url = f'{self.vault_url}/v1/{self.pki_mount}/crl/{encoding}'
+        try:
+            resp = requests.get(url, headers=self._headers(),
+                                timeout=10, verify=self.verify)
+            if resp.status_code == 200:
+                return resp.content
+            logger.error('Vault CRL fetch failed (%d): %s', resp.status_code, resp.text[:200])
+            return None
+        except Exception as e:
+            logger.error('Vault CRL fetch error: %s', e)
             return None
 
     def health_check(self) -> bool:
@@ -414,72 +498,72 @@ def build_pkcs7_from_pem(ca_pem: str) -> bytes:
 ADCS_CSS = """
 <style>
 :root {
-  --bg: #ffffff; --bg-alt: #f4fafa; --text: #333333; --text-muted: #555555;
-  --accent: #006060; --accent-light: #008080; --accent-hover: #009090; --accent-dark: #004040;
-  --banner-bg: linear-gradient(135deg, #006060, #008080);
-  --border: #cccccc; --border-light: #dddddd;
-  --input-bg: #ffffff; --input-border: #aaaaaa;
-  --dl-bg: #f0f0f0; --dl-hover: #e0f0f0;
-  --table-hover: #e0f0f0; --table-stripe: #f4fafa;
-  --th-bg: #006060; --th-text: #ffffff; --th-hover: #005050;
-  --status-ok: #27ae60; --status-err: #c0392b; --status-err-hover: #e74c3c;
-  --revoked-text: #999999;
+  --bg: #fcfdfd; --bg-alt: #f4f6f8; --text: #1b2b32; --text-muted: #57707a;
+  --accent: #0079b8; --accent-light: #48a0d9; --accent-hover: #005a8c; --accent-dark: #003b5c;
+  --banner-bg: #002538;
+  --border: #cccccc; --border-light: #e0e0e0;
+  --input-bg: #ffffff; --input-border: #9baeb8;
+  --dl-bg: #eeeeee; --dl-hover: #e1e1e1;
+  --table-hover: #e8f3fa; --table-stripe: #f4f6f8;
+  --th-bg: #002538; --th-text: #ffffff; --th-hover: #003b5c;
+  --status-ok: #2f8400; --status-err: #c92100; --status-err-hover: #a11a00;
+  --revoked-text: #738f9c;
   --spinner-border: #cccccc;
 }
 [data-theme="dark"] {
-  --bg: #1a1a2e; --bg-alt: #16213e; --text: #e0e0e0; --text-muted: #a0a0b0;
-  --accent: #20b2aa; --accent-light: #3cc8c0; --accent-hover: #5de0d8; --accent-dark: #177a74;
-  --banner-bg: linear-gradient(135deg, #0f3460, #16213e);
-  --border: #334155; --border-light: #2a3a50;
-  --input-bg: #1e2d45; --input-border: #3a5068;
-  --dl-bg: #1e2d45; --dl-hover: #264060;
-  --table-hover: #1e3a5f; --table-stripe: #16213e;
-  --th-bg: #0f3460; --th-text: #e0e0e0; --th-hover: #1a4a7a;
-  --status-ok: #2ecc71; --status-err: #e74c3c; --status-err-hover: #ff6b6b;
-  --revoked-text: #666680;
-  --spinner-border: #334155;
+  --bg: #1b2b32; --bg-alt: #17242b; --text: #f1f6f8; --text-muted: #9baeb8;
+  --accent: #2eabff; --accent-light: #73c8ff; --accent-hover: #008fee; --accent-dark: #006bb3;
+  --banner-bg: #111d24;
+  --border: #3b5360; --border-light: #2c404b;
+  --input-bg: #111d24; --input-border: #57707a;
+  --dl-bg: #22343c; --dl-hover: #2c404b;
+  --table-hover: #22343c; --table-stripe: #17242b;
+  --th-bg: #111d24; --th-text: #f1f6f8; --th-hover: #17242b;
+  --status-ok: #60b515; --status-err: #e82c00; --status-err-hover: #ff4a21;
+  --revoked-text: #57707a;
+  --spinner-border: #3b5360;
 }
-body { font-family: Verdana, Arial, sans-serif; margin: 0; padding: 0; font-size: 13px; color: var(--text); background: var(--bg); transition: background .2s, color .2s; }
-.banner { background: var(--banner-bg); color: #fff; padding: 6px 16px; font-size: 13px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-.banner a { color: #fff; text-decoration: none; font-size: 12px; }
-.banner-right { display: flex; align-items: center; gap: 10px; }
-.theme-toggle { background: none; border: 1px solid rgba(255,255,255,.3); border-radius: 4px; padding: 3px 6px; cursor: pointer; color: #fff; font-size: 15px; line-height: 1; display: flex; align-items: center; }
-.theme-toggle:hover { background: rgba(255,255,255,.15); border-color: rgba(255,255,255,.5); }
-.content { padding: 20px 30px; max-width: 960px; }
-h2 { color: var(--text); font-size: 15px; margin-top: 0; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+body { font-family: 'Metropolis', 'Avenir Next', 'Helvetica Neue', Arial, sans-serif; margin: 0; padding: 0; font-size: 14px; color: var(--text); background: var(--bg); transition: background .2s, color .2s; }
+.banner { background: var(--banner-bg); color: #fff; padding: 10px 24px; font-size: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.banner a { color: #fff; text-decoration: none; font-size: 13px; }
+.banner-right { display: flex; align-items: center; gap: 16px; }
+.theme-toggle { background: none; border: none; cursor: pointer; color: #fff; font-size: 14px; line-height: 1; display: flex; align-items: center; padding: 4px 8px; border-radius: 4px; }
+.theme-toggle:hover { background: rgba(255,255,255,.1); }
+.content { padding: 24px 30px; max-width: 960px; }
+h2 { color: var(--text); font-size: 18px; margin-top: 0; font-weight: 400; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
 a { color: var(--accent); }
 a:hover { color: var(--accent-hover); }
-hr { border: none; border-top: 2px solid var(--accent-light); margin: 16px 0; }
-.task-list { margin: 10px 0 10px 20px; }
-.task-list li { margin: 6px 0; }
-input[type=submit], button { background: var(--accent); color: #fff; border: 1px solid var(--accent-dark); padding: 6px 18px; cursor: pointer; font-size: 13px; border-radius: 2px; }
-input[type=submit]:hover, button:hover { background: var(--accent-light); }
-select, textarea, input[type=text], input[type=number] { border: 1px solid var(--input-border); padding: 4px 6px; font-family: Consolas, monospace; font-size: 12px; background: var(--input-bg); color: var(--text); }
-select { font-family: Verdana, Arial, sans-serif; }
-table.form-table td { padding: 4px 8px; vertical-align: top; }
-table.form-table td:first-child { font-weight: bold; white-space: nowrap; text-align: right; }
-.cert-table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; table-layout: auto; }
-.cert-table th { background: var(--th-bg); color: var(--th-text); padding: 8px 10px; text-align: left; position: sticky; top: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cert-table td { padding: 6px 10px; border-bottom: 1px solid var(--border-light); overflow: hidden; text-overflow: ellipsis; }
-.cert-table th.date-col, .cert-table td.date-col { width: 80px; min-width: 80px; max-width: 90px; white-space: normal; }
+hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+.task-list { margin: 12px 0 12px 24px; padding-left: 0; }
+.task-list li { margin: 8px 0; }
+input[type=submit], button.btn-primary { background: var(--accent); color: #fff; border: 1px solid var(--accent-dark); padding: 8px 24px; cursor: pointer; font-size: 14px; border-radius: 4px; font-weight: 500; }
+input[type=submit]:hover, button.btn-primary:hover { background: var(--accent-hover); }
+select, textarea, input[type=text], input[type=number] { border: 1px solid var(--input-border); padding: 6px 10px; font-family: Consolas, monospace; font-size: 13px; background: var(--input-bg); color: var(--text); border-radius: 4px; }
+select { font-family: 'Metropolis', 'Avenir Next', 'Helvetica Neue', Arial, sans-serif; }
+table.form-table td { padding: 6px 10px; vertical-align: top; }
+table.form-table td:first-child { font-weight: 500; white-space: nowrap; text-align: right; }
+.cert-table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 13px; table-layout: auto; }
+.cert-table th { background: var(--th-bg); color: var(--th-text); padding: 10px 12px; text-align: left; position: sticky; top: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.cert-table td { padding: 8px 12px; border-bottom: 1px solid var(--border-light); overflow: hidden; text-overflow: ellipsis; }
+.cert-table th.date-col, .cert-table td.date-col { width: 90px; min-width: 90px; max-width: 100px; white-space: normal; }
 .cert-table tr:nth-child(even) { background: var(--table-stripe); }
 .cert-table tr:hover { background: var(--table-hover); }
 .cert-table tr.revoked td { color: var(--revoked-text); text-decoration: line-through; }
 .cert-table input[type=checkbox] { transform: scale(1.2); }
-.san-list { font-size: 11px; color: var(--text-muted); }
-.btn-revoke { background: var(--status-err); border-color: #922b21; margin-top: 10px; }
+.san-list { font-size: 12px; color: var(--text-muted); }
+.btn-revoke { background: var(--status-err); color: #fff; border: 1px solid var(--status-err-hover); margin-top: 12px; padding: 8px 24px; cursor: pointer; font-size: 14px; border-radius: 4px; font-weight: 500; }
 .btn-revoke:hover { background: var(--status-err-hover); }
-.section { margin-top: 24px; }
-.section h3 { color: var(--accent); font-size: 14px; margin-bottom: 8px; }
-.dl-links a { display: inline-block; margin: 4px 12px 4px 0; padding: 5px 12px; background: var(--dl-bg); border: 1px solid var(--border); border-radius: 3px; text-decoration: none; color: var(--text); font-size: 12px; }
+.section { margin-top: 32px; }
+.section h3 { color: var(--accent); font-size: 16px; font-weight: 500; margin-bottom: 12px; }
+.dl-links a { display: inline-block; margin: 4px 12px 4px 0; padding: 6px 16px; background: var(--dl-bg); border: 1px solid var(--border); border-radius: 4px; text-decoration: none; color: var(--text); font-size: 13px; font-weight: 500; }
 .dl-links a:hover { background: var(--dl-hover); border-color: var(--accent-light); }
 .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--spinner-border); border-top-color: var(--accent); border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: 6px; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.msg-ok { color: var(--status-ok); font-weight: bold; }
-.msg-err { color: var(--status-err); font-weight: bold; }
+.msg-ok { color: var(--status-ok); font-weight: 600; }
+.msg-err { color: var(--status-err); font-weight: 600; }
 </style>
 <script>
-(function(){var t=localStorage.getItem('msadcs-theme');if(t==='dark')document.documentElement.setAttribute('data-theme','dark');})();
+(function(){var t=localStorage.getItem('clarity-theme');if(t==='dark')document.documentElement.setAttribute('data-theme','dark');})();
 </script>
 """
 
@@ -489,9 +573,12 @@ def page_wrap(title: str, body: str, wide: bool = False) -> str:
 <html><head><meta charset="utf-8"><title>{title}</title>{ADCS_CSS}</head>
 <body>
 <div class="banner">
-<span>MSADCS Proxy &mdash; Vault-PKI-CA</span>
+<span>VCF CA Proxy &mdash; Vault-PKI-CA</span>
 <span class="banner-right">
-<button class="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark mode" id="theme-btn">&#9790;</button>
+<button class="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark mode" id="theme-btn">
+<svg id="theme-icon" viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="width:16px;height:16px;fill:currentColor;vertical-align:middle;margin-right:6px;"><path d="M18.11 32.0003C10.33 32.0003 4 25.7203 4 17.9903C4 10.2603 10.03 4.2003 17.73 4.0003C18.15 3.9903 18.52 4.2303 18.68 4.6103C18.84 4.9903 18.75 5.4303 18.46 5.7203C16.69 7.4503 15.71 9.7603 15.71 12.2103C15.71 17.2403 19.83 21.3303 24.91 21.3303C26.9 21.3303 28.8 20.7003 30.41 19.5103C30.74 19.2703 31.19 19.2503 31.53 19.4603C31.88 19.6803 32.06 20.0803 31.99 20.4903C30.78 27.1603 24.94 32.0003 18.11 32.0003ZM15.43 6.2903C9.99 7.4803 6 12.2403 6 17.9903C6 24.6103 11.43 30.0003 18.11 30.0003C23.16 30.0003 27.58 26.9203 29.37 22.4003C27.97 23.0103 26.46 23.3203 24.91 23.3203C18.74 23.3203 13.71 18.3303 13.71 12.2003C13.71 10.0703 14.31 8.0303 15.43 6.2803V6.2903Z"></path></svg>
+<span id="theme-text">Dark</span>
+</button>
 <a href="/certsrv/">Home</a>
 </span>
 </div>
@@ -499,8 +586,32 @@ def page_wrap(title: str, body: str, wide: bool = False) -> str:
 {body}
 </div>
 <script>
-function toggleTheme(){{var d=document.documentElement,b=document.getElementById('theme-btn');if(d.getAttribute('data-theme')==='dark'){{d.removeAttribute('data-theme');localStorage.setItem('msadcs-theme','light');b.innerHTML='&#9790;';}}else{{d.setAttribute('data-theme','dark');localStorage.setItem('msadcs-theme','dark');b.innerHTML='&#9788;';}}}}
-(function(){{var b=document.getElementById('theme-btn');if(document.documentElement.getAttribute('data-theme')==='dark')b.innerHTML='&#9788;';}})();
+var pathMoon = "M18.11 32.0003C10.33 32.0003 4 25.7203 4 17.9903C4 10.2603 10.03 4.2003 17.73 4.0003C18.15 3.9903 18.52 4.2303 18.68 4.6103C18.84 4.9903 18.75 5.4303 18.46 5.7203C16.69 7.4503 15.71 9.7603 15.71 12.2103C15.71 17.2403 19.83 21.3303 24.91 21.3303C26.9 21.3303 28.8 20.7003 30.41 19.5103C30.74 19.2703 31.19 19.2503 31.53 19.4603C31.88 19.6803 32.06 20.0803 31.99 20.4903C30.78 27.1603 24.94 32.0003 18.11 32.0003ZM15.43 6.2903C9.99 7.4803 6 12.2403 6 17.9903C6 24.6103 11.43 30.0003 18.11 30.0003C23.16 30.0003 27.58 26.9203 29.37 22.4003C27.97 23.0103 26.46 23.3203 24.91 23.3203C18.74 23.3203 13.71 18.3303 13.71 12.2003C13.71 10.0703 14.31 8.0303 15.43 6.2803V6.2903Z";
+var pathSun = "M8.81 10.22C9.01 10.42 9.26 10.51 9.52 10.51C9.78 10.51 10.03 10.41 10.23 10.22C10.62 9.83 10.62 9.2 10.23 8.81L8.11 6.69C7.72 6.3 7.09 6.3 6.7 6.69C6.31 7.08 6.31 7.71 6.7 8.1L8.82 10.22H8.81ZM7 18C7 17.45 6.55 17 6 17H3C2.45 17 2 17.45 2 18C2 18.55 2.45 19 3 19H6C6.55 19 7 18.55 7 18ZM18 7C18.55 7 19 6.55 19 6V3C19 2.45 18.55 2 18 2C17.45 2 17 2.45 17 3V6C17 6.55 17.45 7 18 7ZM26.49 10.51C26.75 10.51 27 10.41 27.2 10.22L29.32 8.1C29.71 7.71 29.71 7.08 29.32 6.69C28.93 6.3 28.3 6.3 27.91 6.69L25.79 8.81C25.4 9.2 25.4 9.83 25.79 10.22C25.99 10.42 26.24 10.51 26.5 10.51H26.49ZM8.81 25.78L6.69 27.9C6.3 28.29 6.3 28.92 6.69 29.31C6.89 29.51 7.14 29.6 7.4 29.6C7.66 29.6 7.91 29.5 8.11 29.31L10.23 27.19C10.62 26.8 10.62 26.17 10.23 25.78C9.84 25.39 9.21 25.39 8.82 25.78H8.81ZM33 17H30C29.45 17 29 17.45 29 18C29 18.55 29.45 19 30 19H33C33.55 19 34 18.55 34 18C34 17.45 33.55 17 33 17ZM18 9C13.04 9 9 13.04 9 18C9 22.96 13.04 27 18 27C22.96 27 27 22.96 27 18C27 13.04 22.96 9 18 9ZM18 25C14.14 25 11 21.86 11 18C11 14.14 14.14 11 18 11C21.86 11 25 14.14 25 18C25 21.86 21.86 25 18 25ZM27.19 25.78C26.8 25.39 26.17 25.39 25.78 25.78C25.39 26.17 25.39 26.8 25.78 27.19L27.9 29.31C28.1 29.51 28.35 29.6 28.61 29.6C28.87 29.6 29.12 29.5 29.32 29.31C29.71 28.92 29.71 28.29 29.32 27.9L27.2 25.78H27.19ZM18 29C17.45 29 17 29.45 17 30V33C17 33.55 17.45 34 18 34C18.55 34 19 33.55 19 33V30C19 29.45 18.55 29 18 29Z";
+function toggleTheme(){{
+  var d=document.documentElement, i=document.getElementById('theme-icon'), t=document.getElementById('theme-text');
+  if(d.getAttribute('data-theme')==='dark'){{
+    d.removeAttribute('data-theme');
+    localStorage.setItem('clarity-theme','light');
+    i.innerHTML='<path d="' + pathMoon + '"></path>';
+    t.innerText='Dark';
+  }}else{{
+    d.setAttribute('data-theme','dark');
+    localStorage.setItem('clarity-theme','dark');
+    i.innerHTML='<path d="' + pathSun + '"></path>';
+    t.innerText='Light';
+  }}
+}}
+(function(){{
+  var i=document.getElementById('theme-icon'), t=document.getElementById('theme-text');
+  if(document.documentElement.getAttribute('data-theme')==='dark'){{
+    i.innerHTML='<path d="' + pathSun + '"></path>';
+    t.innerText='Light';
+  }} else {{
+    i.innerHTML='<path d="' + pathMoon + '"></path>';
+    t.innerText='Dark';
+  }}
+}})();
 </script>
 </body></html>"""
 
@@ -509,7 +620,7 @@ function toggleTheme(){{var d=document.documentElement,b=document.getElementById
 # HTML page templates
 # ---------------------------------------------------------------------------
 
-CERTSRV_HOME_HTML = page_wrap('MSADCS Proxy', """
+CERTSRV_HOME_HTML = page_wrap('VCF CA Proxy', """
 <h2>Welcome</h2>
 <p>Use this Web site to request a certificate for your Web browser, e-mail client, or other program.
 By using a certificate, you can verify your identity to people you communicate with over the Web,
@@ -519,13 +630,14 @@ or certificate revocation list (CRL), or to view the status of a pending request
 <p><b>Select a task:</b></p>
 <ul class="task-list">
 <li><a href="/certsrv/certrqus.asp">Request a certificate</a></li>
+<li><a href="/certsrv/certgen.asp">CSR Generator (New Certificate)</a></li>
 <li><a href="/certsrv/certckpn.asp">View the status of a pending certificate request</a></li>
 <li><a href="/certsrv/certcarc.asp">Download a CA certificate, certificate chain, or CRL</a></li>
 </ul>
 <hr>
 """)
 
-CERTRQUS_HTML = page_wrap('MSADCS Proxy - Request a Certificate', """
+CERTRQUS_HTML = page_wrap('VCF CA Proxy - Request a Certificate', """
 <h2>Request a Certificate</h2>
 <p>Select the certificate type:</p>
 <ul class="task-list">
@@ -540,7 +652,7 @@ CERTRQUS_HTML = page_wrap('MSADCS Proxy - Request a Certificate', """
 <hr>
 """)
 
-CERTRQAD_HTML = page_wrap('MSADCS Proxy - Advanced Certificate Request', """
+CERTRQAD_HTML = page_wrap('VCF CA Proxy - Advanced Certificate Request', """
 <h2>Advanced Certificate Request</h2>
 <p>The policy of the CA determines the types of certificates you can request.
 Click one of the following options to:</p>
@@ -552,7 +664,7 @@ or submit a renewal request by using a base-64-encoded PKCS #7 file.</a></li>
 <hr>
 """)
 
-CERTCKPN_HTML = page_wrap('MSADCS Proxy - Pending Request Status', """
+CERTCKPN_HTML = page_wrap('VCF CA Proxy - Pending Request Status', """
 <h2>View the Status of a Pending Certificate Request</h2>
 <p>All certificate requests issued by this CA are processed immediately.
 There are no pending requests.</p>
@@ -562,7 +674,7 @@ There are no pending requests.</p>
 """)
 
 def build_certfnsh_success(req_id: int) -> str:
-    return page_wrap('MSADCS Proxy - Certificate Issued', f"""
+    return page_wrap('VCF CA Proxy - Certificate Issued', f"""
 <h2>Certificate Issued</h2>
 <p>The certificate you requested was issued to you.</p>
 <p><a href="certnew.cer?ReqID={req_id}&amp;Enc=b64"><b>Install this certificate</b></a></p>
@@ -576,7 +688,7 @@ def build_certfnsh_success(req_id: int) -> str:
 <p><a href="/certsrv/">&laquo; Back to home</a></p>
 """)
 
-CERTFNSH_DENIED_TEMPLATE = page_wrap('MSADCS Proxy - Certificate Request Denied', """
+CERTFNSH_DENIED_TEMPLATE = page_wrap('VCF CA Proxy - Certificate Request Denied', """
 <h2>Certificate Request Denied</h2>
 <p>Your certificate request was denied.</p>
 <p>The disposition message is: <b>{{ERROR}}</b></p>
@@ -585,7 +697,7 @@ CERTFNSH_DENIED_TEMPLATE = page_wrap('MSADCS Proxy - Certificate Request Denied'
 """)
 
 def build_certrqma(template_options: str) -> str:
-    return page_wrap('MSADCS Proxy - Advanced Certificate Request', f"""
+    return page_wrap('VCF CA Proxy - Advanced Certificate Request', f"""
 <h2>Advanced Certificate Request</h2>
 <form method="POST" action="certfnsh.asp" name="SubmitForm">
 <table class="form-table">
@@ -614,7 +726,7 @@ def build_certrqma(template_options: str) -> str:
 
 def build_certrqxt(template_options: str) -> str:
     """The paste-CSR page. Also used by SDDC Manager for template scraping."""
-    return page_wrap('MSADCS Proxy - Submit a Certificate Request or Renewal Request', f"""
+    return page_wrap('VCF CA Proxy - Submit a Certificate Request or Renewal Request', f"""
 <h2>Submit a Certificate Request or Renewal Request</h2>
 <p>To submit a saved request to the CA, paste a base-64-encoded CMC or PKCS #10
 certificate request or PKCS #7 renewal request in the box below.</p>
@@ -637,10 +749,43 @@ certificate request or PKCS #7 renewal request in the box below.</p>
 </form>
 """)
 
+def build_certgen(template_options: str) -> str:
+    return page_wrap('VCF CA Proxy - CSR Generator', f"""
+<h2>CSR Generator</h2>
+<p>Complete this form to generate a new CSR and private key, and automatically issue a certificate.</p>
+<form method="POST" action="certgen_process.asp" name="SubmitForm">
+<table class="form-table">
+<tr><td>Certificate Template:</td><td>
+<select name="lbCertTemplateID" id="lbCertTemplateID" style="width:260px">
+{template_options}
+</select>
+</td></tr>
+<tr><td colspan="2"><hr></td></tr>
+<tr><td>Country (C):</td><td><input type="text" name="Country" value="US" style="width:60px" /></td></tr>
+<tr><td>State (ST):</td><td><input type="text" name="State" value="California" style="width:260px" /></td></tr>
+<tr><td>Locality (L):</td><td><input type="text" name="Locality" value="Palo Alto" style="width:260px" /></td></tr>
+<tr><td>Organization (O):</td><td><input type="text" name="Organization" value="VMware" style="width:260px" /></td></tr>
+<tr><td>Organizational Unit (OU):</td><td><input type="text" name="OrganizationalUnit" value="Cloud Foundation" style="width:260px" /></td></tr>
+<tr><td>Common Name (CN):</td><td><input type="text" name="CommonName" value="" placeholder="app.vcf.lab" style="width:260px" required /></td></tr>
+<tr><td>Subject Alternative Names (SANs):</td><td><textarea name="SANs" rows="3" cols="60" placeholder="DNS:app.vcf.lab&#10;IP:192.168.1.10"></textarea><br><span style="font-size:11px;color:var(--text-muted)">One per line, e.g., DNS:name or IP:1.2.3.4</span></td></tr>
+<tr><td colspan="2"><hr></td></tr>
+<tr><td>Key Size:</td><td>
+<select name="KeySize" style="width:100px">
+<option value="2048" selected>2048</option>
+<option value="4096">4096</option>
+</select>
+</td></tr>
+</table>
+<br>
+<input type="submit" value="Generate &amp; Issue &gt;" />
+</form>
+""")
+
+
 CERTCARC_COMPAT_BLOCK = '<script language="VBScript">\nvar nRenewals=0;\n</script>\n'
 
 def build_certcarc() -> str:
-    return page_wrap('MSADCS Proxy - CA Certificate and Certificate Management', """
+    return page_wrap('VCF CA Proxy - CA Certificate and Certificate Management', """
 <h2>Download a CA Certificate, Certificate Chain, or CRL</h2>
 """ + CERTCARC_COMPAT_BLOCK + """
 <div class="section">
@@ -649,6 +794,8 @@ def build_certcarc() -> str:
 <a href="certnew.cer?ReqID=CACert&amp;Enc=b64">Download CA certificate (PEM)</a>
 <a href="certnew.cer?ReqID=CACert&amp;Enc=bin">Download CA certificate (DER)</a>
 <a href="certnew.p7b?ReqID=CACert&amp;Renewal=0&amp;Enc=bin">Download certificate chain (PKCS#7)</a>
+<a href="certnew.crl?ReqID=CACert&amp;Enc=b64">Download Base CRL (PEM)</a>
+<a href="certnew.crl?ReqID=CACert&amp;Enc=bin">Download Base CRL (DER)</a>
 </div>
 </div>
 
@@ -749,6 +896,8 @@ function dlLinks(c) {
         + '<a href="/certsrv/api/cert/' + s + '?fmt=pem" title="Download PEM">PEM</a>'
         + '<a href="/certsrv/api/cert/' + s + '?fmt=der" title="Download DER">DER</a>'
         + '<a href="/certsrv/api/cert/' + s + '?fmt=p7b" title="Download PKCS#7">P7B</a>'
+        + '<a href="/certsrv/api/cert/' + s + '?fmt=csr" title="Download CSR">CSR</a>'
+        + '<a href="/certsrv/api/cert/' + s + '?fmt=key" title="Download Private Key">KEY</a>'
         + '</span>';
 }
 
@@ -915,17 +1064,11 @@ loadCerts();
 """, wide=True)
 
 
-KNOWN_TEMPLATES = [
-    ('1.3.6.1.4.1.311.21.8.1;WebServer', 'Web Server'),
-    ('1.3.6.1.4.1.311.21.8.2;VCFWebServer', 'VCF Web Server'),
-    ('1.3.6.1.4.1.311.21.8.3;VMwareWebServer', 'VMware Web Server'),
-    ('1.3.6.1.4.1.311.21.8.4;Machine', 'Machine'),
-    ('1.3.6.1.4.1.311.21.8.5;SubCA', 'Subordinate CA'),
-]
 
 
-def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
-                 auth_password: str):
+def make_handler(vault_client: VaultPKIClient, cert_store: CertStore, key_store: KeyStore,
+                 auth_password: str, session_manager: SessionManager,
+                 oidc_config: dict = None):
     """Create a request handler class with the given configuration."""
 
     class CertsrvHandler(BaseHTTPRequestHandler):
@@ -933,31 +1076,68 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
         def log_message(self, format, *args):
             logger.info('%s %s', self.address_string(), format % args)
 
+        def _get_session_id(self) -> str | None:
+            cookie_header = self.headers.get('Cookie', '')
+            for cookie in cookie_header.split(';'):
+                cookie = cookie.strip()
+                if cookie.startswith('certsrv_session='):
+                    return cookie[len('certsrv_session='):]
+            return None
+
         def _get_auth_username(self) -> str | None:
-            """Extract username from Basic Auth header."""
+            """Extract username from Basic Auth header or session cookie."""
             auth_header = self.headers.get('Authorization', '')
-            if not auth_header.startswith('Basic '):
-                return None
-            try:
-                decoded = base64.b64decode(auth_header[6:]).decode('utf-8')
-                username, _ = decoded.split(':', 1)
-                return username
-            except Exception:
-                return None
+            if auth_header.startswith('Basic '):
+                try:
+                    decoded = base64.b64decode(auth_header[6:]).decode('utf-8')
+                    username, _ = decoded.split(':', 1)
+                    return username
+                except Exception:
+                    pass
+            
+            session_id = self._get_session_id()
+            if session_id:
+                return session_manager.get_username(session_id)
+                
+            return None
 
         def _check_auth(self) -> bool:
-            """Validate Basic Auth credentials. Accept any username, check password."""
+            """Validate Basic Auth credentials or valid session."""
+            # 1. Basic Auth check
             auth_header = self.headers.get('Authorization', '')
-            if not auth_header.startswith('Basic '):
-                return False
-            try:
-                decoded = base64.b64decode(auth_header[6:]).decode('utf-8')
-                _, password = decoded.split(':', 1)
-                return password == auth_password
-            except Exception:
-                return False
+            if auth_header.startswith('Basic '):
+                try:
+                    decoded = base64.b64decode(auth_header[6:]).decode('utf-8')
+                    _, password = decoded.split(':', 1)
+                    if password == auth_password:
+                        return True
+                except Exception:
+                    pass
+            
+            # 2. Session cookie check
+            if session_manager.get_username(self._get_session_id()):
+                return True
+                
+            return False
 
         def _send_auth_required(self):
+            if oidc_config:
+                import urllib.parse
+                state = secrets.token_urlsafe(16)
+                params = {
+                    'client_id': oidc_config['client_id'],
+                    'response_type': 'code',
+                    'scope': 'openid profile email',
+                    'redirect_uri': oidc_config['redirect_uri'],
+                    'state': state
+                }
+                url = f"{oidc_config['auth_endpoint']}?{urllib.parse.urlencode(params)}"
+                self.send_response(302)
+                self.send_header('Location', url)
+                self.send_header('Set-Cookie', f'certsrv_oidc_state={state}; HttpOnly; Path=/')
+                self.end_headers()
+                return
+
             self.send_response(401)
             self.send_header('WWW-Authenticate', 'Basic realm="CertSrv"')
             self.send_header('Content-Type', 'text/html')
@@ -988,10 +1168,24 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
             self.wfile.write(cert_data)
 
         def _template_options(self) -> str:
-            return '\n'.join(
-                f'<Option Value="{val}">{label}</Option>'
-                for val, label in KNOWN_TEMPLATES
-            )
+            if not vault_client.role_mapping:
+                known_templates = [
+                    ('1.3.6.1.4.1.311.21.8.1;WebServer', 'Web Server'),
+                    ('1.3.6.1.4.1.311.21.8.2;VCFWebServer', 'VCF Web Server'),
+                    ('1.3.6.1.4.1.311.21.8.3;VMwareWebServer', 'VMware Web Server'),
+                    ('1.3.6.1.4.1.311.21.8.4;Machine', 'Machine'),
+                    ('1.3.6.1.4.1.311.21.8.5;SubCA', 'Subordinate CA'),
+                ]
+                return '\n'.join(
+                    f'<Option Value="{val}">{label}</Option>'
+                    for val, label in known_templates
+                )
+            
+            options = []
+            for idx, template_name in enumerate(vault_client.role_mapping.keys(), start=1):
+                val = f'1.3.6.1.4.1.311.21.8.{idx};{template_name}'
+                options.append(f'<Option Value="{val}">{template_name}</Option>')
+            return '\n'.join(options)
 
         def _send_redirect(self, location: str):
             self.send_response(301)
@@ -1016,6 +1210,9 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
             elif path == '/certsrv/certrqad.asp':
                 self._send_html(200, CERTRQAD_HTML)
 
+            elif path == '/certsrv/certgen.asp':
+                self._send_html(200, build_certgen(self._template_options()))
+
             elif path == '/certsrv/certrqma.asp':
                 self._send_html(200, build_certrqma(self._template_options()))
 
@@ -1034,12 +1231,18 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
             elif path == '/certsrv/certnew.p7b':
                 self._handle_certnew_p7b(params)
 
+            elif path == '/certsrv/certnew.crl':
+                self._handle_certnew_crl(params)
+
             elif path == '/certsrv/api/certs':
                 self._handle_api_certs()
 
             elif path.startswith('/certsrv/api/cert/'):
                 serial = path[len('/certsrv/api/cert/'):]
                 self._handle_api_cert_download(serial, params)
+
+            elif path == '/certsrv/oidc/callback':
+                self._handle_oidc_callback(params)
 
             else:
                 self._send_html(404, page_wrap('Not Found', '<h2>Not Found</h2><p>The requested page does not exist.</p>'))
@@ -1054,6 +1257,8 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
 
             if path == '/certsrv/certfnsh.asp':
                 self._handle_certfnsh()
+            elif path == '/certsrv/certgen_process.asp':
+                self._handle_certgen_process()
             elif path == '/certsrv/api/revoke':
                 self._handle_api_revoke()
             else:
@@ -1063,6 +1268,106 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
             """Send the certificate-denied page with the given error message."""
             html = CERTFNSH_DENIED_TEMPLATE.replace('{{ERROR}}', error_msg)
             self._send_html(200, html)
+
+        def _handle_certgen_process(self):
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else ''
+            form_data = parse_qs(body, keep_blank_values=True)
+            
+            try:
+                country = form_data.get('Country', [''])[0].strip()
+                state = form_data.get('State', [''])[0].strip()
+                locality = form_data.get('Locality', [''])[0].strip()
+                org = form_data.get('Organization', [''])[0].strip()
+                ou = form_data.get('OrganizationalUnit', [''])[0].strip()
+                cn = form_data.get('CommonName', [''])[0].strip()
+                sans_raw = form_data.get('SANs', [''])[0].strip()
+                key_size = int(form_data.get('KeySize', ['2048'])[0])
+                
+                lb_template = form_data.get('lbCertTemplateID', [''])[0]
+                template = 'Unknown'
+                if lb_template:
+                    if ';' in lb_template:
+                        template = lb_template.split(';', 1)[1]
+                    else:
+                        template = lb_template
+                        
+                if not cn:
+                    self._send_denied('Common Name is required')
+                    return
+
+                x509_sans = []
+                for line in sans_raw.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.upper().startswith('DNS:'):
+                        x509_sans.append(x509.DNSName(line[4:].strip()))
+                    elif line.upper().startswith('IP:'):
+                        import ipaddress
+                        x509_sans.append(x509.IPAddress(ipaddress.ip_address(line[3:].strip())))
+
+                private_key = rsa.generate_private_key(
+                    public_exponent=65537,
+                    key_size=key_size,
+                )
+                key_pem = private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption()
+                ).decode('utf-8')
+
+                subject_attrs = []
+                if country: subject_attrs.append(x509.NameAttribute(x509.oid.NameOID.COUNTRY_NAME, country))
+                if state: subject_attrs.append(x509.NameAttribute(x509.oid.NameOID.STATE_OR_PROVINCE_NAME, state))
+                if locality: subject_attrs.append(x509.NameAttribute(x509.oid.NameOID.LOCALITY_NAME, locality))
+                if org: subject_attrs.append(x509.NameAttribute(x509.oid.NameOID.ORGANIZATION_NAME, org))
+                if ou: subject_attrs.append(x509.NameAttribute(x509.oid.NameOID.ORGANIZATIONAL_UNIT_NAME, ou))
+                subject_attrs.append(x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, cn))
+
+                builder = x509.CertificateSigningRequestBuilder().subject_name(
+                    x509.Name(subject_attrs)
+                )
+
+                if x509_sans:
+                    builder = builder.add_extension(
+                        x509.SubjectAlternativeName(x509_sans),
+                        critical=False,
+                    )
+
+                csr = builder.sign(private_key, hashes.SHA256())
+                csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode('utf-8')
+
+                logger.info('Generated CSR for CN=%s, Template=%s', cn, template)
+
+                cert_bundle = vault_client.sign_csr(csr_pem, cn, template_name=template)
+                if not cert_bundle:
+                    self._send_denied('The generated CSR could not be signed by the CA')
+                    return
+                
+                req_id = cert_store.store(cert_bundle)
+                
+                try:
+                    pem_blocks = re.findall(
+                        r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----',
+                        cert_bundle, re.DOTALL)
+                    if pem_blocks:
+                        cert_obj = x509.load_pem_x509_certificate(pem_blocks[0].encode())
+                        serial_int = cert_obj.serial_number
+                        serial_hex = format(serial_int, 'x')
+                        if len(serial_hex) % 2 != 0:
+                            serial_hex = '0' + serial_hex
+                        vault_serial = '-'.join(serial_hex[i:i+2] for i in range(0, len(serial_hex), 2))
+                        key_store.store(vault_serial, key_pem, csr_pem)
+                        logger.info('Stored keys for serial %s', vault_serial)
+                except Exception as e:
+                    logger.error('Failed to extract serial for key storage: %s', e)
+
+                self._send_html(200, build_certfnsh_success(req_id))
+
+            except Exception as e:
+                logger.error('Error generating CSR: %s', e)
+                self._send_denied(f'Error generating CSR: {e}')
 
         def _handle_certfnsh(self):
             """Process CSR submission or User Certificate auto-issue."""
@@ -1101,6 +1406,13 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
                 match = re.search(r'CertificateTemplate:(\S+)', cert_attrib)
                 if match:
                     template = match.group(1)
+            else:
+                lb_template = form_data.get('lbCertTemplateID', [''])[0]
+                if lb_template:
+                    if ';' in lb_template:
+                        template = lb_template.split(';', 1)[1]
+                    else:
+                        template = lb_template
 
             logger.info('Raw CSR length: %d, first 80 chars: %s',
                         len(csr_raw), repr(csr_raw[:80]))
@@ -1115,7 +1427,7 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
             cn = extract_cn_from_csr(csr_pem)
             logger.info('CSR received: CN=%s, Template=%s', cn or '(unknown)', template)
 
-            cert_bundle = vault_client.sign_csr(csr_pem, cn or 'unknown.vcf.lab')
+            cert_bundle = vault_client.sign_csr(csr_pem, cn or 'unknown.vcf.lab', template_name=template)
             if not cert_bundle:
                 self._send_denied('The certificate request could not be signed by the CA')
                 return
@@ -1230,6 +1542,19 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
             else:
                 self._send_cert(p7_der, 'application/x-pkcs7-certificates')
 
+        def _handle_certnew_crl(self, params: dict):
+            """Handle CRL retrieval."""
+            encoding = params.get('Enc', ['bin'])[0]
+            
+            vault_format = 'der' if encoding == 'bin' else 'pem'
+            crl_data = vault_client.get_crl(encoding=vault_format)
+            
+            if not crl_data:
+                self._send_html(500, page_wrap('Error', '<p>CRL unavailable.</p>'))
+                return
+                
+            self._send_cert(crl_data, 'application/pkix-crl')
+
         def _handle_api_certs(self):
             """JSON API: list all issued certificates."""
             certs = vault_client.list_certificates()
@@ -1271,6 +1596,18 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
                 self.send_header('Content-Length', str(len(p7_der)))
                 self.end_headers()
                 self.wfile.write(p7_der)
+            elif fmt in ('csr', 'key'):
+                keys = key_store.get(serial)
+                if not keys:
+                    self._send_json(404, {'error': f'{fmt.upper()} not available for this certificate. It may have been generated externally or the proxy was restarted.'})
+                    return
+                content = keys[fmt].encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/x-pem-file')
+                self.send_header('Content-Disposition', f'attachment; filename="{safe_name}.{fmt}"')
+                self.send_header('Content-Length', str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
             else:
                 pem_bytes = pem.encode('utf-8')
                 self.send_response(200)
@@ -1279,6 +1616,62 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
                 self.send_header('Content-Length', str(len(pem_bytes)))
                 self.end_headers()
                 self.wfile.write(pem_bytes)
+
+        def _handle_oidc_callback(self, params: dict):
+            """Handle OIDC authorization code exchange."""
+            if not oidc_config:
+                self._send_html(404, page_wrap('Not Found', '<h2>OIDC Not Configured</h2>'))
+                return
+
+            code = params.get('code', [''])[0]
+            state = params.get('state', [''])[0]
+            
+            cookie_state = None
+            cookie_header = self.headers.get('Cookie', '')
+            for cookie in cookie_header.split(';'):
+                cookie = cookie.strip()
+                if cookie.startswith('certsrv_oidc_state='):
+                    cookie_state = cookie[len('certsrv_oidc_state='):]
+
+            if not code or not state or state != cookie_state:
+                self._send_html(400, page_wrap('Error', '<h2>OIDC Error</h2><p>Invalid state or missing code.</p>'))
+                return
+
+            token_url = oidc_config['token_endpoint']
+            data = {
+                'grant_type': 'authorization_code',
+                'code': code,
+                'redirect_uri': oidc_config['redirect_uri'],
+                'client_id': oidc_config['client_id'],
+                'client_secret': oidc_config['client_secret']
+            }
+            try:
+                resp = requests.post(token_url, data=data, timeout=10, verify=oidc_config.get('verify_tls', True))
+                if resp.status_code == 200:
+                    token_data = resp.json()
+                    access_token = token_data.get('access_token')
+                    
+                    username = 'oidc_user'
+                    if 'userinfo_endpoint' in oidc_config:
+                        ui_resp = requests.get(oidc_config['userinfo_endpoint'], 
+                                               headers={'Authorization': f'Bearer {access_token}'}, 
+                                               timeout=10, verify=oidc_config.get('verify_tls', True))
+                        if ui_resp.status_code == 200:
+                            ui_data = ui_resp.json()
+                            username = ui_data.get('preferred_username') or ui_data.get('email') or ui_data.get('sub') or 'oidc_user'
+                    
+                    session_id = session_manager.create_session(username)
+                    self.send_response(302)
+                    self.send_header('Location', '/certsrv/')
+                    self.send_header('Set-Cookie', f'certsrv_session={session_id}; HttpOnly; Path=/')
+                    self.end_headers()
+                    return
+                else:
+                    self._send_html(400, page_wrap('Error', f'<h2>OIDC Error</h2><p>Failed to exchange code.</p>'))
+                    return
+            except Exception as e:
+                self._send_html(500, page_wrap('Error', f'<h2>OIDC Error</h2><p>{e}</p>'))
+                return
 
         def _handle_api_revoke(self):
             """JSON API: revoke certificates by serial number."""
@@ -1312,10 +1705,10 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='MSADCS Proxy (Production - Behind Traefik)',
+        description='VCF CA Proxy (Production - Behind Reverse Proxy)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-This version runs plain HTTP. TLS is terminated by Traefik.
+This version runs plain HTTP. TLS is terminated by Reverse Proxy.
 
 Examples:
   # Start with defaults (reads password from /root/creds.txt):
@@ -1330,28 +1723,38 @@ Examples:
     --password 'YOUR_PASSWORD_HERE'
         """
     )
-    parser.add_argument('--port', type=int, default=8900,
-                        help='HTTP listen port (default: 8900)')
-    parser.add_argument('--bind', default='0.0.0.0',
-                        help='Bind address (default: 0.0.0.0)')
-    parser.add_argument('--vault-url', default='http://127.0.0.1:32000',
-                        help='Vault API URL (default: http://127.0.0.1:32000)')
-    parser.add_argument('--vault-token', default=None,
-                        help='Vault token (default: read from --creds-file)')
-    parser.add_argument('--vault-mount', default='pki',
-                        help='Vault PKI mount path (default: pki)')
-    parser.add_argument('--vault-role', default='holodeck',
-                        help='Vault PKI role name (default: holodeck)')
-    parser.add_argument('--vault-skip-verify', action='store_true', default=True,
+    parser.add_argument('--port', type=int, default=int(os.environ.get('PROXY_PORT', 8900)),
+                        help='HTTP listen port (default: $PROXY_PORT or 8900)')
+    parser.add_argument('--bind', default=os.environ.get('PROXY_BIND', '0.0.0.0'),
+                        help='Bind address (default: $PROXY_BIND or 0.0.0.0)')
+    parser.add_argument('--vault-url', default=os.environ.get('VAULT_ADDR', 'http://127.0.0.1:32000'),
+                        help='Vault API URL (default: $VAULT_ADDR or http://127.0.0.1:32000)')
+    parser.add_argument('--vault-token', default=os.environ.get('VAULT_TOKEN'),
+                        help='Vault token (default: $VAULT_TOKEN or read from --creds-file)')
+    parser.add_argument('--vault-mount', default=os.environ.get('VAULT_PKI_MOUNT', 'pki'),
+                        help='Vault PKI mount path (default: $VAULT_PKI_MOUNT or pki)')
+    parser.add_argument('--vault-role', default=os.environ.get('VAULT_PKI_ROLE', 'holodeck'),
+                        help='Vault PKI role name (default: $VAULT_PKI_ROLE or holodeck)')
+    parser.add_argument('--vault-skip-verify', action='store_true', default=os.environ.get('VAULT_SKIP_VERIFY', 'true').lower() == 'true',
                         help='Skip TLS verification for Vault (default: true)')
-    parser.add_argument('--cert-ttl', default='17520h',
-                        help='Certificate TTL (default: 17520h / 2 years)')
-    parser.add_argument('--password', default=None,
-                        help='Auth password (default: read from --creds-file)')
-    parser.add_argument('--creds-file', default='/root/creds.txt',
-                        help='Path to credentials file (default: /root/creds.txt)')
-    parser.add_argument('--debug', action='store_true',
+    parser.add_argument('--cert-ttl', default=os.environ.get('CERT_TTL', '17520h'),
+                        help='Certificate TTL (default: $CERT_TTL or 17520h / 2 years)')
+    parser.add_argument('--password', default=os.environ.get('PROXY_PASSWORD'),
+                        help='Auth password (default: $PROXY_PASSWORD or read from --creds-file)')
+    parser.add_argument('--creds-file', default=os.environ.get('CREDS_FILE', '/root/creds.txt'),
+                        help='Path to credentials file (default: $CREDS_FILE or /root/creds.txt)')
+    parser.add_argument('--debug', action='store_true', default=os.environ.get('PROXY_DEBUG', 'false').lower() == 'true',
                         help='Enable debug logging')
+    parser.add_argument('--role-mapping', default=os.environ.get('ROLE_MAPPING'),
+                        help='Path to JSON file mapping AD CS template names to Vault PKI roles (default: $ROLE_MAPPING)')
+    parser.add_argument('--oidc-issuer', default=os.environ.get('OIDC_ISSUER'),
+                        help='OIDC issuer URL (default: $OIDC_ISSUER)')
+    parser.add_argument('--oidc-client-id', default=os.environ.get('OIDC_CLIENT_ID'),
+                        help='OIDC Client ID (default: $OIDC_CLIENT_ID)')
+    parser.add_argument('--oidc-client-secret', default=os.environ.get('OIDC_CLIENT_SECRET'),
+                        help='OIDC Client Secret (default: $OIDC_CLIENT_SECRET)')
+    parser.add_argument('--oidc-redirect-uri', default=os.environ.get('OIDC_REDIRECT_URI', 'https://ca.vcf.lab/certsrv/oidc/callback'),
+                        help='OIDC Redirect URI (default: $OIDC_REDIRECT_URI or https://ca.vcf.lab/certsrv/oidc/callback)')
 
     args = parser.parse_args()
 
@@ -1379,13 +1782,36 @@ Examples:
                 logger.error('No Vault token available. Use --vault-token or --creds-file.')
                 sys.exit(1)
 
+    role_mapping = {}
+    if args.role_mapping:
+        try:
+            with open(args.role_mapping, 'r') as f:
+                role_mapping = json.load(f)
+            logger.info('Loaded role mapping from %s: %s', args.role_mapping, role_mapping)
+        except Exception as e:
+            logger.error('Failed to load role mapping: %s', e)
+
+    oidc_config = None
+    if args.oidc_issuer and args.oidc_client_id and args.oidc_client_secret:
+        oidc_config = {
+            'client_id': args.oidc_client_id,
+            'client_secret': args.oidc_client_secret,
+            'redirect_uri': args.oidc_redirect_uri,
+            'auth_endpoint': f"{args.oidc_issuer.rstrip('/')}/protocol/openid-connect/auth" if 'authentik' in args.oidc_issuer else f"{args.oidc_issuer.rstrip('/')}/authorize",
+            'token_endpoint': f"{args.oidc_issuer.rstrip('/')}/protocol/openid-connect/token" if 'authentik' in args.oidc_issuer else f"{args.oidc_issuer.rstrip('/')}/token",
+            'userinfo_endpoint': f"{args.oidc_issuer.rstrip('/')}/protocol/openid-connect/userinfo" if 'authentik' in args.oidc_issuer else f"{args.oidc_issuer.rstrip('/')}/userinfo",
+            'verify_tls': True
+        }
+        logger.info('OIDC configuration enabled for issuer %s', args.oidc_issuer)
+
     vault_client = VaultPKIClient(
         vault_url=args.vault_url,
         vault_token=vault_token,
         pki_mount=args.vault_mount,
-        pki_role=args.vault_role,
+        default_pki_role=args.vault_role,
         cert_ttl=args.cert_ttl,
         skip_verify=args.vault_skip_verify,
+        role_mapping=role_mapping
     )
 
     if not vault_client.health_check():
@@ -1394,16 +1820,18 @@ Examples:
         logger.info('Vault connection verified')
 
     cert_store = CertStore()
-    handler_class = make_handler(vault_client, cert_store, password)
+    key_store = KeyStore()
+    session_manager = SessionManager()
+    handler_class = make_handler(vault_client, cert_store, key_store, password, session_manager, oidc_config)
     server = HTTPServer((args.bind, args.port), handler_class)
 
     logger.info('=' * 60)
-    logger.info('MSADCS Proxy (certsrv) - Production/Traefik')
+    logger.info('VCF CA Proxy (certsrv) - Production')
     logger.info('  Listening:  http://%s:%d/certsrv/', args.bind, args.port)
     logger.info('  Vault URL:  %s', args.vault_url)
     logger.info('  PKI Role:   %s/%s', args.vault_mount, args.vault_role)
     logger.info('  Cert TTL:   %s', args.cert_ttl)
-    logger.info('  TLS:        Disabled (handled by Traefik)')
+    logger.info('  TLS:        Disabled (handled by Reverse Proxy)')
     logger.info('=' * 60)
 
     try:

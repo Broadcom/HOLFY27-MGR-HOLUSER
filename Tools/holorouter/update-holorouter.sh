@@ -487,10 +487,17 @@ spec:
         - name: creds-file
           mountPath: /app/creds.txt
           readOnly: true
+        - name: script-file
+          mountPath: /app/certsrv_proxy.py
+          readOnly: true
       volumes:
       - name: creds-file
         hostPath:
           path: /root/creds.txt
+          type: File
+      - name: script-file
+        hostPath:
+          path: /root/certsrv-proxy/certsrv_proxy.py
           type: File
 DSEOF
 

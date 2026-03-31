@@ -64,7 +64,7 @@ graph TB
 | `https://authentik.vcf.lab` | HTTPS | Authentik IdP | Also works via HTTPS |
 | `https://gitlab.vcf.lab` | HTTPS | GitLab EE | HTTP redirects to HTTPS |
 | `https://gitlab-registry.vcf.lab` | HTTPS | GitLab Container Registry | HTTP redirects to HTTPS |
-| `https://ca.vcf.lab/certsrv/` | HTTPS | MSADCS Proxy (Vault PKI) | HTTP redirects to HTTPS |
+| `https://ca.vcf.lab/certsrv/` | HTTPS | PKI Proxy (Vault PKI) | HTTP redirects to HTTPS |
 | `https://auth.vcf.lab/icons/{file}` | HTTPS | Static icon files | 96 app icons served by nginx |
 
 ### HTTP vs HTTPS Behavior
@@ -200,7 +200,7 @@ flowchart TD
     P3B["Phase 3b: Distribute Root CA<br/>Install on Manager &amp; Console VMs,<br/>update-ca-certificates"]
     P4["Phase 4: GitLab Password<br/>Reset root password to<br/>creds.txt value"]
     P5["Phase 5: nginx Configuration<br/>HTTPS blocks, redirects,<br/>icon serving, WebSocket"]
-    P6["Phase 6: Certsrv Proxy<br/>Build Docker image, deploy<br/>DaemonSet, MSADCS→Vault"]
+    P6["Phase 6: Certsrv Proxy<br/>Build Docker image, deploy<br/>DaemonSet, PKI→Vault"]
     P7["Phase 7: Shutdown Script<br/>Add nginx stop to<br/>/root/shutdown.sh"]
     P8["Phase 8: Icon Serving<br/>Copy icons to /var/www/icons,<br/>serve via nginx"]
     P9["Phase 9: Authentik Users<br/>Create users, groups,<br/>set passwords"]
@@ -251,7 +251,7 @@ Configures the systemd nginx reverse proxy with the correct server blocks:
 
 #### Phase 6: Deploy Certsrv Proxy
 
-Builds the MSADCS proxy Docker image from `Dockerfile.certsrv-proxy` and `certsrv_proxy.py`. The Docker daemon is started only for the build and stopped after. The image is exported via `docker save`, imported into containerd with `ctr`, and deployed as a Kubernetes DaemonSet with `hostNetwork: true` on port 8900. This proxy translates Microsoft ADCS Web Enrollment requests (`/certsrv/`) into HashiCorp Vault PKI API calls.
+Builds the PKI proxy Docker image from `Dockerfile.certsrv-proxy` and `certsrv_proxy.py`. The Docker daemon is started only for the build and stopped after. The image is exported via `docker save`, imported into containerd with `ctr`, and deployed as a Kubernetes DaemonSet with `hostNetwork: true` on port 8900. This proxy translates Microsoft ADCS Web Enrollment requests (`/certsrv/`) into HashiCorp Vault PKI API calls.
 
 #### Phase 7: Update Shutdown Script
 
@@ -334,24 +334,128 @@ HashiCorp Vault serves as the internal Certificate Authority for the lab.
 | Max TTL | 17520h (2 years) |
 | Unseal | Automatic on boot via `/root/unseal_vault.sh` |
 
-## MSADCS Proxy (certsrv)
+## VCF CA Proxy (certsrv)
 
-The certsrv proxy impersonates a Microsoft Active Directory Certificate Services web enrollment server. SDDC Manager and VCF Operations use this to request and retrieve certificates.
+> **Disclaimer**: This software is not developed, endorsed, or affiliated with Microsoft Corporation. It provides a certsrv-compatible interface for interoperability with products that expect a Microsoft ADCS Web Enrollment endpoint.
+
+The certsrv proxy provides an interface compatible with Microsoft Active Directory Certificate Services web enrollment. SDDC Manager, VCF Operations, and other lab appliances use this to request and retrieve certificates.
 
 ```mermaid
 sequenceDiagram
-    participant SDDC as SDDC Manager
+    participant Client as Client (SDDC, Browser)
     participant NGINX as nginx (:443)
     participant PROXY as certsrv-proxy (:8900)
+    participant IDP as OIDC Provider (Authentik)
     participant VAULT as Vault PKI
 
-    SDDC->>NGINX: POST /certsrv/certfnsh.asp (CSR)
-    NGINX->>PROXY: Forward request
-    PROXY->>VAULT: POST /v1/pki/sign-verbatim/holodeck
-    VAULT-->>PROXY: Signed certificate
-    PROXY-->>NGINX: PKCS#7 response
-    NGINX-->>SDDC: Signed certificate chain
+    Client->>NGINX: HTTP/HTTPS Request
+    NGINX->>PROXY: Reverse Proxy
+    
+    alt Browser User (OIDC Auth)
+        PROXY->>IDP: Redirect to Login
+        IDP-->>PROXY: Auth Code (OIDC Callback)
+        PROXY->>Client: Set Session Cookie
+    else Service Account (Basic Auth)
+        Client->>PROXY: Authorization: Basic...
+        PROXY-->>PROXY: Validate static password
+    end
+
+    Client->>PROXY: POST /certsrv/certfnsh.asp (CSR)
+    PROXY->>VAULT: POST /v1/pki/sign-verbatim/<role>
+    VAULT-->>PROXY: Signed Certificate + Chain
+    PROXY-->>Client: HTTP 200 (Success HTML / PKCS#7)
 ```
+
+### Features & Capabilities
+- **Template to Vault Role Mapping**: AD CS template names are mapped dynamically to HashiCorp Vault PKI roles via a JSON configuration file.
+- **Advanced Auth Support**: Supports static Basic Auth (for SDDC Manager / scripts) and OpenID Connect (OIDC) with Authentik for browser-based human users.
+- **CRL Distribution**: Exposes the Vault PKI Base CRL via the `/certsrv/certnew.crl` endpoint in both PEM and DER formats.
+- **Instant Issuance**: Automatically signs all CSRs instantly against Vault—no polling or "pending" state required.
+
+### Proxy Configuration
+The proxy accepts several CLI arguments and environment variables to customize behavior:
+
+| CLI Argument | Environment Variable | Default | Description |
+| --- | --- | --- | --- |
+| `--port` | `PROXY_PORT` | `8900` | HTTP listen port |
+| `--bind` | `PROXY_BIND` | `0.0.0.0` | Bind address |
+| `--vault-url` | `VAULT_ADDR` | `http://127.0.0.1:32000` | Vault API URL |
+| `--vault-token` | `VAULT_TOKEN` | (read from creds file) | Vault authentication token |
+| `--vault-mount` | `VAULT_PKI_MOUNT` | `pki` | Vault PKI mount path |
+| `--vault-role` | `VAULT_PKI_ROLE` | `holodeck` | Default Vault PKI role name |
+| `--vault-skip-verify` | `VAULT_SKIP_VERIFY` | `true` | Skip TLS verification for Vault |
+| `--cert-ttl` | `CERT_TTL` | `17520h` | Default Certificate TTL (2 years) |
+| `--password` | `PROXY_PASSWORD` | (read from creds file) | Basic Auth password |
+| `--role-mapping` | `ROLE_MAPPING` | None | Path to JSON file mapping AD CS templates to Vault roles |
+| `--oidc-issuer` | `OIDC_ISSUER` | None | OIDC issuer URL (e.g., `https://auth.vcf.lab/application/o/certsrv/`) |
+| `--oidc-client-id` | `OIDC_CLIENT_ID` | None | OIDC Client ID |
+| `--oidc-client-secret` | `OIDC_CLIENT_SECRET`| None | OIDC Client Secret |
+| `--oidc-redirect-uri` | `OIDC_REDIRECT_URI` | `https://ca.vcf.lab/certsrv/oidc/callback` | OIDC Redirect URI |
+
+Example running with CLI arguments:
+```bash
+python3 certsrv_proxy.py \
+    --port 8900 \
+    --vault-url http://127.0.0.1:32000 \
+    --vault-token '<token>' \
+    --role-mapping /path/to/mapping.json \
+    --oidc-issuer https://auth.vcf.lab/application/o/certsrv/ \
+    --oidc-client-id '<client_id>' \
+    --oidc-client-secret '<secret>' \
+    --oidc-redirect-uri https://ca.vcf.lab/certsrv/oidc/callback
+```
+
+Example using Environment Variables (ideal for Docker / Kubernetes DaemonSet configuration):
+```bash
+export VAULT_ADDR="http://127.0.0.1:32000"
+export OIDC_ISSUER="https://auth.vcf.lab/application/o/certsrv/"
+export OIDC_CLIENT_ID="<client_id>"
+export OIDC_CLIENT_SECRET="<secret>"
+export ROLE_MAPPING="/path/to/mapping.json"
+python3 certsrv_proxy.py
+```
+
+### Role Mapping Configuration (`mapping.json`)
+The mapping configuration allows translating specific AD CS Template requests to their corresponding HashiCorp Vault PKI roles.
+
+```json
+{
+  "WebServer": "web_server",
+  "VCFWebServer": "holodeck",
+  "VMwareWebServer": "holodeck",
+  "SubCA": "subca",
+  "Machine": "machine_cert"
+}
+```
+
+If a template is not mapped or missing, the proxy will gracefully fall back to the default role specified by `--vault-role` (usually `holodeck`).
+
+### Standalone Docker Compose Deployment
+
+If you want to run `certsrv_proxy.py` as a standalone service outside of this specific lab environment (e.g., on a generic Docker host to proxy an existing HashiCorp Vault), you can use the provided `docker-compose.yml` file.
+
+1. **Review and configure `docker-compose.yml`**:
+   Adjust the environment variables to point to your Vault instance, configure your Basic Auth password, and optionally set up OIDC and Role Mapping.
+
+2. **Create the optional `mapping.json`** (if you enabled `ROLE_MAPPING`):
+   ```json
+   {
+     "WebServer": "web_server",
+     "SubCA": "subca"
+   }
+   ```
+
+3. **Start the service**:
+   ```bash
+   docker-compose up -d
+   ```
+
+4. **Verify it's running**:
+   ```bash
+   docker-compose logs -f
+   ```
+
+The container will expose port `8900` by default. It is highly recommended to place it behind a reverse proxy (like Traefik, Nginx, or HAProxy) that handles TLS termination, as the proxy itself serves plain HTTP.
 
 ## Files in This Directory
 
@@ -359,7 +463,7 @@ sequenceDiagram
 | --- | --- |
 | `configure_holorouter.py` | Main normalization script (run from manager VM) |
 | `update-holorouter.sh` | Legacy reference script (do not execute) |
-| `certsrv_proxy.py` | MSADCS proxy Python source |
+| `certsrv_proxy.py` | PKI proxy Python source |
 | `Dockerfile.certsrv-proxy` | Dockerfile for building the certsrv proxy container |
 | `images/` | 114 application icon files (SVG/PNG) for Authentik tiles |
 | `README.md` | This documentation |

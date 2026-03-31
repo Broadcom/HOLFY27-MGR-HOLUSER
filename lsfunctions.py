@@ -1997,7 +1997,8 @@ def push_lab_files_to_console():
     for item in os.listdir(sku_files_dir):
         src = os.path.join(sku_files_dir, item)
         dst = os.path.join(console_files_dir, item)
-        if os.path.isfile(src):
+        # If it is a file and it is not named files-README.md, then copy it
+        if os.path.isfile(src) and item != 'files-README.md':
             try:
                 shutil.copy(src, dst)
                 write_output(f'Copied {item} to console files directory')

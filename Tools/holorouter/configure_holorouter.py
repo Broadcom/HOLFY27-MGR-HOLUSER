@@ -9,7 +9,7 @@ Normalizes a freshly-imported holorouter VM by:
   Phase 3b: Distribute Vault Root CA to Manager & Console VMs
   Phase  4: Fix GitLab root password + initialization
   Phase  5: Fix nginx config (HTTPS for Technitium/Authentik/GitLab/ca, HTTP preserved for Authentik)
-  Phase  6: Deploy certsrv proxy (MSADCS -> Vault PKI)
+  Phase  6: Deploy certsrv proxy (VCF CA -> Vault PKI)
   Phase  7: Update shutdown.sh (add nginx stop)
   Phase  8: Setup icon serving via nginx
   Phase  9: Authentik users and groups
@@ -1002,10 +1002,17 @@ spec:
         - name: creds-file
           mountPath: /app/creds.txt
           readOnly: true
+        - name: script-file
+          mountPath: /app/certsrv_proxy.py
+          readOnly: true
       volumes:
       - name: creds-file
         hostPath:
           path: /root/creds.txt
+          type: File
+      - name: script-file
+        hostPath:
+          path: /root/certsrv-proxy/certsrv_proxy.py
           type: File
 """
     _write_remote_file("/tmp/certsrv-daemonset.yaml", daemonset_yaml)
@@ -1557,7 +1564,7 @@ def phase_11_verify():
     print("    http://authentik.vcf.lab      -> Authentik IdP (HTTP)")
     print("    https://authentik.vcf.lab     -> Authentik IdP (HTTPS)")
     print("    https://gitlab.vcf.lab        -> GitLab EE")
-    print("    https://ca.vcf.lab/certsrv/   -> MSADCS Proxy (Vault PKI)")
+    print("    https://ca.vcf.lab/certsrv/   -> VCF CA Proxy (Vault PKI)")
     print("\n  All passwords: contents of /home/holuser/creds.txt")
     print("  GitLab user: root")
     print("  Authentik admin: akadmin")
