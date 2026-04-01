@@ -148,3 +148,9 @@ iptables -P FORWARD DROP
 
 # indicate that iptables has run
 true > /home/holuser/firewall
+
+# if kubectl is installed and the vault-pki-lab namespace exists, run the following command.
+# Make sure that Vault CA Certificates are configured for 397 days
+if command -v kubectl &> /dev/null && kubectl get namespace vault-pki-lab &> /dev/null; then
+    kubectl exec -n vault-pki-lab vault-0 -- sh -c "vault write pki/roles/holodeck allowed_domains=vcf.lab allow_subdomains=true allow_bare_domains=true max_ttl=9528h key_usage=DigitalSignature,KeyAgreement,KeyEncipherment ext_key_usage=ServerAuth,ClientAuth allow_ip_sans=true"
+fi
