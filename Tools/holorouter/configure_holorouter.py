@@ -256,7 +256,7 @@ def _configure_vault_pki(token):
     vault_api("pki/roles/holodeck", method="POST", data={
         "allowed_domains": "vcf.lab",
         "allow_subdomains": True,
-        "max_ttl": "720h",
+        "max_ttl": "9528h",
     }, token=token)
 
     pki = vault_api("pki/cert/ca", token=token)
@@ -326,36 +326,36 @@ def phase_3_certs():
 
     certs_to_issue = [
         {
-            "cn": "gitlab.vcf.lab", "ttl": "720h",
+            "cn": "gitlab.vcf.lab", "ttl": "9528h",
             "paths": [
                 "/holodeck-runtime/gitlab/ssl/gitlab",
                 "/holodeck-runtime/gitlab/config/ssl/gitlab",
             ],
         },
         {
-            "cn": "gitlab-registry.vcf.lab", "ttl": "720h",
+            "cn": "gitlab-registry.vcf.lab", "ttl": "9528h",
             "paths": [
                 "/holodeck-runtime/gitlab/ssl/gitlab-registry",
                 "/holodeck-runtime/gitlab/config/ssl/gitlab-registry",
             ],
         },
         {
-            "cn": "vault.vcf.lab", "ttl": "720h",
+            "cn": "vault.vcf.lab", "ttl": "9528h",
             "ip_sans": f"{ROUTER_ETH0_IP},10.1.1.1",
             "paths": ["/root/nginx-certs/vault"],
         },
         {
-            "cn": "ca.vcf.lab", "ttl": "720h",
+            "cn": "ca.vcf.lab", "ttl": "9528h",
             "paths": ["/root/certsrv-proxy/ca"],
         },
         {
-            "cn": "technitium.vcf.lab", "ttl": "720h",
+            "cn": "technitium.vcf.lab", "ttl": "9528h",
             "alt_names": "dns.vcf.lab",
             "ip_sans": f"{ROUTER_ETH0_IP},10.1.1.1",
             "paths": ["/root/nginx-certs/technitium"],
         },
         {
-            "cn": "auth.vcf.lab", "ttl": "720h",
+            "cn": "auth.vcf.lab", "ttl": "9528h",
             "alt_names": "authentik.vcf.lab",
             "ip_sans": ROUTER_ETH0_IP,
             "paths": ["/root/nginx-certs/authentik"],
