@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.13 - 2026-03-13
+# Version 2.14 - 2026-04-01
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -9,6 +9,8 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.14 - 2026-04-01:
+#   - Fixed: updated to have vCenters trust the Vault CA.
 # v2.13 - 2026-03-19:
 #   - Fixed: NSX Edge entries with vna- prefix (VCF 9.1 naming) were skipped
 #     due to an earlier build filter in configure_nsx_components. Removed vna- exclusion.
@@ -2955,7 +2957,10 @@ def _trust_vault_ca_on_vcenter(hostname: str, user: str, password: str,
     )
     result = lsf.ssh(check_cmd, f'root@{hostname}', password)
     stdout = getattr(result, 'stdout', '') or ''
-    if stdout.strip() and stdout.strip() != '0':
+    # The SSH banner may prepend text. grep -c prints the count on the last line.
+    lines = [line.strip() for line in stdout.strip().split('\n') if line.strip()]
+    count = lines[-1] if lines else '0'
+    if count != '0':
         lsf.write_output(f'  {hostname}: Vault CA already trusted in vmdir')
         lsf.ssh('/usr/lib/vmware-vmafd/bin/vecs-cli force-refresh', f'root@{hostname}', password)
         return True
@@ -3012,7 +3017,9 @@ def _trust_vault_ca_on_esxi(hostname: str, password: str,
     check_cmd = 'grep -c "vcf.lab Root Authority" /etc/vmware/ssl/castore.pem 2>/dev/null || echo 0'
     result = lsf.ssh(check_cmd, f'root@{hostname}', password)
     stdout = getattr(result, 'stdout', '') or ''
-    if stdout.strip() and stdout.strip() != '0':
+    lines = [line.strip() for line in stdout.strip().split('\n') if line.strip()]
+    count = lines[-1] if lines else '0'
+    if count != '0':
         lsf.write_output(f'  {hostname}: Vault CA already in castore.pem')
         return True
 
@@ -3320,7 +3327,9 @@ def _trust_vault_ca_on_linux_appliance(hostname: str, user: str,
     check_cmd = f'{sudo_prefix}grep -c "vcf.lab Root Authority" /etc/ssl/certs/ca-certificates.crt 2>/dev/null || echo 0'
     result = lsf.ssh(check_cmd, target, password)
     stdout = getattr(result, 'stdout', '') or ''
-    if stdout.strip() and stdout.strip() != '0':
+    lines = [line.strip() for line in stdout.strip().split('\n') if line.strip()]
+    count = lines[-1] if lines else '0'
+    if count != '0':
         lsf.write_output(f'  {hostname}: Vault CA already in OS trust store')
         return True
 
