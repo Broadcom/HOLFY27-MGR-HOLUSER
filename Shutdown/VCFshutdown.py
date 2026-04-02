@@ -1607,7 +1607,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                                  if v.strip() and not v.strip().startswith('#')]
 
             # Static VM list (specific VMs to shutdown)
-            workload_vms = []
+            workload_vms = ['hcx-mgmt-01a', 'hcx-mgmt-01b']
             if lsf.config.has_option('SHUTDOWN', 'workload_vms'):
                 vms_raw = lsf.config.get('SHUTDOWN', 'workload_vms')
                 workload_vms = [v.strip() for v in vms_raw.split('\n') 
@@ -1958,7 +1958,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             update_shutdown_status(8, 'Shutdown VCF Ops for Networks', dry_run)
 
             # Default names cover both legacy (opsnet-*) and VCF 9.1 (ops_networks-*) naming
-            vcf_ops_networks_vms = ['opsnet-a', 'opsnet-01a', 'opsnetcollector-01a']
+            vcf_ops_networks_vms = ['opsnet-a', 'opsnet-b', 'opsnet-01a', 'opsnet-01b', 'opsnetcollector-01a', 'opsnetcollector-01b']
             vcf_ops_networks_patterns = [r'^ops_networks-.*$']
 
             if lsf.config.has_option('SHUTDOWN', 'vcf_ops_networks_vms'):
@@ -2011,7 +2011,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             vcf_write(lsf, '='*60)
             update_shutdown_status(9, 'Shutdown VCF Ops Collector', dry_run)
 
-            vcf_ops_collector_vms = ['opscollector-01a']
+            vcf_ops_collector_vms = ['opscollector-01a', 'opscollector-b']
 
             if lsf.config.has_option('SHUTDOWN', 'vcf_ops_collector_vms'):
                 coll_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_collector_vms')
@@ -2174,7 +2174,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
 
             # Note: VCF Operations (vrops) may have been partially shut down via Fleet API in Phase 1
             # This phase ensures any remaining VMs are shut down
-            vcf_ops_vms = ['ops-a']
+            vcf_ops_vms = ['ops-a', 'ops-b']
 
             if lsf.config.has_option('SHUTDOWN', 'vcf_ops_vms'):
                 ops_raw = lsf.config.get('SHUTDOWN', 'vcf_ops_vms')
@@ -2320,7 +2320,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             vcf_write(lsf, '='*60)
             update_shutdown_status(16, 'Shutdown SDDC Manager', dry_run)
 
-            sddc_manager_vms = ['sddcmanager-a']
+            sddc_manager_vms = ['sddcmanager-a', 'sddcmanager-b']
 
             if lsf.config.has_option('SHUTDOWN', 'sddc_manager_vms'):
                 sddc_raw = lsf.config.get('SHUTDOWN', 'sddc_manager_vms')
