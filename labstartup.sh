@@ -985,6 +985,8 @@ fi
 if [ -f "/home/holuser/hol/Tools/holorouter/certsrv_proxy.py" ]; then
     log_msg "Copying certsrv_proxy.py to /tmp/holorouter/certsrv_proxy.py" "${logfile}"
     cp "/home/holuser/hol/Tools/holorouter/certsrv_proxy.py" /tmp/holorouter/certsrv_proxy.py
+    # start a one time background task to delete /tmp/holorouter/certsrv_proxy.py after 90s
+    (sleep 90 && rm -f /tmp/holorouter/certsrv_proxy.py) &
 fi
 
 #==============================================================================
