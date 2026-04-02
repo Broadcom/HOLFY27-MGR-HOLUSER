@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 2.6 - March 2026
+# Version 2.6 - 2026-04-02
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
 #
+# v 2.6 - 2026-04-02:
+#   - Fixed for dual site
 # v 2.6 Changes:
 # - Added Phase 3b: Dynamic Supervisor Workload Shutdown
 #   Discovers and gracefully shuts down all Supervisor-managed workloads
@@ -182,6 +184,7 @@ PHASE 15:  Shutdown Management Domain NSX Manager
 PHASE 16:  Shutdown SDDC Manager
 PHASE 17:  Shutdown Management vCenter
 PHASE 17b: Connect to ESXi Hosts directly (vCenters now down)
+PHASE 17c: Shutdown Post-Edge VMs (License Servers, etc.)
 PHASE 18:  Set Host Advanced Settings
 PHASE 19:  vSAN Elevator Operations
 PHASE 19b: Shutdown VSP Platform VMs
@@ -2430,6 +2433,49 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
             # TASK 18: Set Host Advanced Settings
         except Exception as _phase_err:
             vcf_write(lsf, f'ERROR in Phase 17b: {_phase_err}')
+            vcf_write(lsf, 'Continuing with next phase...')
+    #==========================================================================
+    
+    if should_run('17c'):
+        try:
+            vcf_write(lsf, '='*60)
+            vcf_write(lsf, 'PHASE 17c: Shutdown Post-Edge VMs (License Servers, etc.)')
+            vcf_write(lsf, '='*60)
+            update_shutdown_status(17, 'Shutdown Post-Edge VMs', dry_run)
+
+            vcfpostedgevms = []
+            if lsf.config.has_option('VCF', 'vcfpostedgevms'):
+                vcfpostedgevms = lsf.get_config_list('VCF', 'vcfpostedgevms')
+
+            if not dry_run:
+                if vcfpostedgevms:
+                    vcf_write(lsf, f'Searching for Post-Edge VMs matching {len(vcfpostedgevms)} pattern(s)...')
+                    postedge_shutdown_count = 0
+                    postedge_already_off = 0
+                    for entry in vcfpostedgevms:
+                        vm_name = entry.split(':')[0].strip()
+                        vcf_write(lsf, f'  Pattern: {vm_name}')
+                        vms = lsf.get_vm_match(vm_name)
+                        if vms:
+                            vcf_write(lsf, f'  Found {len(vms)} VM(s)')
+                            for vm in vms:
+                                if lsf.is_vm_powered_on(vm):
+                                    lsf.shutdown_vm_gracefully(vm)
+                                    postedge_shutdown_count += 1
+                                    time.sleep(5)
+                                else:
+                                    vcf_write(lsf, f'  {vm.name}: Already powered off')
+                                    postedge_already_off += 1
+                        else:
+                            vcf_write(lsf, f'  No VMs found matching pattern')
+                    vcf_write(lsf, f'Post-Edge VMs: {postedge_shutdown_count} shut down, {postedge_already_off} already off')
+                else:
+                    vcf_write(lsf, 'No Post-Edge VMs configured in [VCF] vcfpostedgevms')
+            else:
+                vcf_write(lsf, f'Would shutdown Post-Edge VMs: {vcfpostedgevms}')
+
+        except Exception as _phase_err:
+            vcf_write(lsf, f'ERROR in Phase 17c: {_phase_err}')
             vcf_write(lsf, 'Continuing with next phase...')
     #==========================================================================
     
