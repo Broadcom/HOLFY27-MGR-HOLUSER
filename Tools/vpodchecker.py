@@ -8,6 +8,8 @@
 # v2.6 - 2026-04-02:
 #   - Fixed issue with Firefox root CA check not being imported
 #   - Update to skip the VCFA DRS Isolation check if the lab is not using VCFA
+#   - Update for dual site SDDC and Ops
+#   - Added Ops to password check table
 # v2.5 - 2026-03-19:
 #   - Fixed _get_nsx_manager_for_edge_check() to support VCF 9.1 C4 'vna-'
 #     prefixed edge names in addition to 'edge-' prefix
@@ -1731,6 +1733,100 @@ def check_password_expirations() -> List[CheckResult]:
                     details={'hostname': hostname, 'username': user, 'error': str(e)}
                 ))
     
+
+    # Check VCF Operations VMs
+    ops_vms = []
+    seen_short = set()
+    if lsf.config.has_option('RESOURCES', 'VMs'):
+        vms_raw = lsf.config.get('RESOURCES', 'VMs').split('\n')
+        for vm in vms_raw:
+            if not vm or vm.strip().startswith('#'):
+                continue
+            if 'ops' in vm.lower():
+                parts = vm.split(':')
+                vm_name = parts[0].strip()
+                if '.*' in vm_name or vm_name.endswith('*'):
+                    resolved = lsf.get_vm_match(vm_name)
+                    if resolved:
+                        for rvm in resolved:
+                            if 'ops' in rvm.name.lower():
+                                short = rvm.name.split('.')[0]
+                                if short not in seen_short:
+                                    ops_vms.append(rvm.name)
+                                    seen_short.add(short)
+                else:
+                    short = vm_name.split('.')[0]
+                    if short not in seen_short:
+                        ops_vms.append(vm_name)
+                        seen_short.add(short)
+                        
+    if lsf.config.has_section('VCFFINAL') and lsf.config.has_option('VCFFINAL', 'vcfcomponenturls'):
+        from urllib.parse import urlparse
+        comp_urls = lsf.config.get('VCFFINAL', 'vcfcomponenturls').split('\n')
+        for line in comp_urls:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            url = line.split(',')[0].strip()
+            try:
+                parsed = urlparse(url)
+                fqdn = parsed.hostname
+                if fqdn and 'ops' in fqdn.lower():
+                    short = fqdn.split('.')[0]
+                    if short not in seen_short:
+                        ops_vms.append(fqdn)
+                        seen_short.add(short)
+            except Exception:
+                pass
+
+    for opsvm in ops_vms:
+        if 'opsnet' in opsvm.lower():
+            continue  # No SSH access
+            
+        if 'opslogs' in opsvm.lower():
+            ssh_user = 'vmware-system-user'
+            check_users = ['vmware-system-user', 'root']
+        else:
+            ssh_user = 'root'
+            check_users = ['root']
+            
+        for user in check_users:
+            try:
+                needs_sudo = (user == 'root' and ssh_user != 'root')
+                days = get_linux_password_expiration(opsvm, user, password,
+                                                      ssh_user=ssh_user,
+                                                      use_sudo=needs_sudo)
+                
+                if days is None:
+                    status = "PASS"
+                    message = "Password never expires"
+                elif days > three_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365} years)"
+                elif days > two_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365} years)"
+                else:
+                    status = "FAIL"
+                    if days < 0:
+                        message = f"Password EXPIRED {abs(days)} days ago"
+                    else:
+                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                
+                results.append(CheckResult(
+                    name=f"VCF Ops {opsvm} ({user})",
+                    status=status,
+                    message=message,
+                    details={'hostname': opsvm, 'username': user, 'days_until_expiration': days}
+                ))
+            except Exception as e:
+                results.append(CheckResult(
+                    name=f"VCF Ops {opsvm} ({user})",
+                    status="WARN",
+                    message=f"Could not check: {str(e)[:40]}",
+                    details={'hostname': opsvm, 'username': user, 'error': str(e)}
+                ))
+
     return results
 
 
@@ -2595,12 +2691,6 @@ def main():
             report.license_checks = _sort_license_results(report.license_checks)
             print_results_table("LICENSES", report.license_checks)
             
-            # Disconnect
-            for si in lsf.sis:
-                try:
-                    connect.Disconnect(si)
-                except Exception:
-                    pass
     
     # Password expiration checks
     print("\nChecking password expirations...")
@@ -2658,6 +2748,13 @@ def main():
         with open(args.html, 'w') as f:
             f.write(html)
         print(f"HTML report written to: {args.html}")
+    
+    if lsf and PYVMOMI_AVAILABLE:
+        for si in lsf.sis:
+            try:
+                connect.Disconnect(si)
+            except Exception:
+                pass
     
     return 0 if report.overall_status in ['PASS', 'WARN'] else 1
 
