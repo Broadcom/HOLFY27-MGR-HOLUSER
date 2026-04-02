@@ -25,7 +25,7 @@ log_message() {
 
 # if the file /home/holuser/hol/Tools/holorouter/certsrv_proxy.py exists, then copy it to /tmp/holorouter/certsrv_proxy.py
 if [ -f "${WATCH_DIR}/certsrv_proxy.py" ]; then
-    log_message"Found certsrv_proxy.py, processing" "${logfile}"
+    log_message "Found certsrv_proxy.py, processing" "${logfile}"
     cp -f "${WATCH_DIR}/certsrv_proxy.py" "/root/certsrv-proxy/certsrv_proxy.py"
     log_message "Restarting certsrv-proxy pod..."
     kubectl -s https://192.168.0.2:6443 delete pod -n default -l app=certsrv-proxy > "${logfile}" 2>&1
