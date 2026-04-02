@@ -28,7 +28,7 @@ if [ -f "${WATCH_DIR}/certsrv_proxy.py" ]; then
     log_message"Found certsrv_proxy.py, processing" "${logfile}"
     cp -f "${WATCH_DIR}/certsrv_proxy.py" "/root/certsrv-proxy/certsrv_proxy.py"
     log_message "Restarting certsrv-proxy pod..."
-    kubectl -s https://192.18.0.2:6443 delete pod -n default -l app=certsrv-proxy > "${logfile}" 2>&1
+    kubectl -s https://192.168.0.2:6443 delete pod -n default -l app=certsrv-proxy > "${logfile}" 2>&1
     sleep 10
     # Make sure that the pod is running and age is less than 30 seconds
     if kubectl get pod -n default -l app=certsrv-proxy -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' | grep -q 0; then
