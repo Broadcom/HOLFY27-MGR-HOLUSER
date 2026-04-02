@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.14 - 2026-04-01
+# Version 2.15 - 2026-04-02
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -9,6 +9,8 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.15 - 2026-04-02:
+#   - Fixed for dual site
 # v2.14 - 2026-04-01:
 #   - Fixed: updated to have vCenters trust the Vault CA.
 # v2.13 - 2026-03-19:
@@ -248,7 +250,7 @@ import tempfile
 import zipfile
 import io
 import xml.etree.ElementTree as ET
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import requests
 
@@ -1203,17 +1205,48 @@ def configure_vcenter(entry: str, auth_keys_file: str, password: str,
 # NSX CONFIGURATION FUNCTIONS
 #==============================================================================
 
-def _get_sddc_bearer_token(password: str) -> Optional[str]:
+def _get_sddc_managers() -> List[str]:
+    """
+    Discover all SDDC Manager FQDNs from config.ini.
+    """
+    sddc_managers = []
+    if lsf and hasattr(lsf, 'config'):
+        if lsf.config.has_section('VCF') and lsf.config.has_option('VCF', 'sddcmanager'):
+            sddc_raw = lsf.config.get('VCF', 'sddcmanager').split('\n')
+            for entry in sddc_raw:
+                if not entry or entry.strip().startswith('#'):
+                    continue
+                hostname = entry.split(':')[0].strip()
+                if hostname and hostname not in sddc_managers:
+                    sddc_managers.append(hostname)
+        
+        if lsf.config.has_section('RESOURCES') and lsf.config.has_option('RESOURCES', 'urls'):
+            urls_raw = lsf.config.get('RESOURCES', 'urls').split('\n')
+            for entry in urls_raw:
+                if 'sddcmanager' in entry.lower():
+                    url = entry.split(',')[0].strip()
+                    if '://' in url:
+                        hostname = url.split('://')[1].split('/')[0].split(':')[0]
+                        if hostname and hostname not in sddc_managers:
+                            sddc_managers.append(hostname)
+                            
+    if not sddc_managers:
+        sddc_managers = ['sddcmanager-a.site-a.vcf.lab']
+    return sddc_managers
+
+
+def _get_sddc_bearer_token(sddc_fqdn: str, password: str) -> Optional[str]:
     """
     Acquire a Bearer token from SDDC Manager.
     
     VCF 9.1 C4 requires Bearer token auth for the credentials API
     (Basic Auth returns empty results).
     
+    :param sddc_fqdn: SDDC Manager FQDN
     :param password: Standard lab password
     :return: Bearer token string, or None if auth fails
     """
-    sddc_url = 'https://sddcmanager-a.site-a.vcf.lab'
+    sddc_url = f'https://{sddc_fqdn}'
     try:
         resp = requests.post(
             f'{sddc_url}/v1/tokens',
@@ -1246,7 +1279,31 @@ def get_nsx_root_password_from_sddc(nsx_fqdn: str, password: str,
     :return: The actual root password, or None if lookup fails
     """
     import re
-    sddc_url = 'https://sddcmanager-a.site-a.vcf.lab'
+    
+    # Try to find the matching SDDC Manager based on the domain
+    sddc_managers = _get_sddc_managers()
+    sddc_fqdn = sddc_managers[0]
+    
+    if '.' in nsx_fqdn:
+        nsx_domain = nsx_fqdn.split('.', 1)[1]
+        for sm in sddc_managers:
+            if nsx_domain in sm:
+                sddc_fqdn = sm
+                break
+    else:
+        # Try to match site-a, site-b from the short name
+        site_match = re.search(r'-(site-[a-z])', nsx_fqdn)
+        if not site_match:
+            site_match = re.search(r'-(a|b)$', nsx_fqdn)
+            
+        if site_match:
+            site_str = site_match.group(1)
+            for sm in sddc_managers:
+                if site_str in sm:
+                    sddc_fqdn = sm
+                    break
+
+    sddc_url = f'https://{sddc_fqdn}'
     
     short_name = nsx_fqdn.split('.')[0]
     cluster_name = re.sub(r'-\d+([a-z])$', r'-\1', short_name)
@@ -1256,7 +1313,7 @@ def get_nsx_root_password_from_sddc(nsx_fqdn: str, password: str,
     
     try:
         # Try Bearer token auth first (required for VCF 9.1 C4)
-        token = _get_sddc_bearer_token(password)
+        token = _get_sddc_bearer_token(sddc_fqdn, password)
         if token:
             resp = requests.get(
                 f'{sddc_url}/v1/credentials',
@@ -2132,81 +2189,84 @@ def configure_sddc_manager(auth_keys_file: str, password: str,
     :param dry_run: If True, preview only
     :return: True if successful
     """
-    sddcmgr = 'sddcmanager-a.site-a.vcf.lab'
     vcf_user = 'vcf'
-    
-    lsf.write_output('')
-    lsf.write_output(f'Configuring SDDC Manager: {sddcmgr}')
-    lsf.write_output('-' * 50)
-    lsf.write_output(f'{sddcmgr}: Using SSH user: {vcf_user}')
-    
-    if dry_run:
-        lsf.write_output(f'{sddcmgr}: Would copy authorized_keys using ssh-copy-id')
-        lsf.write_output(f'{sddcmgr}: Would set non-expiring passwords')
-        return True
-    
+    sddc_managers = _get_sddc_managers()
     success = True
     
-    # First check if the host is reachable
-    if not lsf.test_ping(sddcmgr):
-        lsf.write_output(f'{sddcmgr}: FAILED - Host is not reachable (ping failed)')
-        return False
-    
-    # Check if SSH port is open
-    if not lsf.test_tcp_port(sddcmgr, 22):
-        lsf.write_output(f'{sddcmgr}: FAILED - SSH port 22 is not open')
-        return False
-    
-    # Copy authorized_keys for vcf user using ssh-copy-id
-    # This is the preferred method as it handles key format and permissions
-    lsf.write_output(f'{sddcmgr}: Copying SSH keys for {vcf_user} user using ssh-copy-id...')
-    
-    # Try Manager key first
-    manager_key = PUBLIC_KEY_FILE
-    if os.path.isfile(manager_key):
-        # Use sshpass with ssh-copy-id
-        cmd = f'sshpass -p "{password}" ssh-copy-id -o StrictHostKeyChecking=no -i {manager_key} {vcf_user}@{sddcmgr}'
-        result = lsf.run_command(cmd)
-        if result.returncode == 0:
-            lsf.write_output(f'{sddcmgr}: SUCCESS - Manager SSH key copied for {vcf_user}')
-        else:
-            lsf.write_output(f'{sddcmgr}: FAILED - Could not copy Manager SSH key')
-            lsf.write_output(f'{sddcmgr}:         User: {vcf_user}, Password provided: {"yes" if password else "no"}')
-            if result.stderr:
-                lsf.write_output(f'{sddcmgr}:         Error: {result.stderr.strip()[:100]}')
+    for sddcmgr in sddc_managers:
+        lsf.write_output('')
+        lsf.write_output(f'Configuring SDDC Manager: {sddcmgr}')
+        lsf.write_output('-' * 50)
+        lsf.write_output(f'{sddcmgr}: Using SSH user: {vcf_user}')
+        
+        if dry_run:
+            lsf.write_output(f'{sddcmgr}: Would copy authorized_keys using ssh-copy-id')
+            lsf.write_output(f'{sddcmgr}: Would set non-expiring passwords')
+            continue
+        
+        # First check if the host is reachable
+        if not lsf.test_ping(sddcmgr):
+            lsf.write_output(f'{sddcmgr}: FAILED - Host is not reachable (ping failed)')
             success = False
-    
-    # Also copy LMC key if available
-    lmc_key_file = '/lmchol/home/holuser/.ssh/id_rsa.pub'
-    if os.path.isfile(lmc_key_file):
-        lsf.write_output(f'{sddcmgr}: Copying LMC SSH key for {vcf_user} user...')
-        cmd = f'sshpass -p "{password}" ssh-copy-id -o StrictHostKeyChecking=no -i {lmc_key_file} {vcf_user}@{sddcmgr}'
-        result = lsf.run_command(cmd)
-        if result.returncode == 0:
-            lsf.write_output(f'{sddcmgr}: SUCCESS - LMC SSH key copied for {vcf_user}')
+            continue
+        
+        # Check if SSH port is open
+        if not lsf.test_tcp_port(sddcmgr, 22):
+            lsf.write_output(f'{sddcmgr}: FAILED - SSH port 22 is not open')
+            success = False
+            continue
+        
+        # Copy authorized_keys for vcf user using ssh-copy-id
+        # This is the preferred method as it handles key format and permissions
+        lsf.write_output(f'{sddcmgr}: Copying SSH keys for {vcf_user} user using ssh-copy-id...')
+        
+        # Try Manager key first
+        manager_key = PUBLIC_KEY_FILE
+        if os.path.isfile(manager_key):
+            # Use sshpass with ssh-copy-id
+            cmd = f'sshpass -p "{password}" ssh-copy-id -o StrictHostKeyChecking=no -i {manager_key} {vcf_user}@{sddcmgr}'
+            result = lsf.run_command(cmd)
+            if result.returncode == 0:
+                lsf.write_output(f'{sddcmgr}: SUCCESS - Manager SSH key copied for {vcf_user}')
+            else:
+                lsf.write_output(f'{sddcmgr}: FAILED - Could not copy Manager SSH key')
+                lsf.write_output(f'{sddcmgr}:         User: {vcf_user}, Password provided: {"yes" if password else "no"}')
+                if result.stderr:
+                    lsf.write_output(f'{sddcmgr}:         Error: {result.stderr.strip()[:100]}')
+                success = False
+        
+        # Also copy LMC key if available
+        lmc_key_file = '/lmchol/home/holuser/.ssh/id_rsa.pub'
+        if os.path.isfile(lmc_key_file):
+            lsf.write_output(f'{sddcmgr}: Copying LMC SSH key for {vcf_user} user...')
+            cmd = f'sshpass -p "{password}" ssh-copy-id -o StrictHostKeyChecking=no -i {lmc_key_file} {vcf_user}@{sddcmgr}'
+            result = lsf.run_command(cmd)
+            if result.returncode == 0:
+                lsf.write_output(f'{sddcmgr}: SUCCESS - LMC SSH key copied for {vcf_user}')
+            else:
+                lsf.write_output(f'{sddcmgr}: WARNING - Could not copy LMC SSH key')
+        
+        # Run expect script to configure password expiration
+        # This handles the interactive su command needed to modify root settings
+        expect_script = os.path.expanduser('~/hol/Tools/sddcmgr.exp')
+        if os.path.isfile(expect_script):
+            lsf.write_output(f'{sddcmgr}: Running expect script to set non-expiring passwords...')
+            cmd = f'expect {expect_script} {sddcmgr} {password}'
+            result = lsf.run_command(cmd)
+            if result.returncode == 0:
+                lsf.write_output(f'{sddcmgr}: SUCCESS - Passwords set to non-expiring')
+            else:
+                lsf.write_output(f'{sddcmgr}: FAILED - Expect script returned {result.returncode}')
+                if result.stdout:
+                    # Print last few lines of output
+                    out_lines = result.stdout.strip().split('\n')
+                    for line in out_lines[-5:]:
+                        lsf.write_output(f'{sddcmgr}:         {line}')
+                success = False
         else:
-            lsf.write_output(f'{sddcmgr}: WARNING - Could not copy LMC SSH key')
-    
-    # Run expect script to configure password expiration
-    # This handles the interactive su command needed to modify root settings
-    expect_script = os.path.expanduser('~/hol/Tools/sddcmgr.exp')
-    if os.path.isfile(expect_script):
-        lsf.write_output(f'{sddcmgr}: Configuring non-expiring passwords...')
-        result = lsf.run_command(f'/usr/bin/expect {expect_script} {sddcmgr} {password}')
-        if result.returncode == 0:
-            lsf.write_output(f'{sddcmgr}: SUCCESS - Password expiration configured')
-        else:
-            lsf.write_output(f'{sddcmgr}: WARNING - Password config may have failed')
-            if result.stderr:
-                lsf.write_output(f'{sddcmgr}:         Error: {result.stderr.strip()[:100]}')
-    else:
-        lsf.write_output(f'{sddcmgr}: WARNING - sddcmgr.exp not found at {expect_script}')
-    
-    if success:
-        lsf.write_output(f'{sddcmgr}: SDDC Manager configuration completed')
-    else:
-        lsf.write_output(f'{sddcmgr}: SDDC Manager configuration completed with errors')
-    
+            lsf.write_output(f'{sddcmgr}: WARNING - Expect script not found at {expect_script}')
+            success = False
+            
     return success
 
 
@@ -2336,14 +2396,24 @@ def configure_operations_vms(auth_keys_file: str, password: str,
                         if 'ops' in rvm.name.lower():
                             short = rvm.name.split('.')[0]
                             if short not in seen_short:
-                                ops_vms.append((rvm.name, vcenter))
+                                actual_vc = vcenter
+                                if hasattr(rvm, '_stub') and hasattr(rvm._stub, 'host'):
+                                    actual_vc = rvm._stub.host.split(':')[0]
+                                ops_vms.append((rvm.name, actual_vc))
                                 seen_short.add(short)
                 else:
                     lsf.write_output(f'Pattern "{vm_name}" matched no VMs in vCenter')
             else:
                 short = vm_name.split('.')[0]
                 if short not in seen_short:
-                    ops_vms.append((vm_name, vcenter))
+                    actual_vc = vcenter
+                    vm_to_use = vm_name
+                    resolved = lsf.get_vm_match(f'^{short}$')
+                    if resolved:
+                        vm_to_use = resolved[0].name
+                        if hasattr(resolved[0], '_stub') and hasattr(resolved[0]._stub, 'host'):
+                            actual_vc = resolved[0]._stub.host.split(':')[0]
+                    ops_vms.append((vm_to_use, actual_vc))
                     seen_short.add(short)
     
     # Also discover Ops VMs from vcfcomponenturls (e.g. opslogs-a.site-a.vcf.lab)
@@ -2367,7 +2437,14 @@ def configure_operations_vms(auth_keys_file: str, password: str,
                 if fqdn and 'ops' in fqdn.lower():
                     short = fqdn.split('.')[0]
                     if short not in seen_short:
-                        ops_vms.append((fqdn, default_vc))
+                        actual_vc = default_vc
+                        vm_to_use = fqdn
+                        resolved = lsf.get_vm_match(f'^{short}$')
+                        if resolved:
+                            vm_to_use = resolved[0].name
+                            if hasattr(resolved[0], '_stub') and hasattr(resolved[0]._stub, 'host'):
+                                actual_vc = resolved[0]._stub.host.split(':')[0]
+                        ops_vms.append((vm_to_use, actual_vc))
                         seen_short.add(short)
             except Exception:
                 pass
@@ -3446,21 +3523,51 @@ def distribute_vault_ca_trust(ca_pem: str, password: str,
     # --- SDDC Manager ---
     lsf.write_output('')
     lsf.write_output('--- SDDC Manager ---')
-    sddcmgr = 'sddcmanager-a.site-a.vcf.lab'
-    if lsf.test_ping(sddcmgr):
-        total_count += 1
-        if _trust_vault_ca_on_sddc_manager(sddcmgr, password, ca_pem, dry_run):
-            success_count += 1
-    else:
-        lsf.write_output(f'  {sddcmgr}: SKIP - not reachable')
+    sddc_managers = _get_sddc_managers()
+    for sddcmgr in sddc_managers:
+        if lsf.test_ping(sddcmgr):
+            total_count += 1
+            if _trust_vault_ca_on_sddc_manager(sddcmgr, password, ca_pem, dry_run):
+                success_count += 1
+        else:
+            lsf.write_output(f'  {sddcmgr}: SKIP - not reachable')
 
     # --- VCF Automation Appliances ---
     lsf.write_output('')
     lsf.write_output('--- VCF Automation Appliances ---')
-    vcfa_hosts = [
-        ('auto-a.site-a.vcf.lab', 'vmware-system-user'),
-        ('auto-platform-a.site-a.vcf.lab', 'vmware-system-user'),
-    ]
+    vcfa_hosts = []
+    
+    # Dynamically find VCF Automation VMs from config.ini
+    if lsf and hasattr(lsf, 'config'):
+        for section in ['VCFFINAL', 'VCF', 'RESOURCES']:
+            if lsf.config.has_section(section):
+                # Check vravms
+                if lsf.config.has_option(section, 'vravms'):
+                    for entry in lsf.config.get(section, 'vravms').split('\n'):
+                        if entry.strip() and not entry.strip().startswith('#'):
+                            hostname = entry.split(':')[0].strip()
+                            if hostname and hostname.replace('.*', '') not in [h for h, _ in vcfa_hosts]:
+                                # If it's a regex like auto-platform-a.*, just use the base name
+                                clean_host = hostname.replace('.*', '')
+                                vcfa_hosts.append((clean_host, 'vmware-system-user'))
+                
+                # Check vraurls
+                if lsf.config.has_option(section, 'vraurls'):
+                    for entry in lsf.config.get(section, 'vraurls').split('\n'):
+                        if entry.strip() and not entry.strip().startswith('#'):
+                            url = entry.split(',')[0].strip()
+                            if '://' in url:
+                                hostname = url.split('://')[1].split('/')[0].split(':')[0]
+                                if hostname and hostname not in [h for h, _ in vcfa_hosts]:
+                                    vcfa_hosts.append((hostname, 'vmware-system-user'))
+                                    
+    # Fallback to defaults if none found
+    if not vcfa_hosts:
+        vcfa_hosts = [
+            ('auto-a.site-a.vcf.lab', 'vmware-system-user'),
+            ('auto-platform-a.site-a.vcf.lab', 'vmware-system-user'),
+        ]
+
     for vcfa_host, vcfa_user in vcfa_hosts:
         if lsf.test_ping(vcfa_host):
             total_count += 1
@@ -3482,10 +3589,10 @@ def distribute_vault_ca_trust(ca_pem: str, password: str,
             parts = entry.split(':')
             hostname = parts[0].strip()
             ops_vms.append(hostname)
-    # Also try well-known ops hostnames if not in config
-    for ops_host in ['ops-a.site-a.vcf.lab', 'opslogs-a.site-a.vcf.lab']:
-        if ops_host not in ops_vms:
-            ops_vms.append(ops_host)
+    # # Also try well-known ops hostnames if not in config
+    # for ops_host in ['ops-a.site-a.vcf.lab', 'opslogs-a.site-a.vcf.lab', 'ops-b.site-b.vcf.lab', 'opslogs-b.site-b.vcf.lab']:
+    #     if ops_host not in ops_vms:
+    #         ops_vms.append(ops_host)
 
     for ops_host in ops_vms:
         # Determine SSH user based on hostname
@@ -3836,246 +3943,245 @@ def disable_sddc_auto_rotate(dry_run: bool = False) -> bool:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    # Determine if SDDC Manager exists in this environment
-    sddc_host = None
-    if 'VCF' in lsf.config:
-        sddc_host = lsf.config.get('VCF', 'sddcmgr', fallback=None)
-    if not sddc_host:
-        sddc_host = 'sddcmanager-a.site-a.vcf.lab'
+    sddc_managers = _get_sddc_managers()
+    overall_success = True
 
     lsf.write_output('')
     lsf.write_output('=' * 60)
     lsf.write_output('SDDC Manager Auto-Rotate Policy Disable')
     lsf.write_output('=' * 60)
-    lsf.write_output(f'SDDC Manager: {sddc_host}')
 
-    if dry_run:
-        lsf.write_output('Would check for credentials with auto-rotate policies')
-        lsf.write_output('Would disable auto-rotation for all service credentials')
-        return True
+    for sddc_host in sddc_managers:
+        lsf.write_output(f'\nProcessing SDDC Manager: {sddc_host}')
 
-    # Check connectivity
-    if not lsf.test_ping(sddc_host):
-        lsf.write_output(f'{sddc_host}: Not reachable - skipping auto-rotate disable')
-        return True  # Don't fail the overall process
+        if dry_run:
+            lsf.write_output('Would check for credentials with auto-rotate policies')
+            lsf.write_output('Would disable auto-rotation for all service credentials')
+            continue
 
-    password = lsf.get_password()
+            # Check connectivity
+            if not lsf.test_ping(sddc_host):
+                lsf.write_output(f'{sddc_host}: Not reachable - skipping auto-rotate disable')
+                continue  # Don't fail the overall process
 
-    # Step 1: Get API token
-    lsf.write_output(f'{sddc_host}: Authenticating to SDDC Manager API...')
-    try:
-        token_url = f'https://{sddc_host}/v1/tokens'
-        token_body = {
-            'username': 'administrator@vsphere.local',
-            'password': password
-        }
-        response = requests.post(token_url, json=token_body, verify=False, timeout=30)
-        if response.status_code != 200:
-            lsf.write_output(f'{sddc_host}: Failed to authenticate (HTTP {response.status_code})')
-            return False
-        token = response.json().get('accessToken', '')
-        if not token:
-            lsf.write_output(f'{sddc_host}: No access token received')
-            return False
-        lsf.write_output(f'{sddc_host}: Authentication successful')
-    except Exception as e:
-        lsf.write_output(f'{sddc_host}: API authentication error: {e}')
-        return False
+            password = lsf.get_password()
 
-    headers = {
-        'Authorization': f'Bearer {token}',
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-    }
-
-    # Step 2: Get all credentials and find those with auto-rotate policies
-    lsf.write_output(f'{sddc_host}: Checking for credentials with auto-rotate policies...')
-    try:
-        creds_url = f'https://{sddc_host}/v1/credentials'
-        response = requests.get(creds_url, headers=headers, verify=False, timeout=30)
-        if response.status_code != 200:
-            lsf.write_output(f'{sddc_host}: Failed to get credentials (HTTP {response.status_code})')
-            return False
-
-        all_creds = response.json().get('elements', [])
-        auto_rotate_creds = [c for c in all_creds if c.get('autoRotatePolicy')]
-
-        if not auto_rotate_creds:
-            lsf.write_output(f'{sddc_host}: No credentials with auto-rotate policies found')
-            lsf.write_output(f'{sddc_host}: Nothing to disable')
-            return True
-
-        lsf.write_output(f'{sddc_host}: Found {len(auto_rotate_creds)} credential(s) '
-                         f'with auto-rotate enabled:')
-        for cred in auto_rotate_creds:
-            policy = cred['autoRotatePolicy']
-            lsf.write_output(f'  - {cred["username"]} on '
-                             f'{cred.get("resource", {}).get("resourceName", "?")} '
-                             f'({cred.get("credentialType")}) - '
-                             f'every {policy.get("frequencyInDays")} days')
-
-    except Exception as e:
-        lsf.write_output(f'{sddc_host}: Error retrieving credentials: {e}')
-        return False
-
-    # Step 3: Disable auto-rotate for each credential
-    # Group by resource to batch the API calls efficiently
-    # The API accepts multiple credentials per element in a single PATCH call
-    resource_groups = {}
-    for cred in auto_rotate_creds:
-        resource = cred.get('resource', {})
-        resource_name = resource.get('resourceName', '')
-        resource_type = resource.get('resourceType', '')
-        key = (resource_name, resource_type)
-
-        if key not in resource_groups:
-            resource_groups[key] = []
-        resource_groups[key].append({
-            'credentialType': cred.get('credentialType'),
-            'username': cred.get('username')
-        })
-
-    success = True
-    tasks = []
-
-    for (resource_name, resource_type), credentials in resource_groups.items():
-        lsf.write_output(f'{sddc_host}: Disabling auto-rotate for {resource_name} '
-                         f'({len(credentials)} credential(s))...')
-
-        patch_body = {
-            'operationType': 'UPDATE_AUTO_ROTATE_POLICY',
-            'elements': [{
-                'resourceName': resource_name,
-                'resourceType': resource_type,
-                'credentials': credentials
-            }],
-            'autoRotatePolicy': {
-                'enableAutoRotatePolicy': False
-            }
-        }
-
+            # Step 1: Get API token
+            lsf.write_output(f'{sddc_host}: Authenticating to SDDC Manager API...')
         try:
-            response = requests.patch(
-                creds_url, headers=headers, json=patch_body,
-                verify=False, timeout=30
-            )
+            token_url = f'https://{sddc_host}/v1/tokens'
+            token_body = {
+                'username': 'administrator@vsphere.local',
+                'password': password
+            }
+            response = requests.post(token_url, json=token_body, verify=False, timeout=30)
+            if response.status_code != 200:
+                lsf.write_output(f'{sddc_host}: Failed to authenticate (HTTP {response.status_code})')
+                return False
+            token = response.json().get('accessToken', '')
+            if not token:
+                lsf.write_output(f'{sddc_host}: No access token received')
+                return False
+            lsf.write_output(f'{sddc_host}: Authentication successful')
+        except Exception as e:
+            lsf.write_output(f'{sddc_host}: API authentication error: {e}')
+            return False
 
-            if response.status_code == 202:
-                task_data = response.json()
-                task_id = task_data.get('id', '')
-                lsf.write_output(f'{sddc_host}: Disable task submitted '
-                                 f'(task: {task_id[:8]}...)')
-                tasks.append(task_id)
-            else:
-                error_msg = ''
-                try:
-                    error_data = response.json()
-                    error_msg = error_data.get('message', '')
-                except Exception:
-                    error_msg = response.text[:200]
-                lsf.write_output(f'{sddc_host}: Failed to disable auto-rotate for '
-                                 f'{resource_name}: HTTP {response.status_code} - {error_msg}')
-                success = False
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+
+        # Step 2: Get all credentials and find those with auto-rotate policies
+        lsf.write_output(f'{sddc_host}: Checking for credentials with auto-rotate policies...')
+        try:
+            creds_url = f'https://{sddc_host}/v1/credentials'
+            response = requests.get(creds_url, headers=headers, verify=False, timeout=30)
+            if response.status_code != 200:
+                lsf.write_output(f'{sddc_host}: Failed to get credentials (HTTP {response.status_code})')
+                return False
+
+            all_creds = response.json().get('elements', [])
+            auto_rotate_creds = [c for c in all_creds if c.get('autoRotatePolicy')]
+
+            if not auto_rotate_creds:
+                lsf.write_output(f'{sddc_host}: No credentials with auto-rotate policies found')
+                lsf.write_output(f'{sddc_host}: Nothing to disable')
+                return True
+
+            lsf.write_output(f'{sddc_host}: Found {len(auto_rotate_creds)} credential(s) '
+                             f'with auto-rotate enabled:')
+            for cred in auto_rotate_creds:
+                policy = cred['autoRotatePolicy']
+                lsf.write_output(f'  - {cred["username"]} on '
+                                 f'{cred.get("resource", {}).get("resourceName", "?")} '
+                                 f'({cred.get("credentialType")}) - '
+                                 f'every {policy.get("frequencyInDays")} days')
 
         except Exception as e:
-            lsf.write_output(f'{sddc_host}: Error disabling auto-rotate for '
-                             f'{resource_name}: {e}')
-            success = False
+            lsf.write_output(f'{sddc_host}: Error retrieving credentials: {e}')
+            return False
 
-    # Step 4: Wait for tasks to complete
-    failed_tasks = []
-    if tasks:
-        lsf.write_output(f'{sddc_host}: Waiting for {len(tasks)} disable task(s) '
-                         f'to complete...')
-        time.sleep(10)
+        # Step 3: Disable auto-rotate for each credential
+        # Group by resource to batch the API calls efficiently
+        # The API accepts multiple credentials per element in a single PATCH call
+        resource_groups = {}
+        for cred in auto_rotate_creds:
+            resource = cred.get('resource', {})
+            resource_name = resource.get('resourceName', '')
+            resource_type = resource.get('resourceType', '')
+            key = (resource_name, resource_type)
 
-        for task_id in tasks:
-            # Poll task status (up to 90 seconds)
-            task_success = False
-            for attempt in range(18):
-                try:
-                    task_url = f'https://{sddc_host}/v1/tasks/{task_id}'
-                    response = requests.get(
-                        task_url, headers=headers, verify=False, timeout=15
-                    )
-                    if response.status_code == 200:
-                        task_data = response.json()
-                        status = task_data.get('status', '')
-                        if status == 'SUCCESSFUL':
-                            lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... '
-                                             f'completed successfully')
-                            task_success = True
-                            break
-                        elif status == 'FAILED':
-                            # Extract error details for better logging
-                            error_msg = 'Unknown error'
-                            for subtask in task_data.get('subTasks', []):
-                                for error in subtask.get('errors', []):
-                                    error_msg = error.get('message', error_msg)
-                            lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... '
-                                             f'FAILED - {error_msg}')
-                            failed_tasks.append(task_id)
-                            break
-                        # Still in progress or pending, wait and retry
-                        time.sleep(5)
-                    else:
-                        time.sleep(5)
-                except Exception:
-                    time.sleep(5)
+            if key not in resource_groups:
+                resource_groups[key] = []
+            resource_groups[key].append({
+                'credentialType': cred.get('credentialType'),
+                'username': cred.get('username')
+            })
 
-            if not task_success and task_id not in failed_tasks:
-                lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... did not '
-                                 f'complete within timeout')
+        success = True
+        tasks = []
 
-    # Step 5: Cancel any failed tasks to prevent UI notifications
-    if failed_tasks:
-        lsf.write_output(f'{sddc_host}: Cancelling {len(failed_tasks)} failed task(s) '
-                         f'to prevent UI notifications...')
-        for task_id in failed_tasks:
+        for (resource_name, resource_type), credentials in resource_groups.items():
+            lsf.write_output(f'{sddc_host}: Disabling auto-rotate for {resource_name} '
+                             f'({len(credentials)} credential(s))...')
+
+            patch_body = {
+                'operationType': 'UPDATE_AUTO_ROTATE_POLICY',
+                'elements': [{
+                    'resourceName': resource_name,
+                    'resourceType': resource_type,
+                    'credentials': credentials
+                }],
+                'autoRotatePolicy': {
+                    'enableAutoRotatePolicy': False
+                }
+            }
+
             try:
-                cancel_url = f'https://{sddc_host}/v1/credentials/tasks/{task_id}'
-                response = requests.delete(
-                    cancel_url, headers=headers, verify=False, timeout=15
+                response = requests.patch(
+                    creds_url, headers=headers, json=patch_body,
+                    verify=False, timeout=30
                 )
-                if response.status_code in [200, 202]:
-                    lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... cancelled')
+
+                if response.status_code == 202:
+                    task_data = response.json()
+                    task_id = task_data.get('id', '')
+                    lsf.write_output(f'{sddc_host}: Disable task submitted '
+                                     f'(task: {task_id[:8]}...)')
+                    tasks.append(task_id)
                 else:
-                    lsf.write_output(f'{sddc_host}: Could not cancel task '
-                                     f'{task_id[:8]}... (HTTP {response.status_code})')
+                    error_msg = ''
+                    try:
+                        error_data = response.json()
+                        error_msg = error_data.get('message', '')
+                    except Exception:
+                        error_msg = response.text[:200]
+                    lsf.write_output(f'{sddc_host}: Failed to disable auto-rotate for '
+                                     f'{resource_name}: HTTP {response.status_code} - {error_msg}')
+                    success = False
+
             except Exception as e:
-                lsf.write_output(f'{sddc_host}: Error cancelling task '
-                                 f'{task_id[:8]}...: {e}')
+                lsf.write_output(f'{sddc_host}: Error disabling auto-rotate for '
+                                 f'{resource_name}: {e}')
+                success = False
 
-    # Step 6: Verify
-    lsf.write_output(f'{sddc_host}: Verifying auto-rotate policies are disabled...')
-    try:
-        response = requests.get(creds_url, headers=headers, verify=False, timeout=30)
-        if response.status_code == 200:
-            remaining = [c for c in response.json().get('elements', [])
-                         if c.get('autoRotatePolicy')]
-            if not remaining:
-                lsf.write_output(f'{sddc_host}: SUCCESS - All auto-rotate policies '
-                                 f'have been disabled')
-            else:
-                lsf.write_output(f'{sddc_host}: WARNING - {len(remaining)} credential(s) '
-                                 f'still have auto-rotate enabled '
-                                 f'(resource may not be in ACTIVE state):')
-                for cred in remaining:
-                    res_name = cred.get('resource', {}).get('resourceName', '?')
-                    lsf.write_output(f'  - {cred["username"]} on {res_name}')
-                lsf.write_output(f'{sddc_host}: NOTE - These can be manually disabled '
-                                 f'once the resources are in ACTIVE state')
-    except Exception as e:
-        lsf.write_output(f'{sddc_host}: Could not verify: {e}')
+        # Step 4: Wait for tasks to complete
+        failed_tasks = []
+        if tasks:
+            lsf.write_output(f'{sddc_host}: Waiting for {len(tasks)} disable task(s) '
+                             f'to complete...')
+            time.sleep(10)
 
-    if failed_tasks:
-        lsf.write_output(f'{sddc_host}: Completed with {len(failed_tasks)} resource(s) '
-                         f'unavailable - auto-rotate could not be disabled for '
-                         f'resources not in ACTIVE state')
-    else:
-        lsf.write_output(f'{sddc_host}: Auto-rotate disable completed successfully')
+            for task_id in tasks:
+                # Poll task status (up to 90 seconds)
+                task_success = False
+                for attempt in range(18):
+                    try:
+                        task_url = f'https://{sddc_host}/v1/tasks/{task_id}'
+                        response = requests.get(
+                            task_url, headers=headers, verify=False, timeout=15
+                        )
+                        if response.status_code == 200:
+                            task_data = response.json()
+                            status = task_data.get('status', '')
+                            if status == 'SUCCESSFUL':
+                                lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... '
+                                                 f'completed successfully')
+                                task_success = True
+                                break
+                            elif status == 'FAILED':
+                                # Extract error details for better logging
+                                error_msg = 'Unknown error'
+                                for subtask in task_data.get('subTasks', []):
+                                    for error in subtask.get('errors', []):
+                                        error_msg = error.get('message', error_msg)
+                                lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... '
+                                                 f'FAILED - {error_msg}')
+                                failed_tasks.append(task_id)
+                                break
+                            # Still in progress or pending, wait and retry
+                            time.sleep(5)
+                        else:
+                            time.sleep(5)
+                    except Exception:
+                        time.sleep(5)
 
-    return True  # Don't fail HOLification for unavailable resources
+                if not task_success and task_id not in failed_tasks:
+                    lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... did not '
+                                     f'complete within timeout')
+
+        # Step 5: Cancel any failed tasks to prevent UI notifications
+        if failed_tasks:
+            lsf.write_output(f'{sddc_host}: Cancelling {len(failed_tasks)} failed task(s) '
+                             f'to prevent UI notifications...')
+            for task_id in failed_tasks:
+                try:
+                    cancel_url = f'https://{sddc_host}/v1/credentials/tasks/{task_id}'
+                    response = requests.delete(
+                        cancel_url, headers=headers, verify=False, timeout=15
+                    )
+                    if response.status_code in [200, 202]:
+                        lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... cancelled')
+                    else:
+                        lsf.write_output(f'{sddc_host}: Could not cancel task '
+                                         f'{task_id[:8]}... (HTTP {response.status_code})')
+                except Exception as e:
+                    lsf.write_output(f'{sddc_host}: Error cancelling task '
+                                     f'{task_id[:8]}...: {e}')
+
+        # Step 6: Verify
+        lsf.write_output(f'{sddc_host}: Verifying auto-rotate policies are disabled...')
+        try:
+            response = requests.get(creds_url, headers=headers, verify=False, timeout=30)
+            if response.status_code == 200:
+                remaining = [c for c in response.json().get('elements', [])
+                             if c.get('autoRotatePolicy')]
+                if not remaining:
+                    lsf.write_output(f'{sddc_host}: SUCCESS - All auto-rotate policies '
+                                     f'have been disabled')
+                else:
+                    lsf.write_output(f'{sddc_host}: WARNING - {len(remaining)} credential(s) '
+                                     f'still have auto-rotate enabled '
+                                     f'(resource may not be in ACTIVE state):')
+                    for cred in remaining:
+                        res_name = cred.get('resource', {}).get('resourceName', '?')
+                        lsf.write_output(f'  - {cred["username"]} on {res_name}')
+                    lsf.write_output(f'{sddc_host}: NOTE - These can be manually disabled '
+                                     f'once the resources are in ACTIVE state')
+        except Exception as e:
+            lsf.write_output(f'{sddc_host}: Could not verify: {e}')
+
+        if failed_tasks:
+            lsf.write_output(f'{sddc_host}: Completed with {len(failed_tasks)} resource(s) '
+                             f'unavailable - auto-rotate could not be disabled for '
+                             f'resources not in ACTIVE state')
+            overall_success = False
+        else:
+            lsf.write_output(f'{sddc_host}: Auto-rotate disable completed successfully')
+
+    return overall_success  # Don't fail HOLification for unavailable resources
 
 
 #==============================================================================
@@ -4112,7 +4218,7 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
     lsf.write_output('=' * 60)
     
     # Determine VCF Operations Manager FQDN from config
-    ops_fqdn = None
+    ops_fqdns = []
     try:
         if lsf.config.has_option('RESOURCES', 'URLs'):
             urls_raw = lsf.config.get('RESOURCES', 'URLs').split('\n')
@@ -4121,12 +4227,11 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
                 if 'ops-' in url and '.vcf.lab' in url:
                     from urllib.parse import urlparse
                     parsed = urlparse(url)
-                    ops_fqdn = parsed.hostname
-                    break
+                    ops_fqdns.append(parsed.hostname)
     except Exception:
         pass
     
-    if not ops_fqdn:
+    if not ops_fqdns:
         try:
             if lsf.config.has_section('VCF'):
                 if lsf.config.has_option('VCF', 'urls'):
@@ -4136,267 +4241,269 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
                         if 'ops-' in url:
                             from urllib.parse import urlparse
                             parsed = urlparse(url)
-                            ops_fqdn = parsed.hostname
-                            break
+                            ops_fqdns.append(parsed.hostname)
         except Exception:
             pass
     
-    if not ops_fqdn:
+    if not ops_fqdns:
         lsf.write_output('WARNING: VCF Operations Manager FQDN not found in config - skipping')
         return False
-    
-    password = lsf.get_password()
-    base_url = f"https://{ops_fqdn}"
-    api_base = f"{base_url}/suite-api"
-    
-    lsf.write_output(f'VCF Operations Manager: {ops_fqdn}')
-    
-    if dry_run:
-        lsf.write_output('Would create MaxExpiration policy, assign all inventory, and remediate')
-        return True
-    
-    # Step 1: Authenticate
-    lsf.write_output('Authenticating to VCF Operations Manager...')
-    try:
-        token_resp = requests.post(
-            f"{api_base}/api/auth/token/acquire",
-            json={"username": "admin", "password": password, "authSource": "local"},
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            verify=False, timeout=30
-        )
-        token_resp.raise_for_status()
-        token = token_resp.json()["token"]
-        lsf.write_output('SUCCESS - Authenticated to VCF Operations Manager')
-    except Exception as e:
-        lsf.write_output(f'FAILED - Could not authenticate: {e}')
-        return False
-    
-    headers = {
-        "Authorization": f"OpsToken {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "X-vRealizeOps-API-use-unsupported": "true"
-    }
-    
-    # Step 2: Query all existing policies and their assignments
-    lsf.write_output('Querying existing password policies...')
-    existing_policy_id = None
-    all_policies = []
-    try:
-        query_resp = requests.post(
-            f"{api_base}/internal/passwordmanagement/policies/query",
-            headers=headers, json={}, verify=False, timeout=30
-        )
-        query_resp.raise_for_status()
-        all_policies = query_resp.json().get("vcfPolicies", [])
         
-        for policy in all_policies:
-            pname = policy.get("policyInfo", {}).get("policyName", "")
-            pid = policy.get("policyId", "")
-            assigned = policy.get("vcfPolicyAssignedResourceList", [])
-            lsf.write_output(f'  Policy: {pname} (ID: {pid}), Assigned: {len(assigned)} resource(s)')
-            for res in assigned:
-                lsf.write_output(f'    - {res.get("resourceName", "?")} ({res.get("resourceType", "?")})')
-            if pname == "MaxExpiration":
-                existing_policy_id = pid
-    except Exception as e:
-        lsf.write_output(f'WARNING - Could not query existing policies: {e}')
-    
-    # Step 3: Create MaxExpiration policy if it doesn't exist
-    expiration_days = 729
-    expiration_date = (datetime.now() + timedelta(days=expiration_days)).strftime("%Y-%m-%d")
-    policy_description = f"Passwords will expire {expiration_date} ({expiration_days} days from creation)"
-    
-    if not existing_policy_id:
-        lsf.write_output(f'Creating MaxExpiration policy (expires {expiration_date}, {expiration_days} days)...')
+    overall_success = True
+    for ops_fqdn in ops_fqdns:
+        lsf.write_output(f'\nProcessing VCF Operations Manager: {ops_fqdn}')
+        
+        password = lsf.get_password()
+        base_url = f"https://{ops_fqdn}"
+        api_base = f"{base_url}/suite-api"
+        
+        if dry_run:
+            lsf.write_output('Would create MaxExpiration policy, assign all inventory, and remediate')
+            continue
+        
+        # Step 1: Authenticate
+        lsf.write_output(f'{ops_fqdn}: Authenticating to VCF Operations Manager...')
         try:
-            create_resp = requests.post(
-                f"{api_base}/internal/passwordmanagement/policies",
-                headers=headers,
-                json={
-                    "policyInfo": {
-                        "policyName": "MaxExpiration",
-                        "description": policy_description,
-                        "isFleetPolicy": False
-                    },
-                    "complexityConstraint": {
-                        "minLength": 8,
-                        "minLowercase": 0,
-                        "minUppercase": 0,
-                        "minNumeric": 0,
-                        "minSpecial": 0,
-                        "passwordHistory": 1
-                    },
-                    "expirationConstraint": {
-                        "passwordExpirationDays": expiration_days
-                    },
-                    "lockoutConstraint": {
-                        "lockoutMaxAuthFailures": 5,
-                        "lockoutEvaluationPeriod": 300,
-                        "lockoutPeriod": 600
-                    }
-                },
+            token_resp = requests.post(
+                f"{api_base}/api/auth/token/acquire",
+                json={"username": "admin", "password": password, "authSource": "local"},
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
                 verify=False, timeout=30
             )
-            create_resp.raise_for_status()
-            policy_data = create_resp.json()
-            existing_policy_id = policy_data.get("policyId")
-            lsf.write_output(f'SUCCESS - Created MaxExpiration policy: {existing_policy_id}')
+            token_resp.raise_for_status()
+            token = token_resp.json()["token"]
+            lsf.write_output(f'{ops_fqdn}: SUCCESS - Authenticated to VCF Operations Manager')
         except Exception as e:
-            lsf.write_output(f'FAILED - Could not create policy: {e}')
-            return False
-    else:
-        lsf.write_output('MaxExpiration policy already exists - skipping creation')
-    
-    # Step 4: Assign ALL inventory to MaxExpiration
-    # Assigning a resource to MaxExpiration automatically unassigns it from any
-    # other policy. We assign MANAGEMENT first, then each INSTANCE by resourceId.
-    
-    # Step 4a: Assign MANAGEMENT to MaxExpiration
-    lsf.write_output('Assigning MANAGEMENT to MaxExpiration...')
-    try:
-        assign_resp = requests.post(
-            f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}/assign",
-            headers=headers,
-            json={"assignmentGroup": ["MANAGEMENT"]},
-            verify=False, timeout=30
-        )
-        if assign_resp.status_code == 204:
-            lsf.write_output('SUCCESS - MANAGEMENT assigned to MaxExpiration')
-        else:
-            lsf.write_output(f'WARNING - MANAGEMENT assign returned {assign_resp.status_code}: {assign_resp.text[:100]}')
-    except Exception as e:
-        lsf.write_output(f'WARNING - Could not assign MANAGEMENT: {e}')
-    
-    # Step 4b: Collect all INSTANCE resources from other policies and assign to MaxExpiration
-    # The assign endpoint for INSTANCE requires: {"assignmentGroup": ["INSTANCE"], "resourceId": [<uuid>, ...]}
-    instance_ids = []
-    for policy in all_policies:
-        if policy.get("policyId") == existing_policy_id:
+            lsf.write_output(f'{ops_fqdn}: FAILED - Could not authenticate: {e}')
+            overall_success = False
             continue
-        for res in policy.get("vcfPolicyAssignedResourceList", []):
-            if res.get("resourceType") == "INSTANCE":
-                instance_ids.append(res["resourceId"])
-                lsf.write_output(f'  Will reassign: {res.get("resourceName", "?")} from {policy["policyInfo"]["policyName"]}')
+        
+        headers = {
+            "Authorization": f"OpsToken {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-vRealizeOps-API-use-unsupported": "true"
+        }
     
-    # Also check if MaxExpiration itself is missing any INSTANCE assignments
-    # by re-querying after MANAGEMENT assignment
-    try:
-        query_resp = requests.post(
-            f"{api_base}/internal/passwordmanagement/policies/query",
-            headers=headers, json={}, verify=False, timeout=30
-        )
-        query_resp.raise_for_status()
-        refreshed_policies = query_resp.json().get("vcfPolicies", [])
-        for policy in refreshed_policies:
-            if policy.get("policyId") == existing_policy_id:
-                continue
-            for res in policy.get("vcfPolicyAssignedResourceList", []):
-                if res.get("resourceType") == "INSTANCE" and res["resourceId"] not in instance_ids:
-                    instance_ids.append(res["resourceId"])
-                    lsf.write_output(f'  Will reassign: {res.get("resourceName", "?")} from {policy["policyInfo"]["policyName"]}')
-    except Exception:
-        pass
+        # Step 2: Query all existing policies and their assignments
+        lsf.write_output('Querying existing password policies...')
+        existing_policy_id = None
+        all_policies = []
+        try:
+            query_resp = requests.post(
+                f"{api_base}/internal/passwordmanagement/policies/query",
+                headers=headers, json={}, verify=False, timeout=30
+            )
+            query_resp.raise_for_status()
+            all_policies = query_resp.json().get("vcfPolicies", [])
+        
+            for policy in all_policies:
+                pname = policy.get("policyInfo", {}).get("policyName", "")
+                pid = policy.get("policyId", "")
+                assigned = policy.get("vcfPolicyAssignedResourceList", [])
+                lsf.write_output(f'  Policy: {pname} (ID: {pid}), Assigned: {len(assigned)} resource(s)')
+                for res in assigned:
+                    lsf.write_output(f'    - {res.get("resourceName", "?")} ({res.get("resourceType", "?")})')
+                if pname == "MaxExpiration":
+                    existing_policy_id = pid
+        except Exception as e:
+            lsf.write_output(f'WARNING - Could not query existing policies: {e}')
     
-    if instance_ids:
-        lsf.write_output(f'Assigning {len(instance_ids)} INSTANCE resource(s) to MaxExpiration...')
+        # Step 3: Create MaxExpiration policy if it doesn't exist
+        expiration_days = 729
+        expiration_date = (datetime.now() + timedelta(days=expiration_days)).strftime("%Y-%m-%d")
+        policy_description = f"Passwords will expire {expiration_date} ({expiration_days} days from creation)"
+    
+        if not existing_policy_id:
+            lsf.write_output(f'Creating MaxExpiration policy (expires {expiration_date}, {expiration_days} days)...')
+            try:
+                create_resp = requests.post(
+                    f"{api_base}/internal/passwordmanagement/policies",
+                    headers=headers,
+                    json={
+                        "policyInfo": {
+                            "policyName": "MaxExpiration",
+                            "description": policy_description,
+                            "isFleetPolicy": False
+                        },
+                        "complexityConstraint": {
+                            "minLength": 8,
+                            "minLowercase": 0,
+                            "minUppercase": 0,
+                            "minNumeric": 0,
+                            "minSpecial": 0,
+                            "passwordHistory": 1
+                        },
+                        "expirationConstraint": {
+                            "passwordExpirationDays": expiration_days
+                        },
+                        "lockoutConstraint": {
+                            "lockoutMaxAuthFailures": 5,
+                            "lockoutEvaluationPeriod": 300,
+                            "lockoutPeriod": 600
+                        }
+                    },
+                    verify=False, timeout=30
+                )
+                create_resp.raise_for_status()
+                policy_data = create_resp.json()
+                existing_policy_id = policy_data.get("policyId")
+                lsf.write_output(f'SUCCESS - Created MaxExpiration policy: {existing_policy_id}')
+            except Exception as e:
+                lsf.write_output(f'FAILED - Could not create policy: {e}')
+                return False
+        else:
+            lsf.write_output('MaxExpiration policy already exists - skipping creation')
+    
+        # Step 4: Assign ALL inventory to MaxExpiration
+        # Assigning a resource to MaxExpiration automatically unassigns it from any
+        # other policy. We assign MANAGEMENT first, then each INSTANCE by resourceId.
+    
+        # Step 4a: Assign MANAGEMENT to MaxExpiration
+        lsf.write_output('Assigning MANAGEMENT to MaxExpiration...')
         try:
             assign_resp = requests.post(
                 f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}/assign",
                 headers=headers,
-                json={"assignmentGroup": ["INSTANCE"], "resourceId": instance_ids},
+                json={"assignmentGroup": ["MANAGEMENT"]},
                 verify=False, timeout=30
             )
             if assign_resp.status_code == 204:
-                lsf.write_output(f'SUCCESS - {len(instance_ids)} INSTANCE resource(s) assigned to MaxExpiration')
+                lsf.write_output('SUCCESS - MANAGEMENT assigned to MaxExpiration')
             else:
-                msg = assign_resp.text[:150] if assign_resp.text else ""
-                lsf.write_output(f'WARNING - INSTANCE assign returned {assign_resp.status_code}: {msg}')
+                lsf.write_output(f'WARNING - MANAGEMENT assign returned {assign_resp.status_code}: {assign_resp.text[:100]}')
         except Exception as e:
-            lsf.write_output(f'WARNING - Could not assign INSTANCE resources: {e}')
-    else:
-        lsf.write_output('No INSTANCE resources to reassign from other policies')
+            lsf.write_output(f'WARNING - Could not assign MANAGEMENT: {e}')
     
-    # Step 5: Verify final assignment state
-    lsf.write_output('Verifying final policy assignments...')
-    try:
-        verify_resp = requests.get(
-            f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}",
-            headers=headers, verify=False, timeout=30
-        )
-        verify_resp.raise_for_status()
-        policy_state = verify_resp.json()
-        assigned = policy_state.get("vcfPolicyAssignedResourceList", [])
-        lsf.write_output(f'MaxExpiration is assigned to {len(assigned)} resource(s):')
-        for res in assigned:
-            lsf.write_output(f'  - {res.get("resourceName", "?")} ({res.get("resourceType", "?")})')
-        
-        # Also check if the policy's isFleetPolicy flag is correct
-        is_fleet = policy_state.get("policyInfo", {}).get("isFleetPolicy", False)
-        if is_fleet:
-            lsf.write_output('INFO - Resetting isFleetPolicy to False (was set by previous FLEET assignment)')
-            policy_state["policyInfo"]["isFleetPolicy"] = False
-            requests.put(
-                f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}",
-                headers=headers, json=policy_state, verify=False, timeout=30
-            )
-    except Exception as e:
-        lsf.write_output(f'WARNING - Could not verify policy state: {e}')
-    
-    # Step 6: Delete other policies that are now unassigned
-    lsf.write_output('Cleaning up old policies with no remaining assignments...')
-    try:
-        query_resp = requests.post(
-            f"{api_base}/internal/passwordmanagement/policies/query",
-            headers=headers, json={}, verify=False, timeout=30
-        )
-        query_resp.raise_for_status()
-        for policy in query_resp.json().get("vcfPolicies", []):
-            pid = policy.get("policyId")
-            pname = policy.get("policyInfo", {}).get("policyName", "")
-            if pid == existing_policy_id:
+        # Step 4b: Collect all INSTANCE resources from other policies and assign to MaxExpiration
+        # The assign endpoint for INSTANCE requires: {"assignmentGroup": ["INSTANCE"], "resourceId": [<uuid>, ...]}
+        instance_ids = []
+        for policy in all_policies:
+            if policy.get("policyId") == existing_policy_id:
                 continue
-            assigned = policy.get("vcfPolicyAssignedResourceList", [])
-            if len(assigned) == 0:
-                lsf.write_output(f'Deleting unassigned policy: {pname} ({pid})')
-                del_resp = requests.delete(
-                    f"{api_base}/internal/passwordmanagement/policies/{pid}",
-                    headers=headers, verify=False, timeout=30
+            for res in policy.get("vcfPolicyAssignedResourceList", []):
+                if res.get("resourceType") == "INSTANCE":
+                    instance_ids.append(res["resourceId"])
+                    lsf.write_output(f'  Will reassign: {res.get("resourceName", "?")} from {policy["policyInfo"]["policyName"]}')
+    
+        # Also check if MaxExpiration itself is missing any INSTANCE assignments
+        # by re-querying after MANAGEMENT assignment
+        try:
+            query_resp = requests.post(
+                f"{api_base}/internal/passwordmanagement/policies/query",
+                headers=headers, json={}, verify=False, timeout=30
+            )
+            query_resp.raise_for_status()
+            refreshed_policies = query_resp.json().get("vcfPolicies", [])
+            for policy in refreshed_policies:
+                if policy.get("policyId") == existing_policy_id:
+                    continue
+                for res in policy.get("vcfPolicyAssignedResourceList", []):
+                    if res.get("resourceType") == "INSTANCE" and res["resourceId"] not in instance_ids:
+                        instance_ids.append(res["resourceId"])
+                        lsf.write_output(f'  Will reassign: {res.get("resourceName", "?")} from {policy["policyInfo"]["policyName"]}')
+        except Exception:
+            pass
+    
+        if instance_ids:
+            lsf.write_output(f'Assigning {len(instance_ids)} INSTANCE resource(s) to MaxExpiration...')
+            try:
+                assign_resp = requests.post(
+                    f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}/assign",
+                    headers=headers,
+                    json={"assignmentGroup": ["INSTANCE"], "resourceId": instance_ids},
+                    verify=False, timeout=30
                 )
-                if del_resp.status_code == 204:
-                    lsf.write_output(f'SUCCESS - Deleted policy: {pname}')
+                if assign_resp.status_code == 204:
+                    lsf.write_output(f'SUCCESS - {len(instance_ids)} INSTANCE resource(s) assigned to MaxExpiration')
                 else:
-                    msg = del_resp.text[:100] if del_resp.text else ""
-                    lsf.write_output(f'WARNING - Could not delete {pname}: {del_resp.status_code} {msg}')
-            else:
-                lsf.write_output(f'Keeping policy {pname} - still has {len(assigned)} assignment(s)')
-    except Exception as e:
-        lsf.write_output(f'WARNING - Could not clean up old policies: {e}')
-    
-    # Step 7: Attempt remediation
-    lsf.write_output('Attempting to remediate all inventory items...')
-    remediation_attempted = False
-    try:
-        remediate_resp = requests.post(
-            f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}/remediate",
-            headers=headers, json={}, verify=False, timeout=60
-        )
-        if remediate_resp.status_code in (200, 202, 204):
-            lsf.write_output('SUCCESS - Remediation triggered successfully')
-            remediation_attempted = True
+                    msg = assign_resp.text[:150] if assign_resp.text else ""
+                    lsf.write_output(f'WARNING - INSTANCE assign returned {assign_resp.status_code}: {msg}')
+            except Exception as e:
+                lsf.write_output(f'WARNING - Could not assign INSTANCE resources: {e}')
         else:
-            lsf.write_output(f'INFO - Remediate endpoint returned {remediate_resp.status_code}')
-    except Exception:
-        pass
+            lsf.write_output('No INSTANCE resources to reassign from other policies')
     
-    if not remediation_attempted:
-        lsf.write_output('INFO - Automatic remediation via API not available through suite-api proxy.')
-        lsf.write_output('INFO - Please remediate manually via VCF Operations Manager UI:')
-        lsf.write_output(f'INFO -   {base_url}/vcf-operations/ui/manage/fleet/fleet-settings')
-        lsf.write_output('INFO -   Navigate to Fleet Settings > select MaxExpiration > Remediate All')
+        # Step 5: Verify final assignment state
+        lsf.write_output('Verifying final policy assignments...')
+        try:
+            verify_resp = requests.get(
+                f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}",
+                headers=headers, verify=False, timeout=30
+            )
+            verify_resp.raise_for_status()
+            policy_state = verify_resp.json()
+            assigned = policy_state.get("vcfPolicyAssignedResourceList", [])
+            lsf.write_output(f'MaxExpiration is assigned to {len(assigned)} resource(s):')
+            for res in assigned:
+                lsf.write_output(f'  - {res.get("resourceName", "?")} ({res.get("resourceType", "?")})')
+        
+            # Also check if the policy's isFleetPolicy flag is correct
+            is_fleet = policy_state.get("policyInfo", {}).get("isFleetPolicy", False)
+            if is_fleet:
+                lsf.write_output('INFO - Resetting isFleetPolicy to False (was set by previous FLEET assignment)')
+                policy_state["policyInfo"]["isFleetPolicy"] = False
+                requests.put(
+                    f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}",
+                    headers=headers, json=policy_state, verify=False, timeout=30
+                )
+        except Exception as e:
+            lsf.write_output(f'WARNING - Could not verify policy state: {e}')
+    
+        # Step 6: Delete other policies that are now unassigned
+        lsf.write_output('Cleaning up old policies with no remaining assignments...')
+        try:
+            query_resp = requests.post(
+                f"{api_base}/internal/passwordmanagement/policies/query",
+                headers=headers, json={}, verify=False, timeout=30
+            )
+            query_resp.raise_for_status()
+            for policy in query_resp.json().get("vcfPolicies", []):
+                pid = policy.get("policyId")
+                pname = policy.get("policyInfo", {}).get("policyName", "")
+                if pid == existing_policy_id:
+                    continue
+                assigned = policy.get("vcfPolicyAssignedResourceList", [])
+                if len(assigned) == 0:
+                    lsf.write_output(f'Deleting unassigned policy: {pname} ({pid})')
+                    del_resp = requests.delete(
+                        f"{api_base}/internal/passwordmanagement/policies/{pid}",
+                        headers=headers, verify=False, timeout=30
+                    )
+                    if del_resp.status_code == 204:
+                        lsf.write_output(f'SUCCESS - Deleted policy: {pname}')
+                    else:
+                        msg = del_resp.text[:100] if del_resp.text else ""
+                        lsf.write_output(f'WARNING - Could not delete {pname}: {del_resp.status_code} {msg}')
+                else:
+                    lsf.write_output(f'Keeping policy {pname} - still has {len(assigned)} assignment(s)')
+        except Exception as e:
+            lsf.write_output(f'WARNING - Could not clean up old policies: {e}')
+    
+        # Step 7: Attempt remediation
+        lsf.write_output('Attempting to remediate all inventory items...')
+        remediation_attempted = False
+        try:
+            remediate_resp = requests.post(
+                f"{api_base}/internal/passwordmanagement/policies/{existing_policy_id}/remediate",
+                headers=headers, json={}, verify=False, timeout=60
+            )
+            if remediate_resp.status_code in (200, 202, 204):
+                lsf.write_output('SUCCESS - Remediation triggered successfully')
+                remediation_attempted = True
+            else:
+                lsf.write_output(f'INFO - Remediate endpoint returned {remediate_resp.status_code}')
+        except Exception:
+            pass
+    
+        if not remediation_attempted:
+            lsf.write_output(f'{ops_fqdn}: INFO - Automatic remediation via API not available through suite-api proxy.')
+            lsf.write_output(f'{ops_fqdn}: INFO - Please remediate manually via VCF Operations Manager UI:')
+            lsf.write_output(f'{ops_fqdn}: INFO -   {base_url}/vcf-operations/ui/manage/fleet/fleet-settings')
+            lsf.write_output(f'{ops_fqdn}: INFO -   Navigate to Fleet Settings > select MaxExpiration > Remediate All')
     
     lsf.write_output('VCF Operations Fleet Password Policy configuration complete')
-    return True
+    return overall_success
 
 
 #==============================================================================
