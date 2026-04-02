@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.1 - 2026-03-13
+# Version 3.3 - 2026-04-01
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -336,6 +336,39 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('prelim', 'lab_files', 'complete')
         dashboard.generate_html()
     
+
+    #==========================================================================
+    # TASK 7: DISTRIBUTE VAULT CA TRUST
+    #==========================================================================
+    
+    lsf.write_output('Fetching Vault Root CA certificate...')
+    import urllib.request
+    try:
+        req = urllib.request.Request('http://10.1.1.1:32000/v1/pki/ca/pem')
+        with urllib.request.urlopen(req, timeout=10) as response:
+            vault_ca_pem = response.read().decode('utf-8').strip()
+            
+        if vault_ca_pem and 'BEGIN CERTIFICATE' in vault_ca_pem:
+            lsf.write_output('Successfully fetched Vault CA certificate.')
+            
+            # Dynamically import confighol-9.1.py to reuse its trust distribution logic
+            import importlib.util
+            confighol_path = '/home/holuser/hol/Tools/confighol-9.1.py'
+            if os.path.exists(confighol_path):
+                spec = importlib.util.spec_from_file_location("confighol", confighol_path)
+                confighol = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(confighol)
+                
+                # Execute the distribution function
+                lsf.write_output('Distributing Vault CA trust across VCF suite...')
+                confighol.distribute_vault_ca_trust(vault_ca_pem, lsf.get_password(), dry_run=dry_run)
+            else:
+                lsf.write_output(f'WARNING: Could not find {confighol_path} to distribute CA trust.')
+        else:
+            lsf.write_output('WARNING: Invalid Vault CA certificate received.')
+    except Exception as e:
+        lsf.write_output(f'WARNING: Failed to fetch Vault CA: {e}')
+ 
     ##=========================================================================
     ## End Core Team code
     ##=========================================================================
@@ -351,7 +384,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     ## The examples below demonstrate common operations. Uncomment and modify
     ## as needed for your specific lab requirements.
     ##=========================================================================
-    
+   
     ## Example 1: Check URL accessibility
     ## ----------------------------------
     ## Check if a web interface is accessible, optionally verify expected content
