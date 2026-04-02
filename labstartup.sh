@@ -981,6 +981,12 @@ else
     
 fi
 
+# if the file /home/holuser/hol/Tools/holorouter/certsrv_proxy.py exists, then copy it to /tmp/holorouter/certsrv_proxy.py
+if [ -f "/home/holuser/hol/Tools/holorouter/certsrv_proxy.py" ]; then
+    log_msg "Copying certsrv_proxy.py to /tmp/holorouter/certsrv_proxy.py" "${logfile}"
+    cp "/home/holuser/hol/Tools/holorouter/certsrv_proxy.py" /tmp/holorouter/certsrv_proxy.py
+fi
+
 #==============================================================================
 # PUSH CONSOLE FILES VIA NFS
 #==============================================================================

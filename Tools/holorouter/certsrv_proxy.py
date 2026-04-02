@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-VCF CA Proxy - Production
+Author: Burke Azbill, Cursor AI
+Version: 1.0.0
+Date: 2026-04-02
 
+Name: VCF CA Proxy
+
+Disclaimer:
 This software is not developed, endorsed, or affiliated with Microsoft Corporation. 
 It provides a certsrv-compatible interface for interoperability with products that 
 expect a Microsoft ADCS Web Enrollment endpoint, and translates requests to 
@@ -52,6 +57,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+SCRIPT_VERSION = "1.0.0"
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(
@@ -83,22 +90,62 @@ class CertStore:
 
 
 class KeyStore:
-    """Thread-safe in-memory store for generated Private Keys and CSRs."""
+    """Thread-safe store for generated Private Keys and CSRs (persists to disk)."""
 
-    def __init__(self):
+    def __init__(self, storage_dir: str = '/root/certsrv-proxy/keys'):
         self._lock = threading.Lock()
-        self._data = {}
+        self.storage_dir = storage_dir
+        if not os.path.exists(self.storage_dir):
+            try:
+                os.makedirs(self.storage_dir, exist_ok=True)
+            except Exception as e:
+                logger.error('Failed to create KeyStore directory %s: %s', self.storage_dir, e)
+
+    def _normalize_serial(self, serial: str) -> str:
+        return serial.replace(':', '-').lower()
 
     def store(self, serial: str, key_pem: str, csr_pem: str):
+        serial = self._normalize_serial(serial)
         with self._lock:
-            self._data[serial] = {
-                'key': key_pem,
-                'csr': csr_pem
-            }
+            try:
+                if not os.path.exists(self.storage_dir):
+                    os.makedirs(self.storage_dir, exist_ok=True)
+                if key_pem:
+                    with open(os.path.join(self.storage_dir, f"{serial}.key"), 'w') as f:
+                        f.write(key_pem)
+                if csr_pem:
+                    with open(os.path.join(self.storage_dir, f"{serial}.csr"), 'w') as f:
+                        f.write(csr_pem)
+            except Exception as e:
+                logger.error('Failed to save keys for serial %s: %s', serial, e)
 
     def get(self, serial: str) -> dict | None:
+        serial = self._normalize_serial(serial)
         with self._lock:
-            return self._data.get(serial)
+            key_path = os.path.join(self.storage_dir, f"{serial}.key")
+            csr_path = os.path.join(self.storage_dir, f"{serial}.csr")
+            result = {}
+            if os.path.exists(key_path):
+                try:
+                    with open(key_path, 'r') as f:
+                        result['key'] = f.read()
+                except Exception:
+                    pass
+            if os.path.exists(csr_path):
+                try:
+                    with open(csr_path, 'r') as f:
+                        result['csr'] = f.read()
+                except Exception:
+                    pass
+            return result if result else None
+
+    def has_key(self, serial: str) -> bool:
+        serial = self._normalize_serial(serial)
+        return os.path.exists(os.path.join(self.storage_dir, f"{serial}.key"))
+
+    def has_csr(self, serial: str) -> bool:
+        serial = self._normalize_serial(serial)
+        return os.path.exists(os.path.join(self.storage_dir, f"{serial}.csr"))
 
 
 class SessionManager:
@@ -345,13 +392,28 @@ class VaultPKIClient:
                 except x509.ExtensionNotFound:
                     pass
 
+                try:
+                    fingerprint = cert_obj.fingerprint(hashes.SHA256()).hex()
+                except Exception:
+                    fingerprint = ''
+
+                issuer_parts = []
+                for attr in cert_obj.issuer:
+                    try:
+                        issuer_parts.append(f"{attr.oid._name}={attr.value}")
+                    except Exception:
+                        issuer_parts.append(str(attr.value))
+                issuer = ", ".join(issuer_parts)
+
                 certs.append({
                     'serial': serial,
                     'cn': cn,
+                    'issuer': issuer,
+                    'fingerprint': fingerprint,
                     'dns_sans': dns_sans,
                     'ip_sans': ip_sans,
-                    'not_before': cert_obj.not_valid_before_utc.strftime('%Y-%m-%d %H:%M'),
-                    'not_after': cert_obj.not_valid_after_utc.strftime('%Y-%m-%d %H:%M'),
+                    'not_before': cert_obj.not_valid_before_utc.strftime('%Y-%m-%d %H:%M:%S'),
+                    'not_after': cert_obj.not_valid_after_utc.strftime('%Y-%m-%d %H:%M:%S'),
                     'revoked': revocation_time > 0,
                     'key_usage': key_usage_parts,
                 })
@@ -523,13 +585,14 @@ ADCS_CSS = """
   --revoked-text: #57707a;
   --spinner-border: #3b5360;
 }
-body { font-family: 'Metropolis', 'Avenir Next', 'Helvetica Neue', Arial, sans-serif; margin: 0; padding: 0; font-size: 14px; color: var(--text); background: var(--bg); transition: background .2s, color .2s; }
-.banner { background: var(--banner-bg); color: #fff; padding: 10px 24px; font-size: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+body { font-family: 'Metropolis', 'Avenir Next', 'Helvetica Neue', Arial, sans-serif; margin: 0; padding: 0; font-size: 14px; color: var(--text); background: var(--bg); transition: background .2s, color .2s; min-height: 100vh; display: flex; flex-direction: column; }
+.banner { background: var(--banner-bg); color: #fff; padding: 10px 24px; font-size: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 1000; }
+.page-footer { text-align: center; padding: 5px 0; color: var(--text-muted); font-size: 12px; margin-top: 24px; border-top: 1px solid var(--border); position: sticky; bottom: 0; background: var(--bg); z-index: 1000; }
 .banner a { color: #fff; text-decoration: none; font-size: 13px; }
 .banner-right { display: flex; align-items: center; gap: 16px; }
 .theme-toggle { background: none; border: none; cursor: pointer; color: #fff; font-size: 14px; line-height: 1; display: flex; align-items: center; padding: 4px 8px; border-radius: 4px; }
 .theme-toggle:hover { background: rgba(255,255,255,.1); }
-.content { padding: 24px 30px; max-width: 960px; }
+.content { padding: 24px 30px; max-width: 95%; margin: 0 auto; flex: 1; box-sizing: border-box; }
 h2 { color: var(--text); font-size: 18px; margin-top: 0; font-weight: 400; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
 a { color: var(--accent); }
 a:hover { color: var(--accent-hover); }
@@ -561,6 +624,32 @@ table.form-table td:first-child { font-weight: 500; white-space: nowrap; text-al
 @keyframes spin { to { transform: rotate(360deg); } }
 .msg-ok { color: var(--status-ok); font-weight: 600; }
 .msg-err { color: var(--status-err); font-weight: 600; }
+
+/* Modal CSS */
+.modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; display: none; opacity: 0; transition: opacity 0.3s; }
+.modal-overlay.show { display: block; opacity: 1; }
+.side-panel { position: fixed; top: 0; right: -800px; width: 800px; max-width: 90vw; height: 100%; background: var(--bg); box-shadow: -4px 0 15px rgba(0,0,0,0.2); z-index: 1001; transition: right 0.3s ease-in-out; overflow-y: auto; display: flex; flex-direction: column; }
+.side-panel.show { right: 0; }
+.panel-header { padding: 10px 24px; background: var(--th-bg); color: var(--th-text); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); }
+.panel-header h3 { margin: 0; font-size: 18px; font-weight: 500; }
+.close-btn { background: none; border: none; color: var(--th-text); font-size: 24px; cursor: pointer; line-height: 1; padding: 0; opacity: 0.8; }
+.close-btn:hover { opacity: 1; }
+.panel-content { padding: 24px; flex: 1; display: flex; flex-direction: column; gap: 24px; }
+.cert-section { background: var(--bg-alt); border: 1px solid var(--border); border-radius: 6px; padding: 16px; position: relative; }
+.cert-section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.cert-section-title { font-weight: 600; color: var(--accent); font-size: 15px; margin: 0; display: flex; align-items: center; gap: 8px; }
+.status-badge { font-size: 11px; padding: 2px 6px; border-radius: 4px; font-weight: 600; text-transform: uppercase; }
+.status-active { background: var(--status-ok); color: white; }
+.status-revoked { background: var(--status-err); color: white; }
+.meta-grid { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; font-size: 13px; }
+.meta-label { color: var(--text-muted); text-align: right; user-select: none; }
+.meta-value { font-family: Consolas, monospace; word-break: break-all; }
+.pem-container { position: relative; display: flex; flex-direction: column; }
+.pem-textarea { width: 100%; box-sizing: border-box; min-height: 120px; font-family: Consolas, monospace; font-size: 12px; padding: 12px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; resize: vertical; white-space: pre; overflow-wrap: normal; overflow-x: auto; }
+.copy-overlay-btn { position: absolute; top: 8px; right: 8px; background: var(--dl-bg); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-size: 12px; cursor: pointer; color: var(--text); opacity: 0.7; transition: opacity 0.2s; display: flex; align-items: center; gap: 4px; }
+.copy-overlay-btn:hover { opacity: 1; background: var(--dl-hover); border-color: var(--accent); }
+.dl-action-btn { background: var(--accent-light); color: #fff; border: none; padding: 6px 12px; border-radius: 4px; font-size: 12px; font-weight: 600; text-decoration: none; display: inline-flex; align-items: center; gap: 4px; transition: background 0.2s; }
+.dl-action-btn:hover { background: var(--accent); }
 </style>
 <script>
 (function(){var t=localStorage.getItem('clarity-theme');if(t==='dark')document.documentElement.setAttribute('data-theme','dark');})();
@@ -568,7 +657,7 @@ table.form-table td:first-child { font-weight: 500; white-space: nowrap; text-al
 """
 
 def page_wrap(title: str, body: str, wide: bool = False) -> str:
-    content_style = ' style="max-width:95%"' if wide else ''
+    content_style = ' style="max-width:95%; margin: 0 auto;"' if wide else ''
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>{title}</title>{ADCS_CSS}</head>
 <body>
@@ -585,6 +674,7 @@ def page_wrap(title: str, body: str, wide: bool = False) -> str:
 <div class="content"{content_style}>
 {body}
 </div>
+<div class="page-footer">VCF CA Proxy v{SCRIPT_VERSION}</div>
 <script>
 var pathMoon = "M18.11 32.0003C10.33 32.0003 4 25.7203 4 17.9903C4 10.2603 10.03 4.2003 17.73 4.0003C18.15 3.9903 18.52 4.2303 18.68 4.6103C18.84 4.9903 18.75 5.4303 18.46 5.7203C16.69 7.4503 15.71 9.7603 15.71 12.2103C15.71 17.2403 19.83 21.3303 24.91 21.3303C26.9 21.3303 28.8 20.7003 30.41 19.5103C30.74 19.2703 31.19 19.2503 31.53 19.4603C31.88 19.6803 32.06 20.0803 31.99 20.4903C30.78 27.1603 24.94 32.0003 18.11 32.0003ZM15.43 6.2903C9.99 7.4803 6 12.2403 6 17.9903C6 24.6103 11.43 30.0003 18.11 30.0003C23.16 30.0003 27.58 26.9203 29.37 22.4003C27.97 23.0103 26.46 23.3203 24.91 23.3203C18.74 23.3203 13.71 18.3303 13.71 12.2003C13.71 10.0703 14.31 8.0303 15.43 6.2803V6.2903Z";
 var pathSun = "M8.81 10.22C9.01 10.42 9.26 10.51 9.52 10.51C9.78 10.51 10.03 10.41 10.23 10.22C10.62 9.83 10.62 9.2 10.23 8.81L8.11 6.69C7.72 6.3 7.09 6.3 6.7 6.69C6.31 7.08 6.31 7.71 6.7 8.1L8.82 10.22H8.81ZM7 18C7 17.45 6.55 17 6 17H3C2.45 17 2 17.45 2 18C2 18.55 2.45 19 3 19H6C6.55 19 7 18.55 7 18ZM18 7C18.55 7 19 6.55 19 6V3C19 2.45 18.55 2 18 2C17.45 2 17 2.45 17 3V6C17 6.55 17.45 7 18 7ZM26.49 10.51C26.75 10.51 27 10.41 27.2 10.22L29.32 8.1C29.71 7.71 29.71 7.08 29.32 6.69C28.93 6.3 28.3 6.3 27.91 6.69L25.79 8.81C25.4 9.2 25.4 9.83 25.79 10.22C25.99 10.42 26.24 10.51 26.5 10.51H26.49ZM8.81 25.78L6.69 27.9C6.3 28.29 6.3 28.92 6.69 29.31C6.89 29.51 7.14 29.6 7.4 29.6C7.66 29.6 7.91 29.5 8.11 29.31L10.23 27.19C10.62 26.8 10.62 26.17 10.23 25.78C9.84 25.39 9.21 25.39 8.82 25.78H8.81ZM33 17H30C29.45 17 29 17.45 29 18C29 18.55 29.45 19 30 19H33C33.55 19 34 18.55 34 18C34 17.45 33.55 17 33 17ZM18 9C13.04 9 9 13.04 9 18C9 22.96 13.04 27 18 27C22.96 27 27 22.96 27 18C27 13.04 22.96 9 18 9ZM18 25C14.14 25 11 21.86 11 18C11 14.14 14.14 11 18 11C21.86 11 25 14.14 25 18C25 21.86 21.86 25 18 25ZM27.19 25.78C26.8 25.39 26.17 25.39 25.78 25.78C25.39 26.17 25.39 26.8 25.78 27.19L27.9 29.31C28.1 29.51 28.35 29.6 28.61 29.6C28.87 29.6 29.12 29.5 29.32 29.31C29.71 28.92 29.71 28.29 29.32 27.9L27.2 25.78H27.19ZM18 29C17.45 29 17 29.45 17 30V33C17 33.55 17.45 34 18 34C18.55 34 19 33.55 19 33V30C19 29.45 18.55 29 18 29Z";
@@ -634,7 +724,6 @@ or certificate revocation list (CRL), or to view the status of a pending request
 <li><a href="/certsrv/certckpn.asp">View the status of a pending certificate request</a></li>
 <li><a href="/certsrv/certcarc.asp">Download a CA certificate, certificate chain, or CRL</a></li>
 </ul>
-<hr>
 """)
 
 CERTRQUS_HTML = page_wrap('VCF CA Proxy - Request a Certificate', """
@@ -649,7 +738,6 @@ CERTRQUS_HTML = page_wrap('VCF CA Proxy - Request a Certificate', """
 </li>
 </ul>
 <p>Or, submit an <a href="certrqad.asp">advanced certificate request</a>.</p>
-<hr>
 """)
 
 CERTRQAD_HTML = page_wrap('VCF CA Proxy - Advanced Certificate Request', """
@@ -661,7 +749,6 @@ Click one of the following options to:</p>
 <li><a href="certrqxt.asp">Submit a certificate request by using a base-64-encoded CMC or PKCS #10 file,
 or submit a renewal request by using a base-64-encoded PKCS #7 file.</a></li>
 </ul>
-<hr>
 """)
 
 CERTCKPN_HTML = page_wrap('VCF CA Proxy - Pending Request Status', """
@@ -670,7 +757,6 @@ CERTCKPN_HTML = page_wrap('VCF CA Proxy - Pending Request Status', """
 There are no pending requests.</p>
 <p>Certificates issued through this proxy are signed instantly by the backing PKI engine (HashiCorp Vault).</p>
 <p><a href="/certsrv/">&laquo; Back to home</a></p>
-<hr>
 """)
 
 def build_certfnsh_success(req_id: int) -> str:
@@ -684,7 +770,6 @@ def build_certfnsh_success(req_id: int) -> str:
 <a href="certnew.p7b?ReqID={req_id}&amp;Enc=b64">Download certificate chain (PKCS#7)</a>
 <a href="certnew.p7b?ReqID={req_id}&amp;Enc=bin">Download certificate chain (PKCS#7 DER)</a>
 </div>
-<hr>
 <p><a href="/certsrv/">&laquo; Back to home</a></p>
 """)
 
@@ -692,7 +777,6 @@ CERTFNSH_DENIED_TEMPLATE = page_wrap('VCF CA Proxy - Certificate Request Denied'
 <h2>Certificate Request Denied</h2>
 <p>Your certificate request was denied.</p>
 <p>The disposition message is: <b>{{ERROR}}</b></p>
-<hr>
 <p><a href="/certsrv/">&laquo; Back to home</a></p>
 """)
 
@@ -806,7 +890,7 @@ def build_certcarc() -> str:
 <span id="cert-count" style="font-size:12px;color:var(--text-muted)"></span>
 </div>
 <p id="cert-status"><span class="spinner"></span> Loading certificates&hellip;</p>
-<div style="overflow-x:auto;width:90%">
+<div style="overflow-x:auto;width:100%">
 <table class="cert-table" id="cert-table" style="display:none">
 <thead><tr>
 <th style="width:30px;min-width:30px"><input type="checkbox" id="select-all" title="Select all"></th>
@@ -824,7 +908,92 @@ def build_certcarc() -> str:
 </div>
 <button class="btn-revoke" id="btn-revoke" style="display:none" onclick="revokeSelected()">Revoke Selected</button>
 </div>
-<hr>
+
+<!-- Modal Overlay & Side Panel -->
+<div class="modal-overlay" id="modal-overlay" onclick="hideCertDetail()"></div>
+<div class="side-panel" id="side-panel">
+    <div class="panel-header">
+        <h3 id="panel-title">Certificate Details</h3>
+        <button class="close-btn" onclick="hideCertDetail()">&times;</button>
+    </div>
+    <div class="panel-content">
+        <!-- Metadata Section -->
+        <div class="cert-section" style="border-left: 4px solid var(--accent);">
+            <div class="cert-section-header">
+                <div class="cert-section-title">Overview <span id="modal-status" class="status-badge status-active">ACTIVE</span></div>
+            </div>
+            <div class="meta-grid">
+                <div class="meta-label">Subject:</div><div class="meta-value" id="modal-cn"></div>
+                <div class="meta-label">Issuer:</div><div class="meta-value" id="modal-issuer"></div>
+                <div class="meta-label">SANs:</div><div class="meta-value" id="modal-sans"></div>
+                <div class="meta-label">Serial:</div><div class="meta-value" id="modal-serial"></div>
+                <div class="meta-label">Valid From:</div><div class="meta-value" id="modal-issued"></div>
+                <div class="meta-label">Valid Until:</div><div class="meta-value" id="modal-expires"></div>
+                <div class="meta-label">Key Usage:</div><div class="meta-value" id="modal-ku"></div>
+                <div class="meta-label">SHA256 FP:</div><div class="meta-value" id="modal-fp"></div>
+            </div>
+        </div>
+
+        <!-- Certificate PEM Section -->
+        <div class="cert-section">
+            <div class="cert-section-header">
+                <div class="cert-section-title">Certificate</div>
+                <a id="modal-dl-cert" href="#" class="dl-action-btn">Download PEM</a>
+            </div>
+            <div class="pem-container">
+                <button class="copy-overlay-btn" onclick="copyTextArea('modal-pem-cert', this)">&#128203; Copy</button>
+                <textarea id="modal-pem-cert" class="pem-textarea" readonly></textarea>
+            </div>
+        </div>
+
+        <!-- Chain PEM Section -->
+        <div class="cert-section">
+            <div class="cert-section-header">
+                <div class="cert-section-title">Chain (Intermediates)</div>
+                <a id="modal-dl-chain" href="#" class="dl-action-btn">Download Chain</a>
+            </div>
+            <div class="pem-container">
+                <button class="copy-overlay-btn" onclick="copyTextArea('modal-pem-chain', this)">&#128203; Copy</button>
+                <textarea id="modal-pem-chain" class="pem-textarea" readonly></textarea>
+            </div>
+        </div>
+
+        <!-- Full Chain PEM Section -->
+        <div class="cert-section">
+            <div class="cert-section-header">
+                <div class="cert-section-title">Full Chain (Cert + Intermediates)</div>
+                <a id="modal-dl-full" href="#" class="dl-action-btn">Download Full Chain</a>
+            </div>
+            <div class="pem-container">
+                <button class="copy-overlay-btn" onclick="copyTextArea('modal-pem-full', this)">&#128203; Copy</button>
+                <textarea id="modal-pem-full" class="pem-textarea" readonly></textarea>
+            </div>
+        </div>
+
+        <!-- Private Key / CSR Section (if available) -->
+        <div class="cert-section" id="modal-key-section" style="display:none;">
+            <div class="cert-section-header">
+                <div class="cert-section-title">Private Key</div>
+                <a id="modal-dl-key" href="#" class="dl-action-btn">Download Key</a>
+            </div>
+            <div class="pem-container">
+                <button class="copy-overlay-btn" onclick="copyTextArea('modal-pem-key', this)">&#128203; Copy</button>
+                <textarea id="modal-pem-key" class="pem-textarea" readonly></textarea>
+            </div>
+        </div>
+        <div class="cert-section" id="modal-csr-section" style="display:none;">
+            <div class="cert-section-header">
+                <div class="cert-section-title">CSR (Certificate Signing Request)</div>
+                <a id="modal-dl-csr" href="#" class="dl-action-btn">Download CSR</a>
+            </div>
+            <div class="pem-container">
+                <button class="copy-overlay-btn" onclick="copyTextArea('modal-pem-csr', this)">&#128203; Copy</button>
+                <textarea id="modal-pem-csr" class="pem-textarea" readonly></textarea>
+            </div>
+        </div>
+
+    </div>
+</div>
 
 <style>
 .sortable { cursor: pointer; user-select: none; position: relative; }
@@ -896,8 +1065,8 @@ function dlLinks(c) {
         + '<a href="/certsrv/api/cert/' + s + '?fmt=pem" title="Download PEM">PEM</a>'
         + '<a href="/certsrv/api/cert/' + s + '?fmt=der" title="Download DER">DER</a>'
         + '<a href="/certsrv/api/cert/' + s + '?fmt=p7b" title="Download PKCS#7">P7B</a>'
-        + '<a href="/certsrv/api/cert/' + s + '?fmt=csr" title="Download CSR">CSR</a>'
-        + '<a href="/certsrv/api/cert/' + s + '?fmt=key" title="Download Private Key">KEY</a>'
+        + (c.has_csr ? '<a href="/certsrv/api/cert/' + s + '?fmt=csr" title="Download CSR">CSR</a>' : '<a class="disabled" title="CSR not available" style="opacity:0.4;cursor:not-allowed">CSR</a>')
+        + (c.has_key ? '<a href="/certsrv/api/cert/' + s + '?fmt=key" title="Download Private Key">KEY</a>' : '<a class="disabled" title="Private Key not available" style="opacity:0.4;cursor:not-allowed">KEY</a>')
         + '</span>';
 }
 
@@ -923,7 +1092,7 @@ function renderTable(certs) {
         if (c.revoked) tr.className = 'revoked';
         var serialDisp = truncSerial(c.serial);
         tr.innerHTML = '<td><input type="checkbox" name="sel" value="' + esc(c.serial) + '"' + (c.revoked ? ' disabled' : '') + '></td>'
-            + '<td>' + esc(c.cn) + '</td>'
+            + '<td><a href="#" title="View full Certificate Details" onclick="showCertDetail(\\'' + esc(c.serial).replace(/'/g, "\\\\'") + '\\'); return false;">' + esc(c.cn) + '</a></td>'
             + '<td class="san-list">' + esc(sansText(c)) + '</td>'
             + '<td class="date-col">' + fmtDate(c.not_before) + '</td>'
             + '<td class="date-col">' + fmtDate(c.not_after) + '</td>'
@@ -1056,6 +1225,98 @@ function revokeSelected() {
         if (result.error) { alert('Error: ' + result.error); }
         else { alert('Revoked ' + (result.revoked || 0) + ' certificate(s).'); }
         loadCerts();
+    });
+}
+
+function showCertDetail(serial) {
+    var cert = _allCerts.find(function(c) { return c.serial === serial; });
+    if (!cert) return;
+
+    document.getElementById('modal-cn').textContent = cert.cn || '-';
+    document.getElementById('modal-issuer').textContent = cert.issuer || '-';
+    document.getElementById('modal-sans').textContent = sansText(cert);
+    document.getElementById('modal-serial').textContent = cert.serial;
+    document.getElementById('modal-issued').textContent = cert.not_before || '-';
+    document.getElementById('modal-expires').textContent = cert.not_after || '-';
+    document.getElementById('modal-ku').textContent = kuText(cert);
+    document.getElementById('modal-fp').textContent = cert.fingerprint || '-';
+
+    var statusEl = document.getElementById('modal-status');
+    if (cert.revoked) {
+        statusEl.textContent = 'REVOKED';
+        statusEl.className = 'status-badge status-revoked';
+    } else {
+        statusEl.textContent = 'ACTIVE';
+        statusEl.className = 'status-badge status-active';
+    }
+
+    var encSerial = encodeURIComponent(cert.serial);
+    document.getElementById('modal-dl-cert').href = '/certsrv/api/cert/' + encSerial + '?fmt=pem';
+    document.getElementById('modal-dl-chain').href = '/certsrv/certnew.p7b?ReqID=CACert&Enc=b64';
+    document.getElementById('modal-dl-full').href = '/certsrv/api/cert/' + encSerial + '?fmt=p7b';
+
+    document.getElementById('modal-pem-cert').value = 'Loading...';
+    document.getElementById('modal-pem-chain').value = 'Loading...';
+    document.getElementById('modal-pem-full').value = 'Loading...';
+
+    // Fetch Leaf Cert
+    xhrGet('/certsrv/api/cert/' + encSerial + '?fmt=pem', function(status, body) {
+        if (status === 200) {
+            document.getElementById('modal-pem-cert').value = body;
+            // Fetch CA Cert after Leaf to build Full Chain preview
+            xhrGet('/certsrv/certnew.cer?ReqID=CACert&Enc=b64', function(caStatus, caBody) {
+                if (caStatus === 200) {
+                    document.getElementById('modal-pem-chain').value = caBody;
+                    document.getElementById('modal-pem-full').value = body.trim() + '\\n' + caBody.trim();
+                } else {
+                    document.getElementById('modal-pem-chain').value = 'Error loading CA cert';
+                    document.getElementById('modal-pem-full').value = 'Error loading full chain';
+                }
+            });
+        } else {
+            document.getElementById('modal-pem-cert').value = 'Error loading certificate';
+        }
+    });
+
+    if (cert.has_key) {
+        document.getElementById('modal-key-section').style.display = 'block';
+        document.getElementById('modal-dl-key').href = '/certsrv/api/cert/' + encSerial + '?fmt=key';
+        document.getElementById('modal-pem-key').value = 'Loading...';
+        xhrGet('/certsrv/api/cert/' + encSerial + '?fmt=key', function(status, body) {
+            document.getElementById('modal-pem-key').value = status === 200 ? body : 'Error loading key';
+        });
+    } else {
+        document.getElementById('modal-key-section').style.display = 'none';
+    }
+
+    if (cert.has_csr) {
+        document.getElementById('modal-csr-section').style.display = 'block';
+        document.getElementById('modal-dl-csr').href = '/certsrv/api/cert/' + encSerial + '?fmt=csr';
+        document.getElementById('modal-pem-csr').value = 'Loading...';
+        xhrGet('/certsrv/api/cert/' + encSerial + '?fmt=csr', function(status, body) {
+            document.getElementById('modal-pem-csr').value = status === 200 ? body : 'Error loading CSR';
+        });
+    } else {
+        document.getElementById('modal-csr-section').style.display = 'none';
+    }
+
+    document.getElementById('modal-overlay').classList.add('show');
+    document.getElementById('side-panel').classList.add('show');
+}
+
+function hideCertDetail() {
+    document.getElementById('modal-overlay').classList.remove('show');
+    document.getElementById('side-panel').classList.remove('show');
+}
+
+function copyTextArea(id, btn) {
+    var ta = document.getElementById(id);
+    ta.select();
+    ta.setSelectionRange(0, 99999); // For mobile devices
+    navigator.clipboard.writeText(ta.value).then(function() {
+        var originalText = btn.innerHTML;
+        btn.innerHTML = '&#10003; Copied';
+        setTimeout(function() { btn.innerHTML = originalText; }, 2000);
     });
 }
 
@@ -1238,7 +1499,7 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore, key_store:
                 self._handle_api_certs()
 
             elif path.startswith('/certsrv/api/cert/'):
-                serial = path[len('/certsrv/api/cert/'):]
+                serial = unquote_plus(path[len('/certsrv/api/cert/'):])
                 self._handle_api_cert_download(serial, params)
 
             elif path == '/certsrv/oidc/callback':
@@ -1434,6 +1695,23 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore, key_store:
 
             req_id = cert_store.store(cert_bundle)
             logger.info('Certificate issued: ReqID=%d, CN=%s', req_id, cn)
+            
+            try:
+                pem_blocks = re.findall(
+                    r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----',
+                    cert_bundle, re.DOTALL)
+                if pem_blocks:
+                    cert_obj = x509.load_pem_x509_certificate(pem_blocks[0].encode())
+                    serial_int = cert_obj.serial_number
+                    serial_hex = format(serial_int, 'x')
+                    if len(serial_hex) % 2 != 0:
+                        serial_hex = '0' + serial_hex
+                    vault_serial = '-'.join(serial_hex[i:i+2] for i in range(0, len(serial_hex), 2))
+                    key_store.store(vault_serial, None, csr_pem)
+                    logger.info('Stored CSR for serial %s', vault_serial)
+            except Exception as e:
+                logger.error('Failed to extract serial for CSR storage: %s', e)
+
             self._send_html(200, build_certfnsh_success(req_id))
 
         def _handle_certnew_cer(self, params: dict):
@@ -1558,6 +1836,14 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore, key_store:
         def _handle_api_certs(self):
             """JSON API: list all issued certificates."""
             certs = vault_client.list_certificates()
+            for cert in certs:
+                serial = cert.get('serial')
+                if serial:
+                    cert['has_csr'] = key_store.has_csr(serial)
+                    cert['has_key'] = key_store.has_key(serial)
+                else:
+                    cert['has_csr'] = False
+                    cert['has_key'] = False
             self._send_json(200, certs)
 
         def _handle_api_cert_download(self, serial: str, params: dict):

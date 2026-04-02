@@ -1411,7 +1411,7 @@ THUMB=$(echo | openssl s_client -connect vc-mgmt-a.site-a.vcf.lab:443 2>/dev/nul
 # GET compute manager, modify credential.thumbprint, PUT back
 ```
 
-**Prevention**: Always check `dir-cli trustedcert list | grep -c 'vcf.lab Root Authority'` before calling `dir-cli trustedcert publish`. The `/home/holuser/hol/Tools/confighol-9.1.py` v2.11+ includes this guard.
+**Prevention**: Always check `dir-cli trustedcert list | grep -c 'vcf.lab Root Authority'` before calling `dir-cli trustedcert publish`. When running this check via SSH, be aware that terminal banners (like `VMware vCenter Server...`) may precede the command's stdout, so you must parse the last non-empty line of output rather than checking `stdout.strip() != '0'`. The `/home/holuser/hol/Tools/confighol-9.1.py` script includes this robust parsing guard.
 
 **Automated Fix**: `/home/holuser/hol/Tools/cert-replacement.py` (in `Tools/`) includes `NSXComputeManagerFixer` which automatically runs after vCenter/NSX certificate replacements. It fixes double-cert entries, ensures Vault CA is in NSX trust stores, and re-registers compute managers with the new thumbprint. Must also fix WLD vCenter (SSO admin: `administrator@wld.sso`) — both vCenters can have the double-cert issue.
 
