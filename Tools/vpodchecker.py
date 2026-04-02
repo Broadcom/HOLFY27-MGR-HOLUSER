@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.5 - March 19, 2026
+# Version 2.6 - April 2, 2026
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.6 - 2026-04-02:
+#   - Fixed issue with Firefox root CA check not being imported
+#   - Update to skip the VCFA DRS Isolation check if the lab is not using VCFA
 # v2.5 - 2026-03-19:
 #   - Fixed _get_nsx_manager_for_edge_check() to support VCF 9.1 C4 'vna-'
 #     prefixed edge names in addition to 'edge-' prefix
@@ -1738,9 +1741,7 @@ def check_password_expirations() -> List[CheckResult]:
 LMC_FIREFOX_PROFILE_BASE = '/lmchol/home/holuser/snap/firefox/common/.mozilla/firefox'
 CERTUTIL_BINARY = 'certutil'
 
-EXPECTED_PRIVATE_CAS = [
-    'vcf.lab Root Authority',
-]
+EXPECTED_PRIVATE_CAS = []
 
 
 def _find_firefox_profiles() -> List[str]:
@@ -1806,7 +1807,7 @@ def _get_firefox_private_cas(profile_path: str) -> List[Tuple[str, str, dict]]:
             if export.returncode == 0 and export.stdout:
                 info = subprocess.run(
                     ['openssl', 'x509', '-noout', '-subject', '-issuer',
-                     '-startdate', '-enddate'],
+                     '-startdate', '-enddate', '-fingerprint', '-sha256'],
                     input=export.stdout, capture_output=True, text=True, timeout=10
                 )
                 if info.returncode == 0:
@@ -1819,6 +1820,8 @@ def _get_firefox_private_cas(profile_path: str) -> List[Tuple[str, str, dict]]:
                             details['not_before'] = info_line[len('notBefore='):].strip()
                         elif info_line.startswith('notAfter='):
                             details['not_after'] = info_line[len('notAfter='):].strip()
+                        elif info_line.startswith('sha256 Fingerprint='):
+                            details['fingerprint'] = info_line[len('sha256 Fingerprint='):].strip()
 
                     # Calculate days until expiry
                     if 'not_after' in details:
@@ -1865,6 +1868,27 @@ def _build_expected_ca_list() -> List[str]:
     return expected
 
 
+def _get_vault_ca_fingerprint() -> Optional[str]:
+    """
+    Fetch the active Vault CA certificate and compute its SHA256 fingerprint.
+    """
+    try:
+        import requests
+        resp = requests.get('http://10.1.1.1:32000/v1/pki/ca/pem', timeout=5)
+        if resp.status_code == 200:
+            info = subprocess.run(
+                ['openssl', 'x509', '-noout', '-fingerprint', '-sha256'],
+                input=resp.text, capture_output=True, text=True, timeout=5
+            )
+            if info.returncode == 0:
+                for line in info.stdout.splitlines():
+                    if line.startswith('sha256 Fingerprint='):
+                        return line[len('sha256 Fingerprint='):].strip()
+    except Exception:
+        pass
+    return None
+
+
 def check_firefox_trusted_cas() -> List[CheckResult]:
     """
     Check that all expected private CA certificates are trusted in Firefox.
@@ -1908,12 +1932,17 @@ def check_firefox_trusted_cas() -> List[CheckResult]:
 
     expected = _build_expected_ca_list()
     found_names = {name for name, _, _ in found_cas}
+    found_fps = {details.get('fingerprint') for _, _, details in found_cas if 'fingerprint' in details}
+
+    vault_fp = _get_vault_ca_fingerprint()
+    vault_ca_found = False
 
     # Report each found CA
     for nickname, trust, details in found_cas:
         days = details.get('days_until_expiry')
         not_after = details.get('not_after', 'unknown')
         subject = details.get('subject', '')
+        fp = details.get('fingerprint')
 
         if days is not None and days < 0:
             status = "FAIL"
@@ -1927,6 +1956,13 @@ def check_firefox_trusted_cas() -> List[CheckResult]:
         else:
             status = "PASS"
             message = "Trusted (could not determine expiry)"
+
+        # Check if this is the active Vault CA
+        if vault_fp and fp == vault_fp:
+            vault_ca_found = True
+            message = f"Active Vault CA | {message}"
+        elif 'vcf.lab Root Authority' in nickname:
+            message = f"Inactive/Old Vault CA | {message}"
 
         # Include a concise subject hint for context
         if subject:
@@ -1942,6 +1978,22 @@ def check_firefox_trusted_cas() -> List[CheckResult]:
             status=status,
             message=message,
             details=details,
+        ))
+
+    # Check if the active Vault CA was found
+    if vault_fp and not vault_ca_found:
+        results.append(CheckResult(
+            name="Firefox CA: vcf.lab Root Authority",
+            status="FAIL",
+            message="MISSING - Active Vault CA not found in Firefox certificate store",
+            details={'expected_fingerprint': vault_fp, 'profile': profile_path}
+        ))
+    elif not vault_fp:
+        results.append(CheckResult(
+            name="Firefox CA: vcf.lab Root Authority",
+            status="WARN",
+            message="Could not fetch active Vault CA fingerprint from 10.1.1.1:32000",
+            details={'profile': profile_path}
         ))
 
     # Report any expected CAs that are missing
@@ -2190,6 +2242,26 @@ def check_auto_platform_isolation() -> List[CheckResult]:
     6. A mandatory must-NOT-run-on anti-affinity rule keeps other VMs away
     """
     results: List[CheckResult] = []
+
+    # Check if vravms is defined in config.ini
+    has_vravms = False
+    if lsf and hasattr(lsf, 'config'):
+        for section in ['VCFFINAL', 'VCF', 'RESOURCES']:
+            if lsf.config.has_section(section) and lsf.config.has_option(section, 'vravms'):
+                lines = lsf.config.get(section, 'vravms').split('\n')
+                for line in lines:
+                    if line.strip() and not line.strip().startswith('#'):
+                        has_vravms = True
+                        break
+            if has_vravms:
+                break
+                    
+    if not has_vravms:
+        results.append(CheckResult(
+            name='DRS Isolation: auto-platform-a',
+            status='SKIPPED',
+            message='vravms not defined in config.ini'))
+        return results
 
     if not PYVMOMI_AVAILABLE or not lsf or not lsf.sis:
         results.append(CheckResult(
