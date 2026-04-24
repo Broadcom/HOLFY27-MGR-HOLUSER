@@ -4,13 +4,20 @@
 # Author - Burke Azbill and HOL Core Team
 # Imports DNS records from config.ini [VPOD] new-dns-records or new-dns-records.csv
 # Reference: https://github.com/burkeazbill/tdns-mgr
+#
+# Before DNS work, compares local ``tdns-mgr --version`` to upstream VERSION on main;
+# if newer, downloads tdns-mgr.sh to ~/.local/bin/tdns-mgr (skip: TDNS_IMPORT_SKIP_AUTO_UPDATE
+# or ``--skip-tdns-auto-update``).
 
 import csv
+import json
 import os
 import re
-import sys
-import json
 import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
 from typing import Optional, Dict, Any, List, Tuple
 
 # Add hol directory to path
@@ -20,9 +27,15 @@ sys.path.insert(0, '/home/holuser/hol')
 # CONFIGURATION
 #==============================================================================
 
-TDNS_MGR_PATH = '/usr/local/bin/tdns-mgr'
+TDNS_MGR_INSTALL_PATH = os.path.expanduser('~/.local/bin/tdns-mgr')
+TDNS_MGR_PATH = TDNS_MGR_INSTALL_PATH
+TDNS_MGR_UPSTREAM_RAW = (
+    'https://raw.githubusercontent.com/burkeazbill/tdns-mgr/'
+    'refs/heads/main/tdns-mgr.sh'
+)
 DNS_RECORDS_FILENAME = 'new-dns-records.csv'
 DEFAULT_CREDS_FILE = '/home/holuser/creds.txt'
+_UPSTREAM_VERSION_RE = re.compile(r'^VERSION="([^"]+)"', re.MULTILINE)
 
 # CSV header format per tdns-mgr specification
 # See: https://raw.githubusercontent.com/burkeazbill/tdns-mgr/refs/heads/main/new-dns-records.csv
@@ -132,6 +145,169 @@ def tdns_mgr_cmd(*parts: str) -> List[str]:
     return [TDNS_MGR_PATH, *parts]
 
 
+def locate_existing_tdns_mgr() -> Optional[str]:
+    """
+    Return the first usable tdns-mgr binary path without mutating TDNS_MGR_PATH.
+    Search order matches historical lab layout (user install, then system paths, then PATH).
+    """
+    candidates: List[str] = []
+    for p in (
+        TDNS_MGR_INSTALL_PATH,
+        TDNS_MGR_PATH,
+        '/usr/local/bin/tdns-mgr',
+        '/usr/bin/tdns-mgr',
+        os.path.expanduser('~/.local/bin/tdns-mgr'),
+        '/home/holuser/bin/tdns-mgr',
+    ):
+        if p and p not in candidates:
+            candidates.append(p)
+
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+
+    try:
+        result = subprocess.run(
+            ['which', 'tdns-mgr'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    w = result.stdout.strip().split('\n')[0].strip()
+    if w and os.path.isfile(w) and os.access(w, os.X_OK):
+        return w
+    return None
+
+
+def get_installed_tdns_mgr_version(bin_path: str) -> Optional[str]:
+    """Parse ``DNS Manager vX.Y.Z`` from ``tdns-mgr --version`` / ``-v``."""
+    for flag in ('--version', '-v'):
+        try:
+            r = subprocess.run(
+                [bin_path, flag],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        combined = ((r.stdout or '') + (r.stderr or '')).strip()
+        m = re.search(r'DNS\s+Manager\s+v?\s*([\d.]+)', combined, re.I)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def fetch_upstream_tdns_sh() -> Optional[str]:
+    """Download upstream ``tdns-mgr.sh`` from GitHub raw (main branch)."""
+    try:
+        req = urllib.request.Request(
+            TDNS_MGR_UPSTREAM_RAW,
+            headers={'User-Agent': 'HOLFY27-tdns_import.py (lab auto-update)'},
+        )
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            return resp.read().decode('utf-8', errors='replace')
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        write_output(f'WARNING: tdns-mgr upstream fetch failed: {e}')
+        return None
+
+
+def parse_upstream_tdns_version(script_text: str) -> Optional[str]:
+    m = _UPSTREAM_VERSION_RE.search(script_text)
+    return m.group(1).strip() if m else None
+
+
+def install_tdns_mgr_to_local_bin(script_body: str, target_path: str) -> bool:
+    """
+    Write script to target_path atomically (temp file in same directory, chmod +x, replace).
+    """
+    install_dir = os.path.dirname(target_path) or '.'
+    try:
+        os.makedirs(install_dir, mode=0o755, exist_ok=True)
+    except OSError as e:
+        write_output(f'ERROR: cannot create tdns-mgr install directory {install_dir}: {e}')
+        return False
+
+    tmp_path: Optional[str] = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            prefix='.tdns-new-',
+            suffix='.sh',
+            dir=install_dir,
+        )
+        try:
+            os.write(fd, script_body.encode('utf-8'))
+        finally:
+            os.close(fd)
+        os.chmod(tmp_path, 0o755)
+        os.replace(tmp_path, target_path)
+        tmp_path = None
+        return True
+    except OSError as e:
+        write_output(f'ERROR: tdns-mgr install to {target_path} failed: {e}')
+        return False
+    finally:
+        if tmp_path and os.path.isfile(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def maybe_auto_update_tdns_mgr(*, skip: bool = False) -> None:
+    """
+    If local ``tdns-mgr --version`` differs from ``VERSION`` in upstream ``tdns-mgr.sh``,
+    download main-branch script to ~/.local/bin/tdns-mgr and chmod +x.
+
+    Disable with ``TDNS_IMPORT_SKIP_AUTO_UPDATE=1`` (or ``true``/``yes``) or ``skip=True``.
+    """
+    if skip:
+        return
+    if os.environ.get('TDNS_IMPORT_SKIP_AUTO_UPDATE', '').strip().lower() in (
+        '1',
+        'true',
+        'yes',
+    ):
+        write_output('tdns-mgr auto-update skipped (TDNS_IMPORT_SKIP_AUTO_UPDATE)')
+        return
+
+    script = fetch_upstream_tdns_sh()
+    if not script:
+        return
+    upstream_ver = parse_upstream_tdns_version(script)
+    if not upstream_ver:
+        write_output('WARNING: upstream tdns-mgr.sh has no parseable VERSION="..." line')
+        return
+
+    local_bin = locate_existing_tdns_mgr()
+    local_ver = get_installed_tdns_mgr_version(local_bin) if local_bin else None
+
+    if local_ver is None and local_bin:
+        write_output(
+            'WARNING: could not read local tdns-mgr version (--version); skipping auto-update'
+        )
+        return
+
+    if local_ver == upstream_ver:
+        write_output(f'tdns-mgr is already at upstream version {upstream_ver}')
+        return
+
+    write_output(
+        f'tdns-mgr auto-update: installing upstream {upstream_ver} '
+        f'(was {local_ver or "not installed"}) -> {TDNS_MGR_INSTALL_PATH}'
+    )
+    if not install_tdns_mgr_to_local_bin(script, TDNS_MGR_INSTALL_PATH):
+        return
+
+    global TDNS_MGR_PATH
+    TDNS_MGR_PATH = TDNS_MGR_INSTALL_PATH
+    write_output(f'tdns-mgr updated to {upstream_ver} at {TDNS_MGR_INSTALL_PATH}')
+
+
 def get_vpod_repo() -> str:
     """Get the vpodrepo path"""
     try:
@@ -168,28 +344,12 @@ def get_config(ini_path: Optional[str] = None):
 
 
 def check_tdns_mgr_available() -> bool:
-    """Check if tdns-mgr is available"""
+    """Resolve tdns-mgr binary into TDNS_MGR_PATH; return True if found and executable."""
     global TDNS_MGR_PATH
-    
-    # Check common locations
-    paths_to_check = [
-        TDNS_MGR_PATH,
-        '/usr/bin/tdns-mgr',
-        '/home/holuser/bin/tdns-mgr',
-        os.path.expanduser('~/.local/bin/tdns-mgr')
-    ]
-    
-    for path in paths_to_check:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            TDNS_MGR_PATH = path
-            return True
-    
-    # Try to find in PATH
-    result = subprocess.run(['which', 'tdns-mgr'], capture_output=True, text=True)
-    if result.returncode == 0 and result.stdout.strip():
-        TDNS_MGR_PATH = result.stdout.strip()
+    found = locate_existing_tdns_mgr()
+    if found:
+        TDNS_MGR_PATH = found
         return True
-    
     return False
 
 
@@ -495,12 +655,14 @@ def import_records_from_config(records: List[str]) -> Dict[str, Any]:
 def import_dns_records(
     config_ini: Optional[str] = None,
     csv_fallback: bool = True,
+    skip_tdns_auto_update: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Main function to check for and import DNS records
     This is called from labstartup.py
     
     Process:
+    0. Optionally auto-update tdns-mgr from GitHub main when version is behind upstream
     1. Check config.ini [VPOD] new-dns-records for inline values
     2. If config has values, import those (primary source)
     3. If no config values and csv_fallback, check for new-dns-records.csv file
@@ -510,8 +672,11 @@ def import_dns_records(
 
     :param config_ini: Optional path to ini; when set, VPOD new-dns-records are read only from this file
     :param csv_fallback: When False (e.g. --config-ini), do not import from new-dns-records.csv
+    :param skip_tdns_auto_update: When True, do not fetch/compare upstream tdns-mgr.sh
     :return: Import result dictionary, or None if no import needed
     """
+    maybe_auto_update_tdns_mgr(skip=skip_tdns_auto_update)
+
     # Check if tdns-mgr is available
     if not check_tdns_mgr_available():
         write_output('ERROR: tdns-mgr not found - DNS import FAILED')
@@ -700,6 +865,11 @@ def main():
     parser.add_argument('--show-config', action='store_true',
                         help='Show DNS records found in config.ini')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
+    parser.add_argument(
+        '--skip-tdns-auto-update',
+        action='store_true',
+        help='Do not fetch upstream tdns-mgr.sh to compare/update (see TDNS_IMPORT_SKIP_AUTO_UPDATE)',
+    )
     
     args = parser.parse_args()
     
@@ -737,6 +907,7 @@ def main():
     
     if args.csv:
         # Direct import from specified file
+        maybe_auto_update_tdns_mgr(skip=args.skip_tdns_auto_update)
         if not check_tdns_mgr_available():
             print('ERROR: tdns-mgr not found')
             sys.exit(1)
@@ -751,6 +922,7 @@ def main():
         result = import_dns_records(
             config_ini=args.config_ini,
             csv_fallback=args.config_ini is None,
+            skip_tdns_auto_update=args.skip_tdns_auto_update,
         )
     
     if result:

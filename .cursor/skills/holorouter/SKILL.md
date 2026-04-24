@@ -110,6 +110,7 @@ nginx -t && nginx -s reload
 - `tdns_import.py` sets **`INSECURE_TDNS=true`** on subprocesses by default. To force TLS verification instead, set **`TDNS_MGR_SECURE_TLS=1`** (or `true`/`yes`) in the environment.
 - A stale **`DNS_TOKEN`** in `~/.config/tdns-mgr/.tdns-mgr.conf` can short-circuit real password login; the import script clears that line and uses **`CREDS_FILE`** (default `/home/holuser/creds.txt`) for `admin` password.
 - **`tdns-mgr import-records`** (CSV bulk) is broken in upstream **1.2.2** (awk `sub(/\r$/` split across lines → parse failure). **`Tools/tdns_import.py`** avoids it by calling **`tdns-mgr add-record`** per row instead.
+- **`Tools/tdns_import.py`** compares local **`tdns-mgr --version`** to **`VERSION`** in upstream **`tdns-mgr.sh`** on GitHub **main**; if behind, it downloads the script to **`~/.local/bin/tdns-mgr`** (`chmod +x`). Disable with **`TDNS_IMPORT_SKIP_AUTO_UPDATE=1`** or **`--skip-tdns-auto-update`**.
 
 **Technitium API pattern:**
 
