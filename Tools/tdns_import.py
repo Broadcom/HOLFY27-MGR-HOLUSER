@@ -6,6 +6,7 @@
 # Reference: https://github.com/burkeazbill/tdns-mgr
 
 import os
+import re
 import sys
 import json
 import subprocess
@@ -21,7 +22,7 @@ sys.path.insert(0, '/home/holuser/hol')
 
 TDNS_MGR_PATH = '/usr/local/bin/tdns-mgr'
 DNS_RECORDS_FILENAME = 'new-dns-records.csv'
-CREDS_FILE = '/home/holuser/creds.txt'
+DEFAULT_CREDS_FILE = '/home/holuser/creds.txt'
 
 # CSV header format per tdns-mgr specification
 # See: https://raw.githubusercontent.com/burkeazbill/tdns-mgr/refs/heads/main/new-dns-records.csv
@@ -42,16 +43,57 @@ def write_output(msg):
         print(f'[{timestamp}] {msg}')
 
 
+def get_creds_file() -> str:
+    """Lab password file; override with CREDS_FILE environment variable."""
+    return os.environ.get('CREDS_FILE', DEFAULT_CREDS_FILE)
+
+
 def get_password() -> str:
-    """Get password from creds.txt"""
+    """Get Technitium admin password from CREDS_FILE (preferred), else lsfunctions."""
+    path = get_creds_file()
+    if os.path.isfile(path):
+        with open(path, 'r') as f:
+            pw = f.read().strip()
+            if pw:
+                return pw
     try:
         import lsfunctions as lsf
         return lsf.get_password()
     except ImportError:
-        if os.path.isfile(CREDS_FILE):
-            with open(CREDS_FILE, 'r') as f:
-                return f.read().strip()
+        pass
     return ''
+
+
+def tdns_mgr_conf_path() -> str:
+    return os.path.expanduser('~/.config/tdns-mgr/.tdns-mgr.conf')
+
+
+def clear_stored_tdns_token() -> None:
+    """
+    Remove DNS_TOKEN from tdns-mgr user config so a stale/expired token cannot
+    short-circuit authentication (tdns-mgr skips password login when DNS_TOKEN is set).
+    """
+    conf_path = tdns_mgr_conf_path()
+    if not os.path.isfile(conf_path):
+        return
+    token_line = re.compile(r'^\s*(export\s+)?DNS_TOKEN=')
+    try:
+        with open(conf_path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+        new_lines = [ln for ln in lines if not token_line.match(ln)]
+        if len(new_lines) != len(lines):
+            with open(conf_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+            write_output('Cleared stale DNS_TOKEN from tdns-mgr config; re-authenticating with password')
+    except OSError as e:
+        write_output(f'WARNING: Could not update {conf_path} to clear DNS_TOKEN: {e}')
+
+
+def tdns_mgr_env() -> dict:
+    """Environment for tdns-mgr: drop inherited DNS_TOKEN so file/config refresh applies."""
+    env = os.environ.copy()
+    env.pop('DNS_TOKEN', None)
+    return env
 
 
 def get_vpod_repo() -> str:
@@ -184,7 +226,8 @@ def tdns_show_config():
             [TDNS_MGR_PATH, 'config'],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=10,
+            env=tdns_mgr_env(),
         )
         
         if result.returncode == 0 and result.stdout.strip():
@@ -202,7 +245,10 @@ def tdns_show_config():
 
 def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
     """
-    Login to tdns-mgr using password from creds.txt
+    Login to tdns-mgr using password from CREDS_FILE (or lsfunctions fallback).
+    Clears any stale DNS_TOKEN in ~/.config/tdns-mgr/.tdns-mgr.conf first so
+    expired tokens cannot block password-based re-authentication.
+
     Retries up to max_retries times with retry_delay seconds between attempts
     
     :param max_retries: Maximum number of login attempts (default: 10)
@@ -210,6 +256,9 @@ def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
     :return: True if login successful
     """
     import time
+
+    # Expired stored token causes tdns-mgr to skip real login; force password path
+    clear_stored_tdns_token()
     
     # Show config before login attempt for debugging
     tdns_show_config()
@@ -217,20 +266,23 @@ def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
     password = get_password()
     
     if not password:
-        write_output('ERROR: No password available for tdns-mgr login')
+        write_output(
+            f'ERROR: No password available for tdns-mgr login '
+            f'(checked {get_creds_file()} and lsfunctions)'
+        )
         return False
     
     for attempt in range(1, max_retries + 1):
         write_output(f'Logging into tdns-mgr (attempt {attempt}/{max_retries})...')
         
         try:
-            # Pipe password to tdns-mgr login via stdin (echo password | tdns-mgr login)
+            # Non-interactive: -p password (stdin alone can fail if a stale token short-circuits auth)
             result = subprocess.run(
-                [TDNS_MGR_PATH, 'login'],
-                input=password + '\n',
+                [TDNS_MGR_PATH, 'login', '-p', password],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                env=tdns_mgr_env(),
             )
             
             if result.returncode == 0:
@@ -268,7 +320,8 @@ def import_records_from_file(csv_path: str) -> Dict[str, Any]:
             [TDNS_MGR_PATH, 'import-records', csv_path, '--ptr'],
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=120,
+            env=tdns_mgr_env(),
         )
         
         if result.stdout.strip():
