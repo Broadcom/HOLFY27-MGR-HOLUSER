@@ -99,28 +99,16 @@ def tdns_mgr_env() -> dict:
     env = os.environ.copy()
     env.pop('DNS_TOKEN', None)
     env.pop('DNS_PASS', None)
-    # tdns-mgr maps INSECURE_TDNS -> curl -k; keep as backup if CLI --insecure is ever skipped.
+    # tdns-mgr.sh maps INSECURE_TDNS -> INSECURE_TLS -> curl -k (lab CA on dns.vcf.lab:443).
+    # Do NOT pass CLI --insecure: it was added after v1.2.0 and breaks older tdns-mgr installs.
     if os.environ.get('TDNS_MGR_SECURE_TLS', '').lower() not in ('1', 'true', 'yes'):
         env['INSECURE_TDNS'] = 'true'
     return env
 
 
-def tdns_mgr_cli_prefix() -> List[str]:
-    """
-    Global tdns-mgr flags (must appear before the subcommand).
-
-    Technitium at dns.vcf.lab is TLS-terminated with the holodeck CA; without this,
-    curl verification fails and login returns generic failure (no JSON status ok).
-    Set TDNS_MGR_SECURE_TLS=1 to enforce certificate verification.
-    """
-    if os.environ.get('TDNS_MGR_SECURE_TLS', '').lower() in ('1', 'true', 'yes'):
-        return []
-    return ['--insecure']
-
-
 def tdns_mgr_cmd(*parts: str) -> List[str]:
-    """Build argv: tdns-mgr [--insecure] <subcommand> ..."""
-    return [TDNS_MGR_PATH, *tdns_mgr_cli_prefix(), *parts]
+    """Build argv: tdns-mgr <subcommand> ... (TLS insecure via INSECURE_TDNS in tdns_mgr_env)."""
+    return [TDNS_MGR_PATH, *parts]
 
 
 def get_vpod_repo() -> str:
