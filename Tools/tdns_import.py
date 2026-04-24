@@ -105,8 +105,21 @@ def get_vpod_repo() -> str:
         return '/vpodrepo'
 
 
-def get_config():
-    """Get the config parser object"""
+def get_config(ini_path: Optional[str] = None):
+    """
+    Get the config parser object.
+
+    If ini_path is set, read only that file (used for post-boot imports from /tmp/config.ini
+    even when lsfunctions is loaded). Otherwise prefer lsfunctions.config, then /tmp/config.ini.
+    """
+    if ini_path is not None:
+        from configparser import ConfigParser
+        config = ConfigParser()
+        if os.path.isfile(ini_path):
+            config.read(ini_path)
+        else:
+            write_output(f'WARNING: config ini not found: {ini_path}')
+        return config
     try:
         import lsfunctions as lsf
         return lsf.config
@@ -144,9 +157,11 @@ def check_tdns_mgr_available() -> bool:
     return False
 
 
-def get_dns_records_from_config() -> List[str]:
+def get_dns_records_from_config(ini_path: Optional[str] = None) -> List[str]:
     """
     Get DNS records from config.ini [VPOD] new-dns-records
+
+    :param ini_path: If set, read VPOD section from this file only (see get_config).
     
     The config.ini can contain one or more lines of CSV-formatted records:
     new-dns-records = site-a.vcf.lab,gitlab,A,10.1.10.211
@@ -160,7 +175,7 @@ def get_dns_records_from_config() -> List[str]:
     
     :return: List of record lines (without header), empty list if none
     """
-    config = get_config()
+    config = get_config(ini_path)
     records = []
     
     if not config.has_option('VPOD', 'new-dns-records'):
@@ -385,7 +400,10 @@ def import_records_from_config(records: List[str]) -> Dict[str, Any]:
         return {'Message': str(e), 'New Records': 0, 'Errors': 1}
 
 
-def import_dns_records() -> Optional[Dict[str, Any]]:
+def import_dns_records(
+    config_ini: Optional[str] = None,
+    csv_fallback: bool = True,
+) -> Optional[Dict[str, Any]]:
     """
     Main function to check for and import DNS records
     This is called from labstartup.py
@@ -393,11 +411,13 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
     Process:
     1. Check config.ini [VPOD] new-dns-records for inline values
     2. If config has values, import those (primary source)
-    3. If no config values, check for new-dns-records.csv file
+    3. If no config values and csv_fallback, check for new-dns-records.csv file
     4. If file exists, import from file (fallback)
     5. Login to tdns-mgr and import with --ptr flag
     6. Log results (but don't fail the lab)
-    
+
+    :param config_ini: Optional path to ini; when set, VPOD new-dns-records are read only from this file
+    :param csv_fallback: When False (e.g. --config-ini), do not import from new-dns-records.csv
     :return: Import result dictionary, or None if no import needed
     """
     # Check if tdns-mgr is available
@@ -426,10 +446,11 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
             pass
     
     # PRIORITY 1: Check config.ini for inline DNS records
-    config_records = get_dns_records_from_config()
+    config_records = get_dns_records_from_config(config_ini)
     
     if config_records:
-        write_output(f'Found {len(config_records)} DNS records in config.ini')
+        src = config_ini or 'config.ini'
+        write_output(f'Found {len(config_records)} DNS records in {src}')
         
         # Login to tdns-mgr
         if not tdns_login():
@@ -471,6 +492,14 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
         return result
     
     # PRIORITY 2: Check for new-dns-records.csv file (only if no config values)
+    if not csv_fallback:
+        write_output(
+            'No [VPOD] new-dns-records in the given config (--config-ini); '
+            'skipping new-dns-records.csv fallback'
+        )
+        update_dashboard_status('skipped', 'No inline records in specified config')
+        return None
+
     csv_path = find_dns_records_file()
     
     if csv_path:
@@ -564,6 +593,15 @@ def main():
         epilog='Reference: https://github.com/burkeazbill/tdns-mgr'
     )
     parser.add_argument('--csv', '-c', help='Path to CSV file (overrides auto-detection)')
+    parser.add_argument(
+        '--config-ini',
+        metavar='PATH',
+        default=None,
+        help=(
+            'Read [VPOD] new-dns-records only from this file (e.g. /tmp/config.ini). '
+            'Does not fall back to new-dns-records.csv. Use after boot to apply inline DNS only.'
+        ),
+    )
     parser.add_argument('--dry-run', '-n', action='store_true',
                         help='Show what would be imported without making changes')
     parser.add_argument('--show-config', action='store_true',
@@ -573,9 +611,10 @@ def main():
     args = parser.parse_args()
     
     if args.show_config:
-        records = get_dns_records_from_config()
+        records = get_dns_records_from_config(args.config_ini)
         if records:
-            print(f'Found {len(records)} DNS records in config.ini:')
+            src = args.config_ini or 'config.ini'
+            print(f'Found {len(records)} DNS records in {src}:')
             for r in records:
                 print(f'  {r}')
         else:
@@ -584,19 +623,23 @@ def main():
     
     if args.dry_run:
         # Show what would be imported
-        config_records = get_dns_records_from_config()
+        config_records = get_dns_records_from_config(args.config_ini)
         if config_records:
-            print(f'Would import {len(config_records)} records from config.ini:')
+            src = args.config_ini or 'config.ini'
+            print(f'Would import {len(config_records)} records from {src}:')
             for r in config_records:
                 print(f'  {r}')
         else:
-            csv_path = args.csv or find_dns_records_file()
-            if csv_path:
-                print(f'Would import records from file: {csv_path}')
-                with open(csv_path, 'r') as f:
-                    print(f.read())
+            if args.config_ini:
+                print('No DNS records in [VPOD] new-dns-records for --config-ini (CSV fallback disabled)')
             else:
-                print('No DNS records to import')
+                csv_path = args.csv or find_dns_records_file()
+                if csv_path:
+                    print(f'Would import records from file: {csv_path}')
+                    with open(csv_path, 'r') as f:
+                        print(f.read())
+                else:
+                    print('No DNS records to import')
         return
     
     if args.csv:
@@ -611,8 +654,11 @@ def main():
         
         result = import_records_from_file(args.csv)
     else:
-        # Standard auto-detection flow
-        result = import_dns_records()
+        # Standard auto-detection flow, or config-ini-only inline records
+        result = import_dns_records(
+            config_ini=args.config_ini,
+            csv_fallback=args.config_ini is None,
+        )
     
     if result:
         print(f'\nImport Result: {json.dumps(result, indent=2)}')
