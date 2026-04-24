@@ -1,6 +1,6 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.7 - 2026-03-18
+# Version 3.8 - 2026-03-26
 # Changes:
 # - Added functionality to set branch to "ft" if the first 3 characters of the content of /tmp/deploymentpool.txt is "FT-"
 # - Added functionality to git stash local changes for prod.
@@ -844,6 +844,13 @@ if [ "$vPod_SKU" = "HOL-BADSKU" ]; then
     date > ${holorouterdir}/gitdone
     push_router_files_nfs
     push_console_files_nfs
+    if [ -f ${configini} ]; then
+        if cp /tmp/config.ini /lmchol/tmp/config.ini 2>&1; then
+            log_msg "Copied config.ini to /lmchol/tmp/config.ini" "${logfile}"
+        else
+            log_error "Failed to copy config.ini to /lmchol/tmp/config.ini" "${logfile}"
+        fi
+    fi
     runlabstartup
     exit 0
 fi
@@ -974,6 +981,18 @@ else
     
 fi
 
+# if the file /home/holuser/hol/Tools/holorouter/certsrv_proxy.py exists, then copy it to /tmp/holorouter/certsrv_proxy.py
+if [ -f "/home/holuser/hol/Tools/holorouter/certsrv_proxy.py" ]; then
+    log_msg "Copying certsrv_proxy.py to /tmp/holorouter/certsrv_proxy.py" "${logfile}"
+    cp "/home/holuser/hol/Tools/holorouter/certsrv_proxy.py" /tmp/holorouter/certsrv_proxy.py
+fi
+
+# if the file /home/holuser/hol/Tools/doupdate.sh exists, then copy it to /tmp/holorouter/doupdate.sh
+if [ -f "/home/holuser/hol/Tools/doupdate.sh" ]; then
+    log_msg "Copying doupdate.sh to /tmp/holorouter/doupdate.sh" "${logfile}"
+    cp "/home/holuser/hol/Tools/doupdate.sh" /tmp/holorouter/doupdate.sh
+fi
+
 #==============================================================================
 # PUSH CONSOLE FILES VIA NFS
 #==============================================================================
@@ -988,8 +1007,8 @@ if [ "$LMC" = true ] && [ "$1" != "labcheck" ]; then
     push_console_files_nfs
 fi
 
-# Set up Cursor IDE symlinks (skills, rules, MCP) from hol repo
-if [ -x "${holroot}/console/setup-cursor.sh" ] && [ "$1" != "labcheck" ]; then
+# Set up Cursor IDE symlinks (skills, rules, MCP) if working in dev environment
+if [ -x "${holroot}/console/setup-cursor.sh" ] && [ "$1" != "labcheck" ] && [ "${branch}" = "dev" ]; then
     ${holroot}/console/setup-cursor.sh >> ${logfile} 2>&1
 fi
 
@@ -1002,6 +1021,11 @@ date > ${holorouterdir}/gitdone
 #==============================================================================
 
 if [ -f ${configini} ]; then
+    if cp /tmp/config.ini /lmchol/tmp/config.ini 2>&1; then
+        log_msg "Copied config.ini to /lmchol/tmp/config.ini" "${logfile}"
+    else
+        log_error "Failed to copy config.ini to /lmchol/tmp/config.ini" "${logfile}"
+    fi
     runlabstartup
     if [ "${VLP_ENABLED}" = "true" ]; then
         if crontab -l 2>/dev/null | grep -q 'VLPagent\.sh'; then

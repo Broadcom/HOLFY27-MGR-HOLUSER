@@ -1,0 +1,9 @@
+---
+description: Git Commit Behavior
+globs: *
+---
+# Git Commit Rules
+
+- NEVER automatically run `git commit` or commit changes to the repository.
+- ONLY create a commit if the user explicitly and directly asks you to do so (e.g., "commit these changes").
+- Leave all modified files saved in the working directory for the user to review, stage, and commit themselves.

@@ -4,13 +4,21 @@
 # Author - Burke Azbill and HOL Core Team
 # Imports DNS records from config.ini [VPOD] new-dns-records or new-dns-records.csv
 # Reference: https://github.com/burkeazbill/tdns-mgr
+#
+# Before DNS work, compares local ``tdns-mgr --version`` to upstream VERSION on main;
+# if newer, downloads tdns-mgr.sh to ~/.local/bin/tdns-mgr (skip: TDNS_IMPORT_SKIP_AUTO_UPDATE
+# or ``--skip-tdns-auto-update``).
 
-import os
-import sys
+import csv
 import json
+import os
+import re
 import subprocess
+import sys
 import tempfile
-from typing import Optional, Dict, Any, List
+import urllib.error
+import urllib.request
+from typing import Optional, Dict, Any, List, Tuple
 
 # Add hol directory to path
 sys.path.insert(0, '/home/holuser/hol')
@@ -19,13 +27,40 @@ sys.path.insert(0, '/home/holuser/hol')
 # CONFIGURATION
 #==============================================================================
 
-TDNS_MGR_PATH = '/usr/local/bin/tdns-mgr'
+TDNS_MGR_INSTALL_PATH = os.path.expanduser('~/.local/bin/tdns-mgr')
+TDNS_MGR_PATH = TDNS_MGR_INSTALL_PATH
+TDNS_MGR_UPSTREAM_RAW = (
+    'https://raw.githubusercontent.com/burkeazbill/tdns-mgr/'
+    'refs/heads/main/tdns-mgr.sh'
+)
 DNS_RECORDS_FILENAME = 'new-dns-records.csv'
-CREDS_FILE = '/home/holuser/creds.txt'
+DEFAULT_CREDS_FILE = '/home/holuser/creds.txt'
+_UPSTREAM_VERSION_RE = re.compile(r'^VERSION="([^"]+)"', re.MULTILINE)
 
 # CSV header format per tdns-mgr specification
 # See: https://raw.githubusercontent.com/burkeazbill/tdns-mgr/refs/heads/main/new-dns-records.csv
 CSV_HEADER = 'zone,name,type,value'
+
+
+def parse_zone_name_type_value_line(line: str) -> Optional[Tuple[str, str, str, str]]:
+    """
+    Parse one CSV row: zone,name,type,value (quoted fields allowed).
+    Returns None for blanks, comments, or invalid rows.
+    """
+    line = line.strip()
+    if not line or line.startswith('#') or line.lower().startswith('zone,'):
+        return None
+    try:
+        row = next(csv.reader([line]))
+    except Exception:
+        return None
+    if len(row) < 4:
+        return None
+    zone, name, rtype, value = row[0].strip(), row[1].strip(), row[2].strip(), row[3].strip()
+    if not zone or not name or not rtype or not value:
+        return None
+    return zone, name, rtype, value
+
 
 #==============================================================================
 # FUNCTIONS
@@ -42,16 +77,235 @@ def write_output(msg):
         print(f'[{timestamp}] {msg}')
 
 
+def get_creds_file() -> str:
+    """Lab password file; override with CREDS_FILE environment variable."""
+    return os.environ.get('CREDS_FILE', DEFAULT_CREDS_FILE)
+
+
 def get_password() -> str:
-    """Get password from creds.txt"""
+    """Get Technitium admin password from CREDS_FILE (preferred), else lsfunctions."""
+    path = get_creds_file()
+    if os.path.isfile(path):
+        with open(path, 'r') as f:
+            pw = f.read().strip()
+            if pw:
+                return pw
     try:
         import lsfunctions as lsf
         return lsf.get_password()
     except ImportError:
-        if os.path.isfile(CREDS_FILE):
-            with open(CREDS_FILE, 'r') as f:
-                return f.read().strip()
+        pass
     return ''
+
+
+def tdns_mgr_conf_path() -> str:
+    return os.path.expanduser('~/.config/tdns-mgr/.tdns-mgr.conf')
+
+
+def clear_stored_tdns_token() -> None:
+    """
+    Remove DNS_TOKEN from tdns-mgr user config so a stale/expired token cannot
+    short-circuit authentication (tdns-mgr skips password login when DNS_TOKEN is set).
+    """
+    conf_path = tdns_mgr_conf_path()
+    if not os.path.isfile(conf_path):
+        return
+    token_line = re.compile(r'^\s*(export\s+)?DNS_TOKEN=')
+    try:
+        with open(conf_path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+        new_lines = [ln for ln in lines if not token_line.match(ln)]
+        if len(new_lines) != len(lines):
+            with open(conf_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+            write_output('Cleared stale DNS_TOKEN from tdns-mgr config; re-authenticating with password')
+    except OSError as e:
+        write_output(f'WARNING: Could not update {conf_path} to clear DNS_TOKEN: {e}')
+
+
+def tdns_mgr_env() -> dict:
+    """
+    Environment for tdns-mgr subprocesses.
+
+    - Drop inherited DNS_TOKEN so an expired shell token does not override the refreshed file.
+    - Drop DNS_PASS so a stale exported password cannot interact oddly with login -p.
+    """
+    env = os.environ.copy()
+    env.pop('DNS_TOKEN', None)
+    env.pop('DNS_PASS', None)
+    # tdns-mgr.sh maps INSECURE_TDNS -> INSECURE_TLS -> curl -k (lab CA on dns.vcf.lab:443).
+    # Do NOT pass CLI --insecure: it was added after v1.2.0 and breaks older tdns-mgr installs.
+    if os.environ.get('TDNS_MGR_SECURE_TLS', '').lower() not in ('1', 'true', 'yes'):
+        env['INSECURE_TDNS'] = 'true'
+    return env
+
+
+def tdns_mgr_cmd(*parts: str) -> List[str]:
+    """Build argv: tdns-mgr <subcommand> ... (TLS insecure via INSECURE_TDNS in tdns_mgr_env)."""
+    return [TDNS_MGR_PATH, *parts]
+
+
+def locate_existing_tdns_mgr() -> Optional[str]:
+    """
+    Return the first usable tdns-mgr binary path without mutating TDNS_MGR_PATH.
+    Search order matches historical lab layout (user install, then system paths, then PATH).
+    """
+    candidates: List[str] = []
+    for p in (
+        TDNS_MGR_INSTALL_PATH,
+        TDNS_MGR_PATH,
+        '/usr/local/bin/tdns-mgr',
+        '/usr/bin/tdns-mgr',
+        os.path.expanduser('~/.local/bin/tdns-mgr'),
+        '/home/holuser/bin/tdns-mgr',
+    ):
+        if p and p not in candidates:
+            candidates.append(p)
+
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+
+    try:
+        result = subprocess.run(
+            ['which', 'tdns-mgr'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    w = result.stdout.strip().split('\n')[0].strip()
+    if w and os.path.isfile(w) and os.access(w, os.X_OK):
+        return w
+    return None
+
+
+def get_installed_tdns_mgr_version(bin_path: str) -> Optional[str]:
+    """Parse ``DNS Manager vX.Y.Z`` from ``tdns-mgr --version`` / ``-v``."""
+    for flag in ('--version', '-v'):
+        try:
+            r = subprocess.run(
+                [bin_path, flag],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        combined = ((r.stdout or '') + (r.stderr or '')).strip()
+        m = re.search(r'DNS\s+Manager\s+v?\s*([\d.]+)', combined, re.I)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def fetch_upstream_tdns_sh() -> Optional[str]:
+    """Download upstream ``tdns-mgr.sh`` from GitHub raw (main branch)."""
+    try:
+        req = urllib.request.Request(
+            TDNS_MGR_UPSTREAM_RAW,
+            headers={'User-Agent': 'HOLFY27-tdns_import.py (lab auto-update)'},
+        )
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            return resp.read().decode('utf-8', errors='replace')
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        write_output(f'WARNING: tdns-mgr upstream fetch failed: {e}')
+        return None
+
+
+def parse_upstream_tdns_version(script_text: str) -> Optional[str]:
+    m = _UPSTREAM_VERSION_RE.search(script_text)
+    return m.group(1).strip() if m else None
+
+
+def install_tdns_mgr_to_local_bin(script_body: str, target_path: str) -> bool:
+    """
+    Write script to target_path atomically (temp file in same directory, chmod +x, replace).
+    """
+    install_dir = os.path.dirname(target_path) or '.'
+    try:
+        os.makedirs(install_dir, mode=0o755, exist_ok=True)
+    except OSError as e:
+        write_output(f'ERROR: cannot create tdns-mgr install directory {install_dir}: {e}')
+        return False
+
+    tmp_path: Optional[str] = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            prefix='.tdns-new-',
+            suffix='.sh',
+            dir=install_dir,
+        )
+        try:
+            os.write(fd, script_body.encode('utf-8'))
+        finally:
+            os.close(fd)
+        os.chmod(tmp_path, 0o755)
+        os.replace(tmp_path, target_path)
+        tmp_path = None
+        return True
+    except OSError as e:
+        write_output(f'ERROR: tdns-mgr install to {target_path} failed: {e}')
+        return False
+    finally:
+        if tmp_path and os.path.isfile(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def maybe_auto_update_tdns_mgr(*, skip: bool = False) -> None:
+    """
+    If local ``tdns-mgr --version`` differs from ``VERSION`` in upstream ``tdns-mgr.sh``,
+    download main-branch script to ~/.local/bin/tdns-mgr and chmod +x.
+
+    Disable with ``TDNS_IMPORT_SKIP_AUTO_UPDATE=1`` (or ``true``/``yes``) or ``skip=True``.
+    """
+    if skip:
+        return
+    if os.environ.get('TDNS_IMPORT_SKIP_AUTO_UPDATE', '').strip().lower() in (
+        '1',
+        'true',
+        'yes',
+    ):
+        write_output('tdns-mgr auto-update skipped (TDNS_IMPORT_SKIP_AUTO_UPDATE)')
+        return
+
+    script = fetch_upstream_tdns_sh()
+    if not script:
+        return
+    upstream_ver = parse_upstream_tdns_version(script)
+    if not upstream_ver:
+        write_output('WARNING: upstream tdns-mgr.sh has no parseable VERSION="..." line')
+        return
+
+    local_bin = locate_existing_tdns_mgr()
+    local_ver = get_installed_tdns_mgr_version(local_bin) if local_bin else None
+
+    if local_ver is None and local_bin:
+        write_output(
+            'WARNING: could not read local tdns-mgr version (--version); skipping auto-update'
+        )
+        return
+
+    if local_ver == upstream_ver:
+        write_output(f'tdns-mgr is already at upstream version {upstream_ver}')
+        return
+
+    write_output(
+        f'tdns-mgr auto-update: installing upstream {upstream_ver} '
+        f'(was {local_ver or "not installed"}) -> {TDNS_MGR_INSTALL_PATH}'
+    )
+    if not install_tdns_mgr_to_local_bin(script, TDNS_MGR_INSTALL_PATH):
+        return
+
+    global TDNS_MGR_PATH
+    TDNS_MGR_PATH = TDNS_MGR_INSTALL_PATH
+    write_output(f'tdns-mgr updated to {upstream_ver} at {TDNS_MGR_INSTALL_PATH}')
 
 
 def get_vpod_repo() -> str:
@@ -63,8 +317,21 @@ def get_vpod_repo() -> str:
         return '/vpodrepo'
 
 
-def get_config():
-    """Get the config parser object"""
+def get_config(ini_path: Optional[str] = None):
+    """
+    Get the config parser object.
+
+    If ini_path is set, read only that file (used for post-boot imports from /tmp/config.ini
+    even when lsfunctions is loaded). Otherwise prefer lsfunctions.config, then /tmp/config.ini.
+    """
+    if ini_path is not None:
+        from configparser import ConfigParser
+        config = ConfigParser()
+        if os.path.isfile(ini_path):
+            config.read(ini_path)
+        else:
+            write_output(f'WARNING: config ini not found: {ini_path}')
+        return config
     try:
         import lsfunctions as lsf
         return lsf.config
@@ -77,34 +344,20 @@ def get_config():
 
 
 def check_tdns_mgr_available() -> bool:
-    """Check if tdns-mgr is available"""
+    """Resolve tdns-mgr binary into TDNS_MGR_PATH; return True if found and executable."""
     global TDNS_MGR_PATH
-    
-    # Check common locations
-    paths_to_check = [
-        TDNS_MGR_PATH,
-        '/usr/bin/tdns-mgr',
-        '/home/holuser/bin/tdns-mgr',
-        os.path.expanduser('~/.local/bin/tdns-mgr')
-    ]
-    
-    for path in paths_to_check:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            TDNS_MGR_PATH = path
-            return True
-    
-    # Try to find in PATH
-    result = subprocess.run(['which', 'tdns-mgr'], capture_output=True, text=True)
-    if result.returncode == 0 and result.stdout.strip():
-        TDNS_MGR_PATH = result.stdout.strip()
+    found = locate_existing_tdns_mgr()
+    if found:
+        TDNS_MGR_PATH = found
         return True
-    
     return False
 
 
-def get_dns_records_from_config() -> List[str]:
+def get_dns_records_from_config(ini_path: Optional[str] = None) -> List[str]:
     """
     Get DNS records from config.ini [VPOD] new-dns-records
+
+    :param ini_path: If set, read VPOD section from this file only (see get_config).
     
     The config.ini can contain one or more lines of CSV-formatted records:
     new-dns-records = site-a.vcf.lab,gitlab,A,10.1.10.211
@@ -118,7 +371,7 @@ def get_dns_records_from_config() -> List[str]:
     
     :return: List of record lines (without header), empty list if none
     """
-    config = get_config()
+    config = get_config(ini_path)
     records = []
     
     if not config.has_option('VPOD', 'new-dns-records'):
@@ -135,15 +388,9 @@ def get_dns_records_from_config() -> List[str]:
     
     for line in lines:
         line = line.strip()
-        # Skip empty lines, comments, and header
-        if not line or line.startswith('#') or line.lower().startswith('zone,'):
-            continue
-        
-        # Validate it has 4 comma-separated fields (zone,name,type,value)
-        parts = line.split(',')
-        if len(parts) >= 4:
+        if parse_zone_name_type_value_line(line):
             records.append(line)
-        else:
+        elif line and not line.startswith('#'):
             write_output(f'WARNING: Invalid DNS record format (expected zone,name,type,value): {line}')
     
     return records
@@ -172,6 +419,94 @@ def find_dns_records_file() -> Optional[str]:
     return None
 
 
+def load_records_from_csv_file(csv_path: str) -> List[Tuple[str, str, str, str]]:
+    """
+    Load zone,name,type,value rows from a CSV file (header row required).
+    Accepts column name aliases: hostname for name; value/data/ip for value.
+    """
+    rows: List[Tuple[str, str, str, str]] = []
+    with open(csv_path, newline='', encoding='utf-8', errors='replace') as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return rows
+        for raw in reader:
+            d = {(k or '').strip().lower(): (v or '').strip() for k, v in raw.items() if k}
+            if not any(d.values()):
+                continue
+            zone = d.get('zone') or d.get('domain') or ''
+            name = d.get('name') or d.get('hostname') or ''
+            rtype = d.get('type') or d.get('rtype') or ''
+            value = d.get('value') or d.get('data') or d.get('ip') or d.get('ipaddress') or ''
+            if zone and name and rtype and value:
+                rows.append((zone, name, rtype, value))
+    return rows
+
+
+def import_dns_rows(
+    rows: List[Tuple[str, str, str, str]],
+    *,
+    source_label: str,
+    use_ptr: bool,
+) -> Dict[str, Any]:
+    """
+    Apply DNS rows via ``tdns-mgr add-record`` for each line.
+
+    Avoids ``tdns-mgr import-records``: upstream tdns-mgr 1.2.2 embeds a broken awk
+    fragment (split ``sub(/\\r$/`` across lines), which fails for every CSV.
+    """
+    if not rows:
+        return {'Message': 'No records', 'New Records': 0, 'Errors': 0}
+
+    write_output(
+        f'Applying {len(rows)} record(s) via tdns-mgr add-record (source: {source_label})'
+    )
+
+    new_records = 0
+    errors = 0
+    notes: List[str] = []
+
+    for zone, name, rtype, value in rows:
+        rtype_u = rtype.upper()
+        cmd = list(tdns_mgr_cmd('add-record', zone, name, rtype_u, value))
+        if use_ptr and rtype_u in ('A', 'AAAA'):
+            cmd.append('--ptr')
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=45,
+                env=tdns_mgr_env(),
+            )
+        except subprocess.TimeoutExpired:
+            errors += 1
+            msg = f'timeout: {name}.{zone} {rtype_u}'
+            notes.append(msg)
+            write_output(f'DNS add-record error: {msg}')
+            continue
+        except Exception as ex:
+            errors += 1
+            msg = f'{name}.{zone}: {ex}'
+            notes.append(msg)
+            write_output(f'DNS add-record error: {msg}')
+            continue
+
+        if result.returncode == 0:
+            new_records += 1
+            continue
+
+        errors += 1
+        err_text = (result.stderr or result.stdout or '').strip()
+        if len(err_text) > 800:
+            err_text = err_text[:800] + '...'
+        notes.append(f'{name}.{zone} {rtype_u}: {err_text}')
+        write_output(f'DNS add-record failed ({name}.{zone} {rtype_u}): {err_text}')
+
+    message = '; '.join(notes) if notes else 'Success'
+    return {'Message': message, 'New Records': new_records, 'Errors': errors}
+
+
 def tdns_show_config():
     """
     Show tdns-mgr configuration for debugging
@@ -181,10 +516,11 @@ def tdns_show_config():
     
     try:
         result = subprocess.run(
-            [TDNS_MGR_PATH, 'config'],
+            tdns_mgr_cmd('config'),
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=10,
+            env=tdns_mgr_env(),
         )
         
         if result.returncode == 0 and result.stdout.strip():
@@ -202,7 +538,10 @@ def tdns_show_config():
 
 def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
     """
-    Login to tdns-mgr using password from creds.txt
+    Login to tdns-mgr using password from CREDS_FILE (or lsfunctions fallback).
+    Clears any stale DNS_TOKEN in ~/.config/tdns-mgr/.tdns-mgr.conf first so
+    expired tokens cannot block password-based re-authentication.
+
     Retries up to max_retries times with retry_delay seconds between attempts
     
     :param max_retries: Maximum number of login attempts (default: 10)
@@ -210,6 +549,9 @@ def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
     :return: True if login successful
     """
     import time
+
+    # Expired stored token causes tdns-mgr to skip real login; force password path
+    clear_stored_tdns_token()
     
     # Show config before login attempt for debugging
     tdns_show_config()
@@ -217,27 +559,35 @@ def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
     password = get_password()
     
     if not password:
-        write_output('ERROR: No password available for tdns-mgr login')
+        write_output(
+            f'ERROR: No password available for tdns-mgr login '
+            f'(checked {get_creds_file()} and lsfunctions)'
+        )
         return False
     
     for attempt in range(1, max_retries + 1):
         write_output(f'Logging into tdns-mgr (attempt {attempt}/{max_retries})...')
         
         try:
-            # Pipe password to tdns-mgr login via stdin (echo password | tdns-mgr login)
+            # Non-interactive: -p password (stdin alone can fail if a stale token short-circuits auth)
             result = subprocess.run(
-                [TDNS_MGR_PATH, 'login'],
-                input=password + '\n',
+                tdns_mgr_cmd('login', '-p', password),
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                env=tdns_mgr_env(),
             )
             
             if result.returncode == 0:
                 write_output('tdns-mgr login successful')
                 return True
             else:
-                error_msg = result.stderr.strip() if result.stderr else result.stdout.strip() if result.stdout else 'Unknown error'
+                err_parts = []
+                if result.stderr and result.stderr.strip():
+                    err_parts.append(result.stderr.strip())
+                if result.stdout and result.stdout.strip():
+                    err_parts.append(result.stdout.strip())
+                error_msg = ' | '.join(err_parts) if err_parts else 'Unknown error'
                 write_output(f'tdns-mgr login failed: {error_msg}')
                 
         except subprocess.TimeoutExpired:
@@ -256,43 +606,23 @@ def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
 
 def import_records_from_file(csv_path: str) -> Dict[str, Any]:
     """
-    Import DNS records from CSV file using tdns-mgr
-    
-    :param csv_path: Path to the new-dns-records.csv file
-    :return: Result dictionary with import statistics
+    Import DNS records from a CSV file (new-dns-records.csv style).
+
+    Uses per-record ``tdns-mgr add-record`` instead of ``import-records`` (broken awk
+    in tdns-mgr 1.2.2 upstream).
     """
-    write_output(f'Importing DNS records from: {csv_path}')
-    
+    write_output(f'Reading DNS records CSV: {csv_path}')
     try:
-        result = subprocess.run(
-            [TDNS_MGR_PATH, 'import-records', csv_path, '--ptr'],
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
-        
-        if result.stdout.strip():
-            try:
-                output = json.loads(result.stdout.strip())
-                write_output(f'DNS import result: {output}')
-                return output
-            except json.JSONDecodeError:
-                write_output(f'DNS import output: {result.stdout}')
-                return {
-                    'Message': result.stdout.strip(),
-                    'New Records': 0,
-                    'Errors': 0 if result.returncode == 0 else 1
-                }
-        
-        if result.returncode != 0:
-            write_output(f'DNS import error: {result.stderr}')
-            return {'Message': result.stderr, 'New Records': 0, 'Errors': 1}
-        
-        return {'Message': 'Completed', 'New Records': 0, 'Errors': 0}
-        
-    except subprocess.TimeoutExpired:
-        write_output('DNS record import timed out')
-        return {'Message': 'Timeout', 'New Records': 0, 'Errors': 1}
+        rows = load_records_from_csv_file(csv_path)
+        if not rows:
+            write_output('No parseable zone,name,type,value rows in CSV')
+            return {'Message': 'No parseable rows in CSV', 'New Records': 0, 'Errors': 0}
+        result = import_dns_rows(rows, source_label=csv_path, use_ptr=True)
+        write_output(f'DNS import result: {result}')
+        return result
+    except OSError as e:
+        write_output(f'DNS import error: {e}')
+        return {'Message': str(e), 'New Records': 0, 'Errors': 1}
     except Exception as e:
         write_output(f'DNS import error: {e}')
         return {'Message': str(e), 'New Records': 0, 'Errors': 1}
@@ -300,53 +630,53 @@ def import_records_from_file(csv_path: str) -> Dict[str, Any]:
 
 def import_records_from_config(records: List[str]) -> Dict[str, Any]:
     """
-    Import DNS records from config.ini inline values
-    Creates a temporary CSV file and imports it
-    
-    :param records: List of record lines (zone,name,type,value format)
-    :return: Result dictionary with import statistics
+    Import DNS records from config.ini inline values (zone,name,type,value per line).
+
+    Uses ``tdns-mgr add-record`` per row (no tempfile); avoids broken ``import-records`` awk.
     """
     if not records:
         return {'Message': 'No records', 'New Records': 0, 'Errors': 0}
-    
-    write_output(f'Importing {len(records)} DNS records from config.ini')
-    
-    # Create temporary CSV file with proper format
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
-            f.write(f'{CSV_HEADER}\n')
-            for record in records:
-                f.write(f'{record}\n')
-            temp_path = f.name
-        
-        # Import using the temp file
-        result = import_records_from_file(temp_path)
-        
-        # Clean up temp file
-        os.unlink(temp_path)
-        
-        return result
-        
-    except Exception as e:
-        write_output(f'Error creating temp CSV file: {e}')
-        return {'Message': str(e), 'New Records': 0, 'Errors': 1}
+
+    write_output(f'Importing {len(records)} DNS record line(s) from config.ini')
+    rows: List[Tuple[str, str, str, str]] = []
+    for record in records:
+        parsed = parse_zone_name_type_value_line(record)
+        if parsed:
+            rows.append(parsed)
+        else:
+            write_output(f'WARNING: skipped unparsable line: {record!r}')
+
+    if not rows:
+        return {'Message': 'No parseable records', 'New Records': 0, 'Errors': 0}
+
+    return import_dns_rows(rows, source_label='config.ini [VPOD] new-dns-records', use_ptr=True)
 
 
-def import_dns_records() -> Optional[Dict[str, Any]]:
+def import_dns_records(
+    config_ini: Optional[str] = None,
+    csv_fallback: bool = True,
+    skip_tdns_auto_update: bool = False,
+) -> Optional[Dict[str, Any]]:
     """
     Main function to check for and import DNS records
     This is called from labstartup.py
     
     Process:
+    0. Optionally auto-update tdns-mgr from GitHub main when version is behind upstream
     1. Check config.ini [VPOD] new-dns-records for inline values
     2. If config has values, import those (primary source)
-    3. If no config values, check for new-dns-records.csv file
+    3. If no config values and csv_fallback, check for new-dns-records.csv file
     4. If file exists, import from file (fallback)
-    5. Login to tdns-mgr and import with --ptr flag
+    5. Login to tdns-mgr and apply each record via add-record (with --ptr for A/AAAA)
     6. Log results (but don't fail the lab)
-    
+
+    :param config_ini: Optional path to ini; when set, VPOD new-dns-records are read only from this file
+    :param csv_fallback: When False (e.g. --config-ini), do not import from new-dns-records.csv
+    :param skip_tdns_auto_update: When True, do not fetch/compare upstream tdns-mgr.sh
     :return: Import result dictionary, or None if no import needed
     """
+    maybe_auto_update_tdns_mgr(skip=skip_tdns_auto_update)
+
     # Check if tdns-mgr is available
     if not check_tdns_mgr_available():
         write_output('ERROR: tdns-mgr not found - DNS import FAILED')
@@ -373,10 +703,11 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
             pass
     
     # PRIORITY 1: Check config.ini for inline DNS records
-    config_records = get_dns_records_from_config()
+    config_records = get_dns_records_from_config(config_ini)
     
     if config_records:
-        write_output(f'Found {len(config_records)} DNS records in config.ini')
+        src = config_ini or 'config.ini'
+        write_output(f'Found {len(config_records)} DNS records in {src}')
         
         # Login to tdns-mgr
         if not tdns_login():
@@ -418,6 +749,14 @@ def import_dns_records() -> Optional[Dict[str, Any]]:
         return result
     
     # PRIORITY 2: Check for new-dns-records.csv file (only if no config values)
+    if not csv_fallback:
+        write_output(
+            'No [VPOD] new-dns-records in the given config (--config-ini); '
+            'skipping new-dns-records.csv fallback'
+        )
+        update_dashboard_status('skipped', 'No inline records in specified config')
+        return None
+
     csv_path = find_dns_records_file()
     
     if csv_path:
@@ -487,7 +826,8 @@ Fields:
 
 Reference: https://raw.githubusercontent.com/burkeazbill/tdns-mgr/refs/heads/main/new-dns-records.csv
 
-The --ptr flag causes tdns-mgr to also create PTR records for A/AAAA records.
+This script applies rows using ``tdns-mgr add-record`` (and passes ``--ptr`` for A/AAAA).
+It does not call ``tdns-mgr import-records``: upstream 1.2.x shipped a broken awk CSV parser.
 
 In config.ini, specify records like:
 [VPOD]
@@ -511,18 +851,33 @@ def main():
         epilog='Reference: https://github.com/burkeazbill/tdns-mgr'
     )
     parser.add_argument('--csv', '-c', help='Path to CSV file (overrides auto-detection)')
+    parser.add_argument(
+        '--config-ini',
+        metavar='PATH',
+        default=None,
+        help=(
+            'Read [VPOD] new-dns-records only from this file (e.g. /tmp/config.ini). '
+            'Does not fall back to new-dns-records.csv. Use after boot to apply inline DNS only.'
+        ),
+    )
     parser.add_argument('--dry-run', '-n', action='store_true',
                         help='Show what would be imported without making changes')
     parser.add_argument('--show-config', action='store_true',
                         help='Show DNS records found in config.ini')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
+    parser.add_argument(
+        '--skip-tdns-auto-update',
+        action='store_true',
+        help='Do not fetch upstream tdns-mgr.sh to compare/update (see TDNS_IMPORT_SKIP_AUTO_UPDATE)',
+    )
     
     args = parser.parse_args()
     
     if args.show_config:
-        records = get_dns_records_from_config()
+        records = get_dns_records_from_config(args.config_ini)
         if records:
-            print(f'Found {len(records)} DNS records in config.ini:')
+            src = args.config_ini or 'config.ini'
+            print(f'Found {len(records)} DNS records in {src}:')
             for r in records:
                 print(f'  {r}')
         else:
@@ -531,23 +886,28 @@ def main():
     
     if args.dry_run:
         # Show what would be imported
-        config_records = get_dns_records_from_config()
+        config_records = get_dns_records_from_config(args.config_ini)
         if config_records:
-            print(f'Would import {len(config_records)} records from config.ini:')
+            src = args.config_ini or 'config.ini'
+            print(f'Would import {len(config_records)} records from {src}:')
             for r in config_records:
                 print(f'  {r}')
         else:
-            csv_path = args.csv or find_dns_records_file()
-            if csv_path:
-                print(f'Would import records from file: {csv_path}')
-                with open(csv_path, 'r') as f:
-                    print(f.read())
+            if args.config_ini:
+                print('No DNS records in [VPOD] new-dns-records for --config-ini (CSV fallback disabled)')
             else:
-                print('No DNS records to import')
+                csv_path = args.csv or find_dns_records_file()
+                if csv_path:
+                    print(f'Would import records from file: {csv_path}')
+                    with open(csv_path, 'r') as f:
+                        print(f.read())
+                else:
+                    print('No DNS records to import')
         return
     
     if args.csv:
         # Direct import from specified file
+        maybe_auto_update_tdns_mgr(skip=args.skip_tdns_auto_update)
         if not check_tdns_mgr_available():
             print('ERROR: tdns-mgr not found')
             sys.exit(1)
@@ -558,8 +918,12 @@ def main():
         
         result = import_records_from_file(args.csv)
     else:
-        # Standard auto-detection flow
-        result = import_dns_records()
+        # Standard auto-detection flow, or config-ini-only inline records
+        result = import_dns_records(
+            config_ini=args.config_ini,
+            csv_fallback=args.config_ini is None,
+            skip_tdns_auto_update=args.skip_tdns_auto_update,
+        )
     
     if result:
         print(f'\nImport Result: {json.dumps(result, indent=2)}')

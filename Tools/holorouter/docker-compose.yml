@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  certsrv-proxy:
+    build: 
+      context: .
+      dockerfile: Dockerfile.certsrv-proxy
+    image: certsrv-proxy:latest
+    container_name: certsrv-proxy
+    ports:
+      - "8900:8900"
+    environment:
+      # --- Network & Binding ---
+      - PROXY_PORT=8900
+      - PROXY_BIND=0.0.0.0
+      
+      # --- HashiCorp Vault Configuration ---
+      - VAULT_ADDR=http://127.0.0.1:32000
+      - VAULT_TOKEN=hvs.your_vault_token_here
+      - VAULT_PKI_MOUNT=pki
+      - VAULT_PKI_ROLE=holodeck
+      - VAULT_SKIP_VERIFY=true
+      
+      # --- Certificate Settings ---
+      - CERT_TTL=17520h
+      
+      # --- Basic Authentication ---
+      # Used by service accounts (e.g. SDDC Manager) when OIDC is bypassed or unavailable
+      - PROXY_PASSWORD=your_basic_auth_password_here
+      
+      # --- Role Mapping ---
+      # Maps AD CS Template Names to distinct Vault PKI roles
+      # Ensure you create a mapping.json file and mount it into the container
+      - ROLE_MAPPING=/app/mapping.json
+      
+      # --- OpenID Connect (OIDC) Authentication ---
+      # Used to redirect web browser users to an IdP (e.g., Authentik, Keycloak)
+      # Uncomment and configure these variables to enable OIDC.
+      # - OIDC_ISSUER=https://auth.example.com/application/o/certsrv/
+      # - OIDC_CLIENT_ID=your_client_id_here
+      # - OIDC_CLIENT_SECRET=your_client_secret_here
+      # - OIDC_REDIRECT_URI=https://ca.example.com/certsrv/oidc/callback
+      
+      # --- Debugging ---
+      - PROXY_DEBUG=false
+
+    volumes:
+      # Mount the role mapping file if you are using ROLE_MAPPING
+      # - ./mapping.json:/app/mapping.json:ro
+    
+    restart: unless-stopped

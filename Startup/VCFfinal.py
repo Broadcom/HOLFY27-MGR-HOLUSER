@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 4.4 - March 2026
+# Version 4.5 - April 2026
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v4.5 Changes:
+# - Now properly handles supervisor checking across management domains, 
+#   workload domains, or mixed environments with the correct SSO 
+#   authentication for each vCenter.
 #
 # v4.4 Changes:
 # - Added Task 2c3: Supervisor Service vSphere Pod DNS Fix
@@ -564,16 +569,21 @@ def check_supervisor_status_api(lsf, vcenter_host, sso_domain='wld.sso'):
             pass
         
         if not clusters or not isinstance(clusters, list) or len(clusters) == 0:
-            return None
+            return []
         
-        cluster = clusters[0]
-        return {
-            'config_status': cluster.get('config_status', ''),
-            'kubernetes_status': cluster.get('kubernetes_status', ''),
-            'api_servers': cluster.get('api_servers', []),
-            'cluster_id': cluster.get('cluster', ''),
-            'cluster_name': cluster.get('cluster_name', ''),
-        }
+        # Return ALL clusters, not just the first one
+        all_clusters = []
+        for cluster in clusters:
+            cluster_info = {
+                'config_status': cluster.get('config_status', ''),
+                'kubernetes_status': cluster.get('kubernetes_status', ''),
+                'api_servers': cluster.get('api_servers', []),
+                'cluster_id': cluster.get('cluster', ''),
+                'cluster_name': cluster.get('cluster_name', ''),
+            }
+            all_clusters.append(cluster_info)
+        
+        return all_clusters
     except Exception as e:
         lsf.write_output(f'  Error querying Supervisor API: {e}')
         return None
@@ -907,63 +917,117 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_output('  Continuing to Supervisor status polling...')
 
         #----------------------------------------------------------------------
-        # TASK 2b: VERIFY - Confirm Supervisor is RUNNING via vCenter REST API
-        # Instead of checking individual VMs (which requires elevated permissions
-        # on system-managed EAM VMs), we use the authoritative vCenter Supervisor
-        # Management API. This is what the vCenter UI shows and is the definitive
-        # source for Supervisor health.
+        # TASK 2b: VERIFY - Multi-vCenter Supervisor Status Check
+        # Enhanced supervisor verification that checks ALL vCenters for supervisors.
+        # This supports environments with supervisors in both management and
+        # workload domains, using the correct SSO domain for each vCenter.
         # Polls every WCP_POLL_INTERVAL seconds up to WCP_MAX_POLL_TIME.
         #----------------------------------------------------------------------
         lsf.write_output('='*60)
-        lsf.write_output('Verifying Supervisor Control Plane Status')
+        lsf.write_output('Verifying Supervisor Control Plane Status (Multi-vCenter)')
         lsf.write_output('='*60)
         lsf.write_vpodprogress('Tanzu Control Plane', 'GOOD-3')
         
+        # Build list of vCenters to check for supervisors
+        vcenter_targets = []
+        for vc_line in vcenters_list:
+            vc_parts = vc_line.split(':')
+            vc_host = vc_parts[0].strip()
+            
+            # Determine SSO domain for this specific vCenter
+            vc_sso_domain = 'vsphere.local'  # Default for management
+            if len(vc_parts) >= 3:
+                user_part = vc_parts[2].strip()
+                if '@' in user_part:
+                    vc_sso_domain = user_part.split('@')[1]
+            
+            vcenter_targets.append({
+                'host': vc_host,
+                'sso_domain': vc_sso_domain
+            })
+        
+        lsf.write_output(f'Will check {len(vcenter_targets)} vCenter(s) for supervisors:')
+        for target in vcenter_targets:
+            lsf.write_output(f'  - {target["host"]} (SSO: {target["sso_domain"]})')
+        
         supervisor_start_time = time.time()
+        last_overall_status = "No supervisors found"
         
         try:
             while (time.time() - supervisor_start_time) < WCP_MAX_POLL_TIME:
                 elapsed = int(time.time() - supervisor_start_time)
                 
-                sup_status = check_supervisor_status_api(lsf, wcp_vcenter, sso_domain)
+                # Check all vCenters for supervisors
+                all_supervisor_clusters = {}
+                total_clusters = 0
+                ready_clusters = 0
+                error_clusters = 0
                 
-                if sup_status is None:
-                    lsf.write_output(f'  Supervisor API not available yet - waiting... ({elapsed}s / {WCP_MAX_POLL_TIME}s)')
-                else:
-                    last_config_status = sup_status.get('config_status', '')
-                    last_k8s_status = sup_status.get('kubernetes_status', '')
+                for target in vcenter_targets:
+                    vc_host = target['host']
+                    vc_sso_domain = target['sso_domain']
                     
-                    if last_config_status == 'RUNNING' and last_k8s_status == 'READY':
-                        cluster_name = sup_status.get('cluster_name', 'unknown')
-                        api_servers = sup_status.get('api_servers', [])
-                        lsf.write_output(f'  Supervisor "{cluster_name}": config_status=RUNNING, kubernetes_status=READY')
-                        if api_servers:
-                            lsf.write_output(f'  API servers: {", ".join(api_servers)}')
+                    sup_clusters = check_supervisor_status_api(lsf, vc_host, vc_sso_domain)
+                    
+                    if sup_clusters:  # sup_clusters is now a list
+                        all_supervisor_clusters[vc_host] = sup_clusters
+                        total_clusters += len(sup_clusters)
+                        
+                        for cluster in sup_clusters:
+                            config_status = cluster.get('config_status', '')
+                            k8s_status = cluster.get('kubernetes_status', '')
+                            
+                            if config_status == 'RUNNING' and k8s_status == 'READY':
+                                ready_clusters += 1
+                            elif config_status == 'ERROR':
+                                error_clusters += 1
+                
+                if total_clusters == 0:
+                    lsf.write_output(f'  No supervisor clusters found on any vCenter - waiting... ({elapsed}s / {WCP_MAX_POLL_TIME}s)')
+                    last_overall_status = "No supervisor clusters found"
+                else:
+                    # Report status of all clusters
+                    lsf.write_output(f'  Found {total_clusters} supervisor cluster(s): {ready_clusters} ready, {error_clusters} error, {total_clusters - ready_clusters - error_clusters} pending ({elapsed}s / {WCP_MAX_POLL_TIME}s)')
+                    
+                    for vc_host, clusters in all_supervisor_clusters.items():
+                        for cluster in clusters:
+                            config_status = cluster.get('config_status', '')
+                            k8s_status = cluster.get('kubernetes_status', '')
+                            cluster_name = cluster.get('cluster_name', 'unknown')
+                            api_servers = cluster.get('api_servers', [])
+                            
+                            status_str = f'config={config_status}, k8s={k8s_status}'
+                            lsf.write_output(f'    {vc_host}: "{cluster_name}" -> {status_str}')
+                            
+                            if api_servers and config_status == 'RUNNING' and k8s_status == 'READY':
+                                lsf.write_output(f'      API servers: {", ".join(api_servers)}')
+                    
+                    last_overall_status = f'{ready_clusters}/{total_clusters} ready, {error_clusters} error'
+                    
+                    # Check if all clusters are ready
+                    if ready_clusters == total_clusters and total_clusters > 0:
+                        lsf.write_output(f'All {total_clusters} supervisor cluster(s) are RUNNING and READY!')
                         tanzu_verify_ok = True
                         break
-                    elif last_config_status == 'ERROR':
-                        lsf.write_output(f'  Supervisor config_status: ERROR')
+                    elif error_clusters > 0:
+                        lsf.write_output(f'  {error_clusters} supervisor cluster(s) in ERROR state')
                         lsf.write_output(f'    Check Supervisor Management in vCenter UI for details')
                         break
-                    elif last_config_status == 'RUNNING':
-                        lsf.write_output(f'  Supervisor config_status: RUNNING, kubernetes_status: {last_k8s_status} - waiting for READY ({elapsed}s / {WCP_MAX_POLL_TIME}s)')
-                    else:
-                        lsf.write_output(f'  Supervisor config_status: {last_config_status}, kubernetes_status: {last_k8s_status} - waiting... ({elapsed}s / {WCP_MAX_POLL_TIME}s)')
                 
                 time.sleep(WCP_POLL_INTERVAL)
             
             if not tanzu_verify_ok:
                 if (time.time() - supervisor_start_time) >= WCP_MAX_POLL_TIME:
-                    lsf.write_output(f'  Supervisor did not reach RUNNING/READY within {WCP_MAX_POLL_TIME // 60} minutes')
-                lsf.write_output(f'  Last status: config={last_config_status or "unknown"}, k8s={last_k8s_status or "unknown"}')
+                    lsf.write_output(f'  Supervisors did not reach RUNNING/READY within {WCP_MAX_POLL_TIME // 60} minutes')
+                lsf.write_output(f'  Final status: {last_overall_status}')
                 
         except Exception as e:
             lsf.write_output(f'Error verifying Supervisor status: {e}')
         
         if tanzu_verify_ok:
-            lsf.write_output('Supervisor Control Plane: RUNNING and READY')
+            lsf.write_output('Supervisor Control Plane: All clusters RUNNING and READY')
         else:
-            lsf.write_output('Supervisor Control Plane: Not yet fully running')
+            lsf.write_output('Supervisor Control Plane: Not all clusters ready')
             lsf.write_output('  check_fix_wcp.sh will attempt to wait and fix certificates')
         
         if dashboard:
@@ -971,7 +1035,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                 dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.COMPLETE)
             else:
                 dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.FAILED,
-                                      f'config={last_config_status or "unknown"}, k8s={last_k8s_status or "unknown"}')
+                                      last_overall_status)
             dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.RUNNING)
             dashboard.generate_html()
         
@@ -1000,7 +1064,11 @@ def main(lsf=None, standalone=False, dry_run=False):
                     lsf.write_output(f'  ERROR: Failed to set execute permission: {chmod_err}')
                     lsf.write_output(f'  Will run via bash interpreter as fallback')
             
-            lsf.write_output(f'Running: {check_fix_wcp_script} {wcp_vcenter}')
+            # Use the first vCenter from our targets for the fix script
+            # (script still needs a single target vCenter)
+            fix_target_vc = vcenter_targets[0]['host'] if vcenter_targets else 'vc-mgmt-a.site-a.vcf.lab'
+            
+            lsf.write_output(f'Running: {check_fix_wcp_script} {fix_target_vc}')
             lsf.write_output(f'  (script has internal polling up to {WCP_MAX_POLL_TIME // 60}m)')
             
             try:
@@ -1008,7 +1076,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                 # Use extended timeout since the script has internal polling
                 # Pass --stdout-only so script does not also write to log file directly
                 # (VCFfinal.py handles all logging via lsf.write_output)
-                wcp_cmd = f'/bin/bash {check_fix_wcp_script} --stdout-only {wcp_vcenter}'
+                wcp_cmd = f'/bin/bash {check_fix_wcp_script} --stdout-only {fix_target_vc}'
                 result = lsf.run_command(wcp_cmd, timeout=WCP_SCRIPT_TIMEOUT)
                 
                 exit_code = result.returncode if hasattr(result, 'returncode') else (0 if result else 1)
@@ -1064,28 +1132,48 @@ def main(lsf=None, standalone=False, dry_run=False):
         #----------------------------------------------------------------------
         if not tanzu_verify_ok or not wcp_certs_ok:
             lsf.write_output('='*60)
-            lsf.write_output('Final Supervisor Status Check')
+            lsf.write_output('Final Supervisor Status Check (Multi-vCenter)')
             lsf.write_output('='*60)
             
-            final_status = check_supervisor_status_api(lsf, wcp_vcenter, sso_domain)
+            # Re-check all vCenters for final status
+            final_ready_clusters = 0
+            final_total_clusters = 0
+            final_all_ready = True
             
-            if final_status and final_status.get('config_status') == 'RUNNING' and final_status.get('kubernetes_status') == 'READY':
-                lsf.write_output('Supervisor is now RUNNING and READY (confirmed via vCenter API)')
-                cluster_name = final_status.get('cluster_name', 'unknown')
-                lsf.write_output(f'  Cluster: {cluster_name}')
+            for target in vcenter_targets:
+                vc_host = target['host']
+                vc_sso_domain = target['sso_domain']
                 
-                # Override dashboard status since the Supervisor is actually healthy
+                final_clusters = check_supervisor_status_api(lsf, vc_host, vc_sso_domain)
+                
+                if final_clusters:
+                    final_total_clusters += len(final_clusters)
+                    
+                    for cluster in final_clusters:
+                        config_status = cluster.get('config_status', '')
+                        k8s_status = cluster.get('kubernetes_status', '')
+                        cluster_name = cluster.get('cluster_name', 'unknown')
+                        
+                        if config_status == 'RUNNING' and k8s_status == 'READY':
+                            final_ready_clusters += 1
+                        else:
+                            final_all_ready = False
+                        
+                        lsf.write_output(f'  {vc_host}: "{cluster_name}" -> config={config_status}, k8s={k8s_status}')
+            
+            if final_all_ready and final_total_clusters > 0:
+                lsf.write_output(f'All {final_total_clusters} supervisor cluster(s) are now RUNNING and READY!')
+                
+                # Override dashboard status since all Supervisors are healthy
                 if not tanzu_verify_ok:
                     lsf.write_output('  Updating Tanzu Control Plane status to COMPLETE')
                     tanzu_verify_ok = True
                 if not wcp_certs_ok:
                     lsf.write_output('  Updating WCP Certificate Fix status to COMPLETE')
-                    lsf.write_output('  (Supervisor is healthy - certificate fix may not have been needed)')
+                    lsf.write_output('  (All supervisors are healthy - certificate fix may not have been needed)')
                     wcp_certs_ok = True
             else:
-                cfg = final_status.get('config_status', 'unknown') if final_status else 'unknown'
-                k8s = final_status.get('kubernetes_status', 'unknown') if final_status else 'unknown'
-                lsf.write_output(f'Supervisor final status: config={cfg}, k8s={k8s}')
+                lsf.write_output(f'Final supervisor status: {final_ready_clusters}/{final_total_clusters} clusters ready')
         
         if dashboard:
             if tanzu_verify_ok:
@@ -2886,6 +2974,38 @@ def main(lsf=None, standalone=False, dry_run=False):
                                   'No NSX managers configured')
         dashboard.generate_html()
     
+    #==========================================================================
+    # TASK 8: DISTRIBUTE VAULT CA TRUST
+    #==========================================================================
+    
+    lsf.write_output('Fetching Vault Root CA certificate...')
+    import urllib.request
+    try:
+        req = urllib.request.Request('http://10.1.1.1:32000/v1/pki/ca/pem')
+        with urllib.request.urlopen(req, timeout=10) as response:
+            vault_ca_pem = response.read().decode('utf-8').strip()
+            
+        if vault_ca_pem and 'BEGIN CERTIFICATE' in vault_ca_pem:
+            lsf.write_output('Successfully fetched Vault CA certificate.')
+            
+            # Dynamically import confighol-9.1.py to reuse its trust distribution logic
+            import importlib.util
+            confighol_path = '/home/holuser/hol/Tools/confighol-9.1.py'
+            if os.path.exists(confighol_path):
+                spec = importlib.util.spec_from_file_location("confighol", confighol_path)
+                confighol = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(confighol)
+                
+                # Execute the distribution function
+                lsf.write_output('Distributing Vault CA trust across VCF suite...')
+                confighol.distribute_vault_ca_trust(vault_ca_pem, lsf.get_password(), dry_run=dry_run)
+            else:
+                lsf.write_output(f'WARNING: Could not find {confighol_path} to distribute CA trust.')
+        else:
+            lsf.write_output('WARNING: Invalid Vault CA certificate received.')
+    except Exception as e:
+        lsf.write_output(f'WARNING: Failed to fetch Vault CA: {e}')
+
     #==========================================================================
     # Cleanup
     #==========================================================================

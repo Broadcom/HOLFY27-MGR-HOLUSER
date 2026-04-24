@@ -2511,7 +2511,7 @@ def load_config(config_path: Optional[str] = None) -> Dict:
     """Load configuration from file or environment variables."""
     config = {
         'sddc_manager_url': 'https://sddcmanager-a.site-a.vcf.lab',
-        'vault_url': 'http://10.1.1.1:32000',
+        'vault_url': 'http://vault.vcf.lab',
         'vault_token': None,  # obtained fresh at runtime
         'vault_role': 'holodeck',
         'vault_mount': 'pki',
@@ -2547,7 +2547,7 @@ def load_config(config_path: Optional[str] = None) -> Dict:
 
     # Get fresh Vault token if not explicitly provided
     if not config.get('vault_token'):
-        vault_url = config.get('vault_url', 'http://10.1.1.1:32000')
+        vault_url = config.get('vault_url', 'http://vault.vcf.lab')
         password = config.get('vcf_pass', '')
         if password:
             config['vault_token'] = get_fresh_vault_token(vault_url, password)
