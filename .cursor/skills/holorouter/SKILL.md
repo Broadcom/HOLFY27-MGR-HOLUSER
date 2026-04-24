@@ -109,6 +109,7 @@ nginx -t && nginx -s reload
 - HTTPS to `dns.vcf.lab:443` is terminated with the **holodeck / lab CA** (nginx cert on holorouter). `tdns-mgr` uses `curl` without trusting that CA unless **`INSECURE_TDNS=true`** is in the environment (mapped to `curl -k` in `tdns-mgr.sh`). Without that, `login` often fails with a generic **Login failed** even when the password is correct. Newer tdns-mgr (≈1.2.2+) also supports a global **`--insecure`** CLI flag; **v1.2.0 does not**, so automation must rely on **`INSECURE_TDNS`**, not `--insecure`.
 - `tdns_import.py` sets **`INSECURE_TDNS=true`** on subprocesses by default. To force TLS verification instead, set **`TDNS_MGR_SECURE_TLS=1`** (or `true`/`yes`) in the environment.
 - A stale **`DNS_TOKEN`** in `~/.config/tdns-mgr/.tdns-mgr.conf` can short-circuit real password login; the import script clears that line and uses **`CREDS_FILE`** (default `/home/holuser/creds.txt`) for `admin` password.
+- **`tdns-mgr import-records`** (CSV bulk) is broken in upstream **1.2.2** (awk `sub(/\r$/` split across lines → parse failure). **`Tools/tdns_import.py`** avoids it by calling **`tdns-mgr add-record`** per row instead.
 
 **Technitium API pattern:**
 

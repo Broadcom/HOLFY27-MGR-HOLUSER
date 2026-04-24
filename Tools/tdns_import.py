@@ -5,13 +5,13 @@
 # Imports DNS records from config.ini [VPOD] new-dns-records or new-dns-records.csv
 # Reference: https://github.com/burkeazbill/tdns-mgr
 
+import csv
 import os
 import re
 import sys
 import json
 import subprocess
-import tempfile
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 # Add hol directory to path
 sys.path.insert(0, '/home/holuser/hol')
@@ -27,6 +27,27 @@ DEFAULT_CREDS_FILE = '/home/holuser/creds.txt'
 # CSV header format per tdns-mgr specification
 # See: https://raw.githubusercontent.com/burkeazbill/tdns-mgr/refs/heads/main/new-dns-records.csv
 CSV_HEADER = 'zone,name,type,value'
+
+
+def parse_zone_name_type_value_line(line: str) -> Optional[Tuple[str, str, str, str]]:
+    """
+    Parse one CSV row: zone,name,type,value (quoted fields allowed).
+    Returns None for blanks, comments, or invalid rows.
+    """
+    line = line.strip()
+    if not line or line.startswith('#') or line.lower().startswith('zone,'):
+        return None
+    try:
+        row = next(csv.reader([line]))
+    except Exception:
+        return None
+    if len(row) < 4:
+        return None
+    zone, name, rtype, value = row[0].strip(), row[1].strip(), row[2].strip(), row[3].strip()
+    if not zone or not name or not rtype or not value:
+        return None
+    return zone, name, rtype, value
+
 
 #==============================================================================
 # FUNCTIONS
@@ -207,15 +228,9 @@ def get_dns_records_from_config(ini_path: Optional[str] = None) -> List[str]:
     
     for line in lines:
         line = line.strip()
-        # Skip empty lines, comments, and header
-        if not line or line.startswith('#') or line.lower().startswith('zone,'):
-            continue
-        
-        # Validate it has 4 comma-separated fields (zone,name,type,value)
-        parts = line.split(',')
-        if len(parts) >= 4:
+        if parse_zone_name_type_value_line(line):
             records.append(line)
-        else:
+        elif line and not line.startswith('#'):
             write_output(f'WARNING: Invalid DNS record format (expected zone,name,type,value): {line}')
     
     return records
@@ -242,6 +257,94 @@ def find_dns_records_file() -> Optional[str]:
             return path
     
     return None
+
+
+def load_records_from_csv_file(csv_path: str) -> List[Tuple[str, str, str, str]]:
+    """
+    Load zone,name,type,value rows from a CSV file (header row required).
+    Accepts column name aliases: hostname for name; value/data/ip for value.
+    """
+    rows: List[Tuple[str, str, str, str]] = []
+    with open(csv_path, newline='', encoding='utf-8', errors='replace') as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return rows
+        for raw in reader:
+            d = {(k or '').strip().lower(): (v or '').strip() for k, v in raw.items() if k}
+            if not any(d.values()):
+                continue
+            zone = d.get('zone') or d.get('domain') or ''
+            name = d.get('name') or d.get('hostname') or ''
+            rtype = d.get('type') or d.get('rtype') or ''
+            value = d.get('value') or d.get('data') or d.get('ip') or d.get('ipaddress') or ''
+            if zone and name and rtype and value:
+                rows.append((zone, name, rtype, value))
+    return rows
+
+
+def import_dns_rows(
+    rows: List[Tuple[str, str, str, str]],
+    *,
+    source_label: str,
+    use_ptr: bool,
+) -> Dict[str, Any]:
+    """
+    Apply DNS rows via ``tdns-mgr add-record`` for each line.
+
+    Avoids ``tdns-mgr import-records``: upstream tdns-mgr 1.2.2 embeds a broken awk
+    fragment (split ``sub(/\\r$/`` across lines), which fails for every CSV.
+    """
+    if not rows:
+        return {'Message': 'No records', 'New Records': 0, 'Errors': 0}
+
+    write_output(
+        f'Applying {len(rows)} record(s) via tdns-mgr add-record (source: {source_label})'
+    )
+
+    new_records = 0
+    errors = 0
+    notes: List[str] = []
+
+    for zone, name, rtype, value in rows:
+        rtype_u = rtype.upper()
+        cmd = list(tdns_mgr_cmd('add-record', zone, name, rtype_u, value))
+        if use_ptr and rtype_u in ('A', 'AAAA'):
+            cmd.append('--ptr')
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=45,
+                env=tdns_mgr_env(),
+            )
+        except subprocess.TimeoutExpired:
+            errors += 1
+            msg = f'timeout: {name}.{zone} {rtype_u}'
+            notes.append(msg)
+            write_output(f'DNS add-record error: {msg}')
+            continue
+        except Exception as ex:
+            errors += 1
+            msg = f'{name}.{zone}: {ex}'
+            notes.append(msg)
+            write_output(f'DNS add-record error: {msg}')
+            continue
+
+        if result.returncode == 0:
+            new_records += 1
+            continue
+
+        errors += 1
+        err_text = (result.stderr or result.stdout or '').strip()
+        if len(err_text) > 800:
+            err_text = err_text[:800] + '...'
+        notes.append(f'{name}.{zone} {rtype_u}: {err_text}')
+        write_output(f'DNS add-record failed ({name}.{zone} {rtype_u}): {err_text}')
+
+    message = '; '.join(notes) if notes else 'Success'
+    return {'Message': message, 'New Records': new_records, 'Errors': errors}
 
 
 def tdns_show_config():
@@ -343,44 +446,23 @@ def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
 
 def import_records_from_file(csv_path: str) -> Dict[str, Any]:
     """
-    Import DNS records from CSV file using tdns-mgr
-    
-    :param csv_path: Path to the new-dns-records.csv file
-    :return: Result dictionary with import statistics
+    Import DNS records from a CSV file (new-dns-records.csv style).
+
+    Uses per-record ``tdns-mgr add-record`` instead of ``import-records`` (broken awk
+    in tdns-mgr 1.2.2 upstream).
     """
-    write_output(f'Importing DNS records from: {csv_path}')
-    
+    write_output(f'Reading DNS records CSV: {csv_path}')
     try:
-        result = subprocess.run(
-            tdns_mgr_cmd('import-records', csv_path, '--ptr'),
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=tdns_mgr_env(),
-        )
-        
-        if result.stdout.strip():
-            try:
-                output = json.loads(result.stdout.strip())
-                write_output(f'DNS import result: {output}')
-                return output
-            except json.JSONDecodeError:
-                write_output(f'DNS import output: {result.stdout}')
-                return {
-                    'Message': result.stdout.strip(),
-                    'New Records': 0,
-                    'Errors': 0 if result.returncode == 0 else 1
-                }
-        
-        if result.returncode != 0:
-            write_output(f'DNS import error: {result.stderr}')
-            return {'Message': result.stderr, 'New Records': 0, 'Errors': 1}
-        
-        return {'Message': 'Completed', 'New Records': 0, 'Errors': 0}
-        
-    except subprocess.TimeoutExpired:
-        write_output('DNS record import timed out')
-        return {'Message': 'Timeout', 'New Records': 0, 'Errors': 1}
+        rows = load_records_from_csv_file(csv_path)
+        if not rows:
+            write_output('No parseable zone,name,type,value rows in CSV')
+            return {'Message': 'No parseable rows in CSV', 'New Records': 0, 'Errors': 0}
+        result = import_dns_rows(rows, source_label=csv_path, use_ptr=True)
+        write_output(f'DNS import result: {result}')
+        return result
+    except OSError as e:
+        write_output(f'DNS import error: {e}')
+        return {'Message': str(e), 'New Records': 0, 'Errors': 1}
     except Exception as e:
         write_output(f'DNS import error: {e}')
         return {'Message': str(e), 'New Records': 0, 'Errors': 1}
@@ -388,36 +470,26 @@ def import_records_from_file(csv_path: str) -> Dict[str, Any]:
 
 def import_records_from_config(records: List[str]) -> Dict[str, Any]:
     """
-    Import DNS records from config.ini inline values
-    Creates a temporary CSV file and imports it
-    
-    :param records: List of record lines (zone,name,type,value format)
-    :return: Result dictionary with import statistics
+    Import DNS records from config.ini inline values (zone,name,type,value per line).
+
+    Uses ``tdns-mgr add-record`` per row (no tempfile); avoids broken ``import-records`` awk.
     """
     if not records:
         return {'Message': 'No records', 'New Records': 0, 'Errors': 0}
-    
-    write_output(f'Importing {len(records)} DNS records from config.ini')
-    
-    # Create temporary CSV file with proper format
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
-            f.write(f'{CSV_HEADER}\n')
-            for record in records:
-                f.write(f'{record}\n')
-            temp_path = f.name
-        
-        # Import using the temp file
-        result = import_records_from_file(temp_path)
-        
-        # Clean up temp file
-        os.unlink(temp_path)
-        
-        return result
-        
-    except Exception as e:
-        write_output(f'Error creating temp CSV file: {e}')
-        return {'Message': str(e), 'New Records': 0, 'Errors': 1}
+
+    write_output(f'Importing {len(records)} DNS record line(s) from config.ini')
+    rows: List[Tuple[str, str, str, str]] = []
+    for record in records:
+        parsed = parse_zone_name_type_value_line(record)
+        if parsed:
+            rows.append(parsed)
+        else:
+            write_output(f'WARNING: skipped unparsable line: {record!r}')
+
+    if not rows:
+        return {'Message': 'No parseable records', 'New Records': 0, 'Errors': 0}
+
+    return import_dns_rows(rows, source_label='config.ini [VPOD] new-dns-records', use_ptr=True)
 
 
 def import_dns_records(
@@ -433,7 +505,7 @@ def import_dns_records(
     2. If config has values, import those (primary source)
     3. If no config values and csv_fallback, check for new-dns-records.csv file
     4. If file exists, import from file (fallback)
-    5. Login to tdns-mgr and import with --ptr flag
+    5. Login to tdns-mgr and apply each record via add-record (with --ptr for A/AAAA)
     6. Log results (but don't fail the lab)
 
     :param config_ini: Optional path to ini; when set, VPOD new-dns-records are read only from this file
@@ -589,7 +661,8 @@ Fields:
 
 Reference: https://raw.githubusercontent.com/burkeazbill/tdns-mgr/refs/heads/main/new-dns-records.csv
 
-The --ptr flag causes tdns-mgr to also create PTR records for A/AAAA records.
+This script applies rows using ``tdns-mgr add-record`` (and passes ``--ptr`` for A/AAAA).
+It does not call ``tdns-mgr import-records``: upstream 1.2.x shipped a broken awk CSV parser.
 
 In config.ini, specify records like:
 [VPOD]
