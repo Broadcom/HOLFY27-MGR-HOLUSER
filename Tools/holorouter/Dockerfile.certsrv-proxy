@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir cryptography requests urllib3
+
+COPY certsrv_proxy.py /app/certsrv_proxy.py
+
+WORKDIR /app
+
+ENTRYPOINT ["python3", "/app/certsrv_proxy.py"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.1 - 2026-03-13
+# Version 3.3 - 2026-04-01
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -351,7 +351,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     ## The examples below demonstrate common operations. Uncomment and modify
     ## as needed for your specific lab requirements.
     ##=========================================================================
-    
+   
     ## Example 1: Check URL accessibility
     ## ----------------------------------
     ## Check if a web interface is accessible, optionally verify expected content

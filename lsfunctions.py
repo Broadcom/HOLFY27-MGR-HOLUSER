@@ -1181,16 +1181,22 @@ def get_vm_by_name(name, **kwargs):
     vmlist = []
     
     if vc and vc in sisvc:
-        vms = get_all_objs(sisvc[vc].content, [vim.VirtualMachine])
-        for vm in vms:
-            if vm.name == name:
-                vmlist.append(vm)
-    else:
-        for si in sis:
-            vms = get_all_objs(si.content, [vim.VirtualMachine])
+        try:
+            vms = get_all_objs(sisvc[vc].content, [vim.VirtualMachine])
             for vm in vms:
                 if vm.name == name:
                     vmlist.append(vm)
+        except Exception:
+            pass
+    else:
+        for si in sis:
+            try:
+                vms = get_all_objs(si.content, [vim.VirtualMachine])
+                for vm in vms:
+                    if vm.name == name:
+                        vmlist.append(vm)
+            except Exception:
+                pass
     return vmlist
 
 
@@ -1203,11 +1209,14 @@ def get_vm_match(name):
     pattern = re.compile(name, re.IGNORECASE)
     vmsreturn = []
     for si in sis:
-        vms = get_all_objs(si.content, [vim.VirtualMachine])
-        for vm in vms:
-            match = pattern.match(vm.name)
-            if match:
-                vmsreturn.append(vm)
+        try:
+            vms = get_all_objs(si.content, [vim.VirtualMachine])
+            for vm in vms:
+                match = pattern.match(vm.name)
+                if match:
+                    vmsreturn.append(vm)
+        except Exception:
+            pass
     return vmsreturn
 
 
@@ -1222,16 +1231,22 @@ def get_vapp(name, **kwargs):
     valist = []
     
     if vc and vc in sisvc:
-        vapps = get_all_objs(sisvc[vc].content, [vim.VirtualApp])
-        for vapp in vapps:
-            if vapp.name == name:
-                valist.append(vapp)
-    else:
-        for si in sis:
-            vapps = get_all_objs(si.content, [vim.VirtualApp])
+        try:
+            vapps = get_all_objs(sisvc[vc].content, [vim.VirtualApp])
             for vapp in vapps:
                 if vapp.name == name:
                     valist.append(vapp)
+        except Exception:
+            pass
+    else:
+        for si in sis:
+            try:
+                vapps = get_all_objs(si.content, [vim.VirtualApp])
+                for vapp in vapps:
+                    if vapp.name == name:
+                        valist.append(vapp)
+            except Exception:
+                pass
     return valist
 
 
@@ -1997,7 +2012,8 @@ def push_lab_files_to_console():
     for item in os.listdir(sku_files_dir):
         src = os.path.join(sku_files_dir, item)
         dst = os.path.join(console_files_dir, item)
-        if os.path.isfile(src):
+        # If it is a file and it is not named files-README.md, then copy it
+        if os.path.isfile(src) and item != 'files-README.md':
             try:
                 shutil.copy(src, dst)
                 write_output(f'Copied {item} to console files directory')

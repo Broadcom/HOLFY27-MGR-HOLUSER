@@ -95,7 +95,7 @@ while [ $PROXY_CHECK_ATTEMPTS -lt $PROXY_CHECK_MAX ]; do
     # Check if GitHub is accessible through the proxy using HTTP status code
     # When proxy filter is DISABLED, GitHub should return HTTP 200
     # When proxy filter is ENABLED, GitHub is blocked (returns 403, 503, or connection fails)
-    HTTP_STATUS=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -x http://proxy.site-a.vcf.lab:3128 https://github.com 2>&1)
+    HTTP_STATUS=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -x http://proxy.site-a.vcf.lab:3128 https://github.com 2>&1 || true)
     
     if [ "$HTTP_STATUS" == "200" ]; then
         echo "GitHub is accessible through proxy (HTTP ${HTTP_STATUS}, filter disabled)" | tee -a $LOGFILE

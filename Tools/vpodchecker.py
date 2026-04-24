@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.5 - March 19, 2026
+# Version 2.6 - April 2, 2026
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.6 - 2026-04-02:
+#   - Fixed issue with Firefox root CA check not being imported
+#   - Update to skip the VCFA DRS Isolation check if the lab is not using VCFA
+#   - Update for dual site SDDC and Ops
+#   - Added Ops to password check table
 # v2.5 - 2026-03-19:
 #   - Fixed _get_nsx_manager_for_edge_check() to support VCF 9.1 C4 'vna-'
 #     prefixed edge names in addition to 'edge-' prefix
@@ -1728,6 +1733,100 @@ def check_password_expirations() -> List[CheckResult]:
                     details={'hostname': hostname, 'username': user, 'error': str(e)}
                 ))
     
+
+    # Check VCF Operations VMs
+    ops_vms = []
+    seen_short = set()
+    if lsf.config.has_option('RESOURCES', 'VMs'):
+        vms_raw = lsf.config.get('RESOURCES', 'VMs').split('\n')
+        for vm in vms_raw:
+            if not vm or vm.strip().startswith('#'):
+                continue
+            if 'ops' in vm.lower():
+                parts = vm.split(':')
+                vm_name = parts[0].strip()
+                if '.*' in vm_name or vm_name.endswith('*'):
+                    resolved = lsf.get_vm_match(vm_name)
+                    if resolved:
+                        for rvm in resolved:
+                            if 'ops' in rvm.name.lower():
+                                short = rvm.name.split('.')[0]
+                                if short not in seen_short:
+                                    ops_vms.append(rvm.name)
+                                    seen_short.add(short)
+                else:
+                    short = vm_name.split('.')[0]
+                    if short not in seen_short:
+                        ops_vms.append(vm_name)
+                        seen_short.add(short)
+                        
+    if lsf.config.has_section('VCFFINAL') and lsf.config.has_option('VCFFINAL', 'vcfcomponenturls'):
+        from urllib.parse import urlparse
+        comp_urls = lsf.config.get('VCFFINAL', 'vcfcomponenturls').split('\n')
+        for line in comp_urls:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            url = line.split(',')[0].strip()
+            try:
+                parsed = urlparse(url)
+                fqdn = parsed.hostname
+                if fqdn and 'ops' in fqdn.lower():
+                    short = fqdn.split('.')[0]
+                    if short not in seen_short:
+                        ops_vms.append(fqdn)
+                        seen_short.add(short)
+            except Exception:
+                pass
+
+    for opsvm in ops_vms:
+        if 'opsnet' in opsvm.lower():
+            continue  # No SSH access
+            
+        if 'opslogs' in opsvm.lower():
+            ssh_user = 'vmware-system-user'
+            check_users = ['vmware-system-user', 'root']
+        else:
+            ssh_user = 'root'
+            check_users = ['root']
+            
+        for user in check_users:
+            try:
+                needs_sudo = (user == 'root' and ssh_user != 'root')
+                days = get_linux_password_expiration(opsvm, user, password,
+                                                      ssh_user=ssh_user,
+                                                      use_sudo=needs_sudo)
+                
+                if days is None:
+                    status = "PASS"
+                    message = "Password never expires"
+                elif days > three_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365} years)"
+                elif days > two_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365} years)"
+                else:
+                    status = "FAIL"
+                    if days < 0:
+                        message = f"Password EXPIRED {abs(days)} days ago"
+                    else:
+                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                
+                results.append(CheckResult(
+                    name=f"VCF Ops {opsvm} ({user})",
+                    status=status,
+                    message=message,
+                    details={'hostname': opsvm, 'username': user, 'days_until_expiration': days}
+                ))
+            except Exception as e:
+                results.append(CheckResult(
+                    name=f"VCF Ops {opsvm} ({user})",
+                    status="WARN",
+                    message=f"Could not check: {str(e)[:40]}",
+                    details={'hostname': opsvm, 'username': user, 'error': str(e)}
+                ))
+
     return results
 
 
@@ -1738,9 +1837,7 @@ def check_password_expirations() -> List[CheckResult]:
 LMC_FIREFOX_PROFILE_BASE = '/lmchol/home/holuser/snap/firefox/common/.mozilla/firefox'
 CERTUTIL_BINARY = 'certutil'
 
-EXPECTED_PRIVATE_CAS = [
-    'vcf.lab Root Authority',
-]
+EXPECTED_PRIVATE_CAS = []
 
 
 def _find_firefox_profiles() -> List[str]:
@@ -1806,7 +1903,7 @@ def _get_firefox_private_cas(profile_path: str) -> List[Tuple[str, str, dict]]:
             if export.returncode == 0 and export.stdout:
                 info = subprocess.run(
                     ['openssl', 'x509', '-noout', '-subject', '-issuer',
-                     '-startdate', '-enddate'],
+                     '-startdate', '-enddate', '-fingerprint', '-sha256'],
                     input=export.stdout, capture_output=True, text=True, timeout=10
                 )
                 if info.returncode == 0:
@@ -1819,6 +1916,8 @@ def _get_firefox_private_cas(profile_path: str) -> List[Tuple[str, str, dict]]:
                             details['not_before'] = info_line[len('notBefore='):].strip()
                         elif info_line.startswith('notAfter='):
                             details['not_after'] = info_line[len('notAfter='):].strip()
+                        elif info_line.startswith('sha256 Fingerprint='):
+                            details['fingerprint'] = info_line[len('sha256 Fingerprint='):].strip()
 
                     # Calculate days until expiry
                     if 'not_after' in details:
@@ -1865,6 +1964,27 @@ def _build_expected_ca_list() -> List[str]:
     return expected
 
 
+def _get_vault_ca_fingerprint() -> Optional[str]:
+    """
+    Fetch the active Vault CA certificate and compute its SHA256 fingerprint.
+    """
+    try:
+        import requests
+        resp = requests.get('http://10.1.1.1:32000/v1/pki/ca/pem', timeout=5)
+        if resp.status_code == 200:
+            info = subprocess.run(
+                ['openssl', 'x509', '-noout', '-fingerprint', '-sha256'],
+                input=resp.text, capture_output=True, text=True, timeout=5
+            )
+            if info.returncode == 0:
+                for line in info.stdout.splitlines():
+                    if line.startswith('sha256 Fingerprint='):
+                        return line[len('sha256 Fingerprint='):].strip()
+    except Exception:
+        pass
+    return None
+
+
 def check_firefox_trusted_cas() -> List[CheckResult]:
     """
     Check that all expected private CA certificates are trusted in Firefox.
@@ -1908,12 +2028,17 @@ def check_firefox_trusted_cas() -> List[CheckResult]:
 
     expected = _build_expected_ca_list()
     found_names = {name for name, _, _ in found_cas}
+    found_fps = {details.get('fingerprint') for _, _, details in found_cas if 'fingerprint' in details}
+
+    vault_fp = _get_vault_ca_fingerprint()
+    vault_ca_found = False
 
     # Report each found CA
     for nickname, trust, details in found_cas:
         days = details.get('days_until_expiry')
         not_after = details.get('not_after', 'unknown')
         subject = details.get('subject', '')
+        fp = details.get('fingerprint')
 
         if days is not None and days < 0:
             status = "FAIL"
@@ -1927,6 +2052,13 @@ def check_firefox_trusted_cas() -> List[CheckResult]:
         else:
             status = "PASS"
             message = "Trusted (could not determine expiry)"
+
+        # Check if this is the active Vault CA
+        if vault_fp and fp == vault_fp:
+            vault_ca_found = True
+            message = f"Active Vault CA | {message}"
+        elif 'vcf.lab Root Authority' in nickname:
+            message = f"Inactive/Old Vault CA | {message}"
 
         # Include a concise subject hint for context
         if subject:
@@ -1942,6 +2074,22 @@ def check_firefox_trusted_cas() -> List[CheckResult]:
             status=status,
             message=message,
             details=details,
+        ))
+
+    # Check if the active Vault CA was found
+    if vault_fp and not vault_ca_found:
+        results.append(CheckResult(
+            name="Firefox CA: vcf.lab Root Authority",
+            status="FAIL",
+            message="MISSING - Active Vault CA not found in Firefox certificate store",
+            details={'expected_fingerprint': vault_fp, 'profile': profile_path}
+        ))
+    elif not vault_fp:
+        results.append(CheckResult(
+            name="Firefox CA: vcf.lab Root Authority",
+            status="WARN",
+            message="Could not fetch active Vault CA fingerprint from 10.1.1.1:32000",
+            details={'profile': profile_path}
         ))
 
     # Report any expected CAs that are missing
@@ -2190,6 +2338,26 @@ def check_auto_platform_isolation() -> List[CheckResult]:
     6. A mandatory must-NOT-run-on anti-affinity rule keeps other VMs away
     """
     results: List[CheckResult] = []
+
+    # Check if vravms is defined in config.ini
+    has_vravms = False
+    if lsf and hasattr(lsf, 'config'):
+        for section in ['VCFFINAL', 'VCF', 'RESOURCES']:
+            if lsf.config.has_section(section) and lsf.config.has_option(section, 'vravms'):
+                lines = lsf.config.get(section, 'vravms').split('\n')
+                for line in lines:
+                    if line.strip() and not line.strip().startswith('#'):
+                        has_vravms = True
+                        break
+            if has_vravms:
+                break
+                    
+    if not has_vravms:
+        results.append(CheckResult(
+            name='DRS Isolation: auto-platform-a',
+            status='SKIPPED',
+            message='vravms not defined in config.ini'))
+        return results
 
     if not PYVMOMI_AVAILABLE or not lsf or not lsf.sis:
         results.append(CheckResult(
@@ -2523,12 +2691,6 @@ def main():
             report.license_checks = _sort_license_results(report.license_checks)
             print_results_table("LICENSES", report.license_checks)
             
-            # Disconnect
-            for si in lsf.sis:
-                try:
-                    connect.Disconnect(si)
-                except Exception:
-                    pass
     
     # Password expiration checks
     print("\nChecking password expirations...")
@@ -2586,6 +2748,13 @@ def main():
         with open(args.html, 'w') as f:
             f.write(html)
         print(f"HTML report written to: {args.html}")
+    
+    if lsf and PYVMOMI_AVAILABLE:
+        for si in lsf.sis:
+            try:
+                connect.Disconnect(si)
+            except Exception:
+                pass
     
     return 0 if report.overall_status in ['PASS', 'WARN'] else 1
 

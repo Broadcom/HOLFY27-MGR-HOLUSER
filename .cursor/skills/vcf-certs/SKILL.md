@@ -1,6 +1,6 @@
 ---
 name: vcf-certs
-description: Manage SSL/TLS certificate lifecycle in VCF 9.x Holodeck labs. Covers the MSADCS Proxy (certsrv→Vault PKI), SDDC Manager certificate generation/installation, VCF Operations Fleet Management cert replacement, Vault PKI configuration, PKCS#7 ordering pitfalls, CSR normalization, and troubleshooting certificate validation failures. Use when working with VCF certificates, certsrv proxy, Vault PKI signing, SDDC Manager Generate CSRs, Generate Signed Certificates, Install Certificates, PKCS#7, certificate replacement, Microsoft CA configuration, or any TLS/SSL cert operations in VCF.
+description: Manage SSL/TLS certificate lifecycle in VCF 9.x Holodeck labs. Covers the VCF CA Proxy (certsrv→Vault PKI), SDDC Manager certificate generation/installation, VCF Operations Fleet Management cert replacement, Vault PKI configuration, PKCS#7 ordering pitfalls, CSR normalization, and troubleshooting certificate validation failures. Use when working with VCF certificates, certsrv proxy, Vault PKI signing, SDDC Manager Generate CSRs, Generate Signed Certificates, Install Certificates, PKCS#7, certificate replacement, Microsoft CA configuration, or any TLS/SSL cert operations in VCF.
 ---
 
 # VCF 9.x Certificate Management
@@ -13,7 +13,7 @@ Consolidated guide for all certificate operations in the Holodeck VCF lab. Passw
 VCF Components (SDDC Mgr, VCF Ops)
         |  HTTPS :443 (certsrv protocol)
         v
-MSADCS Proxy (K8s DaemonSet, holorouter, hostNetwork)
+VCF CA Proxy (K8s DaemonSet, holorouter, hostNetwork)
         |  HTTP :32000 (X-Vault-Token)
         v
 HashiCorp Vault PKI (pki/ mount, role: holodeck)
@@ -43,7 +43,7 @@ curl -sk -H "X-Vault-Token: $PASSWORD" -X POST "$VAULT/v1/pki/roles/holodeck" \
 
 **Role requirements for VCF CSRs**: `allow_any_name: true`, `enforce_hostnames: false` (some VCF components use non-hostname CNs like `VCFA`, `OPS_LOGS`).
 
-## 2. MSADCS Proxy — Deployment
+## 2. VCF CA Proxy — Deployment
 
 ### Install (Beta/Standalone — current lab mode)
 
@@ -357,7 +357,7 @@ sshpass -p "$PASSWORD" ssh vcf@sddcmanager-a.site-a.vcf.lab "python3 - $PASSWORD
 
 ## 12. Vault CA Trust Distribution
 
-Automated by `/home/holuser/hol/Tools/confighol-9.1.py` Step 0b (`distribute_vault_ca_trust()`). Imports the Vault root CA into all VCF component trust stores:
+Automated by `/home/holuser/hol/Tools/confighol-9.1.py` Step 0b (`distribute_vault_ca_trust()`). The distribution function is also dynamically imported and executed by `Startup/prelim.py` to ensure the Vault CA is automatically trusted across the environment during every lab startup. Imports the Vault root CA into all VCF component trust stores:
 
 | Component | Method | Details |
 | --- | --- | --- |
@@ -370,7 +370,7 @@ Automated by `/home/holuser/hol/Tools/confighol-9.1.py` Step 0b (`distribute_vau
 
 All functions are idempotent — they check for existing CA before importing.
 
-**Critical pitfall**: `dir-cli trustedcert publish` silently appends a duplicate PEM when the cert already exists in vmdir, creating a multi-cert entry. NSX's `TrustStoreServiceImpl` rejects multi-cert PEMs (error `MP2179`), breaking compute-manager re-registration. Always check with `dir-cli trustedcert list | grep 'vcf.lab Root Authority'` before publishing. See `.cursor/skills/vcf-troubleshooting/SKILL.md` Section 31.
+**Critical pitfall**: `dir-cli trustedcert publish` silently appends a duplicate PEM when the cert already exists in vmdir, creating a multi-cert entry. NSX's `TrustStoreServiceImpl` rejects multi-cert PEMs (error `MP2179`), breaking compute-manager re-registration. Always check with `dir-cli trustedcert list | grep -c 'vcf.lab Root Authority'` before publishing. However, when running this check over SSH, vCenter terminal banners (e.g., `VMware vCenter Server...`) may precede the `grep` output. Do not use a simple `stdout.strip() != '0'` check; instead, parse the output to extract the last non-empty line to accurately read the `grep -c` count. See `.cursor/skills/vcf-troubleshooting/SKILL.md` Section 31.
 
 ## 13. NSX Compute Manager Re-registration After Certificate Replacement
 

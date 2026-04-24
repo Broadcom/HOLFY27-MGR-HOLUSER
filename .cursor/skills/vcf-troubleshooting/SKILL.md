@@ -1,6 +1,6 @@
 ---
 name: vcf-troubleshooting
-description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, and VSP cluster image pull failures. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, or containerd NO_PROXY.
+description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, and vCenter VAMI shell/PAM SSH breakage. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, or Guest Operations.
 ---
 
 # VCF 9.x Troubleshooting Guide
@@ -41,6 +41,8 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | Fleet LCM SHUTDOWN HTTP 400 for OPS | vrops/OPS returns UnsupportedOperation | VCF Operations cannot shut itself down via its own API | 33 |
 | Phase 4 ManagedObjectNotFound | VM disappears between discovery and shutdown | Race between Phase 3b cluster deletion and Phase 4 VM enumeration | 34 |
 | SCP VM straggler in Phase 19c | SupervisorControlPlaneVM found powered on in audit | EAM-managed VM; cannot be shut down via vCenter API (expected) | 35 |
+| vCenter SSH broken on fresh pod | sshpass exit 5 despite correct password | VAMI shell + pam_mgmt_cli.so intercepts SSH auth; fix via Guest Operations | 36 |
+| SDDC Manager auto-rotate disable HTTP 403 | "maximum number of 10 concurrent" | Stale task_metadata + entity_and_task records in platform DB block concurrency slots | 37 |
 | certsrv-proxy Address already in use | Pod CrashLoopBackOff with `OSError: [Errno 98]` | Orphaned Python process on host still bound to port 443 after force pod delete | 28 |
 | SDDC Manager "Public key mismatch" on cert install | "Public key in CSR and server certificate are not matching" | PKCS#7 DER encoding sorts SET OF elements, putting CA cert before leaf cert | 29 |
 | NSX ReTrust fails after vCenter cert replacement | "Failed to import the trusted root certificate for compute manager" | NSX tries to re-trust vCenter while services are still restarting; transient timing issue | 30 |
@@ -1409,7 +1411,7 @@ THUMB=$(echo | openssl s_client -connect vc-mgmt-a.site-a.vcf.lab:443 2>/dev/nul
 # GET compute manager, modify credential.thumbprint, PUT back
 ```
 
-**Prevention**: Always check `dir-cli trustedcert list | grep -c 'vcf.lab Root Authority'` before calling `dir-cli trustedcert publish`. The `/home/holuser/hol/Tools/confighol-9.1.py` v2.11+ includes this guard.
+**Prevention**: Always check `dir-cli trustedcert list | grep -c 'vcf.lab Root Authority'` before calling `dir-cli trustedcert publish`. When running this check via SSH, be aware that terminal banners (like `VMware vCenter Server...`) may precede the command's stdout, so you must parse the last non-empty line of output rather than checking `stdout.strip() != '0'`. The `/home/holuser/hol/Tools/confighol-9.1.py` script includes this robust parsing guard.
 
 **Automated Fix**: `/home/holuser/hol/Tools/cert-replacement.py` (in `Tools/`) includes `NSXComputeManagerFixer` which automatically runs after vCenter/NSX certificate replacements. It fixes double-cert entries, ensures Vault CA is in NSX trust stores, and re-registers compute managers with the new thumbprint. Must also fix WLD vCenter (SSO admin: `administrator@wld.sso`) — both vCenters can have the double-cert issue.
 
@@ -1512,3 +1514,142 @@ ERROR in Phase 4: (vmodl.fault.ManagedObjectNotFound) {
 **Root Cause**: SCP VMs are EAM-managed (Enterprise Application Manager). They cannot be shut down via vCenter API — `PowerOffVM_Task()` returns `NoPermission`. Phase 3 stops the WCP service but does not power off the SCP VMs. Phase 4 intentionally excludes them. The SCP VM remains running until the ESXi host is shut down or until Phase 19c catches it via direct ESXi host connection (bypassing EAM permissions).
 
 **Resolution**: This is **expected behavior** — not a bug. Phase 19c is specifically designed to catch VMs like this that can only be shut down via direct ESXi access after vCenter is offline.
+
+## 36. vCenter SSH Broken on Fresh Pod (VAMI Shell + PAM)
+
+**Symptom**: `sshpass -p "$PASSWORD" ssh root@vc-mgmt-a.site-a.vcf.lab "echo OK"` returns exit code 5 (invalid/incorrect password) even though the password is correct. Direct SSH prompts show the VAMI appliance shell instead of bash.
+
+**Diagnosis**:
+
+```bash
+# sshpass exit code 5 = invalid/incorrect password
+# But the password IS correct — the problem is PAM intercepting auth
+
+# Check via Guest Operations (from ESXi host):
+# 1. Root login shell is /opt/vmware/bin/appliancesh (VAMI shell, not bash)
+# 2. /etc/pam.d/sshd contains pam_mgmt_cli.so which intercepts auth
+```
+
+**Root Cause**: On fresh VCF 9.x vCenter deployments, root's login shell is `/opt/vmware/bin/appliancesh` (the VAMI appliance shell) and `/etc/pam.d/sshd` includes `pam_mgmt_cli.so`. This PAM module intercepts SSH authentication with its own password prompt that `sshpass` cannot interact with. Even if the password is correct, `sshpass` gets rejected because the PAM module expects an interactive terminal.
+
+**Fix**: Use pyVmomi Guest Operations (VMware Tools) via ESXi host connections to fix the root cause before SSH is needed:
+
+```python
+from pyVim.connect import SmartConnect, Disconnect
+from pyVmomi import vim
+import ssl, time
+
+password = open('/home/holuser/creds.txt').read().strip()
+ctx = ssl._create_unverified_context()
+
+# 1. Find vCenter VM on ESXi hosts
+for esxi in ['esx-01a.site-a.vcf.lab', 'esx-02a.site-a.vcf.lab',
+             'esx-03a.site-a.vcf.lab', 'esx-04a.site-a.vcf.lab']:
+    si = SmartConnect(host=esxi, user='root', pwd=password, sslContext=ctx)
+    for vm in si.RetrieveContent().viewManager.CreateContainerView(
+            si.RetrieveContent().rootFolder, [vim.VirtualMachine], True).view:
+        if 'vc-mgmt' in vm.name and vm.runtime.powerState == 'poweredOn':
+            if vm.guest.toolsRunningStatus == 'guestToolsRunning':
+                # Found it — authenticate via Guest Operations
+                pm = si.RetrieveContent().guestOperationsManager.processManager
+                auth = vim.vm.guest.NamePasswordAuthentication(
+                    username='root', password=password)
+
+                def guest_run(prog, args, wait=2):
+                    spec = vim.vm.guest.ProcessManager.ProgramSpec(
+                        programPath=prog, arguments=args)
+                    pid = pm.StartProgramInGuest(vm, auth, spec)
+                    time.sleep(wait)
+                    return pm.ListProcessesInGuest(vm, auth, pids=[pid])[0].exitCode
+
+                # Fix 1: Set root shell to bash
+                guest_run('/usr/sbin/usermod', '-s /bin/bash root')
+
+                # Fix 2: Replace PAM sshd config (remove pam_mgmt_cli.so)
+                pam_clean = (
+                    '# Begin /etc/pam.d/sshd\n\n'
+                    'auth            include         system-auth\n'
+                    'account         include         system-account\n'
+                    'password        include         system-password\n'
+                    'session         include         system-session\n'
+                    '\n# End /etc/pam.d/sshd\n')
+                guest_run('/bin/bash',
+                    f"-c \"cat > /etc/pam.d/sshd << 'PAMEOF'\n{pam_clean}PAMEOF\n\"")
+
+                # Fix 3: Clear faillock and set non-expiring password
+                guest_run('/bin/bash',
+                    '-c "faillock --user root --reset 2>/dev/null; true"')
+                guest_run('/bin/bash',
+                    '-c "chage -I -1 -m 0 -M 99999 -E -1 root 2>/dev/null; true"')
+
+                # Fix 4: Restart sshd
+                guest_run('/bin/bash',
+                    '-c "systemctl restart sshd 2>/dev/null; true"')
+    Disconnect(si)
+```
+
+**Key Details**:
+- This issue affects **all fresh VCF 9.x pods** where `confighol` has not yet run.
+- The `vSphere.py` startup script (TASK 6b) now automatically fixes this via Guest Operations before `confighol-9.0.py` runs.
+- The `confighol-9.0.py` script (v2.6+) also handles this via `_fix_vcenter_via_guest_ops()` as a fallback.
+- Guest Operations requires VMware Tools running inside the vCenter VM and direct ESXi host connectivity.
+- If the root password was rotated by SDDC Manager, query `/v1/credentials?resourceType=VCENTER` for the actual password before authenticating via Guest Operations.
+- The `vcshell.exp` expect script was previously used for this but is fragile and fails silently when the shell is already configured.
+- After fixing, enable SSH and bash shell via the vCenter REST API (`PUT /api/appliance/access/ssh` with body `true`, `PUT /api/appliance/access/shell` with body `{"enabled":true,"timeout":86400}`) for persistence across service restarts.
+
+## 37. SDDC Manager Auto-Rotate Disable Blocked by Stale Tasks (HTTP 403)
+
+**Symptom**: `PATCH /v1/credentials` with `operationType: UPDATE_AUTO_ROTATE_POLICY` returns HTTP 403:
+```
+"The attempted functionality UPDATE_ROTATE_PASSWORDS is not supported in the current system state.
+This operation is not allowed because you have reached the maximum number of 10 concurrent
+update/rotate passwords operations and cannot update/rotate passwords at this time."
+```
+
+**Diagnosis**: Query the platform and domainmanager databases via Guest Operations:
+```sql
+-- Platform DB: stale task records consuming concurrency slots
+SELECT count(*) FROM task_metadata;
+SELECT count(*) FROM entity_and_task;
+SELECT count(*) FROM task_and_entity_type_and_entity;
+
+-- Domainmanager DB: stale processing tasks
+SELECT count(*) FROM processing_task;
+
+-- Verify via API: non-final tasks blocking slots
+-- GET /v1/tasks — count entries where status is not Successful/Failed
+```
+
+**Root Cause**: After lab restarts, template deployments, or failed credential operations, the SDDC Manager platform database accumulates stale task records (`task_metadata`, `entity_and_task`, `task_and_entity_type_and_entity`). The Java `operationsmanager` service counts these non-resolved records against the 10-task concurrency limit. Even though the `/v1/credentials/tasks` API shows tasks as SUCCESSFUL, the `/v1/tasks` API shows stale "IN_PROGRESS" / "Pending" entries from the platform DB. These cannot be cancelled via API (DELETE returns 500, PATCH returns 409). The `domainmanager` DB also accumulates stale `processing_task` records.
+
+**Fix**: Clear all stale task-related records via direct PostgreSQL access (Guest Operations), then restart services:
+```bash
+export PGPASSWORD='<from /root/.pgpass>'
+PSQL="/usr/pgsql/15/bin/psql -h 127.0.0.1 -U postgres"
+
+# 1. Clear platform DB task records
+$PSQL -d platform -c "DELETE FROM task_and_subtask_and_resource_warning"
+$PSQL -d platform -c "DELETE FROM entity_and_task"
+$PSQL -d platform -c "DELETE FROM task_and_entity_type_and_entity"
+$PSQL -d platform -c "DELETE FROM task_metadata"
+
+# 2. Clear processing tasks from both workflow DBs
+$PSQL -d operationsmanager -c "DELETE FROM processing_task"
+$PSQL -d domainmanager -c "DELETE FROM processing_task"
+
+# 3. Clear resource locks and fix statuses
+$PSQL -d platform -c "DELETE FROM lock"
+$PSQL -d platform -c "UPDATE vcenter SET status = 'ACTIVE' WHERE status NOT IN ('ACTIVE')"
+# ... same for domain, nsxt, nsxt_edge_cluster
+
+# 4. Restart services
+systemctl restart operationsmanager commonsvcs domainmanager
+```
+
+Wait ~60s for API to become responsive (expect 502 for ~30-40s), then re-authenticate and retry.
+
+**Key Details**:
+- The concurrency limit is 10, hard-coded in the Java application.
+- Setting `task_metadata.resolved = true` alone is insufficient; the task status is computed from `entity_and_task` mappings. DELETE is required.
+- `confighol-9.0.py` (v2.7+) automatically performs this cleanup via Guest Operations before attempting auto-rotate disable.
+- Fresh VCF 9.0 pods typically have 60-90 stale `task_metadata` and 400+ `domainmanager.processing_task` records.
