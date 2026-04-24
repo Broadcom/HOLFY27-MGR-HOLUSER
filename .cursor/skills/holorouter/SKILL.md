@@ -1,5 +1,5 @@
 ---
-description: Guide interactions with the Holorouter - the Photon OS 5.0 router/gateway running Kubernetes (kubeadm v1.27), nginx reverse proxy, Technitium DNS, HashiCorp Vault PKI, Authentik identity provider, GitLab EE, MSADCS Proxy, FRR-K8s BGP routing, and Squid proxy. Use when the user mentions holorouter, router, DNS, nginx, reverse proxy, Vault certificates, Authentik, GitLab, certsrv, FRR, BGP, Squid, or any holorouter service management.
+description: Guide interactions with the Holorouter - the Photon OS 5.0 router/gateway running Kubernetes (kubeadm v1.27), nginx reverse proxy, Technitium DNS, tdns-mgr, HashiCorp Vault PKI, Authentik identity provider, GitLab EE, MSADCS Proxy, FRR-K8s BGP routing, and Squid proxy. Use when the user mentions holorouter, router, DNS, nginx, reverse proxy, Vault certificates, Authentik, GitLab, certsrv, FRR, BGP, Squid, tdns-mgr, tdns_import, or any holorouter service management.
 globs: 
   - "**/Tools/holorouter/**"
   - "**/Tools/Authentik/**"
@@ -103,6 +103,12 @@ nginx -t && nginx -s reload
 | Admin | `admin` / creds.txt password |
 | Data | `/holodeck-runtime/dns/` on host |
 | Zones | `vcf.lab`, `site-a.vcf.lab`, `site-b.vcf.lab` + reverse zones |
+
+**tdns-mgr from the manager VM (`Tools/tdns_import.py`, `/usr/local/bin/tdns-mgr`):**
+
+- HTTPS to `dns.vcf.lab:443` is terminated with the **holodeck / lab CA** (nginx cert on holorouter). `tdns-mgr` uses `curl` without trusting that CA unless you pass the global **`--insecure`** flag or set **`INSECURE_TDNS=true`** (see upstream `tdns-mgr.sh`). Without that, `login` often fails with a generic **Login failed** even when the password is correct.
+- `tdns_import.py` passes **`--insecure`** by default and sets `INSECURE_TDNS=true` for subprocesses. To force TLS verification instead, set **`TDNS_MGR_SECURE_TLS=1`** (or `true`/`yes`) in the environment.
+- A stale **`DNS_TOKEN`** in `~/.config/tdns-mgr/.tdns-mgr.conf` can short-circuit real password login; the import script clears that line and uses **`CREDS_FILE`** (default `/home/holuser/creds.txt`) for `admin` password.
 
 **Technitium API pattern:**
 

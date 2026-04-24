@@ -90,10 +90,37 @@ def clear_stored_tdns_token() -> None:
 
 
 def tdns_mgr_env() -> dict:
-    """Environment for tdns-mgr: drop inherited DNS_TOKEN so file/config refresh applies."""
+    """
+    Environment for tdns-mgr subprocesses.
+
+    - Drop inherited DNS_TOKEN so an expired shell token does not override the refreshed file.
+    - Drop DNS_PASS so a stale exported password cannot interact oddly with login -p.
+    """
     env = os.environ.copy()
     env.pop('DNS_TOKEN', None)
+    env.pop('DNS_PASS', None)
+    # tdns-mgr maps INSECURE_TDNS -> curl -k; keep as backup if CLI --insecure is ever skipped.
+    if os.environ.get('TDNS_MGR_SECURE_TLS', '').lower() not in ('1', 'true', 'yes'):
+        env['INSECURE_TDNS'] = 'true'
     return env
+
+
+def tdns_mgr_cli_prefix() -> List[str]:
+    """
+    Global tdns-mgr flags (must appear before the subcommand).
+
+    Technitium at dns.vcf.lab is TLS-terminated with the holodeck CA; without this,
+    curl verification fails and login returns generic failure (no JSON status ok).
+    Set TDNS_MGR_SECURE_TLS=1 to enforce certificate verification.
+    """
+    if os.environ.get('TDNS_MGR_SECURE_TLS', '').lower() in ('1', 'true', 'yes'):
+        return []
+    return ['--insecure']
+
+
+def tdns_mgr_cmd(*parts: str) -> List[str]:
+    """Build argv: tdns-mgr [--insecure] <subcommand> ..."""
+    return [TDNS_MGR_PATH, *tdns_mgr_cli_prefix(), *parts]
 
 
 def get_vpod_repo() -> str:
@@ -238,7 +265,7 @@ def tdns_show_config():
     
     try:
         result = subprocess.run(
-            [TDNS_MGR_PATH, 'config'],
+            tdns_mgr_cmd('config'),
             capture_output=True,
             text=True,
             timeout=10,
@@ -293,7 +320,7 @@ def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
         try:
             # Non-interactive: -p password (stdin alone can fail if a stale token short-circuits auth)
             result = subprocess.run(
-                [TDNS_MGR_PATH, 'login', '-p', password],
+                tdns_mgr_cmd('login', '-p', password),
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -304,7 +331,12 @@ def tdns_login(max_retries: int = 10, retry_delay: int = 15) -> bool:
                 write_output('tdns-mgr login successful')
                 return True
             else:
-                error_msg = result.stderr.strip() if result.stderr else result.stdout.strip() if result.stdout else 'Unknown error'
+                err_parts = []
+                if result.stderr and result.stderr.strip():
+                    err_parts.append(result.stderr.strip())
+                if result.stdout and result.stdout.strip():
+                    err_parts.append(result.stdout.strip())
+                error_msg = ' | '.join(err_parts) if err_parts else 'Unknown error'
                 write_output(f'tdns-mgr login failed: {error_msg}')
                 
         except subprocess.TimeoutExpired:
@@ -332,7 +364,7 @@ def import_records_from_file(csv_path: str) -> Dict[str, Any]:
     
     try:
         result = subprocess.run(
-            [TDNS_MGR_PATH, 'import-records', csv_path, '--ptr'],
+            tdns_mgr_cmd('import-records', csv_path, '--ptr'),
             capture_output=True,
             text=True,
             timeout=120,
