@@ -1,7 +1,10 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.8 - 2026-03-26
+# Version 3.10 - 2026-04-27
 # Changes:
+# - Firefox profile rebuild gate (FIREFOX_PROFILE_REBUILD_REQUIRED in script): deploy
+#   rebuild-firefox-profile.sh, compare to ~/.local/state/firefox_profile_rebuild.count on LMC,
+#   SSH-run rebuild when missing or stored count < required (bump constant to force again).
 # - Added functionality to set branch to "ft" if the first 3 characters of the content of /tmp/deploymentpool.txt is "FT-"
 # - Added functionality to git stash local changes for prod.
 # Author - Burke Azbill and HOL Core Team
@@ -42,6 +45,10 @@ fi
 
 # Source environment variables
 . /home/holuser/.bashrc
+
+# Firefox profile rebuild gate (not a CLI flag): increment in-repo when every lab must run
+# rebuild-firefox-profile.sh again; compared to ~/.local/state/firefox_profile_rebuild.count on LMC.
+FIREFOX_PROFILE_REBUILD_REQUIRED=1
 
 # If no command line argument, clean up old config
 if [ -z "$1" ]; then
@@ -477,6 +484,55 @@ push_router_files_nfs() {
     log_msg "Signaled router: gitdone" "${logfile}"
 }
 
+# Compare LMC flag file to in-script FIREFOX_PROFILE_REBUILD_REQUIRED; if rebuild is needed, run
+# rebuild-firefox-profile.sh on the console (must exist under ~/.local/bin on the console).
+_run_rebuild_firefox_profile_if_needed() {
+    local logf="$1"
+    local script="/lmchol/home/holuser/.local/bin/rebuild-firefox-profile.sh"
+    local flag="/lmchol/home/holuser/.local/state/firefox_profile_rebuild.count"
+    local need="${FIREFOX_PROFILE_REBUILD_REQUIRED:-1}"
+    local stored=0
+    local cur
+
+    if [ ! -f "$script" ]; then
+        log_msg "rebuild-firefox-profile.sh not deployed on LMC — skipping profile rebuild gate." "${logf}"
+        return 0
+    fi
+    chmod +x "$script" 2>/dev/null || true
+
+    mkdir -p "/lmchol/home/holuser/.local/state" 2>/dev/null || true
+    cur=$(cat "$flag" 2>/dev/null | tr -d '[:space:]')
+    if printf '%s\n' "$cur" | grep -qxE '[0-9]+'; then
+        stored="$cur"
+    else
+        stored=0
+    fi
+
+    if [ "$stored" -ge "$need" ]; then
+        log_msg "Firefox profile rebuild skipped (stored count ${stored} >= required ${need})." "${logf}"
+        return 0
+    fi
+
+    log_msg "Firefox profile rebuild needed (stored=${stored}, required=${need}). Running on console VM..." "${logf}"
+    if ! command -v sshpass >/dev/null 2>&1 || [ ! -f /home/holuser/creds.txt ]; then
+        log_msg "sshpass or creds.txt missing — cannot run rebuild on console." "${logf}"
+        return 1
+    fi
+
+    local attempt
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+            holuser@console "/home/holuser/.local/bin/rebuild-firefox-profile.sh --default-profile --yes --rebuild-count ${need}" >>"${logf}" 2>&1; then
+            log_msg "Firefox profile rebuild finished on console (target count ${need})." "${logf}"
+            return 0
+        fi
+        log_msg "Firefox profile rebuild SSH attempt ${attempt} failed or host unreachable; retry in 10s..." "${logf}"
+        sleep 10
+    done
+    log_msg "Firefox profile rebuild did not succeed after retries (see ${logf})." "${logf}"
+    return 1
+}
+
 push_console_files_nfs() {
     # Push console files via NFS to the Main Console VM
     #
@@ -549,6 +605,13 @@ push_console_files_nfs() {
                     log_msg "${src_label}: console/${filename} -> .local/bin/" "${logfile}"
                 fi
                 ;;
+            rebuild-firefox-profile.sh)
+                local bin_dest="/lmchol/home/holuser/.local/bin"
+                mkdir -p "${bin_dest}" 2>/dev/null
+                if cp "$src_file" "${bin_dest}/${filename}" 2>/dev/null; then
+                    log_msg "${src_label}: console/${filename} -> .local/bin/" "${logfile}"
+                fi
+                ;;
             *)
                 if cp "$src_file" "${desktop_dest}/${filename}" 2>/dev/null; then
                     log_msg "${src_label}: console/${filename} -> desktop-hol/" "${logfile}"
@@ -596,7 +659,10 @@ push_console_files_nfs() {
     chmod +x "${conky_dest}/conky-startup.sh" 2>/dev/null
     chmod +x "/lmchol/hol/Tools/hol-ssl.py" 2>/dev/null
     chmod +x "/lmchol/home/holuser/.local/bin/firefox-prewarm.sh" 2>/dev/null
-    chmod 644 "/lmchol/home/holuser/.config/autostart/firefox-prewarm.desktop" 2>/dev/null
+    chmod +x "/lmchol/home/holuser/.local/bin/rebuild-firefox-profile.sh" 2>/dev/null
+    # chmod 644 "/lmchol/home/holuser/.config/autostart/firefox-prewarm.desktop" 2>/dev/null
+
+    _run_rebuild_firefox_profile_if_needed "${logfile}" || true
     
     # Trigger firefox-prewarm.sh on the console VM so it's ready before login
     # log_msg "Triggering firefox-prewarm.sh on the console VM via SSH..." "${logfile}"
