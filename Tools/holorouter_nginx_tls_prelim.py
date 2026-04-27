@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+Version 1.0 - 2026-04-27
+Author - Burke Azbill and HOL Core Team
 Prelim helper: queue holorouter nginx TLS renewal when auth.vcf.lab is near expiry.
 
 Instead of SCP/SSH (often blocked), copies ``Tools/holorouter/renew-nginx-tls-from-vault.sh``
@@ -26,8 +28,16 @@ RENEW_SCRIPT_NAME = "renew-nginx-tls-from-vault.sh"
 REQUEST_FLAG = "renew_nginx_tls.request"
 
 
-def _leaf_not_after_utc(host: str, port: int, timeout: float) -> Optional[datetime]:
-    """Return notAfter of the presented TLS leaf as timezone-aware UTC, or None."""
+def inspect_tls_leaf(
+    host: str = CHECK_HOST,
+    port: int = CHECK_PORT,
+    timeout: float = 12.0,
+) -> Tuple[Optional[datetime], Optional[str]]:
+    """
+    Connect and read the presented TLS leaf ``notAfter``.
+
+    Returns ``(not_after_utc, None)`` on success, or ``(None, diagnostic)`` on failure.
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -35,17 +45,23 @@ def _leaf_not_after_utc(host: str, port: int, timeout: float) -> Optional[dateti
         with socket.create_connection((host, port), timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=host) as ssock:
                 cert = ssock.getpeercert()
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, f"socket/TLS error: {exc!s}"
     if not cert:
-        return None
+        return None, "empty peer certificate"
     na = cert.get("notAfter")
     if not na:
-        return None
+        return None, "certificate missing notAfter field"
     dt = parsedate_to_datetime(na)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    return dt.astimezone(timezone.utc), None
+
+
+def _leaf_not_after_utc(host: str, port: int, timeout: float) -> Optional[datetime]:
+    """Return notAfter of the presented TLS leaf as timezone-aware UTC, or None."""
+    end, _err = inspect_tls_leaf(host, port, timeout)
+    return end
 
 
 def days_until_leaf_expires(
@@ -58,7 +74,7 @@ def days_until_leaf_expires(
 
     Negative if already expired. None if TLS could not be inspected.
     """
-    end = _leaf_not_after_utc(host, port, timeout)
+    end, _err = inspect_tls_leaf(host, port, timeout)
     if end is None:
         return None
     now = datetime.now(timezone.utc)
@@ -75,9 +91,11 @@ def maybe_renew_holorouter_nginx_tls(
     dry_run: bool = False,
 ) -> Tuple[bool, str]:
     """
-    If ``auth.vcf.lab`` TLS expires within ``renew_within_days`` (or is expired),
-    copy the renewal script to ``lsf.holorouter_dir`` and create ``renew_nginx_tls.request``
-    for ``doupdate.sh`` on the holorouter (reads ``/mnt/manager``).
+    If ``auth.vcf.lab`` TLS expires within ``renew_within_days`` (or is expired), or if
+    TLS inspection fails from the manager, copy the renewal script to ``lsf.holorouter_dir``
+    and create ``renew_nginx_tls.request`` for ``doupdate.sh`` on the holorouter
+    (reads ``/mnt/manager``). Fail-open on inspection failure so the router can still
+    refresh PEMs when the manager cannot complete a handshake to ``auth.vcf.lab``.
 
     :param lsf: lsfunctions module (holroot, holorouter_dir, write_output)
     :param renew_within_days: renew when remaining whole days <= this value
@@ -87,22 +105,32 @@ def maybe_renew_holorouter_nginx_tls(
     log = getattr(lsf, "write_output", print)
     hr_dir = getattr(lsf, "holorouter_dir", "/tmp/holorouter")
 
-    days = days_until_leaf_expires()
-    if days is None:
-        msg = (
-            f"holorouter TLS: could not inspect {CHECK_HOST}:{CHECK_PORT} "
-            "(DNS/TLS unavailable); skipping nginx cert renewal queue"
-        )
-        log(msg)
-        return True, msg
+    log(
+        f"holorouter TLS: checking {CHECK_HOST}:{CHECK_PORT} "
+        f"(queue renewal on share when whole UTC days until notAfter <= {renew_within_days})"
+    )
 
-    if days > renew_within_days:
-        msg = (
-            f"holorouter TLS: {CHECK_HOST} leaf expires in {days} days "
-            f"(>{renew_within_days}d threshold); skipping renewal queue"
+    not_after, diag = inspect_tls_leaf(CHECK_HOST, CHECK_PORT, 12.0)
+    days: Optional[int] = None
+    if not_after is None:
+        log(
+            f"holorouter TLS: inspection failed for {CHECK_HOST}:{CHECK_PORT} ({diag}); "
+            "queuing renewal anyway (fail-open: holorouter can still refresh PEMs from Vault)"
         )
-        log(msg)
-        return True, msg
+    else:
+        now = datetime.now(timezone.utc)
+        days = int((not_after - now).total_seconds() // 86400)
+        log(
+            f"holorouter TLS: leaf notAfter={not_after.isoformat()} "
+            f"(~{days} whole UTC days from now; renew_within_days={renew_within_days})"
+        )
+        if days > renew_within_days:
+            msg = (
+                f"holorouter TLS: renewal not queued — {days}d remaining exceeds "
+                f"{renew_within_days}d threshold"
+            )
+            log(msg)
+            return True, msg
 
     local_script = renew_script_path(lsf.holroot)
     if not os.path.isfile(local_script):
@@ -114,10 +142,16 @@ def maybe_renew_holorouter_nginx_tls(
     dst_flag = os.path.join(hr_dir, REQUEST_FLAG)
 
     if dry_run:
-        msg = (
-            f"holorouter TLS: dry-run — would queue renewal for doupdate "
-            f"({CHECK_HOST} in {days} days → {dst_script} + {REQUEST_FLAG})"
-        )
+        if not_after is None:
+            msg = (
+                f"holorouter TLS: dry-run — would queue renewal for doupdate "
+                f"(inspection failed: {diag} → {dst_script} + {REQUEST_FLAG})"
+            )
+        else:
+            msg = (
+                f"holorouter TLS: dry-run — would queue renewal for doupdate "
+                f"(notAfter={not_after.isoformat()}, ~{days}d left → {dst_script} + {REQUEST_FLAG})"
+            )
         log(msg)
         return True, msg
 
@@ -132,9 +166,17 @@ def maybe_renew_holorouter_nginx_tls(
         log(f"WARNING: {msg}")
         return False, msg
 
-    msg = (
-        f"holorouter TLS: queued nginx cert renewal for doupdate.sh ({CHECK_HOST} was in {days} days); "
-        f"see router {REQUEST_FLAG} + {RENEW_SCRIPT_NAME} on NFS share"
-    )
+    if not_after is None:
+        msg = (
+            f"holorouter TLS: queued nginx cert renewal for doupdate.sh "
+            f"(inspection failed: {diag}); "
+            f"on router see {REQUEST_FLAG} + {RENEW_SCRIPT_NAME} under NFS mount"
+        )
+    else:
+        msg = (
+            f"holorouter TLS: queued nginx cert renewal for doupdate.sh "
+            f"(notAfter={not_after.isoformat()}, ~{days}d left); "
+            f"on router see {REQUEST_FLAG} + {RENEW_SCRIPT_NAME} under NFS mount"
+        )
     log(msg)
     return True, msg

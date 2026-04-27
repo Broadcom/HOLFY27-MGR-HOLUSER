@@ -1032,11 +1032,16 @@ if [ -f "/home/holuser/hol/Tools/doupdate.sh" ]; then
     cp "/home/holuser/hol/Tools/doupdate.sh" /tmp/holorouter/doupdate.sh
 fi
 
-# Vault PKI nginx renewal script (consumers: prelim queues + doupdate.sh on holorouter)
+# Vault PKI nginx renewal script (consumers: prelim queues + doupdate.sh on holorouter).
+# doupdate.sh expects renew_nginx_tls.request alongside the script to run renewal; prelim
+# normally creates the flag when auth.vcf.lab is near expiry. Touch the flag here too so
+# labstartup alone still queues one renewal pass (script-only drops previously caused skips).
 if [ -f "${holroot}/Tools/holorouter/renew-nginx-tls-from-vault.sh" ]; then
-    log_msg "Copying renew-nginx-tls-from-vault.sh to /tmp/holorouter/" "${logfile}"
-    cp "${holroot}/Tools/holorouter/renew-nginx-tls-from-vault.sh" /tmp/holorouter/renew-nginx-tls-from-vault.sh
-    chmod 755 /tmp/holorouter/renew-nginx-tls-from-vault.sh 2>/dev/null || true
+    log_msg "Copying renew-nginx-tls-from-vault.sh to ${holorouterdir}/" "${logfile}"
+    cp "${holroot}/Tools/holorouter/renew-nginx-tls-from-vault.sh" "${holorouterdir}/renew-nginx-tls-from-vault.sh"
+    chmod 755 "${holorouterdir}/renew-nginx-tls-from-vault.sh" 2>/dev/null || true
+    touch "${holorouterdir}/renew_nginx_tls.request"
+    log_msg "Created ${holorouterdir}/renew_nginx_tls.request for doupdate.sh nginx TLS renewal" "${logfile}"
 fi
 
 #==============================================================================
