@@ -160,6 +160,9 @@ class StatusDashboard:
                 ('odyssey_cleanup', 'Odyssey Cleanup', 'Clean previous Odyssey installation files'),
                 ('vscode_proxy', 'VS Code Proxy', 'Configure VS Code proxy on console for Marketplace access'),
                 ('lab_files', 'Lab Files', 'Push lab files to console'),
+                ('holorouter_tls_renew', 'Holorouter TLS', 'Queue renew-nginx script + flag on NFS for doupdate.sh on router'),
+                ('firefox_lmchol_tune', 'Firefox LMC tune', 'Fix proxy + lightweight prefs in console Firefox user.js'),
+                ('vault_firefox_trust', 'Vault CA in Firefox', 'Trust Vault PKI root CA in console Firefox for auth/vault.vcf.lab'),
             ]),
             
             # Group 2: ESXi.py - ESXi Host Verification
@@ -1132,6 +1135,10 @@ if __name__ == '__main__':
             dashboard.update_task('prelim', 'odyssey_cleanup', 'complete',
                                   total=3, success=3)
             dashboard.update_task('prelim', 'vscode_proxy', 'complete')
+            dashboard.update_task('prelim', 'lab_files', 'complete')
+            dashboard.update_task('prelim', 'holorouter_tls_renew', 'complete')
+            dashboard.update_task('prelim', 'firefox_lmchol_tune', 'complete')
+            dashboard.update_task('prelim', 'vault_firefox_trust', 'complete')
             
             # Group 2: esxi - complete with host counts
             dashboard.update_task('esxi', 'host_check', 'complete', 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.3 - 2026-04-01
+# Version 3.4 - 2026-04-01
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -334,6 +334,80 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     if dashboard:
         dashboard.update_task('prelim', 'lab_files', 'complete')
+        dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 7: Holorouter nginx TLS (auth/dns/vault.vcf.lab) near expiry
+    #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('prelim', 'holorouter_tls_renew', 'running')
+        dashboard.generate_html()
+    
+    try:
+        from Tools.holorouter_nginx_tls_prelim import maybe_renew_holorouter_nginx_tls
+
+        ok, _msg = maybe_renew_holorouter_nginx_tls(lsf, dry_run=dry_run)
+        if not ok:
+            lsf.write_output(
+                'WARNING: Holorouter nginx TLS renewal queue failed; '
+                'check /tmp/holorouter on the manager and doupdate.sh /mnt/manager on the holorouter'
+            )
+    except Exception as e:
+        lsf.write_output(f'WARNING: Holorouter TLS renewal skipped: {e}')
+    
+    if dashboard:
+        dashboard.update_task('prelim', 'holorouter_tls_renew', 'complete')
+        dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 8: Firefox LMC tuning (proxy + lightweight prefs in user.js on console home)
+    #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('prelim', 'firefox_lmchol_tune', 'running')
+        dashboard.generate_html()
+    
+    if os.path.isdir(lsf.lmcholroot):
+        try:
+            from Tools.firefox_lmchol_tuning import apply_firefox_lmchol_tuning
+
+            if not apply_firefox_lmchol_tuning(lsf, dry_run=dry_run):
+                lsf.write_output(
+                    'WARNING: Firefox LMC user.js tuning failed for one or more profiles'
+                )
+        except Exception as e:
+            lsf.write_output(f'WARNING: Firefox LMC tuning skipped: {e}')
+    else:
+        lsf.write_output('firefox_lmchol_tuning: console home not mounted at lsf.lmcholroot; skip')
+    
+    if dashboard:
+        dashboard.update_task('prelim', 'firefox_lmchol_tune', 'complete')
+        dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 9: Trust Vault PKI root CA in Firefox (console profile via /lmchol on manager)
+    #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('prelim', 'vault_firefox_trust', 'running')
+        dashboard.generate_html()
+    
+    if os.path.isdir(lsf.lmcholroot):
+        try:
+            from Tools.vault_firefox_trust import sync_vault_ca_to_firefox
+
+            if not sync_vault_ca_to_firefox(lsf.mc, lsf.write_output, dry_run=dry_run):
+                lsf.write_output(
+                    'WARNING: Vault PKI root CA could not be fully synced to Firefox profiles'
+                )
+        except Exception as e:
+            lsf.write_output(f'WARNING: Vault Firefox CA sync skipped: {e}')
+    else:
+        lsf.write_output('vault_firefox_trust: console home not mounted; skipping Firefox CA sync')
+    
+    if dashboard:
+        dashboard.update_task('prelim', 'vault_firefox_trust', 'complete')
         dashboard.generate_html()
     
     ##=========================================================================

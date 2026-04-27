@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 # Shutdown.py - HOLFY27 Lab Shutdown Orchestration
-# Version 2.2 - 2026-03-04
+# Version 2.3 - 2026-04-27
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # Main shutdown script for graceful lab environment shutdown
+#
+# v 2.3 Changes (2026-04-27):
+# - Added --phases and --fleet-products CLI; mutually exclusive --phase / --phases; pass-through to VCFshutdown
+# - Orchestrator skips Docker (0b), cleanup (21), host wait (22) unless full run (no --phase / --phases)
+# - wait_for_hosts_poweroff: STILL_RUNNING heartbeat every 90s; optional shutdown_helpers import
 #
 # v 2.2 Changes:
 # - Updated vSAN elevator polling: now polls `/storage/lsom/elevatorRunning`
@@ -73,6 +78,11 @@ import datetime
 sys.path.insert(0, '/home/holuser/hol')
 sys.path.insert(0, '/home/holuser/hol/Shutdown')
 
+try:
+    import shutdown_helpers as shutdown_helpers  # noqa: F401
+except ImportError:
+    shutdown_helpers = None  # type: ignore
+
 # Default logging level
 logging.basicConfig(
     level=logging.WARNING,
@@ -86,7 +96,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 SCRIPT_NAME = 'Shutdown'
-SCRIPT_VERSION = '2.1'
+SCRIPT_VERSION = '2.3'
 SCRIPT_DESCRIPTION = 'HOLFY27 Lab Shutdown Orchestration'
 
 # Log files
@@ -289,23 +299,28 @@ def shutdown_docker_containers(lsf, dry_run: bool = False) -> bool:
     return True
 
 
-def run_vcf_shutdown(lsf, dry_run: bool = False, phase=None) -> dict:
+def run_vcf_shutdown(lsf, dry_run: bool = False, phase=None,
+                     phases=None, fleet_products=None) -> dict:
     """
     Run the VCF shutdown module
-    
+
     :param lsf: lsfunctions module
     :param dry_run: Preview mode
-    :param phase: If set, run only this specific VCF shutdown phase
+    :param phase: Run only this VCF shutdown phase (single)
+    :param phases: Comma-separated phases for one process (multi)
+    :param fleet_products: Override [SHUTDOWN] fleet_products for Phase 1
     :return: Dictionary with 'success' status and 'esx_hosts' list
     """
     module = import_shutdown_module('VCFshutdown', lsf)
-    
+
     if module is None:
         lsf.write_output('VCFshutdown module not available')
         return {'success': False, 'esx_hosts': []}
-    
+
     try:
-        result = module.main(lsf=lsf, dry_run=dry_run, phase=phase)
+        result = module.main(
+            lsf=lsf, dry_run=dry_run, phase=phase, phases=phases,
+            fleet_products_override=fleet_products)
         if isinstance(result, dict):
             return result
         else:
@@ -346,9 +361,19 @@ def wait_for_hosts_poweroff(lsf, hosts: list, dry_run: bool = False,
     
     start_time = time.time()
     hosts_remaining = set(hosts)
-    
+    last_hb = time.time()
+
     while (time.time() - start_time) < max_wait:
         elapsed = int(time.time() - start_time)
+        now = time.time()
+        hb_sec = (shutdown_helpers.HEARTBEAT_SEC if shutdown_helpers else 90)
+        if (now - last_hb) >= hb_sec:
+            rem = max_wait - elapsed
+            write_shutdown_output(
+                f'STILL_RUNNING: host power-off wait — {len(hosts_remaining)} host(s) up, '
+                f'{rem}s left on wait ceiling',
+                lsf)
+            last_hb = now
         hosts_still_up = set()
         
         for host in hosts_remaining:
@@ -375,7 +400,8 @@ def wait_for_hosts_poweroff(lsf, hosts: list, dry_run: bool = False,
         remaining_time = max_wait - elapsed
         write_shutdown_output(f'  {len(hosts_remaining)} host(s) still running... '
                             f'(elapsed: {elapsed}s, remaining: {remaining_time}s)', lsf)
-        
+        last_hb = time.time()
+
         time.sleep(poll_interval)
     
     # Timeout - report which hosts are still up
@@ -393,15 +419,18 @@ def wait_for_hosts_poweroff(lsf, hosts: list, dry_run: bool = False,
 #==============================================================================
 
 def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
-         skip_host_shutdown: bool = False, phase=None):
+         skip_host_shutdown: bool = False, phase=None, phases=None,
+         fleet_products=None):
     """
     Main shutdown orchestration function
-    
+
     :param lsf: lsfunctions module (will be imported if None)
     :param dry_run: Preview mode - show what would be done
     :param skip_vsan_wait: Skip the vSAN elevator wait period
     :param skip_host_shutdown: Skip ESXi host shutdown
-    :param phase: If set, run only this specific VCF shutdown phase (e.g., '1', '13')
+    :param phase: Run only this specific VCF shutdown phase (e.g., '1', '13')
+    :param phases: Comma-separated VCF phases for one run (e.g. '2,8')
+    :param fleet_products: Comma-separated Phase 1 product keys (e.g. 'vra,vrni')
     """
     start_time = datetime.datetime.now()
     
@@ -418,7 +447,7 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     # Set initial status
     update_status('Shutting Down', dry_run)
     
-    if phase is None:
+    if phase is None and phases is None:
         print_banner(lsf)
         write_shutdown_output(f'Shutdown started at: {start_time.strftime("%Y-%m-%d %H:%M:%S")}', lsf)
         write_shutdown_output(f'Lab SKU: {lsf.lab_sku}', lsf)
@@ -432,27 +461,27 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     # Phase 0: Pre-shutdown checks
     #==========================================================================
     
-    if phase is None:
+    if phase is None and phases is None:
         print_phase_header(lsf, 0, 'Pre-Shutdown Checks', dry_run)
     
     if not os.path.isfile(lsf.configini):
-        if phase is None:
+        if phase is None and phases is None:
             write_shutdown_output('WARNING: config.ini not found - using defaults', lsf)
-    elif phase is None:
+    elif phase is None and phases is None:
         write_shutdown_output(f'Config file: {lsf.configini}', lsf)
     
     lab_type = 'VCF'
     if lsf.config.has_option('VPOD', 'labtype'):
         lab_type = lsf.config.get('VPOD', 'labtype').upper()
     
-    if phase is None:
+    if phase is None and phases is None:
         write_shutdown_output(f'Lab type: {lab_type}', lsf)
     
     #==========================================================================
     # Phase 0b: Docker Containers (Optional) - skip when --phase targets a VCF phase
     #==========================================================================
     
-    if phase is None:
+    if phase is None and phases is None:
         print_phase_header(lsf, '0b', 'Docker Containers', dry_run)
         
         if lsf.config.has_option('SHUTDOWN', 'shutdown_docker'):
@@ -478,28 +507,31 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     vcf_result = {'success': False, 'esx_hosts': []}
     
     if lab_type.upper() in VCF_LAB_TYPES:
-        if phase is None:
+        if phase is None and phases is None:
             write_shutdown_output(f'Lab type {lab_type} uses VCF shutdown procedure', lsf)
-        
+
         if skip_vsan_wait and not dry_run:
             if not lsf.config.has_section('SHUTDOWN'):
                 lsf.config.add_section('SHUTDOWN')
             lsf.config.set('SHUTDOWN', 'vsan_timeout', '0')
-        
+
         if skip_host_shutdown and not dry_run:
             if not lsf.config.has_section('SHUTDOWN'):
                 lsf.config.add_section('SHUTDOWN')
             lsf.config.set('SHUTDOWN', 'shutdown_hosts', 'false')
-        
-        vcf_result = run_vcf_shutdown(lsf, dry_run, phase=phase)
+
+        vcf_result = run_vcf_shutdown(
+            lsf, dry_run, phase=phase, phases=phases, fleet_products=fleet_products)
     elif lab_type.upper() == 'VVF':
-        if phase is None:
+        if phase is None and phases is None:
             write_shutdown_output('VVF lab type - using VVF shutdown procedure', lsf)
-        vcf_result = run_vcf_shutdown(lsf, dry_run, phase=phase)
+        vcf_result = run_vcf_shutdown(
+            lsf, dry_run, phase=phase, phases=phases, fleet_products=fleet_products)
     else:
-        if phase is None:
+        if phase is None and phases is None:
             write_shutdown_output(f'Lab type {lab_type} - using default VCF shutdown procedure', lsf)
-        vcf_result = run_vcf_shutdown(lsf, dry_run, phase=phase)
+        vcf_result = run_vcf_shutdown(
+            lsf, dry_run, phase=phase, phases=phases, fleet_products=fleet_products)
     
     # Extract ESXi hosts list from VCF shutdown result
     esx_hosts = vcf_result.get('esx_hosts', [])
@@ -508,7 +540,7 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     # Phase 21: Final Cleanup - skip when --phase targets a single VCF phase
     #==========================================================================
     
-    if phase is None:
+    if phase is None and phases is None:
         print_phase_header(lsf, 21, 'Final Cleanup', dry_run)
         
         write_shutdown_output('Disconnecting vSphere sessions...', lsf)
@@ -539,7 +571,9 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     
     write_shutdown_output('', lsf)
     write_shutdown_output('=' * 70, lsf)
-    if phase is not None:
+    if phases:
+        write_shutdown_output(f'VCF PHASES {phases} SHUTDOWN COMPLETE', lsf)
+    elif phase is not None:
         write_shutdown_output(f'PHASE {phase} SHUTDOWN COMPLETE', lsf)
     else:
         write_shutdown_output('SHUTDOWN COMPLETE', lsf)
@@ -548,7 +582,7 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     write_shutdown_output(f'End time: {end_time.strftime("%Y-%m-%d %H:%M:%S")}', lsf)
     write_shutdown_output(f'Elapsed: {str(elapsed).split(".")[0]}', lsf)
     
-    if phase is None:
+    if phase is None and phases is None:
         write_shutdown_output('', lsf)
         if dry_run:
             write_shutdown_output('*** DRY RUN COMPLETE - No changes were made ***', lsf)
@@ -575,10 +609,12 @@ Examples:
     python3 Shutdown.py --quick            # Skip vSAN elevator (faster but less safe)
     python3 Shutdown.py --no-hosts         # Shutdown VMs but leave hosts running
     python3 Shutdown.py --phase 1          # Run only Fleet Operations phase
+    python3 Shutdown.py --phases 2,8       # vCenter connect + Ops for Networks VMs
+    python3 Shutdown.py --phase 1 --fleet-products vra,vrni   # Phase 1 subset
     python3 Shutdown.py --phase 13         # Run only VCF Operations shutdown
     python3 Shutdown.py --phase 1 --dry-run  # Preview a single phase
 
-VCF Shutdown Phases (for --phase):
+VCF Shutdown Phases (for --phase / --phases):
     1     Fleet Operations (VCF Operations Suite) Shutdown
     1b    VCF Automation VM fallback (if Fleet API failed)
     2     Connect to vCenters
@@ -600,6 +636,7 @@ VCF Shutdown Phases (for --phase):
     16    Shutdown SDDC Manager
     17    Shutdown Management vCenter
     17b   Connect to ESXi Hosts directly
+    17c   Shutdown Post-Edge VMs (optional)
     18    Set Host Advanced Settings
     19    vSAN Elevator Operations
     19b   Shutdown VSP Platform VMs
@@ -629,9 +666,15 @@ Configuration:
     parser.add_argument('--no-hosts', action='store_true',
                         help='Skip ESXi host shutdown (leave hosts running)')
     
-    parser.add_argument('--phase', '-p', type=str, default=None,
-                        help='Run only a specific VCF shutdown phase (e.g., 1, 1b, 13, 17b)')
-    
+    phase_grp = parser.add_mutually_exclusive_group()
+    phase_grp.add_argument('--phase', '-p', type=str, default=None,
+                           help='Run only a specific VCF shutdown phase (e.g., 1, 1b, 13, 17b)')
+    phase_grp.add_argument('--phases', type=str, default=None,
+                           help='Comma-separated VCF phases in one run (e.g. 2,8,13); prerequisites auto-inserted')
+
+    parser.add_argument('--fleet-products', type=str, default=None,
+                        help='Override [SHUTDOWN] fleet_products for Phase 1 (e.g. vra,vrni,vrops)')
+
     parser.add_argument('--version', '-v', action='version',
                         version=f'{SCRIPT_NAME} v{SCRIPT_VERSION}')
     
@@ -653,7 +696,9 @@ Configuration:
             dry_run=args.dry_run,
             skip_vsan_wait=args.quick,
             skip_host_shutdown=args.no_hosts,
-            phase=args.phase
+            phase=args.phase,
+            phases=args.phases,
+            fleet_products=args.fleet_products,
         )
         sys.exit(0 if success else 1)
     except KeyboardInterrupt:

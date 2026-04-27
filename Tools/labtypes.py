@@ -1,5 +1,5 @@
 # labtypes.py - HOLFY27 LabType Execution Path Manager
-# Version 1.0 - January 2026
+# Version 1.0 - 2026-04-27
 # Author - Burke Azbill and HOL Core Team
 # Manages different startup sequences for HOL, Discovery, VXP, ATE, EDU lab types
 
