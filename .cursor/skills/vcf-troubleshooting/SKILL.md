@@ -1,6 +1,6 @@
 ---
 name: vcf-troubleshooting
-description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, and vCenter VAMI shell/PAM SSH breakage. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, or Guest Operations.
+description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, and holorouter auth.vcf.lab / vault.vcf.lab TLS expiry. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, or auth.vcf.lab certificate expired.
 ---
 
 # VCF 9.x Troubleshooting Guide
@@ -47,6 +47,8 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | SDDC Manager "Public key mismatch" on cert install | "Public key in CSR and server certificate are not matching" | PKCS#7 DER encoding sorts SET OF elements, putting CA cert before leaf cert | 29 |
 | NSX ReTrust fails after vCenter cert replacement | "Failed to import the trusted root certificate for compute manager" | NSX tries to re-trust vCenter while services are still restarting; transient timing issue | 30 |
 | NSX Compute Manager DOWN after vCenter cert replacement | `connection_status: DOWN`, `REGISTERED_WITH_ERRORS`, error 7059/MP2179 | `dir-cli trustedcert publish` double-cert in TRUSTED_ROOTS; NSX rejects multi-cert PEM | 31 |
+| auth.vcf.lab / vault.vcf.lab untrusted or Firefox very slow | TLS error despite `vcf.lab Root Authority` in Firefox; `openssl verify` shows expired leaf | nginx `/root/nginx-certs/*.crt` leaf certs expired (~30d TTL); root CA still valid | 38 |
+| Firefox takes minutes to open on LMC | `user.js` had `network.proxy.type` 2 with `10.0.0.1:3128`; large `suggest.sqlite` | Invalid PAC + dead proxy stalls startup; huge urlbar DB adds local SQLite I/O (profile is local disk on console) | 39 |
 
 ---
 
@@ -1653,3 +1655,55 @@ Wait ~60s for API to become responsive (expect 502 for ~30-40s), then re-authent
 - Setting `task_metadata.resolved = true` alone is insufficient; the task status is computed from `entity_and_task` mappings. DELETE is required.
 - `confighol-9.0.py` (v2.7+) automatically performs this cleanup via Guest Operations before attempting auto-rotate disable.
 - Fresh VCF 9.0 pods typically have 60-90 stale `task_metadata` and 400+ `domainmanager.processing_task` records.
+
+## 38. auth.vcf.lab / vault.vcf.lab Certificate Untrusted or Firefox Hangs
+
+**Symptom**: Firefox shows a certificate problem for `https://auth.vcf.lab` or `https://vault.vcf.lab`, or the browser tab takes a very long time to load. Re-importing the Vault root CA via `confighol-9.1.py` does not fix it. `openssl s_client` reports `verify error:num=10:certificate has expired` for the **server** certificate (not the root).
+
+**Diagnosis**:
+
+```bash
+echo | openssl s_client -connect auth.vcf.lab:443 -servername auth.vcf.lab 2>/dev/null | openssl x509 -noout -dates -issuer -subject
+curl -sS http://10.1.1.1:32000/v1/pki/ca/pem | openssl x509 -noout -subject -fingerprint -sha256
+```
+
+If the leaf `notAfter` is in the past but the issuer is still `CN = vcf.lab Root Authority`, the **TLS leaf** on holorouter nginx has expired. The root CA in Firefox is correct; the leaf must be re-issued.
+
+**Root Cause**: Holorouter terminates HTTPS with PEM files under `/root/nginx-certs/` (authentik, technitium, vault). Those leaf certs were issued with a short TTL (for example 30 days). After expiry, TLS validation fails. Firefox may also spend a long time on **CRL / OCSP** URLs embedded in the certificate (for example `http://192.168.0.2:32000/v1/pki/crl`) before showing the error.
+
+**Fix** (on holorouter as `root`): Re-issue the three nginx certificates from Vault PKI and reload nginx. From the hol repo use `Tools/holorouter/renew-nginx-tls-from-vault.sh` (copy to the router or run the `kubectl exec vault write pki/issue/holodeck` steps it contains), then:
+
+```bash
+nginx -t && nginx -s reload
+```
+
+After renewal, `openssl s_client ... -CAfile <(curl -sS http://10.1.1.1:32000/v1/pki/ca/pem)` should show `Verify return code: 0 (ok)`.
+
+**Key Details**:
+- Lab startup (`Startup/prelim.py`) runs `Tools/vault_firefox_trust.py` to keep the **current** Vault PKI root in Firefox NSS; that does not renew **leaf** certs on nginx.
+- Prelim also runs `Tools/holorouter_nginx_tls_prelim.py`: when `auth.vcf.lab` TLS is within **14 days** of expiry (or already expired), it copies `renew-nginx-tls-from-vault.sh` to the manager’s holorouter NFS share (`/tmp/holorouter`) and creates `renew_nginx_tls.request`. **SSH is not required.** The holorouter runs `doupdate.sh` (same share at `/mnt/manager`), which executes the script so nginx leaf certs refresh before Firefox NSS trust sync.
+- Vault PKI role `holodeck` `max_ttl` can be up to ~397 days (`9528h`); new issuances should use a long `ttl` so nginx leaf certs do not lapse monthly.
+
+## 39. Firefox Very Slow to Launch on Main Console (LMC)
+
+**Symptom**: Firefox (snap) takes minutes to show a window on the Linux Main Console.
+
+**Architecture note**: On the **console VM**, the Firefox profile is under **`~/snap/firefox/...`** on **local disk**. The **manager** VM mounts the same home tree as **`/lmchol`** (NFS client → console export) so automation can edit `user.js` and NSS databases; only those **remote-management** code paths use NFS — not the Firefox process on the console.
+
+**Diagnosis** (from manager, or on console with paths under `$HOME`):
+
+```bash
+# Manager (NFS view of console home):
+du -sh /lmchol/home/holuser/snap/firefox/common/.mozilla/firefox/*/
+grep -E 'network\.proxy|quicksuggest' /lmchol/home/holuser/snap/firefox/common/.mozilla/firefox/*/user.js
+```
+
+If `user.js` shows **`network.proxy.type` = 2** (automatic / PAC) together with **`network.proxy.http`** pointing at **`10.0.0.1:3128`**, Firefox waits on proxy discovery and dead addresses during startup. A large **`suggest.sqlite`** (tens of MB) increases **local** SQLite work at launch.
+
+**Root Cause**: Misconfigured proxy mode; optionally oversized urlbar/suggest databases on **local** disk.
+
+**Fix**: `Tools/firefox_lmchol_tuning.py` rewrites `user.js` with **manual** proxy (`network.proxy.type` **1**) to **`proxy.site-a.vcf.lab:3128`** (or the value in `lsf.proxy`), a sensible **`network.proxy.no_proxies_on`** list for `*.vcf.lab`, and lightweight prefs (Quick Suggest off, speculative connect off, safebrowsing off for lab). It runs from **`Startup/prelim.py`** (task **firefox_lmchol_tune**) and from **`labstartup.sh`** after console file push. If startup is still slow after tuning, with Firefox **fully closed**, an operator may delete **`suggest.sqlite`** / **`-wal`** / **`-shm`** in the profile to shrink urlbar suggest data (Firefox will recreate the DB).
+
+**Key Details**:
+- Do not use PAC (`type` 2) unless `network.proxy.autoconfig_url` is set; orphan `http_*` prefs under PAC mode stall startup.
+- First launch after deleting `suggest.sqlite` can be slow while the DB rebuilds; thereafter startup often improves if the database had grown too large earlier.

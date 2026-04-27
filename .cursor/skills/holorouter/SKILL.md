@@ -93,6 +93,8 @@ nginx acts as the host-based reverse proxy for all web services. It routes by `s
 nginx -t && nginx -s reload
 ```
 
+**TLS leaf renewal (auth / vault / dns hostnames)**: PEMs in `/root/nginx-certs/` are issued by Vault PKI (`pki/issue/holodeck`). **`gitlab.vcf.lab` / `gitlab-registry.vcf.lab`** are **not** read from that directory — nginx uses `/holodeck-runtime/gitlab/ssl/gitlab*.crt`. **`ca.vcf.lab`** uses **`/root/certsrv-proxy/ca.crt`**. The script `Tools/holorouter/renew-nginx-tls-from-vault.sh` issues certs then **`install`** them into those paths (not only `/root/nginx-certs/`). When leaves expire, browsers show errors even if the Vault root CA is trusted. Run the script on the router as `root`, then `nginx -t && nginx -s reload`. Default TTL is `9528h` (~397 days).
+
 ### Technitium DNS (namespace: `default`)
 
 | Item | Detail |
@@ -371,7 +373,7 @@ This script fixes: Vault dev->standalone migration, PKI setup, GitLab certs + ro
 - **Profile path:** `~/snap/firefox/common/.mozilla/firefox/hu6lbvyx.default/`
 - **Vault CA trust:** Imported as "vcf.lab Root Authority" (CT,C,C)
 - **User-Agent override:** macOS Safari (`general.useragent.override` in `user.js`)
-- **Proxy:** PAC or manual proxy at `10.0.0.1:3128`
+- **Proxy:** Squid on the holorouter at `proxy.site-a.vcf.lab:3128` or `10.1.1.1:3128` (manual proxy in Firefox `user.js` must use **type 1**, not PAC type 2 with orphan `http_*` prefs)
 
 ## Troubleshooting
 

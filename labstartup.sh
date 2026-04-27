@@ -599,6 +599,14 @@ push_console_files_nfs() {
                 echo "$PREF_LINE_2" >> "$USER_JS"
             fi
         fi
+        # Correct invalid PAC + dead proxy rows in user.js; add lightweight prefs
+        # (see Tools/firefox_lmchol_tuning.py — also run from Startup/prelim.py).
+        log_msg "Applying Firefox LMC tuning (proxy + lightweight prefs for console Firefox user.js)." "${logfile}"
+        if /usr/bin/python3 "${holroot}/Tools/firefox_lmchol_tuning.py" --mc-base /lmchol >>"${logfile}" 2>&1; then
+            log_msg "Firefox LMC tuning completed." "${logfile}"
+        else
+            log_msg "Firefox LMC tuning returned non-zero (see ${logfile})." "${logfile}"
+        fi
     fi
 
     log_msg "Console file push complete" "${logfile}"
@@ -991,6 +999,13 @@ fi
 if [ -f "/home/holuser/hol/Tools/doupdate.sh" ]; then
     log_msg "Copying doupdate.sh to /tmp/holorouter/doupdate.sh" "${logfile}"
     cp "/home/holuser/hol/Tools/doupdate.sh" /tmp/holorouter/doupdate.sh
+fi
+
+# Vault PKI nginx renewal script (consumers: prelim queues + doupdate.sh on holorouter)
+if [ -f "${holroot}/Tools/holorouter/renew-nginx-tls-from-vault.sh" ]; then
+    log_msg "Copying renew-nginx-tls-from-vault.sh to /tmp/holorouter/" "${logfile}"
+    cp "${holroot}/Tools/holorouter/renew-nginx-tls-from-vault.sh" /tmp/holorouter/renew-nginx-tls-from-vault.sh
+    chmod 755 /tmp/holorouter/renew-nginx-tls-from-vault.sh 2>/dev/null || true
 fi
 
 #==============================================================================

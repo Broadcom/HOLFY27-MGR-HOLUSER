@@ -1,12 +1,12 @@
 #!/usr/bin/bash
 # doupdate.sh - HOLFY27 Update Script
-# Version 1.0 - April 2026
+# Version 1.1 - 2026-04-17
 # Author - Burke Azbill and HOL Core Team
-# Trigger: Runs on holorouterfrom watcher.sh - after getrules.sh completes
-# Action: Copies certsrv_proxy.py to /mnt/manager/certsrv_proxy.py if it exists
-#         Restarts the certsrv-proxy pod
-#         Deletes the certsrv_proxy.py file after the pod is restarted
-#         Deletes the certsrv_proxy.py file after the pod is restarted
+# Trigger: Runs on holorouter from watcher.sh (and related startup paths).
+# Action:
+#   - certsrv_proxy.py: copy from NFS mount, restart certsrv-proxy DaemonSet, remove drop-in
+#   - renew_nginx_tls.request + renew-nginx-tls-from-vault.sh: run Vault PKI nginx renewal
+#     (manager queues via /tmp/holorouter → /mnt/manager; no SSH required)
 ###############################################################################
 # Version 1.0 code:
 ###############################################################################
@@ -35,6 +35,21 @@ if [ -f "${WATCH_DIR}/certsrv_proxy.py" ]; then
         rm -f "${WATCH_DIR}/certsrv_proxy.py"
     fi
 fi
+
+# Nginx TLS (auth/dns/vault/gitlab/ca) — manager drops script + renew_nginx_tls.request on NFS share
+RENEW_REQ="${WATCH_DIR}/renew_nginx_tls.request"
+RENEW_SH="${WATCH_DIR}/renew-nginx-tls-from-vault.sh"
+if [ -f "${RENEW_REQ}" ] && [ -f "${RENEW_SH}" ]; then
+    log_message "Found renew_nginx_tls request + script; running Vault PKI nginx renewal..."
+    if bash "${RENEW_SH}" >>"${logfile}" 2>&1; then
+        log_message "renew-nginx-tls-from-vault.sh completed successfully"
+        rm -f "${RENEW_REQ}" "${RENEW_SH}"
+    else
+        log_message "renew-nginx-tls-from-vault.sh failed (see ${logfile}); leaving ${RENEW_REQ} for retry"
+    fi
+elif [ -f "${RENEW_REQ}" ] && [ ! -f "${RENEW_SH}" ]; then
+    log_message "renew_nginx_tls.request present but renew-nginx-tls-from-vault.sh missing on share — skipping"
+fi
 ###############################################################################
-# End Version 1.0 code:
+# End doupdate.sh
 ###############################################################################
