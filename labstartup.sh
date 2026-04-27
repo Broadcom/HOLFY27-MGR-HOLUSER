@@ -532,7 +532,11 @@ push_console_files_nfs() {
                 ;;
             firefox-prewarm.desktop)
                 log_msg "SKIPPING${src_label}: console/${filename} -> .config/autostart/" "${logfile}"
-                # local autostart_dest="/lmchol/home/holuser/.config/autostart"
+                local autostart_dest="/lmchol/home/holuser/.config/autostart"
+                # if the file is present in the autostart_dest folder then delete it
+                if [ -f "${autostart_dest}/${filename}" ]; then
+                    rm "${autostart_dest}/${filename}"
+                fi
                 # mkdir -p "${autostart_dest}" 2>/dev/null
                 # if cp "$src_file" "${autostart_dest}/${filename}" 2>/dev/null; then
                 #     log_msg "${src_label}: console/${filename} -> .config/autostart/" "${logfile}"
