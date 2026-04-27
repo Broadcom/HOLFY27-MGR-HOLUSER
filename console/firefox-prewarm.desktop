@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Firefox (prewarm)
+Comment=Start Firefox at login and minimize so it is ready when you open it
+Exec=/home/holuser/.local/bin/firefox-prewarm.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true
+StartupNotify=false
+# Optional: delay autostart a few seconds after the shell starts (uncomment if you see races)
+# X-GNOME-Autostart-Delay=5
