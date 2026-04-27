@@ -531,11 +531,12 @@ push_console_files_nfs() {
                 # Skip placeholder files
                 ;;
             firefox-prewarm.desktop)
-                local autostart_dest="/lmchol/home/holuser/.config/autostart"
-                mkdir -p "${autostart_dest}" 2>/dev/null
-                if cp "$src_file" "${autostart_dest}/${filename}" 2>/dev/null; then
-                    log_msg "${src_label}: console/${filename} -> .config/autostart/" "${logfile}"
-                fi
+                log_msg "SKIPPING${src_label}: console/${filename} -> .config/autostart/" "${logfile}"
+                # local autostart_dest="/lmchol/home/holuser/.config/autostart"
+                # mkdir -p "${autostart_dest}" 2>/dev/null
+                # if cp "$src_file" "${autostart_dest}/${filename}" 2>/dev/null; then
+                #     log_msg "${src_label}: console/${filename} -> .config/autostart/" "${logfile}"
+                # fi
                 ;;
             firefox-prewarm.sh)
                 local bin_dest="/lmchol/home/holuser/.local/bin"
@@ -594,19 +595,19 @@ push_console_files_nfs() {
     chmod 644 "/lmchol/home/holuser/.config/autostart/firefox-prewarm.desktop" 2>/dev/null
     
     # Trigger firefox-prewarm.sh on the console VM so it's ready before login
-    log_msg "Triggering firefox-prewarm.sh on the console VM via SSH..." "${logfile}"
-    if command -v sshpass >/dev/null 2>&1 && [ -f /home/holuser/creds.txt ]; then
-        (
-            for i in 1 2 3 4 5 6; do
-                if sshpass -f /home/holuser/creds.txt ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 holuser@console "nohup /home/holuser/.local/bin/firefox-prewarm.sh >/dev/null 2>&1 &" 2>/dev/null; then
-                    break
-                fi
-                sleep 5
-            done
-        ) &
-    else
-        log_msg "sshpass or creds.txt not available, skipping console SSH execution." "${logfile}"
-    fi
+    # log_msg "Triggering firefox-prewarm.sh on the console VM via SSH..." "${logfile}"
+    # if command -v sshpass >/dev/null 2>&1 && [ -f /home/holuser/creds.txt ]; then
+    #     (
+    #         for i in 1 2 3 4 5 6; do
+    #             if sshpass -f /home/holuser/creds.txt ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 holuser@console "nohup /home/holuser/.local/bin/firefox-prewarm.sh >/dev/null 2>&1 &" 2>/dev/null; then
+    #                 break
+    #             fi
+    #             sleep 5
+    #         done
+    #     ) &
+    # else
+    #     log_msg "sshpass or creds.txt not available, skipping console SSH execution." "${logfile}"
+    # fi
 
     # Now make sure the user-agent override is present in the Firefox profile:
     log_msg "Making sure user-agent override is present in Firefox profile." "${logfile}"
