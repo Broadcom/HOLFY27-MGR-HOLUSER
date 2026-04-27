@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 # fleet.py - HOLFY27 Fleet Management (SDDC Manager) Operations
-# Version 2.2 - February 2026
+# Version 2.3 - 2026-04-27
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # Provides Fleet Operations API integration for shutdown orchestration
+#
+# v2.3 Changes (2026-04-27):
+# - TASK_HEARTBEAT_SEC (90s): STILL_RUNNING lines in wait_for_task_v91 and wait_for_fleet_lcm_task
+# - _fleet_component_skip_shutdown(): skip Fleet shutdown when component already appears inactive
+# - shutdown_products_fleet_lcm / shutdown_products_v91: use skip helper before triggering shutdown
 #
 # v2.2 Changes:
 # - Added fleet-lcm direct API functions for VCF 9.1 shutdown:
@@ -102,6 +107,7 @@ INVENTORY_SYNC_MAX_WAIT = 300  # 5 minutes max wait for inventory sync
 V91_API_BASE = '/suite-api/internal'
 V91_TASK_POLL_INTERVAL = 15  # seconds between task status checks
 V91_TASK_MAX_WAIT = 1800     # 30 minutes max wait for shutdown workflow
+TASK_HEARTBEAT_SEC = 90      # STILL_RUNNING if no status line for this long
 V91_TOKEN_TIMEOUT = 30       # seconds for suite-api token acquisition
 
 # VCF 9.0 product name -> VCF 9.1 component type mapping
@@ -854,6 +860,28 @@ def get_task_status_v91(ops_fqdn: str, token: str, task_id: str,
         logger.error(f"Failed to get V91 task status: {e}")
         return {'status': 'FAILED', 'error': str(e)}
 
+def _fleet_component_skip_shutdown(comp: dict, write_output) -> tuple:
+    """
+    Return (True, reason) if shutdown API should be skipped (already inactive).
+    Heuristic: inspect status / operational fields on component dict.
+    """
+    _log = write_output if write_output else lambda x: None
+    props = comp.get('properties') if isinstance(comp.get('properties'), dict) else {}
+    candidates = [
+        comp.get('status'),
+        comp.get('operationalStatus'),
+        comp.get('componentStatus'),
+        props.get('status'),
+        props.get('powerState'),
+    ]
+    blob = ' '.join(str(c).upper() for c in candidates if c)
+    for token in ('POWERED_OFF', 'NOT_RUNNING', 'STOPPED', 'DOWN', 'SHUTDOWN'):
+        if token in blob:
+            _log(f'  SKIP: component appears already inactive ({token})')
+            return True, token
+    return False, ''
+
+
 def wait_for_task_v91(ops_fqdn: str, token: str, task_id: str,
                       poll_interval: int = V91_TASK_POLL_INTERVAL,
                       max_wait: int = V91_TASK_MAX_WAIT,
@@ -874,10 +902,17 @@ def wait_for_task_v91(ops_fqdn: str, token: str, task_id: str,
     _log = write_output if write_output else lambda x: print(f'INFO: {x}')
     start_time = time.time()
     check_count = 0
+    last_hb = time.time()
 
     while (time.time() - start_time) < max_wait:
         check_count += 1
         elapsed = int(time.time() - start_time)
+        now = time.time()
+        if now - last_hb >= TASK_HEARTBEAT_SEC:
+            rem = int(max_wait - elapsed)
+            _log(f'  STILL_RUNNING: waiting on Fleet task {task_id[:8]}... '
+                 f'(elapsed {elapsed}s, ~{rem}s max remaining)')
+            last_hb = now
         task_info = get_task_status_v91(ops_fqdn, token, task_id, verify)
         status = task_info.get('status', 'UNKNOWN')
 
@@ -890,6 +925,7 @@ def wait_for_task_v91(ops_fqdn: str, token: str, task_id: str,
             stage_summary = f' | stage: {stage_name}={stage_status}'
 
         _log(f'  [Check {check_count}] Task {task_id[:8]}... status: {status}{stage_summary} (elapsed: {elapsed}s)')
+        last_hb = time.time()
 
         if status == 'SUCCEEDED':
             _log(f'  Task completed successfully in {elapsed}s')
@@ -969,6 +1005,10 @@ def shutdown_products_v91(ops_fqdn: str, token: str, products: list,
         comp_id = comp.get('componentUuid', comp.get('id', ''))
         props = comp.get('properties', {})
         comp_fqdn = props.get('fqdn', 'unknown')
+
+        skip, _sk = _fleet_component_skip_shutdown(comp, _log)
+        if skip:
+            continue
 
         if not api_shutdown_attempted:
             _log(f'Attempting API shutdown for {product} ({component_type}): {comp_fqdn}...')
@@ -1251,10 +1291,17 @@ def wait_for_fleet_lcm_task(fleet_fqdn: str, token: str, task_id: str,
     _log = write_output if write_output else lambda x: print(f'INFO: {x}')
     start_time = time.time()
     check_count = 0
+    last_hb = time.time()
 
     while (time.time() - start_time) < max_wait:
         check_count += 1
         elapsed = int(time.time() - start_time)
+        now = time.time()
+        if now - last_hb >= TASK_HEARTBEAT_SEC:
+            rem = int(max_wait - elapsed)
+            _log(f'  STILL_RUNNING: fleet-lcm task {task_id[:8]}... '
+                 f'(elapsed {elapsed}s, ~{rem}s max remaining)')
+            last_hb = now
 
         try:
             resp = _make_fleet_lcm_request(
@@ -1284,6 +1331,7 @@ def wait_for_fleet_lcm_task(fleet_fqdn: str, token: str, task_id: str,
 
         _log(f'  [Check {check_count}] Task {task_id[:8]}... status: '
              f'{status}{stage_summary} (elapsed: {elapsed}s)')
+        last_hb = time.time()
 
         if status == 'SUCCEEDED':
             _log(f'  Task completed successfully in {elapsed}s')
@@ -1371,6 +1419,10 @@ def shutdown_products_fleet_lcm(fleet_fqdn: str, token: str,
 
         comp_id = comp.get('id', comp.get('componentUuid', ''))
         comp_fqdn = _get_component_fqdn(comp)
+
+        skip, _why = _fleet_component_skip_shutdown(comp, _log)
+        if skip:
+            continue
 
         _log(f'Shutting down {product} ({component_type}): {comp_fqdn}...')
         task_id = shutdown_component_fleet_lcm(

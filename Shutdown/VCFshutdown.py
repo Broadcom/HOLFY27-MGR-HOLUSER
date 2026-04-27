@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 2.6 - 2026-04-02
+# Version 2.7 - 2026-04-27
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 2.7 Changes (2026-04-27):
+# - Added --phases (multi-phase) and --fleet-products (Phase 1 override); mutual exclusion with --phase
+# - Integrated shutdown_helpers: phase plan expansion, auto vCenter/ESXi sessions, selective disconnect
+# - ETA tracker (approximate budgets) and _vcf_phase_entry() for per-phase progress; HEARTBEAT_INTERVAL 90s
+# - vSAN elevator wait: 90s progress via heartbeat_still_waiting; VSAN_ELEVATOR_LOG_INTERVAL 90s
+# - shutdown_vms_by_names: skip VMs already powered off (SKIP log line)
 #
 # v 2.6 - 2026-04-02:
 #   - Fixed for dual site
@@ -232,7 +239,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 MODULE_NAME = 'VCFshutdown'
-MODULE_VERSION = '2.6'
+MODULE_VERSION = '2.7'
 MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 9.x compliant)'
 
 # Status file for console display
@@ -244,14 +251,14 @@ SHUTDOWN_LOG = '/home/holuser/hol/shutdown.log'
 # vSAN elevator timeout (45 minutes - safety ceiling; active polling finishes sooner)
 VSAN_ELEVATOR_TIMEOUT = 2700  # 45 minutes in seconds
 VSAN_ELEVATOR_POLL_INTERVAL = 30  # Seconds between elevatorRunning polls
-VSAN_ELEVATOR_LOG_INTERVAL = 120  # Seconds between progress log lines
+VSAN_ELEVATOR_LOG_INTERVAL = 90  # Seconds between progress log lines
 
 # VM shutdown timeout
 VM_SHUTDOWN_TIMEOUT = 300  # 5 minutes per VM
 VM_SHUTDOWN_POLL_INTERVAL = 5  # seconds
 
 # Progress heartbeat: log a waiting message if no output for this many seconds
-HEARTBEAT_INTERVAL = 60  # seconds
+HEARTBEAT_INTERVAL = 90  # seconds
 
 # Host shutdown timeout
 HOST_SHUTDOWN_TIMEOUT = 600  # 10 minutes per host
@@ -320,7 +327,7 @@ def get_vms_by_regex(lsf, pattern: str) -> list:
 
 
 def shutdown_vms_by_names(lsf, vm_names: list, dry_run: bool = False,
-                         phase_label: str = '', use_regex: bool = False) -> int:
+                          phase_label: str = '', use_regex: bool = False) -> int:
     """
     Look up VMs by name (exact or regex) and shut them down gracefully.
     
@@ -345,6 +352,9 @@ def shutdown_vms_by_names(lsf, vm_names: list, dry_run: bool = False,
             vms = lsf.get_vm_by_name(vm_name)
         if vms:
             for vm in vms:
+                if not lsf.is_vm_powered_on(vm):
+                    vcf_write(lsf, f'    SKIP: {vm.name} already powered off')
+                    continue
                 processed += 1
                 lsf.shutdown_vm_gracefully(vm)
                 time.sleep(5)
@@ -815,9 +825,11 @@ def wait_for_elevator_completion(lsf, esx_hosts: list, username: str,
     :param poll_interval: seconds between polls
     :return: True if all hosts completed, False on timeout
     """
+    import shutdown_helpers as sh
+
     start = time.time()
     pending_hosts = set(esx_hosts)
-    last_log = 0
+    last_hb = time.monotonic()
 
     while pending_hosts and (time.time() - start) < max_wait:
         elapsed = int(time.time() - start)
@@ -832,11 +844,13 @@ def wait_for_elevator_completion(lsf, esx_hosts: list, username: str,
         pending_hosts = still_running
 
         if pending_hosts:
-            if elapsed - last_log >= VSAN_ELEVATOR_LOG_INTERVAL or last_log == 0:
-                remaining = int(max_wait - elapsed)
-                vcf_write(lsf, f'  {len(pending_hosts)} host(s) still flushing '
-                          f'({elapsed}s elapsed, {remaining}s max remaining)')
-                last_log = elapsed
+            remaining = int(max_wait - elapsed)
+            last_hb = sh.heartbeat_still_waiting(
+                lambda m: vcf_write(lsf, m),
+                f'vSAN elevator: {len(pending_hosts)} host(s) still flushing '
+                f'({elapsed}s elapsed, ~{remaining}s until timeout ceiling)',
+                last_hb,
+            )
             time.sleep(poll_interval)
 
     total = int(time.time() - start)
@@ -905,47 +919,74 @@ def shutdown_host(lsf, host_fqdn: str, username: str, password: str) -> bool:
 # MAIN FUNCTION
 #==============================================================================
 
-def main(lsf=None, standalone=False, dry_run=False, phase=None):
+def main(lsf=None, standalone=False, dry_run=False, phase=None,
+         phases=None, fleet_products_override=None):
     """
     Main entry point for VCFshutdown module
-    
+
     :param lsf: lsfunctions module (will be imported if None)
     :param standalone: Whether running in standalone test mode
     :param dry_run: Whether to skip actual changes
-    :param phase: If set, run only this specific phase (e.g., '1', '1b', '2b', '17b')
-                  If None, run all phases in order.
+    :param phase: Run only this VCF phase (e.g. '1', '8', '17b')
+    :param phases: Comma-separated list of phases (mutually exclusive with phase)
+    :param fleet_products_override: Comma-separated product keys for Phase 1 only
     """
     from pyVim import connect
     from pyVmomi import vim
-    
+
     if lsf is None:
         import lsfunctions as lsf
         if not standalone:
             lsf.init(router=False)
-    
+
     import fleet  # Import fleet operations module
-    
-    # Valid phase IDs for --phase parameter validation
-    ALL_PHASES = [
-        '1', '1b', '2', '2b', '3', '3b', '4', '5', '6', '7',
-        '8', '9', '10', '11', '12', '13',
-        '14', '15', '16', '17', '17b',
-        '18', '19', '19b', '19c', '20'
-    ]
-    
-    if phase is not None and str(phase).lower() not in ALL_PHASES:
-        vcf_write(lsf, f'ERROR: Invalid phase "{phase}". Valid phases: {", ".join(ALL_PHASES)}')
+    import shutdown_helpers as sh
+
+    _prev_eta_holder = {'id': None}
+
+    def _vcf_phase_entry(lsf, phase_id, dry_run, mgmt_hosts, eta):
+        pid = phase_id.lower()
+        prev = _prev_eta_holder['id']
+        if eta and prev and prev != pid:
+            eta.phase_end(prev)
+        sh.ensure_sessions_for_phase(
+            phase_id, lsf, dry_run, mgmt_hosts,
+            lambda m: vcf_write(lsf, m))
+        if eta:
+            eta.phase_begin(phase_id)
+        _prev_eta_holder['id'] = pid
+
+    user_phase_tokens = []
+    if phases:
+        user_phase_tokens = sh.parse_phases_csv(phases)
+    elif phase is not None:
+        user_phase_tokens = [str(phase).strip().lower()]
+
+    phase_set = None
+    ordered_plan = list(sh.CANONICAL_PHASE_ORDER)
+    try:
+        if user_phase_tokens:
+            sh.validate_phase_tokens(user_phase_tokens)
+            ordered_plan = sh.expand_phase_plan(user_phase_tokens)
+            phase_set = frozenset(ordered_plan)
+    except ValueError as exc:
+        vcf_write(lsf, f'ERROR: {exc}')
         return {'success': False, 'esx_hosts': []}
-    
+
     ##=========================================================================
     ## Core Team code - do not modify - place custom code in the CUSTOM section
     ##=========================================================================
-    
-    if phase is None:
+
+    if phase is None and phases is None:
         vcf_write(lsf, f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
-    
+    elif user_phase_tokens:
+        vcf_write(lsf, f'Selective {MODULE_NAME} — execution plan: {", ".join(ordered_plan)}')
+        auto_added = sorted(frozenset(ordered_plan) - frozenset(user_phase_tokens))
+        if auto_added:
+            vcf_write(lsf, f'AUTO_PREREQ: inserted {", ".join(auto_added)}')
+
     password = lsf.get_password()
-    
+
     #==========================================================================
     # TASK 1: Shutdown Fleet Operations Products (VCF Operations Suite)
     # Supports two API paths:
@@ -953,12 +994,11 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     #   VCF 9.0: opslcm-a legacy API (Basic auth, environment/product-based)
     # Version is read from [VCF] vcf_version or auto-probed at runtime.
     #==========================================================================
-    
+
     def should_run(phase_id: str) -> bool:
-        """Return True if this phase should execute (no filter, or matches)."""
-        if phase is None:
+        if phase_set is None:
             return True
-        return str(phase).lower() == str(phase_id).lower()
+        return str(phase_id).lower() in phase_set
     
     # All config reading happens unconditionally so later phases have
     # the data they need even when running a single phase.
@@ -989,7 +1029,13 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     fleet_products = ['vra', 'vrni']
     if lsf.config.has_option('SHUTDOWN', 'fleet_products'):
         fleet_products_raw = lsf.config.get('SHUTDOWN', 'fleet_products')
-        fleet_products = [p.strip() for p in fleet_products_raw.split(',')]
+        fleet_products = [p.strip() for p in fleet_products_raw.split(',')
+                          if p.strip()]
+    if fleet_products_override:
+        ov = [p.strip() for p in str(fleet_products_override).split(',') if p.strip()]
+        if ov:
+            fleet_products = ov
+            vcf_write(lsf, f'Fleet products (CLI override): {", ".join(fleet_products)}')
     
     # --- Version detection ---
     vcf_version = fleet.detect_vcf_version(lsf.config)
@@ -1018,9 +1064,16 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     esx_username = 'root'
     if lsf.config.has_option('SHUTDOWN', 'esx_username'):
         esx_username = lsf.config.get('SHUTDOWN', 'esx_username')
-    
+
+    eta = sh.ShutdownEtaTracker(
+        list(sh.CANONICAL_PHASE_ORDER) if phase_set is None else ordered_plan,
+        lambda m: vcf_write(lsf, m),
+    )
+    eta.log_run_start()
+
     if should_run('1'):
         try:
+            _vcf_phase_entry(lsf, '1', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 1: Fleet Operations (VCF Operations Suite) Shutdown')
             vcf_write(lsf, '='*60)
@@ -1142,6 +1195,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('1b'):
         try:
+            _vcf_phase_entry(lsf, '1b', dry_run, mgmt_hosts, eta)
             if not fleet_api_succeeded:
                 vcf_write(lsf, '='*60)
                 vcf_write(lsf, 'PHASE 1b: Shutdown VCF Automation VMs (Fleet API fallback)')
@@ -1210,6 +1264,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('2'):
         try:
+            _vcf_phase_entry(lsf, '2', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 2: Connect to Management Infrastructure')
             vcf_write(lsf, '='*60)
@@ -1253,6 +1308,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('2b'):
         try:
+            _vcf_phase_entry(lsf, '2b', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 2b: Scale Down VCF Component Services (K8s on VSP)')
             vcf_write(lsf, '='*60)
@@ -1467,6 +1523,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
 
     if should_run('3b'):
         try:
+            _vcf_phase_entry(lsf, '3b', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 3b: Graceful Supervisor Workload Shutdown')
             vcf_write(lsf, '='*60)
@@ -1523,6 +1580,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('3'):
         try:
+            _vcf_phase_entry(lsf, '3', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 3: Stop Workload Control Plane (WCP)')
             vcf_write(lsf, '='*60)
@@ -1578,6 +1636,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('4'):
         try:
+            _vcf_phase_entry(lsf, '4', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 4: Shutdown Workload VMs')
             vcf_write(lsf, '='*60)
@@ -1742,6 +1801,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('5'):
         try:
+            _vcf_phase_entry(lsf, '5', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 5: Shutdown Workload Domain NSX Edges')
             vcf_write(lsf, '='*60)
@@ -1791,6 +1851,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('6'):
         try:
+            _vcf_phase_entry(lsf, '6', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 6: Shutdown Workload Domain NSX Manager')
             vcf_write(lsf, '='*60)
@@ -1841,6 +1902,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('7'):
         try:
+            _vcf_phase_entry(lsf, '7', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 7: Shutdown Workload vCenters')
             vcf_write(lsf, '='*60)
@@ -1952,6 +2014,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('8'):
         try:
+            _vcf_phase_entry(lsf, '8', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 8: Shutdown VCF Operations for Networks')
             vcf_write(lsf, '='*60)
@@ -2006,6 +2069,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('9'):
         try:
+            _vcf_phase_entry(lsf, '9', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 9: Shutdown VCF Operations Collector')
             vcf_write(lsf, '='*60)
@@ -2047,6 +2111,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('10'):
         try:
+            _vcf_phase_entry(lsf, '10', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 10: Shutdown VCF Operations for Logs')
             vcf_write(lsf, '='*60)
@@ -2087,6 +2152,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('11'):
         try:
+            _vcf_phase_entry(lsf, '11', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 11: Shutdown VCF Identity Broker')
             vcf_write(lsf, '='*60)
@@ -2127,6 +2193,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('12'):
         try:
+            _vcf_phase_entry(lsf, '12', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 12: Shutdown VCF Operations Fleet Management')
             vcf_write(lsf, '='*60)
@@ -2167,6 +2234,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('13'):
         try:
+            _vcf_phase_entry(lsf, '13', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 13: Shutdown VCF Operations')
             vcf_write(lsf, '='*60)
@@ -2210,6 +2278,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('14'):
         try:
+            _vcf_phase_entry(lsf, '14', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 14: Shutdown Management NSX Edges')
             vcf_write(lsf, '='*60)
@@ -2263,6 +2332,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('15'):
         try:
+            _vcf_phase_entry(lsf, '15', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 15: Shutdown Management NSX Manager')
             vcf_write(lsf, '='*60)
@@ -2315,6 +2385,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('16'):
         try:
+            _vcf_phase_entry(lsf, '16', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 16: Shutdown SDDC Manager')
             vcf_write(lsf, '='*60)
@@ -2355,6 +2426,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('17'):
         try:
+            _vcf_phase_entry(lsf, '17', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 17: Shutdown Management vCenter')
             vcf_write(lsf, '='*60)
@@ -2405,6 +2477,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('17b'):
         try:
+            _vcf_phase_entry(lsf, '17b', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 17b: Connect to ESXi Hosts Directly')
             vcf_write(lsf, '='*60)
@@ -2438,6 +2511,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('17c'):
         try:
+            _vcf_phase_entry(lsf, '17c', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 17c: Shutdown Post-Edge VMs (License Servers, etc.)')
             vcf_write(lsf, '='*60)
@@ -2481,6 +2555,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('18'):
         try:
+            _vcf_phase_entry(lsf, '18', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 18: Set Host Advanced Settings')
             vcf_write(lsf, '='*60)
@@ -2516,6 +2591,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('19'):
         try:
+            _vcf_phase_entry(lsf, '19', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 19: vSAN Elevator Operations')
             vcf_write(lsf, '='*60)
@@ -2610,6 +2686,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('19b'):
         try:
+            _vcf_phase_entry(lsf, '19b', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 19b: Shutdown VSP Platform VMs')
             vcf_write(lsf, '='*60)
@@ -2663,6 +2740,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('19c'):
         try:
+            _vcf_phase_entry(lsf, '19c', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 19c: Pre-ESXi Shutdown Audit')
             vcf_write(lsf, '='*60)
@@ -2738,6 +2816,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
     
     if should_run('20'):
         try:
+            _vcf_phase_entry(lsf, '20', dry_run, mgmt_hosts, eta)
             vcf_write(lsf, '='*60)
             vcf_write(lsf, 'PHASE 20: Shutdown ESXi Hosts')
             vcf_write(lsf, '='*60)
@@ -2792,8 +2871,15 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
         except Exception as _phase_err:
             vcf_write(lsf, f'ERROR in Phase 20: {_phase_err}')
             vcf_write(lsf, 'Continuing with next phase...')
-    if phase is None:
+    if phase is None and phases is None:
         vcf_write(lsf, f'{MODULE_NAME} completed')
+    else:
+        vcf_write(lsf, f'{MODULE_NAME} selective run finished')
+
+    if phase_set is not None:
+        if eta and _prev_eta_holder['id']:
+            eta.phase_end(_prev_eta_holder['id'])
+        sh.disconnect_vsphere_sessions(lsf)
 
     return {'success': True, 'esx_hosts': esx_hosts}
 
@@ -2829,6 +2915,7 @@ Phase IDs for --phase:
   16    Shutdown SDDC Manager
   17    Shutdown Management vCenter
   17b   Connect to ESXi Hosts directly
+  17c   Shutdown Post-Edge VMs (optional)
   18    Set Host Advanced Settings
   19    vSAN Elevator Operations
   19b   Shutdown VSP Platform VMs
@@ -2847,9 +2934,14 @@ Examples:
                         help='Show what would be done without making changes')
     parser.add_argument('--skip-init', action='store_true',
                         help='Skip lsf.init() call')
-    parser.add_argument('--phase', '-p', type=str, default=None,
-                        help='Run only a specific phase (e.g., 1, 1b, 13, 17b)')
-    
+    phase_grp = parser.add_mutually_exclusive_group()
+    phase_grp.add_argument('--phase', '-p', type=str, default=None,
+                           help='Run only a specific phase (e.g., 1, 1b, 13, 17b)')
+    phase_grp.add_argument('--phases', type=str, default=None,
+                           help='Comma-separated phases (e.g. 2,8,13). Auto-inserts prerequisites.')
+    parser.add_argument('--fleet-products', type=str, default=None,
+                        help='Override Phase 1 fleet product list (e.g. vra,vrni)')
+
     args = parser.parse_args()
     
     import lsfunctions as lsf
@@ -2866,4 +2958,5 @@ Examples:
         print()
     
     main(lsf=lsf, standalone=args.standalone, dry_run=args.dry_run,
-         phase=args.phase)
+         phase=args.phase, phases=args.phases,
+         fleet_products_override=args.fleet_products)

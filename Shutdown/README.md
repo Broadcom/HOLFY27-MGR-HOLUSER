@@ -1,6 +1,6 @@
 # HOL Lab Shutdown Scripts
 
-Version 2.1 - 2026-03-04
+Version 2.3 - 2026-04-27
 
 ## Overview
 
@@ -60,6 +60,15 @@ python3 Shutdown.py --phase 1
 # Preview a single phase
 python3 Shutdown.py --phase 13 --dry-run
 
+# Multiple VCF phases in one process (prerequisites such as Phase 2 / 17b auto-inserted)
+python3 Shutdown.py --phases 2,8
+
+# Phase 1 with only selected suite products (overrides [SHUTDOWN] fleet_products for this run)
+python3 Shutdown.py --phase 1 --fleet-products vra
+python3 Shutdown.py --phase 1 --fleet-products vra,vrni
+python3 Shutdown.py --phase 1 --fleet-products vrops,vrli
+python3 Shutdown.py --phase 1 --fleet-products vra,vrni,vrops,vrli,vrlcm
+
 # Show help (includes full phase list)
 python3 Shutdown.py --help
 ```
@@ -100,18 +109,19 @@ Supports two API versions:
 
 | Version | Endpoint | Auth | API Style |
 | ------- | -------- | ---- | --------- |
-| VCF 9.1 | `ops-a` via `/suite-api/internal/components/` | OpsToken | Component-based (VCFA, NI, OPS, LI) |
+| VCF 9.1 (primary) | `fleet-01a` via `/fleet-lcm/v1/` | JWT (VSP Identity) | Component types: `VCFA`, `OPS_NETWORKS`, `OPS`, `OPS_LOGS`, `VCF_FLEET_LCM` |
+| VCF 9.1 (fallback) | `ops-a` via `/suite-api/internal/components/` | OpsToken | Same logical products; shutdown action may return HTTP 500 |
 | VCF 9.0 | `opslcm-a` via `/lcm/lcops/api/v2/` | Basic (base64) | Environment/product-based (vra, vrni) |
 
-VCF 9.1 component type mapping:
+VCF 9.1 product → component type mapping:
 
-| Product | Component Type | Description |
-| ------- | -------------- | ----------- |
-| vra | VCFA | VCF Automation |
-| vrni | NI | Operations for Networks |
-| vrops | OPS | VCF Operations |
-| vrli | LI | Operations for Logs |
-| vrlcm | FLEET_LCM | Fleet Lifecycle Manager |
+| Product | suite-api `componentType` | fleet-lcm `componentType` | Description |
+| ------- | --------------------------- | ---------------------------- | ----------- |
+| vra | VCFA | VCFA | VCF Automation |
+| vrni | NI | OPS_NETWORKS | Operations for Networks |
+| vrops | OPS | OPS | VCF Operations |
+| vrli | LI | OPS_LOGS | Operations for Logs |
+| vrlcm | FLEET_LCM | VCF_FLEET_LCM | Fleet Lifecycle Manager |
 
 Can be tested standalone:
 
@@ -171,15 +181,16 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 | ----- | ----------- | ----- |
 | **Main Orchestrator (Shutdown.py)** | | |
 | Phase 0 | Pre-Shutdown Checks | Check config, detect lab type |
-| Phase 1 | Docker Containers | Stop Docker containers |
-| Phase 2 | VCF Environment Shutdown | Calls VCFshutdown.py |
-| Phase 3 | Final Cleanup | Disconnect vSphere sessions |
-| Phase 4 | Wait for Host Power Off | Ping monitoring (15s, 30min max) |
+| Phase 0b | Docker Containers | Optional remote Docker stop |
+| (module) | VCF Environment Shutdown | Invokes `VCFshutdown.py` (internal phases 1–20) |
+| Phase 21 | Final Cleanup | Disconnect vSphere sessions |
+| Phase 22 | Wait for Host Power Off | Ping monitoring (15s interval, 30min max) |
 | **VCF Shutdown (VCFshutdown.py)** | | |
-| Phase 1 | Fleet Operations | VCF Ops Suite via API (vra, vrni, vrops, vrli) |
+| Phase 1 | Fleet Operations | VCF Ops Suite via API (vra, vrni, vrops, vrli, vrlcm) |
 | Phase 1b | VCF Automation VM fallback | Only if Fleet API failed |
 | Phase 2 | Connect to vCenters | vCenters first (while available) |
 | Phase 2b | Scale Down VCF Components | K8s workloads on VSP |
+| Phase 3b | Supervisor workload drain | VKS/Harbor etc. before WCP stop |
 | Phase 3 | Stop WCP | Workload Control Plane services |
 | Phase 4 | Workload VMs | Tanzu, K8s, Supervisor VMs |
 | Phase 5 | Workload NSX Edges | Workload domain NSX Edges |
@@ -196,6 +207,7 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 | Phase 16 | SDDC Manager | SDDC Manager |
 | Phase 17 | Mgmt vCenter | Management domain vCenter |
 | Phase 17b | Connect to ESXi | Direct ESXi connections (vCenters now down) |
+| Phase 17c | Post-Edge VMs | Optional patterns from `[VCF] vcfpostedgevms` |
 | Phase 18 | Host Settings | Set ESXi advanced settings |
 | Phase 19 | vSAN Elevator | Enable elevator, poll until flush complete, disable (OSA only) |
 | Phase 19b | VSP Platform VMs | Shutdown VSP VMs |
@@ -204,13 +216,17 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 
 ### Key Design Decisions
 
-1. **vCenters connected first (Phase 2)**: While vCenters are still running, all VM shutdown operations (Phases 3-17) go through vCenter for reliable VM discovery and graceful shutdown. ESXi host direct connections only happen after vCenters are shut down (Phase 17b).
+1. **vCenters connected first (Phase 2)**: While vCenters are still running, VM shutdown operations go through vCenter. For selective runs (`--phase` / `--phases`), **Phase 2 (or Phase 17b for ESXi-only inventory)** is auto-inserted when a phase needs vCenter or ESXi vim inventory but you did not list it.
 
-2. **Phase 1b follows Phase 1**: If the Fleet API cannot shut down VCF Automation, the fallback VM shutdown (Phase 1b) runs immediately after, before connecting to infrastructure (Phase 2).
+2. **Phase 1b follows Phase 1**: If the Fleet API cannot shut down VCF Automation, the fallback VM shutdown (Phase 1b) runs immediately after Phase 1; Phase 1b can connect to vCenters on its own when needed.
 
-3. **VCF Components vs VMs**: In VCF 9.1, many services (opslogs-a, opslcm-a, Identity Broker, etc.) run as Kubernetes workloads on VSP, not as standalone VMs. These are handled by Phase 2b (K8s scale-down) and Phase 1 (Fleet API), not by VM lookup phases. Phases 10-12 only target actual VMs when configured in `config.ini`.
+3. **VCF Components vs VMs**: In VCF 9.1, many services run as Kubernetes workloads on VSP. These are handled by Phase 2b (K8s scale-down) and Phase 1 (Fleet API). VM-name phases (8–13, etc.) only target VMs that exist for your build.
 
-4. **Fleet API uses suite-api internal endpoint**: The VCF 9.1 Fleet LCM plugin API at `/vcf-operations/plug/fleet-lcm/v1/` requires a UI session. Instead, the script uses `/suite-api/internal/components/` with OpsToken authentication (same pattern as the password management API). The shutdown *action* (`POST ?action=shutdown`) returns HTTP 500 through this proxy, so Phase 1 performs component discovery only - actual shutdown is handled by VM power-off in Phase 1b and subsequent phases.
+4. **Fleet shutdown (VCF 9.1)**: Phase 1 prefers the **fleet-lcm direct API** on the Fleet LCM gateway (JWT via VSP Identity Service) so `POST .../components/{id}?action=shutdown` works. It falls back to suite-api internal components, then VCF 9.0 legacy LCM. Components that already appear inactive are **skipped** with a `SKIP:` log line.
+
+5. **Progress and ETA**: Long waits (Fleet task polling, vSAN elevator, host power-off wait, guest shutdown) emit **at least one line every ~90 seconds** to the console and `shutdown.log`. At startup, an **approximate** total time budget is logged; each phase logs remaining budget (not a SLA).
+
+6. **Idempotent VM shutdown**: VM phases skip guests that are **already powered off** (`SKIP:` in logs).
 
 ## Command-Line Options
 
@@ -221,7 +237,9 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 | `--dry-run` | `-n` | Preview mode - show what would be done without making changes |
 | `--quick` | `-q` | Skip the vSAN elevator entirely (faster but less safe) |
 | `--no-hosts` | | Skip ESXi host shutdown (leave hosts running) |
-| `--phase PHASE` | `-p` | Run only a specific VCF shutdown phase |
+| `--phase PHASE` | `-p` | Run only one VCF shutdown phase (mutually exclusive with `--phases`) |
+| `--phases LIST` | | Comma-separated VCF phases in canonical order (auto prerequisites) |
+| `--fleet-products` | | Comma-separated product keys for Phase 1 only (overrides config) |
 | `--version` | `-v` | Show version number |
 | `--debug` | `-d` | Enable debug logging |
 
@@ -232,45 +250,58 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 | `--dry-run` | | Preview mode |
 | `--standalone` | | Run in standalone test mode |
 | `--skip-init` | | Skip lsf.init() call |
-| `--phase PHASE` | `-p` | Run only a specific phase |
+| `--phase PHASE` | `-p` | Run only one phase (mutually exclusive with `--phases`) |
+| `--phases LIST` | | Comma-separated phases (same expansion as `Shutdown.py`) |
+| `--fleet-products` | | Phase 1 product list override |
 
-### Using --phase for Selective Shutdown
+### Selective shutdown (`--phase`, `--phases`, `--fleet-products`)
 
-The `--phase` parameter allows you to run a single shutdown phase at a time. This is useful for:
+- **`--phase`**: one internal VCF phase (e.g. `8` for Ops for Networks VMs).
+- **`--phases`**: several phases in **one process**, merged with **auto-prerequisites**:
+  - VM inventory on vCenter → inserts **`2`** if missing.
+  - VM inventory on ESXi (e.g. `19b`, `17c`) → inserts **`17b`** if missing.
+  - Phases always run in **canonical VCF order** (not the order tokens appear on the CLI).
+- **`--fleet-products`**: applies only to **Phase 1** Fleet shutdown. Standard keys:
 
-- **Debugging**: Test a specific phase without running the entire sequence
-- **Selective operations**: Shut down only certain components
-- **Recovery**: Re-run a failed phase without repeating completed ones
+| Key | VCF 9.1 suite-api type | fleet-lcm direct type | Component |
+| --- | ---------------------- | ---------------------- | --------- |
+| `vra` | VCFA | VCFA | VCF Automation |
+| `vrni` | NI | OPS_NETWORKS | Operations for Networks |
+| `vrops` | OPS | OPS | VCF Operations (vROps) |
+| `vrli` | LI | OPS_LOGS | Operations for Logs |
+| `vrlcm` | FLEET_LCM | VCF_FLEET_LCM | Fleet / LCM |
 
 ```bash
-# Shut down only Fleet Operations (VCF Automation, Networks, etc.)
-python3 Shutdown.py --phase 1
+# Fleet Phase 1: one run shuts down the products you list together
+python3 Shutdown.py --phase 1 --fleet-products vra
+python3 Shutdown.py --phase 1 --fleet-products vrni
+python3 Shutdown.py --phase 1 --fleet-products vra,vrni
+python3 Shutdown.py --phase 1 --fleet-products vrops
+python3 Shutdown.py --phase 1 --fleet-products vrli
+python3 Shutdown.py --phase 1 --fleet-products vrlcm
+python3 Shutdown.py --phase 1 --fleet-products vra,vrni,vrops,vrli,vrlcm
 
-# Preview what Phase 13 (VCF Operations) would do
+# VM phases: connect + shutdown Ops for Networks VMs (Phase 2 auto-inserted before 8)
+python3 Shutdown.py --phases 8
+python3 Shutdown.py --phases 2,8
+
+# Preview Phase 13
 python3 Shutdown.py --phase 13 --dry-run
 
-# Scale down VCF Component Services on VSP
 python3 Shutdown.py --phase 2b
-
-# Shut down only SDDC Manager
 python3 Shutdown.py --phase 16
-
-# Run the vSAN elevator operations
 python3 Shutdown.py --phase 19
-
-# Run the pre-ESXi audit to find straggler VMs
 python3 Shutdown.py --phase 19c
 
-# Not passing --phase runs all phases in order (default behavior)
+# Full lab shutdown (default)
 python3 Shutdown.py
 ```
 
-When `--phase` is specified:
+When **`--phase`** or **`--phases`** is set:
 
-- Only the selected VCF shutdown phase executes
-- Infrastructure connections (Phase 2) are set up automatically if needed
-- Configuration is always read so the selected phase has all required data
-- Docker containers, final cleanup, and host power-off monitoring are skipped
+- Only the listed VCF phases run (plus any auto-inserted prerequisites), then **vSphere sessions are disconnected** inside `VCFshutdown.py` for selective runs.
+- `Shutdown.py` skips Docker (0b), orchestrator cleanup (21), and host ping wait (22).
+- Config is still loaded so each phase has required settings.
 
 ## Configuration
 
