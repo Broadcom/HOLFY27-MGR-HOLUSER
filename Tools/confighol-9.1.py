@@ -4536,7 +4536,7 @@ def configure_vsp_proxy(dry_run: bool = False) -> bool:
 
     PROXY_URL = 'http://10.1.1.1:3128'
     NO_PROXY = (
-        'localhost,127.0.0.1,10.1.1.0/24,10.96.0.0/12,172.16.0.0/12,'
+        'localhost,127.0.0.1,10.0.0.0/8,10.96.0.0/12,172.16.0.0/16,192.168.100.0/24,'
         '198.18.0.0/16,'
         '.site-a.vcf.lab,.svc,.cluster.local,.svc.cluster.local,'
         '10.1.0.0/24,registry.vmsp-platform.svc.cluster.local'
