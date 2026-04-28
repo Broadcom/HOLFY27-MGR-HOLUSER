@@ -614,7 +614,7 @@ CLUSTER_ID=$(curl -sk -H "vmware-api-session-id: ${SESSION}" \
   "https://${WLD_VC}/api/vcenter/namespace-management/clusters" \
   | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['cluster'])")
 
-# Configure proxy (both HTTP and HTTPS in one call)
+# Configure proxy (HTTP, HTTPS, and no-proxy bypass list)
 curl -sk -X PATCH -H "vmware-api-session-id: ${SESSION}" \
   -H "Content-Type: application/json" \
   "https://${WLD_VC}/api/vcenter/namespace-management/clusters/${CLUSTER_ID}" \
@@ -622,7 +622,8 @@ curl -sk -X PATCH -H "vmware-api-session-id: ${SESSION}" \
     "cluster_proxy_config": {
       "proxy_settings_source": "CLUSTER_CONFIGURED",
       "http_proxy_config": "http://10.1.1.1:3128",
-      "https_proxy_config": "http://10.1.1.1:3128"
+      "https_proxy_config": "http://10.1.1.1:3128",
+      "no_proxy_config": ["localhost","127.0.0.1","10.0.0.0/8","10.96.0.0/12","172.16.0.0/16","192.168.100.0/24","192.168.0.0/24","198.18.0.0/16",".site-a.vcf.lab",".site-b.vcf.lab",".vcf.lab",".svc",".cluster.local",".svc.cluster.local","10.1.0.0/24","registry.vmsp-platform.svc.cluster.local"]
     }
   }'
 ```
@@ -634,7 +635,7 @@ VSP nodes are Photon OS 5.0 VMs. Configure proxy at four levels:
 ```bash
 PASSWORD=$(cat /home/holuser/creds.txt)
 PROXY="http://10.1.1.1:3128"
-NO_PROXY="localhost,127.0.0.1,10.1.1.0/24,10.96.0.0/12,172.16.0.0/12,.site-a.vcf.lab,.svc,.cluster.local,.svc.cluster.local,10.1.0.0/24,registry.vmsp-platform.svc.cluster.local"
+NO_PROXY="localhost,127.0.0.1,10.0.0.0/8,10.96.0.0/12,172.16.0.0/16,192.168.100.0/24,192.168.0.0/24,198.18.0.0/16,.site-a.vcf.lab,.site-b.vcf.lab,.vcf.lab,.svc,.cluster.local,.svc.cluster.local,10.1.0.0/24,registry.vmsp-platform.svc.cluster.local"
 
 # Discover VSP node IPs from control plane
 VSP_NODES=$(sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T \
@@ -654,7 +655,8 @@ VSP_NODES=$(sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new -T 
 | Setting | Value |
 | --- | --- |
 | Proxy server | `http://10.1.1.1:3128` (holorouter Squid) |
-| NO_PROXY | `localhost,127.0.0.1,10.1.1.0/24,10.96.0.0/12,172.16.0.0/12,.site-a.vcf.lab,.svc,.cluster.local,.svc.cluster.local,10.1.0.0/24,registry.vmsp-platform.svc.cluster.local` |
+| NO_PROXY | `localhost,127.0.0.1,10.0.0.0/8,10.96.0.0/12,172.16.0.0/16,192.168.100.0/24,192.168.0.0/24,198.18.0.0/16,.site-a.vcf.lab,.site-b.vcf.lab,.vcf.lab,.svc,.cluster.local,.svc.cluster.local,10.1.0.0/24,registry.vmsp-platform.svc.cluster.local` |
+| Supervisor `no_proxy_config` | Same entries as comma-separated `NO_PROXY` (JSON array of strings) |
 | Supervisor source | `CLUSTER_CONFIGURED` (overrides `VC_INHERITED` default) |
 | Automated by | `confighol-9.1.py` v2.9+ (Step 9) |
 
@@ -836,9 +838,9 @@ Items below are unique pitfalls NOT already covered in the detailed sections abo
 23. **Postgres suspension is two-step**: Label `database.vmsp.vmware.com/suspended` AND patch `numberOfInstances`.
 24. **ClickHouse in vodap**: Must scale statefulsets directly; stopping the operator alone doesn't stop pods.
 25. **VSP service CIDR is `198.18.128.0/17`**: Must include `198.18.0.0/16` in NO_PROXY for containerd/kubelet.
-26. **VSP node images are all internal**: From `registry.vmsp-platform.svc.cluster.local:5000`. Containerd resolves to ClusterIP before checking NO_PROXY.
+26. **VSP node images are all internal**: From `registry.vmsp-platform.svc.cluster.local:5000`. Containerd resolves to ClusterIP before checking NO_PROXY. Also include **`.vcf.lab`** (bare names like `auth.vcf.lab`, `vault.vcf.lab`) and **`192.168.0.0/24`** (holorouter 192.168.0.2); set Supervisor **`no_proxy_config`** to the same list as `NO_PROXY`.
 27. **Photon OS 5.0 proxy framework**: Four config points: `/etc/sysconfig/proxy`, `/etc/environment`, containerd drop-in, kubelet drop-in. Run `systemctl daemon-reload` after.
-28. **Supervisor proxy via vCenter API**: `PATCH .../namespace-management/clusters/{id}` with `proxy_settings_source: "CLUSTER_CONFIGURED"`. Both HTTP and HTTPS must be set in one PATCH call.
+28. **Supervisor proxy via vCenter API**: `PATCH .../namespace-management/clusters/{id}` with `proxy_settings_source: "CLUSTER_CONFIGURED"`. Set HTTP, HTTPS, and **`no_proxy_config`** in one PATCH call.
 
 ### VCF Operations
 29. **Internal APIs need header**: `X-vRealizeOps-API-use-unsupported: true`.

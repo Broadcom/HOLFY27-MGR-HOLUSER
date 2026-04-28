@@ -1171,7 +1171,7 @@ The `confighol-9.1.py` proxy configuration step included hostname `registry.vmsp
 
 ```bash
 PASSWORD=$(cat /home/holuser/creds.txt)
-NEW_NO_PROXY="localhost,127.0.0.1,10.1.1.0/24,10.96.0.0/12,172.16.0.0/12,198.18.0.0/16,.site-a.vcf.lab,.svc,.cluster.local,.svc.cluster.local,10.1.0.0/24,registry.vmsp-platform.svc.cluster.local"
+NEW_NO_PROXY="localhost,127.0.0.1,10.0.0.0/8,10.96.0.0/12,172.16.0.0/16,192.168.100.0/24,192.168.0.0/24,198.18.0.0/16,.site-a.vcf.lab,.site-b.vcf.lab,.vcf.lab,.svc,.cluster.local,.svc.cluster.local,10.1.0.0/24,registry.vmsp-platform.svc.cluster.local"
 
 # Get all VSP node IPs
 VSP_NODES=$(sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.142 \
@@ -1212,7 +1212,7 @@ sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-u
   "echo '${PASSWORD}' | sudo -S -i bash /tmp/fix-pods.sh"
 ```
 
-**Permanent Fix**: `/home/holuser/hol/Tools/confighol-9.1.py` Step 9 updated to include `198.18.0.0/16` in the NO_PROXY list for all VSP node proxy configurations.
+**Permanent Fix**: `/home/holuser/hol/Tools/confighol-9.1.py` Step 9 sets a full `NO_PROXY` list (including `198.18.0.0/16`, **`.vcf.lab`**, **`.site-b.vcf.lab`**, **`192.168.0.0/24`**, Supervisor **`no_proxy_config`**, and re-syncs `/etc/environment` proxy lines on each run). Re-run Step 9 after pulling updates.
 
 **Key Details**:
 - The VSP cluster service CIDR `198.18.128.0/17` is unique to VCF 9.1 and not covered by the standard `10.96.0.0/12` that Kubernetes typically uses.
