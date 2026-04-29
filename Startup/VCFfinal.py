@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 4.5 - April 2026
+# Version 4.6 - April 2026
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v4.6 Changes:
+# - Task 8b: Optional Authentik + VCF integration when [VCFFINAL] authentik_vcf_integration=true
+#   (runs Tools/authentik_vcf_integration.py after Vault CA distribution).
 #
 # v4.5 Changes:
 # - Now properly handles supervisor checking across management domains, 
@@ -3005,6 +3009,33 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_output('WARNING: Invalid Vault CA certificate received.')
     except Exception as e:
         lsf.write_output(f'WARNING: Failed to fetch Vault CA: {e}')
+
+    #==========================================================================
+    # TASK 8b: Authentik + VCF integration (optional, [VCFFINAL] config-gated)
+    #==========================================================================
+    try:
+        if lsf.config.has_option('VCFFINAL', 'authentik_vcf_integration'):
+            raw = lsf.config.get('VCFFINAL', 'authentik_vcf_integration', fallback='').strip().lower()
+            if raw in ('1', 'true', 'yes', 'on'):
+                import importlib.util
+                ak_path = '/home/holuser/hol/Tools/authentik_vcf_integration.py'
+                if os.path.isfile(ak_path):
+                    spec = importlib.util.spec_from_file_location(
+                        'authentik_vcf_integration', ak_path)
+                    akmod = importlib.util.module_from_spec(spec)
+                    assert spec.loader is not None
+                    spec.loader.exec_module(akmod)
+                    lsf.write_output('Running Authentik + VCF integration (authentik_vcf_integration)...')
+                    ok_ak = akmod.run_authentik_vcf_integration(
+                        lsf, dry_run=dry_run, config_path='/tmp/config.ini')
+                    if not ok_ak:
+                        lsf.write_output(
+                            'WARNING: authentik_vcf_integration completed with errors (see messages above).')
+                else:
+                    lsf.write_output(
+                        f'WARNING: {ak_path} not found — skipping authentik_vcf_integration')
+    except Exception as e:
+        lsf.write_output(f'WARNING: authentik_vcf_integration failed: {e}')
 
     #==========================================================================
     # Cleanup

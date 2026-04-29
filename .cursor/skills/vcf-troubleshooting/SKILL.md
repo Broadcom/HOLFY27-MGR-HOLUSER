@@ -1,6 +1,6 @@
 ---
 name: vcf-troubleshooting
-description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, and holorouter auth.vcf.lab / vault.vcf.lab TLS expiry. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, or auth.vcf.lab certificate expired.
+description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, and Fleet SSO Overview get-started empty despite prerequisites. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, or SSO prerequisites checkboxes.
 ---
 
 # VCF 9.x Troubleshooting Guide
@@ -49,6 +49,9 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | NSX Compute Manager DOWN after vCenter cert replacement | `connection_status: DOWN`, `REGISTERED_WITH_ERRORS`, error 7059/MP2179 | `dir-cli trustedcert publish` double-cert in TRUSTED_ROOTS; NSX rejects multi-cert PEM | 31 |
 | auth.vcf.lab / vault.vcf.lab untrusted or Firefox very slow | TLS error despite `vcf.lab Root Authority` in Firefox; `openssl verify` shows expired leaf | nginx `/root/nginx-certs/*.crt` leaf certs expired (~30d TTL); root CA still valid | 38 |
 | Firefox takes minutes to open on LMC | `user.js` had `network.proxy.type` 2 with `10.0.0.1:3128`; large `suggest.sqlite` | Invalid PAC + dead proxy stalls startup; huge urlbar DB adds local SQLite I/O (profile is local disk on console) | 39 |
+| vCenter OIDC IdP registration fails (526/503, parse errors) | `POST /api/vcenter/identity/providers` returns 400; message mentions `external-vecs` or `parsePropertyException` | Discovery URL fetch via vCenter trust proxy — TLS to IdP not trusted, or invalid `claim_map` shape | 40 |
+| vCenter / VCF Operations still show only local login after Authentik script | No “SSO” or corporate IdP button; only `administrator@…` / `admin` + password | Legacy `authentik_skip_fleet_iam` path skips Fleet IAM enrollment; or Fleet IAM / SCIM / Join SSO failed — see §41 | 41 |
+| VCF SSO Overview get-started empty after Prerequisites | All five prerequisite boxes submitted; UI still shows nothing configured | Prerequisites alone do not open the wizard — must click **Configure SSO**; **`idpId`** null until Fleet IAM `POST .../identity-providers` or IdP wizard completes (cert chain shape, discovery 404, etc.) — see §42 | 42 |
 
 ---
 
@@ -1171,7 +1174,7 @@ The `confighol-9.1.py` proxy configuration step included hostname `registry.vmsp
 
 ```bash
 PASSWORD=$(cat /home/holuser/creds.txt)
-NEW_NO_PROXY="localhost,127.0.0.1,10.0.0.0/8,10.96.0.0/12,172.16.0.0/16,192.168.100.0/24,192.168.0.0/24,198.18.0.0/16,.site-a.vcf.lab,.site-b.vcf.lab,.vcf.lab,.svc,.cluster.local,.svc.cluster.local,10.1.0.0/24,registry.vmsp-platform.svc.cluster.local"
+NEW_NO_PROXY="localhost,127.0.0.1,10.1.1.0/24,10.96.0.0/12,172.16.0.0/12,198.18.0.0/16,.site-a.vcf.lab,.svc,.cluster.local,.svc.cluster.local,10.1.0.0/24,registry.vmsp-platform.svc.cluster.local"
 
 # Get all VSP node IPs
 VSP_NODES=$(sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-user@10.1.1.142 \
@@ -1212,7 +1215,7 @@ sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=accept-new vmware-system-u
   "echo '${PASSWORD}' | sudo -S -i bash /tmp/fix-pods.sh"
 ```
 
-**Permanent Fix**: `/home/holuser/hol/Tools/confighol-9.1.py` Step 9 sets a full `NO_PROXY` list (including `198.18.0.0/16`, **`.vcf.lab`**, **`.site-b.vcf.lab`**, **`192.168.0.0/24`**, Supervisor **`no_proxy_config`**, and re-syncs `/etc/environment` proxy lines on each run). Re-run Step 9 after pulling updates.
+**Permanent Fix**: `/home/holuser/hol/Tools/confighol-9.1.py` Step 9 updated to include `198.18.0.0/16` in the NO_PROXY list for all VSP node proxy configurations.
 
 **Key Details**:
 - The VSP cluster service CIDR `198.18.128.0/17` is unique to VCF 9.1 and not covered by the standard `10.96.0.0/12` that Kubernetes typically uses.
@@ -1707,3 +1710,92 @@ If `user.js` shows **`network.proxy.type` = 2** (automatic / PAC) together with 
 **Key Details**:
 - Do not use PAC (`type` 2) unless `network.proxy.autoconfig_url` is set; orphan `http_*` prefs under PAC mode stall startup.
 - First launch after deleting `suggest.sqlite` can be slow while the DB rebuilds; thereafter startup often improves if the database had grown too large earlier.
+
+## 40. vCenter OIDC / Authentik Discovery Failures (Identity Provider Federation)
+
+**Symptom**: `POST https://<mgmt-vc>/api/vcenter/identity/providers` fails with HTTP 400. JSON `messages` may include `InvalidArgumentException` / `IOException` and a URL containing **`localhost:1080/external-vecs/http1/<idp-host>/443/.well-known/openid-configuration`**, or HTTP status codes like **526** / **503** for that internal fetch.
+
+**Diagnosis**:
+
+```bash
+# From management workstation — does discovery work directly?
+curl -sk "https://auth.vcf.lab/application/o/vcf/.well-known/openid-configuration" | head
+
+# vCenter session
+VC=vc-mgmt-a.site-a.vcf.lab
+SID=$(curl -sk -X POST "https://${VC}/api/session" \
+  -u "administrator@vsphere.local:$(cat /home/holuser/creds.txt)" | tr -d '"')
+
+# Minimal OIDC body uses empty claim_map (see vcf-9-api §4 Identity provider federation)
+curl -sk -X POST "https://${VC}/api/vcenter/identity/providers" \
+  -H "vmware-api-session-id: $SID" -H "Content-Type: application/json" \
+  -d '{"config_tag":"Oidc","oidc":{"claim_map":{},"client_id":"x","client_secret":"y","discovery_endpoint":"https://auth.vcf.lab/application/o/vcf/.well-known/openid-configuration"}}'
+```
+
+**Root Cause**: vCenter **trustmanagement** fetches the OIDC discovery document through an **internal forwarder**. If the IdP certificate chain is not trusted in vCenter’s trust store, or TLS is intercepted/broken, the fetch fails. Separately, **`claim_map` values that are plain strings** (instead of the expected list structure or empty `{}`) cause **`parsePropertyException` / “Unable to parse property with name spec”**.
+
+**Fix**:
+
+1. Ensure **IdP TLS is trusted** the same way as the manual VCF SSO wizard: import the PEM CA that signs `auth.vcf.lab` (e.g. from `https://ca.vcf.lab` or Vault PKI distribution via `confighol-9.1.py` Step 0b). Retry `POST /api/vcenter/identity/providers`.
+2. Use **`"claim_map": {}`** in the OIDC spec unless you implement full map-entry lists per vSphere API schema.
+3. For **Authentik + SCIM automation**, see `vcf-9-api` **Section 16** and `Tools/authentik_vcf_integration.py`.
+
+**Key Details**:
+- Slow or unreachable `discovery_endpoint` hosts can make validation **hang** for minutes (vCenter server-side fetch); use a real IdP URL and reasonable timeouts when probing.
+- **VIDB** auth source creation in VCF Operations (`POST /suite-api/api/auth/sources`) can return **HTTP 500** `VCF SSO authentication source test failed` until the OAuth client and issuer URL are correct and reachable — see vcf-9-api §2 VIDB subsection.
+
+## 41. vCenter and VCF Operations Still Show “Local” Login After Authentik / OIDC API Steps
+
+**Symptom**: Visiting `https://vc-mgmt-a.site-a.vcf.lab` or `https://ops-a.site-a.vcf.lab` shows the usual **username + password** form (e.g. `administrator@vsphere.local` or `admin`). There is no obvious **SSO**, **Corporate login**, or **Redirect to Authentik** control.
+
+**Root Cause**: With **`authentik_skip_fleet_iam=true`** (legacy path), the script only registers **vCenter OIDC** and optional **VIDB** — it does not complete **Fleet IAM** enrollment (**SSO realm**, **OIDC+SCIM IdP**, **SCIM token**, **role assignment**, **Join SSO**). With the **default Fleet IAM path** (`Tools/authentik_vcf_integration.py` + `Tools/authentik_fleet_iam.py`), those steps are API-driven; if login is still local-only, the Fleet IAM calls failed partially, **SCIM groups never arrived** (check Authentik SCIM sync / worker), or the UI still defaults to local until you pick the federated domain / source.
+
+**Fix**:
+
+1. Re-run **`Tools/authentik_vcf_integration.py`** with `[VCFFINAL] authentik_vcf_integration=true` and **without** `authentik_skip_fleet_iam` (default). Inspect logs for `Fleet IAM:` lines (HTTP errors, missing groups after SCIM wait).
+2. If you must use the legacy path, set `authentik_skip_fleet_iam=true` and complete **VCF SSO Overview** manually through **Finish**, SCIM, **Assign VCF Roles**, **Join SSO** per `HOL_Authentik_Config_Cycle_7.md`.
+3. Confirm **Authentik** OAuth redirect URI and issuer (`https://auth.vcf.lab/application/o/vcf/.well-known/openid-configuration` and callback under `/federation/t/CUSTOMER/...`).
+4. On **vCenter** SSO configuration, confirm the external OIDC provider / identity broker state matches the Fleet wizard outcome.
+
+**Key Details**:
+- **“Integration script ran”** vs **“federated login works”**: verify SCIM-provisioned groups (`prod-admins`, `dev-admins`) appear under the SSO realm and that users use the **vcf.lab** (or configured) domain / UPN expected by the broker.
+- **VCF Operations** may still offer **local** as one option after federation; test `prod-admin@vcf.lab` / `dev-admin@vcf.lab` against the federated path per lab docs.
+
+## 42. VCF SSO Overview “Get started” Empty After Prerequisites (No IdP)
+
+**Symptom**: Under **Fleet → Identity and access → VCF SSO → Get started**, nothing appears configured. You open **Prerequisites**, check all five boxes, click **Submit**, and the overview still shows no SSO / IdP progress — often because **Configure SSO** was never clicked.
+
+**Diagnosis**:
+
+```bash
+PASS=$(cat /home/holuser/creds.txt)
+TOK=$(curl -sk -X POST "https://ops-a.site-a.vcf.lab/suite-api/api/auth/token/acquire" \
+  -H "Content-Type: application/json" -H "Accept: application/json" \
+  -H "X-vRealizeOps-API-use-unsupported: true" \
+  -d "{\"username\":\"admin\",\"password\":\"${PASS}\",\"authSource\":\"local\"}" | jq -r .token)
+curl -sk "https://ops-a.site-a.vcf.lab/suite-api/api/fleet-management/iam/ssorealms" \
+  -H "Authorization: OpsToken ${TOK}" -H "Accept: application/json" \
+  -H "X-vRealizeOps-API-use-unsupported: true" | jq .
+```
+
+Expect a realm row with a non-null **`idpId`** once Fleet IAM has created the OIDC+SCIM provider. If **`idpId` is missing** and **`totalConfiguredComponents`** is **0**, the UI will match what you see regardless of Prerequisites.
+
+**Root Cause**: The **Prerequisites** step only acknowledges documentation; it does **not** open the **Configure VCF SSO** wizard (`…/sso-overview/initial-setup`). On **Get Started with SSO**, click **Configure SSO** (see `HOL_Authentik_Config_Cycle_7.md` Step 3). Separately, **`idpId`** stays null until `POST .../identity-providers` succeeds (Fleet IAM script) or you finish the IdP wizard. Common API failures:
+
+1. **`certificateChain` sent as one JSON string per PEM line** — VIDB treats each array element as a separate certificate chain and returns **`idp.pem.certificate.chains.max.exceeded`**. Fixed in `Tools/authentik_fleet_iam.py` (array of full PEM strings).
+2. **Authentik OAuth application not created** (e.g. integration not run) — discovery URL `https://auth.vcf.lab/application/o/vcf/.well-known/openid-configuration` returns **404** until the `vcf` app (or configured slug) exists.
+3. **VCF Operations cannot reach the discovery URL** from the ops appliance (DNS/proxy) — `POST .../identity-providers` fails with OIDC validation errors.
+
+**Fix**:
+
+0. In the UI: **Prerequisites** → **Submit**, then **Get Started with SSO** → **Configure SSO** to open the wizard (or rely on `vcf_sso_ui_prereqs.py` when `authentik_sso_ui_prerequisites=true`).
+1. Re-run **`Tools/authentik_vcf_integration.py`** with `[VCFFINAL] authentik_vcf_integration=true` (default Fleet IAM path, not `authentik_skip_fleet_iam`). Watch logs for **`Fleet IAM: Identity provider configured`** and errors from **`configureIDP`**.
+2. From **ops-a**, verify discovery returns **JSON**:  
+   `curl -sk "https://auth.vcf.lab/application/o/vcf/.well-known/openid-configuration" | head`  
+   If you see **404**, create the Authentik OAuth2 app (script Step Authentik) or fix `authentik_application_slug`.
+3. Re-check **`GET .../ssorealms`** for **`idpId`**; then refresh the SSO Overview UI.
+
+**Key Details**:
+
+- **`log_fleet_sso_realm_summary`** (called at end of the integration script’s Fleet IAM path) prints realm **`idpId`** / **`totalConfiguredComponents`** for quick API-vs-UI comparison.
+- Optional **`authentik_sso_ui_prerequisites=true`** runs `Tools/vcf_sso_ui_prereqs.py`: Prerequisites → Submit → **Configure SSO** (wizard entry). It does not replace Fleet IAM API calls in `authentik_fleet_iam.py`.
