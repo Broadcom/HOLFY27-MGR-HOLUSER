@@ -65,8 +65,8 @@ class LabTypeLoader:
         'VXP': {
             'name': 'VCF Experience Program',
             'description': 'Demo environments for VCF Experience',
-            'firewall': True,
-            'proxy_filter': True,
+            'firewall': False,
+            'proxy_filter': False,
             'repo_pattern': 'standard'
         },
         'ATE': {
@@ -79,8 +79,8 @@ class LabTypeLoader:
         'EDU': {
             'name': 'Education',
             'description': 'Training environments',
-            'firewall': True,
-            'proxy_filter': True,
+            'firewall': False,
+            'proxy_filter': False,
             'repo_pattern': 'standard'
         }
     }
