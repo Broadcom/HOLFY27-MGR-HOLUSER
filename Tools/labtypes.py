@@ -1,5 +1,5 @@
 # labtypes.py - HOLFY27 LabType Execution Path Manager
-# Version 1.0 - 2026-04-27
+# Version 1.0 - 2026-04-28
 # Author - Burke Azbill and HOL Core Team
 # Manages different startup sequences for HOL, Discovery, VXP, ATE, EDU lab types
 
@@ -72,7 +72,7 @@ class LabTypeLoader:
         'ATE': {
             'name': 'Advanced Technical Enablement',
             'description': 'Advanced instructor-led Livefire labs',
-            'firewall': True,
+            'firewall': False,
             'proxy_filter': False,
             'repo_pattern': 'standard'
         },

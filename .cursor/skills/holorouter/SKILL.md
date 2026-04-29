@@ -229,6 +229,8 @@ curl -sf -X POST "${API}/core/users/" \
   -d '{"username":"newuser","email":"new@vcf.lab","name":"New User","is_active":true}'
 ```
 
+**VCF lab integration (OIDC / SCIM)**: Programmatic OAuth2 application, SCIM provider, vCenter `POST /api/vcenter/identity/providers`, and VCF Operations VIDB auth source — see **`vcf-9-api` skill Section 16** and repo file `Tools/authentik_vcf_integration.py`. When calling the API from Python, base URL should be `https://auth.vcf.lab/api/v3` with paths like `flows/instances/` (do not double-prefix `/api/v3`).
+
 ### FRR-K8s (namespace: `default`)
 
 | Item | Detail |

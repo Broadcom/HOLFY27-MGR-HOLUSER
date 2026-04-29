@@ -63,7 +63,7 @@ def _hol_block(proxy_host: str, proxy_port: int) -> str:
         'user_pref("network.proxy.share_proxy_settings", true);',
         # Internal lab traffic should bypass Squid (DNS, vCenter, Vault NodePort, etc.)
         'user_pref("network.proxy.no_proxies_on", "localhost, 127.0.0.1, 10.1.1.1, '
-        '*.vcf.lab, *.site-a.vcf.lab, *.site-b.vcf.lab");',
+        '192.168.0.2, *.vcf.lab, *.site-a.vcf.lab, *.site-b.vcf.lab");',
         # Urlbar / disk: reduce SQLite churn (large suggest.sqlite) and speculative work
         'user_pref("browser.urlbar.quicksuggest.enabled", false);',
         'user_pref("browser.urlbar.suggest.quicksuggest.sponsored", false);',
