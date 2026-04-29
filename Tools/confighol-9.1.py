@@ -68,7 +68,9 @@
 #     internet access through holorouter Squid proxy (10.1.1.1:3128).
 #     Dynamically discovers VSP node IPs via kubectl, configures
 #     /etc/sysconfig/proxy, /etc/environment, containerd and kubelet
-#     systemd drop-in files with appropriate NO_PROXY list.
+#     systemd drop-in files with appropriate NO_PROXY list (.vcf.lab, site zones,
+#     192.168.0.0/24, internal CIDRs). Supervisor PATCH includes no_proxy_config;
+#     /etc/environment proxy lines are re-synced each run (not append-once).
 # v2.8 - 2026-03-03:
 #   - Fully non-interactive: removed all input() prompts for vCenter shell/
 #     browser configuration, NSX Manager configuration, NSX SSH enablement
@@ -208,7 +210,9 @@
 #      /etc/sysconfig/proxy, /etc/environment, containerd and kubelet
 #      systemd drop-in files for HTTP_PROXY/HTTPS_PROXY/NO_PROXY
 #    - Proxy: holorouter Squid at http://10.1.1.1:3128
-#    - NO_PROXY includes internal subnets, service CIDRs, internal registry
+#    - NO_PROXY includes internal subnets, service CIDRs, internal registry,
+#      .vcf.lab and .site-a/.site-b zones, 192.168.0.0/24; Supervisor API
+#      receives no_proxy_config array; /etc/environment proxy lines refreshed each run
 #
 # 8. Final Steps:
 #    - Clear ARP cache on console and router
@@ -4528,19 +4532,31 @@ def configure_vsp_proxy(dry_run: bool = False) -> bool:
     3. VSP node containerd systemd drop-in for image pulls
     4. VSP node kubelet systemd drop-in for API server communication
 
-    The no_proxy list includes all internal subnets, service CIDRs, the
-    internal container registry, and the .site-a.vcf.lab domain.
+    The no_proxy list includes internal subnets, service CIDRs, the internal
+    registry, holorouter IPs (e.g. 192.168.0.0/24, 10.0.0.0/8), and all lab DNS
+    under .vcf.lab plus .site-a/.site-b site zones.
     """
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     PROXY_URL = 'http://10.1.1.1:3128'
-    NO_PROXY = (
-        'localhost,127.0.0.1,10.0.0.0/8,10.96.0.0/12,172.16.0.0/16,192.168.100.0/24,'
-        '198.18.0.0/16,'
-        '.site-a.vcf.lab,.svc,.cluster.local,.svc.cluster.local,'
-        '10.1.0.0/24,registry.vmsp-platform.svc.cluster.local'
-    )
+    NO_PROXY_PARTS = [
+        'localhost',
+        '127.0.0.1',
+        '10.0.0.0/8',
+        '10.96.0.0/12',
+        '172.16.0.0/16',
+        '192.168.0.0/16',
+        '198.18.0.0/16',
+        '.site-a.vcf.lab',
+        '.site-b.vcf.lab',
+        '.vcf.lab',
+        '.svc',
+        '.cluster.local',
+        '.svc.cluster.local',
+        'registry.vmsp-platform.svc.cluster.local',
+    ]
+    NO_PROXY = ','.join(NO_PROXY_PARTS)
     VSP_SSH_USER = 'vmware-system-user'
 
     lsf.write_output('')
@@ -4576,6 +4592,7 @@ def configure_vsp_proxy(dry_run: bool = False) -> bool:
         lsf.write_output(f'Would configure Supervisor proxy on {wld_vcenter}')
         lsf.write_output(f'  HTTP proxy:  {PROXY_URL}')
         lsf.write_output(f'  HTTPS proxy: {PROXY_URL}')
+        lsf.write_output(f'  no_proxy_config: {len(NO_PROXY_PARTS)} entries (.vcf.lab, site zones, internal CIDRs)')
     else:
         if not lsf.test_ping(wld_vcenter):
             lsf.write_output(f'{wld_vcenter}: Not reachable - skipping Supervisor proxy')
@@ -4616,6 +4633,7 @@ def configure_vsp_proxy(dry_run: bool = False) -> bool:
                                 'proxy_settings_source': 'CLUSTER_CONFIGURED',
                                 'http_proxy_config': PROXY_URL,
                                 'https_proxy_config': PROXY_URL,
+                                'no_proxy_config': NO_PROXY_PARTS,
                             }
                         }
                         patch_resp = requests.patch(
@@ -4697,8 +4715,10 @@ SOCKS5_SERVER=""
 NO_PROXY="{NO_PROXY}"
 PROXYEOF
 
-if ! grep -q 'http_proxy=' /etc/environment 2>/dev/null; then
-    cat >> /etc/environment << 'ENVEOF'
+# Replace lab proxy lines on every run (was append-only; stale no_proxy never updated)
+touch /etc/environment
+sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment
+cat >> /etc/environment << 'ENVEOF'
 http_proxy={PROXY_URL}
 https_proxy={PROXY_URL}
 no_proxy={NO_PROXY}
@@ -4706,7 +4726,6 @@ HTTP_PROXY={PROXY_URL}
 HTTPS_PROXY={PROXY_URL}
 NO_PROXY={NO_PROXY}
 ENVEOF
-fi
 
 mkdir -p /etc/systemd/system/containerd.service.d
 cat > /etc/systemd/system/containerd.service.d/http-proxy.conf << 'CTDEOF'

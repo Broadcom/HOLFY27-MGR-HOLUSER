@@ -1,6 +1,6 @@
 ---
 name: vcf-9-api
-description: Guide API interactions with VMware Cloud Foundation (VCF) 9.0 and 9.1 environments running on Holodeck nested virtualization. Provides correct endpoints, credentials, authentication flows, SSH access, dir-cli SSO management, CSI secret structure, SDDC Manager auto-rotate API, credential remediation, resource lock management, PostgreSQL direct access, and version-specific differences for SDDC Manager, VCF Operations (Aria), NSX Manager, NSX Edges, vCenter, VCF Automation, and Supervisor clusters. Use when the user mentions VCF, SDDC Manager, Aria Operations, NSX, vCenter API, VCF Automation, Supervisor, Tanzu, password policies, fleet management, CSI driver, dir-cli, service accounts, auto-rotate, credential remediation, password reset, resource locks, or any VMware Cloud Foundation operations.
+description: Guide API interactions with VMware Cloud Foundation (VCF) 9.0 and 9.1 environments running on Holodeck nested virtualization. Provides correct endpoints, credentials, authentication flows, SSH access, dir-cli SSO management, CSI secret structure, SDDC Manager auto-rotate API, credential remediation, resource lock management, PostgreSQL direct access, Authentik REST API (OAuth2/SCIM), vCenter OIDC identity provider federation, VCF Operations VIDB auth source, and version-specific differences for SDDC Manager, VCF Operations (Aria), NSX Manager, NSX Edges, vCenter, VCF Automation, and Supervisor clusters. Use when the user mentions VCF, SDDC Manager, Aria Operations, NSX, vCenter API, VCF Automation, Supervisor, Tanzu, password policies, fleet management, CSI driver, dir-cli, service accounts, auto-rotate, credential remediation, password reset, resource locks, Authentik, OIDC, SCIM, VCF SSO, or any VMware Cloud Foundation operations.
 ---
 
 # VCF 9.x API Interaction Guide
@@ -123,6 +123,39 @@ requests.post(
 | `/vcf-operations/rest/ops/internal/*` | Requires browser CSRF/Session — not proxied through suite-api |
 | `/suite-api/api/fleet-management/*` | Returns 401 — auth mechanism differs from OpsToken |
 
+### VIDB auth source (external OIDC for VCF Operations UI)
+
+Register an OpenID Connect IdP so Operations users can authenticate via the same issuer used for VCF SSO (e.g. Authentik). Uses **public** `suite-api` (OpsToken), not the internal `vcf-operations/rest/ops/internal/*` browser session.
+
+```python
+import requests
+import urllib3
+urllib3.disable_warnings()
+OPS, PASSWORD = "ops-a.site-a.vcf.lab", open("/home/holuser/creds.txt").read().strip()
+token = requests.post(
+    f"https://{OPS}/suite-api/api/auth/token/acquire",
+    json={"username": "admin", "password": PASSWORD, "authSource": "local"},
+    headers={"X-vRealizeOps-API-use-unsupported": "true"}, verify=False,
+).json()["token"]
+headers = {"Authorization": f"OpsToken {token}", "X-vRealizeOps-API-use-unsupported": "true",
+           "Content-Type": "application/json", "Accept": "application/json"}
+payload = {
+    "name": "VCF-Auth-authentik",
+    "sourceType": {"id": "VIDB", "name": "VIDB"},
+    "property": [
+        {"name": "display-name", "value": "VCF Auth"},
+        {"name": "issuer-url", "value": "https://auth.vcf.lab/application/o/vcf/"},
+        {"name": "client-id", "value": "<from IdP>"},
+        {"name": "client-secret", "value": "<from IdP>"},
+    ],
+    "certificates": [],
+}
+r = requests.post(f"https://{OPS}/suite-api/api/auth/sources", json=payload, headers=headers, verify=False)
+# HTTP 500 with "VCF SSO authentication source test failed" if issuer unreachable or client invalid
+```
+
+**Auth source type metadata**: `GET /suite-api/api/auth/sourcetypes/VIDB` returns allowed property names (`issuer-url` + `client-id` + `client-secret` mode, or legacy `host`/`port`/`tenant`/`user-name`/`password`).
+
 ## 3. NSX Manager API
 
 **Critical**: User management requires **numeric IDs**, not usernames.
@@ -205,6 +238,48 @@ ssh root@${VC} "vmon-cli --start trustmanagement"
 - `administrator@vsphere.local` is an **SSO user**, not a local account. `/rest/appliance/local-accounts/administrator` returns 404.
 - Workload vCenter uses SSO domain `wld.sso`, not `vsphere.local`.
 - `vapi-endpoint` and `trustmanagement` services frequently fail to autostart on boot — always verify and start them.
+
+### Identity provider federation (OIDC on management vCenter)
+
+Embedded **VCF Identity Broker** / federation uses the vSphere Automation API. **Create** an external OIDC provider:
+
+- `POST https://{vc}/api/vcenter/identity/providers`
+- Body shape: `{"config_tag": "Oidc", "oidc": { ... }}`
+- Required OIDC fields: `client_id`, `client_secret`, `discovery_endpoint` (full URL to `/.well-known/openid-configuration` — **not** a separate `issuer_url` key on this API version).
+- **`claim_map`**: must be a **JSON object** (Map). Use `{}` for defaults (Cycle 7 wizard “unique identifier `sub`”). Plain string values per claim (e.g. `{"sub": "sub"}`) produce **`parsePropertyException` / “Unable to parse property with name spec”** — values must be list-structured map-entries, not strings; simplest automation path is **`"claim_map": {}`**.
+- vCenter fetches the discovery document through an **internal HTTP proxy** (`InvalidArgumentException` mentioning `localhost:1080/external-vecs/...`). If the IdP TLS chain is not trusted, errors appear as **HTTP 526**, **503**, etc. on that fetch — align with manual workflow: trust the CA that signs the IdP (e.g. `auth.vcf.lab` via `https://ca.vcf.lab` or Vault PKI distribution).
+
+**Redirect URI** (Holodeck / embedded tenant): `https://vc-mgmt-a.site-a.vcf.lab/federation/t/CUSTOMER/auth/response/oauth2` — `CUSTOMER` is the literal path segment, not a variable.
+
+**SCIM base URL** for Authentik (and manual sync): `https://vc-mgmt-a.site-a.vcf.lab/usergroup/t/CUSTOMER/scim/v2`
+
+```python
+import requests
+VC, PASSWORD = "vc-mgmt-a.site-a.vcf.lab", open("/home/holuser/creds.txt").read().strip()
+sid = requests.post(f"https://{VC}/api/session", auth=("administrator@vsphere.local", PASSWORD), verify=False)
+sid.raise_for_status()
+session_id = sid.text.strip('"')
+headers = {"vmware-api-session-id": session_id, "Content-Type": "application/json"}
+body = {
+    "config_tag": "Oidc",
+    "oidc": {
+        "claim_map": {},
+        "client_id": "<oauth_client_id>",
+        "client_secret": "<oauth_client_secret>",
+        "discovery_endpoint": "https://auth.vcf.lab/application/o/vcf/.well-known/openid-configuration",
+    },
+}
+r = requests.post(f"https://{VC}/api/vcenter/identity/providers", json=body, headers=headers, verify=False)
+# Expect HTTP 200 or 201 on success
+```
+
+### VAMI no-proxy (Fleet IAM / VIDB outbound OIDC)
+
+When the management vCenter has a **global HTTP(S) proxy** (Squid), **embedded VIDB** fetches the OIDC discovery URL through that proxy. Hostnames like **`auth.vcf.lab`** must be in the **VAMI** no-proxy list or Squid returns **403** and Fleet IAM `configureIDP` fails with “Failed to connect”.
+
+- **Authoritative API** (not only `/etc/sysconfig/proxy`): `GET` / `PUT` `https://<vc-fqdn>:5480/rest/appliance/networking/noproxy` with Basic **`root:<creds.txt>`** and JSON body **`{"servers":["localhost",...,"auth.vcf.lab",".vcf.lab","192.168.0.2"]}`** on `PUT`.
+- **vmware-vmon** injects `NO_PROXY` into **vsphere-ui** at service start. After changing VAMI no-proxy, run **`systemctl restart vmware-vmon`** on the vCSA (brief UI disruption) so the JVM picks up the new bypass list. Restarting **only** `vsphere-ui` may leave stale env if vmon was not restarted.
+- **`Tools/authentik_vcf_integration.py`** merges issuer / `.vcf.lab` / holorouter IP via VAMI and optionally restarts vmware-vmon (disable with `authentik_skip_mgmt_vc_vmon_restart=true` in `[VCFFINAL]`).
 
 ## 5. VCF Automation (Aria Automation)
 
@@ -799,6 +874,50 @@ resp = session.put(
 | vsp-01a.site-a.vcf.lab | VMSP_PLATFORM | f054476f-d26e-3279-b46c-4dfcc1f0f12e |
 | opsnet-a (10.1.1.60) | ARIA_NETWORK | 29cfd82e-dec4-30f1-83a2-2c68ab59dac5 |
 
+## 16. Authentik REST API + VCF SSO automation (Holodeck)
+
+**Human-readable lab procedure**: `HOL_Authentik_Config_Cycle_7.md` (CoreDNS, Authentik UI, VCF Operations wizard, SCIM, roles).
+
+**Automated helper**: `Tools/authentik_vcf_integration.py` (+ `Tools/authentik_fleet_iam.py`) — gated by `[VCFFINAL] authentik_vcf_integration=true`; invoked from `Startup/VCFfinal.py` Task 8b after Vault CA distribution. Reads `/tmp/config.ini`.
+
+**Default (full E2E)**: OpsToken + **Fleet IAM** public suite-api — `GET/POST .../api/fleet-management/iam/vidbs`, `.../ssorealms`, `POST .../identity-providers` (OIDC + **SCIM** + **TLS chain for the IdP host** as a JSON array of **full PEM strings**, not one string per line — see pitfalls §68), `POST .../identity-providers/{id}/directories/{dir}/sync-client` with `{"generateToken":true}` to mint the **SCIM bearer token**; then Authentik SCIM provider, `POST .../providers/scim/{pk}/sync/` (best-effort), `PUT .../ssorealms/{realm}/principals/{groupId}/roles` (`vcf_administrator` + `SSO_REALM` scope), and `POST .../components/auth-sources` (Join SSO for vCenter + VCF Operations + VCF Automation). Authentik users/groups: defaults `prod-admin@vcf.lab` / `dev-admin@vcf.lab` and `prod-admins` / `dev-admins`.
+
+**Legacy** (`authentik_skip_fleet_iam=true`): vCenter `POST /api/vcenter/identity/providers`, VIDB `POST /suite-api/api/auth/sources`, optional `[VCFFINAL] vcf_scim_bearer_token` for Authentik SCIM only.
+
+Optional keys: `authentik_mgmt_vc_fqdn`, `authentik_ops_fqdn`, `authentik_issuer_base`, `authentik_application_slug`, `authentik_directory_users`, `authentik_scim_group_names`, `authentik_scim_domain`, `authentik_fleet_idp_name`, `authentik_fleet_directory_name`, `authentik_fleet_vcf_role`, `authentik_fleet_join_nsx`, `authentik_skip_fleet_iam`, `vcf_scim_bearer_token` (legacy), `authentik_skip_coredns`, `authentik_skip_vcenter`, `authentik_skip_ops_vidb`, `authentik_api_token`, `authentik_signing_key_pk`.
+
+### Authentik API base URL and auth
+
+| Item | Value |
+| --- | --- |
+| Base | `https://auth.vcf.lab/api/v3` (or `http://192.168.0.2:31080/api/v3` from holorouter) |
+| Header | `Authorization: Bearer <token>` |
+| Default bootstrap token | `holodeck` (override with env `AUTHENTIK_API_TOKEN` or `[VCFFINAL] authentik_api_token`) |
+
+**Path construction**: the HTTP client base URL must end with `/api/v3`. API paths are **relative** (`flows/instances/...`, `providers/oauth2/`, `core/applications/`). Do **not** prefix paths with `/api/v3` again or requests hit `/api/v3/api/v3/...` (**404**).
+
+### OAuth2/OpenID provider + application (explicit consent)
+
+1. Resolve flow PKs: `GET .../flows/instances/?slug=default-provider-authorization-explicit-consent` and `...slug=default-provider-invalidation-flow`.
+2. Resolve signing key: `GET .../crypto/certificatekeypairs/` (first result, or set `authentik_signing_key_pk`).
+3. `POST .../providers/oauth2/` with `authorization_flow`, `invalidation_flow`, `client_type: confidential`, `redirect_uris` as a **list of objects** `[{"url": "<vc callback>", "matching_mode": "strict"}]`, `signing_key`, `issuer_mode` (e.g. `per_provider`), `sub_mode`, `include_claims_in_id_token`.
+4. `POST .../core/applications/` with `name`, `slug` (e.g. `vcf`), `provider` set to the OAuth2 provider **integer pk**.
+5. **Reuse**: `GET .../providers/oauth2/{pk}/` returns `client_id` and `client_secret` (admin API) for idempotent vCenter/VIDB registration.
+
+### SCIM provider + backchannel (Authentik → vCenter)
+
+**Automated (default)**: After Fleet IAM configures the OIDC+SCIM IdP, `POST .../identity-providers/{idpConfigId}/directories/{directoryId}/sync-client` with `{"tokenTtl":262800,"generateToken":true}` returns `accessTokenDetails.accessToken` — use that as the Authentik SCIM provider `token` (`verify_certificates: false` for lab). See `Tools/authentik_fleet_iam.py`.
+
+**Manual / legacy**: Optional `[VCFFINAL] vcf_scim_bearer_token` when `authentik_skip_fleet_iam=true` (wizard popup token).
+
+1. `POST .../providers/scim/` with `name`, `url` (`https://<mgmt-vc>/usergroup/t/CUSTOMER/scim/v2`), `token`, `verify_certificates: false` (lab parity with “uncheck verify” in the doc).
+2. Link: `PATCH .../core/applications/<slug>/` with JSON `{"backchannel_providers": [<scim_provider_pk>]}` — URL uses **application slug** (UUID pk for PATCH returned 404 in testing).
+3. **Initial directory sync**: `POST .../providers/scim/{pk}/sync/` (script tries this and `.../sync/full/`); worker may still batch — UI Schedules (Play) remains a fallback.
+
+### CoreDNS forwarder (Cycle 7 Step 1)
+
+On **router** as `root`, patch `10.1.1.1` → `10.244.0.1` in `/holodeck-runtime/k8s/coredns_configmap.yaml`, then `kubectl delete` + `kubectl apply` that manifest. The script uses `sshpass -f /home/holuser/creds.txt` and **`subprocess.run(..., shell=True)`** (not `lsf.run_command`, which splits passwords incorrectly).
+
 ## Critical Pitfalls
 
 Items below are unique pitfalls NOT already covered in the detailed sections above. For pitfalls covered in detail elsewhere, see the referenced sections or skills.
@@ -890,3 +1009,14 @@ Items below are unique pitfalls NOT already covered in the detailed sections abo
 59. **`/v1/tasks` vs `/v1/credentials/tasks`**: `/v1/credentials/tasks` shows credential-specific task status. `/v1/tasks` shows ALL SDDC Manager tasks computed from platform DB tables. Stale tasks appear only in `/v1/tasks` and cannot be cancelled via API.
 60. **Operations VM passwords may be rotated**: SDDC Manager rotates passwords on Operations VMs (ops-a, opscollector-01a, opslcm-a). Query `/v1/credentials` (no resourceType filter) and match by hostname to retrieve actual passwords.
 61. **Holorouter HTTPS leaves expire separately from Vault root CA trust**: `https://auth.vcf.lab` and `https://vault.vcf.lab` use nginx PEMs in `/root/nginx-certs/`. Importing the Vault root into Firefox (or `Tools/vault_firefox_trust.py`) does not renew those leaves. Re-issue with `Tools/holorouter/renew-nginx-tls-from-vault.sh` on the router. See vcf-troubleshooting Section 38.
+
+### Authentik / VCF SSO (API automation)
+62. **Authentik API double `/api/v3`**: Base URL is `https://auth.vcf.lab/api/v3`; child paths must be `flows/...`, `providers/oauth2/`, not `/api/v3/flows/...`.
+63. **vCenter OIDC `claim_map` is not a string map**: Keys like `{"sub": "sub"}` cause **`parsePropertyException`**. Use **`claim_map: {}`** unless you implement the correct list-valued map-entry structure.
+64. **vCenter OIDC discovery fetch uses internal proxy**: Failures show as **526** / **503** / `InvalidArgumentException` with `localhost:1080/external-vecs/...` — fix IdP TLS trust (same class of issue as federation wizard CA upload).
+65. **VIDB `POST /suite-api/api/auth/sources` can return HTTP 500** with `VCF SSO authentication source test failed` until the IdP is reachable and client credentials match the live OAuth app.
+66. **SCIM bearer token for vCenter (Fleet IAM)**: Mint via `POST /suite-api/api/fleet-management/iam/identity-providers/{idpConfigId}/directories/{directoryId}/sync-client` with `generateToken: true` (after OIDC+SCIM IdP is created). Legacy: `[VCFFINAL] vcf_scim_bearer_token` when `authentik_skip_fleet_iam=true`.
+67. **Authentik SCIM “sync now”**: Script calls `POST .../providers/scim/{pk}/sync/` (and `/sync/full/`); some builds return **405** — groups may appear after worker/hourly sync; UI Schedules (Play) is fallback.
+68. **Fleet IAM `certificateChain` must be full PEM strings**: The JSON field is an array of **whole certificates** (typically leaf + issuing CA, max three). Splitting a PEM into **one JSON string per line** is parsed as many separate chains → **`idp.pem.certificate.chains.max.exceeded`**. `Tools/authentik_fleet_iam.py` builds the correct shape.
+69. **SSO Overview “Prerequisites” ≠ IdP creation**: Checking the five boxes only acknowledges documentation; you must also click **Configure SSO** on **Get Started with SSO** to open the **Configure VCF SSO** wizard (`…/initial-setup`), per `HOL_Authentik_Config_Cycle_7.md` Step 3. **`GET .../fleet-management/iam/ssorealms`** must show a non-null **`idpId`** after `POST .../identity-providers` (Fleet IAM script) or after finishing the IdP step in the UI.
+70. **Fleet IAM `directories[0].name` (validName) rejects dots**: Only alphanumeric, space, hyphen, underscore (1–128). Using **`vcf.lab`** as the directory display name (same as SCIM domain) causes **`directories[0].validName`** HTTP 400 — `Tools/authentik_fleet_iam.py` sanitizes (e.g. `vcf_lab`) while **`domains`** / **`defaultDomain`** stay **`vcf.lab`**.

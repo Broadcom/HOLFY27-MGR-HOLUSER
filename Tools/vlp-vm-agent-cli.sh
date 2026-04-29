@@ -2,7 +2,7 @@
 # version 1.1 29-May 2025
 
 #AGENT_URL="https://content.labplatform.vmware.com/api/storage/file/NEE/agent/vlp-agent-"
-AGENT_URL="https://content.labplatform.broadcom.com/api/storage/file/NEE/agent/vlp-agent-"
+AGENT_URL="https://www.labplatform.broadcom.com/api/storage/file/NEE/agent/vlp-agent-"
 
 AGENT_DIR=vlp-agent
 HR="-------------------------------------------------------------------------------------------------------------------------------"

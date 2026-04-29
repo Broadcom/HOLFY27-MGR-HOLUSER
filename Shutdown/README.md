@@ -31,7 +31,11 @@ This folder contains the graceful shutdown orchestration scripts for HOLFY27 lab
     # the kubernetes environment, services, etc...
     ```
 
+    **NOTE:** if the manager vm is shutdown before the router, the router may take a long time to shutdown since it has an NFS mount to the manager vm which would no longer be valid if the manager is offline.
+
 3) Shutdown manager
+
+    **NOTE:** if the console vm is shutdown before the manager, the manager may take a long time to shutdown since it has an NFS mount to the console vm which would no longer be valid if the console is offline.
 
 4) Shutdown console
 
