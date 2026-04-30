@@ -1,11 +1,12 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.10 - 2026-04-27
+# Version 3.10 - 2026-04-30
 # Changes:
 # - Firefox profile rebuild gate (FIREFOX_PROFILE_REBUILD_REQUIRED in script): deploy
 #   rebuild-firefox-profile.sh, compare to ~/.local/state/firefox_profile_rebuild.count on LMC,
 #   SSH-run rebuild when missing or stored count < required (bump constant to force again).
 # - Added functionality to set branch to "ft" if the first 3 characters of the content of /tmp/deploymentpool.txt is "FT-"
+# - Update branch detection logic
 # - Added functionality to git stash local changes for prod.
 # Author - Burke Azbill and HOL Core Team
 # Enhanced with NFS-based router communication, DNS import support
@@ -978,35 +979,46 @@ if check_testing_mode; then
     log_msg "TESTING MODE: Skipping git operations for ${vPod_SKU}" "${logfile}"
     git_success=true  # Consider testing mode as success (use existing files)
 else
-    # Determine branch
+    # Determine branch: dev (Holodeck OVF), main (prod default), or ft (FT- deployment pool + ft/config.ini on GitHub)
     cloud=$(/usr/bin/vmtoolsd --cmd 'info-get guestinfo.ovfEnv' 2>&1)
     holdev=$(echo "${cloud}" | grep -i dev)
 
-    # wait for up to 90 seconds for /tmp/deploymentpool.txt to be created by the VLP agent
-    deploymentpool_wait=0
-    deploymentpool_max_wait=90
-
-    while [ "$deploymentpool_wait" -lt "$deploymentpool_max_wait" ]; do
-        if [ -f /tmp/deploymentpool.txt ]; then
-            break
-        fi
-        deploymentpool_wait=$((deploymentpool_wait + 5))
-        sleep 5
-    done
-
-    if [ "$deploymentpool_wait" -eq "$deploymentpool_max_wait" ]; then
-        log_msg "No deploymentpool.txt found after ${deploymentpool_max_wait}s. " "${logfile}"
-    fi
-
     if [ "${cloud}" = "No value found" ] || [ -n "${holdev}" ]; then
         branch="dev"
-        # if /tmp/deploymentpool.txt exists and the first 3 characters are "FT-", then set the branch to "ft"
-        # You can have VLP create the /tmp/deploymentpool.txt by adding the following to your vmscript:
-        # echo $(echo $1 | cut -f5 -d ':'|  cut -f1 -d'}') > /tmp/deploymentpool.txt
-    elif [ -f /tmp/deploymentpool.txt ] && [ "$(head -c 3 /tmp/deploymentpool.txt)" = "FT-" ]; then
-        branch="ft"
     else
+        # Prod default; overridden to ft only when both checks below succeed
         branch="main"
+
+        # Prove ref "ft" exists and exposes config.ini (no auth). Path Broadcom/<vPod_SKU> matches get_git_project_info URLs.
+        ft_raw_config_url="https://raw.githubusercontent.com/Broadcom/${vPod_SKU}/refs/heads/ft/config.ini"
+        ft_raw_config_status=$(curl -s --max-time 15 -o /dev/null -w '%{http_code}' "$ft_raw_config_url" 2>/dev/null)
+        ft_branch_config_ok=false
+        [ "$ft_raw_config_status" = "200" ] && ft_branch_config_ok=true
+
+        # Only FT-capable repos wait for VLP: /tmp/deploymentpool.txt 
+        # vmscript example: echo $(echo $1 | cut -f5 -d ':'| cut -f1 -d'}') > /tmp/deploymentpool.txt
+        if [ "$ft_branch_config_ok" = true ]; then
+            deploymentpool_wait=0
+            deploymentpool_max_wait=90
+            while [ "$deploymentpool_wait" -lt "$deploymentpool_max_wait" ]; do
+                [ -f /tmp/deploymentpool.txt ] && break
+                deploymentpool_wait=$((deploymentpool_wait + 5))
+                log_msg "Waiting for deploymentpool.txt to be created by the VLP agent... (${deploymentpool_wait}/${deploymentpool_max_wait}s)" "${logfile}"
+                sleep 5
+            done
+            if [ "$deploymentpool_wait" -eq "$deploymentpool_max_wait" ]; then
+                log_msg "No deploymentpool.txt found after ${deploymentpool_max_wait}s. " "${logfile}"
+            fi
+        fi
+
+        # First 3 bytes of deploymentpool.txt must be "FT-" to select branch ft (requires ft_branch_config_ok above)
+        if [ -f /tmp/deploymentpool.txt ] && [ "$(head -c 3 /tmp/deploymentpool.txt)" = "FT-" ]; then
+            if [ "$ft_branch_config_ok" = true ]; then
+                branch="ft"
+            else
+                log_msg "Deployment pool is FT- but ${ft_raw_config_url} unavailable (HTTP ${ft_raw_config_status}); using main" "${logfile}"
+            fi
+        fi
     fi
 
     log_msg "Ready to pull updates for ${vPod_SKU} from ${gitproject}." "${logfile}"
