@@ -965,21 +965,6 @@ if [ "$vPod_SKU" = "HOL-BADSKU" ]; then
     exit 0
 fi
 
-# Determine branch
-cloud=$(/usr/bin/vmtoolsd --cmd 'info-get guestinfo.ovfEnv' 2>&1)
-holdev=$(echo "${cloud}" | grep -i dev)
-
-if [ "${cloud}" = "No value found" ] || [ -n "${holdev}" ]; then
-    branch="dev"
-    # if /tmp/deploymentpool.txt exists and the first 3 characters are "FT-", then set the branch to "ft"
-    # You can have VLP create the /tmp/deploymentpool.txt by adding the following to your vmscript:
-    # echo $(echo $1 | cut -f5 -d ':'|  cut -f1 -d'}') > /tmp/deploymentpool.txt
-elif [ -f /tmp/deploymentpool.txt ] && [ "$(head -c 3 /tmp/deploymentpool.txt)" = "FT-" ]; then
-    branch="ft"
-else
-    branch="main"
-fi
-
 # Calculate git repos from vPod_SKU using labtype-aware function
 # This sets: gitproject, yearrepo, vpodgitdir, vpodgit
 get_git_project_info
@@ -993,6 +978,37 @@ if check_testing_mode; then
     log_msg "TESTING MODE: Skipping git operations for ${vPod_SKU}" "${logfile}"
     git_success=true  # Consider testing mode as success (use existing files)
 else
+    # Determine branch
+    cloud=$(/usr/bin/vmtoolsd --cmd 'info-get guestinfo.ovfEnv' 2>&1)
+    holdev=$(echo "${cloud}" | grep -i dev)
+
+    # wait for up to 90 seconds for /tmp/deploymentpool.txt to be created by the VLP agent
+    deploymentpool_wait=0
+    deploymentpool_max_wait=90
+
+    while [ "$deploymentpool_wait" -lt "$deploymentpool_max_wait" ]; do
+        if [ -f /tmp/deploymentpool.txt ]; then
+            break
+        fi
+        deploymentpool_wait=$((deploymentpool_wait + 5))
+        sleep 5
+    done
+
+    if [ "$deploymentpool_wait" -eq "$deploymentpool_max_wait" ]; then
+        log_msg "No deploymentpool.txt found after ${deploymentpool_max_wait}s. " "${logfile}"
+    fi
+
+    if [ "${cloud}" = "No value found" ] || [ -n "${holdev}" ]; then
+        branch="dev"
+        # if /tmp/deploymentpool.txt exists and the first 3 characters are "FT-", then set the branch to "ft"
+        # You can have VLP create the /tmp/deploymentpool.txt by adding the following to your vmscript:
+        # echo $(echo $1 | cut -f5 -d ':'|  cut -f1 -d'}') > /tmp/deploymentpool.txt
+    elif [ -f /tmp/deploymentpool.txt ] && [ "$(head -c 3 /tmp/deploymentpool.txt)" = "FT-" ]; then
+        branch="ft"
+    else
+        branch="main"
+    fi
+
     log_msg "Ready to pull updates for ${vPod_SKU} from ${gitproject}." "${logfile}"
     
     if [ ! -e "${yearrepo}" ] || [ ! -e "${vpodgitdir}" ]; then
