@@ -33,6 +33,9 @@ TDNS_MGR_UPSTREAM_RAW = (
     'https://raw.githubusercontent.com/burkeazbill/tdns-mgr/'
     'refs/heads/main/tdns-mgr.sh'
 )
+# Quick probe before downloading tdns-mgr.sh (proxy-blocked GitHub caused multi-minute stalls).
+_UPSTREAM_TDNS_PROBE_TIMEOUT = 5.0
+_UPSTREAM_TDNS_FETCH_TIMEOUT = 60.0
 DNS_RECORDS_FILENAME = 'new-dns-records.csv'
 DEFAULT_CREDS_FILE = '/home/holuser/creds.txt'
 _UPSTREAM_VERSION_RE = re.compile(r'^VERSION="([^"]+)"', re.MULTILINE)
@@ -202,14 +205,34 @@ def get_installed_tdns_mgr_version(bin_path: str) -> Optional[str]:
     return None
 
 
+def _upstream_tdns_sh_reachable() -> bool:
+    """
+    Return True if raw.githubusercontent.com responds to HEAD within a few seconds.
+    Used to avoid long hangs when a lab proxy blocks GitHub (tdns-mgr auto-update is optional).
+    """
+    try:
+        req = urllib.request.Request(
+            TDNS_MGR_UPSTREAM_RAW,
+            method='HEAD',
+            headers={'User-Agent': 'HOLFY27-tdns_import.py (lab auto-update)'},
+        )
+        with urllib.request.urlopen(req, timeout=_UPSTREAM_TDNS_PROBE_TIMEOUT) as resp:
+            code = resp.getcode()
+            return 200 <= code < 300
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return False
+
+
 def fetch_upstream_tdns_sh() -> Optional[str]:
     """Download upstream ``tdns-mgr.sh`` from GitHub raw (main branch)."""
+    if not _upstream_tdns_sh_reachable():
+        return None
     try:
         req = urllib.request.Request(
             TDNS_MGR_UPSTREAM_RAW,
             headers={'User-Agent': 'HOLFY27-tdns_import.py (lab auto-update)'},
         )
-        with urllib.request.urlopen(req, timeout=90) as resp:
+        with urllib.request.urlopen(req, timeout=_UPSTREAM_TDNS_FETCH_TIMEOUT) as resp:
             return resp.read().decode('utf-8', errors='replace')
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         write_output(f'WARNING: tdns-mgr upstream fetch failed: {e}')
