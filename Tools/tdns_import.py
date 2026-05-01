@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # tdns_import.py - HOLFY27 DNS Record Import Module
-# Version 2.0 - January 2026
+# Version 2.1 - 2026-05-01
 # Author - Burke Azbill and HOL Core Team
 # Imports DNS records from config.ini [VPOD] new-dns-records or new-dns-records.csv
 # Reference: https://github.com/burkeazbill/tdns-mgr
@@ -487,6 +487,7 @@ def import_dns_rows(
     new_records = 0
     errors = 0
     notes: List[str] = []
+    added_records: List[str] = []
 
     for zone, name, rtype, value in rows:
         rtype_u = rtype.upper()
@@ -517,6 +518,7 @@ def import_dns_rows(
 
         if result.returncode == 0:
             new_records += 1
+            added_records.append(f"{name}.{zone} {rtype_u} {value}")
             continue
 
         errors += 1
@@ -527,7 +529,7 @@ def import_dns_rows(
         write_output(f'DNS add-record failed ({name}.{zone} {rtype_u}): {err_text}')
 
     message = '; '.join(notes) if notes else 'Success'
-    return {'Message': message, 'New Records': new_records, 'Errors': errors}
+    return {'Message': message, 'New Records': new_records, 'Errors': errors, 'Added Records': added_records}
 
 
 def tdns_show_config():
@@ -758,6 +760,8 @@ def import_dns_records(
         if errors == 0 or records_already_exist:
             if new_records > 0:
                 write_output(f'DNS import from config.ini completed: {new_records} new records added')
+                for rec in result.get('Added Records', []):
+                    write_output(f'  - {rec}')
                 update_dashboard_status('complete', f'{new_records} records imported')
             elif records_already_exist:
                 write_output(f'DNS import from config.ini: all {len(config_records)} records already exist')
@@ -810,6 +814,8 @@ def import_dns_records(
         if errors == 0 or records_already_exist:
             if new_records > 0:
                 write_output(f'DNS import from file completed: {new_records} new records added')
+                for rec in result.get('Added Records', []):
+                    write_output(f'  - {rec}')
                 update_dashboard_status('complete', f'{new_records} records imported')
             elif records_already_exist:
                 write_output(f'DNS import from file: all records already exist')

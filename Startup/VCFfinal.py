@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 4.6 - April 2026
+# Version 4.7 - 2026-05-01
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v4.7 Changes:
+# - Fixed Supervisor DNS Health Check: added missing newline after '='*60
+#   to prevent merging with the next log message.
 #
 # v4.6 Changes:
 # - Task 8b: Optional Authentik + VCF integration when [VCFFINAL] authentik_vcf_integration=true
 #   (runs Tools/authentik_vcf_integration.py after Vault CA distribution).
+# - Dynamically determine Supervisor Service namespaces to fix based on config.ini [VCFFINAL] supervisorservicedns.
+# - Added Task 2c4: Supervisor Service vSphere Pod DNS Fix Cleanup
+#   After the DNS fix, the kube-dns-lb LoadBalancer external VIP is no longer needed,
+#   so it is removed from the carvel-services-overlay secret and the affected
+#   Deployments/StatefulSets are patched to remove the dnsPolicy/dnsConfig fields.
 #
 # v4.5 Changes:
 # - Now properly handles supervisor checking across management domains, 
@@ -956,6 +965,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         
         supervisor_start_time = time.time()
         last_overall_status = "No supervisors found"
+        wcp_active_vcenters = []
         
         try:
             while (time.time() - supervisor_start_time) < WCP_MAX_POLL_TIME:
@@ -974,6 +984,8 @@ def main(lsf=None, standalone=False, dry_run=False):
                     sup_clusters = check_supervisor_status_api(lsf, vc_host, vc_sso_domain)
                     
                     if sup_clusters:  # sup_clusters is now a list
+                        if vc_host not in wcp_active_vcenters:
+                            wcp_active_vcenters.append(vc_host)
                         all_supervisor_clusters[vc_host] = sup_clusters
                         total_clusters += len(sup_clusters)
                         
@@ -1047,6 +1059,11 @@ def main(lsf=None, standalone=False, dry_run=False):
         # TASK 2c: POST-VERIFY - Run check_fix_wcp.sh for certificates/webhooks
         # This script has its own internal polling (30s intervals, 30m max).
         # It waits for SCP to become fully accessible before running fixes.
+        # (the script that checks and starts the vapi-endpoint, trustmanagement, 
+        # and wcp services) into Python natively within VCFfinal.py. However, 
+        # check_fix_wcp.sh (which handles the complex Kubernetes certificate and 
+        # webhook remediation) remains a bash script because it relies heavily on 
+        # kubectl interactions and internal retry loops that are easier to maintain in bash.
         #----------------------------------------------------------------------
         lsf.write_output('='*60)
         lsf.write_output('WCP Certificate Fix (post-verify)')
@@ -1068,61 +1085,63 @@ def main(lsf=None, standalone=False, dry_run=False):
                     lsf.write_output(f'  ERROR: Failed to set execute permission: {chmod_err}')
                     lsf.write_output(f'  Will run via bash interpreter as fallback')
             
-            # Use the first vCenter from our targets for the fix script
-            # (script still needs a single target vCenter)
-            fix_target_vc = vcenter_targets[0]['host'] if vcenter_targets else 'vc-mgmt-a.site-a.vcf.lab'
-            
-            lsf.write_output(f'Running: {check_fix_wcp_script} {fix_target_vc}')
-            lsf.write_output(f'  (script has internal polling up to {WCP_MAX_POLL_TIME // 60}m)')
-            
-            try:
-                # Run via /bin/bash explicitly to avoid execute permission issues
-                # Use extended timeout since the script has internal polling
-                # Pass --stdout-only so script does not also write to log file directly
-                # (VCFfinal.py handles all logging via lsf.write_output)
-                wcp_cmd = f'/bin/bash {check_fix_wcp_script} --stdout-only {fix_target_vc}'
-                result = lsf.run_command(wcp_cmd, timeout=WCP_SCRIPT_TIMEOUT)
-                
-                exit_code = result.returncode if hasattr(result, 'returncode') else (0 if result else 1)
-                
-                # Log stdout from the script (timestamps already included by script)
-                if hasattr(result, 'stdout') and result.stdout:
-                    for line in result.stdout.strip().split('\n'):
-                        if line.strip():
-                            lsf.write_output(f'  {line.strip()}')
-                # Log stderr (errors/warnings from the script)
-                if hasattr(result, 'stderr') and result.stderr:
-                    for line in result.stderr.strip().split('\n'):
-                        if line.strip():
-                            lsf.write_output(f'  {line.strip()}')
-                
-                if exit_code == 0:
-                    lsf.write_output('WCP certificate fix completed successfully')
-                elif exit_code == 2:
-                    lsf.write_output('WARNING: SCP services did not become active within timeout')
-                    lsf.write_output('  hypercrypt/kubelet may still be initializing')
-                    wcp_certs_ok = False
-                elif exit_code == 3:
-                    lsf.write_output('WARNING: Cannot connect to Supervisor / K8s API not available within timeout')
-                    wcp_certs_ok = False
-                elif exit_code == 4:
-                    lsf.write_output('WARNING: kubectl commands failed - certificates may need attention')
-                    wcp_certs_ok = False
-                elif exit_code == 126:
-                    lsf.write_output('ERROR: WCP script is not executable (exit code 126)')
-                    lsf.write_output(f'  Fix: chmod +x {check_fix_wcp_script}')
-                    wcp_certs_ok = False
-                elif exit_code == 127:
-                    lsf.write_output('ERROR: WCP script interpreter not found (exit code 127)')
-                    wcp_certs_ok = False
-                else:
-                    lsf.write_output(f'WARNING: WCP script exited with code {exit_code}')
-                    wcp_certs_ok = False
+            # Use the vCenters where we actually found Supervisors
+            if not wcp_active_vcenters:
+                lsf.write_output('  No active Supervisor clusters found on any vCenter. Skipping WCP fix script.')
+                wcp_certs_ok = True
+            else:
+                for fix_target_vc in wcp_active_vcenters:
+                    lsf.write_output(f'Running: {check_fix_wcp_script} {fix_target_vc}')
+                    lsf.write_output(f'  (script has internal polling up to {WCP_MAX_POLL_TIME // 60}m)')
                     
-            except Exception as wcp_err:
-                lsf.write_output(f'WARNING: Error running WCP script: {wcp_err}')
-                lsf.write_output('  Continuing with startup - WCP may need manual attention')
-                wcp_certs_ok = False
+                    try:
+                        # Run via /bin/bash explicitly to avoid execute permission issues
+                        # Use extended timeout since the script has internal polling
+                        # Pass --stdout-only so script does not also write to log file directly
+                        # (VCFfinal.py handles all logging via lsf.write_output)
+                        wcp_cmd = f'/bin/bash {check_fix_wcp_script} --stdout-only {fix_target_vc}'
+                        result = lsf.run_command(wcp_cmd, timeout=WCP_SCRIPT_TIMEOUT)
+                        
+                        exit_code = result.returncode if hasattr(result, 'returncode') else (0 if result else 1)
+                        
+                        # Log stdout from the script (timestamps already included by script)
+                        if hasattr(result, 'stdout') and result.stdout:
+                            for line in result.stdout.strip().split('\n'):
+                                if line.strip():
+                                    lsf.write_output(f'  {line.strip()}')
+                        # Log stderr (errors/warnings from the script)
+                        if hasattr(result, 'stderr') and result.stderr:
+                            for line in result.stderr.strip().split('\n'):
+                                if line.strip():
+                                    lsf.write_output(f'  {line.strip()}')
+                        
+                        if exit_code == 0:
+                            lsf.write_output(f'WCP certificate fix completed successfully on {fix_target_vc}')
+                        elif exit_code == 2:
+                            lsf.write_output(f'WARNING: SCP services did not become active within timeout on {fix_target_vc}')
+                            lsf.write_output('  hypercrypt/kubelet may still be initializing')
+                            wcp_certs_ok = False
+                        elif exit_code == 3:
+                            lsf.write_output(f'WARNING: Cannot connect to Supervisor / K8s API not available within timeout on {fix_target_vc}')
+                            wcp_certs_ok = False
+                        elif exit_code == 4:
+                            lsf.write_output(f'WARNING: kubectl commands failed on {fix_target_vc} - certificates may need attention')
+                            wcp_certs_ok = False
+                        elif exit_code == 126:
+                            lsf.write_output(f'ERROR: WCP script is not executable (exit code 126) on {fix_target_vc}')
+                            lsf.write_output(f'  Fix: chmod +x {check_fix_wcp_script}')
+                            wcp_certs_ok = False
+                        elif exit_code == 127:
+                            lsf.write_output(f'ERROR: WCP script interpreter not found (exit code 127) on {fix_target_vc}')
+                            wcp_certs_ok = False
+                        else:
+                            lsf.write_output(f'WARNING: WCP script exited with code {exit_code} on {fix_target_vc}')
+                            wcp_certs_ok = False
+                            
+                    except Exception as wcp_err:
+                        lsf.write_output(f'WARNING: Error running WCP script on {fix_target_vc}: {wcp_err}')
+                        lsf.write_output('  Continuing with startup - WCP may need manual attention')
+                        wcp_certs_ok = False
         else:
             lsf.write_output(f'WCP script not found: {check_fix_wcp_script}')
             lsf.write_output('  Skipping certificate fix - manual intervention may be needed')

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # shutdown_helpers.py - HOLFY27 Shutdown shared utilities
-# Version 1.0 - 2026-04-27
+# Version 1.1 - 2026-05-01
 # Author - Burke Azbill and HOL Core Team
 # Phase expansion, approximate ETA tracking, vSphere session connect/disconnect, heartbeat helper.
-#
+#   
+# v 1.1 Changes:
+# - Updated phase timing based on actual lab shutdown times
+
 # v 1.0 Changes (2026-04-27):
 # - CANONICAL_PHASE_ORDER, expand_phase_plan(), validate_phase_tokens(), parse_phases_csv()
 # - Auto-insert Phase 2 (vCenter) and Phase 17b (ESXi vim) prerequisites for selective runs
@@ -42,33 +45,33 @@ NEED_ESXI_VIM_PREREQ_PHASES: FrozenSet[str] = frozenset({'17c', '19b'})
 
 # Rough per-phase budgets (seconds) for approximate ETA — not a SLA
 DEFAULT_PHASE_BUDGET_SEC: dict[str, int] = {
-    '1': 3600,
-    '1b': 900,
-    '2': 180,
-    '2b': 1200,
-    '3b': 1800,
-    '3': 600,
-    '4': 2400,
-    '5': 900,
-    '6': 900,
-    '7': 1200,
-    '8': 600,
-    '9': 600,
-    '10': 600,
-    '11': 300,
-    '12': 600,
-    '13': 1200,
-    '14': 900,
-    '15': 900,
-    '16': 1200,
-    '17': 1200,
-    '17b': 300,
-    '17c': 600,
-    '18': 600,
-    '19': 5400,
-    '19b': 900,
-    '19c': 1800,
-    '20': 600,
+    '1': 2400,
+    '1b': 60,
+    '2': 60,
+    '2b': 300,
+    '3b': 120,
+    '3': 60,
+    '4': 300,
+    '5': 60,
+    '6': 180,
+    '7': 180,
+    '8': 180,
+    '9': 180,
+    '10': 60,
+    '11': 60,
+    '12': 60,
+    '13': 120,
+    '14': 60,
+    '15': 180,
+    '16': 120,
+    '17': 420,
+    '17b': 60,
+    '17c': 120,
+    '18': 60,
+    '19': 2700,
+    '19b': 600,
+    '19c': 240,
+    '20': 300,
 }
 
 HEARTBEAT_SEC = 90
