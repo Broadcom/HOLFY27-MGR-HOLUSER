@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TODO: This script is a work in progress. It is not yet complete.
-VERSION: 0.0.1 - 2026-04-27
+VERSION: 0.0.2 - 2026-04-28
 AUTHOR: Burke Azbill and HOL Core Team
 
 Authentik + VCF lab integration (Cycle 7).
@@ -378,6 +378,59 @@ class AuthentikApi:
             data = {'raw': r.text[:2000]}
         return r.status_code, data
 
+    def align_oauth2_sub_mode_for_fleet_iam(
+        self,
+        provider_pk: Any,
+        cfg: configparser.ConfigParser,
+        dry_run: bool,
+    ) -> None:
+        """
+        Fleet IAM IdP maps OIDC ``sub`` to VIDB ``ExternalId`` (see ``authentik_fleet_iam``).
+        Authentik's default SCIM ``externalId`` pairs with the default (hashed) OAuth subject, not
+        ``user_username``. Misaligned modes cause SCIM-visible users who cannot complete SSO login.
+        """
+        if dry_run or not self._sess:
+            return
+        try:
+            detail = self._oauth2_provider_detail(provider_pk)
+        except Exception as e:
+            _log(self.write, f'  WARNING: could not read OAuth2 provider pk={provider_pk} for sub_mode: {e}')
+            return
+        current = (detail.get('sub_mode') or '').strip()
+        explicit = ''
+        if cfg.has_option('VCFFINAL', 'authentik_oauth_sub_mode'):
+            explicit = (cfg.get('VCFFINAL', 'authentik_oauth_sub_mode') or '').strip()
+        if explicit:
+            if current == explicit:
+                return
+            code, body = self.patch_json(f'providers/oauth2/{int(provider_pk)}/', {'sub_mode': explicit})
+            if code in (200, 201):
+                _log(self.write, f'  Authentik OAuth2: patched sub_mode → {explicit!r} (VCFFINAL.authentik_oauth_sub_mode).')
+            else:
+                _log(
+                    self.write,
+                    f'  WARNING: OAuth2 sub_mode patch to {explicit!r} HTTP {code}: {_redact(body)!s}',
+                )
+            return
+        if current != 'user_username':
+            return
+        code, body = self.patch_json(
+            f'providers/oauth2/{int(provider_pk)}/',
+            {'sub_mode': 'hashed_user_id'},
+        )
+        if code in (200, 201):
+            _log(
+                self.write,
+                '  Authentik OAuth2: patched sub_mode user_username → hashed_user_id '
+                '(Fleet IAM OIDC sub must match SCIM ExternalId; see vcf-troubleshooting §44).',
+            )
+            return
+        _log(
+            self.write,
+            f'  WARNING: could not patch OAuth2 sub_mode from user_username (HTTP {code}: {_redact(body)!s}). '
+            'Set OAuth2 subject in Authentik to the default/hashed mode, or set VCFFINAL.authentik_oauth_sub_mode.',
+        )
+
     def _resolve_pagination_url(self, nxt: Optional[str]) -> Optional[str]:
         """Authentik may return ``next`` as absolute URL or a path-only URL."""
         if not nxt:
@@ -634,7 +687,8 @@ class AuthentikApi:
             'client_type': 'confidential',
             'redirect_uris': [{'url': redirect_url, 'matching_mode': 'strict'}],
             'signing_key': signing_key_pk,
-            'sub_mode': 'user_username',
+            # Omit sub_mode: Authentik default pairs with default SCIM externalId. Fleet IAM maps
+            # openIdUserIdentifierAttribute ``sub`` → internalUserIdentifierAttribute ``ExternalId``.
             'include_claims_in_id_token': True,
             'issuer_mode': 'per_provider',
         }
@@ -1083,6 +1137,9 @@ def run_authentik_vcf_integration(
     except Exception as e:
         _log(write, f'Authentik OAuth/Application FAILED: {e}')
         return False
+
+    if prov_pk is not None and not dry_run:
+        ak.align_oauth2_sub_mode_for_fleet_iam(prov_pk, cfg, dry_run)
 
     if dry_run or not client_secret:
         _log(write, 'Dry-run or reused provider without secret — skipping downstream IdP / SCIM steps.')
