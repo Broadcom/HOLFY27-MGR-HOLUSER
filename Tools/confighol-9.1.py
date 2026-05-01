@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.15 - 2026-04-02
+# Version 2.16 - 2026-05-01
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -9,6 +9,8 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.16 - 2026-05-01:
+#   - Improved task id display in output.
 # v2.15 - 2026-04-02:
 #   - Fixed for dual site
 # v2.14 - 2026-04-01:
@@ -4073,7 +4075,7 @@ def disable_sddc_auto_rotate(dry_run: bool = False) -> bool:
                     task_data = response.json()
                     task_id = task_data.get('id', '')
                     lsf.write_output(f'{sddc_host}: Disable task submitted '
-                                     f'(task: {task_id[:8]}...)')
+                                     f'(task: {task_id[:5]}...{task_id[-5:]})')
                     tasks.append(task_id)
                 else:
                     error_msg = ''
@@ -4111,7 +4113,7 @@ def disable_sddc_auto_rotate(dry_run: bool = False) -> bool:
                             task_data = response.json()
                             status = task_data.get('status', '')
                             if status == 'SUCCESSFUL':
-                                lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... '
+                                lsf.write_output(f'{sddc_host}: Task {task_id[:5]}...{task_id[-5:]} '
                                                  f'completed successfully')
                                 task_success = True
                                 break
@@ -4121,7 +4123,7 @@ def disable_sddc_auto_rotate(dry_run: bool = False) -> bool:
                                 for subtask in task_data.get('subTasks', []):
                                     for error in subtask.get('errors', []):
                                         error_msg = error.get('message', error_msg)
-                                lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... '
+                                lsf.write_output(f'{sddc_host}: Task {task_id[:5]}...{task_id[-5:]} '
                                                  f'FAILED - {error_msg}')
                                 failed_tasks.append(task_id)
                                 break
@@ -4133,7 +4135,7 @@ def disable_sddc_auto_rotate(dry_run: bool = False) -> bool:
                         time.sleep(5)
 
                 if not task_success and task_id not in failed_tasks:
-                    lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... did not '
+                    lsf.write_output(f'{sddc_host}: Task {task_id[:5]}...{task_id[-5:]} did not '
                                      f'complete within timeout')
 
         # Step 5: Cancel any failed tasks to prevent UI notifications
@@ -4147,13 +4149,13 @@ def disable_sddc_auto_rotate(dry_run: bool = False) -> bool:
                         cancel_url, headers=headers, verify=False, timeout=15
                     )
                     if response.status_code in [200, 202]:
-                        lsf.write_output(f'{sddc_host}: Task {task_id[:8]}... cancelled')
+                        lsf.write_output(f'{sddc_host}: Task {task_id[:5]}...{task_id[-5:]} cancelled')
                     else:
                         lsf.write_output(f'{sddc_host}: Could not cancel task '
-                                         f'{task_id[:8]}... (HTTP {response.status_code})')
+                                         f'{task_id[:5]}...{task_id[-5:]} (HTTP {response.status_code})')
                 except Exception as e:
                     lsf.write_output(f'{sddc_host}: Error cancelling task '
-                                     f'{task_id[:8]}...: {e}')
+                                     f'{task_id[:5]}...{task_id[-5:]}: {e}')
 
         # Step 6: Verify
         lsf.write_output(f'{sddc_host}: Verifying auto-rotate policies are disabled...')

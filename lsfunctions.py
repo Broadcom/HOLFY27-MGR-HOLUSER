@@ -1882,7 +1882,9 @@ def push_router_files():
         
         if os.path.isfile(src):
             try:
-                shutil.copy(src, dst)
+                # Use copyfile instead of copy to avoid permission errors (EPERM)
+                # when trying to preserve metadata/chmod on an NFS share
+                shutil.copyfile(src, dst)
                 write_output(f'Copied {item} to holorouter NFS share')
             except Exception as e:
                 write_output(f'Failed to copy {item} to NFS share: {e}')
@@ -1929,7 +1931,9 @@ def push_vpodrepo_router_files():
         
         if os.path.isfile(src):
             try:
-                shutil.copy(src, dst)
+                # Use copyfile instead of copy to avoid permission errors (EPERM)
+                # when trying to preserve metadata/chmod on an NFS share
+                shutil.copyfile(src, dst)
                 write_output(f'Copied vpodrepo {item} to holorouter NFS share')
             except Exception as e:
                 write_output(f'Failed to copy vpodrepo {item} to NFS share: {e}')
