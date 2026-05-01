@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 2.7 - 2026-04-27
+# Version 2.8 - 2026-05-01
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 2.8 Changes:
+# - Shutdown timing updated based on actual lab shutdown times
+# - optimized shutdown process
 #
 # v 2.7 Changes (2026-04-27):
 # - Added --phases (multi-phase) and --fleet-products (Phase 1 override); mutual exclusion with --phase
@@ -1065,9 +1069,25 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
     if lsf.config.has_option('SHUTDOWN', 'esx_username'):
         esx_username = lsf.config.get('SHUTDOWN', 'esx_username')
 
+    dynamic_budget = dict(sh.DEFAULT_PHASE_BUDGET_SEC)
+    if esx_hosts and not dry_run:
+        # Detect vSAN ESA early to adjust ETA budget
+        # Suppress logging during early detection to keep output clean
+        original_write = getattr(lsf, 'write_output', None)
+        try:
+            lsf.write_output = lambda m: None
+            if is_vsan_esa(lsf, esx_hosts[0], esx_username, password):
+                dynamic_budget['19'] = 60
+        except Exception:
+            pass
+        finally:
+            if original_write:
+                lsf.write_output = original_write
+
     eta = sh.ShutdownEtaTracker(
         list(sh.CANONICAL_PHASE_ORDER) if phase_set is None else ordered_plan,
         lambda m: vcf_write(lsf, m),
+        budget_map=dynamic_budget
     )
     eta.log_run_start()
 
@@ -1908,21 +1928,27 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
             vcf_write(lsf, '='*60)
             update_shutdown_status(7, 'Shutdown Workload vCenters', dry_run)
 
-            # Get all vCenters from [VCF] vcfvCenter (primary source)
-            # Filter for workload vCenters (contain "wld" in name)
-            all_vcenters = []
+            # Get all vCenters from [VCF] vcfvCenter AND [RESOURCES] vCenters
+            all_vcenters_set = set()
             if lsf.config.has_option('VCF', 'vcfvCenter'):
                 vc_raw = lsf.config.get('VCF', 'vcfvCenter')
                 for entry in vc_raw.split('\n'):
                     if entry.strip() and not entry.strip().startswith('#'):
                         parts = entry.split(':')
-                        all_vcenters.append(parts[0].strip())
-                vcf_write(lsf, f'Found {len(all_vcenters)} vCenter(s) in [VCF] vcfvCenter')
-            else:
-                vcf_write(lsf, 'No vCenters configured in [VCF] vcfvCenter')
+                        all_vcenters_set.add(parts[0].strip())
+                        
+            if lsf.config.has_option('RESOURCES', 'vCenters'):
+                vc_raw = lsf.config.get('RESOURCES', 'vCenters')
+                for entry in vc_raw.split('\n'):
+                    if entry.strip() and not entry.strip().startswith('#'):
+                        vc_fqdn = entry.split(':')[0].strip()
+                        vc_name = vc_fqdn.split('.')[0]
+                        all_vcenters_set.add(vc_name)
+
+            vcf_write(lsf, f'Found {len(all_vcenters_set)} vCenter(s) in configuration')
 
             # Filter for workload vCenters (contain "wld" in name)
-            workload_vcenters = [v for v in all_vcenters if 'wld' in v.lower()]
+            workload_vcenters = [v for v in all_vcenters_set if 'wld' in v.lower()]
 
             if not dry_run:
                 if workload_vcenters:
@@ -2432,21 +2458,27 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
             vcf_write(lsf, '='*60)
             update_shutdown_status(17, 'Shutdown Management vCenter', dry_run)
 
-            # Get all vCenters from [VCF] vcfvCenter (primary source)
-            # Filter for management vCenters (contain "mgmt" in name)
-            all_vcenters_mgmt = []
+            # Get all vCenters from [VCF] vcfvCenter AND [RESOURCES] vCenters
+            all_vcenters_mgmt_set = set()
             if lsf.config.has_option('VCF', 'vcfvCenter'):
                 vc_raw = lsf.config.get('VCF', 'vcfvCenter')
                 for entry in vc_raw.split('\n'):
                     if entry.strip() and not entry.strip().startswith('#'):
                         parts = entry.split(':')
-                        all_vcenters_mgmt.append(parts[0].strip())
-                vcf_write(lsf, f'Found {len(all_vcenters_mgmt)} vCenter(s) in [VCF] vcfvCenter')
-            else:
-                vcf_write(lsf, 'No vCenters configured in [VCF] vcfvCenter')
+                        all_vcenters_mgmt_set.add(parts[0].strip())
+                        
+            if lsf.config.has_option('RESOURCES', 'vCenters'):
+                vc_raw = lsf.config.get('RESOURCES', 'vCenters')
+                for entry in vc_raw.split('\n'):
+                    if entry.strip() and not entry.strip().startswith('#'):
+                        vc_fqdn = entry.split(':')[0].strip()
+                        vc_name = vc_fqdn.split('.')[0]
+                        all_vcenters_mgmt_set.add(vc_name)
 
-            # Filter for management vCenters (contain "mgmt" in name)
-            mgmt_vcenter_vms = [v for v in all_vcenters_mgmt if 'mgmt' in v.lower()]
+            vcf_write(lsf, f'Found {len(all_vcenters_mgmt_set)} vCenter(s) in configuration')
+
+            # Shut down any remaining vCenters (not workload) to ensure license server shuts down last
+            mgmt_vcenter_vms = [v for v in all_vcenters_mgmt_set if 'wld' not in v.lower()]
 
             if not dry_run:
                 if mgmt_vcenter_vms:
