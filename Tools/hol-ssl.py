@@ -2,7 +2,7 @@
 #
 # hol-ssl.py - Issue SSL certificates for HOL vPods via HashiCorp Vault PKI
 #
-# version 2.2  2026-03-24
+# version 2.3  2026-05-01
 # Connects to a Vault PKI secrets engine to issue certificates. Vault connection
 # details, PKI role, key parameters, and output directory are read from
 # hol-ssl-config.yaml (or a user-supplied config file).
@@ -63,7 +63,9 @@ def read_token(token_file):
 
 def vault_client(url, token):
     """Return an authenticated hvac client after verifying connectivity."""
-    client = hvac.Client(url=url, token=token)
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    client = hvac.Client(url=url, token=token, verify=False)
     try:
         if not client.is_authenticated():
             sys.exit("ERROR: Vault authentication failed. Check token in the configured token_file.")
@@ -206,8 +208,8 @@ def print_cert_details(cert_obj, vault_serial, role, ttl_requested):
     except x509.ExtensionNotFound:
         pass
 
-    not_before = cert_obj.not_valid_before_utc
-    not_after = cert_obj.not_valid_after_utc
+    not_before = cert_obj.not_valid_before
+    not_after = cert_obj.not_valid_after
 
     log.info("")
     log.info("--- Certificate Details ---")
@@ -455,7 +457,7 @@ if __name__ == '__main__':
     ttl_seconds = ttl_to_seconds(ttl)
     key_type = cert_cfg.get('key_type', 'rsa')
     key_bits = int(cert_cfg.get('key_bits', 2048))
-    cert_dir = cert_cfg.get('cert_dir', '/hol/ssl')
+    cert_dir = cert_cfg.get('cert_dir', '/home/holuser/hol/ssl')
 
     pfx_pw_file = cert_cfg.get('pfx_password_file')
     if not pfx_pw_file:
