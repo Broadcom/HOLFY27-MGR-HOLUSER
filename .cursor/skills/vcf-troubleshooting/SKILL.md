@@ -1,6 +1,6 @@
 ---
 name: vcf-troubleshooting
-description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, and Fleet SSO Overview get-started empty despite prerequisites. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, or SSO prerequisites checkboxes.
+description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), and federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch). Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, or OIDC sub ExternalId.
 ---
 
 # VCF 9.x Troubleshooting Guide
@@ -52,6 +52,8 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | vCenter OIDC IdP registration fails (526/503, parse errors) | `POST /api/vcenter/identity/providers` returns 400; message mentions `external-vecs` or `parsePropertyException` | Discovery URL fetch via vCenter trust proxy — TLS to IdP not trusted, or invalid `claim_map` shape | 40 |
 | vCenter / VCF Operations still show only local login after Authentik script | No “SSO” or corporate IdP button; only `administrator@…` / `admin` + password | Legacy `authentik_skip_fleet_iam` path skips Fleet IAM enrollment; or Fleet IAM / SCIM / Join SSO failed — see §41 | 41 |
 | VCF SSO Overview get-started empty after Prerequisites | All five prerequisite boxes submitted; UI still shows nothing configured | Prerequisites alone do not open the wizard — must click **Configure SSO**; **`idpId`** null until Fleet IAM `POST .../identity-providers` or IdP wizard completes (cert chain shape, discovery 404, etc.) — see §42 | 42 |
+| Authentik SCIM “Network error” / failed to sync groups | `authentik-worker` logs: `Failed to sync Group … transient error: Network error communicating with remote system`; same `exc` on users | Outgoing SCIM client calls RFC 7644 `GET …/ServiceProviderConfig` first; vCenter VIDB SCIM returns **HTTP 404** on that path — Authentik mislabels as “network” | 43 |
+| Federated login fails after SCIM users/groups visible | `prod-admin@vcf.lab` authenticates at Authentik but vCenter / Ops SSO rejects or loops | Fleet IAM maps OIDC **`sub`** → VIDB **`ExternalId`**; Authentik **`sub_mode: user_username`** (or UI equivalent) breaks pairing with default SCIM **externalId** | 44 |
 
 ---
 
@@ -1799,3 +1801,163 @@ Expect a realm row with a non-null **`idpId`** once Fleet IAM has created the OI
 
 - **`log_fleet_sso_realm_summary`** (called at end of the integration script’s Fleet IAM path) prints realm **`idpId`** / **`totalConfiguredComponents`** for quick API-vs-UI comparison.
 - Optional **`authentik_sso_ui_prerequisites=true`** runs `Tools/vcf_sso_ui_prereqs.py`: Prerequisites → Submit → **Configure SSO** (wizard entry). It does not replace Fleet IAM API calls in `authentik_fleet_iam.py`.
+
+## 43. Authentik SCIM Sync: “Network error communicating with remote system” (e.g. `prod-readonly`)
+
+**Symptom**: **`authentik-worker`** execution logs show many lines like `Failed to sync Group prod-readonly due to transient error: Network error communicating with remote system` (and similar for other groups/users). Often preceded by: `failed to get ServiceProviderConfig, using default` with the same `exc` string.
+
+**Diagnosis**:
+
+```bash
+# From the worker pod (same network as outgoing SCIM)
+kubectl exec -n default deploy/authentik-worker -- curl -sk -o /dev/null -w "ServiceProviderConfig %{http_code}\n" \
+  "https://vc-mgmt-a.site-a.vcf.lab/usergroup/t/CUSTOMER/scim/v2/ServiceProviderConfig"
+kubectl exec -n default deploy/authentik-worker -- curl -sk -o /dev/null -w "Users %{http_code}\n" \
+  "https://vc-mgmt-a.site-a.vcf.lab/usergroup/t/CUSTOMER/scim/v2/Users"
+kubectl exec -n default deploy/authentik-worker -- curl -sk -o /dev/null -w "Groups %{http_code}\n" \
+  "https://vc-mgmt-a.site-a.vcf.lab/usergroup/t/CUSTOMER/scim/v2/Groups"
+```
+
+Expect **`ServiceProviderConfig` → 404** while **`Users` / `Groups` → 401** without a bearer token (routes exist; auth required). TLS to vCenter still succeeds — this is **not** a generic “network down” failure.
+
+```bash
+kubectl logs -n default deploy/authentik-worker --tail=300 | grep -E 'ServiceProviderConfig|failed to sync'
+```
+
+**Root Cause**: Authentik’s **outgoing SCIM** client follows **RFC 7644** and performs **`GET …/scim/v2/ServiceProviderConfig`** before syncing objects. **VMware vCenter’s VIDB SCIM API** at `…/usergroup/t/CUSTOMER/scim/v2` does **not** implement that resource (returns **404**). Authentik surfaces the failure as **`Network error communicating with remote system`**, which then appears on **every** user/group sync attempt in the same run — misleading wording; underlying issue is **missing `ServiceProviderConfig`**, not intermittent connectivity.
+
+**Fix**:
+
+1. **Interpretation**: If diagnosis shows **404 on `ServiceProviderConfig`** only, treat log noise as **Authentik ↔ VMware SCIM compatibility**, not Squid/DNS outage — verify `Users`/`Groups` with a valid Fleet-minted SCIM bearer when debugging actual provisioning.
+2. **Product path**: Track **Authentik** and **VMware** release notes / issues for optional `ServiceProviderConfig` handling or VIDB adding the endpoint.
+3. **Operational**: Rely on **Fleet IAM** / VIDB-supported flows for directory sync where documented; do not assume full RFC 7644 client behavior against vCenter without confirming both endpoints.
+
+**Key Details**:
+
+- The SCIM base URL is documented in `vcf-9-api` Section 16 (`https://<mgmt-vc>/usergroup/t/CUSTOMER/scim/v2`).
+- Pitfall **§71** in `vcf-9-api` summarizes the same behavior for API-focused lookups.
+
+## 44. Federated SSO Login Fails Though SCIM Users and Groups Exist (e.g. `prod-admin`)
+
+**Symptom**: Under **VCF SSO**, SCIM has provisioned users and groups; **Assign VCF roles** shows `prod-admins` mapped to **VCF Administrators** / **SDDC Administrators**. The user **completes Authentik** (or appears to) but **cannot sign in** to management vCenter or VCF Operations via the federated path — generic access denied, unknown user, or broker error after redirect.
+
+**Diagnosis**:
+
+1. Confirm **Join SSO** ran for **VCENTER** (integration log: `Fleet IAM: Join SSO VCENTER OK`, or re-run `Tools/authentik_vcf_integration.py` and watch for Join SSO lines).
+2. Compare identifiers: Fleet IAM IdP config uses **`openIdUserIdentifierAttribute`: `sub`** mapped to **`internalUserIdentifierAttribute`: `ExternalId`** (`Tools/authentik_fleet_iam.py`). The OIDC **`sub`** claim in the IdP token must equal the directory user’s **ExternalId** from SCIM.
+3. In **Authentik** → **Providers** → your **OAuth2** provider for `vcf`: if **Subject mode** is **Based on the user's username** (API: `user_username`), **`sub`** is typically `prod-admin@vcf.lab` while the default **outgoing SCIM** **externalId** is still Authentik’s **hashed / opaque** identifier — they **do not match**, so the broker cannot bind the OIDC session to the SCIM user.
+
+Decode the **id_token** from a test login and compare **`sub`** to the user’s **ExternalId** in the VIDB / directory record (must match).
+
+**Root Cause**: **OIDC subject (`sub`) and SCIM / VIDB `ExternalId` are different identifiers** while Fleet IAM expects them to align. Disabling SCIM TLS verification only fixes provisioning; it does not fix identifier mapping.
+
+**Fix**:
+
+1. **Preferred (Holodeck `Tools/authentik_vcf_integration.py`)**: Re-run the integration script. It **omits** `sub_mode` on new OAuth providers (Authentik default subject pairs with default SCIM externalId) and **patches** existing providers from `user_username` → `hashed_user_id` when `VCFFINAL.authentik_oauth_sub_mode` is unset.
+2. **Manual (Authentik UI)**: Edit the **OAuth2 Provider** used by the `vcf` application → set **Subject mode** to the **default / hashed user ID** (the mode Authentik documents as matching default SCIM **externalId**), **Save**, then retry federated login.
+3. **Alternative**: Keep **username** as `sub` only if you add **SCIM property mappings** so the pushed **externalId** equals that same string (advanced).
+4. **Login form**: Use the **UPN** the broker expects (often **`prod-admin@vcf.lab`**) and pick the **`vcf.lab`** / federated domain on vCenter if the UI offers a domain control — separate from `sub` mismatch but commonly confused.
+
+**Key Details**:
+
+- Optional **`VCFFINAL.authentik_oauth_sub_mode`** forces a specific Authentik `sub_mode` when you intentionally customize SCIM mappings.
+- Lab users created only via API without **`set_password`** may be unable to authenticate **at Authentik**; pre-seeded users from **`update-holorouter.sh`** use **`creds.txt`**. If Authentik login itself fails, set a password for that user in Authentik.
+
+## 45. Federated SSO Login Fails: Authentik Returns JWE (Encrypted id_token) Unsupported by VIDB
+
+**Symptom**: VIDB/`accesscontrol-service.log` on `vc-mgmt-a` shows:
+```
+NullPointerException: Cannot invoke "io.vertx.core.json.JsonObject.toString()" because "idToken" is null
+```
+User gets "Access Denied" at vCenter after completing Authentik login (no password error). SCIM provisioning is healthy and `sub_mode` is correct.
+
+**Diagnosis**:
+
+```bash
+# Request an id_token from Authentik's token endpoint manually and inspect it
+curl -sk -X POST 'https://auth.vcf.lab/application/o/token/' \
+  -d 'grant_type=authorization_code&code=<code>&redirect_uri=<uri>&client_id=<cid>&client_secret=<cs>' | \
+  python3 -c "import sys,json; t=json.load(sys.stdin); tok=t.get('id_token',''); print(len(tok.split('.')), 'parts ->', tok[:80])"
+```
+- **3 parts (JWS/RS256)** → normal signed token — NOT this issue
+- **5 parts** → JWE (encrypted token) — Authentik is encrypting the `id_token`
+
+Check Authentik OAuth2 provider API:
+```bash
+curl -sk -H "Authorization: Bearer <token>" https://auth.vcf.lab/api/v3/providers/oauth2/<pk>/
+```
+Look for `"encryption_key": <non-null>` — any key here causes JWE output.
+
+**Root Cause**: Authentik's OAuth2 provider has an **Encryption Key** set (under *Advanced protocol settings*). This causes the `id_token` to be returned as a **JWE** (`alg: RSA-OAEP-256`). VIDB's Java runtime cannot decrypt JWE tokens of this algorithm — it receives the encrypted blob and `idToken` evaluates to `null` after failed decryption, causing the NPE.
+
+**Fix**:
+
+Via **Authentik API** (preferred — the UI update may not persist reliably):
+```bash
+# Get CSRF token
+CSRF=$(curl -sc /tmp/ak.jar -sk https://auth.vcf.lab/if/user/ | grep -o 'csrfmiddlewaretoken.*' | head -1 | cut -d'"' -f3 || true)
+# PATCH encryption_key to null
+curl -sk -X PATCH https://auth.vcf.lab/api/v3/providers/oauth2/<pk>/ \
+  -H "Content-Type: application/json" \
+  -H "X-CSRFToken: <csrf>" \
+  --cookie /tmp/ak.jar \
+  -d '{"encryption_key": null}'
+```
+Or from a logged-in admin session in Playwright: `browser_evaluate` with a `fetch` PATCH. In Authentik 2026.2+, API PATCH calls from `browser_evaluate` on the admin page require a valid CSRF cookie — use `page.request.patch()` only from `browser_run_code_unsafe` (to supply proper Referer/cookie headers), or loop through CSRF cookie extraction.
+
+**Automated fix**: `Tools/authentik_vcf_integration.py` now explicitly sets `'encryption_key': None` when creating the OAuth2 provider, preventing this issue for new deployments.
+
+**Key Details**:
+
+- The Authentik UI "Encryption Key" field is under **OAuth2/OpenID Provider → Advanced protocol settings**.
+- If the `encryption_key` field is set to the `authentik Self-signed Certificate` (or any key), every `id_token` will be JWE.
+- VIDB JWKS validation (`accesscontrol-service.log`: `OIDC authentication successful`) can still pass for JWE — the error occurs *after* token retrieval when VIDB tries to deserialize the payload.
+
+## 46. Federated SSO Login Fails: `OidcTokenValidationException: Invalid issuer claim in token`
+
+**Symptom**: `accesscontrol-service.log` on `vc-mgmt-a` shows:
+```
+OidcTokenValidationException: Invalid issuer claim in token: https://auth.vcf.lab/
+```
+VIDB rejects the `id_token` despite valid signature and matching `sub`/`ExternalId`.
+
+**Diagnosis**:
+
+```bash
+# Check what issuer VIDB expects (oiu field in VCDB)
+ssh root@vc-mgmt-a.site-a.vcf.lab \
+  "psql -U postgres -d VCDB -tAc 'SELECT \"idpName\", \"configuration\" FROM \"vidm_schema\".\"fed_IdentityProvider\" LIMIT 5;'"
+# Look for "oiu" key in configuration JSON — this is the expected issuer URL
+
+# Check what issuer Authentik is producing
+curl -sk https://auth.vcf.lab/application/o/vcf/.well-known/openid-configuration | python3 -c "import sys,json; d=json.load(sys.stdin); print('issuer:', d['issuer'])"
+
+# Check Authentik provider issuer_mode
+curl -sk -H "Authorization: Bearer <token>" https://auth.vcf.lab/api/v3/providers/oauth2/<pk>/ | python3 -m json.tool | grep issuer_mode
+```
+
+**Root Cause**: Authentik's OAuth2 provider `issuer_mode` determines the `iss` claim in issued tokens:
+- `issuer_mode: "global"` → `iss: "https://auth.vcf.lab/"` (Authentik base URL)
+- `issuer_mode: "per_provider"` → `iss: "https://auth.vcf.lab/application/o/<slug>/"` (per-application)
+
+VIDB stores the expected issuer as `oiu` in the `fed_IdentityProvider` configuration column (set from the discovery URL's `issuer` field at IdP registration time). If `issuer_mode` was `per_provider` when the IdP was registered (as done by `Tools/authentik_vcf_integration.py`), but later changed to `global`, the stored `oiu` and the token `iss` diverge — validation fails.
+
+**Fix**:
+
+```bash
+# Patch issuer_mode back to per_provider via Authentik API
+# (See Section 45 for CSRF/session approach)
+curl -sk -X PATCH https://auth.vcf.lab/api/v3/providers/oauth2/<pk>/ \
+  -H "Content-Type: application/json" \
+  -d '{"issuer_mode": "per_provider"}'
+# Then restart vc-ws1a-broker to flush OIDC discovery cache:
+ssh root@vc-mgmt-a.site-a.vcf.lab "service-control --stop vc-ws1a-broker && sleep 3 && service-control --start vc-ws1a-broker"
+```
+
+**Automated fix**: `Tools/authentik_vcf_integration.py` always creates the OAuth2 provider with `'issuer_mode': 'per_provider'` (correct).
+
+**Key Details**:
+
+- The `oiu` field in the VCDB `fed_IdentityProvider.configuration` JSON holds the expected issuer. Query it to confirm what VIDB expects before chasing Authentik.
+- After changing `issuer_mode`, the Authentik discovery endpoint (`/application/o/<slug>/.well-known/openid-configuration`) will reflect the new issuer immediately, but vc-ws1a-broker may cache the old value. A restart ensures the fresh discovery is fetched.
+- **Full SSO login fix chain** (from SCIM to working logins): (1) disable SCIM SSL verification in Authentik SCIM provider, (2) `sub_mode: hashed_user_id`, (3) add `vcf.lab` to Squid allowlist so VIDB can fetch JWKS, (4) `encryption_key: null` (no JWE), (5) `issuer_mode: per_provider`.

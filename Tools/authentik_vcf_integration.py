@@ -687,10 +687,10 @@ class AuthentikApi:
             'client_type': 'confidential',
             'redirect_uris': [{'url': redirect_url, 'matching_mode': 'strict'}],
             'signing_key': signing_key_pk,
-            # Omit sub_mode: Authentik default pairs with default SCIM externalId. Fleet IAM maps
-            # openIdUserIdentifierAttribute ``sub`` → internalUserIdentifierAttribute ``ExternalId``.
+            'sub_mode': 'hashed_user_id',
             'include_claims_in_id_token': True,
             'issuer_mode': 'per_provider',
+            'encryption_key': None,
         }
         if dry_run:
             _log(self.write, f'  DRY-RUN would POST providers/oauth2/ {_redact(body)!s}')

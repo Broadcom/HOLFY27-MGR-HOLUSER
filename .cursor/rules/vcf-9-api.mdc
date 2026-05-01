@@ -78,6 +78,10 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 - **Operations VMs SSH user varies** — `ops-a`/`opslcm-a` accept `root`; `opslogs-a` only accepts `vmware-system-user`; `opsnet-a` has no SSH. Try both users, skip on failure.
 - **SDDC Manager auto-rotate HTTP 403 "10 concurrent"** — Stale `task_metadata`/`entity_and_task`/`task_and_entity_type_and_entity` in platform DB plus `processing_task` in domainmanager DB block credential operations. Must DELETE all entries and restart `operationsmanager`, `commonsvcs`, `domainmanager` services. See vcf-troubleshooting Section 37.
 - **Operations VM passwords rotated by SDDC Manager** — `ops-a`, `opscollector-01a`, `opslcm-a` root passwords may be rotated. Query `/v1/credentials` with Bearer token and match by hostname to retrieve actual password. Reset to lab standard via `chpasswd` after connecting.
+- **Authentik OAuth2 provider must have `encryption_key: null`** — any non-null value causes JWE id_tokens (`RSA-OAEP-256`) that VIDB cannot decrypt → `NullPointerException: idToken is null` in `accesscontrol-service.log`. Set via API: `PATCH /api/v3/providers/oauth2/<pk>/` `{"encryption_key": null}`.
+- **Authentik `issuer_mode` must be `per_provider`** — `global` mode produces `iss: https://auth.vcf.lab/` but VIDB stores `oiu: https://auth.vcf.lab/application/o/vcf/` (per_provider). Mismatch causes `OidcTokenValidationException: Invalid issuer claim`. Restart `vc-ws1a-broker` after changing.
+- **Squid must allow `vcf.lab` for VIDB JWKS fetch** — VIDB fetches `https://auth.vcf.lab/application/o/vcf/jwks/` to verify OIDC signatures. Squid 403 causes all SSO logins to fail. After `squid -k reconfigure`, restart `vc-ws1a-broker` to clear cached errors.
+- **Authentik `sub_mode` must be `hashed_user_id`** — Default outgoing SCIM pushes Authentik's hashed opaque ID as `ExternalId`. OIDC `sub` must match that hash. `user_username` mode makes `sub` = username string which never matches `ExternalId`. Integration script sets `hashed_user_id` on OAuth2 provider creation.
 
 ## Session Knowledge Capture
 
