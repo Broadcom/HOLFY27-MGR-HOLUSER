@@ -8,7 +8,9 @@ _User guide for `hol-ssl.py` v2.2 — issue trusted TLS certificates in HOL lab 
 
 `hol-ssl.py` is a command-line tool that requests TLS certificates from a HashiCorp Vault PKI secrets engine and writes them to disk in every format a lab workload might need: PEM, PKCS12/PFX, and Java KeyStore (JKS).
 
-It is designed for **HOL vPod lab environments** where a Vault instance with a configured PKI engine is already running on the Holorouter. The tool handles:
+It is designed for **HOL vPod lab environments** where a Vault instance with a configured PKI engine is already running on the Holorouter.
+
+The tool handles:
 
 - Automatic lab domain detection (reverse DNS, `resolv.conf`, or `site-a.vcf.lab` default)
 - Common Name construction from bare hostnames

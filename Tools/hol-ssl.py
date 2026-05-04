@@ -45,7 +45,6 @@ if sys.stdout.isatty():
 else:
     _CYAN = _BLUE = _GREEN = _YELLOW = _BOLD = _NC = ''
 
-
 # ---------------------------------------------------------------------------
 # Vault interaction
 # ---------------------------------------------------------------------------
@@ -60,7 +59,6 @@ def read_token(token_file):
     except PermissionError:
         sys.exit(f"ERROR: Permission denied reading: {token_file}")
 
-
 def vault_client(url, token):
     """Return an authenticated hvac client after verifying connectivity."""
     import urllib3
@@ -72,7 +70,6 @@ def vault_client(url, token):
     except Exception as exc:
         sys.exit(f"ERROR: Cannot connect to Vault at {url}:\n  {exc}")
     return client
-
 
 def ensure_role_max_ttl(client, mount, role, required_ttl_seconds):
     """
@@ -94,7 +91,6 @@ def ensure_role_max_ttl(client, mount, role, required_ttl_seconds):
             extra_params=existing,
         )
         log.info("Role max_ttl updated successfully.")
-
 
 def issue_certificate(client, mount, role, common_name, alt_names, ip_sans, ttl,
                       key_type, key_bits):
@@ -126,7 +122,6 @@ def issue_certificate(client, mount, role, common_name, alt_names, ip_sans, ttl,
 
     return resp['data']
 
-
 # ---------------------------------------------------------------------------
 # Crypto helpers — parse once, reuse everywhere
 # ---------------------------------------------------------------------------
@@ -137,7 +132,6 @@ def parse_pem_objects(cert_pem, key_pem, ca_pem):
     key_obj = serialization.load_pem_private_key(key_pem.encode(), password=None)
     ca_obj = x509.load_pem_x509_certificate(ca_pem.encode())
     return cert_obj, key_obj, ca_obj
-
 
 # ---------------------------------------------------------------------------
 # File output helpers
@@ -153,7 +147,6 @@ def write_file(path, content, mode='w', permissions=None):
         os.chmod(path, permissions)
     return path
 
-
 def build_pfx(cert_obj, key_obj, ca_obj, password, friendly_name):
     """Build a PKCS12/PFX blob from pre-parsed cryptography objects."""
     return pkcs12.serialize_key_and_certificates(
@@ -163,7 +156,6 @@ def build_pfx(cert_obj, key_obj, ca_obj, password, friendly_name):
         cas=[ca_obj],
         encryption_algorithm=BestAvailableEncryption(password.encode()),
     )
-
 
 def build_jks(cert_obj, key_obj, ca_obj, password, alias):
     """
@@ -184,7 +176,6 @@ def build_jks(cert_obj, key_obj, ca_obj, password, alias):
     keystore.entries['ca'] = ca_entry
 
     return keystore.saves(password)
-
 
 # ---------------------------------------------------------------------------
 # Certificate detail printer
@@ -236,7 +227,6 @@ def print_file_summary(files):
         size_str = f"{size} B" if size < 1024 else f"{size / 1024:.1f} KB"
         log.info("  %-50s %10s", path, size_str)
 
-
 # ---------------------------------------------------------------------------
 # Collect SANs from config
 # ---------------------------------------------------------------------------
@@ -268,7 +258,6 @@ def collect_sans(config_san, fqdn_override, ip_override, dom):
 
     return cn, fqdns, ips
 
-
 # ---------------------------------------------------------------------------
 # TTL helpers
 # ---------------------------------------------------------------------------
@@ -297,7 +286,6 @@ def ttl_to_seconds(ttl_str):
     except ValueError:
         sys.exit(f"ERROR: Invalid TTL value: '{ttl_str}' — expected a number with optional "
                  "suffix (d/h/m/s), e.g. '398d', '8760h', '34387200'")
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -344,7 +332,6 @@ def detect_lab_domain():
         pass
 
     return 'site-a.vcf.lab'
-
 
 def show_help(dom):
     """Print styled help text and exit."""
@@ -396,7 +383,6 @@ def show_help(dom):
     print(f"    comments for details.")
     print()
     sys.exit(0)
-
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(message)s')

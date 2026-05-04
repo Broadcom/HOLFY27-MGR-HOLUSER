@@ -2,7 +2,7 @@
 #
 # Configuration for issuing SSL certificates via HashiCorp Vault PKI
 # Used by hol-ssl.py to request certificates from Vault's PKI secrets engine
-#
+# 
 
 # Vault PKI Configuration
 # Connection details and authentication for the Vault PKI backend
