@@ -1,6 +1,6 @@
 ---
 name: vcf-troubleshooting
-description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), and federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch). Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, or OIDC sub ExternalId.
+description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch), and Authentik SCIM syncing 0 users due to empty property_mappings. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, OIDC sub ExternalId, SCIM 0 users, property_mappings empty, or vcf_viewer role.
 ---
 
 # VCF 9.x Troubleshooting Guide
@@ -1811,11 +1811,11 @@ Expect a realm row with a non-null **`idpId`** once Fleet IAM has created the OI
 ```bash
 # From the worker pod (same network as outgoing SCIM)
 kubectl exec -n default deploy/authentik-worker -- curl -sk -o /dev/null -w "ServiceProviderConfig %{http_code}\n" \
-  "https://vc-mgmt-a.site-a.vcf.lab/usergroup/t/CUSTOMER/scim/v2/ServiceProviderConfig"
+  "https://vc-mgmt-a.site-a.vcf.lab/usergroup/scim/v2/ServiceProviderConfig"
 kubectl exec -n default deploy/authentik-worker -- curl -sk -o /dev/null -w "Users %{http_code}\n" \
-  "https://vc-mgmt-a.site-a.vcf.lab/usergroup/t/CUSTOMER/scim/v2/Users"
+  "https://vc-mgmt-a.site-a.vcf.lab/usergroup/scim/v2/Users"
 kubectl exec -n default deploy/authentik-worker -- curl -sk -o /dev/null -w "Groups %{http_code}\n" \
-  "https://vc-mgmt-a.site-a.vcf.lab/usergroup/t/CUSTOMER/scim/v2/Groups"
+  "https://vc-mgmt-a.site-a.vcf.lab/usergroup/scim/v2/Groups"
 ```
 
 Expect **`ServiceProviderConfig` → 404** while **`Users` / `Groups` → 401** without a bearer token (routes exist; auth required). TLS to vCenter still succeeds — this is **not** a generic “network down” failure.
@@ -1824,7 +1824,7 @@ Expect **`ServiceProviderConfig` → 404** while **`Users` / `Groups` → 401** 
 kubectl logs -n default deploy/authentik-worker --tail=300 | grep -E 'ServiceProviderConfig|failed to sync'
 ```
 
-**Root Cause**: Authentik’s **outgoing SCIM** client follows **RFC 7644** and performs **`GET …/scim/v2/ServiceProviderConfig`** before syncing objects. **VMware vCenter’s VIDB SCIM API** at `…/usergroup/t/CUSTOMER/scim/v2` does **not** implement that resource (returns **404**). Authentik surfaces the failure as **`Network error communicating with remote system`**, which then appears on **every** user/group sync attempt in the same run — misleading wording; underlying issue is **missing `ServiceProviderConfig`**, not intermittent connectivity.
+**Root Cause**: Authentik’s **outgoing SCIM** client follows **RFC 7644** and performs **`GET …/scim/v2/ServiceProviderConfig`** before syncing objects. **VMware vCenter’s VIDB SCIM API** at `…/usergroup/scim/v2` does **not** implement `ServiceProviderConfig` (returns **404**). Authentik surfaces the failure as **`Network error communicating with remote system`**, which then appears on **every** user/group sync attempt in the same run — misleading wording; underlying issue is **missing `ServiceProviderConfig`**, not intermittent connectivity.
 
 **Fix**:
 
@@ -1834,7 +1834,7 @@ kubectl logs -n default deploy/authentik-worker --tail=300 | grep -E 'ServicePro
 
 **Key Details**:
 
-- The SCIM base URL is documented in `vcf-9-api` Section 16 (`https://<mgmt-vc>/usergroup/t/CUSTOMER/scim/v2`).
+- The correct SCIM base URL is `https://<mgmt-vc>/usergroup/scim/v2` (no `/t/CUSTOMER/` segment) — documented in `vcf-9-api` Section 16 and pitfall §77.
 - Pitfall **§71** in `vcf-9-api` summarizes the same behavior for API-focused lookups.
 
 ## 44. Federated SSO Login Fails Though SCIM Users and Groups Exist (e.g. `prod-admin`)
@@ -1961,3 +1961,57 @@ ssh root@vc-mgmt-a.site-a.vcf.lab "service-control --stop vc-ws1a-broker && slee
 - The `oiu` field in the VCDB `fed_IdentityProvider.configuration` JSON holds the expected issuer. Query it to confirm what VIDB expects before chasing Authentik.
 - After changing `issuer_mode`, the Authentik discovery endpoint (`/application/o/<slug>/.well-known/openid-configuration`) will reflect the new issuer immediately, but vc-ws1a-broker may cache the old value. A restart ensures the fresh discovery is fetched.
 - **Full SSO login fix chain** (from SCIM to working logins): (1) disable SCIM SSL verification in Authentik SCIM provider, (2) `sub_mode: hashed_user_id`, (3) add `vcf.lab` to Squid allowlist so VIDB can fetch JWKS, (4) `encryption_key: null` (no JWE), (5) `issuer_mode: per_provider`.
+
+## 47. Authentik SCIM Syncs Groups But 0 Users (Empty `property_mappings`)
+
+**Symptom**: The Authentik SCIM provider shows a recent `last_successful_sync` timestamp and groups appear in the Fleet IAM directory / vCenter VIDB, but **no users are provisioned**. The Authentik UI shows `Users: 0` and `Groups: N` for the SCIM provider. Federated login fails with `USER_NOT_FOUND` in `vc-ws1a-broker`’s `accesscontrol-service.log`.
+
+**Diagnosis**:
+
+```bash
+# Check SCIM provider counts via Authentik API
+curl -sk "https://auth.vcf.lab/api/v3/providers/scim/<pk>/" \
+  -H "Authorization: Bearer holodeck" | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+print('property_mappings:', d.get('property_mappings'))
+print('property_mappings_group:', d.get('property_mappings_group'))
+print('scim_users:', d.get('scim_users'))
+print('scim_groups:', d.get('scim_groups'))
+"
+```
+
+If `property_mappings` is `[]` (empty list), that is the root cause.
+
+**Root Cause**: Authentik’s SCIM provider requires explicit **property mappings** to know which user attributes to serialize and push to the downstream SCIM target. When `property_mappings` is empty, Authentik runs the sync task (no error), records a `last_successful_sync`, and syncs **group membership shells** (used for `group_filters` routing) — but **skips all user object pushes**. The `scim_users` counter stays 0. This is not logged as an error.
+
+**Fix**:
+
+```python
+import requests
+
+AUTH = "https://auth.vcf.lab/api/v3"
+HDR = {"Authorization": "Bearer holodeck", "Content-Type": "application/json"}
+SCIM_PK = <pk>  # your SCIM provider pk
+
+# 1. Look up default SCIM mapping PKs
+mappings = requests.get(f"{AUTH}/propertymappings/provider/scim/", headers=HDR, verify=False).json()
+pm_by_name = {m["name"]: m["pk"] for m in mappings["results"]}
+user_pm = pm_by_name["authentik default SCIM Mapping: User"]
+group_pm = pm_by_name["authentik default SCIM Mapping: Group"]
+
+# 2. PATCH the SCIM provider
+requests.patch(
+    f"{AUTH}/providers/scim/{SCIM_PK}/",
+    headers=HDR, verify=False,
+    json={"property_mappings": [user_pm], "property_mappings_group": [group_pm]},
+)
+```
+
+After patching, trigger a re-sync from the Authentik UI (SCIM provider → Sync now / Schedules → Play) or run `kubectl exec -n default deploy/authentik-worker -- python -m manage scim_sync "VCF SCIM"` from the worker pod. Users should appear within seconds.
+
+**Key Details**:
+
+- `Tools/authentik_vcf_integration.py` now always sets `property_mappings` and `property_mappings_group` when creating or patching the SCIM provider (using the names `authentik default SCIM Mapping: User` and `authentik default SCIM Mapping: Group`).
+- Group membership *shells* (the `scim_groups` count) can appear healthy even when users are 0 — do not use non-zero `scim_groups` as evidence that users are also syncing.
+- The mapping endpoint is `GET /api/v3/propertymappings/provider/scim/` (not `.../provider/saml/` or `.../all/`).
+- Related: pitfall §76 in `vcf-9-api` skill.

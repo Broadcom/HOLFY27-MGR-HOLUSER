@@ -1,6 +1,6 @@
 """
 TODO: This script is a work in progress. It is not yet complete.
-VERSION: 0.0.1 - 2026-04-27
+VERSION: 0.0.2 - 2026-05-04
 AUTHOR: Burke Azbill and HOL Core Team
 
 This script is used to configure the Authentik identity provider for VCF SSO (OIDC + SCIM).

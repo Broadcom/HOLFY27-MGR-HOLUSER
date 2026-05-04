@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TODO: This script is a work in progress. It is not yet complete.
-VERSION: 0.0.2 - 2026-04-28
+VERSION: 0.0.3 - 2026-05-04
 AUTHOR: Burke Azbill and HOL Core Team
 
 Authentik + VCF lab integration (Cycle 7).
@@ -495,6 +495,64 @@ class AuthentikApi:
         except Exception:
             data = {'raw': r.text[:2000]}
         return r.status_code, data
+
+    def _get_oauth2_scope_mapping_pks(self, scope_names: List[str]) -> List[str]:
+        """Look up Authentik OAuth2 scope mapping UUIDs by name (propertymappings/provider/scope/)."""
+        if not scope_names:
+            return []
+        all_scopes: List[Dict] = []
+        try:
+            all_scopes = self.paginate_list('propertymappings/provider/scope/')
+        except Exception as e:
+            _log(self.write, f'  WARNING: could not fetch OAuth2 scope mappings: {e}')
+            return []
+        by_name: Dict[str, str] = {
+            m.get('name', ''): str(m['pk']) for m in all_scopes if m.get('pk') and m.get('name')
+        }
+        pks: List[str] = []
+        for name in scope_names:
+            pk = by_name.get(name)
+            if pk:
+                pks.append(pk)
+            else:
+                _log(self.write, f'  WARNING: OAuth2 scope mapping {name!r} not found — skipping')
+        return pks
+
+    def ensure_oauth2_provider_scopes(
+        self,
+        provider_pk: Any,
+        scope_names: List[str],
+        dry_run: bool,
+    ) -> bool:
+        """Ensure the OAuth2/OIDC provider has the required scope mappings.
+
+        Additive: any scopes already present are preserved. Only missing scopes are added.
+        Idempotent: re-running with the same scope list is a no-op.
+        """
+        if dry_run or not scope_names or not self._sess:
+            return True
+        try:
+            detail = self._oauth2_provider_detail(provider_pk)
+        except Exception as e:
+            _log(self.write, f'  WARNING: could not read OAuth2 provider pk={provider_pk} for scope check: {e}')
+            return False
+        current_pks: set = {str(x) for x in (detail.get('property_mappings') or [])}
+        desired_pks: set = set(self._get_oauth2_scope_mapping_pks(scope_names))
+        missing = desired_pks - current_pks
+        if not missing:
+            _log(self.write, '  Authentik OAuth2: required OIDC scopes already present.')
+            return True
+        merged = list(current_pks | desired_pks)
+        code, body = self.patch_json(f'providers/oauth2/{int(provider_pk)}/', {'property_mappings': merged})
+        if code in (200, 201):
+            _log(
+                self.write,
+                f'  Authentik OAuth2: added missing OIDC scope mappings to provider pk={provider_pk} '
+                f'({len(missing)} added, {len(merged)} total).',
+            )
+            return True
+        _log(self.write, f'  WARNING: OAuth2 scope PATCH HTTP {code}: {_redact(body)!s}')
+        return False
 
     def align_oauth2_sub_mode_for_fleet_iam(
         self,
@@ -1278,6 +1336,19 @@ def run_authentik_vcf_integration(
     if cfg.has_option('VCFFINAL', 'authentik_oauth_provider_name'):
         oauth_provider_name = cfg.get('VCFFINAL', 'authentik_oauth_provider_name').strip()
 
+    # OIDC scope mappings that must be set on the OAuth2 provider for claims to flow correctly.
+    # These correspond to Authentik's built-in scope mappings for email, openid, profile.
+    _default_oidc_scopes = [
+        "authentik default OAuth Mapping: OpenID 'email'",
+        "authentik default OAuth Mapping: OpenID 'openid'",
+        "authentik default OAuth Mapping: OpenID 'profile'",
+    ]
+    oauth_scope_names: List[str] = _default_oidc_scopes
+    if cfg.has_option('VCFFINAL', 'authentik_oauth_scope_names'):
+        v = cfg.get('VCFFINAL', 'authentik_oauth_scope_names').strip()
+        if v:
+            oauth_scope_names = [x.strip() for x in v.split(',') if x.strip()]
+
     scim_provider_name = 'VCF SCIM'
     if cfg.has_option('VCFFINAL', 'authentik_scim_provider_name'):
         scim_provider_name = cfg.get('VCFFINAL', 'authentik_scim_provider_name').strip()
@@ -1411,6 +1482,8 @@ def run_authentik_vcf_integration(
 
     if prov_pk is not None and not dry_run:
         ak.align_oauth2_sub_mode_for_fleet_iam(prov_pk, cfg, dry_run)
+        if not ak.ensure_oauth2_provider_scopes(prov_pk, oauth_scope_names, dry_run):
+            ok = False
 
     if dry_run or not client_secret:
         _log(write, 'Dry-run or reused provider without secret — skipping downstream IdP / SCIM steps.')
