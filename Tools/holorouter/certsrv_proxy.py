@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Author: Burke Azbill, Cursor AI
-Version: 1.0.0
-Date: 2026-04-02
+Version: 1.1.0
+Date: 2026-05-04
 
 Name: VCF CA Proxy
 
@@ -1421,9 +1421,11 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore, key_store:
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_cert(self, cert_data: bytes, content_type: str = 'application/pkix-cert'):
+        def _send_cert(self, cert_data: bytes, content_type: str = 'application/pkix-cert', filename: str = None):
             self.send_response(200)
             self.send_header('Content-Type', content_type)
+            if filename:
+                self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
             self.send_header('Content-Length', str(len(cert_data)))
             self.end_headers()
             self.wfile.write(cert_data)
@@ -1727,9 +1729,9 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore, key_store:
                 if encoding == 'bin':
                     ca_cert = x509.load_pem_x509_certificate(ca_pem.encode())
                     der = ca_cert.public_bytes(serialization.Encoding.DER)
-                    self._send_cert(der, 'text/html')
+                    self._send_cert(der, 'text/html', filename='certnew.cer')
                 else:
-                    self._send_cert(ca_pem.encode(), 'text/html')
+                    self._send_cert(ca_pem.encode(), 'text/html', filename='certnew.cer')
                 return
 
             try:
@@ -1752,15 +1754,15 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore, key_store:
             if encoding == 'bin':
                 cert = x509.load_pem_x509_certificate(cert_pem.encode())
                 der = cert.public_bytes(serialization.Encoding.DER)
-                self._send_cert(der, 'text/html')
+                self._send_cert(der, 'text/html', filename='certnew.cer')
             else:
                 pem_blocks = re.findall(
                     r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----',
                     cert_pem, re.DOTALL)
                 if pem_blocks:
-                    self._send_cert(pem_blocks[0].encode(), 'text/html')
+                    self._send_cert(pem_blocks[0].encode(), 'text/html', filename='certnew.cer')
                 else:
-                    self._send_cert(cert_pem.encode(), 'text/html')
+                    self._send_cert(cert_pem.encode(), 'text/html', filename='certnew.cer')
 
         def _handle_certnew_p7b(self, params: dict):
             """Handle PKCS#7 retrieval — CA chain or issued cert chain."""
@@ -1816,9 +1818,9 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore, key_store:
                 b64_raw = base64.b64encode(p7_der).decode()
                 lines = [b64_raw[i:i+64] for i in range(0, len(b64_raw), 64)]
                 pem_p7b = '-----BEGIN CERTIFICATE-----\n' + '\n'.join(lines) + '\n-----END CERTIFICATE-----\n'
-                self._send_cert(pem_p7b.encode(), 'application/x-pkcs7-certificates')
+                self._send_cert(pem_p7b.encode(), 'application/x-pkcs7-certificates', filename='certnew.p7b')
             else:
-                self._send_cert(p7_der, 'application/x-pkcs7-certificates')
+                self._send_cert(p7_der, 'application/x-pkcs7-certificates', filename='certnew.p7b')
 
         def _handle_certnew_crl(self, params: dict):
             """Handle CRL retrieval."""
@@ -1831,7 +1833,7 @@ def make_handler(vault_client: VaultPKIClient, cert_store: CertStore, key_store:
                 self._send_html(500, page_wrap('Error', '<p>CRL unavailable.</p>'))
                 return
                 
-            self._send_cert(crl_data, 'application/pkix-crl')
+            self._send_cert(crl_data, 'application/pkix-crl', filename='certnew.crl')
 
         def _handle_api_certs(self):
             """JSON API: list all issued certificates."""
@@ -2129,3 +2131,4 @@ Examples:
 
 if __name__ == '__main__':
     main()
+
