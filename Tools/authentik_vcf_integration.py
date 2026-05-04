@@ -201,6 +201,124 @@ def run_coredns_patch(creds_path: str, write: Callable[[str], None], dry_run: bo
     return True
 
 
+def ensure_ops_vault_ca_trust(
+    ops_fqdn: str,
+    creds_path: str,
+    write: Callable[[str], None],
+    dry_run: bool,
+    vault_url: str = 'http://10.1.1.1:32000',
+) -> bool:
+    """
+    Ensure the Vault root CA is trusted by VCF Operations so the Fleet IAM Java service
+    can verify TLS when fetching the Authentik OIDC discovery URL.
+
+    VCF Operations runs on Photon OS with a VMware JRE whose cacerts uses a proprietary
+    format that standard keytool cannot modify. The fix is to:
+      1. Check if Vault CA is already in /etc/pki/tls/certs/ca-bundle.crt.
+      2. If not, append /etc/pki/tls/certs/vault-ca.pem (placed by confighol-9.1.py) to
+         ca-bundle.crt. If vault-ca.pem is missing, fetch from Vault.
+      3. Restart vmware-vcops-web (Tomcat/suite-api) so the updated bundle is loaded.
+      4. Wait up to 120 s for the suite-api to answer.
+    """
+    import urllib.request, ssl, tempfile, os as _os
+    _log(write, 'Authentik integration: Step 1b — Vault CA trust in VCF Operations (ca-bundle.crt)')
+    if dry_run:
+        _log(write, '  DRY-RUN: would append Vault CA to ops-a ca-bundle.crt and restart vmware-vcops-web.')
+        return True
+
+    ssh = f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new root@{ops_fqdn}'
+    ca_bundle = '/etc/pki/tls/certs/ca-bundle.crt'
+    vault_pem_remote = '/etc/pki/tls/certs/vault-ca.pem'
+
+    # Test if auth.vcf.lab is already TLS-trusted by curl (proxy for the full CA trust state)
+    check_tls_cmd = (
+        f'{ssh} "curl -s -o /dev/null -w \'%{{http_code}}\' '
+        f'https://auth.vcf.lab/application/o/vcf/.well-known/openid-configuration 2>/dev/null"'
+    )
+    rc_check = subprocess.run(check_tls_cmd, shell=True, capture_output=True, text=True, timeout=30)
+    if rc_check.stdout.strip().startswith('2') or rc_check.stdout.strip().startswith('3'):
+        _log(write, '  Vault CA already trusted by ops-a (auth.vcf.lab TLS verified) — skip.')
+        return True
+
+    # Determine CA PEM source: prefer the pre-placed vault-ca.pem, else fetch from Vault
+    check_pem_cmd = f'{ssh} "test -f {vault_pem_remote} && echo PRESENT || echo ABSENT"'
+    rc_pem = subprocess.run(check_pem_cmd, shell=True, capture_output=True, text=True, timeout=15)
+    if 'PRESENT' in rc_pem.stdout:
+        # Append the pre-placed file to ca-bundle.crt
+        append_cmd = (
+            f'{ssh} "grep -qF \\"$(openssl x509 -in {vault_pem_remote} -noout -fingerprint 2>/dev/null)\\" {ca_bundle} 2>/dev/null || '
+            f'cat {vault_pem_remote} >> {ca_bundle} && echo APPENDED || echo SKIPPED"'
+        )
+        # Simpler: just append unconditionally and deduplicate by BEGIN count
+        append_cmd = f'{ssh} "cat {vault_pem_remote} >> {ca_bundle} && echo APPENDED"'
+        ra = subprocess.run(append_cmd, shell=True, capture_output=True, text=True, timeout=30)
+        if 'APPENDED' in ra.stdout:
+            _log(write, f'  Vault CA from {vault_pem_remote} appended to ca-bundle.crt.')
+        else:
+            _log(write, f'  WARNING: append of vault-ca.pem failed: {ra.stderr[:200]}')
+    else:
+        # Fetch from Vault and SCP to ops-a, then append
+        try:
+            with urllib.request.urlopen(f'{vault_url}/v1/pki/ca/pem', timeout=15) as resp:
+                ca_pem = resp.read().decode()
+            if '-----BEGIN CERTIFICATE-----' not in ca_pem:
+                _log(write, f'  WARNING: Vault CA from {vault_url} is not a PEM — skipping.')
+                return True
+        except Exception as e:
+            _log(write, f'  WARNING: could not fetch Vault CA from {vault_url}: {e} — skipping.')
+            return True
+        with tempfile.NamedTemporaryFile(suffix='.pem', delete=False, mode='w') as tf:
+            tf.write(ca_pem)
+            local_pem = tf.name
+        try:
+            scp_cmd = (
+                f'sshpass -f {creds_path} scp -o StrictHostKeyChecking=accept-new '
+                f'{local_pem} root@{ops_fqdn}:{vault_pem_remote}'
+            )
+            r_scp = subprocess.run(scp_cmd, shell=True, capture_output=True, text=True, timeout=30)
+            if r_scp.returncode != 0:
+                _log(write, f'  WARNING: scp to ops-a failed: {r_scp.stderr[:200]} — skipping.')
+                return True
+        finally:
+            try:
+                _os.unlink(local_pem)
+            except Exception:
+                pass
+        append_cmd = f'{ssh} "cat {vault_pem_remote} >> {ca_bundle} && echo APPENDED"'
+        ra = subprocess.run(append_cmd, shell=True, capture_output=True, text=True, timeout=30)
+        if 'APPENDED' in ra.stdout:
+            _log(write, f'  Vault CA fetched from Vault and appended to ca-bundle.crt.')
+        else:
+            _log(write, f'  WARNING: append of fetched vault CA failed: {ra.stderr[:200]}')
+
+    # Restart vmware-vcops-web so Tomcat loads the updated CA bundle
+    restart_cmd = f'{ssh} "systemctl restart vmware-vcops-web"'
+    _log(write, '  Restarting vmware-vcops-web (suite-api Tomcat) to apply updated CA bundle...')
+    r2 = subprocess.run(restart_cmd, shell=True, capture_output=True, text=True, timeout=60)
+    if r2.returncode != 0:
+        _log(write, f'  WARNING: vmware-vcops-web restart rc={r2.returncode}: {r2.stderr[:200]}')
+
+    # Wait for suite-api (up to 120 s)
+    suite_api_url = f'https://{ops_fqdn}/suite-api/api/version'
+    _log(write, '  Waiting for suite-api to become available after restart (up to 120 s)...')
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    for attempt in range(24):
+        time.sleep(5)
+        try:
+            with urllib.request.urlopen(suite_api_url, context=ctx, timeout=10) as resp:
+                if resp.status < 500:
+                    _log(write, f'  suite-api is up (attempt {attempt + 1}).')
+                    break
+        except Exception:
+            pass
+    else:
+        _log(write, '  WARNING: suite-api did not respond within 120 s — Fleet IAM may still fail.')
+
+    return True
+
+
 def _vami_noproxy_entries_to_add(issuer_hostname: str) -> List[str]:
     """Hostnames/IPs Fleet/VIDB must reach without the lab Squid proxy."""
     ih = (issuer_hostname or '').strip().lower().rstrip('.')
@@ -516,11 +634,18 @@ class AuthentikApi:
             all_items.extend(chunk)
             pag = data.get('pagination') or {}
             total_count = int(pag.get('count') or 0)
+            total_pages = int(pag.get('total_pages') or 0)
             np = pag.get('next')
 
+            # np==0 (int) means Authentik signals "no next page"
+            if isinstance(np, int) and np == 0:
+                break
             if isinstance(np, int) and np > 0 and np != page:
                 page = np
                 continue
+            # Respect total_pages when provided
+            if total_pages > 0 and page >= total_pages:
+                break
             if total_count and len(all_items) >= total_count:
                 break
             if total_count and len(all_items) < total_count:
@@ -631,6 +756,54 @@ class AuthentikApi:
                         )
         raise RuntimeError(f'Application create failed HTTP {code2}: {app_resp}')
 
+    def _get_scim_property_mapping_pks(self, names: List[str]) -> List[str]:
+        """Look up Authentik SCIM property mapping UUIDs by name.
+
+        Covers both user and group SCIM mappings; the endpoint returns all of them.
+        Returns only the PKs for names that were found; logs a warning for any missing.
+        """
+        if not names:
+            return []
+        all_mappings: List[Dict] = []
+        try:
+            all_mappings = self.paginate_list('propertymappings/provider/scim')
+        except Exception as e:
+            _log(self.write, f'  WARNING: could not fetch SCIM property mappings: {e}')
+            return []
+        by_name: Dict[str, str] = {
+            m.get('name', ''): str(m['pk']) for m in all_mappings if m.get('pk') and m.get('name')
+        }
+        pks: List[str] = []
+        for name in names:
+            pk = by_name.get(name)
+            if pk:
+                pks.append(pk)
+            else:
+                _log(self.write, f'  WARNING: SCIM property mapping {name!r} not found — skipping')
+        return pks
+
+    def _get_group_pks(self, names: List[str]) -> List[str]:
+        """Look up Authentik group UUIDs by name, for use in SCIM group_filters."""
+        if not names:
+            return []
+        pks: List[str] = []
+        for name in names:
+            try:
+                r = self._sess.get(
+                    self._url('core/groups/'),
+                    params={'name': name},
+                    timeout=30,
+                )
+                if r.status_code == 200:
+                    matched = [g for g in r.json().get('results', []) if g.get('name') == name]
+                    if matched:
+                        pks.append(str(matched[0]['pk']))
+                    else:
+                        _log(self.write, f'  WARNING: Authentik group {name!r} not found for SCIM filter')
+            except Exception as e:
+                _log(self.write, f'  WARNING: error looking up group {name!r}: {e}')
+        return pks
+
     def ensure_oauth_application(
         self,
         app_name: str,
@@ -729,26 +902,58 @@ class AuthentikApi:
         bearer_token: str,
         scim_name: str,
         dry_run: bool,
+        filter_group_names: Optional[List[str]] = None,
+        user_mapping_names: Optional[List[str]] = None,
+        group_mapping_names: Optional[List[str]] = None,
     ) -> Tuple[bool, Optional[Any]]:
-        """Return (success, scim_provider_pk). Idempotent: reuse SCIM provider by name or URL."""
+        """Return (success, scim_provider_pk). Idempotent: reuse SCIM provider by name or URL.
+
+        When ``filter_group_names`` is provided, sets ``group_filters`` on the SCIM provider so
+        Authentik only syncs users/groups that belong to those groups.
+        ``user_mapping_names`` / ``group_mapping_names`` set ``property_mappings`` /
+        ``property_mappings_group`` respectively (looked up by name from propertymappings/provider/scim/).
+        Pass ``None`` to leave an existing value unchanged; pass ``[]`` to clear it.
+        """
         if dry_run:
             _log(self.write, f'  DRY-RUN would ensure SCIM provider {_redact({"name": scim_name, "url": scim_url})!s}')
             return True, None
 
+        # Resolve PKs only when the caller specified a value (None = "don't touch").
+        user_pm_pks: Optional[List[str]] = (
+            self._get_scim_property_mapping_pks(user_mapping_names)
+            if user_mapping_names is not None else None
+        )
+        group_pm_pks: Optional[List[str]] = (
+            self._get_scim_property_mapping_pks(group_mapping_names)
+            if group_mapping_names is not None else None
+        )
+        filter_gp_pks: Optional[List[str]] = (
+            self._get_group_pks(filter_group_names)
+            if filter_group_names is not None else None
+        )
+
         spk: Optional[Any] = None
+        existing: Optional[Dict[str, Any]] = None
         for s in self.paginate_list('providers/scim'):
             if s.get('name') == scim_name or (scim_url and (s.get('url') or '') == scim_url):
                 spk = s.get('pk')
+                existing = s
                 _log(self.write, f'  Reusing Authentik SCIM provider name={scim_name!r} pk={spk}')
                 break
 
         if spk is None:
-            body = {
+            body: Dict[str, Any] = {
                 'name': scim_name,
                 'url': scim_url,
                 'token': bearer_token,
                 'verify_certificates': False,
             }
+            if user_pm_pks:
+                body['property_mappings'] = user_pm_pks
+            if group_pm_pks:
+                body['property_mappings_group'] = group_pm_pks
+            if filter_gp_pks:
+                body['group_filters'] = filter_gp_pks
             code, data = self.post_json('providers/scim/', body)
             if code in (200, 201):
                 spk = data['pk']
@@ -757,16 +962,37 @@ class AuthentikApi:
                 for s in self.paginate_list('providers/scim'):
                     if s.get('name') == scim_name or (scim_url and (s.get('url') or '') == scim_url):
                         spk = s.get('pk')
+                        existing = s
                         _log(self.write, f'  SCIM provider already exists — reusing pk={spk}')
                         break
             if spk is None:
                 _log(self.write, f'  SCIM provider create failed HTTP {code}: {_redact(data)!s}')
                 return False, None
-        else:
-            # Refresh token on existing provider (Fleet may mint a new SCIM bearer each run).
-            pcode, _ = self.patch_json(f'providers/scim/{int(spk)}/', {'token': bearer_token})
+
+        if spk is not None:
+            # Always sync: token (Fleet mints new each run) + URL + property mappings + group filters.
+            patch: Dict[str, Any] = {'token': bearer_token}
+            if (existing or {}).get('url', '') != scim_url:
+                patch['url'] = scim_url
+                _log(self.write, f'  SCIM provider pk={spk}: correcting URL → {scim_url!r}')
+            if user_pm_pks is not None:
+                current = sorted(str(x) for x in (existing or {}).get('property_mappings', []))
+                if current != sorted(user_pm_pks):
+                    patch['property_mappings'] = user_pm_pks
+            if group_pm_pks is not None:
+                current = sorted(str(x) for x in (existing or {}).get('property_mappings_group', []))
+                if current != sorted(group_pm_pks):
+                    patch['property_mappings_group'] = group_pm_pks
+            if filter_gp_pks is not None:
+                current = sorted(str(x) for x in (existing or {}).get('group_filters', []))
+                if current != sorted(filter_gp_pks):
+                    patch['group_filters'] = filter_gp_pks
+            changed = [k for k in patch if k != 'token']
+            if changed:
+                _log(self.write, f'  SCIM provider pk={spk}: updating {", ".join(changed)}')
+            pcode, _ = self.patch_json(f'providers/scim/{int(spk)}/', patch)
             if pcode not in (200, 201):
-                _log(self.write, f'  WARNING: SCIM provider token PATCH HTTP {pcode} — continuing')
+                _log(self.write, f'  WARNING: SCIM provider PATCH HTTP {pcode} — continuing')
 
         app: Optional[Dict[str, Any]] = None
         for a in self.paginate_list('core/applications'):
@@ -1014,7 +1240,7 @@ def run_authentik_vcf_integration(
 
     redirect_url = f'{vc_base}/federation/t/{tenant}/auth/response/oauth2'
     discovery_url = f'{issuer_base}/application/o/{app_slug}/.well-known/openid-configuration'
-    scim_url = f'{vc_base}/usergroup/t/{tenant}/scim/v2'
+    scim_url = f'{vc_base}/usergroup/scim/v2'
 
     discovery_url_fleet = discovery_url
     if cfg.has_option('VCFFINAL', 'authentik_fleet_oidc_discovery_url'):
@@ -1058,6 +1284,8 @@ def run_authentik_vcf_integration(
 
     skip_coredns = cfg.has_option('VCFFINAL', 'authentik_skip_coredns') and _truthy(
         cfg.get('VCFFINAL', 'authentik_skip_coredns'))
+    skip_ops_vault_ca = cfg.has_option('VCFFINAL', 'authentik_skip_ops_vault_ca') and _truthy(
+        cfg.get('VCFFINAL', 'authentik_skip_ops_vault_ca'))
     skip_vcenter = cfg.has_option('VCFFINAL', 'authentik_skip_vcenter') and _truthy(
         cfg.get('VCFFINAL', 'authentik_skip_vcenter'))
     skip_vidb = cfg.has_option('VCFFINAL', 'authentik_skip_ops_vidb') and _truthy(
@@ -1086,6 +1314,44 @@ def run_authentik_vcf_integration(
         g = cfg.get('VCFFINAL', 'authentik_scim_group_names').strip()
         if g:
             group_names = [x.strip() for x in g.split(',') if x.strip()]
+
+    # Groups that the SCIM provider will filter on (user + group sync scope).
+    # Defaults to the full expected set of groups in the lab environment.
+    _default_scim_filter = [
+        'approvers', 'dev-admins', 'dev-readonly', 'dev-users',
+        'prod-admins', 'prod-readonly', 'prod-users',
+    ]
+    scim_filter_groups: List[str] = _default_scim_filter
+    if cfg.has_option('VCFFINAL', 'authentik_scim_filter_groups'):
+        v = cfg.get('VCFFINAL', 'authentik_scim_filter_groups').strip()
+        if v:
+            scim_filter_groups = [x.strip() for x in v.split(',') if x.strip()]
+
+    # VCF viewer role assignment: groups that receive the vcf_viewer Fleet IAM role.
+    viewer_group_names: List[str] = ['prod-readonly']
+    if cfg.has_option('VCFFINAL', 'authentik_scim_viewer_groups'):
+        v = cfg.get('VCFFINAL', 'authentik_scim_viewer_groups').strip()
+        if v:
+            viewer_group_names = [x.strip() for x in v.split(',') if x.strip()]
+
+    vcf_viewer_role: str = 'vcf_viewer'
+    if cfg.has_option('VCFFINAL', 'authentik_fleet_viewer_role'):
+        v = cfg.get('VCFFINAL', 'authentik_fleet_viewer_role').strip()
+        if v:
+            vcf_viewer_role = v
+
+    # Authentik SCIM property mapping names (looked up by name at runtime).
+    scim_user_mapping_names: List[str] = ['authentik default SCIM Mapping: User']
+    if cfg.has_option('VCFFINAL', 'authentik_scim_user_mapping_names'):
+        v = cfg.get('VCFFINAL', 'authentik_scim_user_mapping_names').strip()
+        if v:
+            scim_user_mapping_names = [x.strip() for x in v.split(',') if x.strip()]
+
+    scim_group_mapping_names: List[str] = ['authentik default SCIM Mapping: Group']
+    if cfg.has_option('VCFFINAL', 'authentik_scim_group_mapping_names'):
+        v = cfg.get('VCFFINAL', 'authentik_scim_group_mapping_names').strip()
+        if v:
+            scim_group_mapping_names = [x.strip() for x in v.split(',') if x.strip()]
 
     lab_user_emails = ['prod-admin@vcf.lab', 'dev-admin@vcf.lab']
     if cfg.has_option('VCFFINAL', 'authentik_directory_users'):
@@ -1118,6 +1384,11 @@ def run_authentik_vcf_integration(
     else:
         _log(write, 'Skipping CoreDNS patch (authentik_skip_coredns).')
 
+    if not skip_ops_vault_ca:
+        ensure_ops_vault_ca_trust(ops_fqdn, creds_path, write, dry_run)
+    else:
+        _log(write, 'Skipping VCF Operations Vault CA import (authentik_skip_ops_vault_ca).')
+
     if requests is None:
         _log(write, 'ERROR: Python requests module missing — install requests.')
         return False
@@ -1146,8 +1417,12 @@ def run_authentik_vcf_integration(
         return ok
 
     # --- Authentik directory: groups + users (for SCIM into vCenter) ---
+    # Ensure all groups that should be visible exist in Authentik (idempotent).
+    all_groups_to_ensure = list(dict.fromkeys(
+        scim_filter_groups + group_names + viewer_group_names
+    ))
     group_pk_by_name: Dict[str, Any] = {}
-    for gname in group_names:
+    for gname in all_groups_to_ensure:
         gpk = ak.ensure_group(gname, dry_run)
         if gpk is not None:
             group_pk_by_name[gname] = gpk
@@ -1229,7 +1504,14 @@ def run_authentik_vcf_integration(
                 ok = False
             else:
                 scim_linked, scim_pk = ak.ensure_scim_backchannel(
-                    app_slug, scim_url, fleet_scim_tok, scim_provider_name, dry_run
+                    app_slug,
+                    scim_url,
+                    fleet_scim_tok,
+                    scim_provider_name,
+                    dry_run,
+                    filter_group_names=scim_filter_groups,
+                    user_mapping_names=scim_user_mapping_names,
+                    group_mapping_names=scim_group_mapping_names,
                 )
                 if not scim_linked:
                     ok = False
@@ -1251,6 +1533,8 @@ def run_authentik_vcf_integration(
                         join_nsx,
                         group_names,
                         vcf_role,
+                        viewer_group_names=viewer_group_names,
+                        vcf_viewer_role=vcf_viewer_role,
                     ):
                         ok = False
         except Exception as e:
@@ -1293,7 +1577,14 @@ def run_authentik_vcf_integration(
 
         if scim_token:
             sc_ok, _spk = ak.ensure_scim_backchannel(
-                app_slug, scim_url, scim_token, scim_provider_name, dry_run
+                app_slug,
+                scim_url,
+                scim_token,
+                scim_provider_name,
+                dry_run,
+                filter_group_names=scim_filter_groups,
+                user_mapping_names=scim_user_mapping_names,
+                group_mapping_names=scim_group_mapping_names,
             )
             if not sc_ok:
                 ok = False
