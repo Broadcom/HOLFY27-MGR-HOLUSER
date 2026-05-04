@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TODO: This script is a work in progress. It is not yet complete.
-VERSION: 0.0.3 - 2026-05-04
+VERSION: 0.0.4 - 2026-05-04
 AUTHOR: Burke Azbill and HOL Core Team
 
 Authentik + VCF lab integration (Cycle 7).
@@ -1380,11 +1380,23 @@ def run_authentik_vcf_integration(
     if cfg.has_option('VCFFINAL', 'authentik_fleet_vcf_role'):
         vcf_role = cfg.get('VCFFINAL', 'authentik_fleet_vcf_role').strip() or vcf_role
 
-    group_names = ['prod-admins', 'dev-admins']
+    group_names = ['prod-admins']
     if cfg.has_option('VCFFINAL', 'authentik_scim_group_names'):
         g = cfg.get('VCFFINAL', 'authentik_scim_group_names').strip()
         if g:
             group_names = [x.strip() for x in g.split(',') if x.strip()]
+
+    sddc_admin_group_names: List[str] = ['dev-admins']
+    if cfg.has_option('VCFFINAL', 'authentik_scim_sddc_admin_groups'):
+        g = cfg.get('VCFFINAL', 'authentik_scim_sddc_admin_groups').strip()
+        if g:
+            sddc_admin_group_names = [x.strip() for x in g.split(',') if x.strip()]
+
+    vcf_sddc_role: str = 'sddc_admin'
+    if cfg.has_option('VCFFINAL', 'authentik_fleet_sddc_role'):
+        r = cfg.get('VCFFINAL', 'authentik_fleet_sddc_role').strip()
+        if r:
+            vcf_sddc_role = r
 
     # Groups that the SCIM provider will filter on (user + group sync scope).
     # Defaults to the full expected set of groups in the lab environment.
@@ -1492,7 +1504,7 @@ def run_authentik_vcf_integration(
     # --- Authentik directory: groups + users (for SCIM into vCenter) ---
     # Ensure all groups that should be visible exist in Authentik (idempotent).
     all_groups_to_ensure = list(dict.fromkeys(
-        scim_filter_groups + group_names + viewer_group_names
+        scim_filter_groups + group_names + viewer_group_names + sddc_admin_group_names
     ))
     group_pk_by_name: Dict[str, Any] = {}
     for gname in all_groups_to_ensure:
@@ -1504,7 +1516,12 @@ def run_authentik_vcf_integration(
         if local.startswith('prod'):
             gname = 'prod-admins' if 'prod-admins' in group_names else group_names[0]
         else:
-            gname = 'dev-admins' if 'dev-admins' in group_names else group_names[-1]
+            if 'dev-admins' in sddc_admin_group_names:
+                gname = 'dev-admins'
+            elif sddc_admin_group_names:
+                gname = sddc_admin_group_names[0]
+            else:
+                gname = group_names[-1] if group_names else 'dev-admins'
         gpk = group_pk_by_name.get(gname)
         if not gpk:
             _log(write, f'  WARNING: missing group pk for {gname!r} — skip user {email!r}')
@@ -1516,20 +1533,21 @@ def run_authentik_vcf_integration(
             ok = False
 
     use_fleet_iam = not skip_fleet_iam
-    if (use_fleet_iam or not skip_vcenter) and not skip_mgmt_vc_no_proxy:
-        if not ensure_mgmt_vcenter_no_proxy_for_oidc(
-            mgmt_vc,
-            issuer_host,
-            password,
-            creds_path,
-            write,
-            dry_run,
-            verify_tls,
-            restart_vmware_vmon=not skip_mgmt_vc_vmon_restart,
-        ):
-            ok = False
-    elif skip_mgmt_vc_no_proxy:
-        _log(write, 'Skipping management vCenter NO_PROXY patch (authentik_skip_mgmt_vc_no_proxy).')
+    # NO_PROXY modification is no longer required as vcf.lab is in the squid proxy allowlist.
+    # if (use_fleet_iam or not skip_vcenter) and not skip_mgmt_vc_no_proxy:
+    #     if not ensure_mgmt_vcenter_no_proxy_for_oidc(
+    #         mgmt_vc,
+    #         issuer_host,
+    #         password,
+    #         creds_path,
+    #         write,
+    #         dry_run,
+    #         verify_tls,
+    #         restart_vmware_vmon=not skip_mgmt_vc_vmon_restart,
+    #     ):
+    #         ok = False
+    # elif skip_mgmt_vc_no_proxy:
+    #     _log(write, 'Skipping management vCenter NO_PROXY patch (authentik_skip_mgmt_vc_no_proxy).')
 
     if use_fleet_iam:
         _log(write, 'Fleet IAM path: VCF Operations suite-api (SSO realm, OIDC+SCIM IdP, SCIM token).')
@@ -1608,6 +1626,8 @@ def run_authentik_vcf_integration(
                         vcf_role,
                         viewer_group_names=viewer_group_names,
                         vcf_viewer_role=vcf_viewer_role,
+                        sddc_admin_group_names=sddc_admin_group_names,
+                        vcf_sddc_role=vcf_sddc_role,
                     ):
                         ok = False
         except Exception as e:
