@@ -206,7 +206,7 @@ def ensure_ops_vault_ca_trust(
     creds_path: str,
     write: Callable[[str], None],
     dry_run: bool,
-    vault_url: str = 'http://10.1.1.1:32000',
+    vault_url: str = 'https://vault.vcf.lab',
 ) -> bool:
     """
     Ensure the Vault root CA is trusted by VCF Operations so the Fleet IAM Java service
