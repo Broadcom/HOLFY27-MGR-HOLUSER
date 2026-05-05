@@ -930,21 +930,57 @@ class AuthentikApi:
         return True, spk
 
     def trigger_scim_provider_sync(self, provider_pk: Any) -> bool:
-        """Best-effort full SCIM push; Authentik also syncs periodically."""
+        """Best-effort full SCIM push by iterating over all objects."""
         pk = int(provider_pk)
+        
+        # Try generic full sync endpoints first (might be 405 on some versions)
         paths = [
             f'providers/scim/{pk}/sync/',
-            f'providers/scim/{pk}/sync/full/',
-            # Newer Authentik builds expose object sync; full push may still be async.
-            f'providers/scim/{pk}/sync/object/',
+            f'providers/scim/{pk}/sync/full/'
         ]
         for path in paths:
             code, data = self.post_json(path, {})
             if code in (200, 201, 204):
                 _log(self.write, f'  Authentik SCIM sync triggered via {path!r}.')
                 return True
-            _log(self.write, f'  Authentik SCIM sync {path!r} HTTP {code}: {_redact(data)!s}')
-        _log(self.write, '  WARNING: SCIM sync API not accepted; groups may appear after worker/hourly sync.')
+                
+        # If generic endpoints fail, fallback to object-by-object sync
+        _log(self.write, "  Authentik SCIM generic sync API unavailable; falling back to object-by-object sync.")
+        success_count = 0
+        error_count = 0
+        
+        # 1. Sync all groups
+        r_groups = self._sess.get(self._url('core/groups/'), timeout=60)
+        if r_groups.status_code == 200:
+            for g in r_groups.json().get('results', []):
+                payload = {
+                    "sync_object_model": "authentik.core.models.Group",
+                    "sync_object_id": str(g['pk'])
+                }
+                c, _ = self.post_json(f'providers/scim/{pk}/sync/object/', payload)
+                if c in (200, 201, 204):
+                    success_count += 1
+                else:
+                    error_count += 1
+        
+        # 2. Sync all users
+        r_users = self._sess.get(self._url('core/users/'), timeout=60)
+        if r_users.status_code == 200:
+            for u in r_users.json().get('results', []):
+                # skip internal service accounts if needed, but safe to sync all
+                if u.get('type') == 'internal':
+                    continue
+                payload = {
+                    "sync_object_model": "authentik.core.models.User",
+                    "sync_object_id": str(u['pk'])
+                }
+                c, _ = self.post_json(f'providers/scim/{pk}/sync/object/', payload)
+                if c in (200, 201, 204):
+                    success_count += 1
+                else:
+                    error_count += 1
+                    
+        _log(self.write, f'  Authentik SCIM object sync completed (Success: {success_count}, Errors: {error_count}).')
         return True
 
     def ensure_group(self, name: str, dry_run: bool) -> Optional[int]:
