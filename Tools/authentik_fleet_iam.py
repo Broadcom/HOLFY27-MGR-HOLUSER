@@ -1,6 +1,6 @@
 """
 TODO: This script is a work in progress. It is not yet complete.
-VERSION: 0.0.1 - 2026-04-27
+VERSION: 0.0.3 - 2026-05-04
 AUTHOR: Burke Azbill and HOL Core Team
 
 This script is used to configure the Authentik identity provider for VCF SSO (OIDC + SCIM).
@@ -440,6 +440,7 @@ def assign_vcf_admin_to_groups(
     group_display_names: List[str],
     role_name: str,
     write: Optional[Callable[[str], None]],
+    wait_timeout_sec: int = 300,
 ) -> bool:
     ok = True
     assignment = [
@@ -449,7 +450,7 @@ def assign_vcf_admin_to_groups(
         }
     ]
     for gname in group_display_names:
-        gid = wait_for_group(client, sso_realm_id, gname, write)
+        gid = wait_for_group(client, sso_realm_id, gname, write, timeout_sec=wait_timeout_sec)
         if not gid:
             _log(write, f'  Fleet IAM: group {gname!r} not found after SCIM wait — skip role bind.')
             ok = False
@@ -646,6 +647,10 @@ def fleet_iam_post_scim_assign_and_join(
     join_nsx: bool,
     group_names: List[str],
     vcf_role: str,
+    viewer_group_names: Optional[List[str]] = None,
+    vcf_viewer_role: str = 'vcf_viewer',
+    sddc_admin_group_names: Optional[List[str]] = None,
+    vcf_sddc_role: str = 'sddc_admin',
 ) -> bool:
     """After Authentik SCIM provider exists: run sync, assign roles, join SSO."""
     client = FleetIamClient(ops_base, ops_token, write, verify_tls)
@@ -653,6 +658,21 @@ def fleet_iam_post_scim_assign_and_join(
     if not sync_ok:
         _log(write, '  WARNING: Authentik SCIM sync trigger reported failure — continuing with Join SSO.')
     assign_ok = assign_vcf_admin_to_groups(client, sso_realm_id, group_names, vcf_role, write)
+    if viewer_group_names:
+        # Viewer groups should already be SCIM-synced by the time admin groups completed; use short wait.
+        viewer_ok = assign_vcf_admin_to_groups(
+            client, sso_realm_id, viewer_group_names, vcf_viewer_role, write, wait_timeout_sec=60,
+        )
+        if not viewer_ok:
+            _log(write, f'  WARNING: {vcf_viewer_role!r} assignment to viewer groups incomplete.')
+            assign_ok = False
+    if sddc_admin_group_names:
+        sddc_ok = assign_vcf_admin_to_groups(
+            client, sso_realm_id, sddc_admin_group_names, vcf_sddc_role, write, wait_timeout_sec=60,
+        )
+        if not sddc_ok:
+            _log(write, f'  WARNING: {vcf_sddc_role!r} assignment to SDDC admin groups incomplete.')
+            assign_ok = False
     join_ok = join_default_sso_components(client, sso_realm_id, vidb_resource_id, write, join_nsx=join_nsx)
     if not assign_ok:
         _log(

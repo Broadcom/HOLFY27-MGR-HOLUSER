@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.4 - 2026-04-01
+# Version 3.5 - 2026-05-05
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -412,7 +412,133 @@ def main(lsf=None, standalone=False, dry_run=False):
     if dashboard:
         dashboard.update_task('prelim', 'vault_firefox_trust', 'complete')
         dashboard.generate_html()
-    
+
+    #==========================================================================
+    # TASK 10: Install Playwright on Manager (if required by config)
+    #
+    # Triggered when either of the following is true in config.ini:
+    #   [VCFFINAL] authentik_vcf_integration = true  (Authentik integration uses Playwright)
+    #   [VPOD]     install_playwright = true          (explicit opt-in)
+    #
+    # Idempotent: checks whether the Python package is importable AND whether
+    # the chromium browser binary is present before attempting any install.
+    # Both pip install and playwright install chromium are skipped if already done.
+    #==========================================================================
+
+    if dashboard:
+        dashboard.update_task('prelim', 'playwright_install', 'running')
+        dashboard.generate_html()
+
+    need_playwright = (
+        lsf.config.getboolean('VCFFINAL', 'authentik_vcf_integration', fallback=False)
+        or lsf.config.getboolean('VPOD', 'install_playwright', fallback=False)
+    )
+
+    if need_playwright:
+        lsf.write_output('Playwright required by config — checking installation on manager...')
+
+        import subprocess as _sub
+
+        # --- Check 1: is the playwright Python package importable? ---
+        pkg_check = _sub.run(
+            ['python3', '-c', 'import playwright'],
+            capture_output=True, timeout=30
+        )
+        playwright_pkg_ok = (pkg_check.returncode == 0)
+
+        # --- Check 2: is the chromium browser binary present? ---
+        chromium_ok = False
+        if playwright_pkg_ok:
+            chromium_check = _sub.run(
+                ['python3', '-c',
+                 'from playwright.sync_api import sync_playwright as _sp; '
+                 'import os as _os; '
+                 '_pw = _sp().start(); '
+                 '_ep = _pw.chromium.executable_path; '
+                 '_pw.stop(); '
+                 'assert _os.path.isfile(_ep), f"not found: {_ep}"'],
+                capture_output=True, text=True, timeout=30
+            )
+            chromium_ok = (chromium_check.returncode == 0)
+
+        if playwright_pkg_ok and chromium_ok:
+            lsf.write_output('Playwright package and chromium browser already installed — skipping.')
+            if dashboard:
+                dashboard.update_task('prelim', 'playwright_install', 'skipped',
+                                      'Already installed')
+                dashboard.generate_html()
+        elif dry_run:
+            lsf.write_output(
+                'Would install playwright package and chromium browser on manager (dry-run)')
+            if dashboard:
+                dashboard.update_task('prelim', 'playwright_install', 'complete')
+                dashboard.generate_html()
+        else:
+            playwright_install_ok = True
+
+            # --- Step 1: pip install playwright (if package missing) ---
+            if not playwright_pkg_ok:
+                lsf.write_output('Installing playwright Python package globally...')
+                pip_result = _sub.run(
+                    ['python3', '-m', 'pip', 'install',
+                     '--break-system-packages', 'playwright'],
+                    capture_output=True, text=True, timeout=300
+                )
+                if pip_result.stdout:
+                    for line in pip_result.stdout.strip().split('\n'):
+                        if line.strip():
+                            lsf.write_output(f'  pip: {line}')
+                if pip_result.returncode != 0:
+                    lsf.write_output(
+                        f'ERROR: playwright pip install failed (rc={pip_result.returncode})')
+                    if pip_result.stderr:
+                        lsf.write_output(
+                            f'  stderr: {pip_result.stderr.strip()[:500]}')
+                    playwright_install_ok = False
+                else:
+                    playwright_pkg_ok = True
+                    lsf.write_output('playwright package installed successfully.')
+
+            # --- Step 2: playwright install chromium (if browser missing) ---
+            if playwright_pkg_ok and not chromium_ok:
+                lsf.write_output('Installing playwright chromium browser...')
+                cr_result = _sub.run(
+                    ['python3', '-m', 'playwright', 'install', 'chromium'],
+                    capture_output=True, text=True, timeout=600
+                )
+                if cr_result.stdout:
+                    for line in cr_result.stdout.strip().split('\n'):
+                        if line.strip():
+                            lsf.write_output(f'  playwright: {line}')
+                if cr_result.returncode != 0:
+                    lsf.write_output(
+                        f'ERROR: playwright install chromium failed (rc={cr_result.returncode})')
+                    if cr_result.stderr:
+                        lsf.write_output(
+                            f'  stderr: {cr_result.stderr.strip()[:500]}')
+                    playwright_install_ok = False
+                else:
+                    lsf.write_output('playwright chromium browser installed successfully.')
+
+            if playwright_install_ok:
+                if dashboard:
+                    dashboard.update_task('prelim', 'playwright_install', 'complete')
+                    dashboard.generate_html()
+            else:
+                lsf.write_output(
+                    'WARNING: Playwright installation completed with errors — '
+                    'Authentik integration or Playwright-dependent tasks may fail.')
+                if dashboard:
+                    dashboard.update_task('prelim', 'playwright_install', 'failed',
+                                          'Install errors — see log')
+                    dashboard.generate_html()
+    else:
+        lsf.write_output('Playwright installation not required by config — skipping.')
+        if dashboard:
+            dashboard.update_task('prelim', 'playwright_install', 'skipped',
+                                  'Not required by config')
+            dashboard.generate_html()
+
     ##=========================================================================
     ## End Core Team code
     ##=========================================================================

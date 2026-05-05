@@ -1,13 +1,13 @@
-# version 2.2 - 2026-03-24
+# version 2.3 - 2026-05-01
 #
 # Configuration for issuing SSL certificates via HashiCorp Vault PKI
 # Used by hol-ssl.py to request certificates from Vault's PKI secrets engine
-#
+# 
 
 # Vault PKI Configuration
 # Connection details and authentication for the Vault PKI backend
 VAULT:
-  url: "http://10.1.1.1:32000"
+  url: "https://vault.vcf.lab"
   token_file: "/home/holuser/creds.txt"        # File containing the Vault authentication token
   pki_mount: "pki"                              # Vault PKI secrets engine mount path
   pki_role: "holodeck"                          # Vault PKI role used to issue certificates
@@ -29,5 +29,5 @@ CERT:
   key_type: "rsa"                                # Key algorithm: rsa or ec
   key_bits: 2048                                 # RSA: 2048/4096  EC: 256 (P-256) or 384 (P-384)
   ttl: "398d"                                    # Certificate lifetime (398 days = Firefox max)
-  cert_dir: "/hol/ssl"                           # Output directory for all generated files
+  cert_dir: "/home/holuser/hol/ssl"              # Output directory for all generated files
   pfx_password_file: "/home/holuser/creds.txt"   # Password for PFX/JKS files (reads first line)
