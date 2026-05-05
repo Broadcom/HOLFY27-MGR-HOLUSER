@@ -8,7 +8,9 @@ _User guide for `hol-ssl.py` v2.2 — issue trusted TLS certificates in HOL lab 
 
 `hol-ssl.py` is a command-line tool that requests TLS certificates from a HashiCorp Vault PKI secrets engine and writes them to disk in every format a lab workload might need: PEM, PKCS12/PFX, and Java KeyStore (JKS).
 
-It is designed for **HOL vPod lab environments** where a Vault instance with a configured PKI engine is already running on the Holorouter. The tool handles:
+It is designed for **HOL vPod lab environments** where a Vault instance with a configured PKI engine is already running on the Holorouter.
+
+The tool handles:
 
 - Automatic lab domain detection (reverse DNS, `resolv.conf`, or `site-a.vcf.lab` default)
 - Common Name construction from bare hostnames
@@ -52,7 +54,7 @@ flowchart LR
 Install the Python dependencies:
 
 ```bash
-pip install hvac pyyaml cryptography pyjks
+pip install hvac pyyaml cryptography pyjks --break-system-packages
 ```
 
 ---
@@ -70,7 +72,7 @@ This produces a certificate with:
 - **CN:** `my-webserver.site-a.vcf.lab` (domain appended automatically)
 - **SAN (DNS):** any `fqdn.N` entries from the config file
 - **SAN (IP):** `10.0.100.100` (from the `--ip` flag)
-- **Output:** six files written to the configured `cert_dir` (default `/hol/ssl`)
+- **Output:** six files written to the configured `cert_dir` (default `/home/holuser/hol/ssl`)
 
 ---
 
@@ -163,7 +165,7 @@ SANs are specified as numbered keys. The tool collects all keys matching `fqdn.N
 | `key_type` | `rsa` | Key algorithm: `rsa` or `ec` |
 | `key_bits` | `2048` | Key size. RSA: `2048` or `4096`. EC: `256` (P-256) or `384` (P-384). |
 | `ttl` | `398d` | Certificate lifetime. Accepts Vault TTL syntax: `398d`, `8760h`, `60m`, `3600s`, or bare seconds. |
-| `cert_dir` | `/hol/ssl` | Output directory for all generated files. Created automatically if it doesn't exist. |
+| `cert_dir` | `/home/holuser/hol/ssl` | Output directory for all generated files. Created automatically if it doesn't exist. |
 | `pfx_password_file` | — | Path to a file containing the password for PFX/JKS keystores (first line). If omitted, falls back to `token_file` with a warning. |
 
 ### Example config
@@ -184,7 +186,7 @@ CERT:
   key_type: "rsa"
   key_bits: 2048
   ttl: "398d"
-  cert_dir: "/hol/ssl"
+  cert_dir: "/home/holuser/hol/ssl"
   pfx_password_file: "/home/holuser/creds.txt"
 ```
 
