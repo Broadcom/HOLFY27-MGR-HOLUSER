@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """
-TODO: This script is a work in progress. It is not yet complete.
-VERSION: 0.0.4 - 2026-05-04
+VERSION: 0.1.0 - 2026-05-05
 AUTHOR: Burke Azbill and HOL Core Team
 
 Authentik + VCF lab integration (Cycle 7).
 
-End-to-end (default): CoreDNS, Authentik OAuth2 app (idempotent: reuse provider/application by name or slug),
-Authentik users/groups, VCF Operations **Fleet IAM**
-APIs (SSO realm, OIDC+SCIM IdP, SCIM bearer token), Authentik SCIM back-channel, SCIM sync trigger,
-``vcf_administrator`` on ``prod-admins`` / ``dev-admins``, Join SSO for vCenter + VCF Operations + VCF Automation.
+Enabled by a single config.ini toggle:  [VCFFINAL] authentik_vcf_integration = true
 
-Legacy path (``authentik_skip_fleet_iam=true``): vCenter ``/api/vcenter/identity/providers``, VIDB auth source,
-optional manual ``vcf_scim_bearer_token``.
+Steps performed (all idempotent/re-runnable):
+  1. CoreDNS forwarder patch on holorouter
+  2. Vault CA trust check on VCF Operations (ops-a)
+  3. Authentik OAuth2 provider + application (VCF OIDC / VCF)
+  4. Authentik OIDC scope mappings (email, openid, profile)
+  5. Authentik groups + lab users (prod-admins, dev-admins, etc.)
+  6. VCF SSO UI Prerequisites (via Playwright)
+  7. Fleet IAM: SSO realm, OIDC+SCIM IdP, SCIM bearer token
+  8. Authentik SCIM provider + backchannel (VCF SCIM)
+  9. Fleet IAM role assignments:
+       prod-admins  -> vcf_administrator
+       dev-admins   -> sddc_admin
+       prod-readonly -> vcf_viewer
+  10. Fleet IAM: Join SSO (vCenter, VCF Operations, VCF Automation)
 
-Secrets: never printed to stdout/logs (redacted). OAuth client_secret and SCIM token exist only in memory
-unless persisted by the admin in config.ini for re-runs.
+Secrets: never printed to stdout/logs (redacted).
 """
 
 from __future__ import annotations
@@ -25,13 +32,12 @@ import configparser
 import json
 import os
 import re
-import shlex
 import subprocess
 import time
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 
 _tools_dir = str(Path(__file__).resolve().parent)
 if _tools_dir not in sys.path:
@@ -101,20 +107,6 @@ def _load_ini(path: str) -> configparser.ConfigParser:
     return cfg
 
 
-def _vcenter_session(vc_base: str, user: str, password: str, verify_tls: bool) -> str:
-    """Return vmware-api-session-id string."""
-    if requests is None:
-        raise RuntimeError('requests library required for vCenter / VCF Operations calls')
-    ctx = verify_tls
-    r = requests.post(
-        f'{vc_base}/api/session',
-        auth=(user, password),
-        timeout=60,
-        verify=ctx,
-    )
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f'vCenter session HTTP {r.status_code}: {r.text[:500]}')
-    return r.text.strip('"')
 
 
 def _discover_mgmt_vc(cfg: configparser.ConfigParser) -> Tuple[str, str]:
@@ -317,143 +309,6 @@ def ensure_ops_vault_ca_trust(
         _log(write, '  WARNING: suite-api did not respond within 120 s — Fleet IAM may still fail.')
 
     return True
-
-
-def _vami_noproxy_entries_to_add(issuer_hostname: str) -> List[str]:
-    """Hostnames/IPs Fleet/VIDB must reach without the lab Squid proxy."""
-    ih = (issuer_hostname or '').strip().lower().rstrip('.')
-    out: List[str] = []
-    if ih:
-        out.append(ih)
-    if ih.endswith('.vcf.lab'):
-        out.append('authentik.vcf.lab')
-        out.append('.vcf.lab')
-    out.append('192.168.0.2')
-    return list(dict.fromkeys([x for x in out if x]))
-
-
-def ensure_mgmt_vcenter_no_proxy_for_oidc(
-    mgmt_vc: str,
-    issuer_hostname: str,
-    root_password: str,
-    creds_path: str,
-    write: Callable[[str], None],
-    dry_run: bool,
-    verify_tls: bool,
-    restart_vmware_vmon: bool,
-) -> bool:
-    """
-    vCenter **VAMI** (port 5480) owns the no-proxy list that **vmware-vmon** injects into
-    the vsphere-ui JVM. Editing ``/etc/sysconfig/proxy`` alone does not update that env;
-    use ``PUT /rest/appliance/networking/noproxy`` with body ``{"servers":[...]}``.
-
-    When the list changes, restart **vmware-vmon** so services pick up the new bypass list
-    (brief management UI disruption). Skip with ``authentik_skip_mgmt_vc_vmon_restart=true``
-    and reboot vCenter manually if needed.
-    """
-    _log(write, 'Authentik integration: vCenter VAMI no-proxy for OIDC issuer (5480 REST + optional vmon restart)')
-    if dry_run:
-        _log(write, '  DRY-RUN: would merge VAMI noproxy on ' + mgmt_vc + ' if reachable.')
-        return True
-    if requests is None:
-        _log(write, '  ERROR: requests required for VAMI noproxy merge.')
-        return False
-    vami_url = f'https://{mgmt_vc}:5480/rest/appliance/networking/noproxy'
-    adds = _vami_noproxy_entries_to_add(issuer_hostname)
-    try:
-        gr = requests.get(
-            vami_url,
-            auth=('root', root_password),
-            timeout=60,
-            verify=verify_tls,
-        )
-    except Exception as e:
-        _log(write, f'  VAMI GET noproxy FAILED: {e}')
-        return False
-    if gr.status_code == 404:
-        _log(write, '  VAMI noproxy endpoint not found — skip (non-VCSA?).')
-        return True
-    if gr.status_code != 200:
-        _log(write, f'  VAMI GET noproxy HTTP {gr.status_code}: {gr.text[:400]!r}')
-        return False
-    try:
-        data = gr.json()
-    except Exception:
-        _log(write, f'  VAMI GET noproxy: non-JSON body {gr.text[:300]!r}')
-        return False
-    current = [str(x).strip() for x in (data.get('value') or []) if str(x).strip()]
-    merged = list(current)
-    changed = False
-    for a in adds:
-        if a not in merged:
-            merged.append(a)
-            changed = True
-    if not changed:
-        _log(write, '  VAMI noproxy already includes OIDC issuer / Authentik / holorouter IP.')
-        return True
-    try:
-        pr = requests.put(
-            vami_url,
-            auth=('root', root_password),
-            headers={'Content-Type': 'application/json'},
-            json={'servers': merged},
-            timeout=120,
-            verify=verify_tls,
-        )
-    except Exception as e:
-        _log(write, f'  VAMI PUT noproxy FAILED: {e}')
-        return False
-    if pr.status_code not in (200, 204):
-        _log(write, f'  VAMI PUT noproxy HTTP {pr.status_code}: {pr.text[:500]!r}')
-        return False
-    _log(write, f'  VAMI noproxy updated (+{", ".join(adds)}).')
-    if not restart_vmware_vmon:
-        _log(
-            write,
-            '  NOTE: vmware-vmon not restarted (authentik_skip_mgmt_vc_vmon_restart=true). '
-            'VIDB may still use old NO_PROXY until vCenter reboot or: '
-            '`systemctl restart vmware-vmon` on the management vCenter.',
-        )
-        return True
-    _log(
-        write,
-        '  Restarting vmware-vmon so vsphere-ui picks up no-proxy (management UI unavailable ~2–5 min).',
-    )
-    rr = subprocess.run(
-        f'sshpass -f {shlex.quote(creds_path)} ssh -o StrictHostKeyChecking=accept-new '
-        f'{shlex.quote(f"root@{mgmt_vc}")} systemctl restart vmware-vmon',
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if rr.returncode != 0:
-        _log(
-            write,
-            f'  vmware-vmon restart FAILED rc={rr.returncode} {(rr.stderr or rr.stdout)[:500]!r}',
-        )
-        return False
-    # Wait for SSH and vsphere-ui to return (Fleet needs VIDB).
-    deadline = time.time() + 900.0
-    interval = 20.0
-    while time.time() < deadline:
-        chk = subprocess.run(
-            f'sshpass -f {shlex.quote(creds_path)} ssh -o StrictHostKeyChecking=accept-new '
-            f'-o ConnectTimeout=10 {shlex.quote(f"root@{mgmt_vc}")} '
-            f'/usr/lib/vmware-vmon/vmon-cli --status vsphere-ui 2>/dev/null',
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        out = (chk.stdout or '') + (chk.stderr or '')
-        if chk.returncode == 0 and 'RunState: RUNNING' in out:
-            _log(write, '  vmware-vmon: vsphere-ui is RUNNING again.')
-            return True
-        _log(write, '  Waiting for vsphere-ui after vmware-vmon restart…')
-        time.sleep(interval)
-    _log(write, '  TIMEOUT: vsphere-ui did not reach RUNNING within 15m after vmware-vmon restart.')
-    return False
 
 
 class AuthentikApi:
@@ -1140,109 +995,212 @@ class AuthentikApi:
         return True
 
 
-def ensure_vcenter_oidc(
-    vc_base: str,
-    session_id: str,
-    discovery_url: str,
-    client_id: str,
-    client_secret: str,
-    write: Callable[[str], None],
-    dry_run: bool,
-    verify_tls: bool,
+OPS_LOGIN = '/ui/login.action'
+PREREQ_PATH = (
+    '/vcf-operations/ui/manage/fleet/identity-and-access/sso-overview/prerequisites'
+)
+FALLBACK_PATH = (
+    '/vcf-operations/ui/manage/fleet/identity-and-access/sso-overview/get-started'
+)
+
+
+def _log(write: Optional[Callable[[str], None]], msg: str) -> None:
+    if write:
+        write(msg)
+    else:
+        print(msg)
+
+
+def _playwright_python() -> str:
+    return os.environ.get('HOL_PLAYWRIGHT_PYTHON', sys.executable)
+
+
+def submit_sso_prerequisites_ui(
+    ops_fqdn: str,
+    password: str,
+    write: Optional[Callable[[str], None]] = None,
+    dry_run: bool = False,
+    username: str = 'admin',
 ) -> bool:
-    if requests is None:
-        raise RuntimeError('requests required')
-    hdr = {'vmware-api-session-id': session_id, 'Content-Type': 'application/json'}
-    r = requests.get(f'{vc_base}/api/vcenter/identity/providers', headers=hdr, timeout=60, verify=verify_tls)
-    if r.status_code != 200:
-        raise RuntimeError(f'List identity providers HTTP {r.status_code}: {r.text[:400]}')
-    provs = r.json()
-    if isinstance(provs, list) and provs:
-        for p in provs:
-            if p.get('config_tag') == 'Oidc' and p.get('oidc', {}).get('client_id') == client_id:
-                _log(write, f'  vCenter already has OIDC provider for client_id={client_id!r} — skip.')
+    """
+    Log into VCF Operations, complete SSO **Prerequisites**, then click **Configure SSO**
+    (opens the deployment-mode wizard per HOL_Authentik_Config_Cycle_7.md Step 3).
+
+    ops_fqdn: e.g. ops-a.site-a.vcf.lab (no scheme)
+    """
+    if dry_run:
+        _log(
+            write,
+            '  SSO UI: DRY-RUN would complete prerequisites + Configure SSO on '
+            f'https://{ops_fqdn}',
+        )
+        return True
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        _log(
+            write,
+            '  SSO UI: playwright is not installed. This lab environment requires playwright '
+            'to be available in the python environment to complete the VCF SSO Prerequisites. '
+            'Please ensure the lab template is built with playwright installed.'
+        )
+        return False
+
+    base = f'https://{ops_fqdn.rstrip("/")}'
+    shot = '/tmp/vcf-sso-prereqs-failure.png'
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=['--ignore-certificate-errors', '--no-sandbox'],
+        )
+        context = browser.new_context(ignore_https_errors=True)
+        page = context.new_page()
+        try:
+            _log(write, f'  SSO UI: logging in to {base}{OPS_LOGIN} …')
+            page.goto(base + OPS_LOGIN, wait_until='domcontentloaded', timeout=120000)
+            page.wait_for_timeout(2000)
+            # Auth source (e.g. Local / vsphere.local) when shown as a select
+            try:
+                sel = page.locator('select').first
+                if sel.count() and sel.is_visible():
+                    opts = sel.locator('option').all_text_contents()
+                    for label in ('local', 'Local', 'LOCAL', 'vsphere'):
+                        for i, txt in enumerate(opts):
+                            if label.lower() in txt.lower():
+                                sel.select_option(index=i)
+                                break
+            except Exception:
+                pass
+            # vROps / Aria: username + password fields vary by skin — prefer role-based fills
+            user_filled = False
+            for sel in (
+                'input[name="j_username"]',
+                'input#username',
+                'input[formcontrolname="username"]',
+                'input[type="text"]',
+            ):
+                loc = page.locator(sel).first
+                if loc.count() and loc.is_visible():
+                    loc.fill(username)
+                    user_filled = True
+                    break
+            if not user_filled:
+                gl = page.get_by_label(re.compile('user|login', re.I))
+                if gl.count():
+                    gl.first.fill(username)
+                else:
+                    raise RuntimeError('Could not find username field on login page')
+
+            for sel in ('input[name="j_password"]', 'input#password', 'input[type="password"]'):
+                loc = page.locator(sel).first
+                if loc.count() and loc.is_visible():
+                    loc.fill(password)
+                    break
+            else:
+                gl = page.get_by_label(re.compile('password', re.I))
+                if gl.count():
+                    gl.first.fill(password)
+                else:
+                    raise RuntimeError('Could not find password field on login page')
+
+            clicked = False
+            for name_pat in (r'Log\s*In', r'Sign\s*In', r'Login', r'Submit'):
+                btn = page.get_by_role('button', name=re.compile(name_pat, re.I))
+                if btn.count():
+                    btn.first.click()
+                    clicked = True
+                    break
+            if not clicked:
+                page.locator('button[type="submit"]').first.click()
+
+            page.wait_for_load_state('networkidle', timeout=180000)
+            # Prefer Get Started URL + "Prerequisites" tab (matches HOL Step 3 wording).
+            _log(write, f'  SSO UI: opening VCF SSO Overview {FALLBACK_PATH} …')
+            page.goto(base + FALLBACK_PATH, wait_until='domcontentloaded', timeout=120000)
+            page.wait_for_timeout(2000)
+            pre_tab = page.get_by_role('tab', name=re.compile('prerequisite', re.I))
+            if pre_tab.count():
+                pre_tab.first.click()
+                page.wait_for_timeout(1500)
+            else:
+                _log(write, f'  SSO UI: no Prerequisites tab — trying direct URL {PREREQ_PATH} …')
+                r = page.goto(base + PREREQ_PATH, wait_until='domcontentloaded', timeout=120000)
+                if r and r.status >= 400:
+                    _log(write, f'  SSO UI: prerequisites URL HTTP {r.status}.')
+                page.wait_for_timeout(2000)
+                link = page.get_by_role('link', name=re.compile('prerequisite', re.I))
+                if link.count():
+                    link.first.click()
+                    page.wait_for_timeout(1500)
+
+            page.wait_for_timeout(2000)
+            boxes = page.locator('input[type="checkbox"]:visible')
+            n = boxes.count()
+            if n == 0:
+                _log(write, '  SSO UI: no visible checkboxes (prerequisites may already be done).')
+            else:
+                for i in range(n):
+                    boxes.nth(i).check(force=True)
+                _log(write, f'  SSO UI: checked {n} prerequisite checkbox(es).')
+
+                submitted = False
+                for name_pat in (r'Submit', r'Continue', r'Next', r'Save'):
+                    btn = page.get_by_role('button', name=re.compile(name_pat, re.I))
+                    if btn.count():
+                        btn.first.click()
+                        submitted = True
+                        break
+                if not submitted:
+                    st = page.locator('button:has-text("SUBMIT"), button:has-text("Submit")')
+                    if st.count():
+                        st.first.click()
+                    else:
+                        _log(write, '  SSO UI: WARNING: no Submit button for prerequisites.')
+                try:
+                    page.wait_for_load_state('networkidle', timeout=120000)
+                except Exception:
+                    pass
+                _log(write, '  SSO UI: prerequisites submit completed.')
+
+            # HOL Step 3: return to Get Started and launch the Configure VCF SSO wizard.
+            gs_tab = page.get_by_role('tab', name=re.compile(r'Get Started with SSO', re.I))
+            if gs_tab.count():
+                gs_tab.first.click()
+                page.wait_for_timeout(1500)
+            configure = page.get_by_role('button', name=re.compile(r'Configure SSO', re.I))
+            if not configure.count():
+                _log(
+                    write,
+                    '  SSO UI: Configure SSO button not visible — '
+                    'already in wizard, SSO disabled, or UI variant; stopping after prerequisites.',
+                )
                 return True
-    body = {
-        'config_tag': 'Oidc',
-        'oidc': {
-            'claim_map': {},
-            'client_id': client_id,
-            'client_secret': client_secret,
-            'discovery_endpoint': discovery_url,
-        },
-    }
-    if dry_run:
-        _log(write, f'  DRY-RUN would POST /api/vcenter/identity/providers {_redact(body)!s}')
-        return True
-    r2 = requests.post(
-        f'{vc_base}/api/vcenter/identity/providers',
-        headers=hdr,
-        json=body,
-        timeout=120,
-        verify=verify_tls,
-    )
-    if r2.status_code not in (200, 201):
-        _log(write, f'  vCenter OIDC registration FAILED HTTP {r2.status_code}: {r2.text[:800]}')
-        return False
-    _log(write, '  vCenter OIDC identity provider registered.')
-    return True
+            configure.first.click()
+            page.wait_for_timeout(3000)
+            try:
+                page.wait_for_url('**/sso-overview/initial-setup**', timeout=120000)
+            except Exception:
+                pass
+            url = page.url
+            if 'initial-setup' in url:
+                _log(write, '  SSO UI: Configure SSO wizard opened (…/initial-setup).')
+            else:
+                _log(write, f'  SSO UI: WARNING: expected initial-setup in URL after Configure SSO; got {url!r}')
+            return True
+        except Exception as e:
+            _log(write, f'  SSO UI: FAILED: {e}')
+            try:
+                page.screenshot(path=shot)
+                _log(write, f'  SSO UI: screenshot saved to {shot}')
+            except Exception:
+                pass
+            return False
+        finally:
+            context.close()
+            browser.close()
 
-
-def ensure_ops_vidb(
-    ops_base: str,
-    ops_token: str,
-    display_name: str,
-    issuer_url: str,
-    client_id: str,
-    client_secret: str,
-    write: Callable[[str], None],
-    dry_run: bool,
-    verify_tls: bool,
-) -> bool:
-    if requests is None:
-        raise RuntimeError('requests required')
-    hdr = {
-        'Authorization': f'OpsToken {ops_token}',
-        'X-vRealizeOps-API-use-unsupported': 'true',
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-    }
-    r = requests.get(f'{ops_base}/suite-api/api/auth/sources', headers=hdr, timeout=60, verify=verify_tls)
-    if r.status_code != 200:
-        _log(write, f'  List auth sources HTTP {r.status_code}: {r.text[:400]}')
-        return False
-    for src in r.json().get('sources') or []:
-        if src.get('sourceType', {}).get('id') == 'VIDB':
-            for prop in src.get('property') or []:
-                if prop.get('name') == 'issuer-url' and prop.get('value', '').rstrip('/') == issuer_url.rstrip('/'):
-                    _log(write, '  VCF Operations already has matching VIDB issuer-url — skip.')
-                    return True
-    payload = {
-        'name': f'{display_name}-authentik',
-        'sourceType': {'id': 'VIDB', 'name': 'VIDB'},
-        'property': [
-            {'name': 'display-name', 'value': display_name},
-            {'name': 'issuer-url', 'value': issuer_url.rstrip('/') + '/'},
-            {'name': 'client-id', 'value': client_id},
-            {'name': 'client-secret', 'value': client_secret},
-        ],
-        'certificates': [],
-    }
-    if dry_run:
-        _log(write, f'  DRY-RUN would POST /suite-api/api/auth/sources {_redact(payload)!s}')
-        return True
-    r2 = requests.post(
-        f'{ops_base}/suite-api/api/auth/sources',
-        headers=hdr,
-        json=payload,
-        timeout=120,
-        verify=verify_tls,
-    )
-    if r2.status_code not in (200, 201):
-        _log(write, f'  VIDB auth source create HTTP {r2.status_code}: {r2.text[:800]}')
-        return False
-    _log(write, '  VCF Operations VIDB auth source submitted (validate in UI if 500 during IdP test).')
-    return True
 
 
 def run_authentik_vcf_integration(
@@ -1251,7 +1209,9 @@ def run_authentik_vcf_integration(
     config_path: str = '/tmp/config.ini',
 ) -> bool:
     """
-    Main entry for VCFfinal. Returns True on full success, False on partial failure.
+    Main entry point. Enabled by [VCFFINAL] authentik_vcf_integration = true.
+    Returns True on full success, False on any partial failure.
+    All steps are idempotent — safe to re-run on an already-configured environment.
     """
     write: Callable[[str], None] = (lambda m: lsf.write_output(m)) if lsf else print
 
@@ -1267,61 +1227,34 @@ def run_authentik_vcf_integration(
         return True
 
     creds_path = os.environ.get('HOL_CREDS_PATH', CREDS_DEFAULT)
-    if lsf and hasattr(lsf, 'get_password'):
-        password = lsf.get_password()
-    else:
-        password = _read_password(creds_path)
+    password = lsf.get_password() if (lsf and hasattr(lsf, 'get_password')) else _read_password(creds_path)
 
-    verify_tls = False
-    if cfg.has_option('VCFFINAL', 'authentik_verify_tls'):
-        verify_tls = _truthy(cfg.get('VCFFINAL', 'authentik_verify_tls'))
-
-    mgmt_vc, vc_user = _discover_mgmt_vc(cfg)
+    # ── Environment discovery ────────────────────────────────────────────────
+    mgmt_vc, _vc_user = _discover_mgmt_vc(cfg)
     ops_fqdn = _discover_ops_fqdn(cfg)
     vc_base = f'https://{mgmt_vc}'
     ops_base = f'https://{ops_fqdn}'
+    verify_tls = False
 
     issuer_base = 'https://auth.vcf.lab'
-    if cfg.has_option('VCFFINAL', 'authentik_issuer_base'):
-        issuer_base = cfg.get('VCFFINAL', 'authentik_issuer_base').strip().rstrip('/')
-
     app_slug = 'vcf'
-    if cfg.has_option('VCFFINAL', 'authentik_application_slug'):
-        app_slug = cfg.get('VCFFINAL', 'authentik_application_slug').strip()
     app_name = 'VCF'
-    if cfg.has_option('VCFFINAL', 'authentik_application_name'):
-        app_name = cfg.get('VCFFINAL', 'authentik_application_name').strip()
-
     tenant = 'CUSTOMER'
-    if cfg.has_option('VCFFINAL', 'authentik_vcenter_tenant'):
-        tenant = cfg.get('VCFFINAL', 'authentik_vcenter_tenant').strip()
+    scim_domain = 'vcf.lab'
 
     redirect_url = f'{vc_base}/federation/t/{tenant}/auth/response/oauth2'
     discovery_url = f'{issuer_base}/application/o/{app_slug}/.well-known/openid-configuration'
     scim_url = f'{vc_base}/usergroup/scim/v2'
+    issuer_host = urlparse(issuer_base).hostname or 'auth.vcf.lab'
 
-    discovery_url_fleet = discovery_url
-    if cfg.has_option('VCFFINAL', 'authentik_fleet_oidc_discovery_url'):
-        fd = cfg.get('VCFFINAL', 'authentik_fleet_oidc_discovery_url').strip()
-        if fd:
-            discovery_url_fleet = fd
-            _log(write, f'  Fleet IAM: OIDC discovery URL override {discovery_url_fleet!r}.')
-
+    # ── Authentik API token + signing key (auto-discovered) ──────────────────
     ak_token = os.environ.get('AUTHENTIK_API_TOKEN', 'holodeck')
-    if cfg.has_option('VCFFINAL', 'authentik_api_token'):
-        v = cfg.get('VCFFINAL', 'authentik_api_token').strip()
-        if v:
-            ak_token = v
-
     signing_key = 'e469fc95-d878-4042-abe9-1e46840fd125'
-    if cfg.has_option('VCFFINAL', 'authentik_signing_key_pk'):
-        signing_key = cfg.get('VCFFINAL', 'authentik_signing_key_pk').strip()
-    elif requests:
+    if requests:
         try:
-            t_hdr = {'Authorization': f'Bearer {ak_token}', 'Accept': 'application/json'}
             kr = requests.get(
                 f'{issuer_base}/api/v3/crypto/certificatekeypairs/',
-                headers=t_hdr,
+                headers={'Authorization': f'Bearer {ak_token}', 'Accept': 'application/json'},
                 timeout=30,
                 verify=verify_tls,
             )
@@ -1332,150 +1265,49 @@ def run_authentik_vcf_integration(
         except Exception:
             pass
 
+    # ── Fixed provider / role configuration ─────────────────────────────────
     oauth_provider_name = 'VCF OIDC'
-    if cfg.has_option('VCFFINAL', 'authentik_oauth_provider_name'):
-        oauth_provider_name = cfg.get('VCFFINAL', 'authentik_oauth_provider_name').strip()
+    scim_provider_name = 'VCF SCIM'
+    idp_fleet_name = 'VCF Auth'
+    directory_fleet_name = scim_domain
 
-    # OIDC scope mappings that must be set on the OAuth2 provider for claims to flow correctly.
-    # These correspond to Authentik's built-in scope mappings for email, openid, profile.
-    _default_oidc_scopes = [
+    oauth_scope_names: List[str] = [
         "authentik default OAuth Mapping: OpenID 'email'",
         "authentik default OAuth Mapping: OpenID 'openid'",
         "authentik default OAuth Mapping: OpenID 'profile'",
     ]
-    oauth_scope_names: List[str] = _default_oidc_scopes
-    if cfg.has_option('VCFFINAL', 'authentik_oauth_scope_names'):
-        v = cfg.get('VCFFINAL', 'authentik_oauth_scope_names').strip()
-        if v:
-            oauth_scope_names = [x.strip() for x in v.split(',') if x.strip()]
+    scim_user_mapping_names: List[str] = ['authentik default SCIM Mapping: User']
+    scim_group_mapping_names: List[str] = ['authentik default SCIM Mapping: Group']
 
-    scim_provider_name = 'VCF SCIM'
-    if cfg.has_option('VCFFINAL', 'authentik_scim_provider_name'):
-        scim_provider_name = cfg.get('VCFFINAL', 'authentik_scim_provider_name').strip()
+    # Groups and their Fleet IAM role assignments
+    vcf_admin_groups: List[str] = ['prod-admins']      # vcf_administrator
+    sddc_admin_groups: List[str] = ['dev-admins']       # sddc_admin
+    viewer_groups: List[str] = ['prod-readonly']        # vcf_viewer
 
-    skip_coredns = cfg.has_option('VCFFINAL', 'authentik_skip_coredns') and _truthy(
-        cfg.get('VCFFINAL', 'authentik_skip_coredns'))
-    skip_ops_vault_ca = cfg.has_option('VCFFINAL', 'authentik_skip_ops_vault_ca') and _truthy(
-        cfg.get('VCFFINAL', 'authentik_skip_ops_vault_ca'))
-    skip_vcenter = cfg.has_option('VCFFINAL', 'authentik_skip_vcenter') and _truthy(
-        cfg.get('VCFFINAL', 'authentik_skip_vcenter'))
-    skip_vidb = cfg.has_option('VCFFINAL', 'authentik_skip_ops_vidb') and _truthy(
-        cfg.get('VCFFINAL', 'authentik_skip_ops_vidb'))
-
-    scim_token = ''
-    if cfg.has_option('VCFFINAL', 'vcf_scim_bearer_token'):
-        scim_token = cfg.get('VCFFINAL', 'vcf_scim_bearer_token').strip()
-
-    skip_fleet_iam = cfg.has_option('VCFFINAL', 'authentik_skip_fleet_iam') and _truthy(
-        cfg.get('VCFFINAL', 'authentik_skip_fleet_iam'))
-    skip_mgmt_vc_no_proxy = cfg.has_option('VCFFINAL', 'authentik_skip_mgmt_vc_no_proxy') and _truthy(
-        cfg.get('VCFFINAL', 'authentik_skip_mgmt_vc_no_proxy'))
-    skip_mgmt_vc_vmon_restart = cfg.has_option('VCFFINAL', 'authentik_skip_mgmt_vc_vmon_restart') and _truthy(
-        cfg.get('VCFFINAL', 'authentik_skip_mgmt_vc_vmon_restart'))
-    use_sso_ui_prereqs = cfg.has_option('VCFFINAL', 'authentik_sso_ui_prerequisites') and _truthy(
-        cfg.get('VCFFINAL', 'authentik_sso_ui_prerequisites'))
-    join_nsx = cfg.has_option('VCFFINAL', 'authentik_fleet_join_nsx') and _truthy(
-        cfg.get('VCFFINAL', 'authentik_fleet_join_nsx'))
-    vcf_role = 'vcf_administrator'
-    if cfg.has_option('VCFFINAL', 'authentik_fleet_vcf_role'):
-        vcf_role = cfg.get('VCFFINAL', 'authentik_fleet_vcf_role').strip() or vcf_role
-
-    group_names = ['prod-admins']
-    if cfg.has_option('VCFFINAL', 'authentik_scim_group_names'):
-        g = cfg.get('VCFFINAL', 'authentik_scim_group_names').strip()
-        if g:
-            group_names = [x.strip() for x in g.split(',') if x.strip()]
-
-    sddc_admin_group_names: List[str] = ['dev-admins']
-    if cfg.has_option('VCFFINAL', 'authentik_scim_sddc_admin_groups'):
-        g = cfg.get('VCFFINAL', 'authentik_scim_sddc_admin_groups').strip()
-        if g:
-            sddc_admin_group_names = [x.strip() for x in g.split(',') if x.strip()]
-
-    vcf_sddc_role: str = 'sddc_admin'
-    if cfg.has_option('VCFFINAL', 'authentik_fleet_sddc_role'):
-        r = cfg.get('VCFFINAL', 'authentik_fleet_sddc_role').strip()
-        if r:
-            vcf_sddc_role = r
-
-    # Groups that the SCIM provider will filter on (user + group sync scope).
-    # Defaults to the full expected set of groups in the lab environment.
-    _default_scim_filter = [
+    # SCIM filter: all groups whose users and memberships sync into vCenter VIDB
+    scim_filter_groups: List[str] = [
         'approvers', 'dev-admins', 'dev-readonly', 'dev-users',
         'prod-admins', 'prod-readonly', 'prod-users',
     ]
-    scim_filter_groups: List[str] = _default_scim_filter
-    if cfg.has_option('VCFFINAL', 'authentik_scim_filter_groups'):
-        v = cfg.get('VCFFINAL', 'authentik_scim_filter_groups').strip()
-        if v:
-            scim_filter_groups = [x.strip() for x in v.split(',') if x.strip()]
 
-    # VCF viewer role assignment: groups that receive the vcf_viewer Fleet IAM role.
-    viewer_group_names: List[str] = ['prod-readonly']
-    if cfg.has_option('VCFFINAL', 'authentik_scim_viewer_groups'):
-        v = cfg.get('VCFFINAL', 'authentik_scim_viewer_groups').strip()
-        if v:
-            viewer_group_names = [x.strip() for x in v.split(',') if x.strip()]
+    # Lab users to create in Authentik (idempotent)
+    lab_user_emails: List[str] = ['prod-admin@vcf.lab', 'dev-admin@vcf.lab']
 
-    vcf_viewer_role: str = 'vcf_viewer'
-    if cfg.has_option('VCFFINAL', 'authentik_fleet_viewer_role'):
-        v = cfg.get('VCFFINAL', 'authentik_fleet_viewer_role').strip()
-        if v:
-            vcf_viewer_role = v
-
-    # Authentik SCIM property mapping names (looked up by name at runtime).
-    scim_user_mapping_names: List[str] = ['authentik default SCIM Mapping: User']
-    if cfg.has_option('VCFFINAL', 'authentik_scim_user_mapping_names'):
-        v = cfg.get('VCFFINAL', 'authentik_scim_user_mapping_names').strip()
-        if v:
-            scim_user_mapping_names = [x.strip() for x in v.split(',') if x.strip()]
-
-    scim_group_mapping_names: List[str] = ['authentik default SCIM Mapping: Group']
-    if cfg.has_option('VCFFINAL', 'authentik_scim_group_mapping_names'):
-        v = cfg.get('VCFFINAL', 'authentik_scim_group_mapping_names').strip()
-        if v:
-            scim_group_mapping_names = [x.strip() for x in v.split(',') if x.strip()]
-
-    lab_user_emails = ['prod-admin@vcf.lab', 'dev-admin@vcf.lab']
-    if cfg.has_option('VCFFINAL', 'authentik_directory_users'):
-        u = cfg.get('VCFFINAL', 'authentik_directory_users').strip()
-        if u:
-            lab_user_emails = [x.strip() for x in u.split(',') if x.strip()]
-
-    scim_domain = 'vcf.lab'
-    if cfg.has_option('VCFFINAL', 'authentik_scim_domain'):
-        d = cfg.get('VCFFINAL', 'authentik_scim_domain').strip()
-        if d:
-            scim_domain = d
-
-    idp_fleet_name = 'VCF Auth'
-    if cfg.has_option('VCFFINAL', 'authentik_fleet_idp_name'):
-        idp_fleet_name = cfg.get('VCFFINAL', 'authentik_fleet_idp_name').strip() or idp_fleet_name
-
-    directory_fleet_name = scim_domain
-    if cfg.has_option('VCFFINAL', 'authentik_fleet_directory_name'):
-        directory_fleet_name = cfg.get('VCFFINAL', 'authentik_fleet_directory_name').strip() or directory_fleet_name
-
-    issuer_host = urlparse(issuer_base if '://' in issuer_base else f'https://{issuer_base}').hostname or 'auth.vcf.lab'
-
-    _log(write, '=== Authentik + VCF integration (VCFFINAL.authentik_vcf_integration) ===')
+    _log(write, '=== Authentik + VCF integration ===')
     ok = True
 
-    if not skip_coredns:
-        if not run_coredns_patch(creds_path, write, dry_run):
-            ok = False
-    else:
-        _log(write, 'Skipping CoreDNS patch (authentik_skip_coredns).')
+    # ── Step 1: CoreDNS forwarder patch on holorouter ────────────────────────
+    if not run_coredns_patch(creds_path, write, dry_run):
+        ok = False
 
-    if not skip_ops_vault_ca:
-        ensure_ops_vault_ca_trust(ops_fqdn, creds_path, write, dry_run)
-    else:
-        _log(write, 'Skipping VCF Operations Vault CA import (authentik_skip_ops_vault_ca).')
+    # ── Step 2: Vault CA trust on VCF Operations ─────────────────────────────
+    ensure_ops_vault_ca_trust(ops_fqdn, creds_path, write, dry_run)
 
     if requests is None:
         _log(write, 'ERROR: Python requests module missing — install requests.')
         return False
 
+    # ── Step 3-4: Authentik OAuth2 provider + application + OIDC scopes ──────
     ak = AuthentikApi(f'{issuer_base}/api/v3', ak_token, write, verify_tls=verify_tls)
     try:
         prov_pk, client_id, client_secret = ak.ensure_oauth_application(
@@ -1498,191 +1330,81 @@ def run_authentik_vcf_integration(
             ok = False
 
     if dry_run or not client_secret:
-        _log(write, 'Dry-run or reused provider without secret — skipping downstream IdP / SCIM steps.')
+        _log(write, 'Dry-run or reused provider without secret — skipping downstream steps.')
         return ok
 
-    # --- Authentik directory: groups + users (for SCIM into vCenter) ---
-    # Ensure all groups that should be visible exist in Authentik (idempotent).
-    all_groups_to_ensure = list(dict.fromkeys(
-        scim_filter_groups + group_names + viewer_group_names + sddc_admin_group_names
+    # ── Step 5: Authentik groups + lab users ─────────────────────────────────
+    all_groups = list(dict.fromkeys(
+        scim_filter_groups + vcf_admin_groups + sddc_admin_groups + viewer_groups
     ))
     group_pk_by_name: Dict[str, Any] = {}
-    for gname in all_groups_to_ensure:
+    for gname in all_groups:
         gpk = ak.ensure_group(gname, dry_run)
         if gpk is not None:
             group_pk_by_name[gname] = gpk
+
     for email in lab_user_emails:
         local = email.split('@')[0].lower()
-        if local.startswith('prod'):
-            gname = 'prod-admins' if 'prod-admins' in group_names else group_names[0]
-        else:
-            if 'dev-admins' in sddc_admin_group_names:
-                gname = 'dev-admins'
-            elif sddc_admin_group_names:
-                gname = sddc_admin_group_names[0]
-            else:
-                gname = group_names[-1] if group_names else 'dev-admins'
+        gname = 'prod-admins' if local.startswith('prod') else 'dev-admins'
         gpk = group_pk_by_name.get(gname)
         if not gpk:
             _log(write, f'  WARNING: missing group pk for {gname!r} — skip user {email!r}')
             ok = False
             continue
-        disp = local.replace('-', ' ').title()
-        login_username = email
-        if not ak.ensure_user_username(login_username, disp, email, gpk, dry_run):
+        if not ak.ensure_user_username(email, local.replace('-', ' ').title(), email, gpk, dry_run):
             ok = False
 
-    use_fleet_iam = not skip_fleet_iam
-    # NO_PROXY modification is no longer required as vcf.lab is in the squid proxy allowlist.
-    # if (use_fleet_iam or not skip_vcenter) and not skip_mgmt_vc_no_proxy:
-    #     if not ensure_mgmt_vcenter_no_proxy_for_oidc(
-    #         mgmt_vc,
-    #         issuer_host,
-    #         password,
-    #         creds_path,
-    #         write,
-    #         dry_run,
-    #         verify_tls,
-    #         restart_vmware_vmon=not skip_mgmt_vc_vmon_restart,
-    #     ):
-    #         ok = False
-    # elif skip_mgmt_vc_no_proxy:
-    #     _log(write, 'Skipping management vCenter NO_PROXY patch (authentik_skip_mgmt_vc_no_proxy).')
+    # ── Steps 6-9: Fleet IAM SSO realm, IdP, SCIM, role assignment, Join SSO ─
+    _log(write, 'Fleet IAM: VCF Operations suite-api (SSO realm, OIDC+SCIM IdP, SCIM token).')
+    otok: Optional[str] = None
+    
+    # Run UI Prerequisites via Playwright if available
+    submit_sso_prerequisites_ui(ops_fqdn, password, write, dry_run)
 
-    if use_fleet_iam:
-        _log(write, 'Fleet IAM path: VCF Operations suite-api (SSO realm, OIDC+SCIM IdP, SCIM token).')
-        otok: Optional[str] = None
-        try:
-            otok = _ops_token(ops_base, password, verify_tls)
-            if use_sso_ui_prereqs:
-                try:
-                    from vcf_sso_ui_prereqs import submit_sso_prerequisites_ui
-                except ImportError:
-                    submit_sso_prerequisites_ui = None  # type: ignore
-                if submit_sso_prerequisites_ui:
-                    if not submit_sso_prerequisites_ui(ops_fqdn, password, write, dry_run):
-                        _log(
-                            write,
-                            '  WARNING: SSO UI automation failed — complete Prerequisites, then click '
-                            '**Configure SSO** on Get Started (see HOL_Authentik_Config_Cycle_7.md Step 3), '
-                            'or install Playwright (Tools/vcf_sso_ui_prereqs.py). '
-                            'Continuing with Fleet IAM API calls.',
-                        )
-                else:
-                    _log(write, '  WARNING: vcf_sso_ui_prereqs module not importable — skipping UI prerequisites.')
-            else:
-                _log(
-                    write,
-                    '  SSO UI prerequisites automation skipped (set authentik_sso_ui_prerequisites=true '
-                    'after: pip install playwright && playwright install chromium).',
-                )
-            fleet_ok, fleet_scim_tok, realm_id, vidb_rid = run_fleet_iam_vcf_sso(
-                ops_base,
-                otok,
-                mgmt_vc,
-                issuer_host,
-                discovery_url_fleet,
-                client_id,
-                client_secret,
-                scim_domain,
-                idp_fleet_name,
-                directory_fleet_name,
-                write,
-                verify_tls,
-                dry_run,
-            )
-            if not fleet_ok or not fleet_scim_tok or not realm_id or not vidb_rid:
-                ok = False
-            else:
-                scim_linked, scim_pk = ak.ensure_scim_backchannel(
-                    app_slug,
-                    scim_url,
-                    fleet_scim_tok,
-                    scim_provider_name,
-                    dry_run,
-                    filter_group_names=scim_filter_groups,
-                    user_mapping_names=scim_user_mapping_names,
-                    group_mapping_names=scim_group_mapping_names,
-                )
-                if not scim_linked:
-                    ok = False
-                else:
-
-                    def _sync() -> bool:
-                        if dry_run or scim_pk is None:
-                            return True
-                        return ak.trigger_scim_provider_sync(scim_pk)
-
-                    if not fleet_iam_post_scim_assign_and_join(
-                        ops_base,
-                        otok,
-                        vidb_rid,
-                        realm_id,
-                        _sync,
-                        write,
-                        verify_tls,
-                        join_nsx,
-                        group_names,
-                        vcf_role,
-                        viewer_group_names=viewer_group_names,
-                        vcf_viewer_role=vcf_viewer_role,
-                        sddc_admin_group_names=sddc_admin_group_names,
-                        vcf_sddc_role=vcf_sddc_role,
-                    ):
-                        ok = False
-        except Exception as e:
-            _log(write, f'Fleet IAM / SCIM / Join SSO FAILED: {e}')
+    try:
+        otok = _ops_token(ops_base, password, verify_tls)
+        fleet_ok, fleet_scim_tok, realm_id, vidb_rid = run_fleet_iam_vcf_sso(
+            ops_base, otok, mgmt_vc, issuer_host, discovery_url,
+            client_id, client_secret, scim_domain, idp_fleet_name,
+            directory_fleet_name, write, verify_tls, dry_run,
+        )
+        if not fleet_ok or not fleet_scim_tok or not realm_id or not vidb_rid:
             ok = False
-        finally:
-            if otok:
-                try:
-                    log_fleet_sso_realm_summary(ops_base, otok, write, verify_tls)
-                except Exception:
-                    pass
-    else:
-        _log(write, 'Legacy path (authentik_skip_fleet_iam): vCenter OIDC + VIDB auth source.')
-        if not skip_vcenter:
-            try:
-                sess = _vcenter_session(vc_base, vc_user, password, verify_tls)
-                if not ensure_vcenter_oidc(
-                    vc_base, sess, discovery_url, client_id, client_secret, write, dry_run, verify_tls
-                ):
-                    ok = False
-            except Exception as e:
-                _log(write, f'vCenter OIDC step FAILED: {e}')
-                ok = False
         else:
-            _log(write, 'Skipping vCenter OIDC (authentik_skip_vcenter).')
-
-        if not skip_vidb:
-            try:
-                otok = _ops_token(ops_base, password, verify_tls)
-                issuer_url = f'{issuer_base}/application/o/{app_slug}/'
-                if not ensure_ops_vidb(
-                    ops_base, otok, 'VCF Auth', issuer_url, client_id, client_secret, write, dry_run, verify_tls
-                ):
-                    ok = False
-            except Exception as e:
-                _log(write, f'VCF Operations VIDB step FAILED: {e}')
-                ok = False
-        else:
-            _log(write, 'Skipping VCF Operations VIDB (authentik_skip_ops_vidb).')
-
-        if scim_token:
-            sc_ok, _spk = ak.ensure_scim_backchannel(
-                app_slug,
-                scim_url,
-                scim_token,
-                scim_provider_name,
-                dry_run,
+            scim_linked, scim_pk = ak.ensure_scim_backchannel(
+                app_slug, scim_url, fleet_scim_tok, scim_provider_name, dry_run,
                 filter_group_names=scim_filter_groups,
                 user_mapping_names=scim_user_mapping_names,
                 group_mapping_names=scim_group_mapping_names,
             )
-            if not sc_ok:
+            if not scim_linked:
                 ok = False
-        else:
-            _log(write, 'No [VCFFINAL] vcf_scim_bearer_token — skipping Authentik SCIM provider (legacy path).')
+            else:
+                def _sync() -> bool:
+                    if dry_run or scim_pk is None:
+                        return True
+                    return ak.trigger_scim_provider_sync(scim_pk)
+
+                if not fleet_iam_post_scim_assign_and_join(
+                    ops_base, otok, vidb_rid, realm_id, _sync, write, verify_tls,
+                    join_nsx=False,
+                    group_names=vcf_admin_groups,
+                    vcf_role='vcf_administrator',
+                    viewer_group_names=viewer_groups,
+                    vcf_viewer_role='vcf_viewer',
+                    sddc_admin_group_names=sddc_admin_groups,
+                    vcf_sddc_role='sddc_admin',
+                ):
+                    ok = False
+    except Exception as e:
+        _log(write, f'Fleet IAM / SCIM / Join SSO FAILED: {e}')
+        ok = False
+    finally:
+        if otok:
+            try:
+                log_fleet_sso_realm_summary(ops_base, otok, write, verify_tls)
+            except Exception:
+                pass
 
     _log(write, '=== Authentik + VCF integration finished ===')
     return ok
