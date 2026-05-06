@@ -931,57 +931,58 @@ class AuthentikApi:
         _log(self.write, f'  SCIM provider pk={spk} linked to application {app_slug!r}.')
         return True, spk
 
-    def trigger_scim_provider_sync(self, provider_pk: Any) -> bool:
-        """Best-effort full SCIM push by iterating over all objects."""
+    def trigger_scim_provider_sync(self, provider_pk: Any, filter_group_names: Optional[List[str]] = None) -> bool:
+        """Best-effort full SCIM push by iterating over all objects.
+        
+        Since this object-by-object sync bypasses Authentik's native group_filters, 
+        we must manually enforce the filter_group_names if provided.
+        """
         pk = int(provider_pk)
         
-        # Try generic full sync endpoints first (might be 405 on some versions)
-        # paths = [
-        #     f'providers/scim/{pk}/sync/',
-        #     f'providers/scim/{pk}/sync/full/'
-        # ]
-        # for path in paths:
-        #     code, data = self.post_json(path, {})
-        #     if code in (200, 201, 204):
-        #         _log(self.write, f'  Authentik SCIM sync triggered via {path!r}.')
-        #         return True
-                
-        # If generic endpoints fail, fallback to object-by-object sync
-        # _log(self.write, "  Authentik SCIM generic sync API unavailable; falling back to object-by-object sync.")
         success_count = 0
         error_count = 0
         
-        # 1. Sync all groups
-        r_groups = self._sess.get(self._url('core/groups/'), timeout=60)
-        if r_groups.status_code == 200:
-            for g in r_groups.json().get('results', []):
-                payload = {
-                    "sync_object_model": "authentik.core.models.Group",
-                    "sync_object_id": str(g['pk'])
-                }
-                c, _ = self.post_json(f'providers/scim/{pk}/sync/object/', payload)
-                if c in (200, 201, 204):
-                    success_count += 1
-                else:
-                    error_count += 1
+        valid_group_pks = set()
+        if filter_group_names:
+            for g in self.paginate_list('core/groups'):
+                if g.get('name') in filter_group_names:
+                    valid_group_pks.add(str(g.get('pk')))
         
-        # 2. Sync all users
-        r_users = self._sess.get(self._url('core/users/'), timeout=60)
-        if r_users.status_code == 200:
-            for u in r_users.json().get('results', []):
-                # skip internal service accounts if needed, but safe to sync all
-                if u.get('type') == 'internal':
+        # 1. Sync filtered groups
+        for g in self.paginate_list('core/groups'):
+            if valid_group_pks and str(g.get('pk')) not in valid_group_pks:
+                continue
+            payload = {
+                "sync_object_model": "authentik.core.models.Group",
+                "sync_object_id": str(g['pk'])
+            }
+            c, _ = self.post_json(f'providers/scim/{pk}/sync/object/', payload)
+            if c in (200, 201, 204):
+                success_count += 1
+            else:
+                error_count += 1
+        
+        # 2. Sync filtered users
+        for u in self.paginate_list('core/users'):
+            uname = (u.get('username') or '').lower()
+            if uname.startswith('ak-outpost') or uname == 'akadmin':
+                continue
+                
+            if valid_group_pks:
+                user_groups = set(str(g_pk) for g_pk in u.get('groups', []))
+                if not user_groups.intersection(valid_group_pks):
                     continue
-                payload = {
-                    "sync_object_model": "authentik.core.models.User",
-                    "sync_object_id": str(u['pk'])
-                }
-                c, _ = self.post_json(f'providers/scim/{pk}/sync/object/', payload)
-                if c in (200, 201, 204):
-                    success_count += 1
-                else:
-                    error_count += 1
                     
+            payload = {
+                "sync_object_model": "authentik.core.models.User",
+                "sync_object_id": str(u['pk'])
+            }
+            c, _ = self.post_json(f'providers/scim/{pk}/sync/object/', payload)
+            if c in (200, 201, 204):
+                success_count += 1
+            else:
+                error_count += 1
+                
         _log(self.write, f'  Authentik SCIM object sync completed (Success: {success_count}, Errors: {error_count}).')
         return True
 
@@ -1111,13 +1112,19 @@ def submit_sso_prerequisites_ui(
                                 break
             except Exception:
                 pass
+            # Wait explicitly for the VCF Ops login form
+            try:
+                page.wait_for_selector('#userName-inputEl', state='visible', timeout=10000)
+            except Exception:
+                pass
+
             # vROps / Aria: username + password fields vary by skin — prefer role-based fills
             user_filled = False
             for sel in (
+                '#userName-inputEl',
                 'input[name="j_username"]',
                 'input#username',
                 'input[formcontrolname="username"]',
-                'input[type="text"]',
             ):
                 loc = page.locator(sel).first
                 if loc.count() and loc.is_visible():
@@ -1131,7 +1138,7 @@ def submit_sso_prerequisites_ui(
                 else:
                     raise RuntimeError('Could not find username field on login page')
 
-            for sel in ('input[name="j_password"]', 'input#password', 'input[type="password"]'):
+            for sel in ('#password-inputEl', 'input[name="j_password"]', 'input#password', 'input[type="password"]'):
                 loc = page.locator(sel).first
                 if loc.count() and loc.is_visible():
                     loc.fill(password)
@@ -1144,12 +1151,19 @@ def submit_sso_prerequisites_ui(
                     raise RuntimeError('Could not find password field on login page')
 
             clicked = False
-            for name_pat in (r'Log\s*In', r'Sign\s*In', r'Login', r'Submit'):
-                btn = page.get_by_role('button', name=re.compile(name_pat, re.I))
-                if btn.count():
-                    btn.first.click()
-                    clicked = True
-                    break
+            
+            loc = page.locator('#login-btnEl').first
+            if loc.count() and loc.is_visible():
+                loc.click()
+                clicked = True
+                
+            if not clicked:
+                for name_pat in (r'Log\s*In', r'Sign\s*In', r'Login', r'Submit'):
+                    btn = page.get_by_role('button', name=re.compile(name_pat, re.I))
+                    if btn.count():
+                        btn.first.click()
+                        clicked = True
+                        break
             if not clicked:
                 page.locator('button[type="submit"]').first.click()
 
@@ -1423,7 +1437,7 @@ def run_authentik_vcf_integration(
                 def _sync() -> bool:
                     if dry_run or scim_pk is None:
                         return True
-                    return ak.trigger_scim_provider_sync(scim_pk)
+                    return ak.trigger_scim_provider_sync(scim_pk, filter_group_names=scim_filter_groups)
 
                 if not fleet_iam_post_scim_assign_and_join(
                     ops_base, otok, vidb_rid, realm_id, _sync, write, verify_tls,
