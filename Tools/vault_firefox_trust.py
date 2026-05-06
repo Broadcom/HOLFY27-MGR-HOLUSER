@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Sync the active HashiCorp Vault PKI root CA into Firefox NSS profiles on the LMC.
+vault_firefox_trust.py - Sync the active HashiCorp Vault PKI root CA into Firefox NSS profiles on the LMC.
+Version 1.2 - 2026-05-06
+Author - Burke Azbill and HOL Core Team
 
 Used by lab startup (prelim) so https://auth.vcf.lab, https://vault.vcf.lab, and
 other Vault-signed endpoints trust after CA rotation. Mirrors the Vault step in
@@ -11,8 +13,6 @@ Download strategy:
   2. If all fail, try https://vault.vcf.lab/v1/pki/ca/pem — 4 attempts, 15 s between each.
   SSL certificate validation is intentionally disabled: the cert is issued to
   vault.vcf.lab, not the NodePort IP, so hostname verification would always fail.
-
-Version: 1.2 (2026-05-06)
 """
 
 from __future__ import annotations
