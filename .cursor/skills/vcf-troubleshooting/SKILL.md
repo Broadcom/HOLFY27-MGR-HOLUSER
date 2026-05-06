@@ -1,6 +1,6 @@
 ---
 name: vcf-troubleshooting
-description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch), and Authentik SCIM syncing 0 users due to empty property_mappings. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, OIDC sub ExternalId, SCIM 0 users, property_mappings empty, or vcf_viewer role.
+description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch), Authentik SCIM syncing 0 users due to empty property_mappings, and Authentik missing group memberships due to empty vCenter SCIM group payload. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, OIDC sub ExternalId, SCIM 0 users, property_mappings empty, vcf_viewer role, SCIM members array missing, force_vcf_scim_group_memberships, or patch_compare_users bug.
 ---
 
 # VCF 9.x Troubleshooting Guide
@@ -2015,3 +2015,41 @@ After patching, trigger a re-sync from the Authentik UI (SCIM provider → Sync 
 - Group membership *shells* (the `scim_groups` count) can appear healthy even when users are 0 — do not use non-zero `scim_groups` as evidence that users are also syncing.
 - The mapping endpoint is `GET /api/v3/propertymappings/provider/scim/` (not `.../provider/saml/` or `.../all/`).
 - Related: pitfall §76 in `vcf-9-api` skill.
+
+---
+
+## 48. Authentik SCIM Syncs Users but Group Memberships are Empty
+
+**Symptom**: In the VCF Operations Fleet IAM SSO Overview, users and groups are successfully synced and listed. However, when clicking on "Assign VCF Roles" -> "View Group Members", it shows "No items to display", and users cannot log in due to missing group authorizations.
+
+**Diagnosis**:
+Check the vCenter SCIM Users endpoint and Groups endpoint:
+```bash
+# Get SCIM token from Authentik
+export SCIM_TOK=$(curl -sk -H "Authorization: Bearer holodeck" https://auth.vcf.lab/api/v3/providers/scim/6/ | jq -r .token)
+
+# Groups show no members
+curl -sk -H "Authorization: Bearer $SCIM_TOK" -H "Accept: application/scim+json" \
+  https://vc-mgmt-a.site-a.vcf.lab/usergroup/scim/v2/Groups | jq '.Resources[]'
+```
+
+**Root Cause**:
+vCenter VIDB SCIM returns Group objects without a `members` array when the group is empty (instead of `members: []`). Authentik's `patch_compare_users` logic relies on `current_group.members is not None` to calculate which users need to be added. Because vCenter returns `null` or omits `members`, Authentik skips the calculation entirely and never issues the `PATCH` request to add members to the group.
+
+**Fix**:
+The memberships must be manually patched directly into vCenter SCIM by an external script, bypassing Authentik's native sync logic for group memberships.
+```python
+# Example of the required PATCH operation for vCenter SCIM
+payload = {
+    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+    "Operations": [
+        {
+            "op": "add",
+            "path": "members",
+            "value": [{"value": "vcenter-scim-user-uuid"}]
+        }
+    ]
+}
+requests.patch(f"{scim_url}/Groups/{vcenter_scim_group_uuid}", json=payload, headers=headers, verify=False)
+```
+*Note: This logic is now fully implemented in `authentik_vcf_integration.py` via `force_vcf_scim_group_memberships`.*

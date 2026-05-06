@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VERSION: 0.1.1 - 2026-05-06
+VERSION: 0.1.2 - 2026-05-06
 AUTHOR: Burke Azbill and HOL Core Team
 
 Authentik + VCF lab integration (Cycle 7).
@@ -1034,6 +1034,96 @@ class AuthentikApi:
         return True
 
 
+def force_vcf_scim_group_memberships(
+    ak: AuthentikApi,
+    scim_url: str,
+    scim_tok: str,
+    write: Optional[Callable[[str], None]] = None,
+    verify_tls: bool = False,
+) -> None:
+    """
+    Workaround for an Authentik SCIM provider limitation.
+    When a target SCIM provider (like VCF) returns a Group object with a missing
+    `members` array (instead of an empty one), Authentik skips sending PATCH operations
+    to add members to that group. This function forces the group memberships.
+    """
+    import requests
+    _log(write, '  Enforcing SCIM group memberships directly on VCF due to Authentik patch bug...')
+    
+    headers = {'Authorization': f'Bearer {scim_tok}', 'Accept': 'application/scim+json'}
+    try:
+        r_grps = requests.get(f'{scim_url}/Groups?count=1000', headers=headers, verify=verify_tls)
+        vc_groups = r_grps.json().get('Resources', [])
+    except Exception as e:
+        _log(write, f'  Failed to fetch VCF SCIM Groups: {e}')
+        return
+        
+    vc_group_by_ext_id = {str(g.get('externalId')): str(g.get('id')) for g in vc_groups if g.get('externalId')}
+    vc_group_names = {str(g.get('id')): g.get('displayName') for g in vc_groups}
+    
+    try:
+        r_usrs = requests.get(f'{scim_url}/Users?count=1000', headers=headers, verify=verify_tls)
+        vc_users = r_usrs.json().get('Resources', [])
+    except Exception as e:
+        _log(write, f'  Failed to fetch VCF SCIM Users: {e}')
+        return
+        
+    vc_user_id_by_username = {(u.get('userName') or '').lower(): str(u.get('id')) for u in vc_users}
+    
+    ak_users = ak.paginate_list('core/users')
+    members_to_add_by_vc_group = {}
+    
+    for u in ak_users:
+        uname = (u.get('username') or '').lower()
+        if uname.startswith('ak-outpost') or uname == 'akadmin':
+            continue
+            
+        vc_user_id = vc_user_id_by_username.get(uname)
+        if not vc_user_id:
+            continue
+            
+        ak_group_pks = u.get('groups', [])
+        for g_pk in ak_group_pks:
+            vc_group_id = vc_group_by_ext_id.get(str(g_pk))
+            if vc_group_id:
+                # Deduplicate just in case
+                if vc_user_id not in members_to_add_by_vc_group.get(vc_group_id, []):
+                    members_to_add_by_vc_group.setdefault(vc_group_id, []).append(vc_user_id)
+                
+    headers_patch = headers.copy()
+    headers_patch['Content-Type'] = 'application/scim+json'
+    
+    success_count = 0
+    for vc_group_id, vc_user_ids in members_to_add_by_vc_group.items():
+        if not vc_user_ids:
+            continue
+        operations = []
+        for uid in vc_user_ids:
+            operations.append({
+                "op": "add",
+                "path": "members",
+                "value": [{"value": uid}]
+            })
+            
+        payload = {
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": operations
+        }
+        
+        try:
+            r = requests.patch(f'{scim_url}/Groups/{vc_group_id}', headers=headers_patch, json=payload, verify=verify_tls)
+            if r.status_code in (200, 201, 204):
+                success_count += 1
+            else:
+                gname = vc_group_names.get(vc_group_id, vc_group_id)
+                _log(write, f'  WARNING: Failed to patch memberships for group {gname}: HTTP {r.status_code}')
+        except Exception as e:
+            gname = vc_group_names.get(vc_group_id, vc_group_id)
+            _log(write, f'  WARNING: Failed to patch memberships for group {gname}: {e}')
+            
+    _log(write, f'  Enforced memberships for {success_count} VCF SCIM groups.')
+
+
 OPS_LOGIN = '/ui/login.action'
 PREREQ_PATH = (
     '/vcf-operations/ui/manage/fleet/identity-and-access/sso-overview/prerequisites'
@@ -1136,6 +1226,9 @@ def submit_sso_prerequisites_ui(
                 if gl.count():
                     gl.first.fill(username)
                 else:
+                    if "vc-mgmt-a" in page.url:
+                        _log(write, '  SSO UI: Redirected to vCenter SSO (already federated). Skipping prereqs.')
+                        return True
                     raise RuntimeError('Could not find username field on login page')
 
             for sel in ('#password-inputEl', 'input[name="j_password"]', 'input#password', 'input[type="password"]'):
@@ -1437,7 +1530,9 @@ def run_authentik_vcf_integration(
                 def _sync() -> bool:
                     if dry_run or scim_pk is None:
                         return True
-                    return ak.trigger_scim_provider_sync(scim_pk, filter_group_names=scim_filter_groups)
+                    ok_sync = ak.trigger_scim_provider_sync(scim_pk, filter_group_names=scim_filter_groups)
+                    force_vcf_scim_group_memberships(ak, scim_url, fleet_scim_tok, write, verify_tls)
+                    return ok_sync
 
                 if not fleet_iam_post_scim_assign_and_join(
                     ops_base, otok, vidb_rid, realm_id, _sync, write, verify_tls,
