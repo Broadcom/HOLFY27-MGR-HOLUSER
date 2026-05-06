@@ -389,32 +389,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.generate_html()
     
     #==========================================================================
-    # TASK 9: Trust Vault PKI root CA in Firefox (console profile via /lmchol on manager)
-    #==========================================================================
-    
-    if dashboard:
-        dashboard.update_task('prelim', 'vault_firefox_trust', 'running')
-        dashboard.generate_html()
-    
-    if os.path.isdir(lsf.lmcholroot):
-        try:
-            from Tools.vault_firefox_trust import sync_vault_ca_to_firefox
-
-            if not sync_vault_ca_to_firefox(lsf.mc, lsf.write_output, dry_run=dry_run):
-                lsf.write_output(
-                    'WARNING: Vault PKI root CA could not be fully synced to Firefox profiles'
-                )
-        except Exception as e:
-            lsf.write_output(f'WARNING: Vault Firefox CA sync skipped: {e}')
-    else:
-        lsf.write_output('vault_firefox_trust: console home not mounted; skipping Firefox CA sync')
-    
-    if dashboard:
-        dashboard.update_task('prelim', 'vault_firefox_trust', 'complete')
-        dashboard.generate_html()
-
-    #==========================================================================
-    # TASK 10: Install Playwright on Manager (if required by config)
+    # TASK 9: Install Playwright on Manager (if required by config)
     #
     # Triggered when either of the following is true in config.ini:
     #   [VCFFINAL] authentik_vcf_integration = true  (Authentik integration uses Playwright)
@@ -538,6 +513,36 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.update_task('prelim', 'playwright_install', 'skipped',
                                   'Not required by config')
             dashboard.generate_html()
+
+    #==========================================================================
+    # TASK 10: Trust Vault PKI root CA in Firefox (console profile via /lmchol on manager)
+    #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('prelim', 'vault_firefox_trust', 'running')
+        dashboard.generate_html()
+    
+    import time
+    lsf.write_output('Sleeping for 60 seconds before syncing Vault CA to Firefox...')
+    if not dry_run:
+        time.sleep(60)
+
+    if os.path.isdir(lsf.lmcholroot):
+        try:
+            from Tools.vault_firefox_trust import sync_vault_ca_to_firefox
+
+            if not sync_vault_ca_to_firefox(lsf.mc, lsf.write_output, dry_run=dry_run):
+                lsf.write_output(
+                    'WARNING: Vault PKI root CA could not be fully synced to Firefox profiles'
+                )
+        except Exception as e:
+            lsf.write_output(f'WARNING: Vault Firefox CA sync skipped: {e}')
+    else:
+        lsf.write_output('vault_firefox_trust: console home not mounted; skipping Firefox CA sync')
+    
+    if dashboard:
+        dashboard.update_task('prelim', 'vault_firefox_trust', 'complete')
+        dashboard.generate_html()
 
     ##=========================================================================
     ## End Core Team code
