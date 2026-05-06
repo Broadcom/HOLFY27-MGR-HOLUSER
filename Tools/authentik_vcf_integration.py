@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VERSION: 0.1.0 - 2026-05-05
+VERSION: 0.1.1 - 2026-05-06
 AUTHOR: Burke Azbill and HOL Core Team
 
 Authentik + VCF lab integration (Cycle 7).
@@ -9,18 +9,20 @@ Enabled by a single config.ini toggle:  [VCFFINAL] authentik_vcf_integration = t
 
 Steps performed (all idempotent/re-runnable):
   1. CoreDNS forwarder patch on holorouter
-  2. Vault CA trust check on VCF Operations (ops-a)
+  2. VCF SSO UI Prerequisites (via Playwright)
   3. Authentik OAuth2 provider + application (VCF OIDC / VCF)
   4. Authentik OIDC scope mappings (email, openid, profile)
   5. Authentik groups + lab users (prod-admins, dev-admins, etc.)
-  6. VCF SSO UI Prerequisites (via Playwright)
-  7. Fleet IAM: SSO realm, OIDC+SCIM IdP, SCIM bearer token
-  8. Authentik SCIM provider + backchannel (VCF SCIM)
-  9. Fleet IAM role assignments:
+  6. Fleet IAM: SSO realm, OIDC+SCIM IdP, SCIM bearer token
+  7. Authentik SCIM provider + backchannel (VCF SCIM)
+  8. Fleet IAM role assignments:
        prod-admins  -> vcf_administrator
        dev-admins   -> sddc_admin
        prod-readonly -> vcf_viewer
-  10. Fleet IAM: Join SSO (vCenter, VCF Operations, VCF Automation)
+       dev-readonly  -> sddc_viewer
+  9. Fleet IAM: Join SSO (vCenter, VCF Operations, VCF Automation)
+
+Note: Vault CA trust check is currently bypassed. SCIM relies on object-by-object fallback.
 
 Secrets: never printed to stdout/logs (redacted).
 """
@@ -934,18 +936,18 @@ class AuthentikApi:
         pk = int(provider_pk)
         
         # Try generic full sync endpoints first (might be 405 on some versions)
-        paths = [
-            f'providers/scim/{pk}/sync/',
-            f'providers/scim/{pk}/sync/full/'
-        ]
-        for path in paths:
-            code, data = self.post_json(path, {})
-            if code in (200, 201, 204):
-                _log(self.write, f'  Authentik SCIM sync triggered via {path!r}.')
-                return True
+        # paths = [
+        #     f'providers/scim/{pk}/sync/',
+        #     f'providers/scim/{pk}/sync/full/'
+        # ]
+        # for path in paths:
+        #     code, data = self.post_json(path, {})
+        #     if code in (200, 201, 204):
+        #         _log(self.write, f'  Authentik SCIM sync triggered via {path!r}.')
+        #         return True
                 
         # If generic endpoints fail, fallback to object-by-object sync
-        _log(self.write, "  Authentik SCIM generic sync API unavailable; falling back to object-by-object sync.")
+        # _log(self.write, "  Authentik SCIM generic sync API unavailable; falling back to object-by-object sync.")
         success_count = 0
         error_count = 0
         
@@ -1319,6 +1321,7 @@ def run_authentik_vcf_integration(
     vcf_admin_groups: List[str] = ['prod-admins']      # vcf_administrator
     sddc_admin_groups: List[str] = ['dev-admins']       # sddc_admin
     viewer_groups: List[str] = ['prod-readonly']        # vcf_viewer
+    sddc_viewer_groups: List[str] = ['dev-readonly']    # sddc_viewer
 
     # SCIM filter: all groups whose users and memberships sync into vCenter VIDB
     scim_filter_groups: List[str] = [
@@ -1336,8 +1339,12 @@ def run_authentik_vcf_integration(
     if not run_coredns_patch(creds_path, write, dry_run):
         ok = False
 
-    # ── Step 2: Vault CA trust on VCF Operations ─────────────────────────────
-    ensure_ops_vault_ca_trust(ops_fqdn, creds_path, write, dry_run)
+    # ── Step 2: VCF SSO UI Prerequisites ─────────────────────────────────────
+    # Run UI Prerequisites via Playwright if available
+    submit_sso_prerequisites_ui(ops_fqdn, password, write, dry_run)
+
+    # Note: Vault CA trust check is currently bypassed.
+    # ensure_ops_vault_ca_trust(ops_fqdn, creds_path, write, dry_run)
 
     if requests is None:
         _log(write, 'ERROR: Python requests module missing — install requests.')
@@ -1371,7 +1378,7 @@ def run_authentik_vcf_integration(
 
     # ── Step 5: Authentik groups + lab users ─────────────────────────────────
     all_groups = list(dict.fromkeys(
-        scim_filter_groups + vcf_admin_groups + sddc_admin_groups + viewer_groups
+        scim_filter_groups + vcf_admin_groups + sddc_admin_groups + viewer_groups + sddc_viewer_groups
     ))
     group_pk_by_name: Dict[str, Any] = {}
     for gname in all_groups:
@@ -1393,9 +1400,6 @@ def run_authentik_vcf_integration(
     # ── Steps 6-9: Fleet IAM SSO realm, IdP, SCIM, role assignment, Join SSO ─
     _log(write, 'Fleet IAM: VCF Operations suite-api (SSO realm, OIDC+SCIM IdP, SCIM token).')
     otok: Optional[str] = None
-    
-    # Run UI Prerequisites via Playwright if available
-    submit_sso_prerequisites_ui(ops_fqdn, password, write, dry_run)
 
     try:
         otok = _ops_token(ops_base, password, verify_tls)
@@ -1430,6 +1434,8 @@ def run_authentik_vcf_integration(
                     vcf_viewer_role='vcf_viewer',
                     sddc_admin_group_names=sddc_admin_groups,
                     vcf_sddc_role='sddc_admin',
+                    sddc_viewer_group_names=sddc_viewer_groups,
+                    vcf_sddc_viewer_role='sddc_viewer',
                 ):
                     ok = False
     except Exception as e:

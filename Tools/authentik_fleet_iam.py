@@ -1,6 +1,6 @@
 """
 TODO: This script is a work in progress. It is not yet complete.
-VERSION: 0.0.3 - 2026-05-04
+VERSION: 0.0.4 - 2026-05-06
 AUTHOR: Burke Azbill and HOL Core Team
 
 This script is used to configure the Authentik identity provider for VCF SSO (OIDC + SCIM).
@@ -651,6 +651,8 @@ def fleet_iam_post_scim_assign_and_join(
     vcf_viewer_role: str = 'vcf_viewer',
     sddc_admin_group_names: Optional[List[str]] = None,
     vcf_sddc_role: str = 'sddc_admin',
+    sddc_viewer_group_names: Optional[List[str]] = None,
+    vcf_sddc_viewer_role: str = 'sddc_viewer',
 ) -> bool:
     """After Authentik SCIM provider exists: run sync, assign roles, join SSO."""
     client = FleetIamClient(ops_base, ops_token, write, verify_tls)
@@ -672,6 +674,13 @@ def fleet_iam_post_scim_assign_and_join(
         )
         if not sddc_ok:
             _log(write, f'  WARNING: {vcf_sddc_role!r} assignment to SDDC admin groups incomplete.')
+            assign_ok = False
+    if sddc_viewer_group_names:
+        sddc_viewer_ok = assign_vcf_admin_to_groups(
+            client, sso_realm_id, sddc_viewer_group_names, vcf_sddc_viewer_role, write, wait_timeout_sec=60,
+        )
+        if not sddc_viewer_ok:
+            _log(write, f'  WARNING: {vcf_sddc_viewer_role!r} assignment to SDDC viewer groups incomplete.')
             assign_ok = False
     join_ok = join_default_sso_components(client, sso_realm_id, vidb_resource_id, write, join_nsx=join_nsx)
     if not assign_ok:
