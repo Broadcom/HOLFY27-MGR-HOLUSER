@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VERSION: 0.1.2 - 2026-05-06
+VERSION: 0.1.3 - 2026-05-06
 AUTHOR: Burke Azbill and HOL Core Team
 
 Authentik + VCF lab integration (Cycle 7).
@@ -20,7 +20,7 @@ Steps performed (all idempotent/re-runnable):
        dev-admins   -> sddc_admin
        prod-readonly -> vcf_viewer
        dev-readonly  -> sddc_viewer
-  9. Fleet IAM: Join SSO (vCenter, VCF Operations, VCF Automation)
+  9. Fleet IAM: Join SSO (All eligible vCenter and NSX components, VCF Operations, VCF Automation)
 
 Note: Vault CA trust check is currently bypassed. SCIM relies on object-by-object fallback.
 
@@ -1536,7 +1536,7 @@ def run_authentik_vcf_integration(
 
                 if not fleet_iam_post_scim_assign_and_join(
                     ops_base, otok, vidb_rid, realm_id, _sync, write, verify_tls,
-                    join_nsx=False,
+                    join_nsx=True,
                     group_names=vcf_admin_groups,
                     vcf_role='vcf_administrator',
                     viewer_group_names=viewer_groups,
