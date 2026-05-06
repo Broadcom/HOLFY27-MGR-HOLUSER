@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.5 - 2026-05-05
+# Version 3.6 - 2026-05-06
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
