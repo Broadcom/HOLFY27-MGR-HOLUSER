@@ -523,9 +523,9 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.generate_html()
     
     import time
-    lsf.write_output('Sleeping for 60 seconds before syncing Vault CA to Firefox...')
+    lsf.write_output('Sleeping for 30 seconds before syncing Vault CA to Firefox...')
     if not dry_run:
-        time.sleep(60)
+        time.sleep(30)
 
     if os.path.isdir(lsf.lmcholroot):
         try:

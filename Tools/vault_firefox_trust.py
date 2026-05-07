@@ -108,12 +108,12 @@ def download_vault_root_ca_pem(
     Download the Vault PKI root CA PEM, trying the NodePort IP first and
     falling back to the FQDN if the IP is unreachable.
     """
-    pem = _fetch_with_retries(VAULT_CA_URL_IP, max_attempts=3, delay=15, timeout=timeout, log=log)
+    pem = _fetch_with_retries(VAULT_CA_URL_IP, max_attempts=3, delay=20, timeout=timeout, log=log)
     if pem:
         return pem
 
     _log_call(log, f"vault_firefox_trust: IP fetch failed; falling back to {VAULT_CA_URL_FQDN}")
-    return _fetch_with_retries(VAULT_CA_URL_FQDN, max_attempts=4, delay=15, timeout=timeout, log=log)
+    return _fetch_with_retries(VAULT_CA_URL_FQDN, max_attempts=4, delay=20, timeout=timeout, log=log)
 
 
 def import_ca_pem_to_profile(
