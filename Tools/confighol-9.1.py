@@ -2688,6 +2688,100 @@ def install_certutil(dry_run: bool = False) -> bool:
         return False
 
 
+def check_playwright_installed() -> bool:
+    """
+    Check if Playwright and its Chromium browser are installed.
+    
+    :return: True if both the Python package and chromium binary are available
+    """
+    import subprocess
+    
+    # Check 1: is the playwright Python package importable?
+    pkg_check = subprocess.run(
+        ['python3', '-c', 'import playwright'],
+        capture_output=True, timeout=30
+    )
+    if pkg_check.returncode != 0:
+        return False
+        
+    # Check 2: is the chromium browser binary present?
+    chromium_check = subprocess.run(
+        ['python3', '-c',
+         'from playwright.sync_api import sync_playwright as _sp; '
+         'import os as _os; '
+         '_pw = _sp().start(); '
+         '_ep = _pw.chromium.executable_path; '
+         '_pw.stop(); '
+         'assert _os.path.isfile(_ep), f"not found: {_ep}"'],
+        capture_output=True, text=True, timeout=30
+    )
+    return chromium_check.returncode == 0
+
+
+def install_playwright(dry_run: bool = False) -> bool:
+    """
+    Install Playwright Python package and its Chromium browser.
+    
+    :param dry_run: If True, only show what would be done
+    :return: True if installation successful
+    """
+    if check_playwright_installed():
+        lsf.write_output('Playwright package and chromium browser already installed')
+        return True
+        
+    if dry_run:
+        lsf.write_output('Would install playwright package and chromium browser')
+        return True
+        
+    import subprocess
+    playwright_install_ok = True
+    
+    # Check if package is importable first
+    pkg_check = subprocess.run(['python3', '-c', 'import playwright'], capture_output=True)
+    playwright_pkg_ok = (pkg_check.returncode == 0)
+    
+    # Step 1: pip install playwright
+    if not playwright_pkg_ok:
+        lsf.write_output('Installing playwright Python package globally...')
+        pip_result = subprocess.run(
+            ['python3', '-m', 'pip', 'install', '--break-system-packages', 'playwright'],
+            capture_output=True, text=True, timeout=300
+        )
+        if pip_result.stdout:
+            for line in pip_result.stdout.strip().split('\n'):
+                if line.strip():
+                    lsf.write_output(f'  pip: {line}')
+        if pip_result.returncode != 0:
+            lsf.write_output(f'ERROR: playwright pip install failed (rc={pip_result.returncode})')
+            if pip_result.stderr:
+                lsf.write_output(f'  stderr: {pip_result.stderr.strip()[:500]}')
+            playwright_install_ok = False
+        else:
+            playwright_pkg_ok = True
+            lsf.write_output('playwright package installed successfully.')
+
+    # Step 2: playwright install chromium
+    if playwright_pkg_ok:
+        lsf.write_output('Installing playwright chromium browser...')
+        cr_result = subprocess.run(
+            ['python3', '-m', 'playwright', 'install', 'chromium'],
+            capture_output=True, text=True, timeout=600
+        )
+        if cr_result.stdout:
+            for line in cr_result.stdout.strip().split('\n'):
+                if line.strip():
+                    lsf.write_output(f'  playwright: {line}')
+        if cr_result.returncode != 0:
+            lsf.write_output(f'ERROR: playwright install chromium failed (rc={cr_result.returncode})')
+            if cr_result.stderr:
+                lsf.write_output(f'  stderr: {cr_result.stderr.strip()[:500]}')
+            playwright_install_ok = False
+        else:
+            lsf.write_output('playwright chromium browser installed successfully.')
+            
+    return playwright_install_ok
+
+
 def check_vault_accessible(vault_url: str = VAULT_URL, 
                            ca_path: str = VAULT_CA_PATH,
                            timeout: int = 5) -> Tuple[bool, str]:
@@ -4922,6 +5016,9 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
         sys.exit(1)
     
     lsf.write_output("Pre-check: 'expect' utility is present")
+    
+    # Install Playwright if needed (used by Authentik integration)
+    install_playwright(args.dry_run)
     
     # Step 0a: Import Vault root CA to Firefox on console VM (at the beginning)
     # This allows the user to skip/retry/fail early if Vault is not accessible

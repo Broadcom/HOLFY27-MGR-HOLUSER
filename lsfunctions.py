@@ -1,5 +1,5 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.4 - 2026-03-13
+# Version 3.5 - 2026-05-06
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
@@ -1824,7 +1824,9 @@ def startup(module_name, timeout=120, labcheck_mode=False):
         write_output(f'Startup module not found: {module_name}')
         return False
     
+    write_output('='*80)
     write_output(f'Starting module: {module_name} from {module_path}')
+    write_output('='*80)
     
     try:
         # Import and execute the module
