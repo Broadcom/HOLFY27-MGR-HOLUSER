@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 2.8 - 2026-05-01
+# Version 2.9 - 2026-05-06
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 2.9 Changes:
+# - Passed 'lsf' to fleet shutdown methods to track 'vra' OS shutdown via SSH.
 #
 # v 2.8 Changes:
 # - Shutdown timing updated based on actual lab shutdown times
@@ -430,7 +433,7 @@ def shutdown_supervisor_workloads(lsf, vc_fqdn: str, password: str,
         return False
 
     # Helper to run kubectl on SCP
-    def scp_kubectl(cmd):
+    def scp_kubectl(cmd, timeout_sec=30):
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
             f.write(scp_password)
             pwfile = f.name
@@ -438,13 +441,20 @@ def shutdown_supervisor_workloads(lsf, vc_fqdn: str, password: str,
             result = subprocess.run(
                 ['sshpass', '-f', pwfile, 'ssh', '-o', 'StrictHostKeyChecking=accept-new',
                  f'root@{scp_ip}', cmd],
-                capture_output=True, text=True, timeout=30
+                capture_output=True, text=True, timeout=timeout_sec
             )
             return result
+        except subprocess.TimeoutExpired:
+            class TimeoutResult:
+                def __init__(self):
+                    self.returncode = 124
+                    self.stdout = ''
+                    self.stderr = f'Command timed out after {timeout_sec}s'
+            return TimeoutResult()
         finally:
             os.unlink(pwfile)
 
-    # Step 2: Discover and delete TKG/VKS clusters
+    # Step 1: Discover and delete TKG/VKS clusters
     vcf_write(lsf, '  Discovering TKG/VKS clusters...')
     clusters_result = scp_kubectl('kubectl get clusters -A -o json 2>/dev/null')
     clusters_deleted = 0
@@ -1135,7 +1145,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
 
                             success = fleet.shutdown_products_fleet_lcm(
                                 fleet_lcm_fqdn, fleet_jwt, fleet_products,
-                                write_output=_fleet_log)
+                                lsf=lsf, write_output=_fleet_log)
                             if success:
                                 vcf_write(lsf, 'Fleet LCM direct API shutdown complete')
                                 fleet_api_succeeded = True
@@ -1158,7 +1168,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
 
                             success = fleet.shutdown_products_v91(ops_fqdn, jwt_token,
                                                                   fleet_products,
-                                                                  write_output=_fleet_log)
+                                                                  lsf=lsf, write_output=_fleet_log)
                             if success:
                                 vcf_write(lsf, 'Fleet LCM (suite-api proxy) shutdown complete')
                                 fleet_api_succeeded = True
@@ -1326,221 +1336,8 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
             vcf_write(lsf, 'Continuing with next phase...')
     #==========================================================================
     
-    if should_run('2b'):
-        try:
-            _vcf_phase_entry(lsf, '2b', dry_run, mgmt_hosts, eta)
-            vcf_write(lsf, '='*60)
-            vcf_write(lsf, 'PHASE 2b: Scale Down VCF Component Services (K8s on VSP)')
-            vcf_write(lsf, '='*60)
-            update_shutdown_status(2, 'Scale Down VCF Component Services', dry_run)
-
-            vcfcomponents = []
-            if lsf.config.has_option('VCFFINAL', 'vcfcomponents'):
-                comp_raw = lsf.config.get('VCFFINAL', 'vcfcomponents')
-                vcfcomponents = [c.strip() for c in comp_raw.split('\n')
-                                 if c.strip() and not c.strip().startswith('#')]
-
-            if vcfcomponents:
-                vcf_write(lsf, f'Found {len(vcfcomponents)} VCF Component(s) to scale down')
-
-                if not dry_run:
-                    import socket
-
-                    vsp_control_plane_ip = None
-                    vsp_user = 'vmware-system-user'
-
-                    # Check for static override first
-                    if lsf.config.has_option('VCFFINAL', 'vspcontrolplaneip'):
-                        vsp_control_plane_ip = lsf.config.get('VCFFINAL', 'vspcontrolplaneip').strip()
-                        if vsp_control_plane_ip:
-                            vcf_write(lsf, f'  VSP control plane IP (from config): {vsp_control_plane_ip}')
-
-                    # Auto-discover VSP control plane via DNS + SSH
-                    if not vsp_control_plane_ip:
-                        vsp_candidates = ['vsp-01a.site-a.vcf.lab']
-                        for candidate in vsp_candidates:
-                            try:
-                                worker_ip = socket.gethostbyname(candidate)
-                                vcf_write(lsf, f'  VSP worker: {candidate} -> {worker_ip}')
-                                result = lsf.ssh(
-                                    f"echo '{password}' | sudo -S grep server: /etc/kubernetes/node-agent.conf",
-                                    f'{vsp_user}@{worker_ip}'
-                                )
-                                if hasattr(result, 'stdout') and result.stdout:
-                                    import re as _re
-                                    for line in result.stdout.strip().split('\n'):
-                                        if 'server:' in line:
-                                            match = _re.search(r'https?://([0-9.]+):', line)
-                                            if match:
-                                                vsp_control_plane_ip = match.group(1)
-                                                vcf_write(lsf, f'  VSP control plane IP: {vsp_control_plane_ip}')
-                                                break
-                                if vsp_control_plane_ip:
-                                    break
-                            except Exception as e:
-                                vcf_write(lsf, f'  VSP discovery failed for {candidate}: {e}')
-
-                    if vsp_control_plane_ip:
-                        # Detect sudo mode
-                        sudo_needs_password = True
-                        sudo_check = lsf.ssh('sudo -n true', f'{vsp_user}@{vsp_control_plane_ip}')
-                        if hasattr(sudo_check, 'returncode') and sudo_check.returncode == 0:
-                            sudo_needs_password = False
-
-                        def vsp_kubectl(kubectl_cmd):
-                            if sudo_needs_password:
-                                ssh_cmd = f"echo '{password}' | sudo -S -i bash -c '{kubectl_cmd}'"
-                            else:
-                                ssh_cmd = f"sudo -i bash -c '{kubectl_cmd}'"
-                            return lsf.ssh(ssh_cmd, f'{vsp_user}@{vsp_control_plane_ip}')
-
-                        # Scale down each component to 0 replicas (reverse order from startup)
-                        # Save original replica count as annotation so startup can restore it
-                        scaled_down = 0
-                        already_stopped = 0
-                        errors = 0
-
-                        for entry in reversed(vcfcomponents):
-                            parts = entry.split(':', 1)
-                            if len(parts) != 2 or '/' not in parts[1]:
-                                vcf_write(lsf, f'  WARNING: Invalid vcfcomponents entry: {entry}')
-                                errors += 1
-                                continue
-
-                            namespace = parts[0].strip()
-                            resource = parts[1].strip()
-
-                            # Check current replica count
-                            check_cmd = f'kubectl get {resource} -n {namespace} -o jsonpath="{{.spec.replicas}}"'
-                            check_result = vsp_kubectl(check_cmd)
-                            current_replicas = ''
-                            if hasattr(check_result, 'stdout') and check_result.stdout:
-                                current_replicas = check_result.stdout.strip().split('\n')[-1].strip()
-
-                            if current_replicas == '0':
-                                vcf_write(lsf, f'  {namespace}/{resource}: already stopped (replicas=0)')
-                                already_stopped += 1
-                                continue
-
-                            # Save current replica count as annotation for startup restore
-                            if current_replicas.isdigit() and int(current_replicas) > 0:
-                                vsp_kubectl(
-                                    f"kubectl annotate {resource} -n {namespace} "
-                                    f"vcf.lab/original-replicas={current_replicas} --overwrite"
-                                )
-
-                            vcf_write(lsf, f'  Scaling down: {namespace}/{resource} (was replicas={current_replicas})')
-                            scale_cmd = f'kubectl scale {resource} -n {namespace} --replicas=0'
-                            scale_result = vsp_kubectl(scale_cmd)
-
-                            if hasattr(scale_result, 'returncode') and scale_result.returncode == 0:
-                                scaled_down += 1
-                            else:
-                                err = ''
-                                if hasattr(scale_result, 'stderr') and scale_result.stderr:
-                                    err = scale_result.stderr.strip()[:200]
-                                vcf_write(lsf, f'  WARNING: Failed to scale down {namespace}/{resource}: {err}')
-                                errors += 1
-
-                        # Annotate Component CRDs as NotRunning
-                        # Component CRDs are cluster-scoped (not namespaced).
-                        # We fetch JSON and parse locally to avoid SSH escaping
-                        # issues with dotted annotation keys in custom-columns/jsonpath.
-                        # Always run (not gated by scaled_down) so re-runs after
-                        # partial failures still update annotations.
-                        if scaled_down > 0 or already_stopped > 0:
-                            vcf_write(lsf, '  Updating Component CRD annotations to NotRunning...')
-                            comp_json = vsp_kubectl(
-                                'kubectl get components.api.vmsp.vmware.com -o json 2>/dev/null'
-                            )
-                            if hasattr(comp_json, 'stdout') and comp_json.stdout:
-                                try:
-                                    raw = comp_json.stdout.strip()
-                                    json_start = raw.find('{')
-                                    if json_start >= 0:
-                                        raw = raw[json_start:]
-                                    comp_data = json.loads(raw)
-                                    for comp_item in comp_data.get('items', []):
-                                        crd_name = comp_item.get('metadata', {}).get('name', '')
-                                        ann = comp_item.get('metadata', {}).get('annotations', {})
-                                        status = ann.get('component.vmsp.vmware.com/operational-status', '')
-                                        if status == 'Running' and crd_name != 'vsp':
-                                            vcf_write(lsf, f'  Annotating {crd_name} -> NotRunning')
-                                            vsp_kubectl(
-                                                f'kubectl annotate components.api.vmsp.vmware.com '
-                                                f'{crd_name} '
-                                                f'component.vmsp.vmware.com/operational-status=NotRunning --overwrite'
-                                            )
-                                except (json.JSONDecodeError, ValueError) as je:
-                                    vcf_write(lsf, f'  WARNING: Could not parse component JSON: {je}')
-
-                        # Suspend postgres instances (reverse of startup unsuspend)
-                        # Three-step process:
-                        #   1. Set suspended label on PostgresInstance CRD
-                        #   2. Save current numberOfInstances as annotation for restore
-                        #   3. Scale Zalando postgres CRD numberOfInstances to 0
-                        # All steps are needed for clean shutdown and matching startup unsuspend.
-                        vcf_write(lsf, '  Suspending Postgres instances...')
-                        pg_check = vsp_kubectl(
-                            'kubectl get postgresinstances.database.vmsp.vmware.com -A '
-                            '-o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,'
-                            'SUSPENDED:.metadata.labels.database\\.vmsp\\.vmware\\.com/suspended '
-                            '--no-headers'
-                        )
-                        if hasattr(pg_check, 'stdout') and pg_check.stdout:
-                            for line in pg_check.stdout.strip().split('\n'):
-                                cols = line.split()
-                                if len(cols) >= 2:
-                                    pg_ns, pg_name = cols[0], cols[1]
-                                    suspended = cols[2] if len(cols) >= 3 else '<none>'
-                                    if suspended != 'true':
-                                        vcf_write(lsf, f'  Suspending Postgres: {pg_ns}/{pg_name}')
-                                        vsp_kubectl(
-                                            f'kubectl label postgresinstances.database.vmsp.vmware.com '
-                                            f'{pg_name} -n {pg_ns} database.vmsp.vmware.com/suspended=true --overwrite'
-                                        )
-                                        # Save current numberOfInstances so startup can restore it
-                                        cur_inst_check = vsp_kubectl(
-                                            f'kubectl get postgresqls.acid.zalan.do {pg_name} -n {pg_ns} '
-                                            f'-o jsonpath="{{.spec.numberOfInstances}}" 2>/dev/null'
-                                        )
-                                        cur_instances = '1'
-                                        if hasattr(cur_inst_check, 'stdout') and cur_inst_check.stdout:
-                                            val = cur_inst_check.stdout.strip().split('\n')[-1].strip()
-                                            if val.isdigit() and int(val) > 0:
-                                                cur_instances = val
-                                        vsp_kubectl(
-                                            f"kubectl annotate postgresqls.acid.zalan.do {pg_name} -n {pg_ns} "
-                                            f"vcf.lab/original-instances={cur_instances} --overwrite"
-                                        )
-                                        patch_json = '{"spec":{"numberOfInstances":0}}'
-                                        vsp_kubectl(
-                                            f"kubectl patch postgresqls.acid.zalan.do {pg_name} -n {pg_ns} "
-                                            f"--type=merge -p '{patch_json}'"
-                                        )
-
-                        vcf_write(lsf, f'VCF Component Services: {scaled_down} scaled down, '
-                                  f'{already_stopped} already stopped, {errors} errors '
-                                  f'(of {len(vcfcomponents)} total)')
-                    else:
-                        vcf_write(lsf, '  VSP control plane not reachable - skipping component scale-down')
-                        vcf_write(lsf, '  (Components will be stopped when VSP VMs are powered off)')
-                else:
-                    vcf_write(lsf, f'Would scale down {len(vcfcomponents)} VCF component(s) (dry run)')
-            else:
-                vcf_write(lsf, 'No VCF Components configured in [VCFFINAL] vcfcomponents')
-
-            #==========================================================================
-            # TASK 3b: Gracefully shut down Supervisor workloads
-            # Dynamically discovers and shuts down VKS/TKG clusters and
-            # Supervisor Service deployments (Harbor, etc.) via the
-            # Supervisor K8s API BEFORE WCP is stopped (Phase 3).
-            # This is the reverse of VCFfinal.py Task 2a (Supervisor startup).
-        except Exception as _phase_err:
-            vcf_write(lsf, f'ERROR in Phase 2b: {_phase_err}')
-            vcf_write(lsf, 'Continuing with next phase...')
     #==========================================================================
-
+    
     if should_run('3b'):
         try:
             _vcf_phase_entry(lsf, '3b', dry_run, mgmt_hosts, eta)
@@ -2737,8 +2534,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
             if not dry_run:
                 if vsp_vm_patterns:
                     vcf_write(lsf, f'Searching for VSP VMs matching {len(vsp_vm_patterns)} pattern(s)...')
-                    vsp_shutdown_count = 0
-                    vsp_already_off = 0
+                    vsp_vms_to_shutdown = []
                     for pattern in vsp_vm_patterns:
                         vcf_write(lsf, f'  Pattern: {pattern}')
                         vms = lsf.get_vm_match(pattern)
@@ -2746,15 +2542,36 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
                             vcf_write(lsf, f'  Found {len(vms)} VM(s)')
                             for vm in vms:
                                 if lsf.is_vm_powered_on(vm):
-                                    lsf.shutdown_vm_gracefully(vm)
-                                    vsp_shutdown_count += 1
-                                    time.sleep(5)
+                                    vsp_vms_to_shutdown.append(vm)
                                 else:
                                     vcf_write(lsf, f'  {vm.name}: Already powered off')
-                                    vsp_already_off += 1
                         else:
                             vcf_write(lsf, f'  No VMs found matching pattern')
-                    vcf_write(lsf, f'VSP VMs: {vsp_shutdown_count} shut down, {vsp_already_off} already off')
+                    
+                    if vsp_vms_to_shutdown:
+                        import concurrent.futures
+                        vcf_write(lsf, f'Shutting down {len(vsp_vms_to_shutdown)} VSP VM(s) in parallel...')
+                        
+                        def _shutdown_vsp_vm(vm):
+                            try:
+                                lsf.shutdown_vm_gracefully(vm)
+                                return (vm.name, True, None)
+                            except Exception as e:
+                                return (vm.name, False, str(e))
+                                
+                        vsp_shutdown_count = 0
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(vsp_vms_to_shutdown))) as executor:
+                            futures = [executor.submit(_shutdown_vsp_vm, vm) for vm in vsp_vms_to_shutdown]
+                            for future in concurrent.futures.as_completed(futures):
+                                vm_name, success, err = future.result()
+                                if success:
+                                    vsp_shutdown_count += 1
+                                else:
+                                    vcf_write(lsf, f'  WARNING: Failed to shut down {vm_name}: {err}')
+                                    
+                        vcf_write(lsf, f'VSP VMs: {vsp_shutdown_count} shut down gracefully')
+                    else:
+                        vcf_write(lsf, 'No VSP VMs needed shutdown (all already off or none found)')
                 else:
                     vcf_write(lsf, 'No VSP VMs configured in [VCF] vspvms')
             else:

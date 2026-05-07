@@ -1,6 +1,6 @@
 ---
 name: vcf-troubleshooting
-description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch), and Authentik SCIM syncing 0 users due to empty property_mappings. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, OIDC sub ExternalId, SCIM 0 users, property_mappings empty, or vcf_viewer role.
+description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch), Authentik SCIM syncing 0 users due to empty property_mappings, and Authentik missing group memberships due to empty vCenter SCIM group payload. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, OIDC sub ExternalId, SCIM 0 users, property_mappings empty, vcf_viewer role, SCIM members array missing, force_vcf_scim_group_memberships, or patch_compare_users bug.
 ---
 
 # VCF 9.x Troubleshooting Guide
@@ -38,22 +38,28 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | Harbor unreachable, Supervisor DNS broken | Harbor pods CrashLoopBackOff with "i/o timeout" on DNS lookups | kube-dns endpoint points to LB IP causing asymmetric DLB routing | 25 |
 | VSP image pulls fail after boot | All VSP pods in ImagePullBackOff, Fleet LCM/Ops Logs HTTP 500 | VSP service CIDR `198.18.128.0/17` not in NO_PROXY; containerd routes internal pulls through Squid proxy | 26 |
 | VCF Ops Fleet Mgmt rejects Microsoft CA | "Failed to update certificate authorities" in UI | certsrv proxy returns 301 for `/certsrv`; VCF Ops Java client does not follow redirects | 27 |
+| certsrv-proxy Address already in use | Pod CrashLoopBackOff with `OSError: [Errno 98]` | Orphaned Python process on host still bound to port 443 after force pod delete | 28 |
+| SDDC Manager "Public key mismatch" on cert install | "Public key in CSR and server certificate are not matching" | PKCS#7 DER encoding sorts SET OF elements, putting CA cert before leaf cert | 29 |
+| NSX ReTrust fails after vCenter cert replacement | "Failed to import the trusted root certificate for compute manager" | NSX tries to re-trust vCenter while services are still restarting; transient timing issue | 30 |
+| NSX Compute Manager DOWN after vCenter cert replacement | `connection_status: DOWN`, `REGISTERED_WITH_ERRORS`, error 7059/MP2179 | `dir-cli trustedcert publish` double-cert in TRUSTED_ROOTS; NSX rejects multi-cert PEM | 31 |
+| VCF Operations Fleet UI cannot replace SDDC Manager cert | `UndeclaredThrowableException`; SDDC Manager returns HTTP 400 | `ReplaceCertificateTask` sends `resources` as JSON object; SDDC Manager 9.x requires array | 32 |
 | Fleet LCM SHUTDOWN HTTP 400 for OPS | vrops/OPS returns UnsupportedOperation | VCF Operations cannot shut itself down via its own API | 33 |
 | Phase 4 ManagedObjectNotFound | VM disappears between discovery and shutdown | Race between Phase 3b cluster deletion and Phase 4 VM enumeration | 34 |
 | SCP VM straggler in Phase 19c | SupervisorControlPlaneVM found powered on in audit | EAM-managed VM; cannot be shut down via vCenter API (expected) | 35 |
 | vCenter SSH broken on fresh pod | sshpass exit 5 despite correct password | VAMI shell + pam_mgmt_cli.so intercepts SSH auth; fix via Guest Operations | 36 |
 | SDDC Manager auto-rotate disable HTTP 403 | "maximum number of 10 concurrent" | Stale task_metadata + entity_and_task records in platform DB block concurrency slots | 37 |
-| certsrv-proxy Address already in use | Pod CrashLoopBackOff with `OSError: [Errno 98]` | Orphaned Python process on host still bound to port 443 after force pod delete | 28 |
-| SDDC Manager "Public key mismatch" on cert install | "Public key in CSR and server certificate are not matching" | PKCS#7 DER encoding sorts SET OF elements, putting CA cert before leaf cert | 29 |
-| NSX ReTrust fails after vCenter cert replacement | "Failed to import the trusted root certificate for compute manager" | NSX tries to re-trust vCenter while services are still restarting; transient timing issue | 30 |
-| NSX Compute Manager DOWN after vCenter cert replacement | `connection_status: DOWN`, `REGISTERED_WITH_ERRORS`, error 7059/MP2179 | `dir-cli trustedcert publish` double-cert in TRUSTED_ROOTS; NSX rejects multi-cert PEM | 31 |
 | auth.vcf.lab / vault.vcf.lab untrusted or Firefox very slow | TLS error despite `vcf.lab Root Authority` in Firefox; `openssl verify` shows expired leaf | nginx `/root/nginx-certs/*.crt` leaf certs expired (~30d TTL); root CA still valid | 38 |
 | Firefox takes minutes to open on LMC | `user.js` had `network.proxy.type` 2 with `10.0.0.1:3128`; large `suggest.sqlite` | Invalid PAC + dead proxy stalls startup; huge urlbar DB adds local SQLite I/O (profile is local disk on console) | 39 |
 | vCenter OIDC IdP registration fails (526/503, parse errors) | `POST /api/vcenter/identity/providers` returns 400; message mentions `external-vecs` or `parsePropertyException` | Discovery URL fetch via vCenter trust proxy — TLS to IdP not trusted, or invalid `claim_map` shape | 40 |
-| vCenter / VCF Operations still show only local login after Authentik script | No “SSO” or corporate IdP button; only `administrator@…` / `admin` + password | Legacy `authentik_skip_fleet_iam` path skips Fleet IAM enrollment; or Fleet IAM / SCIM / Join SSO failed — see §41 | 41 |
+| vCenter / VCF Operations still show only local login after Authentik script | No "SSO" or corporate IdP button; only `administrator@…` / `admin` + password | Legacy `authentik_skip_fleet_iam` path skips Fleet IAM enrollment; or Fleet IAM / SCIM / Join SSO failed — see §41 | 41 |
 | VCF SSO Overview get-started empty after Prerequisites | All five prerequisite boxes submitted; UI still shows nothing configured | Prerequisites alone do not open the wizard — must click **Configure SSO**; **`idpId`** null until Fleet IAM `POST .../identity-providers` or IdP wizard completes (cert chain shape, discovery 404, etc.) — see §42 | 42 |
-| Authentik SCIM “Network error” / failed to sync groups | `authentik-worker` logs: `Failed to sync Group … transient error: Network error communicating with remote system`; same `exc` on users | Outgoing SCIM client calls RFC 7644 `GET …/ServiceProviderConfig` first; vCenter VIDB SCIM returns **HTTP 404** on that path — Authentik mislabels as “network” | 43 |
+| Authentik SCIM "Network error" / failed to sync groups | `authentik-worker` logs: `Failed to sync Group … transient error: Network error communicating with remote system`; same `exc` on users | Outgoing SCIM client calls RFC 7644 `GET …/ServiceProviderConfig` first; vCenter VIDB SCIM returns **HTTP 404** on that path — Authentik mislabels as "network" | 43 |
 | Federated login fails after SCIM users/groups visible | `prod-admin@vcf.lab` authenticates at Authentik but vCenter / Ops SSO rejects or loops | Fleet IAM maps OIDC **`sub`** → VIDB **`ExternalId`**; Authentik **`sub_mode: user_username`** (or UI equivalent) breaks pairing with default SCIM **externalId** | 44 |
+| Federated login fails: `NullPointerException: idToken is null` | User completes Authentik login; vCenter/Ops returns "Access Denied" with no password error | Authentik OAuth2 provider `encryption_key` set to non-null causes JWE-encrypted `id_token`; VIDB cannot decrypt JWE | 45 |
+| Federated login fails: `Invalid issuer claim in token` | `OidcTokenValidationException` in `accesscontrol-service.log`; OIDC signature is valid | `issuer_mode: global` → `iss: https://auth.vcf.lab/`; VIDB expects per-provider issuer stored at registration | 46 |
+| Authentik SCIM syncs groups but 0 users | SCIM provider shows healthy sync; Fleet IAM / VIDB lists groups but no users | SCIM provider `property_mappings: []` empty; Authentik silently skips all user object pushes | 47 |
+| Authentik SCIM syncs users but group memberships are empty | "View Group Members" shows "No items to display"; users cannot log in | vCenter VIDB SCIM returns Group objects without `members` array; Authentik `patch_compare_users` skips PATCH | 48 |
+| VCF Operations UI shows internal component type names | Lifecycle UI displays `OPS_NETWORKS`, `OPS_LOGS` instead of friendly names; `/fleet-lcm/v1/components` returns `[]` | Race: `vcf-fleet-lcm`/`vcf-sddc-lcm` start before `vidb` finishes JWT key initialization | 49 |
 
 ---
 
@@ -2015,3 +2021,61 @@ After patching, trigger a re-sync from the Authentik UI (SCIM provider → Sync 
 - Group membership *shells* (the `scim_groups` count) can appear healthy even when users are 0 — do not use non-zero `scim_groups` as evidence that users are also syncing.
 - The mapping endpoint is `GET /api/v3/propertymappings/provider/scim/` (not `.../provider/saml/` or `.../all/`).
 - Related: pitfall §76 in `vcf-9-api` skill.
+
+---
+
+## 48. Authentik SCIM Syncs Users but Group Memberships are Empty
+
+**Symptom**: In the VCF Operations Fleet IAM SSO Overview, users and groups are successfully synced and listed. However, when clicking on "Assign VCF Roles" -> "View Group Members", it shows "No items to display", and users cannot log in due to missing group authorizations.
+
+**Diagnosis**:
+Check the vCenter SCIM Users endpoint and Groups endpoint:
+```bash
+# Get SCIM token from Authentik
+export SCIM_TOK=$(curl -sk -H "Authorization: Bearer holodeck" https://auth.vcf.lab/api/v3/providers/scim/6/ | jq -r .token)
+
+# Groups show no members
+curl -sk -H "Authorization: Bearer $SCIM_TOK" -H "Accept: application/scim+json" \
+  https://vc-mgmt-a.site-a.vcf.lab/usergroup/scim/v2/Groups | jq '.Resources[]'
+```
+
+**Root Cause**:
+vCenter VIDB SCIM returns Group objects without a `members` array when the group is empty (instead of `members: []`). Authentik's `patch_compare_users` logic relies on `current_group.members is not None` to calculate which users need to be added. Because vCenter returns `null` or omits `members`, Authentik skips the calculation entirely and never issues the `PATCH` request to add members to the group.
+
+**Fix**:
+The memberships must be manually patched directly into vCenter SCIM by an external script, bypassing Authentik's native sync logic for group memberships.
+```python
+# Example of the required PATCH operation for vCenter SCIM
+payload = {
+    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+    "Operations": [
+        {
+            "op": "add",
+            "path": "members",
+            "value": [{"value": "vcenter-scim-user-uuid"}]
+        }
+    ]
+}
+requests.patch(f"{scim_url}/Groups/{vcenter_scim_group_uuid}", json=payload, headers=headers, verify=False)
+```
+*Note: This logic is now fully implemented in `authentik_vcf_integration.py` via `force_vcf_scim_group_memberships`.*
+
+## 49. VCF Operations UI Component Display Names Show Internal Types (e.g. OPS_NETWORKS)
+
+**Symptom**:
+The VCF Operations Manager Lifecycle UI displays raw component types (like `OPS_NETWORKS` or `OPS_LOGS`) instead of friendly names (like `VCF Operations for networks`). Additionally, the Fleet LCM API `/fleet-lcm/v1/components` returns an empty array `[]` or incomplete data.
+
+**Diagnosis**:
+Check the `vcf-fleet-lcm` pod logs for `java.net.ConnectException` and `UnableToGetVcfaTokenException` or `JWT_PARSE_ERR`. This happens when `vcf-fleet-lcm` and `vcf-sddc-lcm` attempt to pull inventory capabilities before `vidb` (Identity Broker) has fully initialized its new JWT signing keys.
+
+**Root Cause**:
+A race condition during the startup of LCM microservices. If `vcf-fleet-lcm` or `vcf-sddc-lcm` start up before `vidb` is fully healthy and generating valid JWT tokens, the capability push (which maps friendly names) fails to authenticate and the components inventory is not fully populated.
+
+**Fix**:
+Perform a sequential restart of `vidb`, wait for it to initialize (e.g. 30 seconds), and then restart `fleet-lcm` and `sddc-lcm`.
+```bash
+kubectl delete pod --all -n vidb-external
+sleep 30
+kubectl delete pod --all -n vcf-fleet-lcm
+kubectl delete pod --all -n vcf-sddc-lcm
+```

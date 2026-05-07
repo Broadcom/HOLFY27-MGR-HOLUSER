@@ -1,6 +1,6 @@
 """
 TODO: This script is a work in progress. It is not yet complete.
-VERSION: 0.0.4 - 2026-05-06
+VERSION: 0.0.5 - 2026-05-06
 AUTHOR: Burke Azbill and HOL Core Team
 
 This script is used to configure the Authentik identity provider for VCF SSO (OIDC + SCIM).
@@ -491,16 +491,23 @@ def join_default_sso_components(
             _log(write, f'  Fleet IAM: Join SSO {label} HTTP {code}: {str(body)[:500]}')
             ok = False
     if join_nsx:
-        data = client.get_json('/suite-api/api/fleet-management/iam/components')
-        for c in data.get('eligibleComponents') or []:
-            cid = c.get('vcfComponentId')
-            if not cid or cid == vcid:
-                continue
-            code, body = client.join_sso_vcf_component(sso_realm_id, cid)
-            if code in (200, 201, 204):
-                _log(write, f'  Fleet IAM: Join SSO additional component {cid[:8]}… OK.')
-            else:
-                _log(write, f'  Fleet IAM: Join SSO component {cid[:8]}… HTTP {code}: {str(body)[:400]}')
+        code_query, body_query = client.post_json('/suite-api/api/fleet-management/iam/components/auth-sources/query', {})
+        if code_query == 200 and 'iamComponentAuthSources' in body_query:
+            for c in body_query['iamComponentAuthSources']:
+                cid = c.get('vcfComponentId')
+                cname = c.get('componentType', cid[:8] if cid else 'UNKNOWN')
+                if not cid or cid == vcid:
+                    continue
+                if c.get('status') == 'CONFIGURED':
+                    _log(write, f'  Fleet IAM: Join SSO additional component {cname} ({cid[:8]}) already configured — skip.')
+                    continue
+                code, body = client.join_sso_vcf_component(sso_realm_id, cid)
+                if code in (200, 201, 204):
+                    _log(write, f'  Fleet IAM: Join SSO additional component {cname} ({cid[:8]}) OK.')
+                elif code == 409 or (isinstance(body, dict) and 'already' in json.dumps(body).lower()):
+                    _log(write, f'  Fleet IAM: Join SSO additional component {cname} ({cid[:8]}) already configured — skip.')
+                else:
+                    _log(write, f'  Fleet IAM: Join SSO component {cname} ({cid[:8]}) HTTP {code}: {str(body)[:400]}')
     return ok
 
 
