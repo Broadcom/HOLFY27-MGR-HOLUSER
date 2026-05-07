@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # fleet.py - HOLFY27 Fleet Management (SDDC Manager) Operations
-# Version 2.4 - 2026-05-01
+# Version 2.5 - 2026-05-06
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # Provides Fleet Operations API integration for shutdown orchestration
 #   
+# v2.5 Changes:
+# - Increased V91_TASK_MAX_WAIT from 1800 to 2400 (40 mins).
+# - wait_for_fleet_lcm_task / wait_for_task_v91 now track the OS shutdown process for 'vra' by SSHing into the VM periodically.
+#
 # v2.4 Changes:
 # - Added support for VCF 9.1 Fleet LCM plugin API (ops-a proxy, JWT Bearer auth,
 #   component-based shutdown with task polling)
@@ -115,7 +119,7 @@ INVENTORY_SYNC_MAX_WAIT = 300  # 5 minutes max wait for inventory sync
 # component data using OpsToken authentication.
 V91_API_BASE = '/suite-api/internal'
 V91_TASK_POLL_INTERVAL = 15  # seconds between task status checks
-V91_TASK_MAX_WAIT = 1800     # 30 minutes max wait for shutdown workflow
+V91_TASK_MAX_WAIT = 2400     # 40 minutes max wait for shutdown workflow
 TASK_HEARTBEAT_SEC = 90      # STILL_RUNNING if no status line for this long
 V91_TOKEN_TIMEOUT = 30       # seconds for suite-api token acquisition
 
@@ -898,6 +902,9 @@ def wait_for_task_v91(ops_fqdn: str, token: str, task_id: str,
                       poll_interval: int = V91_TASK_POLL_INTERVAL,
                       max_wait: int = V91_TASK_MAX_WAIT,
                       verify: bool = SSL_VERIFY,
+                      lsf=None,
+                      product=None,
+                      comp_fqdn=None,
                       write_output=None) -> bool:
     """
     Wait for a VCF 9.1 Fleet LCM task to complete.
@@ -908,6 +915,9 @@ def wait_for_task_v91(ops_fqdn: str, token: str, task_id: str,
     :param poll_interval: Seconds between status checks
     :param max_wait: Maximum seconds to wait
     :param verify: SSL verification flag
+    :param lsf: lsfunctions object for SSH ops
+    :param product: The product being shut down (e.g. 'vra')
+    :param comp_fqdn: FQDN of the component being shut down
     :param write_output: Optional logging function
     :return: True if task succeeded, False otherwise
     """
@@ -915,6 +925,7 @@ def wait_for_task_v91(ops_fqdn: str, token: str, task_id: str,
     start_time = time.time()
     check_count = 0
     last_hb = time.time()
+    last_auto_hb = time.time()
 
     while (time.time() - start_time) < max_wait:
         check_count += 1
@@ -925,6 +936,24 @@ def wait_for_task_v91(ops_fqdn: str, token: str, task_id: str,
             _log(f'  STILL_RUNNING: waiting on Fleet task {task_id[:5]}...{task_id[-5:]} '
                  f'(elapsed {elapsed}s, ~{rem}s max remaining)')
             last_hb = now
+
+        if lsf and product == 'vra' and comp_fqdn and (now - last_auto_hb) >= 120:
+            last_auto_hb = now
+            _log(f'  Connecting to {comp_fqdn} to retrieve current state...')
+            pwd = lsf.get_password()
+            res = lsf.ssh("echo 'password' | sudo -S -i kubectl get nodes", f"vmware-system-user@{comp_fqdn}", pwd)
+            if hasattr(res, 'returncode') and res.returncode != 0:
+                _log('  VM unreachable via SSH - OS Shutdown initiated. Stopping ops-a tracking.')
+                return True
+            if hasattr(res, 'stdout') and res.stdout:
+                cordoned = [line.split()[0] for line in res.stdout.strip().split('\n')[1:] if 'SchedulingDisabled' in line]
+                if cordoned:
+                    _log(f'  Nodes cordoned: {", ".join(cordoned)}')
+            res2 = lsf.ssh("echo 'password' | sudo -S -i kubectl get pods -A | grep -i Terminating", f"vmware-system-user@{comp_fqdn}", pwd)
+            if hasattr(res2, 'stdout') and res2.stdout:
+                count = len([x for x in res2.stdout.strip().split('\n') if x])
+                if count > 0:
+                    _log(f'  {count} Pods draining (Terminating)...')
         task_info = get_task_status_v91(ops_fqdn, token, task_id, verify)
         status = task_info.get('status', 'UNKNOWN')
 
@@ -963,6 +992,7 @@ def wait_for_task_v91(ops_fqdn: str, token: str, task_id: str,
 
 def shutdown_products_v91(ops_fqdn: str, token: str, products: list,
                           verify: bool = SSL_VERIFY,
+                          lsf=None,
                           write_output=None) -> bool:
     """
     Shutdown VCF 9.1 products via Fleet LCM API.
@@ -980,6 +1010,7 @@ def shutdown_products_v91(ops_fqdn: str, token: str, products: list,
     :param token: OpsToken
     :param products: List of product IDs to shutdown (vra, vrni, etc.)
     :param verify: SSL verification flag
+    :param lsf: lsfunctions object for SSH ops
     :param write_output: Optional logging function
     :return: True if all shutdowns succeeded via API, False if any failed
              (caller should fall back to VM-level shutdown)
@@ -1031,6 +1062,7 @@ def shutdown_products_v91(ops_fqdn: str, token: str, products: list,
             if task_id:
                 success = wait_for_task_v91(ops_fqdn, token, task_id,
                                             verify=verify,
+                                            lsf=lsf, product=product, comp_fqdn=comp_fqdn,
                                             write_output=write_output)
                 if not success:
                     _log(f'WARNING: Shutdown workflow for {product} did not '
@@ -1287,6 +1319,9 @@ def wait_for_fleet_lcm_task(fleet_fqdn: str, token: str, task_id: str,
                              poll_interval: int = V91_TASK_POLL_INTERVAL,
                              max_wait: int = V91_TASK_MAX_WAIT,
                              verify: bool = SSL_VERIFY,
+                             lsf=None,
+                             product=None,
+                             comp_fqdn=None,
                              write_output=None) -> bool:
     """
     Wait for a fleet-lcm task to complete.
@@ -1297,6 +1332,9 @@ def wait_for_fleet_lcm_task(fleet_fqdn: str, token: str, task_id: str,
     :param poll_interval: Seconds between status checks
     :param max_wait: Maximum seconds to wait
     :param verify: SSL verification flag
+    :param lsf: lsfunctions object for SSH ops
+    :param product: The product being shut down (e.g. 'vra')
+    :param comp_fqdn: FQDN of the component being shut down
     :param write_output: Optional logging function
     :return: True if task succeeded, False otherwise
     """
@@ -1304,6 +1342,7 @@ def wait_for_fleet_lcm_task(fleet_fqdn: str, token: str, task_id: str,
     start_time = time.time()
     check_count = 0
     last_hb = time.time()
+    last_auto_hb = time.time()
 
     while (time.time() - start_time) < max_wait:
         check_count += 1
@@ -1314,6 +1353,24 @@ def wait_for_fleet_lcm_task(fleet_fqdn: str, token: str, task_id: str,
             _log(f'  STILL_RUNNING: fleet-lcm task {task_id[:5]}...{task_id[-5:]} '
                  f'(elapsed {elapsed}s, ~{rem}s max remaining)')
             last_hb = now
+
+        if lsf and product == 'vra' and comp_fqdn and (now - last_auto_hb) >= 120:
+            last_auto_hb = now
+            _log(f'  Connecting to {comp_fqdn} to retrieve current state...')
+            pwd = lsf.get_password()
+            res = lsf.ssh("echo 'password' | sudo -S -i kubectl get nodes", f"vmware-system-user@{comp_fqdn}", pwd)
+            if hasattr(res, 'returncode') and res.returncode != 0:
+                _log('  VM unreachable via SSH - OS Shutdown initiated. Stopping ops-a tracking.')
+                return True
+            if hasattr(res, 'stdout') and res.stdout:
+                cordoned = [line.split()[0] for line in res.stdout.strip().split('\n')[1:] if 'SchedulingDisabled' in line]
+                if cordoned:
+                    _log(f'  Nodes cordoned: {", ".join(cordoned)}')
+            res2 = lsf.ssh("echo 'password' | sudo -S -i kubectl get pods -A | grep -i Terminating", f"vmware-system-user@{comp_fqdn}", pwd)
+            if hasattr(res2, 'stdout') and res2.stdout:
+                count = len([x for x in res2.stdout.strip().split('\n') if x])
+                if count > 0:
+                    _log(f'  {count} Pods draining (Terminating)...')
 
         try:
             resp = _make_fleet_lcm_request(
@@ -1382,6 +1439,7 @@ def _get_component_fqdn(comp: dict) -> str:
 def shutdown_products_fleet_lcm(fleet_fqdn: str, token: str,
                                  products: list,
                                  verify: bool = SSL_VERIFY,
+                                 lsf=None,
                                  write_output=None) -> bool:
     """
     Shutdown VCF products via the fleet-lcm direct API.
@@ -1394,6 +1452,7 @@ def shutdown_products_fleet_lcm(fleet_fqdn: str, token: str,
     :param token: JWT access token from get_fleet_lcm_jwt()
     :param products: List of product IDs to shutdown (vra, vrni, etc.)
     :param verify: SSL verification flag
+    :param lsf: lsfunctions object for SSH tracking
     :param write_output: Optional logging function
     :return: True if all shutdowns succeeded, False if any failed
     """
@@ -1441,6 +1500,7 @@ def shutdown_products_fleet_lcm(fleet_fqdn: str, token: str,
         if task_id:
             success = wait_for_fleet_lcm_task(
                 fleet_fqdn, token, task_id, verify=verify,
+                lsf=lsf, product=product, comp_fqdn=comp_fqdn,
                 write_output=write_output)
             if not success:
                 _log(f'WARNING: Shutdown workflow for {product} did not complete successfully')
