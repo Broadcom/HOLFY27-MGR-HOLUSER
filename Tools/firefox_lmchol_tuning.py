@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+Author: Burke Azbill and HOL Core Team
+Version: 1.0.0 2026-05-07
+
 Tune Firefox user.js on the Main Linux Console (LMC) profile.
 
 Lab automation (prelim, manager scripts) edits the same home tree via ``/lmchol``
@@ -30,6 +33,7 @@ _STRIP_LINE_RES = (
     re.compile(r'^\s*user_pref\s*\(\s*["\']browser\.safebrowsing\.(malware|phish)\.enabled'),
     re.compile(r'^\s*user_pref\s*\(\s*["\']browser\.shell\.checkDefaultBrowser'),
     re.compile(r'^\s*user_pref\s*\(\s*["\']browser\.sessionstore\.resume_from_crash'),
+    re.compile(r'^\s*user_pref\s*\(\s*["\']privacy\.clear(History|OnShutdown_v2|SiteData)\.'),
 )
 
 
@@ -75,6 +79,17 @@ def _hol_block(proxy_host: str, proxy_port: int) -> str:
         'user_pref("browser.safebrowsing.phish.enabled", false);',
         'user_pref("browser.shell.checkDefaultBrowser", false);',
         'user_pref("browser.sessionstore.resume_from_crash", false);',
+        # Preserve saved usernames and form history across sessions
+        'user_pref("privacy.clearHistory.formdata", false);',
+        'user_pref("privacy.clearOnShutdown_v2.formdata", false);',
+        'user_pref("privacy.clearSiteData.formdata", false);',
+        'user_pref("privacy.clearSiteData.historyFormDataAndDownloads", false);',
+        'user_pref("browser.formfill.enable", true);',
+        'user_pref("browser.formfill.autoFill", true);',
+        'user_pref("browser.formfill.autoFill.passwords", true);',
+        'user_pref("browser.formfill.autoFill.forms", true);',
+        'user_pref("signon.autofillForms", true);',
+        'user_pref("signon.usernameOnlyForm.enabled", true);',
         END,
         "",
     ]
