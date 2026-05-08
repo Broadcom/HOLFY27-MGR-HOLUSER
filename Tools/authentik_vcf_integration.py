@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VERSION: 0.1.3 - 2026-05-06
+VERSION: 0.1.4 - 2026-05-08
 AUTHOR: Burke Azbill and HOL Core Team
 
 Authentik + VCF lab integration (Cycle 7).
@@ -9,6 +9,7 @@ Enabled by a single config.ini toggle:  [VCFFINAL] authentik_vcf_integration = t
 
 Steps performed (all idempotent/re-runnable):
   1. CoreDNS forwarder patch on holorouter
+  1b. Authentik storage patch (ensures /media is mounted for image uploads)
   2. VCF SSO UI Prerequisites (via Playwright)
   3. Authentik OAuth2 provider + application (VCF OIDC / VCF)
   4. Authentik OIDC scope mappings (email, openid, profile)
@@ -192,6 +193,52 @@ def run_coredns_patch(creds_path: str, write: Callable[[str], None], dry_run: bo
         _log(write, f'  CoreDNS patch FAILED rc={r.returncode} stderr={r.stderr[:500]}')
         return False
     _log(write, '  CoreDNS patch applied.')
+    return True
+
+
+def ensure_authentik_storage_patch(creds_path: str, write: Callable[[str], None], dry_run: bool) -> bool:
+    """
+    Ensure the authentik secret has AUTHENTIK_STORAGE__MEDIA__FILE__PATH=/media
+    If missing, patch it and restart the deployments so image uploads work.
+    """
+    _log(write, 'Authentik integration: Step 1b — Authentik Storage Patch (router kubectl)')
+    if dry_run:
+        _log(write, '  DRY-RUN would check/patch Authentik storage secret.')
+        return True
+        
+    check_cmd = (
+        f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
+        f'{ROUTER_SSH} "kubectl get secret authentik -n default -o jsonpath=\'{{.data.AUTHENTIK_STORAGE__MEDIA__FILE__PATH}}\'"'
+    )
+    r = subprocess.run(check_cmd, shell=True, capture_output=True, text=True, timeout=30)
+    if r.stdout.strip():
+        _log(write, '  Authentik storage patch already applied.')
+        return True
+        
+    _log(write, '  Applying Authentik storage patch...')
+    patch_json = '{\\"stringData\\": {\\"AUTHENTIK_STORAGE__MEDIA__FILE__PATH\\": \\"/media\\"}}'
+    patch_cmd = (
+        f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
+        f'{ROUTER_SSH} "kubectl patch secret authentik -p \'{patch_json}\' -n default"'
+    )
+    r_patch = subprocess.run(patch_cmd, shell=True, capture_output=True, text=True, timeout=30)
+    if r_patch.returncode != 0:
+        _log(write, f'  Authentik storage patch FAILED rc={r_patch.returncode} stderr={r_patch.stderr[:500]}')
+        return False
+        
+    _log(write, '  Restarting Authentik deployments...')
+    restart_cmd = (
+        f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
+        f'{ROUTER_SSH} "kubectl rollout restart deployment authentik-server authentik-worker -n default"'
+    )
+    subprocess.run(restart_cmd, shell=True, capture_output=True, text=True, timeout=60)
+    
+    wait_cmd = (
+        f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
+        f'{ROUTER_SSH} "kubectl rollout status deployment authentik-server -n default"'
+    )
+    subprocess.run(wait_cmd, shell=True, capture_output=True, text=True, timeout=300)
+    _log(write, '  Authentik storage patch applied and deployments restarted.')
     return True
 
 
@@ -1465,6 +1512,9 @@ def run_authentik_vcf_integration(
 
     # ── Step 1: CoreDNS forwarder patch on holorouter ────────────────────────
     if not run_coredns_patch(creds_path, write, dry_run):
+        ok = False
+
+    if not ensure_authentik_storage_patch(creds_path, write, dry_run):
         ok = False
 
     # ── Step 2: VCF SSO UI Prerequisites ─────────────────────────────────────

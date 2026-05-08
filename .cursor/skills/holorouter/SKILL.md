@@ -450,3 +450,13 @@ Always use the shutdown script to prevent stale pods and corrupted state:
 /root/shutdown.sh --no-poweroff # Shutdown services only
 /root/shutdown.sh --reboot     # Shutdown services, then reboot
 ```
+
+## Authentik Deployment Storage Configuration
+
+The `authentik-server` and `authentik-worker` Kubernetes deployments on the holorouter mount a persistent volume at `/media` for storing application media (like uploaded icons). However, the deployments must be explicitly told to use this path via the `AUTHENTIK_STORAGE__MEDIA__FILE__PATH` environment variable. If this variable is missing, Authentik attempts to use the default `./data` directory, which is not a valid mount point, causing file management to be disabled and resulting in `HTTP 405 Method Not Allowed` errors on the `/api/v3/admin/file/` endpoint (due to a Django 500 error handler masking the underlying `ImproperlyConfigured` exception).
+
+**Fix**:
+```bash
+kubectl patch secret authentik -p '{"stringData": {"AUTHENTIK_STORAGE__MEDIA__FILE__PATH": "/media"}}' -n default
+kubectl rollout restart deployment authentik-server authentik-worker -n default
+```
