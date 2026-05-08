@@ -353,6 +353,27 @@ class AuthentikApi:
             data = {'raw': r.text[:2000]}
         return r.status_code, data
 
+    def upload_file(self, file_path: str, name: str, mime_type: str) -> Tuple[int, Any]:
+        if not self._sess:
+            return 500, {'error': 'No requests session'}
+        with open(file_path, 'rb') as f:
+            files = {
+                'file': (name, f, mime_type),
+                'name': (None, name)
+            }
+            # Remove Content-Type so requests can set multipart/form-data with boundary
+            old_ct = self._sess.headers.pop('Content-Type', None)
+            try:
+                r = self._sess.post(self._url('admin/file/'), files=files, timeout=120)
+            finally:
+                if old_ct:
+                    self._sess.headers['Content-Type'] = old_ct
+            try:
+                data = r.json()
+            except Exception:
+                data = {'raw': r.text[:2000]}
+            return r.status_code, data
+
     def _get_oauth2_scope_mapping_pks(self, scope_names: List[str]) -> List[str]:
         """Look up Authentik OAuth2 scope mapping UUIDs by name (propertymappings/provider/scope/)."""
         if not scope_names:
@@ -1459,6 +1480,19 @@ def run_authentik_vcf_integration(
 
     # ── Step 3-4: Authentik OAuth2 provider + application + OIDC scopes ──────
     ak = AuthentikApi(f'{issuer_base}/api/v3', ak_token, write, verify_tls=verify_tls)
+    
+    icon_path = os.path.join(_tools_dir, 'holorouter', 'VCF-VSPHERE-9.webp')
+    icon_name = 'VCF-VSPHERE-9.webp'
+    if not dry_run and os.path.isfile(icon_path):
+        _log(write, f'  Uploading icon {icon_name} to Authentik...')
+        code, data = ak.upload_file(icon_path, icon_name, 'image/webp')
+        if code in (200, 201):
+            _log(write, f'  Icon {icon_name} uploaded successfully.')
+        elif code == 400 and isinstance(data, dict) and 'already' in json.dumps(data).lower():
+            _log(write, f'  Icon {icon_name} already exists.')
+        else:
+            _log(write, f'  WARNING: Icon upload failed HTTP {code}: {data}')
+            
     try:
         prov_pk, client_id, client_secret = ak.ensure_oauth_application(
             app_name=app_name,
@@ -1475,6 +1509,13 @@ def run_authentik_vcf_integration(
         return False
 
     if prov_pk is not None and not dry_run:
+        if os.path.isfile(icon_path):
+            code, data = ak.patch_json(f'core/applications/{app_slug}/', {'meta_icon': icon_name})
+            if code in (200, 201):
+                _log(write, f'  Set meta_icon={icon_name} for application {app_slug!r}.')
+            else:
+                _log(write, f'  WARNING: Failed to set meta_icon HTTP {code}: {data}')
+                
         ak.align_oauth2_sub_mode_for_fleet_iam(prov_pk, cfg, dry_run)
         if not ak.ensure_oauth2_provider_scopes(prov_pk, oauth_scope_names, dry_run):
             ok = False
