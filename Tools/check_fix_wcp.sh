@@ -163,7 +163,7 @@ cleanup_stale_pods() {
     local stale_pods
     stale_pods=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
         "kubectl get pods -n ${namespace} --no-headers 2>/dev/null \
-         | grep -E 'NotFound|ProviderFailed|Unknown|ImagePullBackOff' \
+         | grep -E 'NotFound|ProviderFailed|Unknown|ImagePullBackOff|Failed' \
          | awk '{print \$1}'" 2>/dev/null)
 
     if [[ -z "${stale_pods}" ]]; then
@@ -544,6 +544,20 @@ if [[ -n "${HARBOR_NS}" ]]; then
     cleanup_stale_pods "${HARBOR_NS}" 120
 else
     log_msg "Harbor namespace not found - skipping"
+fi
+
+log_msg "=========================================="
+log_msg "Cleaning up stale pods in all valid namespaces..."
+log_msg "=========================================="
+ALL_NS=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl get ns --no-headers | awk '{print \$1}'" 2>/dev/null)
+if [[ -n "${ALL_NS}" ]]; then
+    echo "${ALL_NS}" | while read -r ns; do
+        if [[ -n "${ns}" ]]; then
+            cleanup_stale_pods "${ns}" 60
+        fi
+    done
+else
+    log_warn "Failed to retrieve namespaces for stale pod cleanup"
 fi
 
 TOTAL_ELAPSED=$(get_elapsed_time)
