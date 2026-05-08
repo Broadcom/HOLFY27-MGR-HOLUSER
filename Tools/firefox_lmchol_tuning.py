@@ -84,6 +84,12 @@ def _hol_block(proxy_host: str, proxy_port: int) -> str:
         'user_pref("privacy.clearOnShutdown_v2.formdata", false);',
         'user_pref("privacy.clearSiteData.formdata", false);',
         'user_pref("privacy.clearSiteData.historyFormDataAndDownloads", false);',
+        'user_pref("browser.formfill.enable", true);',
+        'user_pref("browser.formfill.autoFill", true);',
+        'user_pref("browser.formfill.autoFill.passwords", true);',
+        'user_pref("browser.formfill.autoFill.forms", true);',
+        'user_pref("signon.autofillForms", true);',
+        'user_pref("signon.usernameOnlyForm.enabled", true);',
         END,
         "",
     ]
