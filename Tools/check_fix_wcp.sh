@@ -93,7 +93,7 @@ ssh_with_fallback() {
     local cmd="$*"
 
     # Try key-based authentication first
-    if ssh ${SSH_OPTS} -o BatchMode=yes "${user}@${host}" "${cmd}" 2>/dev/null; then
+    if ssh "${SSH_OPTS}" -o BatchMode=yes "${user}@${host}" "${cmd}" 2>/dev/null; then
         return 0
     fi
 
@@ -101,7 +101,7 @@ ssh_with_fallback() {
     if [[ -f "${CREDS_FILE}" ]]; then
         local password
         password=$(cat "${CREDS_FILE}")
-        /usr/bin/sshpass -p "${password}" ssh ${SSH_OPTS} "${user}@${host}" "${cmd}"
+        /usr/bin/sshpass -p "${password}" ssh "${SSH_OPTS}" "${user}@${host}" "${cmd}"
     else
         log_error "Key-based authentication failed and credentials file not found at ${CREDS_FILE}"
         return 1
@@ -123,7 +123,7 @@ check_k8s_api() {
     local pwd=$2
 
     local result
-    result=$(/usr/bin/sshpass -p "${pwd}" ssh ${SSH_OPTS} "root@${ip}" "kubectl get --raw /healthz 2>&1" 2>/dev/null)
+    result=$(/usr/bin/sshpass -p "${pwd}" ssh "${SSH_OPTS}" "root@${ip}" "kubectl get --raw /healthz 2>&1" 2>/dev/null)
     if [[ "${result}" == "ok" ]]; then
         return 0
     fi
@@ -136,7 +136,7 @@ check_hypercrypt_status() {
     local pwd=$2
 
     local status
-    status=$(/usr/bin/sshpass -p "${pwd}" ssh ${SSH_OPTS} "root@${ip}" "systemctl is-active hypercrypt 2>/dev/null" 2>/dev/null)
+    status=$(/usr/bin/sshpass -p "${pwd}" ssh "${SSH_OPTS}" "root@${ip}" "systemctl is-active hypercrypt 2>/dev/null" 2>/dev/null)
     echo "${status}"
 }
 
@@ -146,7 +146,7 @@ check_kubelet_status() {
     local pwd=$2
 
     local status
-    status=$(/usr/bin/sshpass -p "${pwd}" ssh ${SSH_OPTS} "root@${ip}" "systemctl is-active kubelet 2>/dev/null" 2>/dev/null)
+    status=$(/usr/bin/sshpass -p "${pwd}" ssh "${SSH_OPTS}" "root@${ip}" "systemctl is-active kubelet 2>/dev/null" 2>/dev/null)
     echo "${status}"
 }
 
@@ -161,7 +161,7 @@ cleanup_stale_pods() {
 
     # Get pods in non-Running states that indicate stale/failed scheduling
     local stale_pods
-    stale_pods=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+    stale_pods=$(/usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" \
         "kubectl get pods -n ${namespace} --no-headers 2>/dev/null \
          | grep -E 'NotFound|ProviderFailed|Unknown|ImagePullBackOff|Failed' \
          | awk '{print \$1}'" 2>/dev/null)
@@ -176,7 +176,7 @@ cleanup_stale_pods() {
 
     echo "${stale_pods}" | while read -r pod_name; do
         if [[ -n "${pod_name}" ]]; then
-            /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+            /usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" \
                 "kubectl delete pod ${pod_name} -n ${namespace} --force --grace-period=0 2>/dev/null" 2>/dev/null
             log_msg "    Deleted stale pod: ${pod_name}"
         fi
@@ -191,7 +191,7 @@ cleanup_stale_pods() {
 
         # Check if all deployments in the namespace are ready
         local not_ready
-        not_ready=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+        not_ready=$(/usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" \
             "kubectl get deploy -n ${namespace} --no-headers 2>/dev/null \
              | awk '{split(\$2,a,\"/\"); if (a[1] != a[2]) print \$1}'" 2>/dev/null)
 
@@ -202,7 +202,7 @@ cleanup_stale_pods() {
 
         # Also check for any new stale pods that appeared
         local new_stale
-        new_stale=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+        new_stale=$(/usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" \
             "kubectl get pods -n ${namespace} --no-headers 2>/dev/null \
              | grep -E 'NotFound|ProviderFailed|Unknown' \
              | awk '{print \$1}'" 2>/dev/null)
@@ -211,7 +211,7 @@ cleanup_stale_pods() {
             log_msg "  New stale pods detected - deleting..."
             echo "${new_stale}" | while read -r pod_name; do
                 if [[ -n "${pod_name}" ]]; then
-                    /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+                    /usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" \
                         "kubectl delete pod ${pod_name} -n ${namespace} --force --grace-period=0 2>/dev/null" 2>/dev/null
                 fi
             done
@@ -295,7 +295,7 @@ while [[ $(get_remaining_time) -gt 0 ]]; do
     for try_ip in ${CANDIDATE_IPS}; do
         if check_host_reachable "${try_ip}"; then
             # Verify we can actually SSH and get a service status
-            HYPERCRYPT_CHECK=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${try_ip}" "systemctl is-active hypercrypt 2>/dev/null" 2>/dev/null)
+            HYPERCRYPT_CHECK=$(/usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${try_ip}" "systemctl is-active hypercrypt 2>/dev/null" 2>/dev/null)
             if [[ -n "${HYPERCRYPT_CHECK}" ]]; then
                 ACTUAL_IP="${try_ip}"
                 FOUND_SCP=true
@@ -342,12 +342,12 @@ while [[ $(get_remaining_time) -gt 0 ]]; do
         log_msg "  hypercrypt is still initializing (encryption keys being delivered)..."
     elif [[ "${HYPERCRYPT_STATUS}" == "failed" ]]; then
         log_warn "  hypercrypt has failed - attempting restart..."
-        /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${ACTUAL_IP}" "systemctl restart hypercrypt" 2>/dev/null
+        /usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${ACTUAL_IP}" "systemctl restart hypercrypt" 2>/dev/null
     fi
 
     if [[ "${KUBELET_STATUS}" != "active" && "${HYPERCRYPT_STATUS}" == "active" ]]; then
         log_msg "  hypercrypt is active but kubelet is not - attempting to start kubelet..."
-        /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${ACTUAL_IP}" "systemctl start kubelet" 2>/dev/null
+        /usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${ACTUAL_IP}" "systemctl start kubelet" 2>/dev/null
     fi
 
     sleep ${POLL_INTERVAL}
@@ -402,7 +402,7 @@ check_cert_expiry() {
 
     # Get the certificate data from the secret
     local cert_data
-    cert_data=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+    cert_data=$(/usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" \
         "kubectl -n ${namespace} get secret ${secret_name} -o jsonpath='{.data.tls\\.crt}' 2>/dev/null" 2>/dev/null)
 
     if [[ -z "${cert_data}" ]]; then
@@ -412,7 +412,7 @@ check_cert_expiry() {
 
     # Extract the expiration date from the certificate
     local end_date
-    end_date=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+    end_date=$(/usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" \
         "echo '${cert_data}' | base64 -d 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null" 2>/dev/null)
 
     if [[ -z "${end_date}" ]]; then
@@ -475,7 +475,7 @@ for cert_entry in "${CERTS_TO_CHECK[@]}"; do
         # Expired or expiring - delete to trigger regeneration
         CERTS_NEED_RENEWAL=true
         log_msg "  Deleting ${CERT_NS}/${CERT_NAME} to trigger regeneration..."
-        /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+        /usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" \
             "kubectl -n ${CERT_NS} delete secret ${CERT_NAME} --ignore-not-found=true" >/dev/null 2>&1
         log_msg "  Deleted ${CERT_NAME}"
     elif [[ ${CERT_STATUS} -eq 2 ]]; then
@@ -489,12 +489,12 @@ if [[ "${CERTS_NEED_RENEWAL}" == "true" ]]; then
     log_msg "Restarting deployments to regenerate certificates..."
     log_msg "=========================================="
 
-    if /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+    if /usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" \
         "kubectl -n kube-system rollout restart deploy cns-storage-quota-extension 2>/dev/null || echo 'Deployment not found'" >/dev/null 2>&1; then
         log_msg "Restarted cns-storage-quota-extension deployment"
     fi
 
-    if /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" \
+    if /usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" \
         "kubectl -n kube-system rollout restart deploy storage-quota-webhook 2>/dev/null || echo 'Deployment not found'" >/dev/null 2>&1; then
         log_msg "Restarted storage-quota-webhook deployment"
     fi
@@ -513,9 +513,9 @@ fi
 log_msg "=========================================="
 log_msg "Scaling cci replicas back up to 1..."
 log_msg "=========================================="
-CCI_NS=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl get ns --no-headers | grep 'svc-cci-ns' | awk '{print \$1}'" 2>/dev/null)
+CCI_NS=$(/usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" "kubectl get ns --no-headers | grep 'svc-cci-ns' | awk '{print \$1}'" 2>/dev/null)
 if [[ -n "${CCI_NS}" ]]; then
-    /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n ${CCI_NS} scale deployment --all --replicas=1" >> "${LOG_FILE}" 2>&1
+    /usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" "kubectl -n ${CCI_NS} scale deployment --all --replicas=1" >> "${LOG_FILE}" 2>&1
     log_msg "Scaled CCI deployments in ${CCI_NS}"
     cleanup_stale_pods "${CCI_NS}" 120
 else
@@ -525,8 +525,8 @@ fi
 log_msg "=========================================="
 log_msg "Scaling argocd replicas back up to 1..."
 log_msg "=========================================="
-if /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl get ns argocd >/dev/null 2>&1"; then
-    /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n argocd scale deployment --all --replicas=1" >> "${LOG_FILE}" 2>&1
+if /usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" "kubectl get ns argocd >/dev/null 2>&1"; then
+    /usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" "kubectl -n argocd scale deployment --all --replicas=1" >> "${LOG_FILE}" 2>&1
     log_msg "Scaled ArgoCD deployments"
     cleanup_stale_pods "argocd" 120
 else
@@ -536,10 +536,10 @@ fi
 log_msg "=========================================="
 log_msg "Scaling Harbor replicas back up to 1..."
 log_msg "=========================================="
-HARBOR_NS=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl get ns --no-headers | grep 'svc-harbor' | awk '{print \$1}'" 2>/dev/null)
+HARBOR_NS=$(/usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" "kubectl get ns --no-headers | grep 'svc-harbor' | awk '{print \$1}'" 2>/dev/null)
 if [[ -n "${HARBOR_NS}" ]]; then
-    /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n ${HARBOR_NS} scale sts --all --replicas=1" >> "${LOG_FILE}" 2>&1
-    /usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl -n ${HARBOR_NS} scale deployment --all --replicas=1" >> "${LOG_FILE}" 2>&1
+    /usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" "kubectl -n ${HARBOR_NS} scale sts --all --replicas=1" >> "${LOG_FILE}" 2>&1
+    /usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" "kubectl -n ${HARBOR_NS} scale deployment --all --replicas=1" >> "${LOG_FILE}" 2>&1
     log_msg "Scaled Harbor deployments in ${HARBOR_NS}"
     cleanup_stale_pods "${HARBOR_NS}" 120
 else
@@ -549,7 +549,7 @@ fi
 log_msg "=========================================="
 log_msg "Cleaning up stale pods in all valid namespaces..."
 log_msg "=========================================="
-ALL_NS=$(/usr/bin/sshpass -p "${nodePwd}" ssh ${SSH_OPTS} "root@${nodeIP}" "kubectl get ns --no-headers | awk '{print \$1}'" 2>/dev/null)
+ALL_NS=$(/usr/bin/sshpass -p "${nodePwd}" ssh "${SSH_OPTS}" "root@${nodeIP}" "kubectl get ns --no-headers | awk '{print \$1}'" 2>/dev/null)
 if [[ -n "${ALL_NS}" ]]; then
     echo "${ALL_NS}" | while read -r ns; do
         if [[ -n "${ns}" ]]; then

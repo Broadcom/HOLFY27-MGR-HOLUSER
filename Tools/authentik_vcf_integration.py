@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VERSION: 0.1.3 - 2026-05-06
+VERSION: 0.1.4 - 2026-05-08
 AUTHOR: Burke Azbill and HOL Core Team
 
 Authentik + VCF lab integration (Cycle 7).
@@ -9,6 +9,7 @@ Enabled by a single config.ini toggle:  [VCFFINAL] authentik_vcf_integration = t
 
 Steps performed (all idempotent/re-runnable):
   1. CoreDNS forwarder patch on holorouter
+  1b. Authentik storage patch (ensures /media is mounted for image uploads)
   2. VCF SSO UI Prerequisites (via Playwright)
   3. Authentik OAuth2 provider + application (VCF OIDC / VCF)
   4. Authentik OIDC scope mappings (email, openid, profile)
@@ -195,6 +196,52 @@ def run_coredns_patch(creds_path: str, write: Callable[[str], None], dry_run: bo
     return True
 
 
+def ensure_authentik_storage_patch(creds_path: str, write: Callable[[str], None], dry_run: bool) -> bool:
+    """
+    Ensure the authentik secret has AUTHENTIK_STORAGE__MEDIA__FILE__PATH=/media
+    If missing, patch it and restart the deployments so image uploads work.
+    """
+    _log(write, 'Authentik integration: Step 1b — Authentik Storage Patch (router kubectl)')
+    if dry_run:
+        _log(write, '  DRY-RUN would check/patch Authentik storage secret.')
+        return True
+        
+    check_cmd = (
+        f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
+        f'{ROUTER_SSH} "kubectl get secret authentik -n default -o jsonpath=\'{{.data.AUTHENTIK_STORAGE__MEDIA__FILE__PATH}}\'"'
+    )
+    r = subprocess.run(check_cmd, shell=True, capture_output=True, text=True, timeout=30)
+    if r.stdout.strip():
+        _log(write, '  Authentik storage patch already applied.')
+        return True
+        
+    _log(write, '  Applying Authentik storage patch...')
+    patch_json = '{\\"stringData\\": {\\"AUTHENTIK_STORAGE__MEDIA__FILE__PATH\\": \\"/media\\"}}'
+    patch_cmd = (
+        f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
+        f'{ROUTER_SSH} "kubectl patch secret authentik -p \'{patch_json}\' -n default"'
+    )
+    r_patch = subprocess.run(patch_cmd, shell=True, capture_output=True, text=True, timeout=30)
+    if r_patch.returncode != 0:
+        _log(write, f'  Authentik storage patch FAILED rc={r_patch.returncode} stderr={r_patch.stderr[:500]}')
+        return False
+        
+    _log(write, '  Restarting Authentik deployments...')
+    restart_cmd = (
+        f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
+        f'{ROUTER_SSH} "kubectl rollout restart deployment authentik-server authentik-worker -n default"'
+    )
+    subprocess.run(restart_cmd, shell=True, capture_output=True, text=True, timeout=60)
+    
+    wait_cmd = (
+        f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
+        f'{ROUTER_SSH} "kubectl rollout status deployment authentik-server -n default"'
+    )
+    subprocess.run(wait_cmd, shell=True, capture_output=True, text=True, timeout=300)
+    _log(write, '  Authentik storage patch applied and deployments restarted.')
+    return True
+
+
 def ensure_ops_vault_ca_trust(
     ops_fqdn: str,
     creds_path: str,
@@ -352,6 +399,27 @@ class AuthentikApi:
         except Exception:
             data = {'raw': r.text[:2000]}
         return r.status_code, data
+
+    def upload_file(self, file_path: str, name: str, mime_type: str) -> Tuple[int, Any]:
+        if not self._sess:
+            return 500, {'error': 'No requests session'}
+        with open(file_path, 'rb') as f:
+            files = {
+                'file': (name, f, mime_type),
+                'name': (None, name)
+            }
+            # Remove Content-Type so requests can set multipart/form-data with boundary
+            old_ct = self._sess.headers.pop('Content-Type', None)
+            try:
+                r = self._sess.post(self._url('admin/file/'), files=files, timeout=120)
+            finally:
+                if old_ct:
+                    self._sess.headers['Content-Type'] = old_ct
+            try:
+                data = r.json()
+            except Exception:
+                data = {'raw': r.text[:2000]}
+            return r.status_code, data
 
     def _get_oauth2_scope_mapping_pks(self, scope_names: List[str]) -> List[str]:
         """Look up Authentik OAuth2 scope mapping UUIDs by name (propertymappings/provider/scope/)."""
@@ -1446,6 +1514,9 @@ def run_authentik_vcf_integration(
     if not run_coredns_patch(creds_path, write, dry_run):
         ok = False
 
+    if not ensure_authentik_storage_patch(creds_path, write, dry_run):
+        ok = False
+
     # ── Step 2: VCF SSO UI Prerequisites ─────────────────────────────────────
     # Run UI Prerequisites via Playwright if available
     submit_sso_prerequisites_ui(ops_fqdn, password, write, dry_run)
@@ -1459,6 +1530,19 @@ def run_authentik_vcf_integration(
 
     # ── Step 3-4: Authentik OAuth2 provider + application + OIDC scopes ──────
     ak = AuthentikApi(f'{issuer_base}/api/v3', ak_token, write, verify_tls=verify_tls)
+    
+    icon_path = os.path.join(_tools_dir, 'holorouter', 'VCF-VSPHERE-9.webp')
+    icon_name = 'VCF-VSPHERE-9.webp'
+    if not dry_run and os.path.isfile(icon_path):
+        _log(write, f'  Uploading icon {icon_name} to Authentik...')
+        code, data = ak.upload_file(icon_path, icon_name, 'image/webp')
+        if code in (200, 201):
+            _log(write, f'  Icon {icon_name} uploaded successfully.')
+        elif code == 400 and isinstance(data, dict) and 'already' in json.dumps(data).lower():
+            _log(write, f'  Icon {icon_name} already exists.')
+        else:
+            _log(write, f'  WARNING: Icon upload failed HTTP {code}: {data}')
+            
     try:
         prov_pk, client_id, client_secret = ak.ensure_oauth_application(
             app_name=app_name,
@@ -1475,6 +1559,13 @@ def run_authentik_vcf_integration(
         return False
 
     if prov_pk is not None and not dry_run:
+        if os.path.isfile(icon_path):
+            code, data = ak.patch_json(f'core/applications/{app_slug}/', {'meta_icon': icon_name})
+            if code in (200, 201):
+                _log(write, f'  Set meta_icon={icon_name} for application {app_slug!r}.')
+            else:
+                _log(write, f'  WARNING: Failed to set meta_icon HTTP {code}: {data}')
+                
         ak.align_oauth2_sub_mode_for_fleet_iam(prov_pk, cfg, dry_run)
         if not ak.ensure_oauth2_provider_scopes(prov_pk, oauth_scope_names, dry_run):
             ok = False
