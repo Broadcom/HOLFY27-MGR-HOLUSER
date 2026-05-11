@@ -1451,7 +1451,7 @@ def run_authentik_vcf_integration(
 
     issuer_base = 'https://auth.vcf.lab'
     app_slug = 'vcf'
-    app_name = 'VCF'
+    app_name = 'vCenter (mgmt)'
     tenant = 'CUSTOMER'
     scim_domain = 'vcf.lab'
 
@@ -1462,7 +1462,6 @@ def run_authentik_vcf_integration(
 
     # ── Authentik API token + signing key (auto-discovered) ──────────────────
     ak_token = os.environ.get('AUTHENTIK_API_TOKEN', 'holodeck')
-    signing_key = 'e469fc95-d878-4042-abe9-1e46840fd125'
     if requests:
         try:
             kr = requests.get(
@@ -1559,12 +1558,90 @@ def run_authentik_vcf_integration(
         return False
 
     if prov_pk is not None and not dry_run:
+        app_patch = {
+            'name': app_name,
+            'meta_launch_url': f'https://{mgmt_vc}/ui/',
+            'meta_description': 'Launch Management vCenter',
+            'meta_publisher': 'VMware',
+            'group': 'VCF',
+            'open_in_new_tab': True
+        }
         if os.path.isfile(icon_path):
-            code, data = ak.patch_json(f'core/applications/{app_slug}/', {'meta_icon': icon_name})
-            if code in (200, 201):
-                _log(write, f'  Set meta_icon={icon_name} for application {app_slug!r}.')
+            app_patch['meta_icon'] = icon_name
+
+        code, data = ak.patch_json(f'core/applications/{app_slug}/', app_patch)
+        if code in (200, 201):
+            _log(write, f'  Updated application {app_slug!r} metadata (name, icon, description, etc.).')
+        else:
+            _log(write, f'  WARNING: Failed to update application metadata HTTP {code}: {data}')
+
+        # Add additional UI applications
+        extra_apps = [
+            {
+                'name': 'VCF Automation (Provider)',
+                'slug': 'auto',
+                'meta_launch_url': 'https://auto-a.site-a.vcf.lab/login/?service=provider',
+                'meta_description': 'Launch VCF Automation (Provider)',
+                'group': 'VCF',
+                'meta_publisher': 'VMware',
+                'icon_name': 'VCF-Auto-9.png'
+            },
+            {
+                'name': 'NSX (mgmt)',
+                'slug': 'nsx-mgmt',
+                'meta_launch_url': 'https://nsx-mgmt-a.site-a.vcf.lab/login.jsp',
+                'meta_description': 'Launch Management NSX Manager',
+                'group': 'VCF',
+                'meta_publisher': 'VMware',
+                'icon_name': 'NSX-9.webp'
+            },
+            {
+                'name': 'VCF Operations',
+                'slug': 'ops',
+                'meta_launch_url': 'https://ops-a.site-a.vcf.lab/ui/login.action?vcf=1',
+                'meta_description': 'Launch VCF Operations',
+                'group': 'VCF',
+                'meta_publisher': 'VMware',
+                'icon_name': 'VCF-Ops-9.webp'
+            }
+        ]
+
+        for ea in extra_apps:
+            ea_icon_path = os.path.join(_tools_dir, 'holorouter', ea['icon_name'])
+            if os.path.isfile(ea_icon_path):
+                mime = 'image/webp' if ea['icon_name'].endswith('.webp') else 'image/png'
+                c, d = ak.upload_file(ea_icon_path, ea['icon_name'], mime)
+                if c in (200, 201):
+                    _log(write, f"  Icon {ea['icon_name']} uploaded successfully.")
+                elif c == 400 and isinstance(d, dict) and 'already' in json.dumps(d).lower():
+                    pass
+                else:
+                    _log(write, f"  WARNING: Icon upload failed for {ea['icon_name']} HTTP {c}: {d}")
+
+            ea_patch = {
+                'name': ea['name'],
+                'meta_launch_url': ea['meta_launch_url'],
+                'meta_description': ea['meta_description'],
+                'meta_publisher': ea['meta_publisher'],
+                'group': ea['group'],
+                'open_in_new_tab': True
+            }
+            if os.path.isfile(ea_icon_path):
+                ea_patch['meta_icon'] = ea['icon_name']
+
+            c, d = ak.patch_json(f"core/applications/{ea['slug']}/", ea_patch)
+            if c in (200, 201):
+                _log(write, f"  Updated application {ea['slug']!r}.")
+            elif c == 404:
+                ea_create = ea_patch.copy()
+                ea_create['slug'] = ea['slug']
+                c2, d2 = ak.post_json('core/applications/', ea_create)
+                if c2 in (200, 201):
+                    _log(write, f"  Created application {ea['slug']!r}.")
+                else:
+                    _log(write, f"  WARNING: Failed to create application {ea['slug']} HTTP {c2}: {d2}")
             else:
-                _log(write, f'  WARNING: Failed to set meta_icon HTTP {code}: {data}')
+                _log(write, f"  WARNING: Failed to update application {ea['slug']} HTTP {c}: {d}")
                 
         ak.align_oauth2_sub_mode_for_fleet_iam(prov_pk, cfg, dry_run)
         if not ak.ensure_oauth2_provider_scopes(prov_pk, oauth_scope_names, dry_run):
