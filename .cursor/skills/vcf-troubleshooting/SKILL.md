@@ -2079,3 +2079,24 @@ sleep 30
 kubectl delete pod --all -n vcf-fleet-lcm
 kubectl delete pod --all -n vcf-sddc-lcm
 ```
+## 49. Authentik Image Upload Fails with HTTP 405 Method Not Allowed
+
+**Symptom**: When attempting to upload an image (like an application icon) to Authentik via its API using a `POST` request with `multipart/form-data`, the server responds with an `HTTP 405 Method Not Allowed`. The response headers might indicate `Allow: GET, HEAD, OPTIONS` and the error body might be empty or contain HTML.
+
+**Diagnosis**:
+```bash
+# Example curl command that fails
+curl -s -H "Authorization: Bearer <token>" -X POST https://auth.vcf.lab/api/v3/admin/file/ -F "file=@icon.webp;type=image/webp" -F "name=icon.webp" -i
+```
+
+**Root Cause**: This is often caused by a misconfiguration in the Authentik deployment where the file storage backend is not properly set up. Specifically, if the `AUTHENTIK_STORAGE__MEDIA__FILE__PATH` environment variable is missing or points to an invalid/unmounted directory (like the default `./data` instead of the mounted `/media`), Authentik disables file management. When file management is disabled, the `FileView.post` method raises an `ImproperlyConfigured` exception. Django's default 500 error handler (`ServerErrorView`) is a `TemplateView` that only accepts `GET` requests, so it intercepts the `POST` request and returns a `405 Method Not Allowed` instead of the actual `500 Internal Server Error`, masking the true cause.
+
+**Fix**: Ensure the Authentik Kubernetes deployment (both `authentik-server` and `authentik-worker`) has the correct storage path configured to match the mounted volume.
+
+```bash
+# Patch the authentik secret to include the correct media path
+kubectl patch secret authentik -p '{"stringData": {"AUTHENTIK_STORAGE__MEDIA__FILE__PATH": "/media"}}' -n default
+
+# Restart the deployments to apply the new configuration
+kubectl rollout restart deployment authentik-server authentik-worker -n default
+```
