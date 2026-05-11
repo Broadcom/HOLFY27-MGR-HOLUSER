@@ -400,6 +400,14 @@ class AuthentikApi:
             data = {'raw': r.text[:2000]}
         return r.status_code, data
 
+    def delete_json(self, path: str) -> Tuple[int, Any]:
+        r = self._sess.delete(self._url(path), timeout=120)
+        try:
+            data = r.json()
+        except Exception:
+            data = {'raw': r.text[:2000]}
+        return r.status_code, data
+
     def upload_file(self, file_path: str, name: str, mime_type: str) -> Tuple[int, Any]:
         if not self._sess:
             return 500, {'error': 'No requests session'}
@@ -672,6 +680,15 @@ class AuthentikApi:
 
         # Any application already bound to this OAuth2 provider (list views may omit slug).
         try:
+            app = self.get_json(f'core/applications/{app_slug}/')
+            if self._app_provider_pk(app) == int(prov_pk):
+                return _return_reuse(
+                    f'  Reusing Authentik application slug={app_slug!r} provider pk={prov_pk} (direct lookup)',
+                )
+        except Exception:
+            pass
+
+        try:
             filtered = self.get_json(f'core/applications/?slug={app_slug}')
             for app in filtered.get('results') or []:
                 if self._app_provider_pk(app) == int(prov_pk):
@@ -688,6 +705,27 @@ class AuthentikApi:
                     f'  Reusing Authentik application (matched by provider pk={prov_pk}) '
                     f"slug={self._app_slug(app)!r} name={app.get('name')!r}",
                 )
+
+        try:
+            app = self.get_json(f'core/applications/{app_slug}/')
+            aslug = self._app_slug(app)
+            if aslug == app_slug or app.get('name') == app_name:
+                ap = self._app_provider_pk(app)
+                if ap is not None and ap == int(prov_pk):
+                    return _return_reuse(f'  Reusing Authentik application {app_slug!r} provider pk={prov_pk}')
+                if dry_run:
+                    _log(self.write, f'  DRY-RUN would PATCH application {app_slug!r} to provider pk={prov_pk}')
+                    return int(prov_pk), str(cid), str(csec or '')
+                code, body = self.patch_json(
+                    f'core/applications/{app_slug}/',
+                    {'provider': int(prov_pk), 'name': app_name},
+                )
+                if code not in (200, 201):
+                    raise RuntimeError(f'Application patch (link provider) HTTP {code}: {body}')
+                _log(self.write, f'  Linked Authentik application {app_slug!r} to existing provider pk={prov_pk}')
+                return int(prov_pk), str(cid), str(csec or '')
+        except Exception:
+            pass
 
         for app in apps:
             aslug = self._app_slug(app)
@@ -720,6 +758,20 @@ class AuthentikApi:
         if code2 == 400 and isinstance(app_resp, dict):
             flat = json.dumps(app_resp).lower()
             if 'unique' in flat or 'already' in flat or 'slug' in app_resp or 'provider' in app_resp:
+                try:
+                    app = self.get_json(f'core/applications/{app_slug}/')
+                    if self._app_provider_pk(app) == int(prov_pk):
+                        return _return_reuse(
+                            f'  Application already linked to provider pk={prov_pk} '
+                            f"(slug={self._app_slug(app)!r}) — treating as success",
+                        )
+                    if self._app_slug(app) == app_slug:
+                        return _return_reuse(
+                            f'  Application slug={app_slug!r} already exists (provider pk={self._app_provider_pk(app)})',
+                        )
+                except Exception:
+                    pass
+                
                 apps2 = self.paginate_list('core/applications')
                 for app in apps2:
                     if self._app_provider_pk(app) == int(prov_pk):
@@ -810,6 +862,24 @@ class AuthentikApi:
             raise RuntimeError(f'Authentik invalidation flow {invalidation_flow_slug!r} not found')
         inv_flow = inv_results[0]['pk']
 
+        try:
+            app = self.get_json(f'core/applications/{app_slug}/')
+            prov = self._app_provider_pk(app)
+            if prov is not None:
+                prov_obj = self.get_json(f'providers/oauth2/{int(prov)}/')
+                cid = prov_obj.get('client_id')
+                csec = prov_obj.get('client_secret')
+                _log(self.write, f'  Reusing Authentik application {app_slug!r} provider pk={prov}')
+                return int(prov), str(cid), str(csec or '')
+            # Matching app row without provider — try to attach an existing OAuth2 provider by name.
+            for p in self.paginate_list('providers/oauth2'):
+                if p.get('name') == oauth_name:
+                    return self._reuse_oauth2_provider_and_ensure_app(
+                        p['pk'], app_name, app_slug, dry_run,
+                    )
+        except Exception:
+            pass
+
         for app in self.paginate_list('core/applications'):
             aslug = self._app_slug(app)
             if aslug == app_slug or app.get('name') == app_name:
@@ -877,6 +947,74 @@ class AuthentikApi:
                         _log(self.write, f'  OAuth2 provider {oauth_name!r} already exists — reusing pk={p.get("pk")}')
                         return self._reuse_oauth2_provider_and_ensure_app(p['pk'], app_name, app_slug, dry_run)
         raise RuntimeError(f'OAuth2 provider create failed HTTP {code}: {data}')
+
+    def ensure_application_group_bindings(self, app_slug: str, group_names: List[str], dry_run: bool) -> bool:
+        """Bind an application to specific groups exactly. Idempotent."""
+        try:
+            app = self.get_json(f'core/applications/{app_slug}/')
+        except Exception:
+            _log(self.write, f"  WARNING: Application {app_slug!r} not found for group binding")
+            return False
+
+        app_pk = app.get('pk')
+        target_group_pks = {name: pk for name, pk in zip(group_names, self._get_group_pks(group_names))}
+
+        existing_bindings = []
+        for b in self.paginate_list('policies/bindings'):
+            if b.get('target') == app_pk and b.get('group') is not None:
+                existing_bindings.append(b)
+
+        existing_group_pks = [b.get('group') for b in existing_bindings]
+        desired_group_pks = [pk for pk in target_group_pks.values() if pk is not None]
+
+        order = 0
+        for b in existing_bindings:
+            if b.get('order', 0) >= order:
+                order = b.get('order', 0) + 1
+
+        success = True
+
+        # Remove unwanted group bindings
+        for b in existing_bindings:
+            gpk = b.get('group')
+            if gpk not in desired_group_pks:
+                if dry_run:
+                    _log(self.write, f"  DRY-RUN would remove unwanted binding {b.get('pk')} from {app_slug!r}")
+                    continue
+                dcode, dresp = self.delete_json(f"policies/bindings/{b.get('pk')}/")
+                if dcode in (200, 204):
+                    _log(self.write, f"  Removed unwanted group binding from {app_slug!r}.")
+                else:
+                    _log(self.write, f"  WARNING: Failed to remove binding from {app_slug!r} HTTP {dcode}")
+
+        # Add missing group bindings
+        for gname in group_names:
+            gpk = target_group_pks.get(gname)
+            if not gpk:
+                _log(self.write, f"  WARNING: Group {gname!r} not found, cannot bind to {app_slug!r}")
+                success = False
+                continue
+
+            if gpk in existing_group_pks:
+                continue
+
+            if dry_run:
+                _log(self.write, f"  DRY-RUN would bind {app_slug!r} to group {gname!r}")
+                continue
+
+            code, resp = self.post_json('policies/bindings/', {
+                "target": app_pk,
+                "group": gpk,
+                "order": order
+            })
+            if code in (200, 201):
+                _log(self.write, f"  Bound application {app_slug!r} to group {gname!r}.")
+                order += 1
+            else:
+                _log(self.write, f"  WARNING: Failed to bind {app_slug!r} to group {gname!r} HTTP {code}: {resp}")
+                success = False
+
+        return success
 
     def ensure_scim_backchannel(
         self,
@@ -978,10 +1116,13 @@ class AuthentikApi:
                 _log(self.write, f'  WARNING: SCIM provider PATCH HTTP {pcode} — continuing')
 
         app: Optional[Dict[str, Any]] = None
-        for a in self.paginate_list('core/applications'):
-            if self._app_slug(a) == app_slug:
-                app = self.get_json(f'core/applications/{app_slug}/')
-                break
+        try:
+            app = self.get_json(f'core/applications/{app_slug}/')
+        except Exception:
+            for a in self.paginate_list('core/applications'):
+                if self._app_slug(a) == app_slug:
+                    app = self.get_json(f'core/applications/{app_slug}/')
+                    break
         if not app:
             _log(self.write, f'  ERROR: Authentik application slug={app_slug!r} not found — cannot attach SCIM')
             return False, spk
@@ -1560,6 +1701,7 @@ def run_authentik_vcf_integration(
     if prov_pk is not None and not dry_run:
         app_patch = {
             'name': app_name,
+            'slug': 'vcf',
             'meta_launch_url': f'https://{mgmt_vc}/ui/',
             'meta_description': 'Launch Management vCenter',
             'meta_publisher': 'VMware',
@@ -1574,6 +1716,8 @@ def run_authentik_vcf_integration(
             _log(write, f'  Updated application {app_slug!r} metadata (name, icon, description, etc.).')
         else:
             _log(write, f'  WARNING: Failed to update application metadata HTTP {code}: {data}')
+            
+        ak.ensure_application_group_bindings(app_slug, ['prod-admins', 'prod-readonly'], dry_run)
 
         # Add additional UI applications
         extra_apps = [
@@ -1584,7 +1728,8 @@ def run_authentik_vcf_integration(
                 'meta_description': 'Launch VCF Automation (Provider)',
                 'group': 'VCF',
                 'meta_publisher': 'VMware',
-                'icon_name': 'VCF-Auto-9.png'
+                'icon_name': 'VCF-Auto-9.png',
+                'group_bindings': ['prod-admins']
             },
             {
                 'name': 'NSX (mgmt)',
@@ -1593,7 +1738,8 @@ def run_authentik_vcf_integration(
                 'meta_description': 'Launch Management NSX Manager',
                 'group': 'VCF',
                 'meta_publisher': 'VMware',
-                'icon_name': 'NSX-9.webp'
+                'icon_name': 'NSX-9.webp',
+                'group_bindings': ['prod-admins', 'prod-readonly']
             },
             {
                 'name': 'VCF Operations',
@@ -1602,7 +1748,8 @@ def run_authentik_vcf_integration(
                 'meta_description': 'Launch VCF Operations',
                 'group': 'VCF',
                 'meta_publisher': 'VMware',
-                'icon_name': 'VCF-Ops-9.webp'
+                'icon_name': 'VCF-Ops-9.webp',
+                'group_bindings': ['prod-admins', 'prod-readonly']
             }
         ]
 
@@ -1642,6 +1789,9 @@ def run_authentik_vcf_integration(
                     _log(write, f"  WARNING: Failed to create application {ea['slug']} HTTP {c2}: {d2}")
             else:
                 _log(write, f"  WARNING: Failed to update application {ea['slug']} HTTP {c}: {d}")
+                
+            if 'group_bindings' in ea:
+                ak.ensure_application_group_bindings(ea['slug'], ea['group_bindings'], dry_run)
                 
         ak.align_oauth2_sub_mode_for_fleet_iam(prov_pk, cfg, dry_run)
         if not ak.ensure_oauth2_provider_scopes(prov_pk, oauth_scope_names, dry_run):
@@ -1715,6 +1865,21 @@ def run_authentik_vcf_integration(
                     vcf_sddc_viewer_role='sddc_viewer',
                 ):
                     ok = False
+
+                # Automatically disable vCenter IDP selection prompt for seamless login
+                # Tested on 2026-05-11 but this didn't work. Even restarting all services on vCenter after config did not help.
+                # The Login Method drop-down remains visible.
+                # if not dry_run:
+                #     _log(write, '  Disabling IDP selection prompt on vCenter (sso-config.sh -set_idp_selection_flag false)...')
+                #     sso_cfg_cmd = (
+                #         f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
+                #         f'root@{mgmt_vc} "/opt/vmware/bin/sso-config.sh -set_idp_selection_flag -t vsphere.local false"'
+                #     )
+                #     r_sso = subprocess.run(sso_cfg_cmd, shell=True, capture_output=True, text=True, timeout=120)
+                #     if r_sso.returncode == 0:
+                #         _log(write, '  vCenter IDP selection prompt disabled successfully.')
+                #     else:
+                #         _log(write, f'  WARNING: Failed to disable IDP selection prompt: {r_sso.stderr[:200]}')
     except Exception as e:
         _log(write, f'Fleet IAM / SCIM / Join SSO FAILED: {e}')
         ok = False
