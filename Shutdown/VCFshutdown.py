@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 3.5 - 2026-05-14
+# Version 3.6 - 2026-05-14
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 3.6 Changes (2026-05-14):
+# - vcf_write() no longer calls lsf.write_output() — shutdown output is only
+#   written to shutdown.log and console. labstartup.log is a startup artifact
+#   and should not receive shutdown messages.
+# - Added module-level _vcf_write_quiet flag to suppress console output during
+#   early ESA detection (replaces the lsf.write_output monkey-patch approach).
+# - Fixed VCF 9.0 fleet path: write_output=lsf.write_output replaced with
+#   write_output=lambda m: vcf_write(lsf, m) to stay off labstartup.log.
+# - MODULE_VERSION bumped to 2.8.
 #
 # v 3.5 Changes (2026-05-14):
 # - Phase 1b K8s cleanup: extended IP scan to include 10.1.1.69 (auto-platform-a
@@ -305,7 +315,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 MODULE_NAME = 'VCFshutdown'
-MODULE_VERSION = '2.7'
+MODULE_VERSION = '2.8'
 MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 9.x compliant)'
 
 # Status file for console display
@@ -313,6 +323,10 @@ STATUS_FILE = '/lmchol/hol/startup_status.txt'
 
 # Shutdown log file (mirrors all VCF phase output to shutdown.log)
 SHUTDOWN_LOG = '/home/holuser/hol/shutdown.log'
+
+# When True, vcf_write() suppresses console output but still writes to shutdown.log.
+# Used during early ESA detection to avoid cluttering the startup banner.
+_vcf_write_quiet = False
 
 # vSAN elevator timeout (45 minutes - safety ceiling; active polling finishes sooner)
 VSAN_ELEVATOR_TIMEOUT = 2700  # 45 minutes in seconds
@@ -352,11 +366,14 @@ def write_to_shutdown_log(msg: str):
 
 def vcf_write(lsf, msg: str):
     """
-    Write a message to BOTH lsf.write_output() (labstartup.log + console)
-    AND shutdown.log. Every VCF shutdown phase message should use this
-    function so that shutdown.log has a complete record.
+    Write a message to shutdown.log and console.
+    Does NOT write to labstartup.log — shutdown activity belongs in shutdown.log only.
+    Console output is suppressed when _vcf_write_quiet is True (early ESA detection).
     """
-    lsf.write_output(msg)
+    import datetime as _dt
+    if not _vcf_write_quiet:
+        timestamp = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f'[{timestamp}] {msg}')
     write_to_shutdown_log(msg)
 
 
@@ -1039,18 +1056,18 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
 
     dynamic_budget = dict(sh.DEFAULT_PHASE_BUDGET_SEC)
     if esx_hosts and not dry_run:
-        # Detect vSAN ESA early to adjust ETA budget
-        # Suppress logging during early detection to keep output clean
-        original_write = getattr(lsf, 'write_output', None)
+        # Detect vSAN ESA early to adjust ETA budget.
+        # Suppress console output during detection to keep the banner clean;
+        # ESA check messages still land in shutdown.log via write_to_shutdown_log().
+        global _vcf_write_quiet
+        _vcf_write_quiet = True
         try:
-            lsf.write_output = lambda m: None
             if check_vsan_esa(lsf, esx_hosts[0], esx_username, password):
                 dynamic_budget['19'] = 5
         except Exception:
             pass
         finally:
-            if original_write:
-                lsf.write_output = original_write
+            _vcf_write_quiet = False
 
     eta = sh.ShutdownEtaTracker(
         list(sh.CANONICAL_PHASE_ORDER) if phase_set is None else ordered_plan,
@@ -1154,7 +1171,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
                         try:
                             token = fleet.get_encoded_token(fleet_username, password)
                             success = fleet.shutdown_products(fleet_fqdn, token, fleet_products,
-                                                              write_output=lsf.write_output,
+                                                              write_output=lambda m: vcf_write(lsf, m),
                                                               skip_inventory_sync=True)
                             if success:
                                 vcf_write(lsf, 'Fleet Operations (VCF 9.0) products shutdown complete')
