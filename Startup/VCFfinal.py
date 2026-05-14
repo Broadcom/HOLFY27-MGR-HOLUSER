@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3 - 2026-05-14
+# Version 6.3.1 - 2026-05-14
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.1 Changes:
+# - Fixed Step 0 awk quoting bug: replaced awk '{print $1}' with cut -d" " -f1 to
+#   avoid single-quote clash inside the bash -c '...' wrapper used by vcfa_ssh, and
+#   to prevent $1 from being expanded to empty by the local shell inside lsf.ssh
+#   double-quoted command argument.
 #
 # v6.3 Changes:
 # - Fixed Step 14 prelude StatefulSet check: moved it outside the "if zero_deps:"
@@ -1950,7 +1956,7 @@ echo "PROXY_CONFIGURED"
                 stale_wf_out = _get_stdout(vcfa_ssh(
                     'kubectl get workflow -n vmsp-platform --no-headers 2>/dev/null'
                     ' | grep system-shutdown'
-                    r" | awk '{print $1}'"
+                    ' | cut -d" " -f1'
                 ))
                 stale_wfs = [w.strip() for w in stale_wf_out.splitlines() if w.strip()]
                 if stale_wfs:
