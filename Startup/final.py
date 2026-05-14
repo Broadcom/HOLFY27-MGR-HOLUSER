@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # final.py - HOLFY27 Core Final Lab Checks
-# Version 3.1 - 2026-03-13
+# Version 3.4 - 2026-05-14
 # Author - Burke Azbill and HOL Core Team
 # Final lab startup checks and cleanup
 
@@ -292,7 +292,14 @@ def main(lsf=None, standalone=False, dry_run=False):
     if os.path.isfile(lab_update_python_script):
         lsf.write_output(f"Running lab-update.py from {lab_update_python_script}")
         lsf.run_command(f"chmod +x {lab_update_python_script}")
-        lsf.run_command(f"/usr/bin/python3 {lab_update_python_script}")
+        # Allow up to 30 minutes. For example:
+        #   kubectl rollout wait  ~10 min
+        #   cert install + nginx  ~3 min
+        #   post-install monitor  ~9 min (3 cycles × 3 min)
+        #   overhead              ~8 min
+        result = lsf.run_command(f"/usr/bin/python3 {lab_update_python_script}", timeout=1800)
+        if result.returncode != 0:
+            lsf.labfail("lab-update.py failed - check labstartup.log for details")
         lsf.write_output("Finished Lab updates")
     
 
