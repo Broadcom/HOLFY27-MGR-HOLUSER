@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # Shutdown.py - HOLFY27 Lab Shutdown Orchestration
-# Version 2.3 - 2026-04-27
+# Version 2.4 - 2026-05-13
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # Main shutdown script for graceful lab environment shutdown
+#
+# v 2.4 Changes (2026-05-13):
+# - Removed labstartup.log initialization and logging. All logging is only output to shutdown.log
 #
 # v 2.3 Changes (2026-04-27):
 # - Added --phases and --fleet-products CLI; mutually exclusive --phase / --phases; pass-through to VCFshutdown
@@ -101,7 +104,6 @@ SCRIPT_DESCRIPTION = 'HOLFY27 Lab Shutdown Orchestration'
 
 # Log files
 SHUTDOWN_LOG = '/home/holuser/hol/shutdown.log'
-LABSTARTUP_LOG = '/home/holuser/hol/labstartup.log'
 
 # Status file for console display
 STATUS_FILE = '/lmchol/hol/startup_status.txt'
@@ -126,15 +128,7 @@ def init_shutdown_log(dry_run: bool = False):
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     header = f'Lab Shutdown: {timestamp}\n'
     
-    # Re-initialize labstartup.log with shutdown header
-    try:
-        with open(LABSTARTUP_LOG, 'w') as f:
-            f.write(header)
-            f.write('=' * 70 + '\n')
-    except Exception as e:
-        print(f'Warning: Could not initialize {LABSTARTUP_LOG}: {e}')
-    
-    # Also initialize shutdown.log
+    # Initialize shutdown.log
     try:
         with open(SHUTDOWN_LOG, 'w') as f:
             f.write(header)
@@ -185,18 +179,6 @@ def write_shutdown_output(msg: str, lsf=None):
             f.write(formatted_msg + '\n')
     except Exception:
         pass
-    
-    # Write to labstartup log (local copy)
-    try:
-        with open(LABSTARTUP_LOG, 'a') as f:
-            f.write(formatted_msg + '\n')
-    except Exception:
-        pass
-    
-    # Note: We don't call lsf.write_output() here to avoid duplicate entries
-    # since lsf.write_output() also writes to labstartup.log
-    # The NFS copy (/lmchol/hol/labstartup.log) is handled by lsf.logfiles
-
 
 #==============================================================================
 # HELPER FUNCTIONS
