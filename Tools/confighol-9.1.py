@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.16 - 2026-05-01
+# Version 2.18 - 2026-05-13
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -9,6 +9,17 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.18 - 2026-05-13:
+#   - configure_vsp_proxy() now uses lsf.LAB_PROXY_URL and lsf.build_lab_no_proxy()
+#     instead of a local hardcoded NO_PROXY_PARTS list.
+#
+# v2.17 - 2026-05-12:
+#   - Added _trust_vault_ca_on_auto(): imports Vault root CA into VCF
+#     Automation's cloudapi trusted-certificates store (alias: vcf.lab.ca)
+#     via POST /cloudapi/1.0.0/ssl/trustedCertificates using Basic auth
+#     (admin@System) to obtain a Bearer token.
+#   - distribute_vault_ca_trust() now calls _trust_vault_ca_on_auto() for
+#     the primary auto-a host if VCF Automation is configured and reachable.
 # v2.16 - 2026-05-01:
 #   - Improved task id display in output.
 # v2.15 - 2026-04-02:
@@ -3531,6 +3542,136 @@ def _trust_vault_ca_on_linux_appliance(hostname: str, user: str,
     return True
 
 
+def _trust_vault_ca_on_auto(hostname: str, password: str,
+                             ca_pem: str, dry_run: bool = False) -> bool:
+    """
+    Import the Vault root CA into VCF Automation's trusted certificates.
+
+    Authenticates to the VCF Automation (vCloud Director) cloudapi as
+    admin@System using Basic auth to obtain a Bearer token, then POSTs
+    the CA certificate to /cloudapi/1.0.0/ssl/trustedCertificates with
+    alias 'vcf.lab.ca'.
+
+    Auth flow:
+      POST /cloudapi/1.0.0/sessions/provider
+        Authorization: Basic base64("admin@System:<password>")
+        Accept: application/json;version=10.0.0.0-alpha
+      → response header: x-vmware-vcloud-access-token: <JWT>
+
+    Import endpoint:
+      POST /cloudapi/1.0.0/ssl/trustedCertificates
+      body: {"alias": "vcf.lab.ca", "certificate": "<PEM>"}
+
+    :param hostname: VCF Automation FQDN (e.g. auto-a.site-a.vcf.lab)
+    :param password: Lab password (used for admin@System account)
+    :param ca_pem: PEM-encoded Vault root CA certificate
+    :param dry_run: If True, preview only
+    :return: True if successful or already imported
+    """
+    import base64
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    if dry_run:
+        lsf.write_output(
+            f'  {hostname}: Would import Vault CA via VCF Automation '
+            f'cloudapi trusted-certificates'
+        )
+        return True
+
+    base_url = f'https://{hostname}'
+    vcf_api_version = '10.0.0.0-alpha'
+    common_headers = {
+        'Accept': f'application/json;version={vcf_api_version}',
+        'x-vmware-vcloud-auth-context': 'System',
+    }
+
+    # Obtain Bearer token via Basic auth (admin@System)
+    try:
+        creds = base64.b64encode(f'admin@System:{password}'.encode()).decode()
+        session_resp = requests.post(
+            f'{base_url}/cloudapi/1.0.0/sessions/provider',
+            headers={**common_headers, 'Authorization': f'Basic {creds}'},
+            verify=False, timeout=30,
+        )
+        if session_resp.status_code not in (200, 201):
+            lsf.write_output(
+                f'  {hostname}: WARNING - Failed to authenticate to VCF Automation '
+                f'cloudapi: HTTP {session_resp.status_code}'
+            )
+            return False
+
+        token = session_resp.headers.get('x-vmware-vcloud-access-token', '')
+        if not token:
+            lsf.write_output(
+                f'  {hostname}: WARNING - No access token in VCF Automation '
+                f'cloudapi session response'
+            )
+            return False
+    except Exception as exc:
+        lsf.write_output(f'  {hostname}: ERROR obtaining VCF Automation token - {exc}')
+        return False
+
+    auth_headers = {
+        **common_headers,
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+    }
+    ca_alias = 'vcf.lab.ca'
+
+    # Check for an existing entry with the same alias
+    try:
+        list_resp = requests.get(
+            f'{base_url}/cloudapi/1.0.0/ssl/trustedCertificates'
+            '?page=1&pageSize=50&sortAsc=alias',
+            headers=auth_headers, verify=False, timeout=30,
+        )
+        if list_resp.status_code == 200:
+            for entry in list_resp.json().get('values', []):
+                alias = entry.get('alias', '')
+                if alias == ca_alias:
+                    lsf.write_output(
+                        f'  {hostname}: Vault CA already trusted in VCF Automation '
+                        f'(alias: {alias})'
+                    )
+                    return True
+    except Exception:
+        pass
+
+    # Import the CA certificate
+    try:
+        import_resp = requests.post(
+            f'{base_url}/cloudapi/1.0.0/ssl/trustedCertificates',
+            headers=auth_headers,
+            json={'alias': ca_alias, 'certificate': ca_pem},
+            verify=False, timeout=30,
+        )
+        if import_resp.status_code in (200, 201):
+            lsf.write_output(
+                f'  {hostname}: SUCCESS - Vault CA imported to VCF Automation '
+                f'trusted certificates (alias: {ca_alias})'
+            )
+            return True
+        elif import_resp.status_code == 409:
+            lsf.write_output(
+                f'  {hostname}: Vault CA already in VCF Automation trusted '
+                f'certificates (alias: {ca_alias})'
+            )
+            return True
+        else:
+            lsf.write_output(
+                f'  {hostname}: WARNING - VCF Automation trusted-certificates '
+                f'import returned HTTP {import_resp.status_code}'
+            )
+            body = import_resp.text[:200] if import_resp.text else ''
+            if body:
+                lsf.write_output(f'  {hostname}:   Response: {body}')
+            return False
+    except Exception as exc:
+        lsf.write_output(f'  {hostname}: ERROR - {exc}')
+        return False
+
+
 def distribute_vault_ca_trust(ca_pem: str, password: str,
                                dry_run: bool = False) -> bool:
     """
@@ -3542,6 +3683,7 @@ def distribute_vault_ca_trust(ca_pem: str, password: str,
     - NSX Managers (via trust-management API)
     - SDDC Manager (via trusted-certificates API)
     - VCF Automation appliances (OS trust store)
+    - VCF Automation Provider API (cloudapi trusted-certificates, alias: vcf.lab.ca)
     - VCF Operations VMs (OS trust store)
 
     :param ca_pem: PEM-encoded Vault root CA certificate
@@ -3675,6 +3817,31 @@ def distribute_vault_ca_trust(ca_pem: str, password: str,
                 success_count += 1
         else:
             lsf.write_output(f'  {vcfa_host}: SKIP - not reachable')
+
+    # --- VCF Automation Provider API ---
+    # Import the CA into VCF Automation's trusted-certificates store via the
+    # cloudapi so VCFA can validate TLS connections to hosts signed by Vault.
+    # Only attempt for the primary auto-a host (the Provider endpoint).
+    lsf.write_output('')
+    lsf.write_output('--- VCF Automation Provider Trusted Certificates ---')
+    auto_a_host = None
+    for h, _ in vcfa_hosts:
+        if h.startswith('auto-a.') or h == 'auto-a':
+            auto_a_host = h
+            break
+    if auto_a_host is None and vcfa_hosts:
+        # Fall back to first discovered host that looks like a primary VCFA node
+        auto_a_host = vcfa_hosts[0][0]
+
+    if auto_a_host:
+        if lsf.test_ping(auto_a_host):
+            total_count += 1
+            if _trust_vault_ca_on_auto(auto_a_host, password, ca_pem, dry_run):
+                success_count += 1
+        else:
+            lsf.write_output(f'  {auto_a_host}: SKIP - not reachable')
+    else:
+        lsf.write_output('  No VCF Automation host found in config')
 
     # --- VCF Operations VMs ---
     lsf.write_output('')
@@ -4635,24 +4802,8 @@ def configure_vsp_proxy(dry_run: bool = False) -> bool:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    PROXY_URL = 'http://10.1.1.1:3128'
-    NO_PROXY_PARTS = [
-        'localhost',
-        '127.0.0.1',
-        '10.0.0.0/8',
-        '10.96.0.0/12',
-        '172.16.0.0/16',
-        '192.168.0.0/16',
-        '198.18.0.0/16',
-        '.site-a.vcf.lab',
-        '.site-b.vcf.lab',
-        '.vcf.lab',
-        '.svc',
-        '.cluster.local',
-        '.svc.cluster.local',
-        'registry.vmsp-platform.svc.cluster.local',
-    ]
-    NO_PROXY = ','.join(NO_PROXY_PARTS)
+    PROXY_URL = lsf.LAB_PROXY_URL
+    NO_PROXY = lsf.build_lab_no_proxy()
     VSP_SSH_USER = 'vmware-system-user'
 
     lsf.write_output('')

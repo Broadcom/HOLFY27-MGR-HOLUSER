@@ -1,7 +1,10 @@
 #!/bin/bash
 
-# VCFA Complete Stabilization Script v2.6
-# Default-run philosophy (v2.6): one run of the script with no flags should leave the VCFA in a
+# VCFA Complete Stabilization Script v2.7
+# Version 2.7 - 2026-05-13
+# Author - HOL Core Team
+#
+# Default-run philosophy (v2.6+): one run of the script with no flags should leave the VCFA in a
 # known-good state regardless of what state it was in before, AND should be safe to run again any
 # time (cron, post-reboot, between automation runs) without disrupting a healthy cluster.
 #
@@ -22,6 +25,11 @@
 #     unconditionally just churns rollouts. Set FORCE_KYVERNO_FIX=1 to bypass the heuristic.
 #
 # See VCFA_Stabilizer_Incident_Apr2026.md for the gateway/EnvoyProxy guidance and HTTP 503 recovery.
+#
+# v2.7 changelog (2026-05-13):
+#  * Added robust idempotency check to main() based on persistent configuration changes
+#    (vcfa-eg-mem-keeper.sh and kube-vip lease duration) to allow safe, silent exits
+#    when the script has already been applied.
 #
 # v2.6 changelog (Apr 30, 2026 - same evening as v2.5.1):
 #  * NEW Phase 1.5 in `main()` ("Control-plane preflight") that wraps every persistent control-plane
@@ -1476,6 +1484,15 @@ main() {
     echo ""
     
     check_prerequisites
+    
+    # Check if the stabilizer has already been applied by looking for persistent settings it creates:
+    # 1. The durable systemd watcher script (from Phase 3.5)
+    # 2. The kube-vip lease duration tuning (from Phase 1.5)
+    local check_cmd="test -f /usr/local/bin/vcfa-eg-mem-keeper.sh || grep -A 1 'name: vip_leaseduration' /etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null | grep -q 'value: \"60\"'"
+    if vcfa_ssh_nosudo "$check_cmd" >/dev/null 2>&1; then
+        echo "VCFA Stabilizer already applied..."
+        exit 0
+    fi
     
     echo ""
     info "=== PHASE 1: Initial System Assessment ==="

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Author: Burke Azbill and HOL Core Team
-Version: 1.0.0 2026-05-07
+Version: 1.0.1 2026-05-11
 
 Tune Firefox user.js on the Main Linux Console (LMC) profile.
 
@@ -17,8 +17,10 @@ profile's ``user.js``.
 
 from __future__ import annotations
 
+import glob
 import os
 import re
+import shutil
 from typing import Any, Callable, List, Optional
 
 BEGIN = "# --- BEGIN HOL LMC Firefox tuning ---"
@@ -90,6 +92,7 @@ def _hol_block(proxy_host: str, proxy_port: int) -> str:
         'user_pref("browser.formfill.autoFill.forms", true);',
         'user_pref("signon.autofillForms", true);',
         'user_pref("signon.usernameOnlyForm.enabled", true);',
+        'user_pref("messaging-system.rsexperimentloader.enabled", false);',
         END,
         "",
     ]
@@ -132,6 +135,54 @@ def _rewrite_user_js(path: str, proxy_host: str, proxy_port: int) -> bool:
     return True
 
 
+def _clear_crashes_and_idb(
+    mc_base: str, profiles: List[str], log: Callable[[str], Any], dry_run: bool
+) -> None:
+    # 1. Clear Crash Reports
+    base = os.path.join(
+        mc_base, "home", "holuser", "snap", "firefox", "common", ".mozilla", "firefox"
+    )
+    for subdir in ["pending", "submitted"]:
+        target_dir = os.path.join(base, "Crash Reports", subdir)
+        if os.path.isdir(target_dir):
+            if dry_run:
+                log(f"firefox_lmchol_tuning: dry-run — would clear {target_dir}")
+            else:
+                for item in os.listdir(target_dir):
+                    item_path = os.path.join(target_dir, item)
+                    try:
+                        if os.path.isdir(item_path):
+                            shutil.rmtree(item_path)
+                        else:
+                            os.remove(item_path)
+                    except OSError as e:
+                        log(f"WARNING: firefox_lmchol_tuning: could not remove {item_path}: {e}")
+                log(f"firefox_lmchol_tuning: cleared crash reports in {target_dir}")
+
+    # 2. Clear remote-settings IDB in each profile
+    for prof in profiles:
+        idb_dir = os.path.join(prof, "storage", "permanent", "chrome", "idb")
+        if os.path.isdir(idb_dir):
+            pattern = os.path.join(idb_dir, "*rsegmnoittet-es.*")
+            matches = glob.glob(pattern)
+            if matches:
+                if dry_run:
+                    log(
+                        f"firefox_lmchol_tuning: dry-run — would clear {len(matches)} "
+                        f"remote-settings idb files in {os.path.basename(prof)}"
+                    )
+                else:
+                    for f in matches:
+                        try:
+                            if os.path.isdir(f):
+                                shutil.rmtree(f)
+                            else:
+                                os.remove(f)
+                        except OSError as e:
+                            log(f"WARNING: firefox_lmchol_tuning: could not remove {f}: {e}")
+                    log(f"firefox_lmchol_tuning: cleared remote-settings idb files in {os.path.basename(prof)}")
+
+
 def apply_firefox_lmchol_tuning(
     lsf: Any,
     dry_run: bool = False,
@@ -158,7 +209,10 @@ def apply_firefox_lmchol_tuning(
             f"firefox_lmchol_tuning: dry-run — would tune {len(profiles)} profile(s) "
             f"(proxy {host}:{proxy_port})"
         )
+        _clear_crashes_and_idb(mc, profiles, log, dry_run=True)
         return True
+
+    _clear_crashes_and_idb(mc, profiles, log, dry_run=False)
 
     ok_all = True
     for prof in profiles:

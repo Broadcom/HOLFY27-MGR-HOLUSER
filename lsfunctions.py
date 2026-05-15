@@ -1,5 +1,5 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.5 - 2026-05-06
+# Version 3.6 - 2026-05-13
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
@@ -64,6 +64,42 @@ creds = f'{home}/creds.txt'
 router = 'router.site-a.vcf.lab'
 proxy = 'proxy.site-a.vcf.lab'
 holorouter_dir = '/tmp/holorouter'  # NFS exported directory for router communication
+
+# ---------------------------------------------------------------------------
+# Canonical proxy constants — single source of truth for all lab scripts.
+# Update only here; consumers call build_lab_no_proxy() / build_vscode_no_proxy().
+# ---------------------------------------------------------------------------
+LAB_PROXY_URL = "http://10.1.1.1:3128"
+
+LAB_NO_PROXY_PARTS = [
+    "localhost", "127.0.0.1",
+    "10.0.0.0/8",          # all private 10.x lab networking
+    "172.16.0.0/12",       # pod/overlay/management plane networks
+    "192.168.0.0/16",      # holorouter management range
+    "198.18.0.0/16",       # VSP service CIDR (198.18.128.0/17 in use)
+    ".vcf.lab",            # Covers .vcf and .site-a/.site-b site zones and anything ending in .vcf.lab
+    ".svc",                # K8s short DNS form: service.namespace.svc
+    ".cluster.local",      # K8s full DNS form and .svc.cluster.local;
+                           # also covers registry.vmsp-platform.svc.cluster.local
+]
+
+
+def build_lab_no_proxy():
+    """Return the canonical NO_PROXY comma-string for shell/containerd/systemd use."""
+    return ','.join(LAB_NO_PROXY_PARTS)
+
+
+def build_vscode_no_proxy():
+    """Return NO_PROXY as a list in VS Code glob format.
+
+    VS Code settings.json uses '*.vcf.lab' glob wildcards rather than the
+    shell/curl '.vcf.lab' prefix convention, so dot-prefixed entries are
+    converted: '.vcf.lab' -> '*.vcf.lab'.
+    """
+    result = []
+    for entry in LAB_NO_PROXY_PARTS:
+        result.append('*' + entry if entry.startswith('.') else entry)
+    return result
 
 # Log file name
 logfile = 'labstartup.log'
