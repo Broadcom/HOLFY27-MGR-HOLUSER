@@ -1,8 +1,92 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 4.7 - 2026-05-01
+# Version 6.3.1 - 2026-05-14
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.1 Changes:
+# - Fixed Step 0 awk quoting bug: replaced awk '{print $1}' with cut -d" " -f1 to
+#   avoid single-quote clash inside the bash -c '...' wrapper used by vcfa_ssh, and
+#   to prevent $1 from being expanded to empty by the local shell inside lsf.ssh
+#   double-quoted command argument.
+#
+# v6.3 Changes:
+# - Fixed Step 14 prelude StatefulSet check: moved it outside the "if zero_deps:"
+#   block so it always runs unconditionally. Previously, rabbitmq-ha, tenant-manager,
+#   and vco-app StatefulSets (all 0/0 replicas after shutdown) were never scaled up
+#   when all Deployments were already healthy. Without RabbitMQ and tenant-manager,
+#   api-gateway-server crashes with OIDC JWKS "connection refused" and /login/ returns
+#   HTTP 500 for the entire 30-minute URL-check window.
+# - Step 14b (vmsp-operator re-cordon check) now triggers on "zero_deps or zero_sts"
+#   instead of only on zero_deps.
+#
+# v6.2 Changes:
+# - Added Step 0: Delete all stale system-shutdown Argo Workflows before any
+#   uncordon/startup work. Each Fleet LCM shutdown creates an Argo Workflow in
+#   vmsp-platform that is persisted across reboots. On startup, the Argo controller
+#   resumes any Running workflow, which re-cordons the node, scales all prelude
+#   deployments to 0, and runs shutdown scripts — making VCFA inaccessible (HTTP 500).
+#   Up to 30+ stale workflows can accumulate, each waiting on lock-vmsp-platform
+#   mutex. Deleting them BEFORE uncordon prevents the re-cordon race condition.
+# - Fixed microservices scaling section to use sudo -S -i bash -c pattern (VCF 9.1
+#   requires password for sudo; the old sudo -S kubectl form fails without login shell).
+#
+# v6.1 Changes:
+# - VSP node proxy config now uses lsf.LAB_PROXY_URL and lsf.build_lab_no_proxy()
+#   instead of a local hardcoded NO_PROXY_PARTS list.
+#
+# v6.0 Changes:
+# - Replaced check_fix_wcp.sh with the new unified supervisor_stabilizer.py script
+#   which handles multi-vCenter auto-discovery, proxy config, cert rotation, and
+#   workload recovery in a single idempotent pass.
+#
+# v5.9 Changes:
+# - Added Step 14b: Post-scale node re-check.
+#   After scaling up prelude deployments (Step 14), vmsp-operator
+#   (system:serviceaccount:vmsp:vmsp-operator) re-cordons the K8s node
+#   ~90 seconds later via its startup reconciliation loop, which reads a
+#   stale "maintenance in progress" state from the previous shutdown.
+#   Step 14b waits 120s for this to happen, then overrides the cordon.
+# - Added URL-loop node monitor: every 3 attempts in the VCFA URL check
+#   loop, re-checks node scheduling status and uncordons if needed.
+#   Catches any re-cordon that slips through Step 14b.
+#
+# v5.8 Changes:
+# - opslogs rescue now retries on EVERY attempt >= 5 (was: only once at attempt 5).
+#   The VSP cluster VIP (10.1.1.142) can take 90+ minutes to stabilize after cold boot,
+#   so the single attempt at minute 5 silently failed every time. Now the rescale fires
+#   on each retry loop and logs the kubectl output so failures are visible.
+#   Only annotates the component CRD when the rescale actually succeeds (scaled/unchanged).
+#
+# v5.7 Changes:
+# - Added a Failure Tracking Queue
+# - Add retry logic for components that failed to scale initially, executing after the node provision wait loop.
+#
+# v5.6 Changes:
+# - Add ops-logs StatefulSet rescale if the URL remains unreachable after 5 attempts.
+#
+# v5.5 Changes:
+# - Moved Component CRD annotation updates (NotRunning -> Running) to execute BEFORE 
+#   scaling up K8s workloads in Task 2e. This prevents a race condition where vmsp-operator 
+#   immediately scales pods back down to 0 before the annotation can be applied.
+# - Removed redundant explicit power-on logic for Ops Logs VMs, as they are already 
+#   powered on during VCF.py phase.
+#
+# v5.1 Changes:
+# - Moved JWT Parse Error fix (vcf-fleet-lcm and vidb pod restarts) in Task 2e to execute 
+#   *after* Ops Logs and Ops Networks VMs are powered on, ensuring UI components show
+#   friendly names rather than internal names.
+#
+# v5.0 Changes:
+# - Added logic to Task 4 to isolate Automation VMs on a dedicated ESXi host.
+#
+# v4.9 Changes:
+# - Added explicit power-on logic for Ops Logs VMs in Task 2e since opslogs is a mix
+#   of K8s services and dedicated VMs (just like opsnet).
+#
+# v4.8 Changes:
+# - Added dynamic NO_PROXY injection for VSP cluster nodes in Task 2e to prevent
+#   ImagePullBackOff for opsnet/opslogs components during scale-up.
 #
 # v4.7 Changes:
 # - Fixed Supervisor DNS Health Check: added missing newline after '='*60
@@ -50,6 +134,7 @@ import logging
 import ssl
 import time
 import json
+import subprocess
 
 # Add hol directory to path
 sys.path.insert(0, '/home/holuser/hol')
@@ -110,409 +195,6 @@ def verify_nic_connected(lsf, vm_obj, simple=False):
                 lsf.set_network_adapter_connection(vm_obj, nic, True)
     except Exception as e:
         lsf.write_output(f'Error verifying NIC connection for {vm_obj.name}: {e}')
-
-
-def verify_supervisor_dns(lsf, vcenter_host, password, sso_domain='wld.sso',
-                          dry_run=False):
-    """
-    Verify and fix Supervisor kube-dns endpoint configuration.
-
-    After an ungraceful shutdown, the kube-dns K8s Endpoint can point to
-    the kube-dns-lb LoadBalancer external IP (10.1.0.x) instead of the
-    actual CoreDNS pod IPs (172.16.200.x).  When the NSX Distributed
-    Load Balancer on ESXi intercepts ClusterIP traffic for kube-dns and
-    forwards it to the LB IP, the response comes back through the T1
-    Service Router rather than the DLB, creating an asymmetric routing
-    path that drops all DNS responses.  This breaks DNS for every
-    vSphere Pod on the Supervisor.
-
-    The fix is to patch the kube-dns endpoint to point directly to the
-    CoreDNS pod IPs so the DLB forwards to overlay-reachable pods and
-    the response returns symmetrically.
-    """
-    import subprocess
-    import json as _json
-
-    lsf.write_output('='*60)
-    lsf.write_output('Supervisor DNS Health Check')
-    lsf.write_output('='*60)
-
-    if dry_run:
-        lsf.write_output('  Dry run - skipping DNS health check')
-        return True
-
-    try:
-        scp_pwd_result = subprocess.run(
-            ['sshpass', '-p', password, 'ssh', '-o', 'StrictHostKeyChecking=accept-new',
-             f'root@{vcenter_host}',
-             'python3 /usr/lib/vmware-wcp/decryptK8Pwd.py'],
-            capture_output=True, text=True, timeout=15
-        )
-
-        scp_ip = None
-        scp_pwd = None
-        for line in scp_pwd_result.stdout.split('\n'):
-            if 'IP:' in line:
-                scp_ip = line.split('IP:')[1].strip()
-            if 'PWD:' in line:
-                scp_pwd = line.split('PWD:')[1].strip()
-
-        if not scp_ip or not scp_pwd:
-            lsf.write_output('  Could not retrieve SCP credentials - skipping')
-            return True
-
-        def _scp_cmd(cmd, timeout=15):
-            r = subprocess.run(
-                ['sshpass', '-p', scp_pwd, 'ssh',
-                 '-o', 'StrictHostKeyChecking=accept-new',
-                 f'root@{scp_ip}', cmd],
-                capture_output=True, text=True, timeout=timeout
-            )
-            return r.stdout.strip()
-
-        ep_json = _scp_cmd('kubectl get endpoints -n kube-system kube-dns -o json 2>/dev/null')
-        if not ep_json:
-            lsf.write_output('  Could not query kube-dns endpoint - skipping')
-            return True
-
-        ep_data = _json.loads(ep_json)
-        current_ips = []
-        for subset in ep_data.get('subsets', []):
-            for addr in subset.get('addresses', []):
-                current_ips.append(addr.get('ip', ''))
-
-        coredns_out = _scp_cmd(
-            'kubectl get pods -n kube-system -l k8s-app=kube-dns '
-            '-o jsonpath="{.items[*].status.podIP}" 2>/dev/null'
-        )
-        coredns_ips = [ip for ip in coredns_out.replace('"', '').split() if ip]
-
-        if not coredns_ips:
-            lsf.write_output('  No CoreDNS pods found - skipping')
-            return True
-
-        needs_fix = False
-        for ip in current_ips:
-            if ip not in coredns_ips:
-                needs_fix = True
-                break
-
-        if not needs_fix and set(current_ips) == set(coredns_ips):
-            lsf.write_output(f'  kube-dns endpoint OK (CoreDNS pods: {coredns_ips})')
-            return True
-
-        lsf.write_output(f'  kube-dns endpoint misconfigured:')
-        lsf.write_output(f'    Current: {current_ips}')
-        lsf.write_output(f'    Expected (CoreDNS pods): {coredns_ips}')
-        lsf.write_output(f'  Patching kube-dns endpoint...')
-
-        patch_ep = _json.dumps({
-            'apiVersion': 'v1',
-            'kind': 'Endpoints',
-            'metadata': {'name': 'kube-dns', 'namespace': 'kube-system'},
-            'subsets': [{
-                'addresses': [{'ip': ip} for ip in coredns_ips],
-                'ports': [
-                    {'name': 'dns', 'port': 53, 'protocol': 'UDP'},
-                    {'name': 'dns-tcp', 'port': 53, 'protocol': 'TCP'}
-                ]
-            }]
-        })
-
-        apply_cmd = f"echo '{patch_ep}' | kubectl apply -f - 2>&1"
-        result = _scp_cmd(apply_cmd)
-        lsf.write_output(f'  {result}')
-
-        time.sleep(10)
-
-        verify = _scp_cmd(
-            'kubectl get endpoints -n kube-system kube-dns '
-            '-o jsonpath="{.subsets[0].addresses[*].ip}" 2>/dev/null'
-        )
-        lsf.write_output(f'  Verified kube-dns endpoint IPs: {verify}')
-        return True
-
-    except Exception as e:
-        lsf.write_output(f'  DNS health check error: {e}')
-        lsf.write_output('  Continuing with startup...')
-        return True
-
-
-# def fix_supervisor_service_dns(lsf, vcenter_host, password, namespaces,
-#                                sso_domain='wld.sso', dry_run=False):
-#     """
-#     Fix DNS for vSphere Pods in Supervisor Service namespaces.
-
-#     On VCF 9.0.x labs retrofitted with the new Photon/FRR holorouter, the
-#     NSX Distributed Load Balancer on ESXi correctly DNATs kube-dns ClusterIP
-#     traffic (10.96.0.10) to CoreDNS pod IPs (172.16.200.x), but those IPs
-#     live inside the Antrea CNI overlay of the SCP VMs and are unreachable
-#     from the ESXi datapath.  This means every vSphere Pod's DNS lookup via
-#     ClusterIP silently times out.
-
-#     The fix has two parts:
-
-#     1. Add kapp rebase rules to the shared carvel-services-overlay secret
-#        so that kapp preserves dnsPolicy/dnsConfig fields on Deployments and
-#        StatefulSets across reconciliation cycles (which run every 10 min).
-
-#     2. Patch the affected Deployments/StatefulSets with dnsPolicy: None
-#        pointing to the kube-dns-lb LoadBalancer external VIP, which routes
-#        DNS through the NSX Edge LB (a path that works).
-
-#     The function is idempotent: if DNS already works or the dnsPolicy is
-#     already overridden, nothing is changed.
-
-#     :param lsf: lsfunctions module
-#     :param vcenter_host: WLD vCenter FQDN (for SCP credential retrieval)
-#     :param password: vCenter root password
-#     :param namespaces: list of Supervisor Service namespace names to fix
-#     :param sso_domain: SSO domain (default 'wld.sso')
-#     :param dry_run: if True, only report what would be done
-#     """
-#     import subprocess
-#     import json as _json
-#     import base64
-
-#     lsf.write_output('=' * 60)
-#     lsf.write_output('Supervisor Service DNS Fix')
-#     lsf.write_output('=' * 60)
-
-#     if not namespaces:
-#         lsf.write_output('  No namespaces configured - skipping')
-#         return True
-
-#     if dry_run:
-#         lsf.write_output(f'  Dry run - would check {len(namespaces)} namespace(s)')
-#         return True
-
-#     try:
-#         scp_pwd_result = subprocess.run(
-#             ['sshpass', '-p', password, 'ssh', '-o', 'StrictHostKeyChecking=accept-new',
-#              f'root@{vcenter_host}',
-#              'python3 /usr/lib/vmware-wcp/decryptK8Pwd.py'],
-#             capture_output=True, text=True, timeout=15
-#         )
-
-#         scp_ip = None
-#         scp_pwd = None
-#         for line in scp_pwd_result.stdout.split('\n'):
-#             if 'IP:' in line:
-#                 scp_ip = line.split('IP:')[1].strip()
-#             if 'PWD:' in line:
-#                 scp_pwd = line.split('PWD:')[1].strip()
-
-#         if not scp_ip or not scp_pwd:
-#             lsf.write_output('  Could not retrieve SCP credentials - skipping')
-#             return True
-
-#         def _scp(cmd, timeout=30):
-#             r = subprocess.run(
-#                 ['sshpass', '-p', scp_pwd, 'ssh',
-#                  '-o', 'StrictHostKeyChecking=accept-new',
-#                  f'root@{scp_ip}', cmd],
-#                 capture_output=True, text=True, timeout=timeout
-#             )
-#             return r.stdout.strip()
-
-#         # ---- Discover kube-dns-lb external VIP ----
-#         dns_lb_ip = _scp(
-#             'kubectl get svc kube-dns-lb -n kube-system '
-#             '-o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>/dev/null'
-#         ).replace('"', '').strip()
-
-#         if not dns_lb_ip:
-#             lsf.write_output('  kube-dns-lb LoadBalancer VIP not found - skipping')
-#             return True
-
-#         lsf.write_output(f'  kube-dns-lb VIP: {dns_lb_ip}')
-
-#         # ---- Determine which namespaces actually need fixing ----
-#         namespaces_to_fix = []
-#         for ns in namespaces:
-#             ns = ns.strip()
-#             if not ns:
-#                 continue
-
-#             lsf.write_output(f'  Checking namespace {ns}...')
-
-#             current_dns = _scp(
-#                 f'kubectl get deployments -n {ns} '
-#                 f'-o jsonpath="{{.items[0].spec.template.spec.dnsPolicy}}" 2>/dev/null'
-#             ).replace('"', '').strip()
-
-#             if current_dns == 'None':
-#                 lsf.write_output(f'    dnsPolicy already overridden - OK')
-#                 continue
-
-#             namespaces_to_fix.append(ns)
-#             lsf.write_output(f'    ClusterIP DNS override needed')
-
-#         if not namespaces_to_fix:
-#             lsf.write_output('  All namespaces already fixed or healthy')
-#             return True
-
-#         # ---- Step 1: Ensure kapp rebase rules preserve dnsPolicy/dnsConfig ----
-#         # The carvel-services-overlay secret contains kapp Config rebaseRules
-#         # shared by all Supervisor Service Apps.  Adding rules for dnsPolicy
-#         # and dnsConfig tells kapp to keep those fields from the live resource
-#         # instead of overwriting them from the rendered template.
-#         lsf.write_output('  Ensuring kapp rebase rules for DNS fields...')
-
-#         overlay_b64 = _scp(
-#             'kubectl get secret carvel-services-overlay '
-#             '-n vmware-system-supervisor-services '
-#             '-o jsonpath="{.data.carvel-services-overlay\\.yml}" 2>/dev/null'
-#         ).replace('"', '').strip()
-
-#         rebase_needed = False
-#         if overlay_b64:
-#             try:
-#                 overlay_text = base64.b64decode(overlay_b64).decode('utf-8')
-#                 if 'dnsPolicy' not in overlay_text:
-#                     rebase_needed = True
-#             except Exception:
-#                 rebase_needed = True
-#         else:
-#             rebase_needed = True
-
-#         if rebase_needed:
-#             lsf.write_output('    Adding dnsPolicy/dnsConfig rebase rules...')
-#             dns_rebase_block = (
-#                 '- paths:\n'
-#                 '  - [spec, template, spec, dnsPolicy]\n'
-#                 '  - [spec, template, spec, dnsConfig]\n'
-#                 '  type: copy\n'
-#                 '  sources: [existing, new]\n'
-#                 '  resourceMatchers:\n'
-#                 '  - apiVersionKindMatcher: {apiVersion: apps/v1, kind: Deployment}\n'
-#                 '- paths:\n'
-#                 '  - [spec, template, spec, dnsPolicy]\n'
-#                 '  - [spec, template, spec, dnsConfig]\n'
-#                 '  type: copy\n'
-#                 '  sources: [existing, new]\n'
-#                 '  resourceMatchers:\n'
-#                 '  - apiVersionKindMatcher: {apiVersion: apps/v1, kind: StatefulSet}\n'
-#             )
-#             try:
-#                 overlay_text = base64.b64decode(overlay_b64).decode('utf-8')
-#             except Exception:
-#                 overlay_text = ''
-
-#             if overlay_text:
-#                 # Append before trailing comments
-#                 lines = overlay_text.rstrip().split('\n')
-#                 insert_idx = len(lines)
-#                 for i in range(len(lines) - 1, -1, -1):
-#                     stripped = lines[i].strip()
-#                     if stripped.startswith('#!') or stripped == '':
-#                         insert_idx = i
-#                     else:
-#                         break
-#                 new_lines = lines[:insert_idx] + dns_rebase_block.rstrip().split('\n') + lines[insert_idx:]
-#                 updated_overlay = '\n'.join(new_lines) + '\n'
-#             else:
-#                 updated_overlay = (
-#                     '---\n'
-#                     'apiVersion: kapp.k14s.io/v1alpha1\n'
-#                     'kind: Config\n\n'
-#                     'rebaseRules:\n' + dns_rebase_block
-#                 )
-
-#             updated_b64 = base64.b64encode(updated_overlay.encode('utf-8')).decode('ascii')
-#             patch_result = _scp(
-#                 f"kubectl patch secret carvel-services-overlay "
-#                 f"-n vmware-system-supervisor-services "
-#                 f"--type=merge -p '{{\"data\":{{\"carvel-services-overlay.yml\":\"{updated_b64}\"}}}}' 2>&1"
-#             )
-#             lsf.write_output(f'    {patch_result}')
-#         else:
-#             lsf.write_output('    Rebase rules already present')
-
-#         # ---- Step 2: Patch workloads in each namespace ----
-#         for ns in namespaces_to_fix:
-#             lsf.write_output(f'  Fixing namespace {ns}...')
-
-#             patch = _json.dumps({
-#                 'spec': {'template': {'spec': {
-#                     'dnsPolicy': 'None',
-#                     'dnsConfig': {
-#                         'nameservers': [dns_lb_ip],
-#                         'searches': [
-#                             f'{ns}.svc.cluster.local',
-#                             'svc.cluster.local',
-#                             'cluster.local'
-#                         ],
-#                         'options': [{'name': 'ndots', 'value': '5'}]
-#                     }
-#                 }}}
-#             })
-
-#             dep_names = _scp(
-#                 f'kubectl get deployments -n {ns} '
-#                 f'-o jsonpath="{{.items[*].metadata.name}}" 2>/dev/null'
-#             ).replace('"', '').split()
-
-#             for dep in dep_names:
-#                 result = _scp(
-#                     f"kubectl patch deployment {dep} -n {ns} "
-#                     f"-p '{patch}' 2>&1"
-#                 )
-#                 lsf.write_output(f'    Deployment {dep}: {result}')
-
-#             ss_names = _scp(
-#                 f'kubectl get statefulsets -n {ns} '
-#                 f'-o jsonpath="{{.items[*].metadata.name}}" 2>/dev/null'
-#             ).replace('"', '').split()
-
-#             for ss in ss_names:
-#                 result = _scp(
-#                     f"kubectl patch statefulset {ss} -n {ns} "
-#                     f"-p '{patch}' 2>&1"
-#                 )
-#                 lsf.write_output(f'    StatefulSet {ss}: {result}')
-
-#             # ---- Wait for rollout ----
-#             lsf.write_output(f'    Waiting for rollout (up to 5 min)...')
-#             time.sleep(30)
-
-#             _scp(
-#                 f'kubectl delete pods -n {ns} '
-#                 f'--field-selector=status.phase=Failed 2>/dev/null || true'
-#             )
-
-#             all_ready = False
-#             for attempt in range(10):
-#                 not_ready = _scp(
-#                     f'kubectl get pods -n {ns} --no-headers 2>/dev/null | '
-#                     f'grep -v Running | grep -v Completed | grep -v Terminating | wc -l'
-#                 ).strip()
-#                 try:
-#                     if int(not_ready) == 0:
-#                         all_ready = True
-#                         break
-#                 except ValueError:
-#                     pass
-#                 time.sleep(30)
-
-#             if all_ready:
-#                 lsf.write_output(f'    All pods in {ns} are Running')
-#             else:
-#                 lsf.write_output(f'    WARNING: Some pods in {ns} not yet Running')
-#                 pods_out = _scp(
-#                     f'kubectl get pods -n {ns} --no-headers 2>/dev/null | '
-#                     f'grep -v Running | grep -v Completed | grep -v Terminating'
-#                 )
-#                 if pods_out:
-#                     lsf.write_output(f'    {pods_out}')
-
-#         return True
-
-#     except Exception as e:
-#         lsf.write_output(f'  Supervisor Service DNS fix error: {e}')
-#         lsf.write_output('  Continuing with startup...')
-#         return True
-
 
 def check_supervisor_status_api(lsf, vcenter_host, sso_domain='wld.sso'):
     """
@@ -1056,95 +738,59 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.generate_html()
         
         #----------------------------------------------------------------------
-        # TASK 2c: POST-VERIFY - Run check_fix_wcp.sh for certificates/webhooks
+        # TASK 2c: POST-VERIFY - Run supervisor_stabilizer.py for certificates/webhooks
         # This script has its own internal polling (30s intervals, 30m max).
         # It waits for SCP to become fully accessible before running fixes.
         # (the script that checks and starts the vapi-endpoint, trustmanagement, 
-        # and wcp services) into Python natively within VCFfinal.py. However, 
-        # check_fix_wcp.sh (which handles the complex Kubernetes certificate and 
-        # webhook remediation) remains a bash script because it relies heavily on 
-        # kubectl interactions and internal retry loops that are easier to maintain in bash.
+        # and wcp services) into Python natively within VCFfinal.py.
         #----------------------------------------------------------------------
         lsf.write_output('='*60)
-        lsf.write_output('WCP Certificate Fix (post-verify)')
+        lsf.write_output('Supervisor Stabilization (post-verify)')
         lsf.write_output('='*60)
-        lsf.write_vpodprogress('WCP Certificate Fix', 'GOOD-3')
+        lsf.write_vpodprogress('Supervisor Stabilization', 'GOOD-3')
         
-        check_fix_wcp_script = '/home/holuser/hol/Tools/check_fix_wcp.sh'
+        supervisor_stabilizer_script = '/home/holuser/hol/Tools/supervisor_stabilizer.py'
         wcp_certs_ok = True
         
-        if os.path.isfile(check_fix_wcp_script):
-            # Verify the script is executable before attempting to run it
-            if not os.access(check_fix_wcp_script, os.X_OK):
-                lsf.write_output(f'  Script is not executable: {check_fix_wcp_script}')
-                lsf.write_output(f'  Setting execute permission...')
-                try:
-                    os.chmod(check_fix_wcp_script, 0o755)
-                    lsf.write_output(f'  Execute permission set successfully')
-                except Exception as chmod_err:
-                    lsf.write_output(f'  ERROR: Failed to set execute permission: {chmod_err}')
-                    lsf.write_output(f'  Will run via bash interpreter as fallback')
-            
+        if os.path.isfile(supervisor_stabilizer_script):
             # Use the vCenters where we actually found Supervisors
             if not wcp_active_vcenters:
-                lsf.write_output('  No active Supervisor clusters found on any vCenter. Skipping WCP fix script.')
+                lsf.write_output('  No active Supervisor clusters found on any vCenter. Skipping stabilization script.')
                 wcp_certs_ok = True
             else:
-                for fix_target_vc in wcp_active_vcenters:
-                    lsf.write_output(f'Running: {check_fix_wcp_script} {fix_target_vc}')
-                    lsf.write_output(f'  (script has internal polling up to {WCP_MAX_POLL_TIME // 60}m)')
+                lsf.write_output(f'Running: python3 {supervisor_stabilizer_script} --auto')
+                lsf.write_output(f'  (script will auto-discover and stabilize all active Supervisors)')
+                
+                try:
+                    wcp_cmd = f'python3 {supervisor_stabilizer_script} --auto'
+                    result = lsf.run_command(wcp_cmd, timeout=WCP_SCRIPT_TIMEOUT)
                     
-                    try:
-                        # Run via /bin/bash explicitly to avoid execute permission issues
-                        # Use extended timeout since the script has internal polling
-                        # Pass --stdout-only so script does not also write to log file directly
-                        # (VCFfinal.py handles all logging via lsf.write_output)
-                        wcp_cmd = f'/bin/bash {check_fix_wcp_script} --stdout-only {fix_target_vc}'
-                        result = lsf.run_command(wcp_cmd, timeout=WCP_SCRIPT_TIMEOUT)
-                        
-                        exit_code = result.returncode if hasattr(result, 'returncode') else (0 if result else 1)
-                        
-                        # Log stdout from the script (timestamps already included by script)
-                        if hasattr(result, 'stdout') and result.stdout:
-                            for line in result.stdout.strip().split('\n'):
-                                if line.strip():
-                                    lsf.write_output(f'  {line.strip()}')
-                        # Log stderr (errors/warnings from the script)
-                        if hasattr(result, 'stderr') and result.stderr:
-                            for line in result.stderr.strip().split('\n'):
-                                if line.strip():
-                                    lsf.write_output(f'  {line.strip()}')
-                        
-                        if exit_code == 0:
-                            lsf.write_output(f'WCP certificate fix completed successfully on {fix_target_vc}')
-                        elif exit_code == 2:
-                            lsf.write_output(f'WARNING: SCP services did not become active within timeout on {fix_target_vc}')
-                            lsf.write_output('  hypercrypt/kubelet may still be initializing')
-                            wcp_certs_ok = False
-                        elif exit_code == 3:
-                            lsf.write_output(f'WARNING: Cannot connect to Supervisor / K8s API not available within timeout on {fix_target_vc}')
-                            wcp_certs_ok = False
-                        elif exit_code == 4:
-                            lsf.write_output(f'WARNING: kubectl commands failed on {fix_target_vc} - certificates may need attention')
-                            wcp_certs_ok = False
-                        elif exit_code == 126:
-                            lsf.write_output(f'ERROR: WCP script is not executable (exit code 126) on {fix_target_vc}')
-                            lsf.write_output(f'  Fix: chmod +x {check_fix_wcp_script}')
-                            wcp_certs_ok = False
-                        elif exit_code == 127:
-                            lsf.write_output(f'ERROR: WCP script interpreter not found (exit code 127) on {fix_target_vc}')
-                            wcp_certs_ok = False
-                        else:
-                            lsf.write_output(f'WARNING: WCP script exited with code {exit_code} on {fix_target_vc}')
-                            wcp_certs_ok = False
-                            
-                    except Exception as wcp_err:
-                        lsf.write_output(f'WARNING: Error running WCP script on {fix_target_vc}: {wcp_err}')
-                        lsf.write_output('  Continuing with startup - WCP may need manual attention')
+                    exit_code = result.returncode if hasattr(result, 'returncode') else (0 if result else 1)
+                    
+                    # Log stdout from the script (timestamps already included by script)
+                    if hasattr(result, 'stdout') and result.stdout:
+                        for line in result.stdout.strip().split('\n'):
+                            if line.strip():
+                                lsf.write_output(f'  {line.strip()}')
+                    # Log stderr (errors/warnings from the script)
+                    if hasattr(result, 'stderr') and result.stderr:
+                        for line in result.stderr.strip().split('\n'):
+                            if line.strip():
+                                lsf.write_output(f'  {line.strip()}')
+                    
+                    if exit_code == 0:
+                        lsf.write_output(f'Supervisor stabilization completed successfully')
+                    else:
+                        lsf.write_output(f'WARNING: Supervisor stabilization script exited with code {exit_code}')
                         wcp_certs_ok = False
+                        
+                except Exception as wcp_err:
+                    lsf.write_output(f'WARNING: Error running Supervisor stabilization script: {wcp_err}')
+                    lsf.write_output('  Continuing with startup - WCP may need manual attention')
+                    wcp_certs_ok = False
         else:
-            lsf.write_output(f'WCP script not found: {check_fix_wcp_script}')
-            lsf.write_output('  Skipping certificate fix - manual intervention may be needed')
+            lsf.write_output(f'Supervisor stabilization script not found: {supervisor_stabilizer_script}')
+            lsf.write_output('  Skipping stabilization - manual intervention may be needed')
         
         #----------------------------------------------------------------------
         # Final Supervisor Status Reconciliation
@@ -1208,62 +854,6 @@ def main(lsf=None, standalone=False, dry_run=False):
                 dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.FAILED, 'See log')
             dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.RUNNING)
             dashboard.generate_html()
-            
-        #----------------------------------------------------------------------
-        # TASK 2c2: POST-VERIFY - Supervisor DNS Health Check
-        # After ungraceful shutdown, the kube-dns endpoint may point to
-        # the LoadBalancer external IP instead of CoreDNS pod IPs,
-        # breaking DNS for all vSphere Pods via asymmetric DLB routing.
-        #----------------------------------------------------------------------
-        # if tanzu_verify_ok and wcp_certs_ok and not dry_run:
-        #     if dashboard:
-        #         dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.RUNNING)
-        #         dashboard.generate_html()
-        #     dns_ok = verify_supervisor_dns(lsf, wcp_vcenter, lsf.get_password(),
-        #                                    sso_domain=sso_domain, dry_run=dry_run)
-        #     if dashboard:
-        #         if dns_ok or dns_ok is None:
-        #             dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.COMPLETE)
-        #         else:
-        #             dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.FAILED, 'See log')
-        #         dashboard.generate_html()
-        # elif not tanzu_verify_ok or not wcp_certs_ok:
-        #     if dashboard:
-        #         dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.SKIPPED,
-        #                               'Supervisor not ready')
-        #         dashboard.generate_html()
-
-        #----------------------------------------------------------------------
-        # TASK 2c3: POST-VERIFY - Supervisor Service vSphere Pod DNS Fix
-        # On retrofitted labs where the NSX DLB cannot route to CoreDNS
-        # pod IPs (172.16.200.x) inside the SCP Antrea overlay, vSphere
-        # Pod DNS via ClusterIP silently times out.  This patches affected
-        # Supervisor Service workloads to use the kube-dns-lb LoadBalancer
-        # VIP instead, and injects kapp rebase rules into the shared
-        # carvel-services-overlay secret so the fix survives reconciliation.
-        # Only runs if supervisorservicedns is configured in [VCFFINAL].
-        #----------------------------------------------------------------------
-        # svc_dns_namespaces = lsf.get_config_list('VCFFINAL', 'supervisorservicedns')
-        # if svc_dns_namespaces and tanzu_verify_ok and not dry_run:
-        #     if dashboard:
-        #         dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.RUNNING)
-        #         dashboard.generate_html()
-        #     svc_dns_ok = fix_supervisor_service_dns(lsf, wcp_vcenter, lsf.get_password(),
-        #                                             namespaces=svc_dns_namespaces,
-        #                                             sso_domain=sso_domain, dry_run=dry_run)
-        #     if dashboard:
-        #         if svc_dns_ok or svc_dns_ok is None:
-        #             dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.COMPLETE)
-        #         else:
-        #             dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.FAILED, 'See log')
-        #         dashboard.generate_html()
-        # elif svc_dns_namespaces and dry_run:
-        #     lsf.write_output(f'Would fix DNS for {len(svc_dns_namespaces)} namespace(s) (dry run)')
-        # else:
-        #     if dashboard:
-        #         dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.SKIPPED,
-        #                               'Not configured')
-        #         dashboard.generate_html()
 
     else:
         lsf.write_output('No Tanzu Control Plane VMs configured')
@@ -1548,6 +1138,24 @@ def main(lsf=None, standalone=False, dry_run=False):
                 lsf.write_output('WARNING: Could not determine VSP control plane IP after all attempts')
                 vcf_comp_errors.append('Could not determine VSP control plane IP')
             else:
+                # ---- Restore VSP cluster kube-vip VIP if it dropped ----
+                # After cold boot, kube-vip may not have re-claimed the VIP (10.1.1.142).
+                # The control plane node we discovered has admin.conf and can run kubectl,
+                # but kubectl will fail if it tries to reach the VIP and it isn't assigned.
+                # Restore the VIP on eth0 and send a gratuitous ARP before proceeding.
+                vsp_vip = '10.1.1.142'
+                if not lsf.test_ping(vsp_vip):
+                    lsf.write_output(f'  VSP VIP {vsp_vip} is unreachable — restoring via ip addr add + arping')
+                    restore_cmd = (
+                        f"ip addr add {vsp_vip}/32 dev eth0 2>/dev/null || true; "
+                        f"arping -c 3 -U -I eth0 {vsp_vip} 2>/dev/null || true"
+                    )
+                    vip_ssh_cmd = f"echo '{lsf.get_password()}' | sudo -S -i bash -c '{restore_cmd}'"
+                    lsf.ssh(vip_ssh_cmd, f'{vsp_user}@{vsp_control_plane_ip}', lsf.get_password())
+                    lsf.write_output(f'  VSP VIP {vsp_vip} restored on {vsp_control_plane_ip}')
+                else:
+                    lsf.write_output(f'  VSP VIP {vsp_vip} is reachable — no restore needed')
+
                 # ---- Detect sudo mode on the control plane ----
                 sudo_needs_password = True  # Default to password-required (VCF 9.1.x)
                 sudo_check = lsf.ssh(
@@ -1565,6 +1173,110 @@ def main(lsf=None, standalone=False, dry_run=False):
                     else:
                         ssh_cmd = f"sudo -i bash -c '{kubectl_cmd}'"
                     return lsf.ssh(ssh_cmd, f'{vsp_user}@{vsp_control_plane_ip}')
+                
+                # ---- Apply NO_PROXY fix for VSP cluster nodes ----
+                # Inject proxy configuration to avoid ImagePullBackOff for opsnet/opslogs
+                lsf.write_output('  Applying proxy NO_PROXY configuration to VSP nodes...')
+                vsp_node_ips = []
+                discover_cmd = "kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type==\"InternalIP\")].address}{\" \"}{end}'"
+                result = vsp_kubectl(discover_cmd)
+                
+                if hasattr(result, 'stdout') and result.stdout:
+                    for line in result.stdout.strip().split('\n'):
+                        for token in line.split():
+                            token = token.strip()
+                            if token and token[0].isdigit() and '.' in token:
+                                vsp_node_ips.append(token)
+                
+                if not vsp_node_ips:
+                    lsf.write_output('  WARNING: Could not discover VSP node IPs via kubectl, probing fallback IPs')
+                    for candidate_ip in ['10.1.1.143', '10.1.1.141', '10.1.1.144', '10.1.1.145', '10.1.1.146', '10.1.1.147']:
+                        if lsf.test_ping(candidate_ip):
+                            test = lsf.ssh('hostname', f'{vsp_user}@{candidate_ip}', password)
+                            if hasattr(test, 'returncode') and test.returncode == 0:
+                                vsp_node_ips.append(candidate_ip)
+
+                def apply_proxy_to_nodes(node_ips):
+                    if not node_ips:
+                        return
+                    lsf.write_output(f'  Applying proxy config to {len(node_ips)} VSP nodes: {", ".join(node_ips)}')
+                    PROXY_URL = lsf.LAB_PROXY_URL
+                    NO_PROXY = lsf.build_lab_no_proxy()
+                    
+                    proxy_script = f'''#!/bin/bash
+PROXY_URL="{PROXY_URL}"
+NO_PROXY="{NO_PROXY}"
+
+cat > /etc/sysconfig/proxy << 'PROXYEOF'
+PROXY_ENABLED="yes"
+HTTP_PROXY="{PROXY_URL}"
+HTTPS_PROXY="{PROXY_URL}"
+FTP_PROXY=""
+GOPHER_PROXY=""
+SOCKS_PROXY=""
+SOCKS5_SERVER=""
+NO_PROXY="{NO_PROXY}"
+PROXYEOF
+
+touch /etc/environment
+sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment
+cat >> /etc/environment << 'ENVEOF'
+http_proxy={PROXY_URL}
+https_proxy={PROXY_URL}
+no_proxy={NO_PROXY}
+HTTP_PROXY={PROXY_URL}
+HTTPS_PROXY={PROXY_URL}
+NO_PROXY={NO_PROXY}
+ENVEOF
+
+mkdir -p /etc/systemd/system/containerd.service.d
+cat > /etc/systemd/system/containerd.service.d/http-proxy.conf << 'CTDEOF'
+[Service]
+Environment="HTTP_PROXY={PROXY_URL}"
+Environment="HTTPS_PROXY={PROXY_URL}"
+Environment="NO_PROXY={NO_PROXY}"
+CTDEOF
+
+mkdir -p /etc/systemd/system/kubelet.service.d
+cat > /etc/systemd/system/kubelet.service.d/http-proxy.conf << 'KUBEOF'
+[Service]
+Environment="HTTP_PROXY={PROXY_URL}"
+Environment="HTTPS_PROXY={PROXY_URL}"
+Environment="NO_PROXY={NO_PROXY}"
+KUBEOF
+
+systemctl daemon-reload
+systemctl restart containerd
+systemctl restart kubelet
+echo "PROXY_CONFIGURED"
+'''
+                    script_path = '/tmp/confighol_vsp_proxy.sh'
+                    try:
+                        with open(script_path, 'w') as f:
+                            f.write(proxy_script)
+                        os.chmod(script_path, 0o755)
+                        
+                        for node_ip in node_ips:
+                            lsf.scp(script_path, f'{vsp_user}@{node_ip}:/tmp/confighol_vsp_proxy.sh', password)
+                            if sudo_needs_password:
+                                run_cmd = f"echo '{password}' | sudo -S bash /tmp/confighol_vsp_proxy.sh"
+                            else:
+                                run_cmd = "sudo bash /tmp/confighol_vsp_proxy.sh"
+                            
+                            lsf.ssh(run_cmd, f'{vsp_user}@{node_ip}', password)
+                            
+                            if sudo_needs_password:
+                                lsf.ssh(f"echo '{password}' | sudo -S rm -f /tmp/confighol_vsp_proxy.sh", f'{vsp_user}@{node_ip}', password)
+                            else:
+                                lsf.ssh("sudo rm -f /tmp/confighol_vsp_proxy.sh", f'{vsp_user}@{node_ip}', password)
+                            
+                        os.remove(script_path)
+                    except Exception as e:
+                        lsf.write_output(f'  WARNING: Failed to apply proxy configuration: {e}')
+
+                if vsp_node_ips:
+                    lsf.write_output(f'  Found {len(vsp_node_ips)} VSP nodes: {", ".join(vsp_node_ips)}')
+                    apply_proxy_to_nodes(vsp_node_ips)
                 
                 # ---- Unsuspend postgres instances managed by Zalando operator ----
                 # The VMSP operator sets a "database.vmsp.vmware.com/suspended=true"
@@ -1645,9 +1357,45 @@ def main(lsf=None, standalone=False, dry_run=False):
                                 f'--all -n {fallback_ns} database.vmsp.vmware.com/suspended- 2>/dev/null'
                             )
                 
+                # ---- Update Component CRD annotations to Running ----
+                # The VCF Services Runtime UI reads the annotation
+                # "component.vmsp.vmware.com/operational-status" on each
+                # Component CRD to determine the displayed state.  Scaling
+                # pods alone does not update this annotation, so the UI
+                # would still show "Stopped" without this step.
+                # We do this BEFORE scaling up the pods, so the VMSP operator
+                # doesn't immediately scale them back down to 0!
+                lsf.write_output('  Updating Component CRD annotations to Running...')
+                comp_json = vsp_kubectl(
+                    'kubectl get components.api.vmsp.vmware.com -o json 2>/dev/null'
+                )
+                if hasattr(comp_json, 'stdout') and comp_json.stdout:
+                    try:
+                        import json as _json
+                        raw = comp_json.stdout.strip()
+                        json_start = raw.find('{')
+                        if json_start >= 0:
+                            raw = raw[json_start:]
+                        comp_data = _json.loads(raw)
+                        for comp_item in comp_data.get('items', []):
+                            crd_name = comp_item.get('metadata', {}).get('name', '')
+                            ann = comp_item.get('metadata', {}).get('annotations', {})
+                            status = ann.get('component.vmsp.vmware.com/operational-status', '')
+                            if status == 'NotRunning':
+                                lsf.write_output(f'  Annotating {crd_name} -> Running')
+                                vsp_kubectl(
+                                    f'kubectl annotate components.api.vmsp.vmware.com '
+                                    f'{crd_name} '
+                                    f'component.vmsp.vmware.com/operational-status=Running --overwrite'
+                                )
+                    except (ValueError, Exception) as je:
+                        lsf.write_output(f'  WARNING: Could not parse component JSON: {je}')
+
                 # ---- Scale up each component ----
                 lsf.write_output(f'  Processing {len(vcfcomponents)} component resources...')
                 
+                scaled_components = []
+                failed_components = []
                 for entry in vcfcomponents:
                     # Format: namespace:resource_type/resource_name
                     parts = entry.split(':', 1)
@@ -1690,8 +1438,10 @@ def main(lsf=None, standalone=False, dry_run=False):
                     
                     if hasattr(scale_result, 'stdout') and 'scaled' in scale_result.stdout:
                         vcf_comp_scaled += 1
+                        scaled_components.append({'namespace': namespace, 'resource': resource, 'intended': intended_replicas})
                     elif hasattr(scale_result, 'returncode') and scale_result.returncode == 0:
                         vcf_comp_scaled += 1
+                        scaled_components.append({'namespace': namespace, 'resource': resource, 'intended': intended_replicas})
                     else:
                         err = ''
                         if hasattr(scale_result, 'stderr') and scale_result.stderr:
@@ -1699,44 +1449,129 @@ def main(lsf=None, standalone=False, dry_run=False):
                         elif hasattr(scale_result, 'stdout') and scale_result.stdout:
                             err = scale_result.stdout.strip()[:200]
                         lsf.write_output(f'  WARNING: Failed to scale {namespace}/{resource}: {err}')
-                        vcf_comp_errors.append(f'Failed: {namespace}/{resource}')
+                        failed_components.append({'namespace': namespace, 'resource': resource, 'intended': intended_replicas})
                 
-                # ---- Update Component CRD annotations to Running ----
-                # The VCF Services Runtime UI reads the annotation
-                # "component.vmsp.vmware.com/operational-status" on each
-                # Component CRD to determine the displayed state.  Scaling
-                # pods alone does not update this annotation, so the UI
-                # would still show "Stopped" without this step.
-                # Component CRDs are cluster-scoped (not namespaced).
-                # We fetch JSON and parse locally to avoid SSH escaping
-                # issues with dotted annotation keys in custom-columns/jsonpath.
-                if vcf_comp_scaled > 0:
-                    lsf.write_output('  Updating Component CRD annotations to Running...')
-                    comp_json = vsp_kubectl(
-                        'kubectl get components.api.vmsp.vmware.com -o json 2>/dev/null'
-                    )
-                    if hasattr(comp_json, 'stdout') and comp_json.stdout:
-                        try:
-                            import json as _json
-                            raw = comp_json.stdout.strip()
-                            json_start = raw.find('{')
-                            if json_start >= 0:
-                                raw = raw[json_start:]
-                            comp_data = _json.loads(raw)
-                            for comp_item in comp_data.get('items', []):
-                                crd_name = comp_item.get('metadata', {}).get('name', '')
-                                ann = comp_item.get('metadata', {}).get('annotations', {})
-                                status = ann.get('component.vmsp.vmware.com/operational-status', '')
-                                if status == 'NotRunning':
-                                    lsf.write_output(f'  Annotating {crd_name} -> Running')
-                                    vsp_kubectl(
-                                        f'kubectl annotate components.api.vmsp.vmware.com '
-                                        f'{crd_name} '
-                                        f'component.vmsp.vmware.com/operational-status=Running --overwrite'
-                                    )
-                        except (ValueError, Exception) as je:
-                            lsf.write_output(f'  WARNING: Could not parse component JSON: {je}')
+
+                # ---- Wait for scaled components to become ready and check for VSP node provisioning ----
+                pending_check = vsp_kubectl('kubectl get pods -A --field-selector=status.phase=Pending 2>/dev/null')
+                has_pending = hasattr(pending_check, 'stdout') and pending_check.stdout and ('ops-logs' in pending_check.stdout or 'vodap' in pending_check.stdout)
                 
+                if scaled_components or has_pending:
+                    if scaled_components:
+                        lsf.write_output(f'  Waiting up to 10 minutes for {len(scaled_components)} component(s) to complete scale up...')
+                    if has_pending:
+                        lsf.write_output('  Detected Pending pods in ops-logs/vodap, monitoring vCenter for new VSP node provisioning...')
+                        
+                    max_wait = 600  # 10 minutes
+                    start_time = time.time()
+                    last_log_time = time.time()
+                    
+                    while time.time() - start_time < max_wait:
+                        newly_ready = []
+                        
+                        # Check status of each component
+                        for comp in list(scaled_components):
+                            check_cmd = f'kubectl get {comp["resource"]} -n {comp["namespace"]} -o json 2>/dev/null'
+                            check_result = vsp_kubectl(check_cmd)
+                            ready_replicas = 0
+                            if hasattr(check_result, 'stdout') and check_result.stdout:
+                                try:
+                                    import json as _json_comp
+                                    raw_comp = check_result.stdout.strip()
+                                    json_start_comp = raw_comp.find('{')
+                                    if json_start_comp >= 0:
+                                        raw_comp = raw_comp[json_start_comp:]
+                                    comp_data = _json_comp.loads(raw_comp)
+                                    ready_replicas = comp_data.get('status', {}).get('readyReplicas', 0)
+                                except (ValueError, Exception):
+                                    pass
+                            
+                            if ready_replicas >= comp['intended']:
+                                newly_ready.append(f"{comp['namespace']}/{comp['resource']}")
+                                scaled_components.remove(comp)
+                                
+                        if newly_ready:
+                            for ready_comp in newly_ready:
+                                lsf.write_output(f'  Completed scale up: {ready_comp}')
+                                
+                        # Check for VSP node provisioning
+                        current_vms = lsf.get_vm_match('vsp-01a-.*')
+                        provisioning_vms = [v for v in current_vms if v.runtime.powerState != 'poweredOn' or getattr(getattr(v, 'guest', None), 'toolsRunningStatus', '') != 'guestToolsRunning']
+                        
+                        if not provisioning_vms:
+                            # Let's check if the number of nodes in K8s increased
+                            current_k8s_nodes_cmd = "kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type==\"InternalIP\")].address}{\" \"}{end}' 2>/dev/null"
+                            res = vsp_kubectl(current_k8s_nodes_cmd)
+                            current_ips = []
+                            if hasattr(res, 'stdout') and res.stdout:
+                                for line in res.stdout.strip().split('\n'):
+                                    for token in line.split():
+                                        token = token.strip()
+                                        if token and token[0].isdigit() and '.' in token:
+                                            current_ips.append(token)
+                            
+                            new_ips = [ip for ip in current_ips if ip not in vsp_node_ips]
+                            if new_ips:
+                                lsf.write_output(f'  New VSP nodes joined K8s: {new_ips}')
+                                apply_proxy_to_nodes(new_ips)
+                                vsp_node_ips.extend(new_ips)
+                                lsf.write_output('  Applied proxy to new node(s).')
+                        
+                        # Re-check pending status to see if we can exit early
+                        check_again = vsp_kubectl('kubectl get pods -A --field-selector=status.phase=Pending 2>/dev/null')
+                        still_pending = hasattr(check_again, 'stdout') and check_again.stdout and ('ops-logs' in check_again.stdout or 'vodap' in check_again.stdout)
+                        
+                        if not scaled_components and not still_pending:
+                            lsf.write_output('  All components have completed scale up and no pending pods remain.')
+                            break
+                            
+                        # Log status every 30 seconds
+                        if time.time() - last_log_time >= 30:
+                            if scaled_components:
+                                waiting_for = [f"{c['namespace']}/{c['resource']}" for c in scaled_components]
+                                if len(waiting_for) > 5:
+                                    lsf.write_output(f'  Still waiting for {len(waiting_for)} components to scale up (e.g. {", ".join(waiting_for[:5])}...)')
+                                else:
+                                    lsf.write_output(f'  Still waiting for components to scale up: {", ".join(waiting_for)}')
+                            
+                            if provisioning_vms:
+                                prov_names = [v.name for v in provisioning_vms]
+                                lsf.write_output(f'  Waiting for {len(prov_names)} VSP node(s) to provision: {prov_names}')
+                            elif still_pending:
+                                lsf.write_output('  Still waiting for pending pods to schedule...')
+                                
+                            last_log_time = time.time()
+                            
+                        time.sleep(10) # check every 10 seconds
+                        
+                    if time.time() - start_time >= max_wait:
+                        lsf.write_output(f'  WARNING: Timeout reached ({max_wait}s). Proceeding while components finish scaling in background...')
+
+                if failed_components:
+                    lsf.write_output('  Retrying failed components after cluster stabilized...')
+                    for comp in failed_components:
+                        ns = comp['namespace']
+                        res = comp['resource']
+                        intended = comp['intended']
+                        scale_cmd = f'kubectl scale {res} -n {ns} --replicas={intended}'
+                        lsf.write_output(f'  Retrying scale up: {ns}/{res} to {intended}')
+                        retry_result = vsp_kubectl(scale_cmd)
+                        
+                        if hasattr(retry_result, 'stdout') and 'scaled' in retry_result.stdout:
+                            vcf_comp_scaled += 1
+                            lsf.write_output(f'  Successfully scaled up on retry: {ns}/{res}')
+                        elif hasattr(retry_result, 'returncode') and retry_result.returncode == 0:
+                            vcf_comp_scaled += 1
+                            lsf.write_output(f'  Successfully scaled up on retry: {ns}/{res}')
+                        else:
+                            err = ''
+                            if hasattr(retry_result, 'stderr') and retry_result.stderr:
+                                err = retry_result.stderr.strip()[:200]
+                            elif hasattr(retry_result, 'stdout') and retry_result.stdout:
+                                err = retry_result.stdout.strip()[:200]
+                            lsf.write_output(f'  WARNING: Retry failed for {ns}/{res}: {err}')
+                            vcf_comp_errors.append(f'Failed: {ns}/{res}')
+
                 # ---- Restart any CrashLoopBackOff pods ----
                 # Pods that were crashing while their Postgres database was
                 # down (0 replicas) will be in CrashLoopBackOff with long
@@ -1757,6 +1592,41 @@ def main(lsf=None, standalone=False, dry_run=False):
                             crashed_count += 1
                     if crashed_count > 0:
                         lsf.write_output(f'  Restarted {crashed_count} crashed pod(s)')
+                
+                # ---- Power on VCF Operations for Networks VMs ----
+                # In VCF 9.x, ops_networks (vRNI) is a mix of K8s services (vodap) and
+                # dedicated VMs. The K8s services were scaled up above, but the VMs
+                # must also be explicitly powered on to complete the "Running" state.
+                lsf.write_output('  Powering on VCF Operations for Networks VMs...')
+                opsnet_vms = lsf.get_config_list('SHUTDOWN', 'vcf_ops_networks_vms')
+                if not opsnet_vms:
+                    # Fallback to standard VCF 9.1 and 9.0 lab names
+                    opsnet_vms = ['ops_networks-platform.*', 'ops_networks-collector.*', 'opsnet-a', 'opsnet-01a', 'opsnetcollector-01a']
+                
+                opsnet_resolved = []
+                for vm_pattern in opsnet_vms:
+                    # Handle optional :vcenter suffix used in some config formats
+                    vm_name_only = vm_pattern.split(':')[0]
+                    vms_found = lsf.get_vm_match(vm_name_only)
+                    if vms_found:
+                        opsnet_resolved.extend(vms_found)
+
+                opsnet_started = 0
+                opsnet_already_on = 0
+                for vm in opsnet_resolved:
+                    try:
+                        if vm.runtime.powerState == 'poweredOn':
+                            lsf.write_output(f'  {vm.name} is already powered on')
+                            opsnet_already_on += 1
+                        else:
+                            lsf.write_output(f'  Powering on {vm.name}...')
+                            vm.PowerOnVM_Task()
+                            opsnet_started += 1
+                    except Exception as e:
+                        lsf.write_output(f'  WARNING: Failed to power on {vm.name}: {e}')
+                
+                lsf.write_output(f'  Ops Networks VMs: {opsnet_started} started, {opsnet_already_on} already running')
+                
                 
                 # ---- Summary ----
                 total = len(vcfcomponents)
@@ -1895,12 +1765,57 @@ def main(lsf=None, standalone=False, dry_run=False):
                 else:
                     lsf.write_output(f'Resolved {len(resolved_vcfa_vms)} VCF Automation VMs')
                     
-                    # Before starting, verify NICs are set to start connected
-                    for vm in resolved_vcfa_vms:
-                        try:
-                            verify_nic_connected(lsf, vm, simple=True)
-                        except Exception as e:
-                            lsf.write_output(f'Warning: Error checking NICs for {vm.name}: {e}')
+                    # Isolate Automation VMs on dedicated host
+                    try:
+                        from pyVmomi import vim
+                        from pyVim.task import WaitForTask
+                        import random
+                        
+                        # Find the ESXi host for the first automation VM
+                        auto_vm = resolved_vcfa_vms[0]
+                        auto_host = auto_vm.runtime.host
+                        if auto_host:
+                            lsf.write_output(f'Automation VM {auto_vm.name} is on host {auto_host.name}')
+                            
+                            # Gather all Automation VMs to ensure we don't move them
+                            auto_vm_names = [v.name for v in resolved_vcfa_vms]
+                            
+                            # Find other VMs on this host
+                            vms_to_move = []
+                            for vm in auto_host.vm:
+                                if vm.name not in auto_vm_names and not vm.config.template and not vm.name.startswith('vCLS'):
+                                    vms_to_move.append(vm)
+                            
+                            if vms_to_move:
+                                lsf.write_output(f'Found {len(vms_to_move)} other VMs on {auto_host.name}. Evacuating them to dedicate automation host...')
+                                
+                                # Find alternate hosts in the same cluster
+                                cluster = auto_host.parent
+                                if isinstance(cluster, vim.ClusterComputeResource):
+                                    alt_hosts = [h for h in cluster.host if h != auto_host and h.runtime.connectionState == 'connected' and not h.runtime.inMaintenanceMode]
+                                    
+                                    if alt_hosts:
+                                        for move_vm in vms_to_move:
+                                            dest_host = random.choice(alt_hosts)
+                                            lsf.write_output(f'  Migrating {move_vm.name} to {dest_host.name}...')
+                                            try:
+                                                relocate_spec = vim.vm.RelocateSpec()
+                                                relocate_spec.host = dest_host
+                                                task = move_vm.RelocateVM_Task(relocate_spec)
+                                                WaitForTask(task)
+                                                lsf.write_output(f'    SUCCESS: Migrated {move_vm.name}')
+                                            except Exception as mig_err:
+                                                lsf.write_output(f'    WARNING: Could not migrate {move_vm.name}: {mig_err}')
+                                    else:
+                                        lsf.write_output(f'WARNING: No alternate hosts found in cluster to evacuate VMs from {auto_host.name}')
+                                else:
+                                    lsf.write_output(f'WARNING: Host parent is not a cluster ({type(cluster)})')
+                            else:
+                                lsf.write_output(f'Host {auto_host.name} is already dedicated to Automation VMs.')
+                    except Exception as ev_err:
+                        lsf.write_output(f'Warning: Error while trying to evacuate automation host: {ev_err}')
+                    
+                    # Removed: Do not use verify_nic_connected for automation VMs
                     
                     # Start the VMs
                     try:
@@ -1939,11 +1854,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                                 lsf.labstartup_sleep(lsf.sleep_seconds)
                                 tools_attempt += 1
                             
-                            # Verify NIC is connected after tools are running
-                            try:
-                                verify_nic_connected(lsf, vm, simple=False)
-                            except Exception as nic_err:
-                                lsf.write_output(f'Warning: Post-start NIC verification failed for {vm.name}: {nic_err}')
+                            # Removed: Do not use verify_nic_connected for automation VMs
                         
                         except Exception as e:
                             lsf.write_output(f'Warning: Error waiting for {vm.name}: {e}')
@@ -2011,7 +1922,7 @@ def main(lsf=None, standalone=False, dry_run=False):
             vcenter_host = 'vc-mgmt-a.site-a.vcf.lab'
             
             # Auto-detect K8s API IP from known VCF Automation IPs
-            for candidate_ip in ['10.1.1.71', '10.1.1.72']:
+            for candidate_ip in ['10.1.1.71', '10.1.1.72', '10.1.1.73', '10.1.1.74']:
                 if lsf.test_tcp_port(candidate_ip, 22, timeout=5):
                     vcfa_k8s_ip = candidate_ip
                     break
@@ -2035,6 +1946,47 @@ def main(lsf=None, standalone=False, dry_run=False):
                         return result.stdout
                     return ''
                 
+                # ---- Step 0: Delete stale Fleet LCM system-shutdown Argo Workflows ----
+                # Each shutdown cycle creates a system-shutdown-{id} Argo Workflow in
+                # vmsp-platform. Argo persists workflow state across reboots so the
+                # controller resumes them on startup. A resumed shutdown workflow
+                # cordons the node, scales prelude to 0, and runs its shutdown script,
+                # breaking VCFA. Multiple stale workflows queue on lock-vmsp-platform
+                # mutex, creating a cascade. Delete them ALL before any uncordon.
+                stale_wf_out = _get_stdout(vcfa_ssh(
+                    'kubectl get workflow -n vmsp-platform --no-headers 2>/dev/null'
+                    ' | grep system-shutdown'
+                    ' | cut -d" " -f1'
+                ))
+                stale_wfs = [w.strip() for w in stale_wf_out.splitlines() if w.strip()]
+                if stale_wfs:
+                    lsf.write_output(f'  Deleting {len(stale_wfs)} stale system-shutdown Argo Workflow(s)...')
+                    # Patch Running workflows to stopped first (releases mutex lock cleanly)
+                    for wf in stale_wfs:
+                        vcfa_ssh(
+                            f'kubectl patch workflow {wf} -n vmsp-platform'
+                            r" --type=merge -p '{\"spec\":{\"shutdown\":\"Stop\"}}' 2>/dev/null"
+                        )
+                    import time as _time_wf
+                    _time_wf.sleep(2)
+                    # Delete in batches of 10
+                    for _i in range(0, len(stale_wfs), 10):
+                        batch = ' '.join(stale_wfs[_i:_i+10])
+                        vcfa_ssh(
+                            f'kubectl delete workflow -n vmsp-platform {batch}'
+                            ' --grace-period=0 2>/dev/null'
+                        )
+                    _time_wf.sleep(3)
+                    # Verify
+                    remaining_out = _get_stdout(vcfa_ssh(
+                        'kubectl get workflow -n vmsp-platform --no-headers 2>/dev/null'
+                        ' | grep -c system-shutdown || echo 0'
+                    ))
+                    remaining = remaining_out.strip() or '0'
+                    lsf.write_output(f'  Stale shutdown workflows remaining: {remaining}')
+                else:
+                    lsf.write_output('  No stale system-shutdown workflows found')
+
                 # ---- Step 1: Check/fix kube-vip VIP ----
                 lsf.write_output('Checking kube-vip VIP status...')
                 vip_check = vcfa_ssh(f'ip addr show eth0 | grep {vcfa_vip}')
@@ -2158,7 +2110,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                                 lsf.write_output('  CAPI/CAPV pods in failure state - restarting containerd and kubelet')
                                 vcfa_ssh('systemctl restart containerd kubelet')
                                 time.sleep(30)
-                                lsf.write_output('  Waiting for CAPI/CAPV controllers to recover...')
+                                lsf.write_output('  Waiting for CAPI/CAPV conollers to recover...')
                                 vcfa_ssh(
                                     f'{kctl_prefix} kubectl rollout status deployment '
                                     f'capv-controller-manager -n vmsp-platform --timeout=60s 2>/dev/null'
@@ -2213,7 +2165,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                                 import datetime
                                 created = sw_data.get('metadata', {}).get('creationTimestamp', '')
                                 if created:
-                                    created_dt = datetime.datetime.strptime(
+                                    createdt = datetime.datetime.strptime(
                                         created, '%Y-%m-%dT%H:%M:%SZ'
                                     ).replace(tzinfo=datetime.timezone.utc)
                                     age_secs = (datetime.datetime.now(datetime.timezone.utc) - created_dt).total_seconds()
@@ -2478,7 +2430,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                                         lsf.write_output('  CSI controller became ready')
                                         break
                                 else:
-                                    lsf.write_output('  CSI controller still initializing after 60s (will continue)')
+                                  lsf.write_output('  CSI controller still initializing after 60s (will continue)')
                         
                         # ---- Step 12: RabbitMQ .erlang.cookie permissions ----
                         lsf.write_output('Checking RabbitMQ status...')
@@ -2659,43 +2611,81 @@ def main(lsf=None, standalone=False, dry_run=False):
                                 scaled_count = _get_stdout(result).count('scaled')
                                 lsf.write_output(f'  Batch {i//batch_size + 1}: scaled {scaled_count} deployments')
                             
-                            # Also check StatefulSets
-                            ss_check = vcfa_ssh(
-                                f'{kctl_prefix} kubectl get statefulsets -n prelude -o json 2>/dev/null'
-                            )
-                            ss_out = _get_stdout(ss_check)
-                            if ss_out:
-                                try:
-                                    raw_ss = ss_out.strip()
-                                    json_start_ss = raw_ss.find('{')
-                                    if json_start_ss >= 0:
-                                        raw_ss = raw_ss[json_start_ss:]
-                                    ss_data = _json_k8s.loads(raw_ss)
-                                    for ss in ss_data.get('items', []):
-                                        ss_name = ss['metadata']['name']
-                                        ss_replicas = ss['spec'].get('replicas', 1)
-                                        ss_annos = ss.get('metadata', {}).get('annotations', {}) or {}
-                                        ss_saved = ss_annos.get('vcf.lab/original-replicas', '')
-                                        if ss_replicas == 0:
-                                            ss_intended = int(ss_saved) if ss_saved.isdigit() and int(ss_saved) > 0 else 1
-                                            lsf.write_output(f'  Scaling up StatefulSet {ss_name} to {ss_intended} (was 0)')
-                                            vcfa_ssh(
-                                                f'{kctl_prefix} kubectl scale statefulset {ss_name} '
-                                                f'-n prelude --replicas={ss_intended} 2>/dev/null'
-                                            )
-                                        elif ss_replicas > 0:
-                                            if ss_saved != str(ss_replicas):
-                                                vcfa_ssh(
-                                                    f'{kctl_prefix} kubectl annotate statefulset {ss_name} '
-                                                    f'-n prelude vcf.lab/original-replicas={ss_replicas} '
-                                                    f'--overwrite 2>/dev/null'
-                                                )
-                                except Exception:
-                                    pass
-                            
                             lsf.write_output('  Prelude deployment scale-up complete')
                         else:
                             lsf.write_output('  All prelude deployments already have replicas > 0')
+
+                        # ---- Always check prelude StatefulSets ----
+                        # rabbitmq-ha, tenant-manager, and vco-app are StatefulSets that can be
+                        # at 0 replicas even when all Deployments are healthy (e.g. after a
+                        # graceful shutdown that only scaled Deployments to 0). The old code
+                        # nested this check inside "if zero_deps:" so it was silently skipped
+                        # when Deployments were already running. Without RabbitMQ and
+                        # tenant-manager, api-gateway-server crashes on OIDC JWKS fetch
+                        # (connection refused) causing /login/ to return HTTP 500 for the
+                        # entire URL-check window.
+                        zero_sts = False
+                        lsf.write_output('Checking prelude StatefulSets...')
+                        ss_check = vcfa_ssh(
+                            f'{kctl_prefix} kubectl get statefulsets -n prelude -o json 2>/dev/null'
+                        )
+                        ss_out = _get_stdout(ss_check)
+                        if ss_out:
+                            try:
+                                raw_ss = ss_out.strip()
+                                json_start_ss = raw_ss.find('{')
+                                if json_start_ss >= 0:
+                                    raw_ss = raw_ss[json_start_ss:]
+                                ss_data = _json_k8s.loads(raw_ss)
+                                for ss in ss_data.get('items', []):
+                                    ss_name = ss['metadata']['name']
+                                    ss_replicas = ss['spec'].get('replicas', 1)
+                                    ss_annos = ss.get('metadata', {}).get('annotations', {}) or {}
+                                    ss_saved = ss_annos.get('vcf.lab/original-replicas', '')
+                                    if ss_replicas == 0:
+                                        ss_intended = int(ss_saved) if ss_saved.isdigit() and int(ss_saved) > 0 else 1
+                                        lsf.write_output(f'  Scaling up StatefulSet {ss_name} to {ss_intended} (was 0)')
+                                        vcfa_ssh(
+                                            f'{kctl_prefix} kubectl scale statefulset {ss_name} '
+                                            f'-n prelude --replicas={ss_intended} 2>/dev/null'
+                                        )
+                                        zero_sts = True
+                                    elif ss_replicas > 0:
+                                        if ss_saved != str(ss_replicas):
+                                            vcfa_ssh(
+                                                f'{kctl_prefix} kubectl annotate statefulset {ss_name} '
+                                                f'-n prelude vcf.lab/original-replicas={ss_replicas} '
+                                                f'--overwrite 2>/dev/null'
+                                            )
+                            except Exception:
+                                pass
+
+                        # ---- Step 14b: Post-scale node re-check ----
+                        # vmsp-operator (system:serviceaccount:vmsp:vmsp-operator) re-cordons
+                        # the VCFA K8s node ~90s after startup when its reconciliation loop
+                        # runs and finds a stale "maintenance in progress" state from the
+                        # previous shutdown. Wait for it, then override the cordon.
+                        # Triggered if either deployments OR statefulsets were scaled up.
+                        if zero_deps or zero_sts:
+                            lsf.write_output('  Waiting 120s for vmsp-operator to settle after scale-up...')
+                            time.sleep(120)
+                            _post_nd = _get_stdout(
+                                vcfa_ssh(f'{kctl_prefix} kubectl get nodes --no-headers 2>/dev/null')
+                            )
+                            _re_cordon_found = False
+                            if _post_nd:
+                                for _post_nd_line in _post_nd.strip().split('\n'):
+                                    if 'SchedulingDisabled' in _post_nd_line and _post_nd_line.strip():
+                                        _post_nd_name = _post_nd_line.split()[0]
+                                        _re_cordon_found = True
+                                        lsf.write_output(
+                                            f'  [POST-SCALE RE-CORDON] {_post_nd_name} was re-cordoned '
+                                            f'by vmsp-operator — overriding...'
+                                        )
+                                        vcfa_ssh(f'{kctl_prefix} kubectl uncordon {_post_nd_name}')
+                                        lsf.write_output(f'  {_post_nd_name} uncordoned (post-scale override)')
+                            if not _re_cordon_found:
+                                lsf.write_output('  No post-scale re-cordon detected — node scheduling is clean')
                         
                         # ---- Step 15: Recover prelude pods stuck after volume/CSI fixes ----
                         if stuck_va_fixed or csi_fixed:
@@ -2753,8 +2743,8 @@ def main(lsf=None, standalone=False, dry_run=False):
     urls_failed = 0
     
     if vcfa_urls_configured:
-        lsf.write_output('Checking VCF Automation URLs...')
-        lsf.write_vpodprogress('VCF Automation URL Checks', 'GOOD-8')
+        lsf.write_output('Checking VCF Automation Checks...')
+        lsf.write_vpodprogress('VCF Automation Checks', 'GOOD-8')
         
         # Run remediation scripts before URL checks
         # Check VCF Automation ssh for password expiration and fix if expired
@@ -2762,7 +2752,27 @@ def main(lsf=None, standalone=False, dry_run=False):
         vcfapwcheck_script = '/home/holuser/hol/Tools/vcfapwcheck.sh'
         if os.path.isfile(vcfapwcheck_script) and not dry_run:
             lsf.run_command(vcfapwcheck_script)
-        
+        # If the lab_sku = HOL-2701, then run vcfa-stabilizer.sh
+        if lsf.lab_sku == 'HOL-2701':
+            lsf.write_output('Running vcfa-stabilizer.sh...')
+            import subprocess
+            try:
+                proc = subprocess.Popen(
+                    ['/bin/bash', '/home/holuser/hol/Tools/vcfa-stabilizer.sh'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+                for line in proc.stdout:
+                    lsf.write_output(f'  {line.rstrip()}')
+                proc.wait(timeout=1800)
+            except subprocess.TimeoutExpired:
+                lsf.write_output('  [STDERR] Timeout executing vcfa-stabilizer.sh')
+                proc.kill()
+            except Exception as e:
+                lsf.write_output(f'  [STDERR] Error executing vcfa-stabilizer.sh: {e}')
+
         # vraurls already retrieved above
         
         for url_spec in vraurls:
@@ -2796,6 +2806,25 @@ def main(lsf=None, standalone=False, dry_run=False):
                             urls_failed += 1
                             lsf.labfail(f'VCF Automation URL {url} not accessible after {VCFA_URL_MAX_RETRIES} minutes - should be reached in under 8 minutes')
                         else:
+                            # Every 3 attempts re-check node scheduling — catches vmsp-operator
+                            # re-cordons that slip through Step 14b (e.g. very slow startup).
+                            if attempt % 3 == 0:
+                                try:
+                                    _url_nd = _get_stdout(vcfa_ssh(
+                                        f'{kctl_prefix} kubectl get nodes --no-headers 2>/dev/null'
+                                    ))
+                                    for _url_nd_line in _url_nd.split('\n'):
+                                        if 'SchedulingDisabled' in _url_nd_line and _url_nd_line.strip():
+                                            _url_nd_name = _url_nd_line.split()[0]
+                                            lsf.write_output(
+                                                f'  [NODE MONITOR] {_url_nd_name} is re-cordoned '
+                                                f'(attempt {attempt}) — uncordoning...'
+                                            )
+                                            vcfa_ssh(
+                                                f'{kctl_prefix} kubectl uncordon {_url_nd_name} 2>/dev/null'
+                                            )
+                                except (NameError, Exception):
+                                    pass
                             lsf.write_output(f'  Sleeping and will try again... {attempt} / {VCFA_URL_MAX_RETRIES}')
                             lsf.labstartup_sleep(VCFA_URL_RETRY_DELAY)
         
@@ -2856,6 +2885,15 @@ def main(lsf=None, standalone=False, dry_run=False):
                             vcfc_urls_failed += 1
                             lsf.labfail(f'VCF Component URL {url} not accessible after {VCFC_URL_MAX_RETRIES} minutes')
                         else:
+                            if attempt >= 5 and 'opslogs' in url.lower():
+                                lsf.write_output(f'  [WARNING] opslogs unreachable at attempt {attempt}. Re-scaling StatefulSets to 1 (VSP VIP 10.1.1.142)...')
+                                pwd = lsf.get_password()
+                                scale_result = lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl scale statefulset/log-processor statefulset/log-store -n ops-logs --replicas=1 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
+                                scale_out = scale_result.stdout.strip() if hasattr(scale_result, 'stdout') and scale_result.stdout else '(no output / SSH failed)'
+                                lsf.write_output(f'  StatefulSet rescale result: {scale_out}')
+                                if 'scaled' in scale_out or 'unchanged' in scale_out:
+                                    lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl annotate components.api.vmsp.vmware.com ops-logs component.vmsp.vmware.com/operational-status=Running --overwrite 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
+                            
                             lsf.write_output(f'  Sleeping and will try again... {attempt} / {VCFC_URL_MAX_RETRIES}')
                             lsf.labstartup_sleep(VCFC_URL_RETRY_DELAY)
         
@@ -3114,6 +3152,83 @@ def main(lsf=None, standalone=False, dry_run=False):
     if module_failed and not dry_run:
         lsf.labfail(f'{MODULE_NAME} failed: Supervisor Control Plane not ready or VCF Automation errors')
     
+    if not dry_run:
+        # ---- Fix VCFA Microservices Scaling ----
+        # If VCFA was improperly shut down, its deployments and statefulsets may be at 0 replicas.
+        # This causes fleet-lcm to fail capability sync because it cannot authenticate against VCFA.
+        lsf.write_output('Checking VCFA microservices scaling in prelude namespace...')
+        try:
+            # Build a helper using the correct sudo -S -i bash -c pattern (required for VCF 9.1
+            # where sudo requires a password, and kubectl is only on root's PATH via login shell).
+            def _vcfa_kctl(cmd):
+                full = (
+                    f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
+                    f" vmware-system-user@10.1.1.70"
+                    f" \"echo '{password}' | sudo -S -i bash -c '{cmd}'\""
+                )
+                return subprocess.run(full, shell=True, capture_output=True, text=True, timeout=30)
+
+            # Safety net: delete any remaining stale system-shutdown Argo Workflows
+            # (handles the case where Task 4b VCFA SSH was unavailable at its earlier step).
+            wf_out = subprocess.run(
+                f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
+                f" vmware-system-user@10.1.1.70"
+                f" \"echo '{password}' | sudo -S -i bash -c"
+                r" 'kubectl get workflow -n vmsp-platform --no-headers 2>/dev/null | grep system-shutdown | awk \"{print \\$1}\"'\"",
+                shell=True, capture_output=True, text=True, timeout=30
+            ).stdout
+            stale = [w.strip() for w in wf_out.splitlines() if w.strip()]
+            if stale:
+                lsf.write_output(f'  Deleting {len(stale)} stale system-shutdown workflow(s) (safety net)...')
+                for i in range(0, len(stale), 10):
+                    batch = ' '.join(stale[i:i+10])
+                    _vcfa_kctl(f'kubectl delete workflow -n vmsp-platform {batch} --grace-period=0 2>/dev/null')
+                time.sleep(3)
+
+            # Ensure VCFA node is uncordoned (do this AFTER workflow cleanup)
+            _vcfa_kctl('kubectl uncordon auto-platform-a-b7nps 2>/dev/null')
+            
+            # Scale critical statefulsets to 1
+            _vcfa_kctl('kubectl scale statefulset rabbitmq-ha tenant-manager vco-app -n prelude --replicas=1 2>/dev/null')
+            
+            # Scale all 0-replica deployments to 1
+            dep_out = _vcfa_kctl('kubectl get deployments -n prelude -o json 2>/dev/null').stdout
+            if '{' in dep_out:
+                dep_out = '{' + dep_out.split('{', 1)[1]
+                data = json.loads(dep_out)
+                for d in data.get('items', []):
+                    name = d['metadata']['name']
+                    if d['spec'].get('replicas', 1) == 0:
+                        lsf.write_output(f'  Scaling VCFA deployment {name} to 1 replica...')
+                        _vcfa_kctl(f'kubectl scale deployment {name} -n prelude --replicas=1 2>/dev/null')
+        except Exception as e:
+            lsf.write_output(f'WARNING: Failed to check or scale VCFA microservices: {e}')
+
+        # ---- Fix JWT Parse Error (vcf-fleet-lcm, vidb) ----
+        # Force restart vidb and fleet-lcm pods after cold boot so they
+        # reload their JWT signing keys. Without this, the fleet-lcm API
+        # returns 401 JWT_PARSE_ERR and the Operations Manager UI shows
+        # no components or "Unknown" status for components or internal names.
+        # Must be done at the very end of startup, AFTER opsnet and opslogs 
+        # VMs/services are fully powered on and responding to URL checks, 
+        # so that fleet-lcm initial inventory sync can successfully pull friendly names.
+        # lsf.write_output('Restarting vidb, fleet-lcm, and sddc-lcm pods in sequence to reload JWT keys and sync inventory...')
+        # try:
+        #     # Restart vidb first and wait for it to initialize a new JWT key
+        #     cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no {vsp_user}@10.1.1.142 \"echo '{password}' | sudo -S -i kubectl --kubeconfig=/etc/kubernetes/admin.conf delete pod --all -n vidb-external 2>/dev/null\""
+        #     subprocess.run(cmd, shell=True, check=False)
+            
+        #     lsf.write_output('  Waiting 30 seconds for vidb to become ready...')
+        #     time.sleep(30)
+            
+        #     # Then restart fleet-lcm and sddc-lcm so they fetch the new key during startup and successfully push capabilities (friendly names)
+        #     cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no {vsp_user}@10.1.1.142 \"echo '{password}' | sudo -S -i kubectl --kubeconfig=/etc/kubernetes/admin.conf delete pod --all -n vcf-fleet-lcm 2>/dev/null\""
+        #     subprocess.run(cmd, shell=True, check=False)
+        #     cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no {vsp_user}@10.1.1.142 \"echo '{password}' | sudo -S -i kubectl --kubeconfig=/etc/kubernetes/admin.conf delete pod --all -n vcf-sddc-lcm 2>/dev/null\""
+        #     subprocess.run(cmd, shell=True, check=False)
+        # except Exception as e:
+        #     lsf.write_output(f'WARNING: Failed to restart vidb, fleet-lcm, and sddc-lcm pods: {e}')
+
     lsf.write_output(f'{MODULE_NAME} completed')
     return not module_failed
 
@@ -3157,3 +3272,4 @@ if __name__ == '__main__':
         print()
     
     main(lsf=lsf, standalone=args.standalone, dry_run=args.dry_run)
+

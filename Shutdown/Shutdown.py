@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 # Shutdown.py - HOLFY27 Lab Shutdown Orchestration
-# Version 2.3 - 2026-04-27
+# Version 2.5 - 2026-05-14
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # Main shutdown script for graceful lab environment shutdown
+#
+# v 2.5 Changes (2026-05-14):
+# - Replaced remaining lsf.write_output() calls (module import error paths) with
+#   write_shutdown_output() so all Shutdown.py output goes only to shutdown.log.
+# - Fixed stale docstring in init_shutdown_log() referencing labstartup.log.
+# - Fixed stale comment in run_shutdown() referencing labstartup.log.
+# - Bumped SCRIPT_VERSION constant to match header (was stuck at 2.3).
+#
+# v 2.4 Changes (2026-05-13):
+# - Removed labstartup.log initialization and logging. All logging is only output to shutdown.log
 #
 # v 2.3 Changes (2026-04-27):
 # - Added --phases and --fleet-products CLI; mutually exclusive --phase / --phases; pass-through to VCFshutdown
@@ -96,12 +106,11 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 SCRIPT_NAME = 'Shutdown'
-SCRIPT_VERSION = '2.3'
+SCRIPT_VERSION = '2.5'
 SCRIPT_DESCRIPTION = 'HOLFY27 Lab Shutdown Orchestration'
 
 # Log files
 SHUTDOWN_LOG = '/home/holuser/hol/shutdown.log'
-LABSTARTUP_LOG = '/home/holuser/hol/labstartup.log'
 
 # Status file for console display
 STATUS_FILE = '/lmchol/hol/startup_status.txt'
@@ -116,7 +125,6 @@ VCF_LAB_TYPES = ['VCF', 'HOL', 'DISCOVERY', 'ATE', 'VXP', 'EDU', 'NINJA']
 def init_shutdown_log(dry_run: bool = False):
     """
     Initialize the shutdown log file.
-    Re-initializes labstartup.log with shutdown header.
     
     :param dry_run: If True, skip log initialization
     """
@@ -126,15 +134,7 @@ def init_shutdown_log(dry_run: bool = False):
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     header = f'Lab Shutdown: {timestamp}\n'
     
-    # Re-initialize labstartup.log with shutdown header
-    try:
-        with open(LABSTARTUP_LOG, 'w') as f:
-            f.write(header)
-            f.write('=' * 70 + '\n')
-    except Exception as e:
-        print(f'Warning: Could not initialize {LABSTARTUP_LOG}: {e}')
-    
-    # Also initialize shutdown.log
+    # Initialize shutdown.log
     try:
         with open(SHUTDOWN_LOG, 'w') as f:
             f.write(header)
@@ -185,18 +185,6 @@ def write_shutdown_output(msg: str, lsf=None):
             f.write(formatted_msg + '\n')
     except Exception:
         pass
-    
-    # Write to labstartup log (local copy)
-    try:
-        with open(LABSTARTUP_LOG, 'a') as f:
-            f.write(formatted_msg + '\n')
-    except Exception:
-        pass
-    
-    # Note: We don't call lsf.write_output() here to avoid duplicate entries
-    # since lsf.write_output() also writes to labstartup.log
-    # The NFS copy (/lmchol/hol/labstartup.log) is handled by lsf.logfiles
-
 
 #==============================================================================
 # HELPER FUNCTIONS
@@ -235,7 +223,7 @@ def import_shutdown_module(module_name: str, lsf):
     module_path = f'/home/holuser/hol/Shutdown/{module_name}.py'
     
     if not os.path.isfile(module_path):
-        lsf.write_output(f'Shutdown module not found: {module_name}')
+        write_shutdown_output(f'Shutdown module not found: {module_name}')
         return None
     
     try:
@@ -246,7 +234,7 @@ def import_shutdown_module(module_name: str, lsf):
         spec.loader.exec_module(module)
         return module
     except Exception as e:
-        lsf.write_output(f'Failed to import {module_name}: {e}')
+        write_shutdown_output(f'Failed to import {module_name}: {e}')
         return None
 
 
@@ -314,7 +302,7 @@ def run_vcf_shutdown(lsf, dry_run: bool = False, phase=None,
     module = import_shutdown_module('VCFshutdown', lsf)
 
     if module is None:
-        lsf.write_output('VCFshutdown module not available')
+        write_shutdown_output('VCFshutdown module not available')
         return {'success': False, 'esx_hosts': []}
 
     try:
@@ -434,7 +422,7 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
     """
     start_time = datetime.datetime.now()
     
-    # Initialize log files (re-initialize labstartup.log with shutdown header)
+    # Initialize shutdown log
     init_shutdown_log(dry_run)
     
     if lsf is None:

@@ -1,6 +1,6 @@
 ---
 name: vcf-troubleshooting
-description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch), Authentik SCIM syncing 0 users due to empty property_mappings, and Authentik missing group memberships due to empty vCenter SCIM group payload. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, OIDC sub ExternalId, SCIM 0 users, property_mappings empty, vcf_viewer role, SCIM members array missing, force_vcf_scim_group_memberships, or patch_compare_users bug.
+description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch), Authentik SCIM syncing 0 users due to empty property_mappings, and Authentik missing group memberships due to empty vCenter SCIM group payload. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, OIDC sub ExternalId, SCIM 0 users, property_mappings empty, vcf_viewer role, SCIM members array missing, force_vcf_scim_group_memberships, patch_compare_users bug, VCFA login 500, vcfapostgres pending, system-shutdown Argo Workflow, prelude deployments 0 replicas, node cordoned after startup, lock-vmsp-platform mutex, Fleet LCM stale workflow, or auto-platform-a-b7nps SchedulingDisabled.
 ---
 
 # VCF 9.x Troubleshooting Guide
@@ -60,6 +60,7 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | Authentik SCIM syncs groups but 0 users | SCIM provider shows healthy sync; Fleet IAM / VIDB lists groups but no users | SCIM provider `property_mappings: []` empty; Authentik silently skips all user object pushes | 47 |
 | Authentik SCIM syncs users but group memberships are empty | "View Group Members" shows "No items to display"; users cannot log in | vCenter VIDB SCIM returns Group objects without `members` array; Authentik `patch_compare_users` skips PATCH | 48 |
 | VCF Operations UI shows internal component type names | Lifecycle UI displays `OPS_NETWORKS`, `OPS_LOGS` instead of friendly names; `/fleet-lcm/v1/components` returns `[]` | Race: `vcf-fleet-lcm`/`vcf-sddc-lcm` start before `vidb` finishes JWT key initialization | 49 |
+| VCF Automation `https://auto-a.site-a.vcf.lab/login` returns HTTP 500 | Login page returns 500 shortly after lab startup; `vcfapostgres-0` in Pending state; all prelude deployments at 0/0 | Stale `system-shutdown-*` Argo Workflows in `vmsp-platform` resume after node uncordon, re-cordon node and scale all prelude deployments to 0 | 50 |
 
 ---
 
@@ -2100,3 +2101,94 @@ kubectl patch secret authentik -p '{"stringData": {"AUTHENTIK_STORAGE__MEDIA__FI
 # Restart the deployments to apply the new configuration
 kubectl rollout restart deployment authentik-server authentik-worker -n default
 ```
+
+## 50. VCF Automation HTTP 500 After Lab Startup — Stale Fleet LCM Shutdown Workflows
+
+**Symptom**: `https://auto-a.site-a.vcf.lab/login/` returns HTTP 500 approximately 30–60 minutes after lab startup, even though the labstartup.log confirmed it was HTTP 200 during the startup sequence. `vcfapostgres-0` is in `Pending` state (`0/3 Pending`). All prelude Deployments show `0/0` replicas. The K8s node `auto-platform-a-b7nps` is `Ready,SchedulingDisabled`.
+
+**Diagnosis**:
+```bash
+PASS=$(cat /home/holuser/creds.txt)
+
+# Check node status
+sshpass -p "$PASS" ssh vmware-system-user@auto-a.site-a.vcf.lab \
+  "echo '$PASS' | sudo -S -i bash -c 'kubectl get nodes'"
+# Expected broken: auto-platform-a-b7nps   Ready,SchedulingDisabled
+
+# Check prelude pod status
+sshpass -p "$PASS" ssh vmware-system-user@auto-a.site-a.vcf.lab \
+  "echo '$PASS' | sudo -S -i bash -c 'kubectl get pods -n prelude --no-headers | grep -v Completed'"
+# Shows vcfapostgres-0: 0/3 Pending
+
+# Check deployment replicas
+sshpass -p "$PASS" ssh vmware-system-user@auto-a.site-a.vcf.lab \
+  "echo '$PASS' | sudo -S -i bash -c 'kubectl get deployments -n prelude | head -5'"
+# All show 0/0 READY
+
+# List stale system-shutdown Argo Workflows
+sshpass -p "$PASS" ssh vmware-system-user@auto-a.site-a.vcf.lab \
+  "echo '$PASS' | sudo -S -i bash -c 'kubectl get workflow -n vmsp-platform | grep system-shutdown'"
+# Shows 30+ workflows, one "Running", rest "Pending" (Waiting for lock-vmsp-platform mutex)
+```
+
+**Root Cause**: Each Fleet LCM shutdown cycle (via `Shutdown.py Phase 1`) creates an Argo Workflow (`system-shutdown-{taskid}`) in the `vmsp-platform` namespace. Argo persists workflow state to etcd across reboots. On startup, when `VCFfinal.py` uncordons the K8s node, the Argo controller immediately resumes the stale Running workflow. The resumed workflow:
+1. Re-cordons the node (`kubectl cordon auto-platform-a-b7nps`)
+2. Scales all `prelude` namespace Deployments and StatefulSets to `0` replicas
+3. Runs its execute-script pod (which tries to find a "system-action-shutdown" component and exits)
+
+After it completes, the **next** workflow in the `lock-vmsp-platform` mutex queue acquires the lock and runs, causing a cascade. Up to 30+ stale workflows can accumulate from multiple shutdown/startup cycles.
+
+The VCFA login was initially HTTP 200 at startup because vcfapostgres was running at the moment of the URL check (T+0). The shutdown workflow ran ~30 minutes later when startup allowed the Argo controller to resume it.
+
+**Fix** (immediate recovery):
+```bash
+PASS=$(cat /home/holuser/creds.txt)
+
+# SSH helper
+vcfa() {
+  sshpass -p "$PASS" ssh -o StrictHostKeyChecking=accept-new \
+    vmware-system-user@auto-a.site-a.vcf.lab \
+    "echo '$PASS' | sudo -S -i bash -c '$1'"
+}
+
+# Step 1: Kill any currently-running execute-script pods
+vcfa 'kubectl get pods -n vmsp-platform --no-headers | grep "system-shutdown.*execute-script" | grep Running | awk "{print \$1}" | xargs -r kubectl delete pod -n vmsp-platform --grace-period=0 --force'
+
+# Step 2: Delete ALL stale system-shutdown Argo Workflows
+vcfa 'kubectl get workflow -n vmsp-platform --no-headers | grep system-shutdown | awk "{print \$1}" | xargs -r kubectl delete workflow -n vmsp-platform --grace-period=0'
+
+# Step 3: Uncordon the node (AFTER workflow cleanup)
+vcfa 'kubectl uncordon auto-platform-a-b7nps'
+
+# Step 4: Scale up critical StatefulSets
+vcfa 'kubectl scale statefulset rabbitmq-ha tenant-manager vco-app -n prelude --replicas=1'
+
+# Step 5: Scale up all 0-replica Deployments in prelude
+vcfa 'kubectl get deployments -n prelude -o json | python3 -c "
+import sys,json,subprocess
+d=json.load(sys.stdin)
+for item in d[\"items\"]:
+  if item[\"spec\"].get(\"replicas\",1)==0:
+    n=item[\"metadata\"][\"name\"]
+    subprocess.run([\"kubectl\",\"scale\",\"deployment\",n,\"-n\",\"prelude\",\"--replicas=1\"])
+"'
+
+# Verify (~60s later)
+curl -sk -o /dev/null -w "%{http_code}" https://auto-a.site-a.vcf.lab/login/
+# Expected: 200
+```
+
+**Prevention** (automated in `VCFfinal.py` v6.2+): `Startup/VCFfinal.py` Task 4b now includes a **Step 0** that:
+1. Lists all `system-shutdown-*` Argo Workflows in `vmsp-platform` before any uncordon
+2. Patches Running ones to `spec.shutdown: Stop` to cleanly release the mutex lock
+3. Deletes them all in batches of 10
+4. Only then proceeds to uncordon the node
+
+A safety-net copy of this logic also runs in the `Fix VCFA Microservices Scaling` section (late in startup), using `sudo -S -i bash -c` (required for VCF 9.1 where kubectl is only on root's PATH).
+
+**Additional notes**:
+- The stale task secret `task-{TASK_ID}` in `vmsp-platform` can also be deleted: `kubectl delete secret task-{TASK_ID} -n vmsp-platform`
+- The cluster-autoscaler in `vmsp-platform` (`cluster-autoscaler-clusterapi`) is NOT the cause of the cordon; it only reports `NotTriggerScaleUp` for already-pending pods.
+- The `vcfa-stabilizer.sh` "already applied" guard (checks for `/usr/local/bin/vcfa-eg-mem-keeper.sh`) skips the stabilizer on every startup after first run — this is expected behavior; the uncordon is handled separately in `VCFfinal.py`.
+- `sudo -S kubectl` (without `-i`) fails on VCF 9.1 because kubectl is only on root's `$PATH` via login shell. Always use `sudo -S -i bash -c 'kubectl ...'`.
+

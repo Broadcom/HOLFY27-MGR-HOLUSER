@@ -88,6 +88,8 @@ This is a **Holodeck nested virtualization lab** running VCF 9.0.x or 9.1.x. All
 - **vCenter VIDB SCIM URL has no tenant segment** — correct URL is `https://vc-mgmt-a.site-a.vcf.lab/usergroup/scim/v2`. Using `/usergroup/t/CUSTOMER/scim/v2` routes incorrectly. The `/t/CUSTOMER/` segment belongs only in the OIDC redirect URI.
 - **Fleet IAM VCF role names** — admin role is `vcf_administrator`, viewer role is `vcf_viewer`. Assign via `PUT .../ssorealms/{realm}/principals/{groupId}/roles`.
 - **Authentik OAuth2 provider needs `email`, `openid`, `profile` scope mappings** — without these in `property_mappings`, OIDC claims are missing. Look up PKs via `GET /api/v3/propertymappings/provider/scope/`, PATCH them onto the OAuth2 provider. `Tools/authentik_vcf_integration.py` now sets these automatically.
+- **Stale Fleet LCM system-shutdown Argo Workflows cause VCFA HTTP 500** — each shutdown cycle creates a `system-shutdown-{id}` Argo Workflow in `vmsp-platform` that persists across reboots. On startup, when the node is uncordoned, the Argo controller resumes the workflow which re-cordons the node and scales all `prelude` deployments to 0. Up to 30+ can accumulate. Fix: `kubectl get workflow -n vmsp-platform --no-headers | grep system-shutdown | awk '{print $1}' | xargs kubectl delete workflow -n vmsp-platform --grace-period=0`. `VCFfinal.py` v6.2+ does this automatically as Step 0 of Task 4b. See vcf-troubleshooting Section 50.
+- **`sudo -S kubectl` fails on VCF 9.1 VCFA node** — kubectl is only on root's PATH via login shell. Always use `sudo -S -i bash -c 'kubectl ...'` on the VCFA K8s node.
 
 ## Session Knowledge Capture
 

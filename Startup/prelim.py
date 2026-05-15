@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.6 - 2026-05-06
+# Version 3.7 - 2026-05-13
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -236,24 +236,8 @@ def main(lsf=None, standalone=False, dry_run=False):
         if not dry_run:
             console_host = 'root@console.site-a.vcf.lab'
             
-            PROXY_URL = 'http://10.1.1.1:3128'
-            NO_PROXY_LIST = [
-                'localhost',
-                '127.0.0.1',
-                '10.0.0.0/8',
-                '10.1.0.0/24',
-                '10.96.0.0/12',
-                '172.16.0.0/12',
-                '192.168.0.0/16',
-                '198.18.0.0/16',
-                '*.vcf.lab',
-                '*.site-a.vcf.lab',
-                '*.site-b.vcf.lab',
-                '*.svc',
-                '*.cluster.local',
-                '*.svc.cluster.local',
-                'registry.vmsp-platform.svc.cluster.local',
-            ]
+            PROXY_URL = lsf.LAB_PROXY_URL
+            NO_PROXY_LIST = lsf.build_vscode_no_proxy()
             
             vscode_settings_dir = '/home/holuser/.config/Code/User'
             vscode_settings_file = f'{vscode_settings_dir}/settings.json'
@@ -367,26 +351,26 @@ def main(lsf=None, standalone=False, dry_run=False):
     # TASK 8: Firefox LMC tuning (proxy + lightweight prefs in user.js on console home)
     #==========================================================================
     
-    if dashboard:
-        dashboard.update_task('prelim', 'firefox_lmchol_tune', 'running')
-        dashboard.generate_html()
+    # if dashboard:
+    #     dashboard.update_task('prelim', 'firefox_lmchol_tune', 'running')
+    #     dashboard.generate_html()
     
-    if os.path.isdir(lsf.lmcholroot):
-        try:
-            from Tools.firefox_lmchol_tuning import apply_firefox_lmchol_tuning
+    # if os.path.isdir(lsf.lmcholroot):
+    #     try:
+    #         from Tools.firefox_lmchol_tuning import apply_firefox_lmchol_tuning
 
-            if not apply_firefox_lmchol_tuning(lsf, dry_run=dry_run):
-                lsf.write_output(
-                    'WARNING: Firefox LMC user.js tuning failed for one or more profiles'
-                )
-        except Exception as e:
-            lsf.write_output(f'WARNING: Firefox LMC tuning skipped: {e}')
-    else:
-        lsf.write_output('firefox_lmchol_tuning: console home not mounted at lsf.lmcholroot; skip')
+    #         if not apply_firefox_lmchol_tuning(lsf, dry_run=dry_run):
+    #             lsf.write_output(
+    #                 'WARNING: Firefox LMC user.js tuning failed for one or more profiles'
+    #             )
+    #     except Exception as e:
+    #         lsf.write_output(f'WARNING: Firefox LMC tuning skipped: {e}')
+    # else:
+    #     lsf.write_output('firefox_lmchol_tuning: console home not mounted at lsf.lmcholroot; skip')
     
-    if dashboard:
-        dashboard.update_task('prelim', 'firefox_lmchol_tune', 'complete')
-        dashboard.generate_html()
+    # if dashboard:
+    #     dashboard.update_task('prelim', 'firefox_lmchol_tune', 'complete')
+    #     dashboard.generate_html()
     
     #==========================================================================
     # TASK 9: Install Playwright on Manager (if required by config)

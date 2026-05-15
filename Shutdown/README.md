@@ -1,6 +1,6 @@
 # HOL Lab Shutdown Scripts
 
-Version 2.3 - 2026-04-27
+Version 3.0 - 2026-05-11
 
 ## Overview
 
@@ -197,6 +197,7 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 | Phase 3b | Supervisor workload drain | VKS/Harbor etc. before WCP stop |
 | Phase 3 | Stop WCP | Workload Control Plane services |
 | Phase 4 | Workload VMs | Tanzu, K8s, Supervisor VMs |
+| Phase 4b | VSP Platform VMs | Shutdown VSP VMs via vCenter; falls back to direct ESXi if not found |
 | Phase 5 | Workload NSX Edges | Workload domain NSX Edges |
 | Phase 6 | Workload NSX Manager | Workload domain NSX Manager |
 | Phase 7 | Workload vCenters | Workload vCenters (LAST per VCF 9.0) |
@@ -214,7 +215,6 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 | Phase 17c | Post-Edge VMs | Optional patterns from `[VCF] vcfpostedgevms` |
 | Phase 18 | Host Settings | Set ESXi advanced settings |
 | Phase 19 | vSAN Elevator | Enable elevator, poll until flush complete, disable (OSA only) |
-| Phase 19b | VSP Platform VMs | Shutdown VSP VMs |
 | Phase 19c | Pre-ESXi Audit | Find and shutdown straggler VMs |
 | Phase 20 | ESXi Hosts | Shutdown ESXi hosts |
 
@@ -224,7 +224,7 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 
 2. **Phase 1b follows Phase 1**: If the Fleet API cannot shut down VCF Automation, the fallback VM shutdown (Phase 1b) runs immediately after Phase 1; Phase 1b can connect to vCenters on its own when needed.
 
-3. **VCF Components vs VMs**: In VCF 9.1, many services run as Kubernetes workloads on VSP. These are handled by Phase 2b (K8s scale-down) and Phase 1 (Fleet API). VM-name phases (8–13, etc.) only target VMs that exist for your build.
+3. **VCF Components vs VMs**: In VCF 9.1, many services run as Kubernetes workloads on VSP. These are handled by Phase 1 (Fleet API) and Phase 2b (component annotation). VM-name phases (8–13, etc.) only target VMs that exist for your build.
 
 4. **Fleet shutdown (VCF 9.1)**: Phase 1 prefers the **fleet-lcm direct API** on the Fleet LCM gateway (JWT via VSP Identity Service) so `POST .../components/{id}?action=shutdown` works. It falls back to suite-api internal components, then VCF 9.0 legacy LCM. Components that already appear inactive are **skipped** with a `SKIP:` log line.
 
@@ -263,7 +263,7 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 - **`--phase`**: one internal VCF phase (e.g. `8` for Ops for Networks VMs).
 - **`--phases`**: several phases in **one process**, merged with **auto-prerequisites**:
   - VM inventory on vCenter → inserts **`2`** if missing.
-  - VM inventory on ESXi (e.g. `19b`, `17c`) → inserts **`17b`** if missing.
+  - VM inventory on ESXi (e.g. `17c`) → inserts **`17b`** if missing. Note: Phase `4b` manages its own ESXi fallback internally and does not require `17b`.
   - Phases always run in **canonical VCF order** (not the order tokens appear on the CLI).
 - **`--fleet-products`**: applies only to **Phase 1** Fleet shutdown. Standard keys:
 
