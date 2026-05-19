@@ -111,7 +111,7 @@ URLS = https://vc-mgmt-a.site-a.vcf.lab/ui,VMware vSphere
 
 - **Python modules**: Resolved by `LabTypeLoader.get_module_path()` in `Tools/labtypes.py`. Loaded dynamically via `importlib`.
 - **INI config files**: Resolved by `use_local_holodeck_ini()` in `labstartup.sh` (bash) and `LabTypeLoader.get_override_path()` in `Tools/labtypes.py` (Python).
-- **Router files** (firewall, proxy): Pushed to the router VM via NFS by `lsfunctions.push_router_files()` and `push_vpodrepo_router_files()`.
+- **Router files** (firewall, proxy): Pushed to the router VM via NFS exclusively by `push_router_files_nfs()` in `labstartup.sh`. The firewall/proxy decision is delegated to `LabTypeLoader.requires_firewall()` / `requires_proxy_filter()` in `Tools/labtypes.py` — `labtypes.py` is the single source of truth for whether a labtype uses a restrictive (HOL) or permissive (Discovery/ATE/VXP/EDU) configuration. `lsfunctions.push_router_files()` and `push_vpodrepo_router_files()` are retained for use within individual startup modules but are not called from the main startup flow.
 
 ## Quick Reference: Where to Put Your Files
 
