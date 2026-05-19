@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # labstartup.py - HOLFY27 Main Lab Startup Orchestrator
-# Version 3.0 - January 2026
+# Version 3.1 - 2026-05-19
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # LabType-aware orchestrator with enhanced features
@@ -154,17 +154,11 @@ def main():
     lsf.write_output(f'Firewall required: {loader.requires_firewall()}')
     lsf.write_output(f'Proxy filter required: {loader.requires_proxy_filter()}')
     
-    # Push router files (for HOL labs via NFS)
-    if loader.requires_firewall():
-        lsf.write_output('Pushing router files via NFS...')
-        lsf.push_router_files()
-        lsf.push_vpodrepo_router_files()
-        lsf.signal_router_gitdone()
-    else:
-        lsf.write_output('Firewall not required for this lab type')
-        # Still signal router even if no firewall (allows router to continue)
-        lsf.signal_router_gitdone()
-    
+    # Router files were already pushed and gitdone signaled by labstartup.sh before
+    # this script started. labstartup.sh is the single owner of the router file push
+    # (3-layer: core → labtype overlay → vpodrepo overlay) and the gitdone signal.
+    # signal_router_ready() below is the separate end-of-startup signal.
+
     # Run startup sequence based on LabType
     lsf.write_output(f'Using startup sequence for labtype: {lsf.labtype}')
     

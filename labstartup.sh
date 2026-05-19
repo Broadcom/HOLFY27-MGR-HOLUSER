@@ -1,6 +1,6 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.10 - 2026-04-30
+# Version 3.11 - 2026-05-19
 # Changes:
 # - Firefox profile rebuild gate (FIREFOX_PROFILE_REBUILD_REQUIRED in script): deploy
 #   rebuild-firefox-profile.sh, compare to ~/.local/state/firefox_profile_rebuild.count on LMC,
@@ -479,10 +479,7 @@ push_router_files_nfs() {
             fi
         done
     fi
-    
-    # Signal router that files are ready
-    date > ${holorouterdir}/gitdone
-    log_msg "Signaled router: gitdone" "${logfile}"
+
 }
 
 # Compare LMC flag file to in-script FIREFOX_PROFILE_REBUILD_REQUIRED; if rebuild is needed, run
@@ -1074,24 +1071,30 @@ fi
 # PUSH ROUTER FILES VIA NFS
 #==============================================================================
 
-if [ "${labtype}" = "HOL" ]; then
+# Query labtypes.py for the firewall decision so that labtypes.py is the single
+# source of truth. Fail-safe: if Python fails, default to "yes" (restrictive HOL
+# behavior) to avoid accidentally leaving a lab with no firewall.
+requires_firewall=$(/usr/bin/python3 -c "
+import sys; sys.path.insert(0, '${holroot}/Tools')
+from labtypes import LabTypeLoader
+l = LabTypeLoader('${labtype}', '${holroot}', '${vpodgitdir}')
+print('yes' if l.requires_firewall() else 'no')
+" 2>/dev/null || echo "yes")
+log_msg "requires_firewall=${requires_firewall} (labtype=${labtype})" "${logfile}"
+
+if [ "$requires_firewall" = "yes" ]; then
     push_router_files_nfs
 else
-    log_msg "Pushing $labtype router files via NFS..." "${logfile}"
+    log_msg "Pushing $labtype router files via NFS (permissive — nofirewall/allowall)..." "${logfile}"
     mkdir -p ${holorouterdir}
-    # In dev environment, keep the default iptablescfg.sh from git
-    # In prod environment, use nofirewall.sh for non-HOL labs
-    if [ "$branch" = "dev" ]; then
-        log_msg "Dev environment: keeping default iptablescfg.sh from holorouter" "${logfile}"
-        cp ${holroot}/${router}/iptablescfg.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
-    else
-        log_msg "Prod environment: using nofirewall.sh for non-HOL labtype" "${logfile}"
-        cp ${holroot}/${router}/nofirewall.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
-    fi
+    log_msg "Non-HOL labtype: using nofirewall.sh and allowall for permissive access" "${logfile}"
+    cp ${holroot}/${router}/nofirewall.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
     cp ${holroot}/${router}/allowall ${holorouterdir}/allowlist 2>/dev/null
     
-    # Overlay labtype-specific router overrides if present
-    # Check external team repo first, then in-repo override
+    # Overlay labtype-specific router overrides if present.
+    # Check external team repo first, then in-repo override.
+    # allowlist is MERGED (cat|sort|uniq) so a labtype can extend the permissive list
+    # without accidentally replacing allowall. Other files override directly.
     labtyperouter=""
     if [ -d "${holuser_home}/${labtype}/${router}" ]; then
         labtyperouter="${holuser_home}/${labtype}/${router}"
@@ -1102,13 +1105,21 @@ else
         log_msg "Merging labtype (${labtype}) router files from ${labtyperouter}" "${logfile}"
         for file in "${labtyperouter}"/*; do
             filename=$(basename "$file")
-            if [ "$filename" != ".gitkeep" ]; then
+            if [ "$filename" = "allowlist" ]; then
+                if [ -f "${holorouterdir}/allowlist" ] && [ -f "$file" ]; then
+                    cat "${holorouterdir}/allowlist" "$file" | sort | uniq > ${holorouterdir}/allowlist.tmp
+                    mv ${holorouterdir}/allowlist.tmp ${holorouterdir}/allowlist
+                    log_msg "Merged labtype allowlist" "${logfile}"
+                fi
+            elif [ "$filename" != ".gitkeep" ]; then
                 cp "$file" ${holorouterdir}/ 2>/dev/null
             fi
         done
     fi
     
-    # Overlay vpodrepo-specific router overrides if present
+    # Overlay vpodrepo-specific router overrides if present.
+    # allowlist is replaced (not merged) here — a vpodrepo can deliberately restrict
+    # access below allowall, consistent with vpodrepo being the highest-priority override.
     if [ -d "${vpodgitdir}/${router}" ]; then
         log_msg "Merging vpodrepo router files from ${vpodgitdir}/${router}" "${logfile}"
         for file in "${vpodgitdir}/${router}"/*; do
@@ -1163,6 +1174,7 @@ if [ -x "${holroot}/console/setup-cursor.sh" ] && [ "$1" != "labcheck" ] && [ "$
 fi
 
 # Signal the router that the git pull is complete so files are applied
+log_msg "Signaled router: gitdone" "${logfile}"
 date > /tmp/gitdone
 date > ${holorouterdir}/gitdone
 
