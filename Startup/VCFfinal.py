@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.1 - 2026-05-14
+# Version 6.3.2 - 2026-05-19
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
 #
+# v6.3.2 Changes:
+# - Fixed dashboard updates
 # v6.3.1 Changes:
 # - Fixed Step 0 awk quoting bug: replaced awk '{print $1}' with cut -d" " -f1 to
 #   avoid single-quote clash inside the bash -c '...' wrapper used by vcfa_ssh, and
@@ -317,11 +319,12 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output(f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
     
     # Update status dashboard
+    # wcp_vcenter is the first task that actually executes in VCFfinal, so mark it RUNNING at init
     try:
         sys.path.insert(0, '/home/holuser/hol/Tools')
         from status_dashboard import StatusDashboard, TaskStatus
         dashboard = StatusDashboard(lsf.lab_sku)
-        dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.RUNNING)
+        dashboard.update_task('vcffinal', 'wcp_vcenter', TaskStatus.RUNNING)
         dashboard.generate_html()
     except Exception:
         dashboard = None
@@ -735,6 +738,8 @@ def main(lsf=None, standalone=False, dry_run=False):
                 dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.FAILED,
                                       last_overall_status)
             dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.RUNNING)
+            dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.RUNNING)
+            dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.RUNNING)
             dashboard.generate_html()
         
         #----------------------------------------------------------------------
@@ -850,8 +855,12 @@ def main(lsf=None, standalone=False, dry_run=False):
             # else: already marked FAILED above
             if wcp_certs_ok:
                 dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.COMPLETE)
+                dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.COMPLETE)
+                dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.COMPLETE)
             else:
                 dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.FAILED, 'See log')
+                dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.FAILED, 'See log')
+                dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.FAILED, 'See log')
             dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.RUNNING)
             dashboard.generate_html()
 
