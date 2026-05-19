@@ -387,7 +387,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     lsf.write_vpodprogress('Tanzu Start', 'GOOD-3')
     
-    # Check for Tanzu Control Plane VMs - requires tanzucontrol option with valid (non-commented) values
+    # Check for Supervisor Control Plane VMs - requires tanzucontrol option with valid (non-commented) values
     tanzu_control_values = lsf.get_config_list('VCFFINAL', 'tanzucontrol')
     tanzu_control_configured = len(tanzu_control_values) > 0
     tanzu_verify_ok = False
@@ -624,7 +624,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output('='*60)
         lsf.write_output('Verifying Supervisor Control Plane Status (Multi-vCenter)')
         lsf.write_output('='*60)
-        lsf.write_vpodprogress('Tanzu Control Plane', 'GOOD-3')
+        lsf.write_vpodprogress('Supervisor Control Plane', 'GOOD-3')
         
         # Build list of vCenters to check for supervisors
         vcenter_targets = []
@@ -840,7 +840,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                 
                 # Override dashboard status since all Supervisors are healthy
                 if not tanzu_verify_ok:
-                    lsf.write_output('  Updating Tanzu Control Plane status to COMPLETE')
+                    lsf.write_output('  Updating Supervisor Control Plane status to COMPLETE')
                     tanzu_verify_ok = True
                 if not wcp_certs_ok:
                     lsf.write_output('  Updating WCP Certificate Fix status to COMPLETE')
@@ -865,7 +865,7 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.generate_html()
 
     else:
-        lsf.write_output('No Tanzu Control Plane VMs configured')
+        lsf.write_output('No Supervisor Control Plane VMs configured')
         if dashboard:
             dashboard.update_task('vcffinal', 'wcp_vcenter', TaskStatus.SKIPPED, 'Not configured')
             dashboard.update_task('vcffinal', 'tanzu_control', TaskStatus.SKIPPED, 'Not configured')
