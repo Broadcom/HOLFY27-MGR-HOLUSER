@@ -91,22 +91,41 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
     """
     from pyVim.task import WaitForTask
     
-    vms = lsf.get_vm_by_name(vm_name)
-    if not vms:
-        # Exact name match failed. Some VMs (e.g., VCF Automation appliances) are
-        # deployed with a random suffix appended to the base name (auto-a -> auto-a-45zgb).
-        # Fall back to a prefix match: find VMs whose name starts with vm_name followed
-        # by a dash or end-of-string. This avoids false positives (e.g., "auto-a" should
-        # NOT match "auto-ab" but SHOULD match "auto-a-45zgb").
-        prefix_pattern = f'^{vm_name}(-|$)'
-        prefix_matches = lsf.get_vm_match(prefix_pattern)
-        if prefix_matches:
-            actual_name = prefix_matches[0].name
-            lsf.write_output(f'{fail_label} exact name "{vm_name}" not found, '
-                             f'but prefix match found: "{actual_name}"')
-            vms = prefix_matches
+    # VM discovery with retries - after a cold boot a VM's registration can take
+    # a minute or two to become visible on the ESXi host even though it is already
+    # running. Retry before declaring not_found to avoid a premature lab failure.
+    VM_FIND_MAX_RETRIES = 4
+    VM_FIND_RETRY_DELAY = 30  # seconds between attempts (4 x 30s = up to ~2 min)
+    
+    vms = []
+    for find_attempt in range(1, VM_FIND_MAX_RETRIES + 1):
+        candidates = lsf.get_vm_by_name(vm_name)
+        if not candidates:
+            # Exact name match failed. Some VMs (e.g., VCF Automation appliances) are
+            # deployed with a random suffix appended to the base name (auto-a -> auto-a-45zgb).
+            # Fall back to a prefix match: find VMs whose name starts with vm_name followed
+            # by a dash or end-of-string. This avoids false positives (e.g., "auto-a" should
+            # NOT match "auto-ab" but SHOULD match "auto-a-45zgb").
+            prefix_pattern = f'^{vm_name}(-|$)'
+            prefix_matches = lsf.get_vm_match(prefix_pattern)
+            if prefix_matches:
+                actual_name = prefix_matches[0].name
+                lsf.write_output(f'{fail_label} exact name "{vm_name}" not found, '
+                                 f'but prefix match found: "{actual_name}"')
+                candidates = prefix_matches
+        
+        if candidates:
+            vms = candidates
+            break
+        
+        if find_attempt < VM_FIND_MAX_RETRIES:
+            lsf.write_output(f'WARNING: {fail_label} VM "{vm_name}" not found on any host '
+                             f'(attempt {find_attempt}/{VM_FIND_MAX_RETRIES}), '
+                             f'retrying in {VM_FIND_RETRY_DELAY}s...')
+            time.sleep(VM_FIND_RETRY_DELAY)
         else:
-            lsf.write_output(f'WARNING: {fail_label} VM not found on any host: {vm_name}')
+            lsf.write_output(f'WARNING: {fail_label} VM not found on any host after '
+                             f'{VM_FIND_MAX_RETRIES} attempts: {vm_name}')
             return 'not_found'
     
     # Log all registrations found
