@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.7 - 2026-05-13
+# Version 3.8 - 2026-05-19
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -316,6 +316,10 @@ def main(lsf=None, standalone=False, dry_run=False):
     ##=========================================================================
     ## TASK 6: PUSH LAB FILES TO CONSOLE
     ##=========================================================================
+    
+    if dashboard:
+        dashboard.update_task('prelim', 'lab_files', 'running')
+        dashboard.generate_html()
     
     lsf.push_lab_files_to_console()
     
