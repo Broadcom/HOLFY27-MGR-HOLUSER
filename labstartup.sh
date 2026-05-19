@@ -1081,13 +1081,13 @@ else
     mkdir -p ${holorouterdir}
     # In dev environment, keep the default iptablescfg.sh from git
     # In prod environment, use nofirewall.sh for non-HOL labs
-    if [ "$branch" = "dev" ]; then
-        log_msg "Dev environment: keeping default iptablescfg.sh from holorouter" "${logfile}"
-        cp ${holroot}/${router}/iptablescfg.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
-    else
-        log_msg "Prod environment: using nofirewall.sh for non-HOL labtype" "${logfile}"
+    # if [ "$branch" = "dev" ]; then
+    #     log_msg "Dev environment: keeping default iptablescfg.sh from holorouter" "${logfile}"
+    #     cp ${holroot}/${router}/iptablescfg.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
+    # else
+        log_msg "Non-HOL environment: using nofirewall.sh for non-HOL labtype" "${logfile}"
         cp ${holroot}/${router}/nofirewall.sh ${holorouterdir}/iptablescfg.sh 2>/dev/null
-    fi
+    # fi
     cp ${holroot}/${router}/allowall ${holorouterdir}/allowlist 2>/dev/null
     
     # Overlay labtype-specific router overrides if present
