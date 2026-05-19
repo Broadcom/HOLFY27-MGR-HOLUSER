@@ -94,8 +94,8 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
     # VM discovery with retries - after a cold boot a VM's registration can take
     # a minute or two to become visible on the ESXi host even though it is already
     # running. Retry before declaring not_found to avoid a premature lab failure.
-    VM_FIND_MAX_RETRIES = 4
-    VM_FIND_RETRY_DELAY = 30  # seconds between attempts (4 x 30s = up to ~2 min)
+    VM_FIND_MAX_RETRIES = 8
+    VM_FIND_RETRY_DELAY = 30  # seconds between attempts (8 x 30s = up to ~4 min)
     
     vms = []
     for find_attempt in range(1, VM_FIND_MAX_RETRIES + 1):
