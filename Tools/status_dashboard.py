@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # status_dashboard.py - HOLFY27 Lab Startup Status Dashboard
-# Version 1.2 - 2026-03-05
+# Version 1.3 - 2026-05-19
 # Author - Burke Azbill and HOL Core Team
 # Generates an auto-refreshing HTML status page for lab startup monitoring
 
@@ -152,7 +152,10 @@ class StatusDashboard:
         # Define groups in execution order (top-to-bottom)
         default_groups = [
             # Group 1: prelim.py - Preliminary Checks
+            # Note: dns and dns_import run in labstartup.py BEFORE prelim.py is invoked
             ('prelim', '1. Preliminary Checks (prelim.py)', [
+                ('dns', 'DNS Health Checks', 'Verify DNS resolution for all configured zones'),
+                ('dns_import', 'DNS Record Import', 'Import custom DNS records via tdns-mgr'),
                 ('readme', 'README Sync', 'Copy README to console desktop'),
                 ('update_manager', 'Update Manager', 'Disable Ubuntu update popups'),
                 ('firewall', 'Firewall Verification', 'Confirm firewall is active'),
@@ -161,7 +164,7 @@ class StatusDashboard:
                 ('vscode_proxy', 'VS Code Proxy', 'Configure VS Code proxy on console for Marketplace access'),
                 ('lab_files', 'Lab Files', 'Push lab files to console'),
                 ('holorouter_tls_renew', 'Holorouter TLS', 'Queue renew-nginx script + flag on NFS for doupdate.sh on router'),
-                ('firefox_lmchol_tune', 'Firefox LMC tune', 'Fix proxy + lightweight prefs in console Firefox user.js'),
+                ('playwright_install', 'Playwright Install', 'Install Playwright + Chromium on manager if required by config'),
                 ('vault_firefox_trust', 'Vault CA in Firefox', 'Trust Vault PKI root CA in console Firefox for auth/vault.vcf.lab'),
             ]),
             
@@ -182,9 +185,9 @@ class StatusDashboard:
             ]),
             
             # Group 4: VVF.py - VVF Startup (skipped for VCF labs)
+            # Note: exit_maintenance is performed inside mgmt_cluster in VVF.py (not a separate step)
             ('vvf', '4. VVF Startup (VVF.py)', [
-                ('mgmt_cluster', 'Management Cluster', 'Connect to VVF management cluster hosts'),
-                ('exit_maintenance', 'Exit Maintenance Mode', 'Remove hosts from maintenance mode'),
+                ('mgmt_cluster', 'Management Cluster', 'Connect to VVF hosts and exit maintenance mode'),
                 ('datastore', 'Datastore Verification', 'Verify VVF management datastore'),
                 ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager VM'),
                 ('nsx_edges', 'NSX Edge VMs', 'Start NSX Edge virtual machines'),

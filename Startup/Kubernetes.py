@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Kubernetes.py - HOLFY27 Core Kubernetes Certificate Module
-# Version 3.0 - January 2026
+# Version 3.1 - 2026-05-19
 # Author - Burke Azbill and HOL Core Team
 # Kubernetes certificate verification and renewal
 
@@ -34,11 +34,15 @@ MODULE_DESCRIPTION = 'Kubernetes certificate verification'
 
 def check_kubernetes_certs(lsf, entry, dry_run=False):
     """
-    Evaluate Kubernetes SSL certificates and renew if needed
+    Evaluate Kubernetes SSL certificates and renew if needed.
     
     :param lsf: lsfunctions module
     :param entry: host:account:renewcommand format
     :param dry_run: Whether to skip actual changes
+    :return: tuple (renewed, success) where renewed=True if renewal was attempted
+             and success=True if the renewal completed without error.
+             Returns (False, True) when no renewal is needed.
+             Returns (False, True) on dry_run or missing output.
     """
     renew = False
     now = datetime.datetime.now()
@@ -49,7 +53,7 @@ def check_kubernetes_certs(lsf, entry, dry_run=False):
     parts = entry.split(':')
     if len(parts) < 3:
         lsf.write_output(f'Invalid Kubernetes entry: {entry}')
-        return
+        return (False, True)
     
     remotehost = parts[0].strip()
     account = parts[1].strip()
@@ -59,7 +63,7 @@ def check_kubernetes_certs(lsf, entry, dry_run=False):
     
     if dry_run:
         lsf.write_output(f'Would check certs on {account}@{remotehost}')
-        return
+        return (False, True)
     
     # Create check script
     scriptname = 'checkcerts.sh'
@@ -75,7 +79,7 @@ def check_kubernetes_certs(lsf, entry, dry_run=False):
     
     if not hasattr(output, 'stdout') or not output.stdout:
         lsf.write_output(f'No certificate output from {remotehost}')
-        return
+        return (False, True)
     
     # Parse results
     first_expiry = None
@@ -123,10 +127,14 @@ def check_kubernetes_certs(lsf, entry, dry_run=False):
             output = lsf.ssh(renewcommand, f'{account}@{remotehost}', lsf.password)
             if hasattr(output, 'stdout'):
                 lsf.write_output(output.stdout)
+            return (True, True)
         except Exception as e:
             lsf.write_output(f'Certificate renewal failed: {e}')
+            return (True, False)
     elif first_expiry:
         lsf.write_output(f'Kubernetes certificates valid for {first_expiry.days} days on {remotehost}')
+    
+    return (False, True)
 
 
 #==============================================================================
@@ -185,16 +193,27 @@ def main(lsf=None, standalone=False, dry_run=False):
     # Check Each Kubernetes Cluster
     #==========================================================================
     
+    any_renewed = False
+    any_renewal_failed = False
+    
     for entry in kubernetes:
-        check_kubernetes_certs(lsf, entry, dry_run)
+        renewed, success = check_kubernetes_certs(lsf, entry, dry_run)
+        if renewed:
+            any_renewed = True
+            if not success:
+                any_renewal_failed = True
     
     if dashboard:
         dashboard.update_task('kubernetes', 'cert_check', TaskStatus.COMPLETE)
-        # If cert_renew is still PENDING (no renewal was needed), mark it as skipped
-        for task in dashboard.groups.get('kubernetes', type('', (), {'tasks': []})).tasks:
-            if task.id == 'kubernetes_cert_renew' and task.status == TaskStatus.PENDING:
-                dashboard.update_task('kubernetes', 'cert_renew', TaskStatus.SKIPPED, 'No renewal needed')
-                break
+        if any_renewed:
+            dashboard.update_task('kubernetes', 'cert_renew', TaskStatus.RUNNING)
+            if any_renewal_failed:
+                dashboard.update_task('kubernetes', 'cert_renew', TaskStatus.FAILED,
+                                      'One or more renewals failed — see log')
+            else:
+                dashboard.update_task('kubernetes', 'cert_renew', TaskStatus.COMPLETE)
+        else:
+            dashboard.update_task('kubernetes', 'cert_renew', TaskStatus.SKIPPED, 'No renewal needed')
         dashboard.generate_html()
     
     ##=========================================================================
