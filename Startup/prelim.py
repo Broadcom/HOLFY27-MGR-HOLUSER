@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.8 - 2026-05-19
+# Version 3.9 - 2026-05-20
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -531,6 +531,97 @@ def main(lsf=None, standalone=False, dry_run=False):
     if dashboard:
         dashboard.update_task('prelim', 'vault_firefox_trust', 'complete')
         dashboard.generate_html()
+
+    #==========================================================================
+    # TASK 11: Ensure Technitium DNS Local Endpoint 10.1.1.1:53
+    #==========================================================================
+
+    REQUIRED_DNS_ENDPOINT = '10.1.1.1:53'
+    lsf.write_output(
+        f'Checking Technitium DNS local endpoints for {REQUIRED_DNS_ENDPOINT}...'
+    )
+
+    try:
+        import urllib.parse
+        import urllib.request
+
+        # Load tdns-mgr config (server, port, protocol, token)
+        _tdns_conf = {}
+        _tdns_conf_path = os.path.expanduser('~/.config/tdns-mgr/.tdns-mgr.conf')
+        if os.path.isfile(_tdns_conf_path):
+            with open(_tdns_conf_path) as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if '=' in _line and not _line.startswith('#'):
+                        _k, _v = _line.split('=', 1)
+                        _tdns_conf[_k.strip()] = _v.strip().strip('"')
+
+        _tdns_server   = _tdns_conf.get('DNS_SERVER',   '192.168.0.2')
+        _tdns_port     = _tdns_conf.get('DNS_PORT',     '5380')
+        _tdns_protocol = _tdns_conf.get('DNS_PROTOCOL', 'http')
+        _tdns_base     = f'{_tdns_protocol}://{_tdns_server}:{_tdns_port}/api'
+
+        def _tdns_post(endpoint, params):
+            """POST form-encoded params to the Technitium DNS API."""
+            url  = f'{_tdns_base}/{endpoint}'
+            data = urllib.parse.urlencode(params, doseq=True).encode('utf-8')
+            req  = urllib.request.Request(url, data=data)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+
+        def _tdns_valid_token():
+            """Return a working API token, re-authenticating if the stored one is stale."""
+            _tok = _tdns_conf.get('DNS_TOKEN', '')
+            if _tok:
+                try:
+                    if _tdns_post('user/session/get', {'token': _tok}).get('status') == 'ok':
+                        return _tok
+                except Exception:
+                    pass
+            _user = _tdns_conf.get('DNS_USER', 'admin')
+            _r = _tdns_post(
+                'user/login',
+                {'user': _user, 'pass': lsf.get_password(), 'includeInfo': 'false'},
+            )
+            if _r.get('status') == 'ok':
+                return _r['token']
+            raise RuntimeError(f'Technitium login failed: {_r}')
+
+        _tok = _tdns_valid_token()
+
+        # Fetch current settings and check the local endpoints list
+        _settings = _tdns_post('settings/get', {'token': _tok})
+        _current = _settings.get('response', {}).get('dnsServerLocalEndPoints', [])
+
+        if REQUIRED_DNS_ENDPOINT in _current:
+            lsf.write_output(
+                f'{REQUIRED_DNS_ENDPOINT} already present in DNS local endpoints: {_current}'
+            )
+        else:
+            lsf.write_output(
+                f'{REQUIRED_DNS_ENDPOINT} not found in DNS local endpoints {_current}; adding...'
+            )
+            if not dry_run:
+                _new_endpoints = _current + [REQUIRED_DNS_ENDPOINT]
+                _resp = _tdns_post(
+                    'settings/set',
+                    {'token': _tok, 'dnsServerLocalEndPoints': _new_endpoints},
+                )
+                if _resp.get('status') == 'ok':
+                    lsf.write_output(
+                        f'Successfully added {REQUIRED_DNS_ENDPOINT} to DNS local endpoints'
+                    )
+                else:
+                    lsf.write_output(
+                        f'WARNING: Failed to add {REQUIRED_DNS_ENDPOINT} to DNS local endpoints: {_resp}'
+                    )
+            else:
+                lsf.write_output(
+                    f'[dry-run] Would add {REQUIRED_DNS_ENDPOINT} to DNS local endpoints'
+                )
+
+    except Exception as _e:
+        lsf.write_output(f'WARNING: DNS local endpoint check skipped: {_e}')
 
     ##=========================================================================
     ## End Core Team code
