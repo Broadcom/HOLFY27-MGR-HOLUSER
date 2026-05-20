@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.9 - 2026-05-20
+# Version 3.10 - 2026-05-20
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -542,6 +542,7 @@ def main(lsf=None, standalone=False, dry_run=False):
     )
 
     try:
+        import ssl
         import urllib.parse
         import urllib.request
 
@@ -561,12 +562,18 @@ def main(lsf=None, standalone=False, dry_run=False):
         _tdns_protocol = _tdns_conf.get('DNS_PROTOCOL', 'http')
         _tdns_base     = f'{_tdns_protocol}://{_tdns_server}:{_tdns_port}/api'
 
+        # Mirror tdns-mgr's INSECURE_TDNS=true behaviour (lab uses Vault PKI CA which
+        # is not in the system trust store until after prelim completes Task 10).
+        _ssl_ctx = ssl.create_default_context()
+        _ssl_ctx.check_hostname = False
+        _ssl_ctx.verify_mode = ssl.CERT_NONE
+
         def _tdns_post(endpoint, params):
             """POST form-encoded params to the Technitium DNS API."""
             url  = f'{_tdns_base}/{endpoint}'
             data = urllib.parse.urlencode(params, doseq=True).encode('utf-8')
             req  = urllib.request.Request(url, data=data)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=15, context=_ssl_ctx) as resp:
                 return json.loads(resp.read().decode('utf-8'))
 
         def _tdns_valid_token():
