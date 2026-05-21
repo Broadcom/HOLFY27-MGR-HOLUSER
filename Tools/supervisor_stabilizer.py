@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 1.6 - 2026-05-21
+Version 1.7 - 2026-05-21
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
+
+v1.7 Changes:
+- Spherelet cert renewal is now native Python — renew_spherelet_certs.sh has
+  been retired to Tools/old/ and the subprocess invocation replaced with a
+  full Python implementation inside renew_spherelet_certs().
+  Three new ESXi SSH/SCP helper functions (_ssh_exec_esx, _scp_get_esx,
+  _scp_put_esx) mirror the shell script's ssh_exec/scp_get/scp_put functions:
+  key-based auth first, sshpass fallback, ssh-keygen -R to clear stale keys.
+  CA cert/key extraction uses ssh_to_scp_direct() and the node InternalIP
+  is resolved via kubectl -o json (parsed locally) per the SSH escaping rule.
+  All openssl re-signing runs locally. No external script dependency remains.
 
 v1.6 Changes:
 - Phase 0b: vCenter WCP service check/start — SSHes to each vCenter and checks
@@ -115,15 +126,18 @@ Phases (all enabled by default; each has a --skip-* flag):
           catch pods that re-appear when a scheduler reschedules on a node still
           reconnecting its spherelet.
 
-  Phase 3  — ESXi spherelet certificate renewal
-       Locates and invokes renew_spherelet_certs.sh for each vCenter. ESXi
-       hosts acting as Supervisor worker nodes carry 1-year spherelet
+  Phase 3  — ESXi spherelet certificate renewal (native Python)
+       ESXi hosts acting as Supervisor worker nodes carry 1-year spherelet
        certificates; when they expire the nodes go NotReady and the LCI
        controller-manager pod cannot be scheduled (502 Bad Gateway from the
-       Local Consumption Interface). The script is idempotent — it pre-checks
-       expiry and skips renewal when all certs are valid for 2+ more years.
-       Newly renewed certs are valid for 5 years.
-       Non-fatal: startup continues on any error or if the script is absent.
+       Local Consumption Interface). This phase is idempotent — it pre-checks
+       expiry via openssl -checkend and skips renewal when all certs are valid
+       for 2+ more years. Retrieves SCP credentials via decryptK8Pwd.py,
+       discovers ESXi agent nodes via kubectl -o json, copies the Supervisor
+       CA from the SCP, re-signs client.crt and spherelet.crt locally using
+       openssl, pushes new certs to each ESXi host, restarts spherelet, waits
+       60 s for nodes to re-register, and logs final node status. Newly renewed
+       certs are valid for 5 years. Non-fatal: startup continues on any error.
 
   Phase 4  — Supervisor status verification
        Polls GET /api/vcenter/namespace-management/clusters via the vCenter REST
@@ -1750,11 +1764,122 @@ def load_vcenters(config_path):
 
 
 # ---------------------------------------------------------------------------
+# ESXi SSH / SCP helpers (used by Phase 3 spherelet renewal)
+# ---------------------------------------------------------------------------
+
+def _ssh_exec_esx(host, password, command, timeout=30):
+    """SSH to an ESXi host as root and return stdout as a string.
+
+    Tries key-based auth first (BatchMode=yes), then falls back to sshpass.
+    Returns empty string on any error rather than raising — callers treat
+    empty / missing output as "unreadable" and handle it gracefully.
+    Mirrors the ssh_exec() function from the retired renew_spherelet_certs.sh.
+    """
+    subprocess.run(["ssh-keygen", "-R", host], capture_output=True)
+    esx_opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", "LogLevel=ERROR",
+    ]
+    # Key-based first
+    try:
+        r = subprocess.run(
+            ["ssh", *esx_opts, "-o", "BatchMode=yes", f"root@{host}", command],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            return r.stdout
+    except Exception:
+        pass
+    # sshpass fallback
+    try:
+        r = subprocess.run(
+            ["sshpass", "-p", password, "ssh", *esx_opts,
+             f"root@{host}", command],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return r.stdout
+    except Exception:
+        return ""
+
+
+def _scp_get_esx(host, password, remote_path, local_path, timeout=30):
+    """SCP a file FROM an ESXi host to a local path.
+
+    Tries key-based auth first, then sshpass fallback.  Returns True on
+    success, False on any error.
+    Mirrors scp_get() from the retired renew_spherelet_certs.sh.
+    """
+    subprocess.run(["ssh-keygen", "-R", host], capture_output=True)
+    esx_opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", "LogLevel=ERROR",
+    ]
+    try:
+        r = subprocess.run(
+            ["scp", *esx_opts, "-o", "BatchMode=yes",
+             f"root@{host}:{remote_path}", local_path],
+            capture_output=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["sshpass", "-p", password, "scp", *esx_opts,
+             f"root@{host}:{remote_path}", local_path],
+            capture_output=True, timeout=timeout,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _scp_put_esx(host, password, local_path, remote_path, timeout=30):
+    """SCP a file TO an ESXi host from a local path.
+
+    Tries key-based auth first, then sshpass fallback.  Returns True on
+    success, False on any error.
+    Mirrors scp_put() from the retired renew_spherelet_certs.sh.
+    """
+    subprocess.run(["ssh-keygen", "-R", host], capture_output=True)
+    esx_opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", "LogLevel=ERROR",
+    ]
+    try:
+        r = subprocess.run(
+            ["scp", *esx_opts, "-o", "BatchMode=yes",
+             local_path, f"root@{host}:{remote_path}"],
+            capture_output=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["sshpass", "-p", password, "scp", *esx_opts,
+             local_path, f"root@{host}:{remote_path}"],
+            capture_output=True, timeout=timeout,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Phase 3: ESXi spherelet certificate renewal
 # ---------------------------------------------------------------------------
 
 def renew_spherelet_certs(vc, password, dry_run):
-    """Invoke renew_spherelet_certs.sh for a vCenter to renew ESXi node certs.
+    """Renew expired ESXi spherelet certificates for Supervisor worker nodes.
 
     ESXi hosts acting as Supervisor worker nodes carry 1-year spherelet
     certificates (client.crt and spherelet.crt in /etc/vmware/spherelet/).
@@ -1762,58 +1887,307 @@ def renew_spherelet_certs(vc, password, dry_run):
     controller-manager pod — cannot be scheduled, causing 502 Bad Gateway
     from the Local Consumption Interface.
 
-    The script is idempotent: it pre-checks expiry and skips all renewal if
-    every cert is valid for at least two more years (THRESHOLD_DAYS=730).
+    Pre-checks expiry against THRESHOLD_DAYS (730 / 2 years).  If every
+    node's client.crt is valid for at least that long, this is a no-op.
 
-    Failure is non-fatal: if the script exits non-zero or cannot be found,
-    a WARN is logged and the stabilization pass continues.  The script
-    itself exits 0 whenever renewal is genuinely unnecessary.
+    Steps (mirroring renew_spherelet_certs.sh exactly):
+      1. Retrieve SCP credentials via decryptK8Pwd.py (same as Phase 2).
+      2. Discover ESXi agent nodes via kubectl -o json (parsed locally).
+      3. Pre-check each node's client.crt with openssl -checkend.
+      4. Copy Supervisor CA cert and key from SCP to a local temp dir.
+      5. For each ESXi node: copy private keys, re-sign client.crt and
+         spherelet.crt locally with openssl, push new certs, restart spherelet.
+      6. Wait 60 s for nodes to re-register, then log node status.
 
-    Script search order:
-      1. Same directory as this Python file (Tools/renew_spherelet_certs.sh)
-      2. /home/holuser/hol/Tools/renew_spherelet_certs.sh (production path)
+    Uses _ssh_exec_esx() / _scp_get_esx() / _scp_put_esx() for direct ESXi
+    SSH/SCP (key-based first, sshpass fallback) and ssh_to_scp_direct() to
+    interact with the Supervisor control-plane node.  All openssl operations
+    run locally via subprocess.run().  Non-fatal — always returns True.
     """
+    CERT_DAYS = 1825       # 5-year renewal validity
+    THRESHOLD_DAYS = 730   # renew if any cert expires within 2 years
+    THRESHOLD_SEC = THRESHOLD_DAYS * 86400
+
     label = vc["label"]
     log("")
     log(f"--- {label} ({vc['host']}) -- ESXi spherelet certificate renewal ---")
-
-    # Locate the script
-    script_candidates = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     "renew_spherelet_certs.sh"),
-        "/home/holuser/hol/Tools/renew_spherelet_certs.sh",
-    ]
-    script_path = next((p for p in script_candidates if os.path.isfile(p)), None)
-
-    if not script_path:
-        log(f"  [{label}] renew_spherelet_certs.sh not found in search path "
-            f"— skipping spherelet renewal.", level="WARN")
-        return True  # non-fatal
+    log("=" * 70)
 
     if dry_run:
-        log(f"  [{label}] [dry-run] would run: bash {script_path} {vc['host']}")
+        log(f"  [{label}] [dry-run] would check spherelet cert expiry on all "
+            f"ESXi agent nodes and renew if any expire within "
+            f"{THRESHOLD_DAYS} days ({THRESHOLD_DAYS // 365} years).")
         return True
 
-    log(f"  [{label}] Running: bash {script_path} {vc['host']}")
+    # ── Step 1: retrieve SCP credentials ──────────────────────────────────
+    log(f"  [{label}] Retrieving Supervisor credentials via decryptK8Pwd.py ...")
+    decrypt = ssh_to_vcenter(
+        vc["host"], vc["root_user"], password,
+        "PAGER=cat TERM=dumb /usr/lib/vmware-wcp/decryptK8Pwd.py 2>&1 | cat",
+    )
+    clusters = parse_decrypt_k8_pwd(decrypt)
+    if not clusters:
+        log(f"  [{label}] No Supervisor found on this vCenter — "
+            f"skipping spherelet renewal.")
+        return True
+
+    scp_ip = clusters[0]["ip"]
+    scp_pass = clusters[0]["pwd"]
+    log(f"  [{label}] Supervisor node IP: {scp_ip}")
+    log(f"  [{label}] Supervisor credentials retrieved.")
+
+    # ── Step 2: discover ESXi agent nodes ─────────────────────────────────
+    log(f"  [{label}] Discovering Supervisor agent nodes ...")
+    nodes_json_raw = ssh_to_scp_direct(
+        vc, password, scp_ip, scp_pass,
+        "kubectl get nodes -l node-role.kubernetes.io/agent -o json 2>/dev/null",
+    )
+    esx_nodes = []
     try:
-        result = subprocess.run(
-            ["bash", script_path, vc["host"]],
-            capture_output=True, text=True, timeout=600,
-        )
-        for line in (result.stdout + result.stderr).splitlines():
-            if line.strip():
-                log(f"  {line.rstrip()}")
-        if result.returncode == 0:
-            log(f"  [{label}] Spherelet cert renewal completed (exit 0).")
+        nodes_data = json.loads(nodes_json_raw)
+        esx_nodes = [
+            item["metadata"]["name"]
+            for item in nodes_data.get("items", [])
+        ]
+    except (json.JSONDecodeError, KeyError):
+        pass
+
+    if not esx_nodes:
+        log(f"  [{label}] ERROR: No agent nodes found on Supervisor {scp_ip}",
+            level="ERROR")
+        return True
+
+    log(f"  [{label}] Found {len(esx_nodes)} agent node(s): "
+        f"{', '.join(esx_nodes)}")
+
+    # ── Step 3: pre-check cert expiry ─────────────────────────────────────
+    log(f"  [{label}] Pre-checking certificate validity "
+        f"(threshold: {THRESHOLD_DAYS} days / 2 years)...")
+    needs_renewal = False
+    for esx_host in esx_nodes:
+        expiry = _ssh_exec_esx(
+            esx_host, password,
+            "openssl x509 -in /etc/vmware/spherelet/client.crt "
+            "-noout -enddate 2>/dev/null | cut -d= -f2",
+        ).strip() or "unreadable"
+
+        # -checkend exits 0 = still valid for N seconds, 1 = will expire
+        check_out = _ssh_exec_esx(
+            esx_host, password,
+            f"openssl x509 -in /etc/vmware/spherelet/client.crt "
+            f"-checkend {THRESHOLD_SEC} >/dev/null 2>&1; echo $?",
+        ).strip()
+        still_valid = (check_out.splitlines() or ["1"])[-1] == "0"
+
+        if still_valid:
+            log(f"  [{label}]   OK     {esx_host}  client.crt expires: {expiry}")
         else:
-            log(f"  [{label}] renew_spherelet_certs.sh exited {result.returncode} "
-                f"— non-fatal, startup continues.", level="WARN")
-    except subprocess.TimeoutExpired:
-        log(f"  [{label}] renew_spherelet_certs.sh timed out (600s) "
-            f"— skipping (non-fatal).", level="WARN")
+            log(f"  [{label}]   RENEW  {esx_host}  client.crt expires: {expiry}")
+            needs_renewal = True
+
+    if not needs_renewal:
+        log(f"  [{label}] Supervisor Kubelet Host certificates are still valid "
+            f"for 2+ yrs, not renewing")
+        log("=" * 70)
+        log(f"  [{label}] renew_spherelet_certs: Done (no action needed)")
+        log("=" * 70)
+        return True
+
+    log(f"  [{label}] Supervisor Kubelet Host certificates are expired or "
+        f"expiring soon, renewing...")
+
+    # ── Steps 4-6: renew (temp dir cleaned up in finally) ─────────────────
+    work_dir = tempfile.mkdtemp(prefix="spherelet_renew_")
+    try:
+        # Step 4: copy CA cert and key from SCP
+        log(f"  [{label}] Copying Supervisor CA from {scp_ip} ...")
+        ca_crt_content = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            "cat /etc/kubernetes/pki/ca.crt 2>/dev/null",
+        )
+        # ca.key is a symlink into /dev/shm on the SCP — read via SSH
+        ca_key_content = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            "cat /etc/kubernetes/pki/ca.key 2>/dev/null",
+        )
+        if not ca_crt_content.strip() or not ca_key_content.strip():
+            log(f"  [{label}] ERROR: Could not copy Supervisor CA cert/key — "
+                f"aborting spherelet renewal.", level="ERROR")
+            return True
+
+        ca_crt_path = os.path.join(work_dir, "ca.crt")
+        ca_key_path = os.path.join(work_dir, "ca.key")
+        with open(ca_crt_path, "w") as fh:
+            fh.write(ca_crt_content)
+        with open(ca_key_path, "w") as fh:
+            fh.write(ca_key_content)
+        os.chmod(ca_key_path, 0o600)
+
+        ca_expiry = subprocess.run(
+            ["openssl", "x509", "-in", ca_crt_path, "-noout", "-enddate"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        log(f"  [{label}] Supervisor CA valid until: {ca_expiry}")
+
+        # Step 5: per-node cert renewal
+        for esx_host in esx_nodes:
+            short = esx_host.split(".")[0]   # e.g. esx-05a
+            fqdn = esx_host
+            node_name = f"system:node:{fqdn}"
+
+            log(f"  [{label}] ------------------------------------------")
+            log(f"  [{label}] Processing node: {esx_host}")
+            log(f"  [{label}] ------------------------------------------")
+
+            # 5a: copy existing private keys from ESXi
+            log(f"  [{label}]   Copying existing private keys from {esx_host} ...")
+            client_key = os.path.join(work_dir, f"{short}-client.key")
+            server_key = os.path.join(work_dir, f"{short}-server.key")
+            if not _scp_get_esx(esx_host, password,
+                                 "/etc/vmware/spherelet/client.key", client_key):
+                log(f"  [{label}]   ERROR: Could not copy client.key from "
+                    f"{esx_host} — skipping node.", level="ERROR")
+                continue
+            if not _scp_get_esx(esx_host, password,
+                                 "/etc/vmware/spherelet/server.key", server_key):
+                log(f"  [{label}]   ERROR: Could not copy server.key from "
+                    f"{esx_host} — skipping node.", level="ERROR")
+                continue
+
+            # 5b: re-sign client.crt (kubelet client auth)
+            log(f"  [{label}]   Generating new client.crt for {fqdn} ...")
+            client_ext  = os.path.join(work_dir, f"{short}-client.ext")
+            client_csr  = os.path.join(work_dir, f"{short}-client.csr")
+            client_cert = os.path.join(work_dir, f"{short}-client.crt")
+            with open(client_ext, "w") as fh:
+                fh.write(
+                    "basicConstraints = critical, CA:FALSE\n"
+                    "keyUsage = critical, digitalSignature, keyEncipherment\n"
+                    "extendedKeyUsage = clientAuth\n"
+                    f"subjectAltName = DNS:{node_name}\n"
+                )
+            subprocess.run(
+                ["openssl", "req", "-new", "-key", client_key,
+                 "-subj", f"/C=US/ST=CA/L=Palo Alto/O=system:nodes/CN={node_name}",
+                 "-out", client_csr],
+                capture_output=True, check=True,
+            )
+            subprocess.run(
+                ["openssl", "x509", "-req", "-in", client_csr,
+                 "-CA", ca_crt_path, "-CAkey", ca_key_path, "-CAcreateserial",
+                 "-extfile", client_ext,
+                 "-days", str(CERT_DAYS), "-sha256", "-out", client_cert],
+                capture_output=True, check=True,
+            )
+            new_client_expiry = subprocess.run(
+                ["openssl", "x509", "-in", client_cert, "-noout", "-enddate"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            log(f"  [{label}]   New client.crt valid until: {new_client_expiry}")
+
+            # 5c: re-sign spherelet.crt (kubelet serving cert)
+            log(f"  [{label}]   Generating new spherelet.crt for {fqdn} ...")
+            # Resolve node InternalIP from Supervisor via -o json (parsed locally)
+            node_info_raw = ssh_to_scp_direct(
+                vc, password, scp_ip, scp_pass,
+                f"kubectl get node {fqdn} -o json 2>/dev/null",
+            )
+            node_ip = ""
+            try:
+                nd = json.loads(node_info_raw)
+                node_ip = next(
+                    (a["address"]
+                     for a in nd.get("status", {}).get("addresses", [])
+                     if a.get("type") == "InternalIP"),
+                    "",
+                )
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+            san_line = f"DNS:{fqdn}"
+            if node_ip:
+                san_line += f", IP:{node_ip}"
+
+            server_ext  = os.path.join(work_dir, f"{short}-server.ext")
+            server_csr  = os.path.join(work_dir, f"{short}-server.csr")
+            server_cert = os.path.join(work_dir, f"{short}-spherelet.crt")
+            with open(server_ext, "w") as fh:
+                fh.write(
+                    "basicConstraints = critical, CA:FALSE\n"
+                    "keyUsage = critical, digitalSignature, keyEncipherment\n"
+                    "extendedKeyUsage = serverAuth\n"
+                    f"subjectAltName = {san_line}\n"
+                )
+            subprocess.run(
+                ["openssl", "req", "-new", "-key", server_key,
+                 "-subj", f"/C=US/ST=CA/L=Palo Alto/O=VMware, Inc/CN={fqdn}",
+                 "-out", server_csr],
+                capture_output=True, check=True,
+            )
+            subprocess.run(
+                ["openssl", "x509", "-req", "-in", server_csr,
+                 "-CA", ca_crt_path, "-CAkey", ca_key_path, "-CAcreateserial",
+                 "-extfile", server_ext,
+                 "-days", str(CERT_DAYS), "-sha256", "-out", server_cert],
+                capture_output=True, check=True,
+            )
+            new_server_expiry = subprocess.run(
+                ["openssl", "x509", "-in", server_cert, "-noout", "-enddate"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            log(f"  [{label}]   New spherelet.crt valid until: {new_server_expiry}")
+
+            # 5d: push new certs to ESXi
+            log(f"  [{label}]   Deploying new certificates to {esx_host} ...")
+            if not _scp_put_esx(esx_host, password,
+                                 client_cert,
+                                 "/etc/vmware/spherelet/client.crt"):
+                log(f"  [{label}]   ERROR: Failed to push client.crt to "
+                    f"{esx_host}.", level="ERROR")
+            if not _scp_put_esx(esx_host, password,
+                                 server_cert,
+                                 "/etc/vmware/spherelet/spherelet.crt"):
+                log(f"  [{label}]   ERROR: Failed to push spherelet.crt to "
+                    f"{esx_host}.", level="ERROR")
+
+            # 5e: restart spherelet
+            log(f"  [{label}]   Restarting spherelet on {esx_host} ...")
+            restart_out = _ssh_exec_esx(
+                esx_host, password, "/etc/init.d/spherelet restart",
+            )
+            for line in restart_out.splitlines():
+                if line.strip():
+                    log(f"  [{label}]     {line.rstrip()}")
+            log(f"  [{label}]   {esx_host}: Certificate renewal complete.")
+
+        # Step 6: wait for nodes to re-register, then verify status
+        log("=" * 70)
+        log(f"  [{label}] All spherelet certificates renewed.")
+        log(f"  [{label}] Waiting 60s for nodes to re-register with Supervisor ...")
+        log("=" * 70)
+        time.sleep(60)
+
+        log(f"  [{label}] === Supervisor node status after renewal ===")
+        node_status = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            "kubectl get nodes -o wide 2>/dev/null",
+        )
+        for line in node_status.splitlines():
+            if line.strip():
+                log(f"  [{label}]   {line.rstrip()}")
+
+        log("=" * 70)
+        log(f"  [{label}] renew_spherelet_certs: Done")
+        log("=" * 70)
+
+    except subprocess.CalledProcessError as exc:
+        log(f"  [{label}] openssl failed during spherelet renewal: {exc} "
+            f"— remaining nodes skipped (non-fatal).", level="ERROR")
     except Exception as exc:
-        log(f"  [{label}] renew_spherelet_certs.sh error: {exc} "
-            f"— skipping (non-fatal).", level="WARN")
+        log(f"  [{label}] Unexpected error during spherelet renewal: {exc} "
+            f"— continuing (non-fatal).", level="ERROR")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
     return True  # always non-fatal
 
