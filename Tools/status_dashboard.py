@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # status_dashboard.py - HOLFY27 Lab Startup Status Dashboard
-# Version 1.3 - 2026-05-19
+# Version 1.4 - 2026-05-22
 # Author - Burke Azbill and HOL Core Team
 # Generates an auto-refreshing HTML status page for lab startup monitoring
 
@@ -235,12 +235,18 @@ class StatusDashboard:
             ('vcffinal', '10. VCF Final Tasks (VCFfinal.py)', [
                 ('wcp_vcenter', 'WCP vCenter Services', 'Check/start vapi-endpoint, trustmanagement, wcp'),
                 ('tanzu_control', 'Supervisor Control Plane', 'Power on SCP VMs, verify Supervisor RUNNING'),
-                ('wcp_certs', 'WCP Certificate Fix', 'Fix Kubernetes certificates and webhooks'),
+                ('wcp_certs', 'WCP Certificate Fix', 'Fix Kubernetes certificates and webhooks on Supervisor spherelets'),
                 ('wcp_dns', 'Supervisor DNS Check', 'Verify kube-dns endpoint points to CoreDNS pods'),
                 ('svc_dns', 'Supervisor Service DNS', 'Patch vSphere Pod DNS for Supervisor Services'),
                 ('tanzu_deploy', 'Tanzu Deployment', 'Run Tanzu deployment scripts'),
                 ('vsp_vms', 'VSP Platform VMs', 'Start and verify VSP Platform virtual machines'),
                 ('vcf_components', 'VCF Components', 'Scale up VCF components on VSP management cluster'),
+                ('k8s_certs', 'K8s Certificate Check/Renewal',
+                 'Check and renew expiring K8s certs on VSP and VCFA clusters: '
+                 'kubeadm control-plane certs (Phase 1), kubelet serving certs (Phase 2), '
+                 'cluster CA extension to 10 years (Phase 3.0), '
+                 'cert-manager leaf cert renewal to 5 years (Phase 3.1), '
+                 'Antrea controller TLS (Phase 4). Threshold: 365 days.'),
                 ('vcfa_vms', 'VCF Automation VMs', 'Start VCF Automation virtual machines'),
                 ('vcfa_k8s_health', 'VCFA K8s Health Check', 'Remediate VCF Automation K8s cluster issues'),
                 ('vcfa_urls', 'VCF Automation URL Verification', 'Verify VCF Automation URLs'),
@@ -1166,6 +1172,11 @@ if __name__ == '__main__':
             dashboard.update_task('pings', 'ping_targets', 'complete', 
                                   total=12, success=11, failed=1)
             
+            # K8s certs - complete with cert counts
+            dashboard.update_task('vcffinal', 'k8s_certs', 'complete',
+                                  message='VSP: 57 renewed, 0 skipped | VCFA: 8 renewed',
+                                  total=65, success=65)
+
             # Group 10: urls - complete with counts
             dashboard.update_task('urls', 'url_checks', 'complete', 
                                   total=8, success=8)

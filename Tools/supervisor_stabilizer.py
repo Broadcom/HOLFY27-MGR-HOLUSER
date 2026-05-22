@@ -1,10 +1,110 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 1.5 - 2026-05-13
+Version 2.4 - 2026-05-22
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
+
+v2.4 Changes:
+- renew_spherelet_certs(): removed early-return for dry_run=True.  The function
+  now connects to the SCP, discovers ESXi agent nodes, and runs openssl -checkend
+  on each cert (Steps 1-3) regardless of dry_run.  Steps 4-6 (CA copy, re-sign,
+  push, restart) are guarded with 'if not dry_run'.  This allows vpodchecker.py
+  to call supervisor_stabilizer --dry-run and receive real SKIP/CHECK lines for
+  each spherelet cert without making any changes.
+- _stabilize_one_supervisor() Phase C: restructured so the SCP cert-manager cert
+  check loop runs in both dry_run and live modes.  Renewal actions (Secret delete,
+  deployment restart, proxy cert regeneration) are now guarded with 'if not dry_run'.
+  Emits SKIP / CHECK log lines that vpodchecker can parse for cert status.
+
+v2.3 Changes:
+- Added --threshold-days CLI arg (default 60).  Threads through
+  fix_supervisor_control_plane() → _stabilize_one_supervisor()
+  (_SCP_CERT_THRESHOLD_DAYS) and renew_spherelet_certs() (THRESHOLD_DAYS).
+  confighol-9.1.py passes --threshold-days 1820 to force-renew all spherelet
+  and SCP cert-manager certs to 5 years at template-prep time, so startup
+  checks are instant skips rather than triggering full renewal workloads.
+
+v2.2 Changes:
+- run_on_scp(): Replaced narrow SGR-only ANSI strip pattern with a full
+  VT100 pattern that removes all escape sequences (including \x1b[?2004h
+  bracketed-paste toggles and \x1b[K erase-line sequences) plus bare \r
+  characters.  Residual escape sequences were the root cause of blank lines
+  appearing in labstartup.log between each SCP command.  Also relaxed the
+  root@...# prompt-suppression regex relaxed so residual escape remnants
+  embedded in the hostname/bracket section can no longer prevent filtering.
+
+v2.1 Changes:
+- All cert renewal thresholds lowered from 365 days (1 year) to 60 days.
+  Some certs cannot be issued for more than 1 year; using a 365-day threshold
+  caused those certs to be renewed on every single VCFfinal.py run.
+  60-day threshold matches standard PKI practice for proactive rotation
+  without excessive churn.  Affects: _SCP_CERT_THRESHOLD_DAYS (Phase C)
+  and THRESHOLD_DAYS inside renew_spherelet_certs() (Phase 3).
+
+v2.0 Changes:
+- _stabilize_one_supervisor() Phase C: updated SCP cert-manager certificate
+  renewal threshold from 604800s (1 week) to 365 days (1 year), matching the
+  global threshold used by all other K8s cert checks (spherelet renewal,
+  vsp_cert_renewer.py).  Previously, certs expiring in 20-110 days were logged
+  as "Valid" and silently skipped — they will now be renewed at boot.
+- Added a best-effort Certificate spec.duration patch (43830h / 5 years) before
+  Secret deletion so that cert-manager reissues with a longer TTL where the
+  VMware SCP cert-manager allows it.
+- Improved Phase C log messages to show days-remaining and threshold context.
+
+v1.9 Changes:
+- renew_spherelet_certs(): reduced THRESHOLD_DAYS from 730 (2 years) to 365
+  (1 year), matching the global threshold used by vsp_cert_renewer.py for
+  kubeadm/kubelet/cert-manager/Antrea certs across all K8s clusters.
+  CERT_DAYS remains 1825 (5-year openssl signing target — unchanged).
+
+v1.8 Changes:
+- Fixed ssh_to_scp_direct(): changed 'bash /tmp/.scpcmd_hop' to
+  'bash -s < /tmp/.scpcmd_hop' so the script is piped via stdin to bash on
+  the SCP rather than referencing a file path that only exists on the
+  intermediate vCenter hop.  Previously every call returned
+  'bash: /tmp/.scpcmd_hop: No such file or directory', causing stale-pod
+  namespace discovery to treat the error string as a k8s namespace name and
+  spin through 2x 120-second readiness loops producing nothing but log noise.
+- Added _VALID_NS regex guard in _stabilize_one_supervisor(): non-namespace
+  strings returned by ssh_to_scp_direct (e.g. error messages) are now
+  logged as WARN and discarded rather than passed to _cleanup_stale_pods_with_wait.
+
+v1.7 Changes:
+- Spherelet cert renewal is now native Python — renew_spherelet_certs.sh has
+  been retired to Tools/old/ and the subprocess invocation replaced with a
+  full Python implementation inside renew_spherelet_certs().
+  Three new ESXi SSH/SCP helper functions (_ssh_exec_esx, _scp_get_esx,
+  _scp_put_esx) mirror the shell script's ssh_exec/scp_get/scp_put functions:
+  key-based auth first, sshpass fallback, ssh-keygen -R to clear stale keys.
+  CA cert/key extraction uses ssh_to_scp_direct() and the node InternalIP
+  is resolved via kubectl -o json (parsed locally) per the SSH escaping rule.
+  All openssl re-signing runs locally. No external script dependency remains.
+
+v1.6 Changes:
+- Phase 0b: vCenter WCP service check/start — SSHes to each vCenter and checks
+  vapi-endpoint, trustmanagement, and wcp via vmon-cli; starts any stopped
+  service and re-checks. Critical because trustmanagement delivers encryption
+  keys to the Supervisor; without it decryptK8Pwd.py never returns a valid IP.
+  New flag: --skip-vcenter-services.
+- Phase 3: ESXi spherelet certificate renewal — locates and invokes
+  renew_spherelet_certs.sh for each vCenter after Supervisor stabilization.
+  Spherelet certs are issued with 1-year validity; when they expire ESXi agent
+  nodes go NotReady and the LCI controller-manager pod cannot be scheduled.
+  Non-fatal (script exits 0 when certs are still valid; startup continues on
+  any error). New flag: --skip-spherelet.
+- Phase 4: Supervisor config_status/kubernetes_status polling — polls
+  GET /api/vcenter/namespace-management/clusters via the vCenter REST API
+  (same pattern as _vc_rest_set_noproxy) until all clusters report
+  config_status=RUNNING and kubernetes_status=READY, or the 30-minute timeout
+  is reached. New flag: --skip-supervisor-poll.
+- Phase D improvement: stale pod cleanup now uses a new ssh_to_scp_direct()
+  helper (base64-encoded command, no expect required) to perform a two-pass
+  per-namespace cleanup with a deployment-readiness wait between passes for
+  CCI, ArgoCD, and Harbor namespaces — matching the behaviour of the now-
+  retired check_fix_wcp.sh cleanup_stale_pods() function.
 
 v1.5 Changes:
 - Phase 0 vCenter proxy configuration now also calls the vCenter REST API
@@ -50,32 +150,75 @@ v1.1 Changes:
   to avoid noisy logs from attempting to connect to statically defined vCenters that
   may not exist in the current lab topology.
 
-Combines functionality from check_fix_wcp.sh and fix_supervisor_certs.py into a single,
-idempotent stabilization script that handles:
+Consolidates and supersedes restart_k8s_webhooks.sh, check_fix_wcp.sh, and
+fix_supervisor_certs.py into a single idempotent stabilization script. Intended
+to be run after a cold-boot or ungraceful shutdown of a VCF/vSphere lab. Every
+phase is safe to re-run; skipping a phase leaves that subsystem unchanged.
 
-  1. Content Library trust refresh
-       - Fetches the live upstream cert
-       - Adds it to each vCenter's Content Library trust store
-       - Updates the SHA-1 SSL thumbprint stored on every matching SUBSCRIBED
-         library (this is the step the legacy shell script was MISSING -
-         `govc library.update <id>` without `-thumbprint` is a no-op for the
-         pinned thumbprint, which is why deployments still halt)
-       - Triggers a sync and re-reads the thumbprint to verify the update
-         actually took effect
+Phases (all enabled by default; each has a --skip-* flag):
 
-  2. Supervisor management-proxy cert refresh
-       - SSHes through vCenter to the Supervisor control plane
-       - Deletes the expired cert-manager secrets and rolls the
-         supervisor-management-proxy deployment so cert-manager regenerates
-         fresh mTLS material
+  Phase 0  — vCenter proxy configuration
+       Writes HTTP/HTTPS proxy env-vars to /etc/environment and
+       /etc/sysconfig/proxy on each vCenter as root, and calls the vCenter REST
+       API (PUT /api/appliance/networking/noproxy) to keep the VAMI no-proxy
+       list consistent with the lab's proxy exclusion list.
 
-Both phases are idempotent. Run --dry-run first to preview.
+  Phase 0b — vCenter WCP service check/start
+       SSHes to each vCenter and checks vapi-endpoint, trustmanagement, and wcp
+       via vmon-cli. Starts any stopped service and re-checks after 15 s.
+       trustmanagement is especially critical: it delivers vTPM encryption keys
+       to the Supervisor control-plane node, and without it decryptK8Pwd.py
+       never returns a usable IP (Phase 2 cannot connect to the SCP).
+
+  Phase 1  — Content Library trust refresh
+       Fetches the live upstream TLS certificate, adds it to each vCenter's
+       Content Library trust store, and updates the SHA-1 SSL thumbprint on
+       every matching SUBSCRIBED library. The thumbprint update is the step the
+       legacy shell script was missing — `govc library.update` without
+       `-thumbprint` is a no-op for the pinned thumbprint, which is why
+       deployments halted even after the cert was imported. Also triggers a sync
+       and re-reads the thumbprint to verify the update took effect.
+
+  Phase 2  — Supervisor control plane stabilization
+       SSHes through each vCenter to the Supervisor control plane node:
+       a. Configures containerd and kubelet HTTP proxy settings.
+       b. Checks the storage-quota webhook cert for expiry; if expired, deletes
+          the cert-manager secrets and rolls the affected deployment so
+          cert-manager regenerates fresh mTLS material.
+       c. Scales up CCI, ArgoCD, and Harbor workloads (may be at 0 replicas
+          after a shutdown cycle).
+       d. Performs a two-pass stale pod cleanup per service namespace (CCI,
+          ArgoCD, Harbor) with a deployment-readiness wait between passes to
+          catch pods that re-appear when a scheduler reschedules on a node still
+          reconnecting its spherelet.
+
+  Phase 3  — ESXi spherelet certificate renewal (native Python)
+       ESXi hosts acting as Supervisor worker nodes carry 1-year spherelet
+       certificates; when they expire the nodes go NotReady and the LCI
+       controller-manager pod cannot be scheduled (502 Bad Gateway from the
+       Local Consumption Interface). This phase is idempotent — it pre-checks
+       expiry via openssl -checkend and skips renewal when all certs are valid
+       for 2+ more years. Retrieves SCP credentials via decryptK8Pwd.py,
+       discovers ESXi agent nodes via kubectl -o json, copies the Supervisor
+       CA from the SCP, re-signs client.crt and spherelet.crt locally using
+       openssl, pushes new certs to each ESXi host, restarts spherelet, waits
+       60 s for nodes to re-register, and logs final node status. Newly renewed
+       certs are valid for 5 years. Non-fatal: startup continues on any error.
+
+  Phase 4  — Supervisor status verification
+       Polls GET /api/vcenter/namespace-management/clusters via the vCenter REST
+       API every 30 s until every Supervisor cluster reports
+       config_status=RUNNING and kubernetes_status=READY, or the 30-minute
+       timeout is reached. Provides an authoritative pass/fail signal that
+       matches what the vCenter UI shows.
+
+All phases are idempotent. Run --dry-run first to preview every action.
 
 Requirements on the host running this script:
   - python3 (standard library only)
   - openssl, sshpass, expect on PATH
   - govc on PATH (auto-installed under ~/.local/bin if missing)
-  - Network reachability to the target upstream domain AND to each vCenter
+  - Network reachability to each vCenter and to the target upstream domain
 """
 
 import argparse
@@ -177,7 +320,8 @@ def log(msg, level="INFO"):
     # Timestamp is handled by the VCFfinal.py script that runs this script
     #ts = time.strftime("%Y-%m-%d %H:%M:%S")
     #print(f"[{ts}] {level}: {msg}", flush=True)
-    print(f"{level}: {msg}", flush=True)
+    #print(f"{level}: {msg}", flush=True)
+    print(f"{msg}", flush=True)
 
 
 def fail(msg, code=1):
@@ -395,6 +539,76 @@ def apply_proxy_to_vcenter(vc, password, dry_run):
             f"OS-level files were still written).", level="WARN")
 
     return True
+
+
+# ---------------------------------------------------------------------------
+# Phase 0b: vCenter WCP service check/start
+# ---------------------------------------------------------------------------
+
+def check_start_vcenter_services(vc, password, dry_run):
+    """Check and start critical WCP vCenter services via vmon-cli.
+
+    Checks vapi-endpoint, trustmanagement, and wcp. If any are not STARTED,
+    attempts to start them via vmon-cli and re-checks after 15 s.
+
+    trustmanagement is especially critical: it delivers the vTPM encryption
+    keys to the Supervisor control-plane node; without it decryptK8Pwd.py
+    never returns a usable IP and Phase 2 cannot connect to the SCP.
+
+    Returns True when all services are running (or were successfully started),
+    False when a service remains non-STARTED after the start attempt.
+    Failure is non-fatal — the caller records it and moves on.
+    """
+    label = vc["label"]
+    log("")
+    log(f"--- {label} ({vc['host']}) -- vCenter WCP service check/start ---")
+
+    if dry_run:
+        log(f"  [{label}] [dry-run] would check vapi-endpoint, trustmanagement, "
+            f"wcp via vmon-cli on {vc['host']}")
+        return True
+
+    # Verify SSH reachability first
+    probe = ssh_to_vcenter(vc["host"], vc["root_user"], password, "echo VCREACH_OK")
+    if "VCREACH_OK" not in probe:
+        log(f"  [{label}] SSH to {vc['host']} as {vc['root_user']} not available "
+            f"— skipping vCenter service check.", level="WARN")
+        return True  # non-fatal: root SSH may be disabled on some builds
+
+    all_ok = True
+    for service in ("vapi-endpoint", "trustmanagement", "wcp"):
+        check_cmd = (
+            f"vmon-cli -s {service} 2>/dev/null "
+            f"| grep 'RunState:' | head -1 | sed 's/.*RunState: //'"
+        )
+        status = ssh_to_vcenter(
+            vc["host"], vc["root_user"], password, check_cmd
+        ).strip()
+
+        if status == "STARTED":
+            log(f"  [{label}] {service}: STARTED")
+            continue
+
+        log(f"  [{label}] {service}: {status or 'UNKNOWN'} — attempting start...",
+            level="WARN")
+        ssh_to_vcenter(vc["host"], vc["root_user"], password,
+                       f"vmon-cli -i {service}")
+        time.sleep(15)
+
+        status = ssh_to_vcenter(
+            vc["host"], vc["root_user"], password, check_cmd
+        ).strip()
+        if status == "STARTED":
+            log(f"  [{label}] {service}: started successfully.")
+        else:
+            log(f"  [{label}] {service}: still {status or 'UNKNOWN'} after start "
+                f"attempt.", level="ERROR")
+            if service == "trustmanagement":
+                log(f"  [{label}]   NOTE: trustmanagement is critical for Supervisor "
+                    f"encryption key delivery to the SCP node.", level="WARN")
+            all_ok = False
+
+    return all_ok
 
 
 # ---------------------------------------------------------------------------
@@ -865,7 +1079,16 @@ def run_on_scp(vcenter_host, vcenter_user, vcenter_pass, scp_ip, scp_pass,
             shell=True, capture_output=True, text=True,
             timeout=timeout + 30,
         )
-        output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        # Strip ALL ANSI/VT100 escape sequences (not just SGR colour codes)
+        # and bare carriage-return characters.  The previous pattern
+        # r"\x1b\[[0-9;]*m" only removed colour codes; sequences such as
+        # \x1b[?2004h (bracketed-paste toggle) and \x1b[K (erase-line) were
+        # left in the output.  str.strip() doesn't remove ESC (\x1b), so
+        # lines containing only those sequences appeared non-empty, passed the
+        # `if not s` guard, and were logged as blank lines.  The same residual
+        # escapes also broke the root@…# prompt regex mid-line.
+        output = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])", "", result.stdout)
+        output = output.replace("\r", "")
 
         noise = [
             "spawn ", "Command>", "Shell access is granted",
@@ -879,7 +1102,8 @@ def run_on_scp(vcenter_host, vcenter_user, vcenter_pass, scp_ip, scp_pass,
             s = line.strip()
             if not s or any(p in s for p in noise):
                 continue
-            if re.match(r"^root@\S+\s*\[.*\]\s*#", s):
+            # Suppress shell prompts (root@<hostname> [<dir>]# …)
+            if re.match(r"^root@\S+.*\]#", s):
                 continue
             if s.startswith("<") and len(s) < 80 and "#" not in s:
                 continue
@@ -893,6 +1117,35 @@ def run_on_scp(vcenter_host, vcenter_user, vcenter_pass, scp_ip, scp_pass,
         return "\n".join(clean)
     finally:
         os.unlink(script_path)
+
+
+def _probe_scp_kubeconfig(vc, password, scp_ip, scp_pass):
+    """Return the best available kubeconfig path on the Supervisor (SCP) node.
+
+    Tries /etc/kubernetes/super-admin.conf first (always on disk, unencrypted,
+    available from vSphere 8.0 U2 / VCF 9.x).  Falls back to admin.conf if
+    super-admin.conf is absent.
+
+    Uses ssh_to_vcenter (not ssh_to_scp_direct) so it works even before
+    the bash-s hop is fully established.
+    """
+    probe = ssh_to_vcenter(
+        vc["host"], vc["root_user"], password,
+        f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_kc "
+        f"&& chmod 600 /tmp/.scppwd_kc "
+        f"&& sshpass -f /tmp/.scppwd_kc ssh "
+        f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        f"-o LogLevel=ERROR -o ConnectTimeout=10 root@{scp_ip} "
+        f"'ls /etc/kubernetes/super-admin.conf 2>/dev/null && echo SUPER_ADMIN_EXISTS "
+        f"|| ls /etc/kubernetes/admin.conf 2>/dev/null && echo ADMIN_EXISTS "
+        f"|| echo NO_KUBECONFIG' "
+        f"; rm -f /tmp/.scppwd_kc",
+    )
+    if "SUPER_ADMIN_EXISTS" in probe:
+        return "/etc/kubernetes/super-admin.conf"
+    if "ADMIN_EXISTS" in probe:
+        return "/etc/kubernetes/admin.conf"
+    return "/etc/kubernetes/super-admin.conf"  # best guess
 
 
 def parse_decrypt_k8_pwd(text):
@@ -980,7 +1233,7 @@ def discover_scp_node_ips(vc, password):
 
 
 def fix_supervisor_control_plane(vc, password, dry_run, only_cluster=None,
-                        only_ip=None):
+                        only_ip=None, threshold_days=60):
     """Regenerate the supervisor-management-proxy mTLS cert on one vCenter.
 
     A single vCenter can host multiple Supervisor clusters; we discover them
@@ -1040,13 +1293,112 @@ def fix_supervisor_control_plane(vc, password, dry_run, only_cluster=None,
 
     overall_ok = True
     for c in clusters:
-        ok = _stabilize_one_supervisor(vc, password, c, dry_run)
+        ok = _stabilize_one_supervisor(vc, password, c, dry_run,
+                                       threshold_days=threshold_days)
         if not ok:
             overall_ok = False
     return overall_ok
 
 
-def _stabilize_one_supervisor(vc, password, cluster, dry_run):
+def ssh_to_scp_direct(vc, password, scp_ip, scp_pass, command, timeout=60):
+    """Run a single command on the SCP by hopping through the vCenter SSH.
+
+    Unlike run_on_scp() (which uses expect for multi-command interactive
+    sessions), this helper is for simple non-interactive commands where
+    only stdout is needed.  Both the SCP password and the command are
+    transmitted via base64-decode to a temp file to avoid shell quoting
+    issues through the double hop (this host → vCenter → SCP).
+    """
+    pwd_b64 = base64.b64encode(scp_pass.encode()).decode()
+    cmd_b64 = base64.b64encode(command.encode()).decode()
+    # NOTE: /tmp/.scpcmd_hop is written on the vCenter hop host, not on the
+    # SCP itself.  We pipe it as stdin to 'bash -s' on the SCP via the stdin
+    # redirect so the SCP never needs a local copy of the file.
+    hop_cmd = (
+        f"echo {pwd_b64} | base64 -d > /tmp/.scppwd_hop "
+        f"&& chmod 600 /tmp/.scppwd_hop "
+        f"&& echo {cmd_b64} | base64 -d > /tmp/.scpcmd_hop "
+        f"&& chmod 700 /tmp/.scpcmd_hop "
+        f"&& sshpass -f /tmp/.scppwd_hop ssh "
+        f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        f"-o LogLevel=ERROR -o ConnectTimeout=15 "
+        f"root@{scp_ip} bash -s < /tmp/.scpcmd_hop 2>&1; "
+        f"rm -f /tmp/.scppwd_hop /tmp/.scpcmd_hop"
+    )
+    return ssh_to_vcenter(vc["host"], vc["root_user"], password, hop_cmd)
+
+
+def _cleanup_stale_pods_with_wait(vc, password, scp_ip, scp_pass, namespace,
+                                   kubeconfig, label, max_wait=120):
+    """Delete stale pods in a namespace and wait for deployments to stabilise.
+
+    Makes two passes:
+      1. Delete pods in NotFound / ProviderFailed / Unknown /
+         ImagePullBackOff / Failed state.
+      2. Wait up to max_wait seconds for all deployments to reach
+         desired == ready replicas.
+      3. Second sweep for newly-appeared stale pods (common when a
+         deployment controller reschedules on a node that is still
+         recovering its spherelet connection).
+
+    Uses ssh_to_scp_direct() so no expect session is needed.
+    Returns True (result is informational; caller continues regardless).
+    """
+    K = f"kubectl --kubeconfig={kubeconfig}"
+
+    STALE_FILTER = "NotFound|ProviderFailed|Unknown|ImagePullBackOff|Failed"
+
+    def _get_stale(ns):
+        out = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            f"{K} get pods -n {ns} --no-headers 2>/dev/null "
+            f"| grep -E '{STALE_FILTER}' | awk '{{print $1}}'",
+        )
+        return [p for p in out.splitlines() if p.strip()]
+
+    def _delete_stale(ns, pods):
+        for pod in pods:
+            ssh_to_scp_direct(
+                vc, password, scp_ip, scp_pass,
+                f"{K} delete pod -n {ns} {pod} --force --grace-period=0 "
+                f"2>/dev/null || true",
+            )
+
+    # --- Pass 1: initial delete ---
+    stale = _get_stale(namespace)
+    if not stale:
+        return True
+    log(f"      [{label}] {namespace}: {len(stale)} stale pod(s) — deleting...")
+    _delete_stale(namespace, stale)
+
+    # --- Wait for deployments to reach desired state ---
+    wait_elapsed = 0
+    while wait_elapsed < max_wait:
+        time.sleep(10)
+        wait_elapsed += 10
+        not_ready = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            f"{K} get deploy -n {namespace} --no-headers 2>/dev/null "
+            f"| awk '{{split($2,a,\"/\"); if (a[1]!=a[2]) print $1}}'",
+        ).strip()
+        if not not_ready:
+            log(f"      [{label}] {namespace}: all deployments ready "
+                f"({wait_elapsed}s)")
+            break
+        log(f"      [{label}] {namespace}: waiting for {not_ready} "
+            f"({wait_elapsed}s/{max_wait}s)")
+
+    # --- Pass 2: second sweep for newly-appeared strays ---
+    stale2 = _get_stale(namespace)
+    if stale2:
+        log(f"      [{label}] {namespace}: {len(stale2)} new stale pod(s) "
+            f"appeared — deleting...")
+        _delete_stale(namespace, stale2)
+
+    return True
+
+
+def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60):
     """Apply the stabilization fixes to a single Supervisor cluster stanza."""
     label = vc["label"]
     cid = cluster["cluster"]
@@ -1205,38 +1557,12 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
             timeout=120,
         )
 
-    # Resolve the best available kubeconfig on this SCP node:
-    #
-    #   1. /etc/kubernetes/super-admin.conf  (preferred - unencrypted, always
-    #      on disk, available from vSphere 8.0 U2 onwards).
-    #
-    #   2. /etc/kubernetes/admin.conf        (older builds; this is a symlink
-    #      to /dev/shm/wcp_decrypted_data/k8s-admin-conf_uid0 which is written
-    #      by a PAM module on interactive login.  In our non-interactive expect
-    #      session PAM does not run, so we must trigger decryption manually by
-    #      running decryptK8Pwd.py equivalent: `wcp-user-keys-gen` or by
-    #      sourcing the wcp environment which calls it as a side effect).
-    #
-    # We probe which path exists *before* we attempt any kubectl commands so
-    # we can build the right invocation rather than letting kubectl fail with
-    # a confusing "stat: no such file or directory" error.
-    kubeconfig_probe = ssh_to_vcenter(
-        vc["host"], vc["root_user"], password,
-        f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_kc "
-        f"&& chmod 600 /tmp/.scppwd_kc "
-        f"&& sshpass -f /tmp/.scppwd_kc ssh "
-        f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-        f"-o LogLevel=ERROR -o ConnectTimeout=10 root@{scp_ip} "
-        f"'ls /etc/kubernetes/super-admin.conf 2>/dev/null && echo SUPER_ADMIN_EXISTS "
-        f"|| ls /etc/kubernetes/admin.conf 2>/dev/null && echo ADMIN_EXISTS "
-        f"|| echo NO_KUBECONFIG' "
-        f"; rm -f /tmp/.scppwd_kc",
-    )
-    if "SUPER_ADMIN_EXISTS" in kubeconfig_probe:
-        kubeconfig = "/etc/kubernetes/super-admin.conf"
+    # Resolve the best available kubeconfig on this SCP node.
+    # See _probe_scp_kubeconfig() for the full rationale.
+    kubeconfig = _probe_scp_kubeconfig(vc, password, scp_ip, scp_pass)
+    if "super-admin" in kubeconfig:
         log(f"      [{cid}] Using super-admin.conf (preferred, unencrypted).")
-    elif "ADMIN_EXISTS" in kubeconfig_probe:
-        kubeconfig = "/etc/kubernetes/admin.conf"
+    elif "admin.conf" in kubeconfig:
         log(f"      [{cid}] super-admin.conf not found; using admin.conf "
             f"(PAM-decrypted symlink).", level="WARN")
         log(f"      [{cid}] Note: admin.conf relies on PAM decryption. If "
@@ -1245,47 +1571,72 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
     else:
         log(f"      [{cid}] No kubeconfig found at /etc/kubernetes/ on "
             f"{scp_ip}. kubectl commands will likely fail.", level="WARN")
-        kubeconfig = "/etc/kubernetes/super-admin.conf"  # best guess; let kubectl error speak for itself
 
     K = f"kubectl --kubeconfig={kubeconfig}"
 
     # --- Phase C: Certificate Management ---
-    if dry_run:
-        log(f"      [{cid}] [dry-run] would check/delete cert-manager + kube-system "
-            f"proxy secrets and roll the deployment on {scp_ip}.")
-    else:
-        # 1. Check and renew storage-quota certs
-        certs_to_check = [
-            ("vmware-system-cert-manager", "storage-quota-root-ca-secret"),
-            ("kube-system", "storage-quota-webhook-server-internal-cert"),
-            ("kube-system", "cns-storage-quota-extension-cert")
-        ]
-        
-        certs_need_renewal = False
-        for ns, secret in certs_to_check:
-            cmd_cert = (
-                f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_cert && chmod 600 /tmp/.scppwd_cert && "
-                f"sshpass -f /tmp/.scppwd_cert ssh {SSH_OPTS} root@{scp_ip} "
-                f"'{K} -n {ns} get secret {secret} -o jsonpath=\"{{.data.tls\\\\.crt}}\" 2>/dev/null | base64 -d 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null'; "
-                f"rm -f /tmp/.scppwd_cert"
-            )
-            end_date_out = ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_cert).strip()
-            
-            if not end_date_out:
-                log(f"      [{cid}] {ns}/{secret}: Not found or could not parse (will be created automatically)")
-                continue
-                
-            m = re.search(r"notAfter=(.+)", end_date_out)
-            if m:
-                expiry_str = m.group(1)
-                try:
-                    # Parse openssl date format, e.g., "May  7 14:54:44 2026 GMT"
-                    expiry_epoch = time.mktime(time.strptime(expiry_str, "%b %d %H:%M:%S %Y %Z"))
-                    now_epoch = time.time()
-                    remaining = expiry_epoch - now_epoch
-                    if remaining <= 604800: # 1 week
-                        log(f"      [{cid}] {ns}/{secret}: EXPIRING SOON or EXPIRED. Deleting to trigger regeneration...")
-                        certs_need_renewal = True
+    # Threshold: any cert expiring within threshold_days is renewed.  Default
+    # (60) matches the global policy used by vsp_cert_renewer.py.  confighol
+    # passes a higher value (1820) to force-renew everything at template-prep
+    # time so startup checks are instant skips.
+    _SCP_CERT_THRESHOLD_DAYS = threshold_days
+    _SCP_CERT_THRESHOLD_SEC  = _SCP_CERT_THRESHOLD_DAYS * 86400
+
+    # 1. Check (and optionally renew) storage-quota cert-manager certs.
+    # The check loop runs in BOTH dry_run and live modes so vpodchecker can
+    # call with --dry-run and receive real SKIP/CHECK lines.  Renewal actions
+    # (Secret delete, deployment restart) are guarded with 'if not dry_run'.
+    certs_to_check = [
+        ("vmware-system-cert-manager", "storage-quota-root-ca-secret"),
+        ("kube-system", "storage-quota-webhook-server-internal-cert"),
+        ("kube-system", "cns-storage-quota-extension-cert")
+    ]
+
+    log(f"      [{cid}] Checking {len(certs_to_check)} SCP cert-manager cert(s) "
+        f"(threshold: {_SCP_CERT_THRESHOLD_DAYS}d)")
+
+    certs_need_renewal = False
+    for ns, secret in certs_to_check:
+        cmd_cert = (
+            f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_cert && chmod 600 /tmp/.scppwd_cert && "
+            f"sshpass -f /tmp/.scppwd_cert ssh {SSH_OPTS} root@{scp_ip} "
+            f"'{K} -n {ns} get secret {secret} -o jsonpath=\"{{.data.tls\\\\.crt}}\" 2>/dev/null | base64 -d 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null'; "
+            f"rm -f /tmp/.scppwd_cert"
+        )
+        end_date_out = ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_cert).strip()
+
+        if not end_date_out:
+            log(f"      [{cid}] {ns}/{secret}: Not found or could not parse "
+                f"(will be created automatically)")
+            continue
+
+        m = re.search(r"notAfter=(.+)", end_date_out)
+        if m:
+            expiry_str = m.group(1)
+            try:
+                # Parse openssl date format, e.g., "May  7 14:54:44 2026 GMT"
+                expiry_epoch = time.mktime(
+                    time.strptime(expiry_str, "%b %d %H:%M:%S %Y %Z"))
+                now_epoch = time.time()
+                remaining = expiry_epoch - now_epoch
+                days_remaining = int(remaining / 86400)
+                if remaining <= _SCP_CERT_THRESHOLD_SEC:
+                    log(f"      [{cid}] CHECK  : {ns}/{secret} — "
+                        f"EXPIRES in {days_remaining}d (expires: {expiry_str})")
+                    certs_need_renewal = True
+                    if not dry_run:
+                        # Best-effort: patch Certificate spec.duration to 5 years
+                        # before deleting the Secret so cert-manager reissues with
+                        # a longer TTL.  Silently ignored if the Certificate resource
+                        # doesn't exist or the VMware operator restricts duration.
+                        cmd_patch = (
+                            f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_patch && chmod 600 /tmp/.scppwd_patch && "
+                            f"sshpass -f /tmp/.scppwd_patch ssh {SSH_OPTS} root@{scp_ip} "
+                            f"'{K} -n {ns} patch certificate {secret} --type=merge "
+                            f"-p {{\\\"spec\\\":{{\\\"duration\\\":\\\"43830h0m0s\\\"}}}} 2>/dev/null || true'; "
+                            f"rm -f /tmp/.scppwd_patch"
+                        )
+                        ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_patch)
                         cmd_del = (
                             f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_del && chmod 600 /tmp/.scppwd_del && "
                             f"sshpass -f /tmp/.scppwd_del ssh {SSH_OPTS} root@{scp_ip} "
@@ -1293,29 +1644,35 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
                             f"rm -f /tmp/.scppwd_del"
                         )
                         ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_del)
-                    else:
-                        log(f"      [{cid}] {ns}/{secret}: Valid ({int(remaining/86400)}d remaining)")
-                except ValueError:
-                    log(f"      [{cid}] Could not parse expiry date: {expiry_str}", level="WARN")
-                    
-        if certs_need_renewal:
-            log(f"      [{cid}] Restarting deployments to regenerate certificates...")
-            restart_cmds = [
-                f"{K} -n kube-system rollout restart deploy cns-storage-quota-extension || true",
-                f"{K} -n kube-system rollout restart deploy storage-quota-webhook || true"
-            ]
-            run_on_scp(
-                vc["host"], vc["root_user"], password,
-                scp_ip, scp_pass, restart_cmds,
-                description=f"      [{cid}] Restarting storage-quota deployments",
-                timeout=120,
-            )
-            time.sleep(20)
+                else:
+                    log(f"      [{cid}] SKIP   : {ns}/{secret} — "
+                        f"valid for {days_remaining}d (expires: {expiry_str})")
+            except ValueError:
+                log(f"      [{cid}] Could not parse expiry date: {expiry_str}",
+                    level="WARN")
 
-        # 2. Regenerate supervisor-management-proxy certs.
-        #    All commands are guarded so they are silent no-ops when the
-        #    resources don't exist (e.g. newer Supervisor builds that have
-        #    removed or renamed this component).
+    if certs_need_renewal and not dry_run:
+        log(f"      [{cid}] Restarting deployments to regenerate certificates...")
+        restart_cmds = [
+            f"{K} -n kube-system rollout restart deploy cns-storage-quota-extension || true",
+            f"{K} -n kube-system rollout restart deploy storage-quota-webhook || true"
+        ]
+        run_on_scp(
+            vc["host"], vc["root_user"], password,
+            scp_ip, scp_pass, restart_cmds,
+            description=f"      [{cid}] Restarting storage-quota deployments",
+            timeout=120,
+        )
+        time.sleep(20)
+
+    # 2. Regenerate supervisor-management-proxy certs (live mode only).
+    #    All commands are guarded so they are silent no-ops when the
+    #    resources don't exist (e.g. newer Supervisor builds that have
+    #    removed or renamed this component).
+    if dry_run:
+        log(f"      [{cid}] [dry-run] would regenerate supervisor-management-proxy "
+            f"certs on {scp_ip}.")
+    else:
         commands = [
             # Delete cert-manager proxy secrets only when any actually exist.
             # Without the guard, an empty subshell produces "error: resource(s)
@@ -1345,29 +1702,84 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
 
     # --- Phase D: Workload Recovery ---
     if dry_run:
-        log(f"      [{cid}] [dry-run] would scale up cci, argocd, harbor and clean up stale pods.")
+        log(f"      [{cid}] [dry-run] would scale up cci, argocd, harbor and "
+            f"clean up stale pods.")
     else:
-        log(f"      [{cid}] Scaling up services and cleaning up stale pods...")
+        log(f"      [{cid}] Scaling up services and running initial stale-pod "
+            f"sweep...")
         recovery_cmds = [
-            # Scale up CCI
-            f"CCI_NS=$({K} get ns --no-headers | grep 'svc-cci-ns' | awk '{{print $1}}'); if [ -n \"$CCI_NS\" ]; then {K} -n $CCI_NS scale deployment --all --replicas=1; fi",
+            # Scale up CCI (dynamic namespace discovery)
+            f"CCI_NS=$({K} get ns --no-headers | grep 'svc-cci-ns' | awk '{{print $1}}');"
+            f" if [ -n \"$CCI_NS\" ]; then {K} -n $CCI_NS scale deployment --all --replicas=1; fi",
             # Scale up ArgoCD
             f"if {K} get ns argocd >/dev/null 2>&1; then {K} -n argocd scale deployment --all --replicas=1; fi",
-            # Scale up Harbor
-            f"HARBOR_NS=$({K} get ns --no-headers | grep 'svc-harbor' | awk '{{print $1}}'); if [ -n \"$HARBOR_NS\" ]; then {K} -n $HARBOR_NS scale sts --all --replicas=1; {K} -n $HARBOR_NS scale deployment --all --replicas=1; fi",
-            # Clean up stale pods in all namespaces.
-            # Written as a single compound line so the shell returns to the
-            # root@.*# prompt when done.  Multiline for/if blocks put the
-            # shell into continuation mode (> prompt) which the expect script
-            # can never match, causing a timeout after the first 'do'.
-            f"for ns in $({K} get ns --no-headers | awk '{{print $1}}'); do stale=$({K} get pods -n $ns --no-headers 2>/dev/null | grep -E 'NotFound|ProviderFailed|Unknown|ImagePullBackOff|Failed' | awk '{{print $1}}'); if [ -n \"$stale\" ]; then for p in $stale; do {K} delete pod -n $ns $p --force --grace-period=0 2>/dev/null; done; fi; done",
+            # Scale up Harbor (both statefulsets and deployments)
+            f"HARBOR_NS=$({K} get ns --no-headers | grep 'svc-harbor' | awk '{{print $1}}');"
+            f" if [ -n \"$HARBOR_NS\" ]; then {K} -n $HARBOR_NS scale sts --all --replicas=1;"
+            f" {K} -n $HARBOR_NS scale deployment --all --replicas=1; fi",
+            # First stale-pod sweep across all namespaces (fire-and-forget via
+            # expect). Written as a single compound line — multiline for/if
+            # blocks put the shell into continuation mode (> prompt) which the
+            # expect script can never match.
+            f"for ns in $({K} get ns --no-headers | awk '{{print $1}}'); do"
+            f" stale=$({K} get pods -n $ns --no-headers 2>/dev/null"
+            f" | grep -E 'NotFound|ProviderFailed|Unknown|ImagePullBackOff|Failed'"
+            f" | awk '{{print $1}}');"
+            f" if [ -n \"$stale\" ]; then for p in $stale; do"
+            f" {K} delete pod -n $ns $p --force --grace-period=0 2>/dev/null; done; fi; done",
         ]
         run_on_scp(
             vc["host"], vc["root_user"], password,
             scp_ip, scp_pass, recovery_cmds,
-            description=f"      [{cid}] Executing workload recovery on SCP",
+            description=f"      [{cid}] Executing initial workload recovery on SCP",
             timeout=300,
         )
+
+        # Per-namespace two-pass cleanup with deployment-readiness wait.
+        # Discover actual namespace names dynamically via ssh_to_scp_direct so
+        # we aren't hard-coding domain-specific suffixes like -domain-c10.
+        log(f"      [{cid}] Running per-namespace stale-pod cleanup with "
+            f"readiness wait...")
+
+        cci_raw = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            f"{K} get ns --no-headers 2>/dev/null | grep 'svc-cci-ns' | awk '{{print $1}}'",
+        )
+        argocd_check = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            f"{K} get ns argocd --no-headers 2>/dev/null | awk '{{print $1}}'",
+        )
+        harbor_raw = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            f"{K} get ns --no-headers 2>/dev/null | grep 'svc-harbor' | awk '{{print $1}}'",
+        )
+
+        # Validate that namespace names look like real k8s namespaces
+        # (lowercase alphanumeric + hyphens).  If ssh_to_scp_direct returned
+        # an error string the bad value is silently dropped rather than
+        # being passed to _cleanup_stale_pods_with_wait as the namespace.
+        _VALID_NS = re.compile(r'^[a-z0-9][a-z0-9\-]*$')
+
+        def _add_ns(raw, namespaces):
+            for ns in raw.splitlines():
+                ns = ns.strip()
+                if ns and _VALID_NS.match(ns):
+                    namespaces.append(ns)
+                elif ns:
+                    log(f"      [{cid}] namespace discovery returned unexpected "
+                        f"value (ignored): {ns!r}", level="WARN")
+
+        service_namespaces = []
+        _add_ns(cci_raw, service_namespaces)
+        if "argocd" in argocd_check and _VALID_NS.match("argocd"):
+            service_namespaces.append("argocd")
+        _add_ns(harbor_raw, service_namespaces)
+
+        for ns in service_namespaces:
+            _cleanup_stale_pods_with_wait(
+                vc, password, scp_ip, scp_pass, ns, kubeconfig, cid,
+                max_wait=120,
+            )
 
     return True
 
@@ -1472,9 +1884,572 @@ def load_vcenters(config_path):
     if ini_vcenters:
         log(f"Loaded {len(ini_vcenters)} vCenter(s) from /tmp/config.ini")
         return ini_vcenters
-        
+
     log("Falling back to default vCenter list")
     return DEFAULT_VCENTERS
+
+
+# ---------------------------------------------------------------------------
+# ESXi SSH / SCP helpers (used by Phase 3 spherelet renewal)
+# ---------------------------------------------------------------------------
+
+def _ssh_exec_esx(host, password, command, timeout=30):
+    """SSH to an ESXi host as root and return stdout as a string.
+
+    Tries key-based auth first (BatchMode=yes), then falls back to sshpass.
+    Returns empty string on any error rather than raising — callers treat
+    empty / missing output as "unreadable" and handle it gracefully.
+    Mirrors the ssh_exec() function from the retired renew_spherelet_certs.sh.
+    """
+    subprocess.run(["ssh-keygen", "-R", host], capture_output=True)
+    esx_opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", "LogLevel=ERROR",
+    ]
+    # Key-based first
+    try:
+        r = subprocess.run(
+            ["ssh", *esx_opts, "-o", "BatchMode=yes", f"root@{host}", command],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            return r.stdout
+    except Exception:
+        pass
+    # sshpass fallback
+    try:
+        r = subprocess.run(
+            ["sshpass", "-p", password, "ssh", *esx_opts,
+             f"root@{host}", command],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return r.stdout
+    except Exception:
+        return ""
+
+
+def _scp_get_esx(host, password, remote_path, local_path, timeout=30):
+    """SCP a file FROM an ESXi host to a local path.
+
+    Tries key-based auth first, then sshpass fallback.  Returns True on
+    success, False on any error.
+    Mirrors scp_get() from the retired renew_spherelet_certs.sh.
+    """
+    subprocess.run(["ssh-keygen", "-R", host], capture_output=True)
+    esx_opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", "LogLevel=ERROR",
+    ]
+    try:
+        r = subprocess.run(
+            ["scp", *esx_opts, "-o", "BatchMode=yes",
+             f"root@{host}:{remote_path}", local_path],
+            capture_output=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["sshpass", "-p", password, "scp", *esx_opts,
+             f"root@{host}:{remote_path}", local_path],
+            capture_output=True, timeout=timeout,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _scp_put_esx(host, password, local_path, remote_path, timeout=30):
+    """SCP a file TO an ESXi host from a local path.
+
+    Tries key-based auth first, then sshpass fallback.  Returns True on
+    success, False on any error.
+    Mirrors scp_put() from the retired renew_spherelet_certs.sh.
+    """
+    subprocess.run(["ssh-keygen", "-R", host], capture_output=True)
+    esx_opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", "LogLevel=ERROR",
+    ]
+    try:
+        r = subprocess.run(
+            ["scp", *esx_opts, "-o", "BatchMode=yes",
+             local_path, f"root@{host}:{remote_path}"],
+            capture_output=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["sshpass", "-p", password, "scp", *esx_opts,
+             local_path, f"root@{host}:{remote_path}"],
+            capture_output=True, timeout=timeout,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: ESXi spherelet certificate renewal
+# ---------------------------------------------------------------------------
+
+def renew_spherelet_certs(vc, password, dry_run, threshold_days=60):
+    """Renew expired ESXi spherelet certificates for Supervisor worker nodes.
+
+    ESXi hosts acting as Supervisor worker nodes carry 1-year spherelet
+    certificates (client.crt and spherelet.crt in /etc/vmware/spherelet/).
+    When they expire the nodes go NotReady and workloads — including the LCI
+    controller-manager pod — cannot be scheduled, causing 502 Bad Gateway
+    from the Local Consumption Interface.
+
+    Pre-checks expiry against threshold_days.  If every node's client.crt is
+    valid for at least that long, this is a no-op.  Default is 60 days
+    (startup policy); confighol passes 1820 to force-renew everything to 5
+    years at template-prep time.
+
+    Steps (mirroring renew_spherelet_certs.sh exactly):
+      1. Retrieve SCP credentials via decryptK8Pwd.py (same as Phase 2).
+      2. Discover ESXi agent nodes via kubectl -o json (parsed locally).
+      3. Pre-check each node's client.crt with openssl -checkend.
+      4. Copy Supervisor CA cert and key from SCP to a local temp dir.
+      5. For each ESXi node: copy private keys, re-sign client.crt and
+         spherelet.crt locally with openssl, push new certs, restart spherelet.
+      6. Wait 60 s for nodes to re-register, then log node status.
+
+    Uses _ssh_exec_esx() / _scp_get_esx() / _scp_put_esx() for direct ESXi
+    SSH/SCP (key-based first, sshpass fallback) and ssh_to_scp_direct() to
+    interact with the Supervisor control-plane node.  All openssl operations
+    run locally via subprocess.run().  Non-fatal — always returns True.
+    """
+    CERT_DAYS = 1825                      # 5-year renewal validity (openssl -days)
+    THRESHOLD_DAYS = threshold_days       # renew if any cert expires within N days
+    THRESHOLD_SEC = THRESHOLD_DAYS * 86400
+
+    label = vc["label"]
+    log("")
+    log(f"--- {label} ({vc['host']}) -- ESXi spherelet certificate renewal ---")
+    log("=" * 70)
+
+    if dry_run:
+        log(f"  [{label}] [dry-run] checking spherelet cert expiry on all ESXi "
+            f"agent nodes (threshold: {THRESHOLD_DAYS}d) — no changes will be made.")
+
+    # ── Step 1: retrieve SCP credentials ──────────────────────────────────
+    log(f"  [{label}] Retrieving Supervisor credentials via decryptK8Pwd.py ...")
+    decrypt = ssh_to_vcenter(
+        vc["host"], vc["root_user"], password,
+        "PAGER=cat TERM=dumb /usr/lib/vmware-wcp/decryptK8Pwd.py 2>&1 | cat",
+    )
+    clusters = parse_decrypt_k8_pwd(decrypt)
+    if not clusters:
+        log(f"  [{label}] No Supervisor found on this vCenter — "
+            f"skipping spherelet renewal.")
+        return True
+
+    scp_ip = clusters[0]["ip"]
+    scp_pass = clusters[0]["pwd"]
+    log(f"  [{label}] Supervisor node IP: {scp_ip}")
+    log(f"  [{label}] Supervisor credentials retrieved.")
+
+    # ── Resolve best kubeconfig (shared helper, same probe as Phase 2) ────
+    kubeconfig = _probe_scp_kubeconfig(vc, password, scp_ip, scp_pass)
+    if "super-admin" in kubeconfig:
+        log(f"  [{label}] Using super-admin.conf (preferred, unencrypted).")
+    else:
+        log(f"  [{label}] Using admin.conf kubeconfig.")
+    K = f"kubectl --kubeconfig={kubeconfig}"
+
+    # ── Step 2: discover ESXi agent nodes ─────────────────────────────────
+    log(f"  [{label}] Discovering Supervisor agent nodes ...")
+    nodes_json_raw = ssh_to_scp_direct(
+        vc, password, scp_ip, scp_pass,
+        f"{K} get nodes -l node-role.kubernetes.io/agent -o json 2>/dev/null",
+    )
+    esx_nodes = []
+    try:
+        nodes_data = json.loads(nodes_json_raw)
+        esx_nodes = [
+            item["metadata"]["name"]
+            for item in nodes_data.get("items", [])
+        ]
+    except (json.JSONDecodeError, KeyError):
+        log(f"  [{label}] WARNING: could not parse node JSON from SCP "
+            f"(raw output: {nodes_json_raw[:200]!r})", level="WARN")
+
+    if not esx_nodes:
+        log(f"  [{label}] ERROR: No agent nodes found on Supervisor {scp_ip}",
+            level="ERROR")
+        return True
+
+    log(f"  [{label}] Found {len(esx_nodes)} agent node(s): "
+        f"{', '.join(esx_nodes)}")
+
+    # ── Step 3: pre-check cert expiry ─────────────────────────────────────
+    log(f"  [{label}] Pre-checking certificate validity "
+        f"(threshold: {THRESHOLD_DAYS} days / 1 year)...")
+    needs_renewal = False
+    for esx_host in esx_nodes:
+        expiry = _ssh_exec_esx(
+            esx_host, password,
+            "openssl x509 -in /etc/vmware/spherelet/client.crt "
+            "-noout -enddate 2>/dev/null | cut -d= -f2",
+        ).strip() or "unreadable"
+
+        # -checkend exits 0 = still valid for N seconds, 1 = will expire
+        check_out = _ssh_exec_esx(
+            esx_host, password,
+            f"openssl x509 -in /etc/vmware/spherelet/client.crt "
+            f"-checkend {THRESHOLD_SEC} >/dev/null 2>&1; echo $?",
+        ).strip()
+        still_valid = (check_out.splitlines() or ["1"])[-1] == "0"
+
+        if still_valid:
+            log(f"  [{label}] SKIP   : {esx_host} client.crt — VALID (expires: {expiry})")
+        else:
+            log(f"  [{label}] CHECK  : {esx_host} client.crt — expires: {expiry} "
+                f"(within {THRESHOLD_DAYS}d threshold)")
+            needs_renewal = True
+
+    if not needs_renewal:
+        log(f"  [{label}] All spherelet client.crt certs are valid — no renewal needed.")
+        log("=" * 70)
+        log(f"  [{label}] renew_spherelet_certs: Done (no action needed)")
+        log("=" * 70)
+        return True
+
+    if dry_run:
+        log(f"  [{label}] [dry-run] would renew {len(esx_nodes)} spherelet "
+            f"cert(s) — skipping file operations.")
+        log("=" * 70)
+        log(f"  [{label}] renew_spherelet_certs: Done (dry-run)")
+        log("=" * 70)
+        return True
+
+    log(f"  [{label}] Supervisor Kubelet Host certificates are expired or "
+        f"expiring soon, renewing...")
+
+    # ── Steps 4-6: renew (temp dir cleaned up in finally) ─────────────────
+    work_dir = tempfile.mkdtemp(prefix="spherelet_renew_")
+    try:
+        # Step 4: copy CA cert and key from SCP
+        log(f"  [{label}] Copying Supervisor CA from {scp_ip} ...")
+        ca_crt_content = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            "cat /etc/kubernetes/pki/ca.crt 2>/dev/null",
+        )
+        # ca.key is a symlink into /dev/shm on the SCP — read via SSH
+        ca_key_content = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            "cat /etc/kubernetes/pki/ca.key 2>/dev/null",
+        )
+        if not ca_crt_content.strip() or not ca_key_content.strip():
+            log(f"  [{label}] ERROR: Could not copy Supervisor CA cert/key — "
+                f"aborting spherelet renewal.", level="ERROR")
+            return True
+
+        ca_crt_path = os.path.join(work_dir, "ca.crt")
+        ca_key_path = os.path.join(work_dir, "ca.key")
+        with open(ca_crt_path, "w") as fh:
+            fh.write(ca_crt_content)
+        with open(ca_key_path, "w") as fh:
+            fh.write(ca_key_content)
+        os.chmod(ca_key_path, 0o600)
+
+        ca_expiry = subprocess.run(
+            ["openssl", "x509", "-in", ca_crt_path, "-noout", "-enddate"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        log(f"  [{label}] Supervisor CA valid until: {ca_expiry}")
+
+        # Step 5: per-node cert renewal
+        for esx_host in esx_nodes:
+            short = esx_host.split(".")[0]   # e.g. esx-05a
+            fqdn = esx_host
+            node_name = f"system:node:{fqdn}"
+
+            log(f"  [{label}] ------------------------------------------")
+            log(f"  [{label}] Processing node: {esx_host}")
+            log(f"  [{label}] ------------------------------------------")
+
+            # 5a: copy existing private keys from ESXi
+            log(f"  [{label}]   Copying existing private keys from {esx_host} ...")
+            client_key = os.path.join(work_dir, f"{short}-client.key")
+            server_key = os.path.join(work_dir, f"{short}-server.key")
+            if not _scp_get_esx(esx_host, password,
+                                 "/etc/vmware/spherelet/client.key", client_key):
+                log(f"  [{label}]   ERROR: Could not copy client.key from "
+                    f"{esx_host} — skipping node.", level="ERROR")
+                continue
+            if not _scp_get_esx(esx_host, password,
+                                 "/etc/vmware/spherelet/server.key", server_key):
+                log(f"  [{label}]   ERROR: Could not copy server.key from "
+                    f"{esx_host} — skipping node.", level="ERROR")
+                continue
+
+            # 5b: re-sign client.crt (kubelet client auth)
+            log(f"  [{label}]   Generating new client.crt for {fqdn} ...")
+            client_ext  = os.path.join(work_dir, f"{short}-client.ext")
+            client_csr  = os.path.join(work_dir, f"{short}-client.csr")
+            client_cert = os.path.join(work_dir, f"{short}-client.crt")
+            with open(client_ext, "w") as fh:
+                fh.write(
+                    "basicConstraints = critical, CA:FALSE\n"
+                    "keyUsage = critical, digitalSignature, keyEncipherment\n"
+                    "extendedKeyUsage = clientAuth\n"
+                    f"subjectAltName = DNS:{node_name}\n"
+                )
+            subprocess.run(
+                ["openssl", "req", "-new", "-key", client_key,
+                 "-subj", f"/C=US/ST=CA/L=Palo Alto/O=system:nodes/CN={node_name}",
+                 "-out", client_csr],
+                capture_output=True, check=True,
+            )
+            subprocess.run(
+                ["openssl", "x509", "-req", "-in", client_csr,
+                 "-CA", ca_crt_path, "-CAkey", ca_key_path, "-CAcreateserial",
+                 "-extfile", client_ext,
+                 "-days", str(CERT_DAYS), "-sha256", "-out", client_cert],
+                capture_output=True, check=True,
+            )
+            new_client_expiry = subprocess.run(
+                ["openssl", "x509", "-in", client_cert, "-noout", "-enddate"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            log(f"  [{label}]   New client.crt valid until: {new_client_expiry}")
+
+            # 5c: re-sign spherelet.crt (kubelet serving cert)
+            log(f"  [{label}]   Generating new spherelet.crt for {fqdn} ...")
+            # Resolve node InternalIP from Supervisor via -o json (parsed locally)
+            node_info_raw = ssh_to_scp_direct(
+                vc, password, scp_ip, scp_pass,
+                f"{K} get node {fqdn} -o json 2>/dev/null",
+            )
+            node_ip = ""
+            try:
+                nd = json.loads(node_info_raw)
+                node_ip = next(
+                    (a["address"]
+                     for a in nd.get("status", {}).get("addresses", [])
+                     if a.get("type") == "InternalIP"),
+                    "",
+                )
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+            san_line = f"DNS:{fqdn}"
+            if node_ip:
+                san_line += f", IP:{node_ip}"
+
+            server_ext  = os.path.join(work_dir, f"{short}-server.ext")
+            server_csr  = os.path.join(work_dir, f"{short}-server.csr")
+            server_cert = os.path.join(work_dir, f"{short}-spherelet.crt")
+            with open(server_ext, "w") as fh:
+                fh.write(
+                    "basicConstraints = critical, CA:FALSE\n"
+                    "keyUsage = critical, digitalSignature, keyEncipherment\n"
+                    "extendedKeyUsage = serverAuth\n"
+                    f"subjectAltName = {san_line}\n"
+                )
+            subprocess.run(
+                ["openssl", "req", "-new", "-key", server_key,
+                 "-subj", f"/C=US/ST=CA/L=Palo Alto/O=VMware, Inc/CN={fqdn}",
+                 "-out", server_csr],
+                capture_output=True, check=True,
+            )
+            subprocess.run(
+                ["openssl", "x509", "-req", "-in", server_csr,
+                 "-CA", ca_crt_path, "-CAkey", ca_key_path, "-CAcreateserial",
+                 "-extfile", server_ext,
+                 "-days", str(CERT_DAYS), "-sha256", "-out", server_cert],
+                capture_output=True, check=True,
+            )
+            new_server_expiry = subprocess.run(
+                ["openssl", "x509", "-in", server_cert, "-noout", "-enddate"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            log(f"  [{label}]   New spherelet.crt valid until: {new_server_expiry}")
+
+            # 5d: push new certs to ESXi
+            log(f"  [{label}]   Deploying new certificates to {esx_host} ...")
+            if not _scp_put_esx(esx_host, password,
+                                 client_cert,
+                                 "/etc/vmware/spherelet/client.crt"):
+                log(f"  [{label}]   ERROR: Failed to push client.crt to "
+                    f"{esx_host}.", level="ERROR")
+            if not _scp_put_esx(esx_host, password,
+                                 server_cert,
+                                 "/etc/vmware/spherelet/spherelet.crt"):
+                log(f"  [{label}]   ERROR: Failed to push spherelet.crt to "
+                    f"{esx_host}.", level="ERROR")
+
+            # 5e: restart spherelet
+            log(f"  [{label}]   Restarting spherelet on {esx_host} ...")
+            restart_out = _ssh_exec_esx(
+                esx_host, password, "/etc/init.d/spherelet restart",
+            )
+            for line in restart_out.splitlines():
+                if line.strip():
+                    log(f"  [{label}]     {line.rstrip()}")
+            log(f"  [{label}]   {esx_host}: Certificate renewal complete.")
+
+        # Step 6: wait for nodes to re-register, then verify status
+        log("=" * 70)
+        log(f"  [{label}] All spherelet certificates renewed.")
+        log(f"  [{label}] Waiting 60s for nodes to re-register with Supervisor ...")
+        log("=" * 70)
+        time.sleep(60)
+
+        log(f"  [{label}] === Supervisor node status after renewal ===")
+        node_status = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            f"{K} get nodes -o wide 2>/dev/null",
+        )
+        for line in node_status.splitlines():
+            if line.strip():
+                log(f"  [{label}]   {line.rstrip()}")
+
+        log("=" * 70)
+        log(f"  [{label}] renew_spherelet_certs: Done")
+        log("=" * 70)
+
+    except subprocess.CalledProcessError as exc:
+        log(f"  [{label}] openssl failed during spherelet renewal: {exc} "
+            f"— remaining nodes skipped (non-fatal).", level="ERROR")
+    except Exception as exc:
+        log(f"  [{label}] Unexpected error during spherelet renewal: {exc} "
+            f"— continuing (non-fatal).", level="ERROR")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    return True  # always non-fatal
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Supervisor config_status / kubernetes_status polling
+# ---------------------------------------------------------------------------
+
+def poll_supervisor_ready(vc, password, dry_run, timeout=1800):
+    """Poll GET /api/vcenter/namespace-management/clusters until RUNNING/READY.
+
+    Uses the vCenter REST API session pattern (same as _vc_rest_set_noproxy)
+    to poll every 30 s until every Supervisor cluster on this vCenter reports
+        config_status  == 'RUNNING'
+        kubernetes_status == 'READY'
+    or the timeout (default 30 min) is reached.
+
+    Returns True if all clusters reached the target state (or if no clusters
+    exist on this vCenter — nothing to wait for), False on timeout or session
+    error.  Caller records the failure and continues; overall startup is not
+    aborted.
+    """
+    label = vc["label"]
+    log("")
+    log(f"--- {label} ({vc['host']}) -- Supervisor status polling "
+        f"(timeout={timeout // 60}m) ---")
+
+    if dry_run:
+        log(f"  [{label}] [dry-run] would poll Supervisor "
+            f"config_status / kubernetes_status")
+        return True
+
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    # Authenticate — /api/session returns the token as a plain JSON string
+    auth_b64 = base64.b64encode(
+        f"{vc['sso_user']}:{password}".encode()
+    ).decode()
+    try:
+        sess_req = urllib.request.Request(
+            f"https://{vc['host']}/api/session",
+            method="POST",
+            headers={"Authorization": f"Basic {auth_b64}"},
+        )
+        with urllib.request.urlopen(sess_req, context=ssl_ctx, timeout=30) as resp:
+            # Response is a JSON string (the token value), not an object
+            token = json.loads(resp.read().decode())
+    except Exception as exc:
+        log(f"  [{label}] Could not create REST API session for Supervisor "
+            f"poll: {exc}", level="WARN")
+        return False
+
+    clusters_url = (f"https://{vc['host']}"
+                    f"/api/vcenter/namespace-management/clusters")
+    poll_interval = 30
+    start = time.time()
+
+    try:
+        while True:
+            elapsed = int(time.time() - start)
+            try:
+                req = urllib.request.Request(
+                    clusters_url,
+                    headers={"vmware-api-session-id": token},
+                )
+                with urllib.request.urlopen(req, context=ssl_ctx,
+                                            timeout=30) as resp:
+                    clusters = json.loads(resp.read().decode())
+            except Exception as exc:
+                log(f"  [{label}] Poll error ({elapsed}s): {exc}", level="WARN")
+                clusters = []
+
+            if not clusters:
+                log(f"  [{label}] No Supervisor clusters found on this vCenter "
+                    f"— nothing to wait for. ({elapsed}s)")
+                return True
+
+            all_ready = True
+            for cluster in clusters:
+                cfg = cluster.get("config_status", "")
+                k8s = cluster.get("kubernetes_status", "")
+                name = (cluster.get("cluster_name")
+                        or cluster.get("cluster", "unknown"))
+                log(f"  [{label}] {name}: config={cfg}, "
+                    f"k8s={k8s} ({elapsed}s/{timeout}s)")
+                if cfg != "RUNNING" or k8s != "READY":
+                    all_ready = False
+                if cfg == "ERROR":
+                    log(f"  [{label}] {name}: Supervisor is in ERROR state. "
+                        f"Check vCenter Supervisor Management UI.",
+                        level="ERROR")
+
+            if all_ready:
+                log(f"  [{label}] All Supervisor clusters RUNNING and READY "
+                    f"after {elapsed}s.")
+                return True
+
+            if elapsed >= timeout:
+                log(f"  [{label}] Supervisor did not reach RUNNING/READY "
+                    f"within {timeout // 60}m.", level="ERROR")
+                return False
+
+            time.sleep(poll_interval)
+
+    finally:
+        # Best-effort session cleanup
+        try:
+            del_req = urllib.request.Request(
+                f"https://{vc['host']}/api/session",
+                method="DELETE",
+                headers={"vmware-api-session-id": token},
+            )
+            with urllib.request.urlopen(del_req, context=ssl_ctx,
+                                        timeout=15) as _:
+                pass
+        except Exception:
+            pass
 
 
 def parse_args():
@@ -1519,12 +2494,29 @@ def parse_args():
         help="Don't run the vCenter proxy configuration phase (Phase 0).",
     )
     p.add_argument(
+        "--skip-vcenter-services", action="store_true",
+        help="Don't run the vCenter WCP service check/start phase (Phase 0b). "
+             "Use when vapi-endpoint, trustmanagement, and wcp are known-good.",
+    )
+    p.add_argument(
         "--skip-content-lib", action="store_true",
-        help="Don't run the content library trust refresh phase.",
+        help="Don't run the content library trust refresh phase (Phase 1).",
     )
     p.add_argument(
         "--skip-proxy", action="store_true",
-        help="Don't run the supervisor-management-proxy regeneration phase.",
+        help="Don't run the supervisor-management-proxy regeneration phase "
+             "(Phase 2).",
+    )
+    p.add_argument(
+        "--skip-spherelet", action="store_true",
+        help="Don't run the ESXi spherelet certificate renewal phase (Phase 3). "
+             "Use when spherelet certs are known to be valid (> 1 year remaining).",
+    )
+    p.add_argument(
+        "--skip-supervisor-poll", action="store_true",
+        help="Don't poll Supervisor config_status/kubernetes_status for "
+             "RUNNING/READY after stabilization (Phase 4). Use when you only "
+             "need to apply fixes without waiting for full readiness.",
     )
     p.add_argument(
         "--supervisor-cluster", default=None,
@@ -1543,6 +2535,12 @@ def parse_args():
         "--dry-run", action="store_true",
         help="Show every action that would be taken without changing state.",
     )
+    p.add_argument(
+        "--threshold-days", type=int, default=60,
+        help="Renew spherelet and SCP cert-manager certs expiring within this "
+             "many days (default: 60).  Pass 1820 when calling from confighol "
+             "to force-renew all certs to 5 years at template-prep time.",
+    )
     return p.parse_args()
 
 
@@ -1552,15 +2550,21 @@ def main():
 
     banner("Supervisor Cert Rotation Remediation")
     log(f"target upstream domain : {args.target_domain}")
+    log(f"threshold-days         : {args.threshold_days}")
     log(f"dry-run                : {args.dry_run}")
     _active = " ".join(filter(None, [
         "" if args.skip_vcenter_proxy else "vcenter-proxy",
+        "" if args.skip_vcenter_services else "vcenter-services",
         "" if args.skip_content_lib else "content-lib",
         "" if args.skip_proxy else "proxy",
+        "" if args.skip_spherelet else "spherelet",
+        "" if args.skip_supervisor_poll else "supervisor-poll",
     ]))
     log(f"phases                 : {_active or '(none!)'}")
 
-    if args.skip_vcenter_proxy and args.skip_content_lib and args.skip_proxy:
+    if (args.skip_vcenter_proxy and args.skip_vcenter_services
+            and args.skip_content_lib and args.skip_proxy
+            and args.skip_spherelet and args.skip_supervisor_poll):
         fail("All phases skipped - nothing to do.")
 
     for tool in ("openssl", "sshpass", "expect"):
@@ -1582,6 +2586,14 @@ def main():
             if not ok:
                 failures.append(f"vcenter-proxy:{vc['label']}")
 
+    # ---- Phase 0b: vCenter WCP service check/start ----------------------
+    if not args.skip_vcenter_services:
+        banner("Phase 0b: vCenter WCP service check/start")
+        for vc in vcenters:
+            ok = check_start_vcenter_services(vc, password, args.dry_run)
+            if not ok:
+                failures.append(f"vcenter-services:{vc['label']}")
+
     # ---- Phase 1: Content Library trust refresh -------------------------
     if not args.skip_content_lib:
         banner("Phase 1: Content Library trust refresh")
@@ -1599,19 +2611,36 @@ def main():
             if not ok:
                 failures.append(f"content-lib:{vc['label']}")
 
-    # ---- Phase 2: Supervisor control plane stabilization -----------------------
+    # ---- Phase 2: Supervisor control plane stabilization ----------------
     if not args.skip_proxy:
         banner("Phase 2: Supervisor control plane stabilization")
-        # We try all vCenters, the function will gracefully skip if no Supervisor is found
         proxy_targets = vcenters
         for vc in proxy_targets:
             ok = fix_supervisor_control_plane(
                 vc, password, args.dry_run,
                 only_cluster=args.supervisor_cluster,
                 only_ip=args.supervisor_ip,
+                threshold_days=args.threshold_days,
             )
             if not ok:
                 failures.append(f"proxy:{vc['label']}")
+
+    # ---- Phase 3: ESXi spherelet certificate renewal --------------------
+    if not args.skip_spherelet:
+        banner("Phase 3: ESXi spherelet certificate renewal")
+        proxy_targets = proxy_targets if not args.skip_proxy else vcenters
+        for vc in proxy_targets:
+            renew_spherelet_certs(vc, password, args.dry_run,
+                                  threshold_days=args.threshold_days)
+            # Non-fatal — never appended to failures
+
+    # ---- Phase 4: Supervisor config_status / kubernetes_status poll -----
+    if not args.skip_supervisor_poll:
+        banner("Phase 4: Supervisor status verification")
+        for vc in vcenters:
+            ok = poll_supervisor_ready(vc, password, args.dry_run)
+            if not ok:
+                failures.append(f"supervisor-poll:{vc['label']}")
 
     banner("Summary")
     if failures:

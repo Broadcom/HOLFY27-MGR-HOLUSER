@@ -1,12 +1,13 @@
 #!/bin/bash
 # Author: Burke Azbill
-# Version: 1.1
-# Date: 2025-10-24
+# Version: 1.2
+# Date: 2026-05-21
 # Script to delete old certificates and restart Kubernetes webhooks after extracting credentials from vCenter
 # This script:
 # 1. SSH to vCenter and run decryptK8Pwd.py
 # 2. Parse output to extract IP and Password
 # 3. Use those credentials to delete certificates and restart the webhooks
+# 4. Renew ESXi spherelet (agent node) certificates if expired.
 #
 # Usage: ./restart_k8s_webhooks.sh [vcenter_host]
 # Example: ./restart_k8s_webhooks.sh vc-wld01-a.site-a.vcf.lab
@@ -127,4 +128,18 @@ echo "==========================================" >> "${LOG_FILE}"
 echo "✓ Successfully completed certificate resets and webhook restarts" >> "${LOG_FILE}"
 echo "==========================================" >> "${LOG_FILE}"
 
+# Renew ESXi spherelet (agent node) certificates if expired.
+# These 1-year certs govern ESXi→Supervisor API authentication; when they
+# expire the worker nodes go NotReady, blocking the LCI controller-manager
+# pod from being scheduled and causing the /appplatform1/ endpoint to 502.
+SPHERELET_SCRIPT="$(dirname "$0")/renew_spherelet_certs.sh"
+if [[ -x "${SPHERELET_SCRIPT}" ]]; then
+    echo "==========================================" >> "${LOG_FILE}"
+    echo "Renewing ESXi spherelet certificates..." >> "${LOG_FILE}"
+    echo "==========================================" >> "${LOG_FILE}"
+    bash "${SPHERELET_SCRIPT}" "${VCENTER_HOST}" >> "${LOG_FILE}" 2>&1 || \
+        echo "WARNING: renew_spherelet_certs.sh exited non-zero; check log for details" >> "${LOG_FILE}"
+else
+    echo "WARNING: ${SPHERELET_SCRIPT} not found or not executable — skipping spherelet renewal" >> "${LOG_FILE}"
+fi
 
