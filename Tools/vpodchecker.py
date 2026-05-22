@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.6 - April 2, 2026
+# Version 2.7 - 2026-05-22
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.7 - 2026-05-22:
+#   - Added check_k8s_certificates(): checks Kubernetes certificate expiration
+#     across VCFA, VSP, and Supervisor environments by calling
+#     vsp_cert_renewer.py --dry-run and supervisor_stabilizer.py --dry-run as
+#     subprocesses and parsing their CHECK/SKIP output lines.  Results are
+#     grouped by environment label and emitted as CheckResult objects.
+#   - Added k8s_cert_checks field to ValidationReport dataclass.
+#   - Added "KUBERNETES CERTIFICATES" section to main() output.
+#   - k8s_cert_checks included in all_checks for overall status calculation.
+#
 # v2.6 - 2026-04-02:
 #   - Fixed issue with Firefox root CA check not being imported
 #   - Update to skip the VCFA DRS Isolation check if the lab is not using VCFA
@@ -146,6 +156,7 @@ class ValidationReport:
     fleet_password_policy_checks: List[CheckResult] = field(default_factory=list)
     firefox_ca_checks: List[CheckResult] = field(default_factory=list)
     drs_isolation_checks: List[CheckResult] = field(default_factory=list)
+    k8s_cert_checks: List[CheckResult] = field(default_factory=list)
     overall_status: str = "PASS"
     
     def to_dict(self) -> Dict:
@@ -2522,6 +2533,233 @@ def check_auto_platform_isolation() -> List[CheckResult]:
 
 
 #==============================================================================
+# KUBERNETES CERTIFICATE CHECKS
+#==============================================================================
+
+def check_k8s_certificates() -> List[CheckResult]:
+    """Check Kubernetes certificate expiration across VCFA, VSP, and Supervisor.
+
+    Calls two external scripts in dry-run mode and parses their structured
+    CHECK/SKIP output lines into CheckResult objects grouped by cluster label.
+
+    Subprocess A — vsp_cert_renewer.py --dry-run --cluster all --no-timestamps
+        Checks kubeadm CP certs, kubelet serving certs, cert-manager leaf
+        certs, and Antrea TLS across all VSP and VCFA clusters.
+        Emits lines: [LABEL] CHECK  : <cert> — EXPIRES: ... — RESIDUAL: <N>d
+                     [LABEL] SKIP   : ...
+
+    Subprocess B — supervisor_stabilizer.py --auto --dry-run (cert phases only)
+        Checks SCP cert-manager certs (storage-quota, proxy) and spherelet certs.
+        Emits lines: [LABEL] CHECK  : <cert> — EXPIRES in <N>d
+                     [LABEL] SKIP   : <cert> — valid for <N>d
+
+    Groups results by label prefix:
+        [VSP]  → "VSP Kubernetes"
+        [VCFA] → "VCFA Kubernetes"
+        others (e.g. [vc-wld01-a]) → "Supervisor Kubernetes"
+
+    :return: List[CheckResult] — one entry per cert found. Empty if scripts
+             are not installed or not reachable.
+    """
+    results = []
+    tools_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
+
+    # ── Regex patterns for both scripts ───────────────────────────────────────
+    # vsp_cert_renewer.py patterns:
+    #   [LABEL]  CHECK  : <name> — EXPIRES: <date> — RESIDUAL: <N>d
+    #   [LABEL]  SKIP   : ... valid for ... (RESIDUAL <N>d)
+    _re_vcr_label   = re.compile(r'\[([A-Z0-9_-]+)\]')
+    _re_vcr_check   = re.compile(
+        r'CHECK\s+:\s+(.+?)\s+[—\-]+\s+EXPIRES:\s+(.+?)\s+[—\-]+\s+RESIDUAL:\s+(\d+)d',
+        re.IGNORECASE)
+    _re_vcr_skip    = re.compile(r'SKIP\s+:', re.IGNORECASE)
+    _re_vcr_error   = re.compile(r'ERROR\s+:', re.IGNORECASE)
+    # supervisor_stabilizer.py patterns:
+    #   [LABEL] CHECK  : <ns>/<secret> — EXPIRES in <N>d (expires: <date>)
+    #   [LABEL] SKIP   : <ns>/<secret> — valid for <N>d (expires: <date>)
+    #   [LABEL] CHECK  : <host> client.crt — expires: <date> (within <N>d threshold)
+    #   [LABEL] SKIP   : <host> client.crt — VALID (expires: <date>)
+    _re_ss_check    = re.compile(
+        r'CHECK\s+:\s+(.+?)\s+[—\-]+\s+.*?(\d+)d', re.IGNORECASE)
+    _re_ss_skip     = re.compile(
+        r'SKIP\s+:\s+(.+?)\s+[—\-]+\s+.*?(\d+)d', re.IGNORECASE)
+
+    def _label_to_env(label: str) -> str:
+        """Map a cluster label string to a human-readable environment name."""
+        u = label.upper()
+        if u == 'VSP':
+            return 'VSP Kubernetes'
+        if u == 'VCFA':
+            return 'VCFA Kubernetes'
+        return 'Supervisor Kubernetes'
+
+    # ── Subprocess A: vsp_cert_renewer.py ─────────────────────────────────────
+    renewer = os.path.join(tools_dir, 'vsp_cert_renewer.py')
+    if os.path.isfile(renewer):
+        cmd_a = [
+            'python3', '-u', renewer,
+            '--dry-run',
+            '--cluster', 'all',
+            '--no-timestamps',
+        ]
+        try:
+            proc_a = subprocess.run(
+                cmd_a,
+                capture_output=True, text=True, timeout=300,
+            )
+            for line in (proc_a.stdout + proc_a.stderr).splitlines():
+                # Extract label from [LABEL] prefix inside the message
+                lm = _re_vcr_label.search(line)
+                label = lm.group(1) if lm else 'VSP'
+                env = _label_to_env(label)
+
+                # CHECK line — cert is expiring / was renewed
+                cm = _re_vcr_check.search(line)
+                if cm:
+                    cert_name = cm.group(1).strip()
+                    expires   = cm.group(2).strip()
+                    residual  = int(cm.group(3))
+                    if residual <= 0:
+                        status, msg = 'FAIL', f'EXPIRED (expires: {expires})'
+                    elif residual <= 60:
+                        status, msg = 'WARN', (
+                            f'Expires in {residual}d (expires: {expires})')
+                    else:
+                        status, msg = 'PASS', (
+                            f'Valid — {residual}d remaining (expires: {expires})')
+                    results.append(CheckResult(
+                        name=f'{env}: {cert_name}',
+                        status=status, message=msg,
+                        details={'label': label, 'residual_days': residual,
+                                 'expires': expires}))
+                    continue
+
+                # SKIP line — cert is valid, no renewal needed
+                if _re_vcr_skip.search(line) and _re_vcr_label.search(line):
+                    # Extract a short name from the line when possible
+                    # e.g. "[VSP] SKIP   : apiserver valid for >60d (RESIDUAL 1825d)"
+                    after_skip = re.sub(
+                        r'^.*?SKIP\s*:\s*', '', line, flags=re.IGNORECASE).strip()
+                    # Pull out residual days if present
+                    rm = re.search(r'RESIDUAL\s+(\d+)d', after_skip, re.IGNORECASE)
+                    rd = int(rm.group(1)) if rm else None
+                    msg = (f'Valid — {rd}d remaining' if rd else 'Valid') + \
+                          (f' ({after_skip[:80]})' if after_skip else '')
+                    results.append(CheckResult(
+                        name=f'{env}: {after_skip[:60]}',
+                        status='PASS', message=msg,
+                        details={'label': label}))
+                    continue
+
+                # ERROR line
+                if _re_vcr_error.search(line) and _re_vcr_label.search(line):
+                    after_err = re.sub(
+                        r'^.*?ERROR\s*:\s*', '', line, flags=re.IGNORECASE).strip()
+                    results.append(CheckResult(
+                        name=f'{env}: ERROR',
+                        status='FAIL', message=after_err[:120],
+                        details={'label': label}))
+
+        except subprocess.TimeoutExpired:
+            results.append(CheckResult(
+                name='K8s Cert Check (VSP/VCFA)',
+                status='WARN',
+                message='vsp_cert_renewer.py timed out after 300s'))
+        except Exception as exc:
+            results.append(CheckResult(
+                name='K8s Cert Check (VSP/VCFA)',
+                status='WARN',
+                message=f'Could not run vsp_cert_renewer.py: {exc}'))
+    else:
+        results.append(CheckResult(
+            name='K8s Cert Check (VSP/VCFA)',
+            status='SKIPPED',
+            message=f'vsp_cert_renewer.py not found at {renewer}'))
+
+    # ── Subprocess B: supervisor_stabilizer.py (cert phases only) ─────────────
+    stabilizer = os.path.join(tools_dir, 'supervisor_stabilizer.py')
+    if os.path.isfile(stabilizer):
+        cmd_b = [
+            'python3', '-u', stabilizer,
+            '--auto',
+            '--dry-run',
+            '--skip-vcenter-proxy',
+            '--skip-vcenter-services',
+            '--skip-content-lib',
+            '--skip-supervisor-poll',
+        ]
+        try:
+            proc_b = subprocess.run(
+                cmd_b,
+                capture_output=True, text=True, timeout=300,
+            )
+            for line in (proc_b.stdout + proc_b.stderr).splitlines():
+                # supervisor_stabilizer labels appear as [label] inside the msg,
+                # typically like [vc-wld01-a] or a cluster ID.
+                lm = re.search(r'\[([a-z0-9_\-\.]+)\]', line, re.IGNORECASE)
+                label = lm.group(1) if lm else 'supervisor'
+                env = _label_to_env(label)
+
+                # CHECK line (cert expiring)
+                cm = _re_ss_check.search(line)
+                if cm and 'CHECK' in line.upper():
+                    cert_name = cm.group(1).strip()
+                    residual  = int(cm.group(2))
+                    exp_m = re.search(r'expires?[:\s]+([^\(]+)', line, re.IGNORECASE)
+                    expires = exp_m.group(1).strip() if exp_m else 'unknown'
+                    if residual <= 0:
+                        status, msg = 'FAIL', f'EXPIRED (expires: {expires})'
+                    elif residual <= 60:
+                        status, msg = 'WARN', (
+                            f'Expires in {residual}d (expires: {expires})')
+                    else:
+                        status, msg = 'PASS', (
+                            f'Valid — {residual}d remaining (expires: {expires})')
+                    results.append(CheckResult(
+                        name=f'{env}: {cert_name}',
+                        status=status, message=msg,
+                        details={'label': label, 'residual_days': residual}))
+                    continue
+
+                # SKIP line (cert valid)
+                sm = _re_ss_skip.search(line)
+                if sm and 'SKIP' in line.upper():
+                    cert_name = sm.group(1).strip()
+                    residual  = int(sm.group(2))
+                    exp_m = re.search(r'expires?[:\s]+([^\(]+)', line, re.IGNORECASE)
+                    expires = exp_m.group(1).strip() if exp_m else 'unknown'
+                    results.append(CheckResult(
+                        name=f'{env}: {cert_name}',
+                        status='PASS',
+                        message=f'Valid — {residual}d remaining (expires: {expires})',
+                        details={'label': label, 'residual_days': residual}))
+
+        except subprocess.TimeoutExpired:
+            results.append(CheckResult(
+                name='K8s Cert Check (Supervisor)',
+                status='WARN',
+                message='supervisor_stabilizer.py timed out after 300s'))
+        except Exception as exc:
+            results.append(CheckResult(
+                name='K8s Cert Check (Supervisor)',
+                status='WARN',
+                message=f'Could not run supervisor_stabilizer.py: {exc}'))
+    else:
+        results.append(CheckResult(
+            name='K8s Cert Check (Supervisor)',
+            status='SKIPPED',
+            message=f'supervisor_stabilizer.py not found at {stabilizer}'))
+
+    if not results:
+        results.append(CheckResult(
+            name='K8s Certificates',
+            status='SKIPPED',
+            message='No Kubernetes cert check tools found'))
+
+    return results
+
+
+#==============================================================================
 # MAIN
 #==============================================================================
 
@@ -2715,18 +2953,27 @@ def main():
         print_results_table("FIREFOX TRUSTED PRIVATE CAs", report.firefox_ca_checks)
     except Exception as e:
         print(f"Firefox CA check failed: {e}")
-    
+
+    # Kubernetes certificate expirations (VCFA, VSP, Supervisor)
+    print("\nChecking Kubernetes certificate expirations...")
+    try:
+        report.k8s_cert_checks = check_k8s_certificates()
+        print_results_table("KUBERNETES CERTIFICATES", report.k8s_cert_checks)
+    except Exception as e:
+        print(f"K8s cert check failed: {e}")
+
     # Determine overall status
     all_checks = (
-        report.ssl_checks + 
-        report.license_checks + 
-        report.ntp_checks + 
-        report.vm_config_checks + 
+        report.ssl_checks +
+        report.license_checks +
+        report.ntp_checks +
+        report.vm_config_checks +
         report.vm_resource_checks +
         report.password_expiration_checks +
         report.fleet_password_policy_checks +
         report.firefox_ca_checks +
-        report.drs_isolation_checks
+        report.drs_isolation_checks +
+        report.k8s_cert_checks
     )
     
     if any(c.status == 'FAIL' for c in all_checks):

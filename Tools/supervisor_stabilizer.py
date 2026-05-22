@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.3 - 2026-05-22
+Version 2.4 - 2026-05-22
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
+
+v2.4 Changes:
+- renew_spherelet_certs(): removed early-return for dry_run=True.  The function
+  now connects to the SCP, discovers ESXi agent nodes, and runs openssl -checkend
+  on each cert (Steps 1-3) regardless of dry_run.  Steps 4-6 (CA copy, re-sign,
+  push, restart) are guarded with 'if not dry_run'.  This allows vpodchecker.py
+  to call supervisor_stabilizer --dry-run and receive real SKIP/CHECK lines for
+  each spherelet cert without making any changes.
+- _stabilize_one_supervisor() Phase C: restructured so the SCP cert-manager cert
+  check loop runs in both dry_run and live modes.  Renewal actions (Secret delete,
+  deployment restart, proxy cert regeneration) are now guarded with 'if not dry_run'.
+  Emits SKIP / CHECK log lines that vpodchecker can parse for cert status.
 
 v2.3 Changes:
 - Added --threshold-days CLI arg (default 60).  Threads through
@@ -1570,47 +1582,49 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60)
     _SCP_CERT_THRESHOLD_DAYS = threshold_days
     _SCP_CERT_THRESHOLD_SEC  = _SCP_CERT_THRESHOLD_DAYS * 86400
 
-    if dry_run:
-        log(f"      [{cid}] [dry-run] would check/delete cert-manager + kube-system "
-            f"proxy secrets and roll the deployment on {scp_ip}.")
-    else:
-        # 1. Check and renew storage-quota certs
-        certs_to_check = [
-            ("vmware-system-cert-manager", "storage-quota-root-ca-secret"),
-            ("kube-system", "storage-quota-webhook-server-internal-cert"),
-            ("kube-system", "cns-storage-quota-extension-cert")
-        ]
+    # 1. Check (and optionally renew) storage-quota cert-manager certs.
+    # The check loop runs in BOTH dry_run and live modes so vpodchecker can
+    # call with --dry-run and receive real SKIP/CHECK lines.  Renewal actions
+    # (Secret delete, deployment restart) are guarded with 'if not dry_run'.
+    certs_to_check = [
+        ("vmware-system-cert-manager", "storage-quota-root-ca-secret"),
+        ("kube-system", "storage-quota-webhook-server-internal-cert"),
+        ("kube-system", "cns-storage-quota-extension-cert")
+    ]
 
-        log(f"      [{cid}] Checking {len(certs_to_check)} SCP cert-manager cert(s) "
-            f"(threshold: {_SCP_CERT_THRESHOLD_DAYS}d)")
+    log(f"      [{cid}] Checking {len(certs_to_check)} SCP cert-manager cert(s) "
+        f"(threshold: {_SCP_CERT_THRESHOLD_DAYS}d)")
 
-        certs_need_renewal = False
-        for ns, secret in certs_to_check:
-            cmd_cert = (
-                f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_cert && chmod 600 /tmp/.scppwd_cert && "
-                f"sshpass -f /tmp/.scppwd_cert ssh {SSH_OPTS} root@{scp_ip} "
-                f"'{K} -n {ns} get secret {secret} -o jsonpath=\"{{.data.tls\\\\.crt}}\" 2>/dev/null | base64 -d 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null'; "
-                f"rm -f /tmp/.scppwd_cert"
-            )
-            end_date_out = ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_cert).strip()
+    certs_need_renewal = False
+    for ns, secret in certs_to_check:
+        cmd_cert = (
+            f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_cert && chmod 600 /tmp/.scppwd_cert && "
+            f"sshpass -f /tmp/.scppwd_cert ssh {SSH_OPTS} root@{scp_ip} "
+            f"'{K} -n {ns} get secret {secret} -o jsonpath=\"{{.data.tls\\\\.crt}}\" 2>/dev/null | base64 -d 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null'; "
+            f"rm -f /tmp/.scppwd_cert"
+        )
+        end_date_out = ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_cert).strip()
 
-            if not end_date_out:
-                log(f"      [{cid}] {ns}/{secret}: Not found or could not parse (will be created automatically)")
-                continue
+        if not end_date_out:
+            log(f"      [{cid}] {ns}/{secret}: Not found or could not parse "
+                f"(will be created automatically)")
+            continue
 
-            m = re.search(r"notAfter=(.+)", end_date_out)
-            if m:
-                expiry_str = m.group(1)
-                try:
-                    # Parse openssl date format, e.g., "May  7 14:54:44 2026 GMT"
-                    expiry_epoch = time.mktime(time.strptime(expiry_str, "%b %d %H:%M:%S %Y %Z"))
-                    now_epoch = time.time()
-                    remaining = expiry_epoch - now_epoch
-                    days_remaining = int(remaining / 86400)
-                    if remaining <= _SCP_CERT_THRESHOLD_SEC:
-                        log(f"      [{cid}] {ns}/{secret}: "
-                            f"EXPIRING in {days_remaining}d — deleting Secret to trigger regeneration")
-                        certs_need_renewal = True
+        m = re.search(r"notAfter=(.+)", end_date_out)
+        if m:
+            expiry_str = m.group(1)
+            try:
+                # Parse openssl date format, e.g., "May  7 14:54:44 2026 GMT"
+                expiry_epoch = time.mktime(
+                    time.strptime(expiry_str, "%b %d %H:%M:%S %Y %Z"))
+                now_epoch = time.time()
+                remaining = expiry_epoch - now_epoch
+                days_remaining = int(remaining / 86400)
+                if remaining <= _SCP_CERT_THRESHOLD_SEC:
+                    log(f"      [{cid}] CHECK  : {ns}/{secret} — "
+                        f"EXPIRES in {days_remaining}d (expires: {expiry_str})")
+                    certs_need_renewal = True
+                    if not dry_run:
                         # Best-effort: patch Certificate spec.duration to 5 years
                         # before deleting the Secret so cert-manager reissues with
                         # a longer TTL.  Silently ignored if the Certificate resource
@@ -1630,30 +1644,35 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60)
                             f"rm -f /tmp/.scppwd_del"
                         )
                         ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_del)
-                    else:
-                        log(f"      [{cid}] {ns}/{secret}: "
-                            f"Valid ({days_remaining}d remaining — above {_SCP_CERT_THRESHOLD_DAYS}d threshold)")
-                except ValueError:
-                    log(f"      [{cid}] Could not parse expiry date: {expiry_str}", level="WARN")
-                    
-        if certs_need_renewal:
-            log(f"      [{cid}] Restarting deployments to regenerate certificates...")
-            restart_cmds = [
-                f"{K} -n kube-system rollout restart deploy cns-storage-quota-extension || true",
-                f"{K} -n kube-system rollout restart deploy storage-quota-webhook || true"
-            ]
-            run_on_scp(
-                vc["host"], vc["root_user"], password,
-                scp_ip, scp_pass, restart_cmds,
-                description=f"      [{cid}] Restarting storage-quota deployments",
-                timeout=120,
-            )
-            time.sleep(20)
+                else:
+                    log(f"      [{cid}] SKIP   : {ns}/{secret} — "
+                        f"valid for {days_remaining}d (expires: {expiry_str})")
+            except ValueError:
+                log(f"      [{cid}] Could not parse expiry date: {expiry_str}",
+                    level="WARN")
 
-        # 2. Regenerate supervisor-management-proxy certs.
-        #    All commands are guarded so they are silent no-ops when the
-        #    resources don't exist (e.g. newer Supervisor builds that have
-        #    removed or renamed this component).
+    if certs_need_renewal and not dry_run:
+        log(f"      [{cid}] Restarting deployments to regenerate certificates...")
+        restart_cmds = [
+            f"{K} -n kube-system rollout restart deploy cns-storage-quota-extension || true",
+            f"{K} -n kube-system rollout restart deploy storage-quota-webhook || true"
+        ]
+        run_on_scp(
+            vc["host"], vc["root_user"], password,
+            scp_ip, scp_pass, restart_cmds,
+            description=f"      [{cid}] Restarting storage-quota deployments",
+            timeout=120,
+        )
+        time.sleep(20)
+
+    # 2. Regenerate supervisor-management-proxy certs (live mode only).
+    #    All commands are guarded so they are silent no-ops when the
+    #    resources don't exist (e.g. newer Supervisor builds that have
+    #    removed or renamed this component).
+    if dry_run:
+        log(f"      [{cid}] [dry-run] would regenerate supervisor-management-proxy "
+            f"certs on {scp_ip}.")
+    else:
         commands = [
             # Delete cert-manager proxy secrets only when any actually exist.
             # Without the guard, an empty subshell produces "error: resource(s)
@@ -2023,10 +2042,8 @@ def renew_spherelet_certs(vc, password, dry_run, threshold_days=60):
     log("=" * 70)
 
     if dry_run:
-        log(f"  [{label}] [dry-run] would check spherelet cert expiry on all "
-            f"ESXi agent nodes and renew if any expire within "
-            f"{THRESHOLD_DAYS} days ({THRESHOLD_DAYS // 365} years).")
-        return True
+        log(f"  [{label}] [dry-run] checking spherelet cert expiry on all ESXi "
+            f"agent nodes (threshold: {THRESHOLD_DAYS}d) — no changes will be made.")
 
     # ── Step 1: retrieve SCP credentials ──────────────────────────────────
     log(f"  [{label}] Retrieving Supervisor credentials via decryptK8Pwd.py ...")
@@ -2098,16 +2115,24 @@ def renew_spherelet_certs(vc, password, dry_run, threshold_days=60):
         still_valid = (check_out.splitlines() or ["1"])[-1] == "0"
 
         if still_valid:
-            log(f"  [{label}]   OK     {esx_host}  client.crt expires: {expiry}")
+            log(f"  [{label}] SKIP   : {esx_host} client.crt — VALID (expires: {expiry})")
         else:
-            log(f"  [{label}]   RENEW  {esx_host}  client.crt expires: {expiry}")
+            log(f"  [{label}] CHECK  : {esx_host} client.crt — expires: {expiry} "
+                f"(within {THRESHOLD_DAYS}d threshold)")
             needs_renewal = True
 
     if not needs_renewal:
-        log(f"  [{label}] Supervisor Kubelet Host certificates are still valid "
-            f"for 2+ yrs, not renewing")
+        log(f"  [{label}] All spherelet client.crt certs are valid — no renewal needed.")
         log("=" * 70)
         log(f"  [{label}] renew_spherelet_certs: Done (no action needed)")
+        log("=" * 70)
+        return True
+
+    if dry_run:
+        log(f"  [{label}] [dry-run] would renew {len(esx_nodes)} spherelet "
+            f"cert(s) — skipping file operations.")
+        log("=" * 70)
+        log(f"  [{label}] renew_spherelet_certs: Done (dry-run)")
         log("=" * 70)
         return True
 

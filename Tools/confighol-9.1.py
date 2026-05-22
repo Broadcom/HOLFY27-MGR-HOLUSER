@@ -9,6 +9,19 @@
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
 #
 # CHANGELOG:
+# v2.20 - 2026-05-22:
+#   - Step 9 now covers ALL 4 proxy targets (was only Supervisor API + VSP nodes):
+#     Target 1 (vCenter OS: /etc/environment, /etc/sysconfig/proxy, VAMI REST)
+#     Target 2 (Supervisor CP node OS + proxy mTLS cert regen)
+#     Target 3 (Supervisor API namespace-management PATCH)
+#     Target 4 (VSP node OS + containerd/kubelet systemd drop-ins)
+#   - configure_all_proxies() wraps all 4 targets with an interactive prompt
+#     that shows the resolved PROXY_URL and NO_PROXY values before asking Y/N.
+#   - Targets 1 & 2 are applied by streaming supervisor_stabilizer.py with
+#     only Phase 0 (vCenter proxy) and Phase 2 (SCP proxy) active.
+#   - Added --skip-proxy-config CLI arg (skip Step 9 entirely, e.g. non-HOL labs).
+#   - Added --yes-proxy CLI arg (auto-confirm without interactive prompt, for CI).
+#
 # v2.19 - 2026-05-22:
 #   - Added Step 10: configure_k8s_certs() — streams vsp_cert_renewer.py
 #     --cluster all --threshold-days 1820 to force-renew all VSP + VCFA
@@ -231,17 +244,20 @@
 #    - Disables auto-rotation for all service credentials
 #    - Prevents failed password rotation tasks after template deployment
 #
-# 7. VSP & Supervisor Proxy Configuration:
-#    - Configures Supervisor HTTP/HTTPS proxy via vCenter API
-#      (CLUSTER_CONFIGURED mode on WLD vCenter namespace-management API)
-#    - Discovers VSP cluster node IPs via kubectl on the control plane VIP
-#    - Configures OS-level proxy on each VSP node (Photon OS):
-#      /etc/sysconfig/proxy, /etc/environment, containerd and kubelet
-#      systemd drop-in files for HTTP_PROXY/HTTPS_PROXY/NO_PROXY
-#    - Proxy: holorouter Squid at http://10.1.1.1:3128
-#    - NO_PROXY includes internal subnets, service CIDRs, internal registry,
-#      .vcf.lab and .site-a/.site-b zones, 192.168.0.0/24; Supervisor API
-#      receives no_proxy_config array; /etc/environment proxy lines refreshed each run
+# 7. Proxy Configuration (all 4 targets — interactive Y/N prompt):
+#    Displays resolved PROXY_URL and NO_PROXY values before asking; use
+#    --skip-proxy-config to bypass entirely, --yes-proxy to auto-confirm.
+#    Target 1 — vCenter OS: /etc/environment, /etc/sysconfig/proxy, VAMI REST
+#               (applied via supervisor_stabilizer.py Phase 0)
+#    Target 2 — Supervisor CP node OS: /etc/environment, /etc/sysconfig/proxy
+#               + supervisor-management-proxy mTLS cert regeneration
+#               (applied via supervisor_stabilizer.py Phase 2)
+#    Target 3 — Supervisor API: vCenter namespace-management PATCH
+#               (CLUSTER_CONFIGURED mode, HTTP+HTTPS proxy, no_proxy array)
+#    Target 4 — VSP nodes OS: /etc/sysconfig/proxy, /etc/environment,
+#               containerd systemd drop-in, kubelet systemd drop-in
+#    Proxy URL and NO_PROXY list come from lsf.LAB_PROXY_URL /
+#    lsf.build_lab_no_proxy() (holorouter Squid at http://10.1.1.1:3128).
 #
 # 8. K8s Certificate Pre-Provisioning (VSP + VCFA) — Step 10:
 #    - Streams vsp_cert_renewer.py --cluster all --threshold-days 1820
@@ -261,14 +277,17 @@
 #    - Run vpodchecker.py to update L2 VMs (uuid, typematicdelay)
 #
 # USAGE:
-#    python3 confighol.py                    # Full non-interactive HOLification
+#    python3 confighol.py                    # Full HOLification (proxy prompt shown)
 #    python3 confighol.py --dry-run          # Preview what would be done
 #    python3 confighol.py --skip-vcshell     # Skip vCenter shell configuration
 #    python3 confighol.py --skip-nsx         # Skip NSX configuration
 #    python3 confighol.py --esx-only         # Only configure ESXi hosts
+#    python3 confighol.py --skip-proxy-config # Skip all proxy/NO_PROXY configuration
+#    python3 confighol.py --yes-proxy        # Auto-confirm proxy config (no prompt)
 #
-# NOTE: All operations run non-interactively. Unavailable components are
-#       auto-skipped with a warning. NSX Edge SSH is enabled automatically
+# NOTE: Step 9 (proxy) is interactive: shows PROXY_URL and NO_PROXY values,
+#       then asks Y/N. Use --yes-proxy for unattended/CI runs. All other
+#       operations are non-interactive. NSX Edge SSH is enabled automatically
 #       via Guest Operations. See HOLIFICATION.md for details.
 
 """
@@ -314,7 +333,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.19'
+SCRIPT_VERSION = '2.20'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -5074,6 +5093,134 @@ echo "PROXY_CONFIGURED"
     return success
 
 
+def configure_all_proxies(dry_run: bool = False,
+                           auto_yes: bool = False) -> bool:
+    """Configure PROXY and NO_PROXY settings across all 4 lab targets.
+
+    Covers every location where proxy settings must be written so that
+    lab components can reach the internet through holorouter Squid:
+
+      1. vCenter OS  — /etc/environment, /etc/sysconfig/proxy, VAMI REST
+                       (supervisor_stabilizer.py Phase 0)
+      2. Supervisor CP node OS — /etc/environment, /etc/sysconfig/proxy
+                       + supervisor-management-proxy mTLS cert regen
+                       (supervisor_stabilizer.py Phase 2)
+      3. Supervisor API — vCenter namespace-management PATCH
+                       (configure_vsp_proxy() Part 1)
+      4. VSP nodes OS — /etc/sysconfig/proxy, /etc/environment,
+                       containerd and kubelet systemd drop-ins
+                       (configure_vsp_proxy() Part 2)
+
+    Both PROXY_URL and NO_PROXY are applied as a pair — the same values
+    used for all four targets come from lsf.LAB_PROXY_URL and
+    lsf.build_lab_no_proxy().
+
+    Interactive: prints the resolved PROXY_URL and NO_PROXY values, then
+    asks Y/N before applying.  Pass auto_yes=True (--yes-proxy CLI flag)
+    to skip the prompt for unattended/CI runs.  With --dry-run, shows the
+    banner and values but makes no changes and skips the prompt.
+
+    :param dry_run: Preview mode — print banner but make no changes.
+    :param auto_yes: Skip the interactive Y/N prompt and proceed directly.
+    :return: True (non-fatal; unavailable targets are skipped with warnings).
+    """
+    # Resolve proxy values at call time (after lsf.init())
+    try:
+        proxy_url = lsf.LAB_PROXY_URL
+    except AttributeError:
+        proxy_url = 'http://10.1.1.1:3128'
+
+    try:
+        no_proxy = lsf.build_lab_no_proxy()
+    except AttributeError:
+        no_proxy = 'localhost,127.0.0.1,10.0.0.0/8,.vcf.lab'
+
+    lsf.write_output('')
+    lsf.write_output('=' * 60)
+    lsf.write_output('Step 9: Proxy Configuration')
+    lsf.write_output('=' * 60)
+    lsf.write_output(f'PROXY URL : {proxy_url}')
+    lsf.write_output(f'NO_PROXY  : {no_proxy}')
+    lsf.write_output('')
+    lsf.write_output('The following targets will be configured:')
+    lsf.write_output('  1. vCenter OS  (/etc/environment, /etc/sysconfig/proxy, VAMI REST)')
+    lsf.write_output('  2. Supervisor CP node OS (/etc/environment, /etc/sysconfig/proxy)')
+    lsf.write_output('     + supervisor-management-proxy mTLS cert regeneration')
+    lsf.write_output('  3. Supervisor API (vCenter namespace-management proxy settings)')
+    lsf.write_output('  4. VSP nodes OS (/etc/environment, /etc/sysconfig/proxy,')
+    lsf.write_output('     containerd systemd drop-in, kubelet systemd drop-in)')
+
+    if dry_run:
+        lsf.write_output('')
+        lsf.write_output('[dry-run] Would apply the above proxy and NO_PROXY settings'
+                         ' to all 4 targets — no changes made.')
+        return True
+
+    if not auto_yes:
+        lsf.write_output('')
+        try:
+            answer = input('Configure proxy settings? [Y/n]: ').strip().lower()
+        except EOFError:
+            # Non-interactive stdin (e.g. pipe/redirect) — default to yes
+            answer = 'y'
+            lsf.write_output('(non-interactive stdin — defaulting to yes)')
+        if answer not in ('', 'y', 'yes'):
+            lsf.write_output('Proxy configuration skipped (user choice).')
+            return True
+
+    lsf.write_output('')
+
+    # ── Targets 1 & 2: vCenter OS proxy + SCP OS proxy via supervisor_stabilizer ──
+    stabilizer_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        'supervisor_stabilizer.py',
+    )
+    if os.path.isfile(stabilizer_script):
+        lsf.write_output('Applying proxy to vCenter OS and Supervisor CP node...')
+        cmd = [
+            'python3', '-u', stabilizer_script,
+            '--auto',
+            '--skip-vcenter-services',
+            '--skip-content-lib',
+            '--skip-spherelet',
+            '--skip-supervisor-poll',
+        ]
+        lsf.write_output(f'  Running: {" ".join(cmd)}')
+        try:
+            env = os.environ.copy()
+            env['PYTHONUNBUFFERED'] = '1'
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=env,
+            )
+            for line in proc.stdout:
+                stripped = line.rstrip()
+                if stripped.strip():
+                    lsf.write_output(f' {stripped.strip()}')
+            proc.wait()
+            if proc.returncode != 0:
+                lsf.write_output(
+                    f'WARNING: supervisor_stabilizer.py exited {proc.returncode} '
+                    f'for proxy phases — review output above; continuing'
+                )
+        except Exception as exc:
+            lsf.write_output(
+                f'WARNING: Error running supervisor_stabilizer.py for proxy: {exc}'
+            )
+    else:
+        lsf.write_output(
+            f'WARNING: supervisor_stabilizer.py not found at {stabilizer_script}'
+            f' — skipping vCenter and SCP proxy configuration (targets 1 & 2)'
+        )
+
+    # ── Targets 3 & 4: Supervisor API + VSP node proxy via configure_vsp_proxy ──
+    lsf.write_output('')
+    lsf.write_output('Applying proxy to Supervisor API and VSP nodes...')
+    configure_vsp_proxy(dry_run=False)
+
+    return True
+
+
 def configure_k8s_certs(dry_run: bool = False,
                          threshold_days: int = 1820) -> bool:
     """Force-renew all VSP and VCFA Kubernetes certificates to 5 years.
@@ -5271,7 +5418,8 @@ def main():
     6. VCF Automation VMs configuration (uses vmware-system-user)
     7. Operations VMs configuration
     8. Disable SDDC Manager auto-rotate policies (prevents post-deployment failures)
-    9. Configure VSP & Supervisor proxy (enables outbound internet via holorouter proxy)
+    9. Configure proxy/NO_PROXY on all 4 targets (vCenter OS, Supervisor CP, Supervisor API,
+       VSP nodes) — interactive Y/N prompt showing resolved PROXY_URL and NO_PROXY values.
     10. K8s certificate pre-provisioning — VSP + VCFA (kubeadm, kubelet, cert-manager, Antrea → 5y)
     11. Supervisor spherelet certificate pre-provisioning (ESXi agent certs → 5y)
     12. Final cleanup
@@ -5284,8 +5432,10 @@ This script automates the HOLification process for vApp templates.
 It must be run after the Holodeck factory build completes.
 
 Examples:
-  python3 confighol.py                    Full interactive HOLification
+  python3 confighol.py                    Full HOLification (proxy prompt shown)
   python3 confighol.py --dry-run          Preview what would be done
+  python3 confighol.py --yes-proxy        Auto-confirm proxy config (no prompt)
+  python3 confighol.py --skip-proxy-config  Skip all proxy/NO_PROXY config
   python3 confighol.py --skip-vcshell     Skip vCenter shell configuration
   python3 confighol.py --skip-nsx         Skip NSX configuration
   python3 confighol.py --esx-only         Only configure ESXi hosts
@@ -5308,6 +5458,13 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
                         help='Skip NSX configuration')
     parser.add_argument('--esx-only', action='store_true',
                         help='Only configure ESXi hosts')
+    parser.add_argument('--skip-proxy-config', action='store_true',
+                        help='Skip Step 9: all proxy and NO_PROXY configuration '
+                             '(vCenter OS, Supervisor CP, Supervisor API, VSP nodes). '
+                             'Use for non-HOL lab types that do not require a proxy.')
+    parser.add_argument('--yes-proxy', action='store_true',
+                        help='Auto-confirm Step 9 proxy configuration without the '
+                             'interactive Y/N prompt (for unattended/CI runs).')
     parser.add_argument('--skip-k8s-certs', action='store_true',
                         help='Skip Step 10: VSP/VCFA K8s certificate '
                              'pre-provisioning via vsp_cert_renewer.py')
@@ -5434,9 +5591,11 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
     # Creates "MaxExpiration" policy, assigns ALL inventory (MANAGEMENT + INSTANCE), remediates
     configure_vcf_fleet_password_policy(args.dry_run)
     
-    # Step 9: Configure VSP & Supervisor proxy
-    # Enables proxy on VSP cluster nodes and Supervisor for outbound internet access
-    configure_vsp_proxy(args.dry_run)
+    # Step 9: Configure proxy and NO_PROXY on all 4 targets
+    # Shows resolved PROXY_URL + NO_PROXY values, asks Y/N (unless --yes-proxy).
+    # Use --skip-proxy-config for non-HOL lab types that do not need a proxy.
+    if not args.skip_proxy_config:
+        configure_all_proxies(args.dry_run, auto_yes=args.yes_proxy)
 
     # Step 10: K8s certificate pre-provisioning (VSP + VCFA)
     # Force-renew kubeadm CP certs, kubelet serving certs, cert-manager leaf
