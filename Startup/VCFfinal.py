@@ -1,8 +1,81 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.2 - 2026-05-19
+# Version 6.3.11 - 2026-05-22
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.11 Changes:
+# - Task 7 (NSX password expiration): Check current days-until-expiry via
+#   NSX REST API (GET /api/v1/node/users/{id}) before updating each user.
+#   Only applies 'set user {user} password-expiration 9999' when the current
+#   expiry is ≤ 90 days.  Users that already expire far in the future or that
+#   have no expiry configured are logged as SKIP, avoiding unnecessary CLI
+#   writes on every lab startup.  Falls back to updating if the API returns
+#   an unexpected value.  NSX user ID map: root=0, admin=10000, audit=10002.
+#
+# v6.3.10 Changes:
+# - Task 5 (VCF Automation checks): After vcfapwcheck.sh, run 'chage -M -1
+#   vmware-system-user' on all auto-* and opslogs-* VMs at every startup.
+#   Root cause: confighol sets chage at template-prep time, but on first
+#   deployment vcfapass.sh changes the password (resetting last_change) without
+#   clearing maxdays — starting a fresh 365-day clock.  Running chage -M -1 at
+#   startup is idempotent and corrects both the template state and any subsequent
+#   password changes.  Hosts discovered from vraurls (auto-*) and
+#   vcfcomponenturls (opslogs-*).
+# - vcfapass.sh v1.3: Companion fix — added 'chage -M -1 vmware-system-user'
+#   after passwd reset; switched to generic prompt patterns (dropped hardcoded
+#   'auto-a-8fpl5' hostname that would never match real deployments).
+#
+# v6.3.9 Changes:
+# - Task 8: After distribute_vault_ca_trust(), also import the Vault root CA
+#   into Firefox on the console VM via confighol.import_ca_to_firefox_profile()
+#   and confighol.find_firefox_profiles(). Previously this only happened when
+#   confighol-9.1.py was run interactively; VCFfinal Task 8 skipped Firefox,
+#   causing vpodchecker to report FAIL "Active Vault CA not found in Firefox
+#   certificate store" on every lab boot.
+#
+# v6.3.8 Changes:
+# - Gate ALL proxy and NO_PROXY operations on LabTypeLoader.requires_proxy_filter().
+#   Only HOL labtype returns True; DISCOVERY, VXP, ATE, EDU skip proxy entirely.
+#   Proxy and NO_PROXY are treated as a pair — if proxy is not required, neither
+#   value is written to any target.
+# - Task 2c: supervisor_stabilizer.py call now appends --skip-vcenter-proxy and
+#   --skip-proxy when _proxy_required=False, so Phase 0 (vCenter PROXY/NO_PROXY)
+#   and Phase 2 (SCP PROXY/NO_PROXY) are skipped; cert phases still run.
+# - Task 2e: apply_proxy_to_nodes() calls (initial + new-node discovery) wrapped
+#   in 'if _proxy_required:' so PROXY_URL and NO_PROXY are only pushed to VSP
+#   nodes for HOL lab types.
+#
+# v6.3.7 Changes:
+# - status_dashboard: add k8s_certs task (RUNNING/COMPLETE/FAILED/SKIPPED)
+#   around vsp_cert_renewer.py calls in Task 2e; add SKIPPED to all
+#   early-exit branches (no vCenters, no Supervisor configured).
+#
+# v6.3.6 Changes:
+# - Task 2e: reduce vsp_cert_renewer streaming output indentation from 4
+#   spaces to 1 space so cert log lines are not excessively deep.
+#
+# v6.3.5 Changes:
+# - Task 2e: pass --no-timestamps to vsp_cert_renewer.py so its internal
+#   [timestamp] prefix is suppressed and lsf.write_output's timestamp is
+#   the only one shown (matches supervisor_stabilizer.py convention).
+#
+# v6.3.4 Changes:
+# - Task 2e: added K8s certificate check/renewal block (vsp_cert_renewer.py)
+#   immediately after the NO_PROXY configuration, before component scale-up.
+#   Runs once for VSP and once for VCFA via streaming Popen (same pattern as
+#   the supervisor_stabilizer call in Task 2c).  THRESHOLD=365d, renews to
+#   5 years via kubeadm --config certificateValidityPeriod.  Non-fatal.
+#
+# v6.3.3 Changes:
+# - Task 2c: replaced lsf.run_command() (blocks until completion, dumps all
+#   output at once) with subprocess.Popen streaming so supervisor_stabilizer.py
+#   output appears in the log in real time instead of after a ~5-minute gap.
+#   Uses python3 -u + PYTHONUNBUFFERED=1 to disable Python stdio buffering.
+# - Removed inline 'import subprocess' inside main() (Task 4 vcfa-stabilizer
+#   block). The inline import made subprocess a local variable for the entire
+#   main() scope, causing UnboundLocalError at the Task 2c Popen call.
+#   subprocess is already imported at module level (line 145).
 #
 # v6.3.2 Changes:
 # - Fixed dashboard updates
@@ -329,6 +402,23 @@ def main(lsf=None, standalone=False, dry_run=False):
     except Exception:
         dashboard = None
     
+    # Determine whether this lab type requires proxy/NO_PROXY configuration.
+    # Only HOL lab types have firewall + proxy filtering; all others (DISCOVERY,
+    # VXP, ATE, EDU) have direct internet access and need neither PROXY nor
+    # NO_PROXY settings.  PROXY and NO_PROXY are always treated as a pair:
+    # if proxy is not required, neither value is written to any target.
+    try:
+        sys.path.insert(0, '/home/holuser/hol/Tools')
+        from labtypes import LabTypeLoader
+        _proxy_required = LabTypeLoader(
+            lsf.labtype, '/home/holuser/hol'
+        ).requires_proxy_filter()
+    except Exception:
+        _proxy_required = True  # safe default: always configure proxy if unsure
+    lsf.write_output(
+        f'Labtype: {lsf.labtype} — proxy/NO_PROXY configuration required: {_proxy_required}'
+    )
+
     #==========================================================================
     # TASK 1: Connect to VCF Management Cluster Hosts (if needed)
     #==========================================================================
@@ -378,6 +468,8 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.update_task('vcffinal', 'vcfa_k8s_health', TaskStatus.SKIPPED,
                                   'No vCenters configured')
             dashboard.update_task('vcffinal', 'vcfa_urls', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.SKIPPED,
                                   'No vCenters configured')
             dashboard.update_task('vcffinal', 'nsx_passwords', TaskStatus.SKIPPED,
                                   'No vCenters configured')
@@ -767,28 +859,48 @@ def main(lsf=None, standalone=False, dry_run=False):
                 lsf.write_output(f'  (script will auto-discover and stabilize all active Supervisors)')
                 
                 try:
-                    wcp_cmd = f'python3 {supervisor_stabilizer_script} --auto'
-                    result = lsf.run_command(wcp_cmd, timeout=WCP_SCRIPT_TIMEOUT)
-                    
-                    exit_code = result.returncode if hasattr(result, 'returncode') else (0 if result else 1)
-                    
-                    # Log stdout from the script (timestamps already included by script)
-                    if hasattr(result, 'stdout') and result.stdout:
-                        for line in result.stdout.strip().split('\n'):
-                            if line.strip():
-                                lsf.write_output(f'  {line.strip()}')
-                    # Log stderr (errors/warnings from the script)
-                    if hasattr(result, 'stderr') and result.stderr:
-                        for line in result.stderr.strip().split('\n'):
-                            if line.strip():
-                                lsf.write_output(f'  {line.strip()}')
-                    
+                    # Stream output line-by-line so the log shows progress in
+                    # real time rather than buffering the entire ~5-minute run
+                    # and dumping it all at once after the script exits.
+                    # -u forces Python unbuffered I/O; PYTHONUNBUFFERED=1 is a
+                    # belt-and-suspenders complement for any C-level buffering.
+                    env = os.environ.copy()
+                    env['PYTHONUNBUFFERED'] = '1'
+                    _stabilizer_cmd = ['python3', '-u', supervisor_stabilizer_script, '--auto']
+                    if not _proxy_required:
+                        # Non-HOL labtype: skip Phase 0 (vCenter PROXY/NO_PROXY)
+                        # and Phase 2 (SCP PROXY/NO_PROXY); cert phases still run.
+                        _stabilizer_cmd += ['--skip-vcenter-proxy', '--skip-proxy']
+                        lsf.write_output(
+                            '  Labtype does not require proxy — '
+                            'skipping vCenter and SCP proxy phases'
+                        )
+                    proc = subprocess.Popen(
+                        _stabilizer_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        env=env,
+                    )
+                    start_time = time.time()
+                    for line in proc.stdout:
+                        if time.time() - start_time > WCP_SCRIPT_TIMEOUT:
+                            proc.kill()
+                            lsf.write_output('  WARNING: Supervisor stabilization script timed out')
+                            break
+                        line_stripped = line.rstrip('\n')
+                        if line_stripped.strip():
+                            lsf.write_output(f'  {line_stripped.strip()}')
+                    proc.wait()
+                    exit_code = proc.returncode if proc.returncode is not None else 1
+
                     if exit_code == 0:
                         lsf.write_output(f'Supervisor stabilization completed successfully')
                     else:
                         lsf.write_output(f'WARNING: Supervisor stabilization script exited with code {exit_code}')
                         wcp_certs_ok = False
-                        
+
                 except Exception as wcp_err:
                     lsf.write_output(f'WARNING: Error running Supervisor stabilization script: {wcp_err}')
                     lsf.write_output('  Continuing with startup - WCP may need manual attention')
@@ -872,6 +984,7 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.SKIPPED, 'Not configured')
             dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.SKIPPED, 'Not configured')
             dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.SKIPPED, 'Not configured')
+            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.SKIPPED, 'No Supervisor configured')
             dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.RUNNING)
             dashboard.generate_html()
     
@@ -1183,9 +1296,14 @@ def main(lsf=None, standalone=False, dry_run=False):
                         ssh_cmd = f"sudo -i bash -c '{kubectl_cmd}'"
                     return lsf.ssh(ssh_cmd, f'{vsp_user}@{vsp_control_plane_ip}')
                 
-                # ---- Apply NO_PROXY fix for VSP cluster nodes ----
-                # Inject proxy configuration to avoid ImagePullBackOff for opsnet/opslogs
-                lsf.write_output('  Applying proxy NO_PROXY configuration to VSP nodes...')
+                # ---- Apply PROXY and NO_PROXY to VSP cluster nodes (HOL only) ----
+                # Inject proxy configuration to avoid ImagePullBackOff for opsnet/opslogs.
+                # Skipped for non-HOL labtypes (DISCOVERY, VXP, ATE, EDU) that have direct
+                # internet access and require neither PROXY nor NO_PROXY settings.
+                if _proxy_required:
+                    lsf.write_output('  Applying proxy and NO_PROXY configuration to VSP nodes...')
+                else:
+                    lsf.write_output('  Labtype does not require proxy — skipping VSP node proxy/NO_PROXY configuration')
                 vsp_node_ips = []
                 discover_cmd = "kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type==\"InternalIP\")].address}{\" \"}{end}'"
                 result = vsp_kubectl(discover_cmd)
@@ -1285,8 +1403,68 @@ echo "PROXY_CONFIGURED"
 
                 if vsp_node_ips:
                     lsf.write_output(f'  Found {len(vsp_node_ips)} VSP nodes: {", ".join(vsp_node_ips)}')
-                    apply_proxy_to_nodes(vsp_node_ips)
-                
+                    if _proxy_required:
+                        apply_proxy_to_nodes(vsp_node_ips)
+
+                # ---- Kubernetes certificate check/renewal (VSP + VCFA) ----
+                # Runs before component scale-up so the API server is healthy
+                # for everything that follows.  Non-fatal per cluster — a
+                # failure in one cluster does not abort the other or the boot.
+                _k8s_cert_script = '/home/holuser/hol/Tools/vsp_cert_renewer.py'
+                _k8s_cert_errors = []
+                if dashboard:
+                    dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.RUNNING)
+                    dashboard.generate_html()
+                if os.path.isfile(_k8s_cert_script):
+                    for _cert_cluster in ('vsp', 'vcfa'):
+                        lsf.write_output(
+                            f'  Running K8s cert check/renewal for '
+                            f'{_cert_cluster.upper()}...'
+                        )
+                        _cert_env = os.environ.copy()
+                        _cert_env['PYTHONUNBUFFERED'] = '1'
+                        _cert_proc = subprocess.Popen(
+                            ['python3', '-u', _k8s_cert_script,
+                             '--cluster', _cert_cluster,
+                             '--no-timestamps'],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1,
+                            env=_cert_env,
+                        )
+                        for _cert_line in _cert_proc.stdout:
+                            _cert_line = _cert_line.rstrip('\n')
+                            if _cert_line.strip():
+                                lsf.write_output(f' {_cert_line.strip()}')
+                        _cert_proc.wait()
+                        if _cert_proc.returncode not in (0, None):
+                            lsf.write_output(
+                                f'  WARNING: {_cert_cluster.upper()} cert '
+                                f'renewal exited {_cert_proc.returncode} '
+                                f'— continuing'
+                            )
+                            _k8s_cert_errors.append(
+                                f'{_cert_cluster.upper()} exited {_cert_proc.returncode}'
+                            )
+                    if dashboard:
+                        if _k8s_cert_errors:
+                            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.FAILED,
+                                                  f'Non-zero exit: {"; ".join(_k8s_cert_errors)}')
+                        else:
+                            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.COMPLETE,
+                                                  'VSP + VCFA cert check/renewal complete')
+                        dashboard.generate_html()
+                else:
+                    lsf.write_output(
+                        f'  K8s cert renewal script not found: '
+                        f'{_k8s_cert_script} — skipping'
+                    )
+                    if dashboard:
+                        dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.SKIPPED,
+                                              'vsp_cert_renewer.py not found')
+                        dashboard.generate_html()
+
                 # ---- Unsuspend postgres instances managed by Zalando operator ----
                 # The VMSP operator sets a "database.vmsp.vmware.com/suspended=true"
                 # label on PostgresInstance CRDs when a component is stopped.  The
@@ -1522,9 +1700,10 @@ echo "PROXY_CONFIGURED"
                             new_ips = [ip for ip in current_ips if ip not in vsp_node_ips]
                             if new_ips:
                                 lsf.write_output(f'  New VSP nodes joined K8s: {new_ips}')
-                                apply_proxy_to_nodes(new_ips)
+                                if _proxy_required:
+                                    apply_proxy_to_nodes(new_ips)
+                                    lsf.write_output('  Applied proxy and NO_PROXY to new node(s).')
                                 vsp_node_ips.extend(new_ips)
-                                lsf.write_output('  Applied proxy to new node(s).')
                         
                         # Re-check pending status to see if we can exit early
                         check_again = vsp_kubectl('kubectl get pods -A --field-selector=status.phase=Pending 2>/dev/null')
@@ -2761,10 +2940,65 @@ echo "PROXY_CONFIGURED"
         vcfapwcheck_script = '/home/holuser/hol/Tools/vcfapwcheck.sh'
         if os.path.isfile(vcfapwcheck_script) and not dry_run:
             lsf.run_command(vcfapwcheck_script)
+
+        # Ensure vmware-system-user never expires on VCF Automation (auto-*)
+        # and VCF Ops Logs (opslogs-*) VMs.  Both use vmware-system-user for
+        # SSH with password-based sudo.  On initial deployment the account
+        # maxdays may be 365 (OS default); vcfapass.sh resets the password but
+        # previously did not clear maxdays, starting a fresh 365-day clock.
+        # Running chage -M -1 at every startup is idempotent and corrects
+        # both the initial template state and any subsequent password changes.
+        if not dry_run:
+            _chage_hosts = []
+            # VCF Automation hosts from vraurls (auto-a, auto-platform-a, etc.)
+            for _us in vraurls:
+                _uh = _us.split(',')[0].strip()
+                if '://' in _uh:
+                    _uh = _uh.split('://')[1].split('/')[0].split(':')[0]
+                if _uh and _uh.startswith('auto-') and _uh not in _chage_hosts:
+                    _chage_hosts.append(_uh)
+            # opslogs hosts from vcfcomponenturls
+            _comp_urls_raw = lsf.get_config_list('VCFFINAL', 'vcfcomponenturls')
+            for _us in _comp_urls_raw:
+                _uh = _us.split(',')[0].strip()
+                if '://' in _uh:
+                    _uh = _uh.split('://')[1].split('/')[0].split(':')[0]
+                if _uh and 'opslogs' in _uh.lower() and _uh not in _chage_hosts:
+                    _chage_hosts.append(_uh)
+            for _chage_host in _chage_hosts:
+                if not lsf.test_tcp_port(_chage_host, 22, timeout=5):
+                    lsf.write_output(
+                        f'  {_chage_host}: SSH not reachable — skipping chage')
+                    continue
+                lsf.write_output(
+                    f'  {_chage_host}: Ensuring vmware-system-user '
+                    f'password never expires...')
+                try:
+                    _chage_cmd = (
+                        f"echo '{password}' | sudo -S chage -M -1 "
+                        f"vmware-system-user 2>&1"
+                    )
+                    _cr = lsf.ssh(
+                        _chage_cmd,
+                        f'vmware-system-user@{_chage_host}',
+                        password,
+                    )
+                    if _cr.returncode == 0:
+                        lsf.write_output(
+                            f'  {_chage_host}: vmware-system-user '
+                            f'password expiration set to never')
+                    else:
+                        lsf.write_output(
+                            f'  {_chage_host}: WARNING — chage -M -1 '
+                            f'returned exit {_cr.returncode}')
+                except Exception as _ce:
+                    lsf.write_output(
+                        f'  {_chage_host}: WARNING — could not run '
+                        f'chage: {_ce}')
+
         # If the lab_sku = HOL-2701, then run vcfa-stabilizer.sh
         if lsf.lab_sku == 'HOL-2701':
             lsf.write_output('Running vcfa-stabilizer.sh...')
-            import subprocess
             try:
                 proc = subprocess.Popen(
                     ['/bin/bash', '/home/holuser/hol/Tools/vcfa-stabilizer.sh'],
@@ -2934,33 +3168,113 @@ echo "PROXY_CONFIGURED"
     nsx_mgr_entries = lsf.get_config_list('VCF', 'vcfnsxmgr')
     nsx_users = ['admin', 'root', 'audit']
     nsx_expiry_days = 9999
+    nsx_expiry_threshold_days = 90   # Only update if current expiry < this
     nsx_task_failed = False
     password = lsf.get_password()
-    
+
+    # NSX user IDs used by GET /api/v1/node/users/{id}
+    _nsx_user_id = {'root': 0, 'admin': 10000, 'audit': 10002}
+
+    _NSX_EXPIRY_API_ERROR = -1   # sentinel: REST call failed, fall back to update
+
+    def _nsx_days_until_expiry(fqdn, admin_pwd, username):
+        """Return days until NSX user password expires via REST API.
+
+        Returns:
+            int  > 0               — days remaining until expiry
+            0                      — NSX "no expiry" sentinel in response
+            None                   — key absent from response (no expiry configured)
+            _NSX_EXPIRY_API_ERROR  — REST call failed; caller should update
+        """
+        import urllib.request as _ureq
+        import ssl as _ssl
+        import base64 as _b64
+        import json as _json
+        uid = _nsx_user_id.get(username)
+        if uid is None:
+            return None
+        _ctx = _ssl.create_default_context()
+        _ctx.check_hostname = False
+        _ctx.verify_mode = _ssl.CERT_NONE
+        _creds = _b64.b64encode(f'admin:{admin_pwd}'.encode()).decode()
+        _req = _ureq.Request(
+            f'https://{fqdn}/api/v1/node/users/{uid}',
+            headers={'Authorization': f'Basic {_creds}',
+                     'Accept': 'application/json'},
+        )
+        try:
+            with _ureq.urlopen(_req, timeout=10, context=_ctx) as _r:
+                return _json.loads(_r.read().decode()).get(
+                    'days_until_password_expiry')
+        except Exception:
+            return _NSX_EXPIRY_API_ERROR
+
     if nsx_mgr_entries:
-        lsf.write_output(f'Setting NSX Manager password expiration to {nsx_expiry_days} days...')
+        lsf.write_output(
+            f'Checking NSX Manager password expiration '
+            f'(threshold: {nsx_expiry_threshold_days}d)...'
+        )
         lsf.write_vpodprogress('NSX Password Config', 'GOOD-8')
-        
+
         for entry in nsx_mgr_entries:
             nsx_host = entry.split(':')[0].strip()
             nsx_fqdn = f'{nsx_host}.site-a.vcf.lab' if '.' not in nsx_host else nsx_host
-            
+
             if not dry_run:
                 if not lsf.test_tcp_port(nsx_fqdn, 22, timeout=5):
                     lsf.write_output(f'  {nsx_fqdn}: SSH not reachable - skipping')
                     continue
-                
+
                 for user in nsx_users:
+                    current = _nsx_days_until_expiry(nsx_fqdn, password, user)
+
+                    if current == _NSX_EXPIRY_API_ERROR:
+                        # REST call failed — can't verify; update as safe fallback
+                        lsf.write_output(
+                            f'  {nsx_fqdn}: {user} — REST API check failed, '
+                            f'updating as safe fallback')
+                    elif current is None:
+                        # Key absent in response → no expiry configured → skip
+                        lsf.write_output(
+                            f'  {nsx_fqdn}: {user} — no expiry configured '
+                            f'(password_change_frequency=0) — SKIP')
+                        continue
+                    elif current == 0:
+                        # NSX "no expiry" sentinel value → skip
+                        lsf.write_output(
+                            f'  {nsx_fqdn}: {user} — API reports 0 days '
+                            f'(non-expiring) — SKIP')
+                        continue
+                    elif current > nsx_expiry_threshold_days:
+                        lsf.write_output(
+                            f'  {nsx_fqdn}: {user} — expires in {current}d '
+                            f'(> {nsx_expiry_threshold_days}d threshold) — SKIP')
+                        continue
+                    else:
+                        # Expires within threshold — update
+                        lsf.write_output(
+                            f'  {nsx_fqdn}: {user} — expires in {current}d '
+                            f'(≤ {nsx_expiry_threshold_days}d) — setting to '
+                            f'{nsx_expiry_days}d')
                     result = lsf.ssh(
                         f'set user {user} password-expiration {nsx_expiry_days}',
                         f'admin@{nsx_fqdn}', password
                     )
                     if result.returncode == 0:
-                        lsf.write_output(f'  {nsx_fqdn}: {user} password expiration set to {nsx_expiry_days} days')
+                        lsf.write_output(
+                            f'  {nsx_fqdn}: {user} password expiration '
+                            f'updated to {nsx_expiry_days} days')
                     else:
-                        lsf.write_output(f'  {nsx_fqdn}: WARNING - could not set {user} password expiration')
+                        lsf.write_output(
+                            f'  {nsx_fqdn}: WARNING — could not set {user} '
+                            f'password expiration (exit {result.returncode})')
+                        nsx_task_failed = True
             else:
-                lsf.write_output(f'  Would set {nsx_expiry_days}-day password expiration on {nsx_fqdn} for {nsx_users}')
+                lsf.write_output(
+                    f'  Would check NSX user expiry on {nsx_fqdn} and update '
+                    f'any user expiring within {nsx_expiry_threshold_days}d '
+                    f'to {nsx_expiry_days}d'
+                )
     
     # Fleet password policy remediation via ops-a suite-api
     ops_fqdn = 'ops-a.site-a.vcf.lab'
@@ -3069,6 +3383,38 @@ echo "PROXY_CONFIGURED"
                 # Execute the distribution function
                 lsf.write_output('Distributing Vault CA trust across VCF suite...')
                 confighol.distribute_vault_ca_trust(vault_ca_pem, lsf.get_password(), dry_run=dry_run)
+
+                # Import the active Vault CA into Firefox on the console VM.
+                # distribute_vault_ca_trust() handles VCF infrastructure (vCenter,
+                # ESXi, NSX, SDDC Manager, VCFA, Ops) but not the Firefox cert store.
+                # import_ca_to_firefox_profile() deletes any stale entry first, then
+                # re-imports, so repeated runs are safe and always keep Firefox in sync
+                # with the current active CA — fixing the vpodchecker FAIL
+                # "Active Vault CA not found in Firefox certificate store".
+                lsf.write_output('Importing Vault CA into Firefox on console VM...')
+                try:
+                    ff_profiles = confighol.find_firefox_profiles()
+                    if ff_profiles:
+                        imported = 0
+                        for ff_profile in ff_profiles:
+                            if confighol.import_ca_to_firefox_profile(
+                                vault_ca_pem, ff_profile,
+                                confighol.VAULT_CA_NAME, dry_run=dry_run,
+                            ):
+                                imported += 1
+                        lsf.write_output(
+                            f'Vault CA imported into {imported}/{len(ff_profiles)} '
+                            f'Firefox profile(s).'
+                        )
+                    else:
+                        lsf.write_output(
+                            'WARNING: No Firefox profiles found on console VM — '
+                            'skipping Firefox CA import.'
+                        )
+                except Exception as ff_exc:
+                    lsf.write_output(
+                        f'WARNING: Firefox CA import failed: {ff_exc}'
+                    )
             else:
                 lsf.write_output(f'WARNING: Could not find {confighol_path} to distribute CA trust.')
         else:

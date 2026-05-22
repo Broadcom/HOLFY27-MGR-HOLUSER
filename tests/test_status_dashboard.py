@@ -153,7 +153,11 @@ class TestStatusDashboard:
         
         dashboard = StatusDashboard('HOL-2705')
         
-        expected_groups = ['prelim', 'infrastructure', 'vsphere', 'services', 'tanzu', 'final']
+        expected_groups = [
+            'prelim', 'esxi', 'vcf', 'vvf', 'vsphere',
+            'pings', 'services', 'kubernetes', 'urls',
+            'vcffinal', 'final', 'odyssey',
+        ]
         
         for group_id in expected_groups:
             assert group_id in dashboard.groups
@@ -212,8 +216,27 @@ class TestStatusDashboard:
                 html = dashboard.generate_html()
                 
                 assert 'Preliminary Checks' in html
-                assert 'Infrastructure Startup' in html
+                assert 'ESXi Host Verification' in html
                 assert 'vSphere Configuration' in html
+                assert 'VCF Final Tasks' in html
+                # New k8s cert task should be present
+                assert 'K8s Certificate Check/Renewal' in html
+
+    def test_vcffinal_group_contains_k8s_certs(self):
+        """Test vcffinal group contains the k8s_certs task"""
+        from status_dashboard import StatusDashboard
+        
+        dashboard = StatusDashboard('HOL-2705')
+        
+        assert 'vcffinal' in dashboard.groups
+        task_ids = [t.id for t in dashboard.groups['vcffinal'].tasks]
+        assert 'vcffinal_k8s_certs' in task_ids
+        
+        # Verify ordering: vcf_components before k8s_certs before vcfa_vms
+        comp_idx   = task_ids.index('vcffinal_vcf_components')
+        certs_idx  = task_ids.index('vcffinal_k8s_certs')
+        vcfa_idx   = task_ids.index('vcffinal_vcfa_vms')
+        assert comp_idx < certs_idx < vcfa_idx
     
     def test_html_refresh_interval(self):
         """Test HTML has correct refresh interval"""
