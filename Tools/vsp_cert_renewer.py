@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 vsp_cert_renewer.py
-Version 1.7 - 2026-05-22
+Version 1.8 - 2026-05-22
 Author: Burke Azbill and HOL Core Team
 
 Proactive Kubernetes certificate check and renewal for VSP and VCFA clusters.
@@ -10,7 +10,7 @@ Runs at every lab startup (called by VCFfinal.py Task 2e before component
 scale-up). Non-fatal — exceptions are caught per-phase so a failure in one
 phase never aborts the others or the boot sequence.
 
-Threshold: THRESHOLD_DAYS (365). Any cert expiring within 1 year is renewed
+Threshold: THRESHOLD_DAYS (60). Any cert expiring within 60 days is renewed
 to 5 years via kubeadm --config certificateValidityPeriod (confirmed valid on
 VMware kubeadm v1.34.2). Falls back to default 1-year renewal on older builds.
 
@@ -32,6 +32,13 @@ Log format per cert:
   SKIP   : <name> — valid for ><N>d
   WARN   : <description>
   ERROR  : <description>
+
+v1.8 Changes:
+- THRESHOLD_DAYS lowered from 365 (1 year) to 60 days.  Some certs cannot be
+  issued for more than 1 year; a 365-day threshold caused those certs to be
+  renewed on every single VCFfinal.py run.  60-day threshold matches standard
+  PKI practice — proactive without excessive churn.  Applies to all phases
+  (kubeadm, kubelet, cert-manager, Antrea) for both VSP and VCFA clusters.
 
 v1.7 Changes:
 - Phase 3.0: lowered CA_MIN_REMAINING_H from 43830h (5y) to 8760h (1y).
@@ -63,7 +70,7 @@ v1.6 Changes:
 
 Usage:
   python3 vsp_cert_renewer.py --cluster vsp|vcfa|all
-                               [--threshold-days 365]
+                               [--threshold-days 60]
                                [--dry-run]
                                [--skip-kubeadm] [--skip-kubelet]
                                [--skip-certmanager] [--skip-antrea]
@@ -81,11 +88,11 @@ import time
 from datetime import datetime, timezone
 
 # ─── Version ──────────────────────────────────────────────────────────────────
-VERSION = "1.7"
+VERSION = "1.8"
 DATE    = "2026-05-22"
 
 # ─── Global constants ─────────────────────────────────────────────────────────
-THRESHOLD_DAYS = 365           # renew if any cert expires within 1 year
+THRESHOLD_DAYS = 60            # renew if any cert expires within 60 days
 THRESHOLD_SEC  = THRESHOLD_DAYS * 86400
 CERT_VALIDITY  = "43830h0m0s"  # 5 years via kubeadm certificateValidityPeriod
 CREDS_FILE     = "/home/holuser/creds.txt"

@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.0 - 2026-05-22
+Version 2.1 - 2026-05-22
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
+
+v2.1 Changes:
+- All cert renewal thresholds lowered from 365 days (1 year) to 60 days.
+  Some certs cannot be issued for more than 1 year; using a 365-day threshold
+  caused those certs to be renewed on every single VCFfinal.py run.
+  60-day threshold matches standard PKI practice for proactive rotation
+  without excessive churn.  Affects: _SCP_CERT_THRESHOLD_DAYS (Phase C)
+  and THRESHOLD_DAYS inside renew_spherelet_certs() (Phase 3).
 
 v2.0 Changes:
 - _stabilize_one_supervisor() Phase C: updated SCP cert-manager certificate
@@ -1527,11 +1535,12 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
     K = f"kubectl --kubeconfig={kubeconfig}"
 
     # --- Phase C: Certificate Management ---
-    # Threshold: any cert expiring within 365 days is renewed (matches the
+    # Threshold: any cert expiring within 60 days is renewed (matches the
     # global policy used by vsp_cert_renewer.py for all other K8s clusters).
-    # Previously this was 604800s (1 week) — far too short for a proactive
-    # lab-startup remediation tool.
-    _SCP_CERT_THRESHOLD_DAYS = 365
+    # Previously 604800s (1 week), then 365 days — 365d was too aggressive
+    # because some certs cannot be issued for more than 1 year and were being
+    # renewed on every single VCFfinal.py run.
+    _SCP_CERT_THRESHOLD_DAYS = 60
     _SCP_CERT_THRESHOLD_SEC  = _SCP_CERT_THRESHOLD_DAYS * 86400
 
     if dry_run:
@@ -1976,7 +1985,7 @@ def renew_spherelet_certs(vc, password, dry_run):
     run locally via subprocess.run().  Non-fatal — always returns True.
     """
     CERT_DAYS = 1825       # 5-year renewal validity (openssl -days)
-    THRESHOLD_DAYS = 365   # renew if any cert expires within 1 year
+    THRESHOLD_DAYS = 60    # renew if any cert expires within 60 days
     THRESHOLD_SEC = THRESHOLD_DAYS * 86400
 
     label = vc["label"]
