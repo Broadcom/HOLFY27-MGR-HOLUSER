@@ -1,6 +1,6 @@
 ---
 name: vcf-troubleshooting
-description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch), Authentik SCIM syncing 0 users due to empty property_mappings, and Authentik missing group memberships due to empty vCenter SCIM group payload. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, OIDC sub ExternalId, SCIM 0 users, property_mappings empty, vcf_viewer role, SCIM members array missing, force_vcf_scim_group_memberships, patch_compare_users bug, VCFA login 500, vcfapostgres pending, system-shutdown Argo Workflow, prelude deployments 0 replicas, node cordoned after startup, lock-vmsp-platform mutex, Fleet LCM stale workflow, or auto-platform-a-b7nps SchedulingDisabled, cert-manager Certificate not-Ready, tls-for-opensearch expired, vcf-cluster-ca expired, spec.duration short, vsp_cert_renewer, or VSP certificate renewal.
+description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch), Authentik SCIM syncing 0 users due to empty property_mappings, and Authentik missing group memberships due to empty vCenter SCIM group payload. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, OIDC sub ExternalId, SCIM 0 users, property_mappings empty, vcf_viewer role, SCIM members array missing, force_vcf_scim_group_memberships, patch_compare_users bug, VCFA login 500, vcfapostgres pending, system-shutdown Argo Workflow, prelude deployments 0 replicas, node cordoned after startup, lock-vmsp-platform mutex, Fleet LCM stale workflow, or auto-platform-a-b7nps SchedulingDisabled, cert-manager Certificate not-Ready, tls-for-opensearch expired, vcf-cluster-ca expired, spec.duration short, vsp_cert_renewer, VSP certificate renewal, CA rotation ImagePullBackOff, ECDSA verification failure vcf-cluster-ca, registry-certificate broken after CA rotation, or vodap ImagePullBackOff after boot.
 last_updated: 2026-05-22
 ---
 
@@ -63,6 +63,7 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | VCF Operations UI shows internal component type names | Lifecycle UI displays `OPS_NETWORKS`, `OPS_LOGS` instead of friendly names; `/fleet-lcm/v1/components` returns `[]` | Race: `vcf-fleet-lcm`/`vcf-sddc-lcm` start before `vidb` finishes JWT key initialization | 49 |
 | VCF Automation `https://auto-a.site-a.vcf.lab/login` returns HTTP 500 | Login page returns 500 shortly after lab startup; `vcfapostgres-0` in Pending state; all prelude deployments at 0/0 | Stale `system-shutdown-*` Argo Workflows in `vmsp-platform` resume after node uncordon, re-cordon node and scale all prelude deployments to 0 | 50 |
 | VSP cert-manager certs expire within lab lifecycle | cert-manager `Certificate` resources not-Ready or expiring within days/weeks; short default `spec.duration` from template freeze-date; `tls-for-opensearch`, cluster CAs expire ~3y after template build | cert-manager default or VMware-set durations (8760h–27740h) do not account for template reuse; fix by extending CAs to 10y then leaf certs to 5y | 51 |
+| VSP ImagePullBackOff after CA rotation | pods in `vodap`/`ops-logs` fail with `ECDSA verification failure` for `vcf-cluster-ca`; image pulls from `registry.vmsp-platform.svc.cluster.local:5000` fail | Phase 3.0 CA rotation generates new key pair; VCF operator reverts spec.duration causing repeat rotations; leaf certs signed by old key become unverifiable | 52 |
 
 ---
 
@@ -2282,3 +2283,41 @@ python3 /home/holuser/hol/Tools/vsp_cert_renewer.py \
 - Leaf cert duration is capped by the issuing CA's remaining validity. Always extend the CAs (Phase 3.0) **before** renewing leaf certs (Phase 3.1) so leaf certs can achieve the full 5-year target.
 - `trust-manager` Bundles in this environment have no `sources` or `targets` configured — there are no CA trust ConfigMaps to update after CA rotation.
 - `datetime.utcnow()` is deprecated in Python 3.12+; use `datetime.now(timezone.utc).replace(tzinfo=None)` for naive-UTC comparisons.
+
+## 52. VSP ImagePullBackOff After CA Rotation — "ECDSA verification failure" for vcf-cluster-ca
+
+**Symptom**: After `vsp_cert_renewer.py` runs (or runs multiple times in the same boot cycle), pods in `vodap` or other VSP namespaces fail to start with `ImagePullBackOff`. Describing the pod shows:
+```
+tls: failed to verify certificate: x509: certificate signed by unknown authority
+(possibly because of "x509: ECDSA verification failure" while trying to verify
+candidate authority certificate "vcf-cluster-ca")
+```
+The internal image registry `registry.vmsp-platform.svc.cluster.local:5000` (at `198.18.128.16:5000`) is returning a TLS cert that cannot be verified against the current CA.
+
+**Diagnosis**:
+```bash
+# Check what CA is currently in the Secret
+kubectl get secret vcf-cluster-ca-secret -n vmsp-platform \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -dates -subject
+
+# Check the registry cert's issuer
+kubectl get secret registry-certificate -n vmsp-platform \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -dates -issuer
+
+# Check for ImagePullBackOff pods
+kubectl get pods -A --field-selector=status.phase!=Running -o wide | grep -v Completed
+```
+If the registry cert's `notBefore` predates the CA's `notBefore`, the registry cert was signed by an older CA key than the one currently in the Secret.
+
+**Root Cause**: `vsp_cert_renewer.py` Phase 3.0 (CA extension) sets `spec.duration=87600h` on `vcf-cluster-ca` and deletes the backing Secret, triggering cert-manager to reissue the CA **with a brand new key pair**. The VCF operator enforces `spec.duration=27740h` (~3.17y) and continuously reverts the patch, but not before cert-manager issues a temporary 10-year cert. On the *next* run of `vsp_cert_renewer.py` (e.g. if VCFfinal.py is invoked twice), the CA has ~3.17y remaining which is still below the old 5-year threshold (43830h), so Phase 3.0 fires *again* and rotates the CA to yet another key. If Phase 3.1 sees the `registry-cert` as valid (it was renewed in the first run), it skips it — leaving the registry cert signed by an old CA key that no longer matches the current CA Secret.
+
+**Fix (immediate)**: Delete the registry-certificate Secret to force cert-manager to reissue it with the current CA:
+```bash
+kubectl delete secret registry-certificate -n vmsp-platform --ignore-not-found=true
+# Wait ~30s for cert-manager to reissue, then delete the stuck pod
+kubectl delete pod <stuck-pod-name> -n vodap --force --grace-period=0
+```
+
+**Fix (permanent, `vsp_cert_renewer.py` v1.7+)**:
+- `CA_MIN_REMAINING_H` was lowered from `43830` (5 years) to `8760` (1 year). A fresh template deployment has ~3y on the CA so Phase 3.0 no longer fires on every boot.
+- `_phase3_extend_ca()` now returns `True` if a CA was actually rotated. `_check_cluster()` passes `force_all=True` to `_phase3_certmanager()` when the CA was rotated, forcing immediate renewal of **all** leaf certs regardless of their notAfter date — because the old CA key is no longer valid for any cert signed with it.

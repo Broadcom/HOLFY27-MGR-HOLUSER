@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 vsp_cert_renewer.py
-Version 1.6 - 2026-05-22
+Version 1.7 - 2026-05-22
 Author: Burke Azbill and HOL Core Team
 
 Proactive Kubernetes certificate check and renewal for VSP and VCFA clusters.
@@ -32,6 +32,23 @@ Log format per cert:
   SKIP   : <name> — valid for ><N>d
   WARN   : <description>
   ERROR  : <description>
+
+v1.7 Changes:
+- Phase 3.0: lowered CA_MIN_REMAINING_H from 43830h (5y) to 8760h (1y).
+  The VCF operator enforces spec.duration=27740h (~3.17y) on the vcf-cluster-ca
+  and continuously reverts our spec.duration patch.  With the 5y threshold, Phase
+  3.0 triggered on EVERY boot of a fresh template deployment (CA always ~3y left
+  < 5y threshold), generating a new CA key pair each time and breaking all leaf
+  certs.  The 1y threshold means Phase 3.0 only fires when the CA is genuinely
+  near expiry.
+- Phase 3.0: _phase3_extend_ca() now returns True if any CA was actually rotated.
+- Phase 3.1: _phase3_certmanager() gains a force_all parameter.  When the CA
+  was rotated (return value from Phase 3.0), force_all=True forces immediate
+  renewal of ALL leaf certs regardless of their notAfter date — required because
+  the new CA has a new key pair and all previously-issued leaf certs are now
+  cryptographically broken even if their notAfter is years away.
+- _check_cluster(): wires Phase 3.0 rotated flag → Phase 3.1 force_all, with
+  a WARN log explaining why all certs are being renewed.
 
 v1.6 Changes:
 - Phase 4 (Antrea): instead of deleting the Secret and letting Antrea
@@ -64,7 +81,7 @@ import time
 from datetime import datetime, timezone
 
 # ─── Version ──────────────────────────────────────────────────────────────────
-VERSION = "1.6"
+VERSION = "1.7"
 DATE    = "2026-05-22"
 
 # ─── Global constants ─────────────────────────────────────────────────────────
@@ -873,8 +890,14 @@ def _phase2_one_node(label, node_name, node_ip, password, cp_ip,
 # leaf-cert reissuances (Phase 3.1) are not capped at the CA's expiry.
 # trust-manager Bundles on this cluster are all empty (no sources/targets) so
 # there are no CA bundle ConfigMaps to update after rotation.
-CA_TARGET_DURATION = "87600h0m0s"   # 10 years
-CA_MIN_REMAINING_H = 43830          # extend if < 5 years (~43830h) remaining
+CA_TARGET_DURATION = "87600h0m0s"   # 10 years (best-effort; VCF operator may revert)
+# Threshold: only rotate the CA if it has < 1 year remaining.
+# Using 5 years (43830h) caused Phase 3.0 to fire on EVERY boot because the
+# VCF operator enforces spec.duration=27740h (~3.17y) and continuously reverts
+# our patch.  Each rotation generates a new key pair, breaking all existing
+# leaf certs signed by the previous CA.  1 year matches the global THRESHOLD_DAYS
+# policy and avoids the destructive rotation cycle on normal deployments.
+CA_MIN_REMAINING_H = 8760           # extend if < 1 year (~8760h) remaining
 
 _CA_CERTS = [
     # (namespace, certificate_name, secret_name)
@@ -884,19 +907,25 @@ _CA_CERTS = [
 
 
 def _phase3_extend_ca(cluster_cfg, cp_ip, password, kubeconfig, dry_run):
-    """Extend both cluster CA certs to 10 years if remaining validity < 5 years.
+    """Extend both cluster CA certs if remaining validity < CA_MIN_REMAINING_H (1 year).
 
-    Runs before leaf cert renewal (Phase 3.1) so the new CA is in place when
-    cert-manager issues the extended-duration leaf certs.  Self-signed CAs are
-    rotated by patching spec.duration then deleting the backing Secret so
-    cert-manager reissues with the new duration.
+    Returns True if any CA was actually rotated (new Secret issued), False
+    otherwise.  The caller uses this to decide whether to force-renew all leaf
+    certs in Phase 3.1 — necessary because CA rotation generates a new key pair
+    and all existing leaf certs signed by the old key become unverifiable.
+
+    NOTE: The VCF operator enforces spec.duration=27740h and may revert our
+    patch shortly after issuance.  CA_MIN_REMAINING_H is set to 8760h (1 year)
+    so this phase only fires when the CA is genuinely near expiry, not on every
+    boot of a fresh template deployment.
     """
     label   = cluster_cfg["label"]
     kc_flag = f"--kubeconfig={kubeconfig}" if kubeconfig else ""
+    rotated = False   # becomes True if any CA Secret is actually deleted/reissued
     log_sep()
     log_info(f"Phase 3.0: cluster CA extension")
-    log_info(f"  Target duration : {CA_TARGET_DURATION} (10 years)")
-    log_info(f"  Extend threshold: < {CA_MIN_REMAINING_H}h remaining (~5 years)")
+    log_info(f"  Target duration : {CA_TARGET_DURATION} (10 years, best-effort)")
+    log_info(f"  Extend threshold: < {CA_MIN_REMAINING_H}h remaining (1 year)")
 
     for ns, cert_name, secret_name in _CA_CERTS:
         rc, out = _ssh_exec(
@@ -973,6 +1002,7 @@ def _phase3_extend_ca(cluster_cfg, cp_ip, password, kubeconfig, dry_run):
             f"--ignore-not-found=true 2>/dev/null",
             timeout=15,
         )
+        rotated = True  # CA was actually replaced — leaf certs must be force-renewed
 
         # Wait up to 30s for cert-manager to reissue the CA cert
         new_expiry = "unknown"
@@ -994,10 +1024,18 @@ def _phase3_extend_ca(cluster_cfg, cp_ip, password, kubeconfig, dry_run):
             f"OLD EXPIRY: {not_after_str} → NEW EXPIRY: {new_expiry}"
         )
 
+    return rotated  # True if ≥1 CA was replaced; caller must force-renew leaf certs
+
 
 # ─── Phase 3.1: cert-manager leaf cert renewal (VSP only) ────────────────────
-def _phase3_certmanager(cluster_cfg, cp_ip, password, kubeconfig, dry_run, threshold_days):
+def _phase3_certmanager(cluster_cfg, cp_ip, password, kubeconfig, dry_run,
+                        threshold_days, force_all=False):
     """Renew cert-manager leaf certs that are not-Ready OR expiring within threshold.
+
+    If force_all=True, ALL leaf certs are renewed regardless of expiry.  This is
+    set automatically when Phase 3.0 rotated a CA: the new CA has a new key pair,
+    so every existing leaf cert signed by the old CA is cryptographically broken
+    even if its notAfter date is far in the future.
 
     For every cert that needs renewal:
       1. Patch spec.duration to CERT_VALIDITY (5 years) unless the cert has
@@ -1012,6 +1050,9 @@ def _phase3_certmanager(cluster_cfg, cp_ip, password, kubeconfig, dry_run, thres
     log_info(f"Phase 3.1: cert-manager leaf certificate renewal")
     log_info(f"  Threshold      : {threshold_days}d")
     log_info(f"  Target duration: {CERT_VALIDITY} (5 years)")
+    if force_all:
+        log_info(f"  Force-all mode : ENABLED — CA was rotated; renewing ALL leaf certs"
+                 f" regardless of expiry (old CA key no longer valid)")
 
     # Check cert-manager health
     rc_h, health_out = _ssh_exec(
@@ -1089,7 +1130,7 @@ def _phase3_certmanager(cluster_cfg, cp_ip, password, kubeconfig, dry_run, thres
             f"EXPIRES: {not_after_str or 'unknown':25s} — {validity_tag}"
         )
 
-        if not is_ready or expiring:
+        if not is_ready or expiring or force_all:
             to_renew.append({
                 "ns":          ns,
                 "name":        name,
@@ -1456,12 +1497,18 @@ def _check_cluster(cluster_name, cluster_cfg, args):
         log_info(f"Phase 2 (kubelet): skipped")
 
     # ── Phase 3.0: extend cluster CAs to 10 years (VSP only) ────────────────
+    _ca_rotated = False
     if "extendca" in phases_cfg and not args.skip_extend_ca:
         try:
-            _phase3_extend_ca(
+            _ca_rotated = _phase3_extend_ca(
                 cluster_cfg, cp_ip, password, kubeconfig,
                 args.dry_run,
             )
+            if _ca_rotated:
+                log_warn(
+                    "CA was rotated — Phase 3.1 will force-renew ALL leaf certs "
+                    "to ensure they are signed by the new CA key"
+                )
         except Exception as exc:
             log_error(f"Phase 3.0 (extend-ca) raised unexpected exception: {exc}")
     else:
@@ -1473,6 +1520,7 @@ def _check_cluster(cluster_name, cluster_cfg, args):
             _phase3_certmanager(
                 cluster_cfg, cp_ip, password, kubeconfig,
                 args.dry_run, args.threshold_days,
+                force_all=_ca_rotated,
             )
         except Exception as exc:
             log_error(f"Phase 3.1 (cert-manager) raised unexpected exception: {exc}")
