@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.2 - 2026-05-22
+Version 2.3 - 2026-05-22
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
+
+v2.3 Changes:
+- Added --threshold-days CLI arg (default 60).  Threads through
+  fix_supervisor_control_plane() → _stabilize_one_supervisor()
+  (_SCP_CERT_THRESHOLD_DAYS) and renew_spherelet_certs() (THRESHOLD_DAYS).
+  confighol-9.1.py passes --threshold-days 1820 to force-renew all spherelet
+  and SCP cert-manager certs to 5 years at template-prep time, so startup
+  checks are instant skips rather than triggering full renewal workloads.
 
 v2.2 Changes:
 - run_on_scp(): Replaced narrow SGR-only ANSI strip pattern with a full
@@ -1213,7 +1221,7 @@ def discover_scp_node_ips(vc, password):
 
 
 def fix_supervisor_control_plane(vc, password, dry_run, only_cluster=None,
-                        only_ip=None):
+                        only_ip=None, threshold_days=60):
     """Regenerate the supervisor-management-proxy mTLS cert on one vCenter.
 
     A single vCenter can host multiple Supervisor clusters; we discover them
@@ -1273,7 +1281,8 @@ def fix_supervisor_control_plane(vc, password, dry_run, only_cluster=None,
 
     overall_ok = True
     for c in clusters:
-        ok = _stabilize_one_supervisor(vc, password, c, dry_run)
+        ok = _stabilize_one_supervisor(vc, password, c, dry_run,
+                                       threshold_days=threshold_days)
         if not ok:
             overall_ok = False
     return overall_ok
@@ -1377,7 +1386,7 @@ def _cleanup_stale_pods_with_wait(vc, password, scp_ip, scp_pass, namespace,
     return True
 
 
-def _stabilize_one_supervisor(vc, password, cluster, dry_run):
+def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60):
     """Apply the stabilization fixes to a single Supervisor cluster stanza."""
     label = vc["label"]
     cid = cluster["cluster"]
@@ -1554,12 +1563,11 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
     K = f"kubectl --kubeconfig={kubeconfig}"
 
     # --- Phase C: Certificate Management ---
-    # Threshold: any cert expiring within 60 days is renewed (matches the
-    # global policy used by vsp_cert_renewer.py for all other K8s clusters).
-    # Previously 604800s (1 week), then 365 days — 365d was too aggressive
-    # because some certs cannot be issued for more than 1 year and were being
-    # renewed on every single VCFfinal.py run.
-    _SCP_CERT_THRESHOLD_DAYS = 60
+    # Threshold: any cert expiring within threshold_days is renewed.  Default
+    # (60) matches the global policy used by vsp_cert_renewer.py.  confighol
+    # passes a higher value (1820) to force-renew everything at template-prep
+    # time so startup checks are instant skips.
+    _SCP_CERT_THRESHOLD_DAYS = threshold_days
     _SCP_CERT_THRESHOLD_SEC  = _SCP_CERT_THRESHOLD_DAYS * 86400
 
     if dry_run:
@@ -1977,7 +1985,7 @@ def _scp_put_esx(host, password, local_path, remote_path, timeout=30):
 # Phase 3: ESXi spherelet certificate renewal
 # ---------------------------------------------------------------------------
 
-def renew_spherelet_certs(vc, password, dry_run):
+def renew_spherelet_certs(vc, password, dry_run, threshold_days=60):
     """Renew expired ESXi spherelet certificates for Supervisor worker nodes.
 
     ESXi hosts acting as Supervisor worker nodes carry 1-year spherelet
@@ -1986,8 +1994,10 @@ def renew_spherelet_certs(vc, password, dry_run):
     controller-manager pod — cannot be scheduled, causing 502 Bad Gateway
     from the Local Consumption Interface.
 
-    Pre-checks expiry against THRESHOLD_DAYS (365 / 1 year).  If every
-    node's client.crt is valid for at least that long, this is a no-op.
+    Pre-checks expiry against threshold_days.  If every node's client.crt is
+    valid for at least that long, this is a no-op.  Default is 60 days
+    (startup policy); confighol passes 1820 to force-renew everything to 5
+    years at template-prep time.
 
     Steps (mirroring renew_spherelet_certs.sh exactly):
       1. Retrieve SCP credentials via decryptK8Pwd.py (same as Phase 2).
@@ -2003,8 +2013,8 @@ def renew_spherelet_certs(vc, password, dry_run):
     interact with the Supervisor control-plane node.  All openssl operations
     run locally via subprocess.run().  Non-fatal — always returns True.
     """
-    CERT_DAYS = 1825       # 5-year renewal validity (openssl -days)
-    THRESHOLD_DAYS = 60    # renew if any cert expires within 60 days
+    CERT_DAYS = 1825                      # 5-year renewal validity (openssl -days)
+    THRESHOLD_DAYS = threshold_days       # renew if any cert expires within N days
     THRESHOLD_SEC = THRESHOLD_DAYS * 86400
 
     label = vc["label"]
@@ -2500,6 +2510,12 @@ def parse_args():
         "--dry-run", action="store_true",
         help="Show every action that would be taken without changing state.",
     )
+    p.add_argument(
+        "--threshold-days", type=int, default=60,
+        help="Renew spherelet and SCP cert-manager certs expiring within this "
+             "many days (default: 60).  Pass 1820 when calling from confighol "
+             "to force-renew all certs to 5 years at template-prep time.",
+    )
     return p.parse_args()
 
 
@@ -2509,6 +2525,7 @@ def main():
 
     banner("Supervisor Cert Rotation Remediation")
     log(f"target upstream domain : {args.target_domain}")
+    log(f"threshold-days         : {args.threshold_days}")
     log(f"dry-run                : {args.dry_run}")
     _active = " ".join(filter(None, [
         "" if args.skip_vcenter_proxy else "vcenter-proxy",
@@ -2578,6 +2595,7 @@ def main():
                 vc, password, args.dry_run,
                 only_cluster=args.supervisor_cluster,
                 only_ip=args.supervisor_ip,
+                threshold_days=args.threshold_days,
             )
             if not ok:
                 failures.append(f"proxy:{vc['label']}")
@@ -2587,7 +2605,8 @@ def main():
         banner("Phase 3: ESXi spherelet certificate renewal")
         proxy_targets = proxy_targets if not args.skip_proxy else vcenters
         for vc in proxy_targets:
-            renew_spherelet_certs(vc, password, args.dry_run)
+            renew_spherelet_certs(vc, password, args.dry_run,
+                                  threshold_days=args.threshold_days)
             # Non-fatal — never appended to failures
 
     # ---- Phase 4: Supervisor config_status / kubernetes_status poll -----
