@@ -12,8 +12,8 @@ v2.2 Changes:
   bracketed-paste toggles and \x1b[K erase-line sequences) plus bare \r
   characters.  Residual escape sequences were the root cause of blank lines
   appearing in labstartup.log between each SCP command.  Also relaxed the
-  root@…# prompt regex from strict `\s*\[.*\]\s*#` to `.*\]#` so embedded
-  escape remnants can no longer break prompt suppression.
+  root@...# prompt-suppression regex relaxed so residual escape remnants
+  embedded in the hostname/bracket section can no longer prevent filtering.
 
 v2.1 Changes:
 - All cert renewal thresholds lowered from 365 days (1 year) to 60 days.
