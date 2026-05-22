@@ -1,8 +1,39 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.2 - 2026-05-19
+# Version 6.3.7 - 2026-05-22
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.7 Changes:
+# - status_dashboard: add k8s_certs task (RUNNING/COMPLETE/FAILED/SKIPPED)
+#   around vsp_cert_renewer.py calls in Task 2e; add SKIPPED to all
+#   early-exit branches (no vCenters, no Supervisor configured).
+#
+# v6.3.6 Changes:
+# - Task 2e: reduce vsp_cert_renewer streaming output indentation from 4
+#   spaces to 1 space so cert log lines are not excessively deep.
+#
+# v6.3.5 Changes:
+# - Task 2e: pass --no-timestamps to vsp_cert_renewer.py so its internal
+#   [timestamp] prefix is suppressed and lsf.write_output's timestamp is
+#   the only one shown (matches supervisor_stabilizer.py convention).
+#
+# v6.3.4 Changes:
+# - Task 2e: added K8s certificate check/renewal block (vsp_cert_renewer.py)
+#   immediately after the NO_PROXY configuration, before component scale-up.
+#   Runs once for VSP and once for VCFA via streaming Popen (same pattern as
+#   the supervisor_stabilizer call in Task 2c).  THRESHOLD=365d, renews to
+#   5 years via kubeadm --config certificateValidityPeriod.  Non-fatal.
+#
+# v6.3.3 Changes:
+# - Task 2c: replaced lsf.run_command() (blocks until completion, dumps all
+#   output at once) with subprocess.Popen streaming so supervisor_stabilizer.py
+#   output appears in the log in real time instead of after a ~5-minute gap.
+#   Uses python3 -u + PYTHONUNBUFFERED=1 to disable Python stdio buffering.
+# - Removed inline 'import subprocess' inside main() (Task 4 vcfa-stabilizer
+#   block). The inline import made subprocess a local variable for the entire
+#   main() scope, causing UnboundLocalError at the Task 2c Popen call.
+#   subprocess is already imported at module level (line 145).
 #
 # v6.3.2 Changes:
 # - Fixed dashboard updates
@@ -378,6 +409,8 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.update_task('vcffinal', 'vcfa_k8s_health', TaskStatus.SKIPPED,
                                   'No vCenters configured')
             dashboard.update_task('vcffinal', 'vcfa_urls', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.SKIPPED,
                                   'No vCenters configured')
             dashboard.update_task('vcffinal', 'nsx_passwords', TaskStatus.SKIPPED,
                                   'No vCenters configured')
@@ -767,28 +800,39 @@ def main(lsf=None, standalone=False, dry_run=False):
                 lsf.write_output(f'  (script will auto-discover and stabilize all active Supervisors)')
                 
                 try:
-                    wcp_cmd = f'python3 {supervisor_stabilizer_script} --auto'
-                    result = lsf.run_command(wcp_cmd, timeout=WCP_SCRIPT_TIMEOUT)
-                    
-                    exit_code = result.returncode if hasattr(result, 'returncode') else (0 if result else 1)
-                    
-                    # Log stdout from the script (timestamps already included by script)
-                    if hasattr(result, 'stdout') and result.stdout:
-                        for line in result.stdout.strip().split('\n'):
-                            if line.strip():
-                                lsf.write_output(f'  {line.strip()}')
-                    # Log stderr (errors/warnings from the script)
-                    if hasattr(result, 'stderr') and result.stderr:
-                        for line in result.stderr.strip().split('\n'):
-                            if line.strip():
-                                lsf.write_output(f'  {line.strip()}')
-                    
+                    # Stream output line-by-line so the log shows progress in
+                    # real time rather than buffering the entire ~5-minute run
+                    # and dumping it all at once after the script exits.
+                    # -u forces Python unbuffered I/O; PYTHONUNBUFFERED=1 is a
+                    # belt-and-suspenders complement for any C-level buffering.
+                    env = os.environ.copy()
+                    env['PYTHONUNBUFFERED'] = '1'
+                    proc = subprocess.Popen(
+                        ['python3', '-u', supervisor_stabilizer_script, '--auto'],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        env=env,
+                    )
+                    start_time = time.time()
+                    for line in proc.stdout:
+                        if time.time() - start_time > WCP_SCRIPT_TIMEOUT:
+                            proc.kill()
+                            lsf.write_output('  WARNING: Supervisor stabilization script timed out')
+                            break
+                        line_stripped = line.rstrip('\n')
+                        if line_stripped.strip():
+                            lsf.write_output(f'  {line_stripped.strip()}')
+                    proc.wait()
+                    exit_code = proc.returncode if proc.returncode is not None else 1
+
                     if exit_code == 0:
                         lsf.write_output(f'Supervisor stabilization completed successfully')
                     else:
                         lsf.write_output(f'WARNING: Supervisor stabilization script exited with code {exit_code}')
                         wcp_certs_ok = False
-                        
+
                 except Exception as wcp_err:
                     lsf.write_output(f'WARNING: Error running Supervisor stabilization script: {wcp_err}')
                     lsf.write_output('  Continuing with startup - WCP may need manual attention')
@@ -872,6 +916,7 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.update_task('vcffinal', 'wcp_certs', TaskStatus.SKIPPED, 'Not configured')
             dashboard.update_task('vcffinal', 'wcp_dns', TaskStatus.SKIPPED, 'Not configured')
             dashboard.update_task('vcffinal', 'svc_dns', TaskStatus.SKIPPED, 'Not configured')
+            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.SKIPPED, 'No Supervisor configured')
             dashboard.update_task('vcffinal', 'tanzu_deploy', TaskStatus.RUNNING)
             dashboard.generate_html()
     
@@ -1286,7 +1331,66 @@ echo "PROXY_CONFIGURED"
                 if vsp_node_ips:
                     lsf.write_output(f'  Found {len(vsp_node_ips)} VSP nodes: {", ".join(vsp_node_ips)}')
                     apply_proxy_to_nodes(vsp_node_ips)
-                
+
+                # ---- Kubernetes certificate check/renewal (VSP + VCFA) ----
+                # Runs before component scale-up so the API server is healthy
+                # for everything that follows.  Non-fatal per cluster — a
+                # failure in one cluster does not abort the other or the boot.
+                _k8s_cert_script = '/home/holuser/hol/Tools/vsp_cert_renewer.py'
+                _k8s_cert_errors = []
+                if dashboard:
+                    dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.RUNNING)
+                    dashboard.generate_html()
+                if os.path.isfile(_k8s_cert_script):
+                    for _cert_cluster in ('vsp', 'vcfa'):
+                        lsf.write_output(
+                            f'  Running K8s cert check/renewal for '
+                            f'{_cert_cluster.upper()}...'
+                        )
+                        _cert_env = os.environ.copy()
+                        _cert_env['PYTHONUNBUFFERED'] = '1'
+                        _cert_proc = subprocess.Popen(
+                            ['python3', '-u', _k8s_cert_script,
+                             '--cluster', _cert_cluster,
+                             '--no-timestamps'],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1,
+                            env=_cert_env,
+                        )
+                        for _cert_line in _cert_proc.stdout:
+                            _cert_line = _cert_line.rstrip('\n')
+                            if _cert_line.strip():
+                                lsf.write_output(f' {_cert_line.strip()}')
+                        _cert_proc.wait()
+                        if _cert_proc.returncode not in (0, None):
+                            lsf.write_output(
+                                f'  WARNING: {_cert_cluster.upper()} cert '
+                                f'renewal exited {_cert_proc.returncode} '
+                                f'— continuing'
+                            )
+                            _k8s_cert_errors.append(
+                                f'{_cert_cluster.upper()} exited {_cert_proc.returncode}'
+                            )
+                    if dashboard:
+                        if _k8s_cert_errors:
+                            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.FAILED,
+                                                  f'Non-zero exit: {"; ".join(_k8s_cert_errors)}')
+                        else:
+                            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.COMPLETE,
+                                                  'VSP + VCFA cert check/renewal complete')
+                        dashboard.generate_html()
+                else:
+                    lsf.write_output(
+                        f'  K8s cert renewal script not found: '
+                        f'{_k8s_cert_script} — skipping'
+                    )
+                    if dashboard:
+                        dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.SKIPPED,
+                                              'vsp_cert_renewer.py not found')
+                        dashboard.generate_html()
+
                 # ---- Unsuspend postgres instances managed by Zalando operator ----
                 # The VMSP operator sets a "database.vmsp.vmware.com/suspended=true"
                 # label on PostgresInstance CRDs when a component is stopped.  The
@@ -2764,7 +2868,6 @@ echo "PROXY_CONFIGURED"
         # If the lab_sku = HOL-2701, then run vcfa-stabilizer.sh
         if lsf.lab_sku == 'HOL-2701':
             lsf.write_output('Running vcfa-stabilizer.sh...')
-            import subprocess
             try:
                 proc = subprocess.Popen(
                     ['/bin/bash', '/home/holuser/hol/Tools/vcfa-stabilizer.sh'],

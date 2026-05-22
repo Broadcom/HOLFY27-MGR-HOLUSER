@@ -1,10 +1,39 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 1.7 - 2026-05-21
+Version 2.0 - 2026-05-22
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
+
+v2.0 Changes:
+- _stabilize_one_supervisor() Phase C: updated SCP cert-manager certificate
+  renewal threshold from 604800s (1 week) to 365 days (1 year), matching the
+  global threshold used by all other K8s cert checks (spherelet renewal,
+  vsp_cert_renewer.py).  Previously, certs expiring in 20-110 days were logged
+  as "Valid" and silently skipped — they will now be renewed at boot.
+- Added a best-effort Certificate spec.duration patch (43830h / 5 years) before
+  Secret deletion so that cert-manager reissues with a longer TTL where the
+  VMware SCP cert-manager allows it.
+- Improved Phase C log messages to show days-remaining and threshold context.
+
+v1.9 Changes:
+- renew_spherelet_certs(): reduced THRESHOLD_DAYS from 730 (2 years) to 365
+  (1 year), matching the global threshold used by vsp_cert_renewer.py for
+  kubeadm/kubelet/cert-manager/Antrea certs across all K8s clusters.
+  CERT_DAYS remains 1825 (5-year openssl signing target — unchanged).
+
+v1.8 Changes:
+- Fixed ssh_to_scp_direct(): changed 'bash /tmp/.scpcmd_hop' to
+  'bash -s < /tmp/.scpcmd_hop' so the script is piped via stdin to bash on
+  the SCP rather than referencing a file path that only exists on the
+  intermediate vCenter hop.  Previously every call returned
+  'bash: /tmp/.scpcmd_hop: No such file or directory', causing stale-pod
+  namespace discovery to treat the error string as a k8s namespace name and
+  spin through 2x 120-second readiness loops producing nothing but log noise.
+- Added _VALID_NS regex guard in _stabilize_one_supervisor(): non-namespace
+  strings returned by ssh_to_scp_direct (e.g. error messages) are now
+  logged as WARN and discarded rather than passed to _cleanup_stale_pods_with_wait.
 
 v1.7 Changes:
 - Spherelet cert renewal is now native Python — renew_spherelet_certs.sh has
@@ -254,7 +283,8 @@ def log(msg, level="INFO"):
     # Timestamp is handled by the VCFfinal.py script that runs this script
     #ts = time.strftime("%Y-%m-%d %H:%M:%S")
     #print(f"[{ts}] {level}: {msg}", flush=True)
-    print(f"{level}: {msg}", flush=True)
+    #print(f"{level}: {msg}", flush=True)
+    print(f"{msg}", flush=True)
 
 
 def fail(msg, code=1):
@@ -1042,6 +1072,35 @@ def run_on_scp(vcenter_host, vcenter_user, vcenter_pass, scp_ip, scp_pass,
         os.unlink(script_path)
 
 
+def _probe_scp_kubeconfig(vc, password, scp_ip, scp_pass):
+    """Return the best available kubeconfig path on the Supervisor (SCP) node.
+
+    Tries /etc/kubernetes/super-admin.conf first (always on disk, unencrypted,
+    available from vSphere 8.0 U2 / VCF 9.x).  Falls back to admin.conf if
+    super-admin.conf is absent.
+
+    Uses ssh_to_vcenter (not ssh_to_scp_direct) so it works even before
+    the bash-s hop is fully established.
+    """
+    probe = ssh_to_vcenter(
+        vc["host"], vc["root_user"], password,
+        f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_kc "
+        f"&& chmod 600 /tmp/.scppwd_kc "
+        f"&& sshpass -f /tmp/.scppwd_kc ssh "
+        f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        f"-o LogLevel=ERROR -o ConnectTimeout=10 root@{scp_ip} "
+        f"'ls /etc/kubernetes/super-admin.conf 2>/dev/null && echo SUPER_ADMIN_EXISTS "
+        f"|| ls /etc/kubernetes/admin.conf 2>/dev/null && echo ADMIN_EXISTS "
+        f"|| echo NO_KUBECONFIG' "
+        f"; rm -f /tmp/.scppwd_kc",
+    )
+    if "SUPER_ADMIN_EXISTS" in probe:
+        return "/etc/kubernetes/super-admin.conf"
+    if "ADMIN_EXISTS" in probe:
+        return "/etc/kubernetes/admin.conf"
+    return "/etc/kubernetes/super-admin.conf"  # best guess
+
+
 def parse_decrypt_k8_pwd(text):
     """Parse the (possibly multi-cluster) output of decryptK8Pwd.py.
 
@@ -1204,6 +1263,9 @@ def ssh_to_scp_direct(vc, password, scp_ip, scp_pass, command, timeout=60):
     """
     pwd_b64 = base64.b64encode(scp_pass.encode()).decode()
     cmd_b64 = base64.b64encode(command.encode()).decode()
+    # NOTE: /tmp/.scpcmd_hop is written on the vCenter hop host, not on the
+    # SCP itself.  We pipe it as stdin to 'bash -s' on the SCP via the stdin
+    # redirect so the SCP never needs a local copy of the file.
     hop_cmd = (
         f"echo {pwd_b64} | base64 -d > /tmp/.scppwd_hop "
         f"&& chmod 600 /tmp/.scppwd_hop "
@@ -1212,7 +1274,7 @@ def ssh_to_scp_direct(vc, password, scp_ip, scp_pass, command, timeout=60):
         f"&& sshpass -f /tmp/.scppwd_hop ssh "
         f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
         f"-o LogLevel=ERROR -o ConnectTimeout=15 "
-        f"root@{scp_ip} bash /tmp/.scpcmd_hop 2>&1; "
+        f"root@{scp_ip} bash -s < /tmp/.scpcmd_hop 2>&1; "
         f"rm -f /tmp/.scppwd_hop /tmp/.scpcmd_hop"
     )
     return ssh_to_vcenter(vc["host"], vc["root_user"], password, hop_cmd)
@@ -1447,38 +1509,12 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
             timeout=120,
         )
 
-    # Resolve the best available kubeconfig on this SCP node:
-    #
-    #   1. /etc/kubernetes/super-admin.conf  (preferred - unencrypted, always
-    #      on disk, available from vSphere 8.0 U2 onwards).
-    #
-    #   2. /etc/kubernetes/admin.conf        (older builds; this is a symlink
-    #      to /dev/shm/wcp_decrypted_data/k8s-admin-conf_uid0 which is written
-    #      by a PAM module on interactive login.  In our non-interactive expect
-    #      session PAM does not run, so we must trigger decryption manually by
-    #      running decryptK8Pwd.py equivalent: `wcp-user-keys-gen` or by
-    #      sourcing the wcp environment which calls it as a side effect).
-    #
-    # We probe which path exists *before* we attempt any kubectl commands so
-    # we can build the right invocation rather than letting kubectl fail with
-    # a confusing "stat: no such file or directory" error.
-    kubeconfig_probe = ssh_to_vcenter(
-        vc["host"], vc["root_user"], password,
-        f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_kc "
-        f"&& chmod 600 /tmp/.scppwd_kc "
-        f"&& sshpass -f /tmp/.scppwd_kc ssh "
-        f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-        f"-o LogLevel=ERROR -o ConnectTimeout=10 root@{scp_ip} "
-        f"'ls /etc/kubernetes/super-admin.conf 2>/dev/null && echo SUPER_ADMIN_EXISTS "
-        f"|| ls /etc/kubernetes/admin.conf 2>/dev/null && echo ADMIN_EXISTS "
-        f"|| echo NO_KUBECONFIG' "
-        f"; rm -f /tmp/.scppwd_kc",
-    )
-    if "SUPER_ADMIN_EXISTS" in kubeconfig_probe:
-        kubeconfig = "/etc/kubernetes/super-admin.conf"
+    # Resolve the best available kubeconfig on this SCP node.
+    # See _probe_scp_kubeconfig() for the full rationale.
+    kubeconfig = _probe_scp_kubeconfig(vc, password, scp_ip, scp_pass)
+    if "super-admin" in kubeconfig:
         log(f"      [{cid}] Using super-admin.conf (preferred, unencrypted).")
-    elif "ADMIN_EXISTS" in kubeconfig_probe:
-        kubeconfig = "/etc/kubernetes/admin.conf"
+    elif "admin.conf" in kubeconfig:
         log(f"      [{cid}] super-admin.conf not found; using admin.conf "
             f"(PAM-decrypted symlink).", level="WARN")
         log(f"      [{cid}] Note: admin.conf relies on PAM decryption. If "
@@ -1487,11 +1523,17 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
     else:
         log(f"      [{cid}] No kubeconfig found at /etc/kubernetes/ on "
             f"{scp_ip}. kubectl commands will likely fail.", level="WARN")
-        kubeconfig = "/etc/kubernetes/super-admin.conf"  # best guess; let kubectl error speak for itself
 
     K = f"kubectl --kubeconfig={kubeconfig}"
 
     # --- Phase C: Certificate Management ---
+    # Threshold: any cert expiring within 365 days is renewed (matches the
+    # global policy used by vsp_cert_renewer.py for all other K8s clusters).
+    # Previously this was 604800s (1 week) — far too short for a proactive
+    # lab-startup remediation tool.
+    _SCP_CERT_THRESHOLD_DAYS = 365
+    _SCP_CERT_THRESHOLD_SEC  = _SCP_CERT_THRESHOLD_DAYS * 86400
+
     if dry_run:
         log(f"      [{cid}] [dry-run] would check/delete cert-manager + kube-system "
             f"proxy secrets and roll the deployment on {scp_ip}.")
@@ -1502,7 +1544,10 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
             ("kube-system", "storage-quota-webhook-server-internal-cert"),
             ("kube-system", "cns-storage-quota-extension-cert")
         ]
-        
+
+        log(f"      [{cid}] Checking {len(certs_to_check)} SCP cert-manager cert(s) "
+            f"(threshold: {_SCP_CERT_THRESHOLD_DAYS}d)")
+
         certs_need_renewal = False
         for ns, secret in certs_to_check:
             cmd_cert = (
@@ -1512,11 +1557,11 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
                 f"rm -f /tmp/.scppwd_cert"
             )
             end_date_out = ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_cert).strip()
-            
+
             if not end_date_out:
                 log(f"      [{cid}] {ns}/{secret}: Not found or could not parse (will be created automatically)")
                 continue
-                
+
             m = re.search(r"notAfter=(.+)", end_date_out)
             if m:
                 expiry_str = m.group(1)
@@ -1525,9 +1570,23 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
                     expiry_epoch = time.mktime(time.strptime(expiry_str, "%b %d %H:%M:%S %Y %Z"))
                     now_epoch = time.time()
                     remaining = expiry_epoch - now_epoch
-                    if remaining <= 604800: # 1 week
-                        log(f"      [{cid}] {ns}/{secret}: EXPIRING SOON or EXPIRED. Deleting to trigger regeneration...")
+                    days_remaining = int(remaining / 86400)
+                    if remaining <= _SCP_CERT_THRESHOLD_SEC:
+                        log(f"      [{cid}] {ns}/{secret}: "
+                            f"EXPIRING in {days_remaining}d — deleting Secret to trigger regeneration")
                         certs_need_renewal = True
+                        # Best-effort: patch Certificate spec.duration to 5 years
+                        # before deleting the Secret so cert-manager reissues with
+                        # a longer TTL.  Silently ignored if the Certificate resource
+                        # doesn't exist or the VMware operator restricts duration.
+                        cmd_patch = (
+                            f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_patch && chmod 600 /tmp/.scppwd_patch && "
+                            f"sshpass -f /tmp/.scppwd_patch ssh {SSH_OPTS} root@{scp_ip} "
+                            f"'{K} -n {ns} patch certificate {secret} --type=merge "
+                            f"-p {{\\\"spec\\\":{{\\\"duration\\\":\\\"43830h0m0s\\\"}}}} 2>/dev/null || true'; "
+                            f"rm -f /tmp/.scppwd_patch"
+                        )
+                        ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_patch)
                         cmd_del = (
                             f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_del && chmod 600 /tmp/.scppwd_del && "
                             f"sshpass -f /tmp/.scppwd_del ssh {SSH_OPTS} root@{scp_ip} "
@@ -1536,7 +1595,8 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
                         )
                         ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_del)
                     else:
-                        log(f"      [{cid}] {ns}/{secret}: Valid ({int(remaining/86400)}d remaining)")
+                        log(f"      [{cid}] {ns}/{secret}: "
+                            f"Valid ({days_remaining}d remaining — above {_SCP_CERT_THRESHOLD_DAYS}d threshold)")
                 except ValueError:
                     log(f"      [{cid}] Could not parse expiry date: {expiry_str}", level="WARN")
                     
@@ -1639,15 +1699,26 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run):
             f"{K} get ns --no-headers 2>/dev/null | grep 'svc-harbor' | awk '{{print $1}}'",
         )
 
+        # Validate that namespace names look like real k8s namespaces
+        # (lowercase alphanumeric + hyphens).  If ssh_to_scp_direct returned
+        # an error string the bad value is silently dropped rather than
+        # being passed to _cleanup_stale_pods_with_wait as the namespace.
+        _VALID_NS = re.compile(r'^[a-z0-9][a-z0-9\-]*$')
+
+        def _add_ns(raw, namespaces):
+            for ns in raw.splitlines():
+                ns = ns.strip()
+                if ns and _VALID_NS.match(ns):
+                    namespaces.append(ns)
+                elif ns:
+                    log(f"      [{cid}] namespace discovery returned unexpected "
+                        f"value (ignored): {ns!r}", level="WARN")
+
         service_namespaces = []
-        for ns in cci_raw.splitlines():
-            if ns.strip():
-                service_namespaces.append(ns.strip())
-        if "argocd" in argocd_check:
+        _add_ns(cci_raw, service_namespaces)
+        if "argocd" in argocd_check and _VALID_NS.match("argocd"):
             service_namespaces.append("argocd")
-        for ns in harbor_raw.splitlines():
-            if ns.strip():
-                service_namespaces.append(ns.strip())
+        _add_ns(harbor_raw, service_namespaces)
 
         for ns in service_namespaces:
             _cleanup_stale_pods_with_wait(
@@ -1887,7 +1958,7 @@ def renew_spherelet_certs(vc, password, dry_run):
     controller-manager pod — cannot be scheduled, causing 502 Bad Gateway
     from the Local Consumption Interface.
 
-    Pre-checks expiry against THRESHOLD_DAYS (730 / 2 years).  If every
+    Pre-checks expiry against THRESHOLD_DAYS (365 / 1 year).  If every
     node's client.crt is valid for at least that long, this is a no-op.
 
     Steps (mirroring renew_spherelet_certs.sh exactly):
@@ -1904,8 +1975,8 @@ def renew_spherelet_certs(vc, password, dry_run):
     interact with the Supervisor control-plane node.  All openssl operations
     run locally via subprocess.run().  Non-fatal — always returns True.
     """
-    CERT_DAYS = 1825       # 5-year renewal validity
-    THRESHOLD_DAYS = 730   # renew if any cert expires within 2 years
+    CERT_DAYS = 1825       # 5-year renewal validity (openssl -days)
+    THRESHOLD_DAYS = 365   # renew if any cert expires within 1 year
     THRESHOLD_SEC = THRESHOLD_DAYS * 86400
 
     label = vc["label"]
@@ -1936,11 +2007,19 @@ def renew_spherelet_certs(vc, password, dry_run):
     log(f"  [{label}] Supervisor node IP: {scp_ip}")
     log(f"  [{label}] Supervisor credentials retrieved.")
 
+    # ── Resolve best kubeconfig (shared helper, same probe as Phase 2) ────
+    kubeconfig = _probe_scp_kubeconfig(vc, password, scp_ip, scp_pass)
+    if "super-admin" in kubeconfig:
+        log(f"  [{label}] Using super-admin.conf (preferred, unencrypted).")
+    else:
+        log(f"  [{label}] Using admin.conf kubeconfig.")
+    K = f"kubectl --kubeconfig={kubeconfig}"
+
     # ── Step 2: discover ESXi agent nodes ─────────────────────────────────
     log(f"  [{label}] Discovering Supervisor agent nodes ...")
     nodes_json_raw = ssh_to_scp_direct(
         vc, password, scp_ip, scp_pass,
-        "kubectl get nodes -l node-role.kubernetes.io/agent -o json 2>/dev/null",
+        f"{K} get nodes -l node-role.kubernetes.io/agent -o json 2>/dev/null",
     )
     esx_nodes = []
     try:
@@ -1950,7 +2029,8 @@ def renew_spherelet_certs(vc, password, dry_run):
             for item in nodes_data.get("items", [])
         ]
     except (json.JSONDecodeError, KeyError):
-        pass
+        log(f"  [{label}] WARNING: could not parse node JSON from SCP "
+            f"(raw output: {nodes_json_raw[:200]!r})", level="WARN")
 
     if not esx_nodes:
         log(f"  [{label}] ERROR: No agent nodes found on Supervisor {scp_ip}",
@@ -1962,7 +2042,7 @@ def renew_spherelet_certs(vc, password, dry_run):
 
     # ── Step 3: pre-check cert expiry ─────────────────────────────────────
     log(f"  [{label}] Pre-checking certificate validity "
-        f"(threshold: {THRESHOLD_DAYS} days / 2 years)...")
+        f"(threshold: {THRESHOLD_DAYS} days / 1 year)...")
     needs_renewal = False
     for esx_host in esx_nodes:
         expiry = _ssh_exec_esx(
@@ -2090,7 +2170,7 @@ def renew_spherelet_certs(vc, password, dry_run):
             # Resolve node InternalIP from Supervisor via -o json (parsed locally)
             node_info_raw = ssh_to_scp_direct(
                 vc, password, scp_ip, scp_pass,
-                f"kubectl get node {fqdn} -o json 2>/dev/null",
+                f"{K} get node {fqdn} -o json 2>/dev/null",
             )
             node_ip = ""
             try:
@@ -2170,7 +2250,7 @@ def renew_spherelet_certs(vc, password, dry_run):
         log(f"  [{label}] === Supervisor node status after renewal ===")
         node_status = ssh_to_scp_direct(
             vc, password, scp_ip, scp_pass,
-            "kubectl get nodes -o wide 2>/dev/null",
+            f"{K} get nodes -o wide 2>/dev/null",
         )
         for line in node_status.splitlines():
             if line.strip():
@@ -2367,7 +2447,7 @@ def parse_args():
     p.add_argument(
         "--skip-spherelet", action="store_true",
         help="Don't run the ESXi spherelet certificate renewal phase (Phase 3). "
-             "Use when spherelet certs are known to be valid (> 2 years remaining).",
+             "Use when spherelet certs are known to be valid (> 1 year remaining).",
     )
     p.add_argument(
         "--skip-supervisor-poll", action="store_true",

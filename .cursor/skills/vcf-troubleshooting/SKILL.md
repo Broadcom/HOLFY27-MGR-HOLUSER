@@ -1,6 +1,7 @@
 ---
 name: vcf-troubleshooting
-description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch), Authentik SCIM syncing 0 users due to empty property_mappings, and Authentik missing group memberships due to empty vCenter SCIM group payload. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, OIDC sub ExternalId, SCIM 0 users, property_mappings empty, vcf_viewer role, SCIM members array missing, force_vcf_scim_group_memberships, patch_compare_users bug, VCFA login 500, vcfapostgres pending, system-shutdown Argo Workflow, prelude deployments 0 replicas, node cordoned after startup, lock-vmsp-platform mutex, Fleet LCM stale workflow, or auto-platform-a-b7nps SchedulingDisabled.
+description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch), Authentik SCIM syncing 0 users due to empty property_mappings, and Authentik missing group memberships due to empty vCenter SCIM group payload. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, OIDC sub ExternalId, SCIM 0 users, property_mappings empty, vcf_viewer role, SCIM members array missing, force_vcf_scim_group_memberships, patch_compare_users bug, VCFA login 500, vcfapostgres pending, system-shutdown Argo Workflow, prelude deployments 0 replicas, node cordoned after startup, lock-vmsp-platform mutex, Fleet LCM stale workflow, or auto-platform-a-b7nps SchedulingDisabled, cert-manager Certificate not-Ready, tls-for-opensearch expired, vcf-cluster-ca expired, spec.duration short, vsp_cert_renewer, or VSP certificate renewal.
+last_updated: 2026-05-22
 ---
 
 # VCF 9.x Troubleshooting Guide
@@ -61,6 +62,7 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | Authentik SCIM syncs users but group memberships are empty | "View Group Members" shows "No items to display"; users cannot log in | vCenter VIDB SCIM returns Group objects without `members` array; Authentik `patch_compare_users` skips PATCH | 48 |
 | VCF Operations UI shows internal component type names | Lifecycle UI displays `OPS_NETWORKS`, `OPS_LOGS` instead of friendly names; `/fleet-lcm/v1/components` returns `[]` | Race: `vcf-fleet-lcm`/`vcf-sddc-lcm` start before `vidb` finishes JWT key initialization | 49 |
 | VCF Automation `https://auto-a.site-a.vcf.lab/login` returns HTTP 500 | Login page returns 500 shortly after lab startup; `vcfapostgres-0` in Pending state; all prelude deployments at 0/0 | Stale `system-shutdown-*` Argo Workflows in `vmsp-platform` resume after node uncordon, re-cordon node and scale all prelude deployments to 0 | 50 |
+| VSP cert-manager certs expire within lab lifecycle | cert-manager `Certificate` resources not-Ready or expiring within days/weeks; short default `spec.duration` from template freeze-date; `tls-for-opensearch`, cluster CAs expire ~3y after template build | cert-manager default or VMware-set durations (8760h–27740h) do not account for template reuse; fix by extending CAs to 10y then leaf certs to 5y | 51 |
 
 ---
 
@@ -2192,3 +2194,91 @@ A safety-net copy of this logic also runs in the `Fix VCFA Microservices Scaling
 - The `vcfa-stabilizer.sh` "already applied" guard (checks for `/usr/local/bin/vcfa-eg-mem-keeper.sh`) skips the stabilizer on every startup after first run — this is expected behavior; the uncordon is handled separately in `VCFfinal.py`.
 - `sudo -S kubectl` (without `-i`) fails on VCF 9.1 because kubectl is only on root's `$PATH` via login shell. Always use `sudo -S -i bash -c 'kubectl ...'`.
 
+
+## 51. VSP cert-manager Certificates Expire Within Lab Lifecycle (Short Default Duration)
+
+**Symptom**: VCF Supervisor (VSP) cert-manager `Certificate` resources are not-Ready or show expiry dates within the current calendar year, even though the Supervisor cluster was only recently deployed. kubectl reports many certs with `READY=False` or `openssl x509` shows `notAfter` within days/weeks.
+
+Commonly affected certificates include `tls-for-opensearch`, `tls-for-opensearch-admin`, `auth-keypair`, `clickhouse-tls`, and various vSphere Pods (VSP) internal service certs.
+
+**Diagnosis**:
+```bash
+PASS=$(cat /home/holuser/creds.txt)
+VSP_CP=10.1.1.142
+
+# List all cert-manager Certificates with expiry and Ready status
+sshpass -p "$PASS" ssh -o StrictHostKeyChecking=accept-new \
+  vmware-system-user@vsp-01a.site-a.vcf.lab \
+  "sudo -S -i bash -c 'kubectl --kubeconfig=/etc/kubernetes/super-admin.conf \
+    get certificates -A -o json'" <<< "$PASS" | \
+  python3 -c "
+import sys, json
+from datetime import datetime, timezone
+data = json.load(sys.stdin)
+now = datetime.now(timezone.utc).replace(tzinfo=None)
+for c in data.get('items', []):
+    ns = c['metadata']['namespace']; name = c['metadata']['name']
+    exp = c.get('status', {}).get('notAfter', '')
+    dur = c.get('spec', {}).get('duration', '')
+    rdy = next((x for x in c.get('status',{}).get('conditions',[]) if x.get('type')=='Ready'), {})
+    ok  = rdy.get('status') == 'True'
+    try:
+        dt = datetime.strptime(exp, '%Y-%m-%dT%H:%M:%SZ')
+        days = (dt - now).days
+    except: days = '?'
+    print(f'  {\"Ready\" if ok else \"NOT RDY\"} {ns}/{name}: expires {exp} ({days}d) dur={dur}')
+"
+
+# Check both cluster CA certs
+for cert in vcf-cluster-ca vcf-external-cluster-ca-cert; do
+  sshpass -p "$PASS" ssh -o StrictHostKeyChecking=accept-new \
+    vmware-system-user@vsp-01a.site-a.vcf.lab \
+    "sudo -S -i bash -c 'kubectl --kubeconfig=/etc/kubernetes/super-admin.conf \
+      get certificate $cert -n vmsp-platform -o jsonpath=\"{.status.notAfter} {.spec.duration}\"'" \
+    <<< "$PASS"
+done
+```
+
+**Root Cause**: VMware deploys the Supervisor (VSP) cluster with cert-manager using a default cert duration (typically 8760h = 1 year, or a cluster-specific value). Both cluster CAs (`vcf-cluster-ca`, `vcf-external-cluster-ca-cert`) were created with `spec.duration: 27740h` (~3.16 years) at the time the nested-virtualization template was originally built. When the environment is deployed from a powered-off template, all cert expiry dates are frozen at their original values. Since labs are deployed many times per month over 1–2 years, certs frequently expire within the first months of use.
+
+**Fix** (`vsp_cert_renewer.py` v1.4+, runs automatically at boot via `VCFfinal.py` Task 2e):
+
+```bash
+# Phase 3.0 — extend both cluster CAs to 10 years (idempotent, skips if already >= 5y)
+sshpass -p "$PASS" ssh vmware-system-user@vsp-01a.site-a.vcf.lab \
+  "sudo -S -i bash -c 'kubectl --kubeconfig=/etc/kubernetes/super-admin.conf \
+    patch certificate vcf-cluster-ca -n vmsp-platform \
+      --type=merge -p \"{\\\"spec\\\":{\\\"duration\\\":\\\"87600h0m0s\\\"}}\";
+    kubectl --kubeconfig=/etc/kubernetes/super-admin.conf \
+      delete secret vcf-cluster-ca-secret -n vmsp-platform --ignore-not-found=true'" \
+  <<< "$PASS"
+
+# Phase 3.1 — renew every leaf cert expiring within 365 days:
+# For each cert:
+#   1. Patch spec.duration to 43830h0m0s (5 years) unless cert has ownerReferences
+#   2. Delete the backing Secret — cert-manager reissues immediately
+sshpass -p "$PASS" ssh vmware-system-user@vsp-01a.site-a.vcf.lab \
+  "sudo -S -i bash -c 'kubectl --kubeconfig=/etc/kubernetes/super-admin.conf \
+    patch certificate tls-for-opensearch -n ops-logs \
+      --type=merge -p \"{\\\"spec\\\":{\\\"duration\\\":\\\"43830h0m0s\\\"}}\";
+    kubectl --kubeconfig=/etc/kubernetes/super-admin.conf \
+      delete secret tls-for-opensearch-secret -n ops-logs --ignore-not-found=true'" \
+  <<< "$PASS"
+# Repeat for each expiring cert; cert-manager re-creates the Secret and updates
+# status.notAfter within seconds.
+```
+
+**Automated fix** — run the full cert renewer script:
+```bash
+python3 /home/holuser/hol/Tools/vsp_cert_renewer.py \
+  --cluster vsp \
+  --threshold-days 365
+# Phases: 3.0 (extend CAs), 3.1 (leaf certs), 1 (kubeadm), 2 (kubelet)
+```
+
+**Key notes**:
+- `spec.duration` only affects the next reissuance — deleting the backing Secret forces cert-manager to act immediately.
+- Certs with `ownerReferences` (e.g. ClickHouse-managed certs) are renewed (Secret deleted) but `spec.duration` is NOT patched; the owning controller manages their duration.
+- Leaf cert duration is capped by the issuing CA's remaining validity. Always extend the CAs (Phase 3.0) **before** renewing leaf certs (Phase 3.1) so leaf certs can achieve the full 5-year target.
+- `trust-manager` Bundles in this environment have no `sources` or `targets` configured — there are no CA trust ConfigMaps to update after CA rotation.
+- `datetime.utcnow()` is deprecated in Python 3.12+; use `datetime.now(timezone.utc).replace(tzinfo=None)` for naive-UTC comparisons.
