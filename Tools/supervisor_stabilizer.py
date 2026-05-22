@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.1 - 2026-05-22
+Version 2.2 - 2026-05-22
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
+
+v2.2 Changes:
+- run_on_scp(): Replaced narrow SGR-only ANSI strip pattern with a full
+  VT100 pattern that removes all escape sequences (including \x1b[?2004h
+  bracketed-paste toggles and \x1b[K erase-line sequences) plus bare \r
+  characters.  Residual escape sequences were the root cause of blank lines
+  appearing in labstartup.log between each SCP command.  Also relaxed the
+  root@…# prompt regex from strict `\s*\[.*\]\s*#` to `.*\]#` so embedded
+  escape remnants can no longer break prompt suppression.
 
 v2.1 Changes:
 - All cert renewal thresholds lowered from 365 days (1 year) to 60 days.
@@ -1050,7 +1059,16 @@ def run_on_scp(vcenter_host, vcenter_user, vcenter_pass, scp_ip, scp_pass,
             shell=True, capture_output=True, text=True,
             timeout=timeout + 30,
         )
-        output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        # Strip ALL ANSI/VT100 escape sequences (not just SGR colour codes)
+        # and bare carriage-return characters.  The previous pattern
+        # r"\x1b\[[0-9;]*m" only removed colour codes; sequences such as
+        # \x1b[?2004h (bracketed-paste toggle) and \x1b[K (erase-line) were
+        # left in the output.  str.strip() doesn't remove ESC (\x1b), so
+        # lines containing only those sequences appeared non-empty, passed the
+        # `if not s` guard, and were logged as blank lines.  The same residual
+        # escapes also broke the root@…# prompt regex mid-line.
+        output = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])", "", result.stdout)
+        output = output.replace("\r", "")
 
         noise = [
             "spawn ", "Command>", "Shell access is granted",
@@ -1064,7 +1082,8 @@ def run_on_scp(vcenter_host, vcenter_user, vcenter_pass, scp_ip, scp_pass,
             s = line.strip()
             if not s or any(p in s for p in noise):
                 continue
-            if re.match(r"^root@\S+\s*\[.*\]\s*#", s):
+            # Suppress shell prompts (root@<hostname> [<dir>]# …)
+            if re.match(r"^root@\S+.*\]#", s):
                 continue
             if s.startswith("<") and len(s) < 80 and "#" not in s:
                 continue
