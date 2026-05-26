@@ -1,5 +1,5 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.6 - 2026-05-13
+# Version 3.7 - 2026-05-26
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
@@ -2232,3 +2232,300 @@ def start_autocheck():
 def clear_atq():
     """Clear all at queue jobs"""
     run_command('for i in $(atq | awk \'{print $1}\'); do atrm "$i"; done')
+
+
+#==============================================================================
+# AUTHENTIK OPERATIONS
+#==============================================================================
+#
+# General-purpose Authentik user and group provisioning functions.
+# Driven by the [AUTHENTIK] section in config.ini.
+# All operations are idempotent — safe to call on every boot.
+#
+# Authentication: uses the Authentik bootstrap API token.
+#   Default value: 'holodeck'  (matches the holorouter Authentik pre-config)
+#   Override:      set the AUTHENTIK_API_TOKEN environment variable.
+#
+# These functions operate independently of authentik_vcf_integration.py.
+# Both can be active simultaneously without conflict.
+#==============================================================================
+
+_AUTHENTIK_DEFAULT_BASE = 'https://auth.vcf.lab'
+
+
+def _authentik_token() -> str:
+    """Return the Authentik API bootstrap token."""
+    return os.environ.get('AUTHENTIK_API_TOKEN', 'holodeck')
+
+
+def _authentik_base_url() -> str:
+    """
+    Return the Authentik base URL.
+
+    Reads [AUTHENTIK] authentik_base_url from config.ini if present,
+    otherwise returns the holorouter default https://auth.vcf.lab.
+    """
+    val = get_config_value('AUTHENTIK', 'authentik_base_url')
+    return val.rstrip('/') if val else _AUTHENTIK_DEFAULT_BASE
+
+
+def _authentik_headers(token: str = None) -> dict:
+    """Return HTTP headers for Authentik API requests."""
+    if token is None:
+        token = _authentik_token()
+    return {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    }
+
+
+def authentik_ensure_group(name: str, base_url: str = None, token: str = None):
+    """
+    Ensure an Authentik group exists, creating it if necessary.
+
+    Searches for an exact name match first (idempotent). Creates the group
+    only when it does not already exist.
+
+    :param name:     Group name
+    :param base_url: Authentik base URL (defaults to _authentik_base_url())
+    :param token:    API token (defaults to _authentik_token())
+    :return:         Group pk as a string, or None on failure
+    """
+    if not base_url:
+        base_url = _authentik_base_url()
+    if not token:
+        token = _authentik_token()
+
+    api = f'{base_url}/api/v3'
+    hdrs = _authentik_headers(token)
+
+    try:
+        r = requests.get(
+            f'{api}/core/groups/',
+            params={'search': name},
+            headers=hdrs,
+            verify=False,
+            timeout=30,
+        )
+        if r.status_code == 200:
+            for grp in r.json().get('results') or []:
+                if grp.get('name') == name:
+                    write_output(f'  Authentik group {name!r} already exists (pk={grp["pk"]})')
+                    return str(grp['pk'])
+    except Exception as exc:
+        write_output(f'  WARNING: Authentik group search failed for {name!r}: {exc}')
+        return None
+
+    try:
+        r = requests.post(
+            f'{api}/core/groups/',
+            json={'name': name},
+            headers=hdrs,
+            verify=False,
+            timeout=30,
+        )
+        if r.status_code in (200, 201):
+            pk = str(r.json().get('pk', ''))
+            write_output(f'  Authentik group {name!r} created (pk={pk})')
+            return pk
+        write_output(
+            f'  WARNING: Authentik group create {name!r} HTTP {r.status_code}: {r.text[:200]}'
+        )
+    except Exception as exc:
+        write_output(f'  WARNING: Authentik group create failed for {name!r}: {exc}')
+
+    return None
+
+
+def authentik_ensure_user(
+    username: str,
+    display_name: str,
+    email: str,
+    group_pks: list,
+    base_url: str = None,
+    token: str = None,
+    password: str = None,
+) -> bool:
+    """
+    Ensure an Authentik user exists, creating them if necessary.
+
+    Looks up the user by email address (case-insensitive). If found, the
+    existing user is left unchanged (idempotent). If absent, the user is
+    created and optionally assigned an initial password.
+
+    :param username:     Authentik login name
+    :param display_name: Human-readable full name
+    :param email:        Email address — used as the unique identity key
+    :param group_pks:    List of group pk strings to assign at creation time
+    :param base_url:     Authentik base URL (defaults to _authentik_base_url())
+    :param token:        API token (defaults to _authentik_token())
+    :param password:     Initial password; defaults to lab password from creds.txt
+    :return:             True on success or if user already existed
+    """
+    if not base_url:
+        base_url = _authentik_base_url()
+    if not token:
+        token = _authentik_token()
+    if password is None:
+        password = get_password()
+
+    api = f'{base_url}/api/v3'
+    hdrs = _authentik_headers(token)
+
+    # Check whether a user with this email already exists
+    try:
+        r = requests.get(
+            f'{api}/core/users/',
+            params={'email': email},
+            headers=hdrs,
+            verify=False,
+            timeout=30,
+        )
+        if r.status_code == 200:
+            for u in r.json().get('results') or []:
+                if (u.get('email') or '').lower() == email.lower():
+                    write_output(
+                        f'  Authentik user {username!r} ({email}) already exists — skipping.'
+                    )
+                    return True
+    except Exception as exc:
+        write_output(f'  WARNING: Authentik user lookup failed for {email!r}: {exc}')
+        return False
+
+    # Create the user
+    body = {
+        'username': username,
+        'name': display_name,
+        'email': email,
+        'groups': group_pks,
+        'path': 'users',
+        'is_active': True,
+    }
+    try:
+        r = requests.post(
+            f'{api}/core/users/',
+            json=body,
+            headers=hdrs,
+            verify=False,
+            timeout=30,
+        )
+        if r.status_code not in (200, 201):
+            write_output(
+                f'  WARNING: Authentik user create {username!r} HTTP {r.status_code}: {r.text[:200]}'
+            )
+            return False
+        user_pk = r.json().get('pk')
+        write_output(f'  Authentik user {username!r} created (pk={user_pk})')
+    except Exception as exc:
+        write_output(f'  WARNING: Authentik user create failed for {username!r}: {exc}')
+        return False
+
+    # Set the initial password
+    if password and user_pk is not None:
+        try:
+            pr = requests.post(
+                f'{api}/core/users/{user_pk}/set_password/',
+                json={'password': password},
+                headers=hdrs,
+                verify=False,
+                timeout=30,
+            )
+            if pr.status_code in (200, 204):
+                write_output(f'  Authentik user {username!r} password set.')
+            else:
+                write_output(
+                    f'  WARNING: set_password for {username!r} HTTP {pr.status_code}: {pr.text[:200]}'
+                )
+        except Exception as exc:
+            write_output(f'  WARNING: set_password failed for {username!r}: {exc}')
+
+    return True
+
+
+def authentik_provision_from_config() -> bool:
+    """
+    Provision Authentik groups and users declared in [AUTHENTIK] config.ini.
+
+    Processing order:
+      1. Create all groups listed in ``authentik_groups`` (if any).
+      2. Parse each ``authentik_users`` entry, auto-create referenced groups,
+         then create the user and assign them to the specified groups.
+
+    User entry format:  ``username:Display Name:email:group1,group2,...``
+    Group entry format: ``groupname``
+
+    :return: True if all operations succeeded, False if any failed
+    """
+    base_url = _authentik_base_url()
+    token = _authentik_token()
+    password = get_password()
+    ok = True
+
+    write_output(f'Authentik provisioning: base_url={base_url}')
+
+    # --- Phase 1: explicit group creation ---
+    group_entries = get_config_list('AUTHENTIK', 'authentik_groups')
+    group_pk_cache: dict = {}  # name -> pk
+
+    for entry in group_entries:
+        name = entry.strip()
+        if not name:
+            continue
+        pk = authentik_ensure_group(name, base_url=base_url, token=token)
+        if pk:
+            group_pk_cache[name] = pk
+        else:
+            write_output(f'  ERROR: Failed to ensure Authentik group {name!r}')
+            ok = False
+
+    # --- Phase 2: user creation ---
+    user_entries = get_config_list('AUTHENTIK', 'authentik_users')
+
+    for entry in user_entries:
+        # Format: username:Display Name:email:group1,group2,...
+        # maxsplit=3 so a display name containing ':' is handled gracefully
+        parts = entry.split(':', 3)
+        if len(parts) < 3:
+            write_output(f'  WARNING: Skipping malformed authentik_users entry: {entry!r}')
+            ok = False
+            continue
+
+        username = parts[0].strip()
+        display_name = parts[1].strip()
+        email = parts[2].strip()
+        group_names = (
+            [g.strip() for g in parts[3].split(',') if g.strip()]
+            if len(parts) > 3
+            else []
+        )
+
+        if not username or not email:
+            write_output(f'  WARNING: Skipping entry with empty username/email: {entry!r}')
+            ok = False
+            continue
+
+        # Ensure every referenced group exists before assigning the user
+        group_pks = []
+        for gname in group_names:
+            if gname not in group_pk_cache:
+                pk = authentik_ensure_group(gname, base_url=base_url, token=token)
+                if pk:
+                    group_pk_cache[gname] = pk
+                else:
+                    write_output(
+                        f'  ERROR: Failed to ensure group {gname!r} for user {username!r}'
+                    )
+                    ok = False
+                    continue
+            gpk = group_pk_cache.get(gname)
+            if gpk:
+                group_pks.append(gpk)
+
+        if not authentik_ensure_user(
+            username, display_name, email, group_pks,
+            base_url=base_url, token=token, password=password,
+        ):
+            ok = False
+
+    return ok
