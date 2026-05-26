@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.11 - 2026-05-22
+# Version 6.3.12 - 2026-05-26
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.12 Changes:
+# - Task 4b Step 5b: Before the seaweedfs stale-pod check (Step 6), delete
+#   any stuck support-bundle-cluster-info-dump-* jobs in vmsp-platform, verify
+#   no dump pods remain, and suspend the support-bundle-cluster-info-dump
+#   cronjob. These jobs accumulate during ungraceful shutdowns, consume resource
+#   quota, and can block other pods from scheduling.
 #
 # v6.3.11 Changes:
 # - Task 7 (NSX password expiration): Check current days-until-expiry via
@@ -2337,6 +2344,62 @@ echo "PROXY_CONFIGURED"
                                 vcfa_ssh('systemctl restart containerd')
                                 time.sleep(30)
                         
+                        # ---- Step 5b: Stuck support-bundle-cluster-info-dump jobs ----
+                        # These jobs accumulate in vmsp-platform when the cluster info
+                        # dump cronjob fires during or after an ungraceful shutdown. They
+                        # hold resource quota and can block other pods from scheduling.
+                        lsf.write_output('Cleaning up stuck support-bundle-cluster-info-dump jobs...')
+
+                        # List stuck jobs first so we can log each name
+                        dump_jobs_raw = _get_stdout(vcfa_ssh(
+                            f'{kctl_prefix} kubectl get jobs -n vmsp-platform -o name 2>/dev/null '
+                            f'| grep "support-bundle-cluster-info-dump-"'
+                        ))
+                        dump_jobs = [j.strip() for j in dump_jobs_raw.strip().splitlines() if j.strip()]
+
+                        if dump_jobs:
+                            lsf.write_output(f'  Found {len(dump_jobs)} stuck job(s):')
+                            for dj in dump_jobs:
+                                lsf.write_output(f'    {dj}')
+                            # Delete all matching jobs via xargs in one SSH call
+                            del_out = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl get jobs -n vmsp-platform -o name 2>/dev/null '
+                                f'| grep "support-bundle-cluster-info-dump-" '
+                                f'| xargs -r kubectl delete -n vmsp-platform 2>/dev/null'
+                            ))
+                            for line in del_out.strip().splitlines():
+                                if line.strip():
+                                    lsf.write_output(f'    {line.strip()}')
+                            lsf.write_output(f'  Deleted {len(dump_jobs)} support-bundle job(s).')
+                        else:
+                            lsf.write_output('  No stuck support-bundle-cluster-info-dump jobs found.')
+
+                        # Verify no dump pods remain after job deletion
+                        lsf.write_output('  Verifying no support-bundle-cluster-info-dump pods remain...')
+                        dump_pods_raw = _get_stdout(vcfa_ssh(
+                            f'{kctl_prefix} kubectl get pods -n vmsp-platform 2>/dev/null '
+                            f'| grep "support-bundle-cluster-info-dump"'
+                        ))
+                        if dump_pods_raw.strip():
+                            lsf.write_output('  WARNING: dump pods still present:')
+                            for line in dump_pods_raw.strip().splitlines():
+                                if line.strip():
+                                    lsf.write_output(f'    {line.strip()}')
+                        else:
+                            lsf.write_output('  No support-bundle-cluster-info-dump pods found.')
+
+                        # Suspend the cronjob to prevent new dump jobs during startup
+                        lsf.write_output('  Suspending support-bundle-cluster-info-dump cronjob...')
+                        suspend_out = _get_stdout(vcfa_ssh(
+                            f'{kctl_prefix} kubectl patch cronjob -n vmsp-platform '
+                            f'support-bundle-cluster-info-dump '
+                            f'-p \'{{"spec":{{"suspend":true}}}}\' 2>/dev/null'
+                        ))
+                        if suspend_out.strip():
+                            lsf.write_output(f'  {suspend_out.strip()}')
+                        else:
+                            lsf.write_output('  Cronjob patched (or not found — skipped).')
+
                         # ---- Step 6: Stale seaweedfs-master-0 pod ----
                         lsf.write_output('Checking seaweedfs-master-0 for stale pod (>1hr old)...')
                         for attempt in range(3):
