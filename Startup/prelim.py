@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.10 - 2026-05-20
+# Version 3.11 - 2026-05-26
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -629,6 +629,70 @@ def main(lsf=None, standalone=False, dry_run=False):
 
     except Exception as _e:
         lsf.write_output(f'WARNING: DNS local endpoint check skipped: {_e}')
+
+    #==========================================================================
+    # TASK 12: Authentik User and Group Provisioning
+    #
+    # Gated on [AUTHENTIK] authentik_groups or authentik_users being non-empty.
+    # Reads group/user definitions from config.ini and provisions them in
+    # Authentik via the REST API (https://auth.vcf.lab by default).
+    # All operations are idempotent — safe to re-run on every startup.
+    # Independent of [VCFFINAL] authentik_vcf_integration.
+    #==========================================================================
+
+    if dashboard:
+        dashboard.update_task('prelim', 'authentik_provisioning', 'running')
+        dashboard.generate_html()
+
+    _has_groups = bool(lsf.get_config_list('AUTHENTIK', 'authentik_groups'))
+    _has_users  = bool(lsf.get_config_list('AUTHENTIK', 'authentik_users'))
+
+    if _has_groups or _has_users:
+        lsf.write_output(
+            'Authentik provisioning: [AUTHENTIK] entries found — provisioning users and groups...'
+        )
+        if not dry_run:
+            try:
+                _ak_ok = lsf.authentik_provision_from_config()
+                if _ak_ok:
+                    lsf.write_output('Authentik user/group provisioning completed successfully.')
+                    if dashboard:
+                        dashboard.update_task('prelim', 'authentik_provisioning', 'complete')
+                        dashboard.generate_html()
+                else:
+                    lsf.write_output(
+                        'WARNING: Authentik provisioning completed with errors — see log above.'
+                    )
+                    if dashboard:
+                        dashboard.update_task(
+                            'prelim', 'authentik_provisioning', 'failed',
+                            'Provisioning errors — see log'
+                        )
+                        dashboard.generate_html()
+            except Exception as _e:
+                lsf.write_output(f'WARNING: Authentik provisioning raised an exception: {_e}')
+                if dashboard:
+                    dashboard.update_task(
+                        'prelim', 'authentik_provisioning', 'failed', str(_e)
+                    )
+                    dashboard.generate_html()
+        else:
+            lsf.write_output(
+                'Would provision Authentik groups/users from [AUTHENTIK] config (dry-run).'
+            )
+            if dashboard:
+                dashboard.update_task('prelim', 'authentik_provisioning', 'complete')
+                dashboard.generate_html()
+    else:
+        lsf.write_output(
+            'Authentik provisioning: no [AUTHENTIK] entries configured — skipping.'
+        )
+        if dashboard:
+            dashboard.update_task(
+                'prelim', 'authentik_provisioning', 'skipped',
+                'No authentik_groups or authentik_users in config'
+            )
+            dashboard.generate_html()
 
     ##=========================================================================
     ## End Core Team code
