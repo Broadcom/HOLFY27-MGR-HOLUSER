@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-# prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.11 - 2026-05-26
+# prelim.py - HOLFY27 Preliminary Tasks
+# Version 3.11 - 2026-05-28
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
+#
+# DISCOVERY override changes (relative to core Startup/prelim.py):
+#   - Task 3 (Firewall): belt-and-suspenders re-push of nofirewall.sh so the
+#     Python startup sequence is self-contained regardless of labstartup.sh timing.
+#   - Task 3b (Proxy Filter): explicit log confirming PROXY_URL="" / NO_PROXY=""
+#     for DISCOVERY; notes VSP/Supervisor proxy clearing deferred to VCFfinal.
+#   - Task 5 (VS Code): calls lsf.clear_vscode_proxy() to actively clear any
+#     stale proxy from a previous HOL/confighol run when proxy is not required.
 
 import os
 import sys
@@ -141,6 +149,18 @@ def main(lsf=None, standalone=False, dry_run=False):
                 lsf.write_output('WARNING: Router not reachable for firewall check')
     else:
         lsf.write_output(f'Firewall not required for {lsf.labtype} lab type')
+        # re-push of nofirewall.sh.
+        # labstartup.sh already copies it, but re-pushing here ensures the
+        # Python startup sequence is self-contained.
+        import shutil as _shutil
+        _nofirewall_src = os.path.join(lsf.holroot, 'holorouter', 'nofirewall.sh')
+        _nofirewall_dst = os.path.join(lsf.holorouter_dir, 'iptablescfg.sh')
+        if os.path.isfile(_nofirewall_src):
+            os.makedirs(lsf.holorouter_dir, exist_ok=True)
+            _shutil.copy2(_nofirewall_src, _nofirewall_dst)
+            lsf.write_output(f'DISCOVERY: nofirewall.sh applied → {_nofirewall_dst}')
+        else:
+            lsf.write_output(f'DISCOVERY: WARNING — nofirewall.sh not found at {_nofirewall_src}')
     
     if dashboard:
         dashboard.update_task('prelim', 'firewall', 'complete')
@@ -186,6 +206,10 @@ def main(lsf=None, standalone=False, dry_run=False):
                 dashboard.generate_html()
     else:
         lsf.write_output(f'Proxy filter not required for {lsf.labtype} lab type')
+        # confirm empty proxy values are in effect.
+        # VSP node and Supervisor proxy clearing is deferred to VCFfinal Task 2c/2e.
+        lsf.write_output('DISCOVERY: proxy not required — PROXY_URL="" NO_PROXY="" '
+                          '(VSP/Supervisor proxy cleared by VCFfinal Task 2c/2e)')
         if dashboard:
             dashboard.update_task('prelim', 'proxy_filter', 'skipped', 
                                   f'Not required for {lsf.labtype} lab type')
@@ -229,7 +253,13 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.generate_html()
     
     enable_vscode_proxy = lsf.config.getboolean('VPOD', 'enablevscodeproxy', fallback=False)
-    
+
+    # when proxy is not required, actively clear any stale
+    # http.proxy / http.noProxy from a previous HOL or confighol run.
+    if not loader.requires_proxy_filter():
+        lsf.clear_vscode_proxy('root@console.site-a.vcf.lab', lsf.get_password(),
+                               dry_run=dry_run)
+
     if enable_vscode_proxy:
         lsf.write_output('Configuring VS Code proxy on console...')
         

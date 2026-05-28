@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-# VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.12 - 2026-05-26
+# VCFfinal.py - HOLFY27 VCF Final Tasks
+# Version 6.3.12 - 2026-05-28
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# changes (relative to core Startup/VCFfinal.py):
+#   - Task 2c (supervisor_stabilizer): replaces --skip-vcenter-proxy --skip-proxy
+#     with --clear-proxy so Phases 0 & 1 run with empty proxy values (Targets 1 & 2).
+#     After the stabilizer subprocess, calls lsf.clear_supervisor_api_proxy() for
+#     Target 3 (Supervisor API cluster_proxy_config PATCH with empty values).
+#   - Task 2e (VSP nodes): in the `not _proxy_required` branch, calls
+#     lsf.clear_vsp_node_proxy() per node for Target 4 instead of silently skipping.
+#     Same change applied at the new-node discovery loop (~line 1710+).
 #
 # v6.3.12 Changes:
 # - Task 4b Step 5b: Before the seaweedfs stale-pod check (Step 6), delete
@@ -876,11 +885,14 @@ def main(lsf=None, standalone=False, dry_run=False):
                     _stabilizer_cmd = ['python3', '-u', supervisor_stabilizer_script, '--auto']
                     if not _proxy_required:
                         # Non-HOL labtype: skip Phase 0 (vCenter PROXY/NO_PROXY)
-                        # and Phase 2 (SCP PROXY/NO_PROXY); cert phases still run.
-                        _stabilizer_cmd += ['--skip-vcenter-proxy', '--skip-proxy']
+                        # run Phase 0 and Phase 2 with empty
+                        # proxy values (--clear-proxy) instead of skipping them.
+                        # This actively clears Target 1 (vCenter OS) and Target 2
+                        # (Supervisor CP node OS) from any previous HOL/confighol run.
+                        _stabilizer_cmd += ['--clear-proxy']
                         lsf.write_output(
-                            '  Labtype does not require proxy — '
-                            'skipping vCenter and SCP proxy phases'
+                            'proxy not required — running supervisor_stabilizer '
+                            'with --clear-proxy (Targets 1 & 2: vCenter OS + SCP node OS)'
                         )
                     proc = subprocess.Popen(
                         _stabilizer_cmd,
@@ -907,6 +919,19 @@ def main(lsf=None, standalone=False, dry_run=False):
                     else:
                         lsf.write_output(f'WARNING: Supervisor stabilization script exited with code {exit_code}')
                         wcp_certs_ok = False
+
+                    # Target 3 — clear Supervisor API cluster_proxy_config.
+                    # Runs after the stabilizer subprocess so the Supervisor is reachable.
+                    if not _proxy_required:
+                        lsf.write_output('Clearing Supervisor API proxy config (Target 3)...')
+                        try:
+                            _wld_vc_host = wld_vcenter if isinstance(wld_vcenter, str) else str(wld_vcenter)
+                            lsf.clear_supervisor_api_proxy(
+                                _wld_vc_host, 'administrator@wld.sso',
+                                lsf.get_password(), dry_run=dry_run,
+                            )
+                        except Exception as _t3_err:
+                            lsf.write_output(f'Supervisor API proxy clear skipped: {_t3_err}')
 
                 except Exception as wcp_err:
                     lsf.write_output(f'WARNING: Error running Supervisor stabilization script: {wcp_err}')
@@ -1412,6 +1437,12 @@ echo "PROXY_CONFIGURED"
                     lsf.write_output(f'  Found {len(vsp_node_ips)} VSP nodes: {", ".join(vsp_node_ips)}')
                     if _proxy_required:
                         apply_proxy_to_nodes(vsp_node_ips)
+                    else:
+                        # Target 4 — clear proxy on each VSP node.
+                        lsf.write_output(f'Clearing proxy on {len(vsp_node_ips)} VSP node(s) (Target 4)...')
+                        for _vsp_ip in vsp_node_ips:
+                            lsf.clear_vsp_node_proxy(_vsp_ip, lsf.get_password(),
+                                                     dry_run=dry_run)
 
                 # ---- Kubernetes certificate check/renewal (VSP + VCFA) ----
                 # Runs before component scale-up so the API server is healthy
@@ -1710,6 +1741,12 @@ echo "PROXY_CONFIGURED"
                                 if _proxy_required:
                                     apply_proxy_to_nodes(new_ips)
                                     lsf.write_output('  Applied proxy and NO_PROXY to new node(s).')
+                                else:
+                                    # clear proxy on newly-joined VSP nodes.
+                                    lsf.write_output(f'Clearing proxy on {len(new_ips)} new VSP node(s) (Target 4)...')
+                                    for _new_ip in new_ips:
+                                        lsf.clear_vsp_node_proxy(_new_ip, lsf.get_password(),
+                                                                  dry_run=dry_run)
                                 vsp_node_ips.extend(new_ips)
                         
                         # Re-check pending status to see if we can exit early
