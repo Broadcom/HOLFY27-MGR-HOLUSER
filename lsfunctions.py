@@ -1,5 +1,5 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.7 - 2026-05-26
+# Version 3.8 - 2026-05-28
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
@@ -100,6 +100,239 @@ def build_vscode_no_proxy():
     for entry in LAB_NO_PROXY_PARTS:
         result.append('*' + entry if entry.startswith('.') else entry)
     return result
+
+
+#==============================================================================
+# PROXY CLEAR HELPERS
+# These helpers actively clear proxy configuration from lab components when
+# the labtype does not require a proxy (e.g. DISCOVERY, VXP, ATE, EDU).
+# All functions are non-fatal: they log a warning and return False on error.
+#==============================================================================
+
+def clear_supervisor_api_proxy(vc_host, sso_user, password, dry_run=False):
+    """PATCH empty cluster_proxy_config on every Supervisor cluster for vc_host.
+
+    Authenticates with a vCenter REST session (POST /api/session), lists all
+    Supervisor clusters (GET /api/vcenter/namespace-management/clusters), and
+    PATCHes each one with proxy_settings_source=CLUSTER_CONFIGURED and empty
+    http_proxy_config, https_proxy_config, and no_proxy_config=[].
+
+    :param vc_host: Hostname or IP of the vCenter (e.g. 'vc-wld01-a.site-a.vcf.lab')
+    :param sso_user: SSO user for REST auth (e.g. 'administrator@wld.sso')
+    :param password: Password for sso_user (and session auth)
+    :param dry_run: If True, log intent but make no changes.
+    :return: True if all clusters were cleared (or no clusters found), False on error.
+    """
+    label = vc_host.split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would PATCH empty cluster_proxy_config on Supervisor clusters via {vc_host}')
+        return True
+
+    base = f'https://{vc_host}'
+    session_token = None
+    try:
+        resp = requests.post(
+            f'{base}/api/session',
+            auth=(sso_user, password),
+            verify=False, timeout=30,
+        )
+        if resp.status_code not in (200, 201):
+            write_output(f'WARNING: {label}: REST session failed HTTP {resp.status_code} — skipping Supervisor API proxy clear')
+            return False
+        session_token = resp.json()
+    except Exception as e:
+        write_output(f'WARNING: {label}: REST session error — skipping Supervisor API proxy clear: {e}')
+        return False
+
+    headers = {'vmware-api-session-id': session_token, 'Content-Type': 'application/json'}
+    try:
+        clusters_resp = requests.get(
+            f'{base}/api/vcenter/namespace-management/clusters',
+            headers=headers, verify=False, timeout=30,
+        )
+        if clusters_resp.status_code != 200:
+            write_output(f'WARNING: {label}: GET clusters HTTP {clusters_resp.status_code} — skipping Supervisor API proxy clear')
+            return False
+        clusters = clusters_resp.json()
+    except Exception as e:
+        write_output(f'WARNING: {label}: GET clusters error: {e}')
+        return False
+
+    if not clusters:
+        write_output(f'{label}: No Supervisor clusters found — nothing to clear')
+        return True
+
+    proxy_body = {
+        'cluster_proxy_config': {
+            'proxy_settings_source': 'CLUSTER_CONFIGURED',
+            'http_proxy_config': '',
+            'https_proxy_config': '',
+            'no_proxy_config': [],
+        }
+    }
+    ok = True
+    for cluster in clusters:
+        cluster_id = cluster.get('cluster') or cluster.get('cluster_id') or cluster.get('id', '')
+        if not cluster_id:
+            continue
+        try:
+            patch_resp = requests.patch(
+                f'{base}/api/vcenter/namespace-management/clusters/{cluster_id}',
+                headers=headers, json=proxy_body, verify=False, timeout=30,
+            )
+            if patch_resp.status_code in (200, 204):
+                write_output(f'{label}: Supervisor cluster {cluster_id} proxy config cleared')
+            else:
+                write_output(f'WARNING: {label}: cluster {cluster_id} PATCH HTTP {patch_resp.status_code}: {patch_resp.text[:120]}')
+                ok = False
+        except Exception as e:
+            write_output(f'WARNING: {label}: cluster {cluster_id} PATCH error: {e}')
+            ok = False
+
+    try:
+        requests.delete(f'{base}/api/session', headers=headers, verify=False, timeout=15)
+    except Exception:
+        pass
+
+    return ok
+
+
+# Template for the proxy-clear bash script pushed to each VSP node.
+# Written as a module-level constant so it is not re-defined on every call.
+_VSP_PROXY_CLEAR_SCRIPT = r"""#!/bin/bash
+cat > /etc/sysconfig/proxy << 'PROXYEOF'
+PROXY_ENABLED="no"
+HTTP_PROXY=""
+HTTPS_PROXY=""
+FTP_PROXY=""
+GOPHER_PROXY=""
+SOCKS_PROXY=""
+SOCKS5_SERVER=""
+NO_PROXY=""
+PROXYEOF
+
+sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment
+
+mkdir -p /etc/systemd/system/containerd.service.d
+printf '[Service]\nEnvironment="HTTP_PROXY="\nEnvironment="HTTPS_PROXY="\nEnvironment="NO_PROXY="\n' \
+  > /etc/systemd/system/containerd.service.d/http-proxy.conf
+
+mkdir -p /etc/systemd/system/kubelet.service.d
+printf '[Service]\nEnvironment="HTTP_PROXY="\nEnvironment="HTTPS_PROXY="\nEnvironment="NO_PROXY="\n' \
+  > /etc/systemd/system/kubelet.service.d/http-proxy.conf
+
+systemctl daemon-reload
+echo "PROXY_CLEARED"
+"""
+
+
+def clear_vsp_node_proxy(node_ip, password, dry_run=False):
+    """Push an empty-proxy script to a single VSP node via SCP+SSH.
+
+    Clears /etc/sysconfig/proxy (PROXY_ENABLED="no", all fields ""),
+    strips proxy lines from /etc/environment, overwrites the containerd and
+    kubelet systemd drop-ins with empty Environment values, and runs
+    systemctl daemon-reload.  Sentinel "PROXY_CLEARED" in output confirms
+    success.
+
+    :param node_ip: IP address of the VSP node.
+    :param password: Password for the vmware-system-user account.
+    :param dry_run: If True, log intent but make no changes.
+    :return: True on success, False on error (non-fatal).
+    """
+    vsp_user = 'vmware-system-user'
+    target = f'{vsp_user}@{node_ip}'
+    remote_script = '/tmp/clear_vsp_proxy.sh'
+
+    if dry_run:
+        write_output(f'[dry-run] would clear proxy on VSP node {node_ip}')
+        return True
+
+    script_path = f'/tmp/clear_vsp_proxy_{node_ip.replace(".", "_")}.sh'
+    try:
+        with open(script_path, 'w') as f:
+            f.write(_VSP_PROXY_CLEAR_SCRIPT)
+    except Exception as e:
+        write_output(f'WARNING: {node_ip}: Could not write proxy clear script: {e}')
+        return False
+
+    try:
+        scp_result = scp(script_path, f'{target}:{remote_script}', password)
+        if scp_result.returncode != 0:
+            write_output(f'WARNING: {node_ip}: SCP of proxy clear script failed')
+            return False
+
+        run_cmd = f"echo '{password}' | sudo -S bash {remote_script}"
+        run_result = ssh(run_cmd, target, password)
+        output = (run_result.stdout or '') + (run_result.stderr or '')
+
+        if 'PROXY_CLEARED' in output:
+            write_output(f'{node_ip}: VSP node proxy cleared successfully')
+        else:
+            write_output(f'WARNING: {node_ip}: proxy clear script did not confirm — check manually')
+
+        ssh(f"echo '{password}' | sudo -S rm -f {remote_script}", target, password)
+        return 'PROXY_CLEARED' in output
+    except Exception as e:
+        write_output(f'WARNING: {node_ip}: VSP node proxy clear error: {e}')
+        return False
+    finally:
+        try:
+            os.remove(script_path)
+        except Exception:
+            pass
+
+
+def clear_vscode_proxy(console_host, password, dry_run=False):
+    """Set http.proxy='' and http.noProxy=[] in VS Code settings.json on the console.
+
+    Fetches settings.json from console_host via SCP, sets http.proxy to an
+    empty string and http.noProxy to an empty list, then pushes the file back.
+    Non-fatal: logs a warning and returns False on any error.
+
+    :param console_host: SSH target string, e.g. 'root@console.site-a.vcf.lab'
+    :param password: SSH password for console_host.
+    :param dry_run: If True, log intent but make no changes.
+    :return: True on success, False on error.
+    """
+    vscode_file = '/home/holuser/.config/Code/User/settings.json'
+    tmp_path = '/tmp/vscode_settings_proxy_clear.json'
+
+    if dry_run:
+        write_output(f'[dry-run] would clear http.proxy and http.noProxy in VS Code settings on {console_host}')
+        return True
+
+    try:
+        fetch = scp(f'{console_host}:{vscode_file}', tmp_path, password)
+        if fetch.returncode != 0 or not os.path.isfile(tmp_path):
+            write_output(f'WARNING: Could not fetch VS Code settings.json from {console_host} — skipping proxy clear')
+            return False
+
+        with open(tmp_path) as f:
+            settings = json.load(f)
+
+        settings['http.proxy'] = ''
+        settings['http.noProxy'] = []
+
+        with open(tmp_path, 'w') as f:
+            json.dump(settings, f, indent=4)
+
+        push = scp(tmp_path, f'{console_host}:{vscode_file}', password)
+        if push.returncode != 0:
+            write_output(f'WARNING: Could not push cleared VS Code settings.json to {console_host}')
+            return False
+
+        write_output(f'VS Code proxy cleared on {console_host}: http.proxy="" http.noProxy=[]')
+        return True
+    except Exception as e:
+        write_output(f'WARNING: VS Code proxy clear on {console_host} failed: {e}')
+        return False
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
 
 # Log file name
 logfile = 'labstartup.log'
