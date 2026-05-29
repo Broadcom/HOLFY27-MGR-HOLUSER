@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.4 - 2026-05-22
+Version 2.5 - 2026-05-28
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
+
+v2.5 Changes:
+- apply_proxy_to_vcenter(): added clear=False parameter.  When clear=True,
+  strips proxy lines from /etc/environment (no append), writes PROXY_ENABLED="no"
+  with empty values to /etc/sysconfig/proxy, and calls _vc_rest_set_noproxy with
+  an empty list — used for non-HOL labtypes that must not have a proxy configured.
+- fix_supervisor_control_plane(): added clear_proxy=False parameter threaded
+  through to _stabilize_one_supervisor() Phase B.  When clear_proxy=True, the
+  containerd drop-in and /etc/environment are cleared (empty values) instead of
+  being written with HOL proxy values.
+- Added --clear-proxy CLI arg: sets clear=True and clear_proxy=True on Phase 0
+  and Phase 2 respectively.  Use instead of --skip-vcenter-proxy/--skip-proxy
+  for non-HOL lab boots that need proxy state actively wiped.
 
 v2.4 Changes:
 - renew_spherelet_certs(): removed early-return for dry_run=True.  The function
@@ -455,7 +468,7 @@ def _vc_rest_delete_session(host, token, ssl_ctx):
         pass
 
 
-def apply_proxy_to_vcenter(vc, password, dry_run):
+def apply_proxy_to_vcenter(vc, password, dry_run, clear=False):
     """Write HTTP/HTTPS proxy and NO_PROXY settings onto a vCenter appliance.
 
     Writes two OS-level proxy config files via SSH (root):
@@ -470,16 +483,21 @@ def apply_proxy_to_vcenter(vc, password, dry_run):
     served by the appliance management layer, completely separate from the
     OS-level environment files.
 
+    :param clear: When True, write empty values (PROXY_ENABLED="no", all
+                  proxy fields "") and clear the VAMI no-proxy list instead
+                  of writing HOL proxy values.  Used for non-HOL labtypes.
+
     Returns True on success, False if SSH is unavailable (non-fatal; vCenter
     may simply not allow root SSH in hardened deployments).
     """
     label = vc["label"]
     log("")
-    log(f"--- {label} ({vc['host']}) -- vCenter proxy configuration ---")
+    log(f"--- {label} ({vc['host']}) -- vCenter proxy {'CLEAR' if clear else 'configuration'} ---")
 
     if dry_run:
-        log(f"  [{label}] [dry-run] would write /etc/environment and "
-            f"/etc/sysconfig/proxy on {vc['host']} and update VAMI noproxy via REST API")
+        action = "CLEAR proxy settings on" if clear else "write proxy settings to"
+        log(f"  [{label}] [dry-run] would {action} {vc['host']} "
+            f"(/etc/environment, /etc/sysconfig/proxy, VAMI REST)")
         return True
 
     # Verify SSH reachability before attempting writes
@@ -489,6 +507,37 @@ def apply_proxy_to_vcenter(vc, password, dry_run):
             f"available - skipping proxy configuration.", level="WARN")
         return True  # non-fatal: vCenter may have SSH disabled
 
+    if clear:
+        # CLEAR mode: strip proxy lines from /etc/environment (no append),
+        # write PROXY_ENABLED="no" with empty values to /etc/sysconfig/proxy.
+        sysconfig_clear = (
+            'PROXY_ENABLED="no"\n'
+            'HTTP_PROXY=""\n'
+            'HTTPS_PROXY=""\n'
+            'FTP_PROXY=""\n'
+            'GOPHER_PROXY=""\n'
+            'SOCKS_PROXY=""\n'
+            'SOCKS5_SERVER=""\n'
+            'NO_PROXY=""\n'
+        )
+        sysconfig_b64 = base64.b64encode(sysconfig_clear.encode()).decode()
+        commands = [
+            "sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;"
+            "/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment",
+            f"echo {sysconfig_b64} | base64 -d > /etc/sysconfig/proxy",
+        ]
+        for cmd in commands:
+            ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd)
+        log(f"  [{label}] proxy cleared from OS-level files on {vc['host']}.")
+        log(f"  [{label}] Clearing VAMI no-proxy list via REST API (as {vc['sso_user']})...")
+        if _vc_rest_set_noproxy(vc["host"], vc["sso_user"], password, []):
+            log(f"  [{label}] VAMI no-proxy list cleared successfully.")
+        else:
+            log(f"  [{label}] VAMI no-proxy REST clear failed (non-fatal; "
+                f"OS-level files were still cleared).", level="WARN")
+        return True
+
+    # NORMAL mode: write HOL proxy values.
     # Build /etc/environment additions (sed first to remove any stale lines,
     # then append the current values).
     env_additions = (
@@ -1233,7 +1282,7 @@ def discover_scp_node_ips(vc, password):
 
 
 def fix_supervisor_control_plane(vc, password, dry_run, only_cluster=None,
-                        only_ip=None, threshold_days=60):
+                        only_ip=None, threshold_days=60, clear_proxy=False):
     """Regenerate the supervisor-management-proxy mTLS cert on one vCenter.
 
     A single vCenter can host multiple Supervisor clusters; we discover them
@@ -1247,6 +1296,9 @@ def fix_supervisor_control_plane(vc, password, dry_run, only_cluster=None,
       only_ip      -- exact IP override; bypasses both decryptK8Pwd discovery
                       and the VPX-DB fallback. Useful when the operator
                       already knows which node to talk to.
+      clear_proxy  -- When True, Phase B writes empty proxy values to the SCP
+                      node instead of HOL proxy values.  Used for non-HOL
+                      labtypes that must not have a proxy configured.
     """
     label = vc["label"]
     log("")
@@ -1294,7 +1346,8 @@ def fix_supervisor_control_plane(vc, password, dry_run, only_cluster=None,
     overall_ok = True
     for c in clusters:
         ok = _stabilize_one_supervisor(vc, password, c, dry_run,
-                                       threshold_days=threshold_days)
+                                       threshold_days=threshold_days,
+                                       clear_proxy=clear_proxy)
         if not ok:
             overall_ok = False
     return overall_ok
@@ -1398,8 +1451,14 @@ def _cleanup_stale_pods_with_wait(vc, password, scp_ip, scp_pass, namespace,
     return True
 
 
-def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60):
-    """Apply the stabilization fixes to a single Supervisor cluster stanza."""
+def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60,
+                               clear_proxy=False):
+    """Apply the stabilization fixes to a single Supervisor cluster stanza.
+
+    :param clear_proxy: When True, Phase B writes empty proxy values (clears
+                        any previous HOL proxy config) instead of writing
+                        HOL proxy values.  Used for non-HOL labtypes.
+    """
     label = vc["label"]
     cid = cluster["cluster"]
     scp_ip = cluster["ip"]
@@ -1521,9 +1580,13 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60)
         return False
 
     # --- Phase B: Proxy Configuration ---
-    log(f"      [{cid}] Configuring PROXY/NO_PROXY settings on SCP node...")
+    if clear_proxy:
+        log(f"      [{cid}] Clearing PROXY/NO_PROXY settings on SCP node (non-HOL labtype)...")
+    else:
+        log(f"      [{cid}] Configuring PROXY/NO_PROXY settings on SCP node...")
     if dry_run:
-        log(f"      [{cid}] [dry-run] would configure /etc/environment and containerd proxy.")
+        action = "CLEAR" if clear_proxy else "configure"
+        log(f"      [{cid}] [dry-run] would {action} /etc/environment and containerd proxy.")
     else:
         # Build the containerd drop-in content and base64-encode it so it
         # can be written with a single echo | base64 -d > command.  A heredoc
@@ -1531,29 +1594,48 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60)
         # into continuation mode (the '>' prompt) which never matches the
         # expect pattern root@.*# — causing a timeout before systemctl ever
         # runs and leaving containerd without proxy settings.
-        _proxy_conf_b64 = base64.b64encode((
-            "[Service]\n"
-            f'Environment="HTTP_PROXY={HTTP_PROXY}"\n'
-            f'Environment="HTTPS_PROXY={HTTPS_PROXY}"\n'
-            f'Environment="NO_PROXY={NO_PROXY}"\n'
-        ).encode()).decode()
-        proxy_commands = [
-            f"sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment",
-            f"echo 'http_proxy={HTTP_PROXY}' >> /etc/environment",
-            f"echo 'https_proxy={HTTPS_PROXY}' >> /etc/environment",
-            f"echo 'no_proxy={NO_PROXY}' >> /etc/environment",
-            f"echo 'HTTP_PROXY={HTTP_PROXY}' >> /etc/environment",
-            f"echo 'HTTPS_PROXY={HTTPS_PROXY}' >> /etc/environment",
-            f"echo 'NO_PROXY={NO_PROXY}' >> /etc/environment",
-            f"mkdir -p /etc/systemd/system/containerd.service.d",
-            f"echo {_proxy_conf_b64} | base64 -d > /etc/systemd/system/containerd.service.d/http-proxy.conf",
-            f"systemctl daemon-reload",
-            f"systemctl restart containerd",
-        ]
+        if clear_proxy:
+            # CLEAR mode: strip proxy env-vars (no append), write empty drop-in.
+            _proxy_conf_b64 = base64.b64encode((
+                "[Service]\n"
+                'Environment="HTTP_PROXY="\n'
+                'Environment="HTTPS_PROXY="\n'
+                'Environment="NO_PROXY="\n'
+            ).encode()).decode()
+            proxy_commands = [
+                "sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;"
+                "/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment",
+                f"mkdir -p /etc/systemd/system/containerd.service.d",
+                f"echo {_proxy_conf_b64} | base64 -d > /etc/systemd/system/containerd.service.d/http-proxy.conf",
+                "systemctl daemon-reload",
+                "systemctl restart containerd",
+            ]
+        else:
+            # NORMAL mode: write HOL proxy values.
+            _proxy_conf_b64 = base64.b64encode((
+                "[Service]\n"
+                f'Environment="HTTP_PROXY={HTTP_PROXY}"\n'
+                f'Environment="HTTPS_PROXY={HTTPS_PROXY}"\n'
+                f'Environment="NO_PROXY={NO_PROXY}"\n'
+            ).encode()).decode()
+            proxy_commands = [
+                f"sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment",
+                f"echo 'http_proxy={HTTP_PROXY}' >> /etc/environment",
+                f"echo 'https_proxy={HTTPS_PROXY}' >> /etc/environment",
+                f"echo 'no_proxy={NO_PROXY}' >> /etc/environment",
+                f"echo 'HTTP_PROXY={HTTP_PROXY}' >> /etc/environment",
+                f"echo 'HTTPS_PROXY={HTTPS_PROXY}' >> /etc/environment",
+                f"echo 'NO_PROXY={NO_PROXY}' >> /etc/environment",
+                f"mkdir -p /etc/systemd/system/containerd.service.d",
+                f"echo {_proxy_conf_b64} | base64 -d > /etc/systemd/system/containerd.service.d/http-proxy.conf",
+                f"systemctl daemon-reload",
+                f"systemctl restart containerd",
+            ]
+        action_desc = "Clearing" if clear_proxy else "Applying"
         run_on_scp(
             vc["host"], vc["root_user"], password,
             scp_ip, scp_pass, proxy_commands,
-            description=f"      [{cid}] Applying proxy settings and restarting containerd",
+            description=f"      [{cid}] {action_desc} proxy settings and restarting containerd",
             timeout=120,
         )
 
@@ -2490,6 +2572,16 @@ def parse_args():
              "See README for schema. Defaults to the lab topology baked in.",
     )
     p.add_argument(
+        "--clear-proxy", action="store_true",
+        help="Clear (empty) proxy settings on vCenter OS and Supervisor CP node "
+             "instead of writing HOL proxy values.  Affects Phase 0 "
+             "(apply_proxy_to_vcenter) and Phase 2 Phase B (SCP node containerd "
+             "drop-in and /etc/environment).  Use for non-HOL labtypes (DISCOVERY, "
+             "VXP, ATE, EDU) that must not have a proxy configured.  Independent "
+             "of --skip-vcenter-proxy and --skip-proxy: both phases still run, "
+             "but write empty values.",
+    )
+    p.add_argument(
         "--skip-vcenter-proxy", action="store_true",
         help="Don't run the vCenter proxy configuration phase (Phase 0).",
     )
@@ -2552,6 +2644,7 @@ def main():
     log(f"target upstream domain : {args.target_domain}")
     log(f"threshold-days         : {args.threshold_days}")
     log(f"dry-run                : {args.dry_run}")
+    log(f"clear-proxy            : {args.clear_proxy}")
     _active = " ".join(filter(None, [
         "" if args.skip_vcenter_proxy else "vcenter-proxy",
         "" if args.skip_vcenter_services else "vcenter-services",
@@ -2580,9 +2673,10 @@ def main():
 
     # ---- Phase 0: vCenter proxy configuration ---------------------------
     if not args.skip_vcenter_proxy:
-        banner("Phase 0: vCenter proxy configuration")
+        banner(f"Phase 0: vCenter proxy {'CLEAR' if args.clear_proxy else 'configuration'}")
         for vc in vcenters:
-            ok = apply_proxy_to_vcenter(vc, password, args.dry_run)
+            ok = apply_proxy_to_vcenter(vc, password, args.dry_run,
+                                        clear=args.clear_proxy)
             if not ok:
                 failures.append(f"vcenter-proxy:{vc['label']}")
 
@@ -2621,6 +2715,7 @@ def main():
                 only_cluster=args.supervisor_cluster,
                 only_ip=args.supervisor_ip,
                 threshold_days=args.threshold_days,
+                clear_proxy=args.clear_proxy,
             )
             if not ok:
                 failures.append(f"proxy:{vc['label']}")

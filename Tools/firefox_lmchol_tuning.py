@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Author: Burke Azbill and HOL Core Team
-Version: 1.0.1 2026-05-11
+Version: 1.1 2026-05-28
 
 Tune Firefox user.js on the Main Linux Console (LMC) profile.
 
@@ -57,6 +57,45 @@ def _user_js_path(profile_dir: str) -> str:
     return os.path.join(profile_dir, "user.js")
 
 
+def _hol_proxy_clear_block() -> str:
+    """Return the user.js HOL block that disables the proxy (network.proxy.type=0).
+
+    Used for non-HOL lab types (DISCOVERY, VXP, ATE, EDU) where no proxy filter
+    is required.  Perf prefs (Quick Suggest, safe-browsing, etc.) are still
+    applied so Firefox starts cleanly regardless of lab type.
+    """
+    lines = [
+        BEGIN,
+        'user_pref("network.proxy.type", 0);',
+        # Urlbar / disk: reduce SQLite churn and speculative work
+        'user_pref("browser.urlbar.quicksuggest.enabled", false);',
+        'user_pref("browser.urlbar.suggest.quicksuggest.sponsored", false);',
+        'user_pref("browser.urlbar.suggest.quicksuggest.nonsponsored", false);',
+        'user_pref("browser.places.speculativeConnect.enabled", false);',
+        'user_pref("network.prefetch-next", false);',
+        # Skip network-heavy checks during startup (lab is trusted)
+        'user_pref("browser.safebrowsing.malware.enabled", false);',
+        'user_pref("browser.safebrowsing.phish.enabled", false);',
+        'user_pref("browser.shell.checkDefaultBrowser", false);',
+        'user_pref("browser.sessionstore.resume_from_crash", false);',
+        # Preserve saved usernames and form history across sessions
+        'user_pref("privacy.clearHistory.formdata", false);',
+        'user_pref("privacy.clearOnShutdown_v2.formdata", false);',
+        'user_pref("privacy.clearSiteData.formdata", false);',
+        'user_pref("privacy.clearSiteData.historyFormDataAndDownloads", false);',
+        'user_pref("browser.formfill.enable", true);',
+        'user_pref("browser.formfill.autoFill", true);',
+        'user_pref("browser.formfill.autoFill.passwords", true);',
+        'user_pref("browser.formfill.autoFill.forms", true);',
+        'user_pref("signon.autofillForms", true);',
+        'user_pref("signon.includeOtherSubdomainsInLookup", false)',
+        'user_pref("messaging-system.rsexperimentloader.enabled", false);',
+        END,
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def _hol_block(proxy_host: str, proxy_port: int) -> str:
     # Manual proxy (type 1). PAC type 2 with http_* set is invalid and stalls startup.
     lines = [
@@ -91,7 +130,7 @@ def _hol_block(proxy_host: str, proxy_port: int) -> str:
         'user_pref("browser.formfill.autoFill.passwords", true);',
         'user_pref("browser.formfill.autoFill.forms", true);',
         'user_pref("signon.autofillForms", true);',
-        'user_pref("signon.usernameOnlyForm.enabled", true);',
+        'user_pref("signon.includeOtherSubdomainsInLookup", false)',
         'user_pref("messaging-system.rsexperimentloader.enabled", false);',
         END,
         "",
@@ -99,7 +138,19 @@ def _hol_block(proxy_host: str, proxy_port: int) -> str:
     return "\n".join(lines)
 
 
-def _rewrite_user_js(path: str, proxy_host: str, proxy_port: int) -> bool:
+def _rewrite_user_js(
+    path: str,
+    proxy_host: str,
+    proxy_port: int,
+    override_block: Optional[str] = None,
+) -> bool:
+    """Rewrite user.js, replacing the HOL marker block with a fresh one.
+
+    :param override_block: If provided, insert this block instead of the
+                           default ``_hol_block(proxy_host, proxy_port)`` block.
+                           Pass the output of ``_hol_proxy_clear_block()`` to
+                           disable the proxy for non-HOL lab types.
+    """
     if os.path.isfile(path):
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             raw_lines = f.readlines()
@@ -127,7 +178,7 @@ def _rewrite_user_js(path: str, proxy_host: str, proxy_port: int) -> bool:
     if out and out[-1].strip() != "":
         out.append("\n")
 
-    block = _hol_block(proxy_host, proxy_port)
+    block = override_block if override_block is not None else _hol_block(proxy_host, proxy_port)
     out.append(block)
     text = "".join(out)
     with open(path, "w", encoding="utf-8") as f:
@@ -186,18 +237,31 @@ def _clear_crashes_and_idb(
 def apply_firefox_lmchol_tuning(
     lsf: Any,
     dry_run: bool = False,
+    clear: bool = False,
     proxy_host: Optional[str] = None,
     proxy_port: int = 3128,
 ) -> bool:
-    """
-    Update user.js in each LMC Firefox profile: correct manual Squid proxy and
-    lightweight startup prefs (Quick Suggest off, etc.).
+    """Update user.js in each LMC Firefox profile.
 
-    :return: True if all profiles updated or none found; False on write error
+    When ``clear=False`` (default / HOL lab types): writes the manual Squid
+    proxy block plus lightweight startup prefs.
+
+    When ``clear=True`` (non-HOL lab types — DISCOVERY, VXP, ATE, EDU): writes
+    ``network.proxy.type=0`` (no proxy) plus the same startup perf prefs.
+
+    :param lsf:        lsfunctions module reference (or any object with
+                       ``write_output``, ``mc``, and ``proxy`` attributes).
+    :param dry_run:    If True log intent but make no changes.
+    :param clear:      If True write the proxy-clear block instead of the
+                       proxy-set block.
+    :param proxy_host: Squid host (default from lsf.proxy).
+    :param proxy_port: Squid port (default 3128).
+    :return: True if all profiles updated or none found; False on write error.
     """
     log: Callable[[str], Any] = getattr(lsf, "write_output", print)
     mc = getattr(lsf, "mc", "/lmchol")
     host = proxy_host or getattr(lsf, "proxy", "proxy.site-a.vcf.lab")
+    mode_desc = "clear (no proxy)" if clear else f"set (manual proxy {host}:{proxy_port})"
 
     profiles = _firefox_profile_dirs(mc)
     if not profiles:
@@ -207,7 +271,7 @@ def apply_firefox_lmchol_tuning(
     if dry_run:
         log(
             f"firefox_lmchol_tuning: dry-run — would tune {len(profiles)} profile(s) "
-            f"(proxy {host}:{proxy_port})"
+            f"({mode_desc})"
         )
         _clear_crashes_and_idb(mc, profiles, log, dry_run=True)
         return True
@@ -218,11 +282,18 @@ def apply_firefox_lmchol_tuning(
     for prof in profiles:
         uj = _user_js_path(prof)
         try:
-            _rewrite_user_js(uj, host, proxy_port)
-            log(
-                f"firefox_lmchol_tuning: updated user.js for profile {os.path.basename(prof)} "
-                f"(manual proxy {host}:{proxy_port}, lightweight prefs)"
-            )
+            if clear:
+                _rewrite_user_js(uj, host, proxy_port, override_block=_hol_proxy_clear_block())
+                log(
+                    f"firefox_lmchol_tuning: user.js {os.path.basename(prof)} "
+                    f"— proxy cleared (type=0)"
+                )
+            else:
+                _rewrite_user_js(uj, host, proxy_port)
+                log(
+                    f"firefox_lmchol_tuning: user.js {os.path.basename(prof)} "
+                    f"— manual proxy {host}:{proxy_port}"
+                )
         except OSError as e:
             log(f"WARNING: firefox_lmchol_tuning: could not write {uj}: {e}")
             ok_all = False

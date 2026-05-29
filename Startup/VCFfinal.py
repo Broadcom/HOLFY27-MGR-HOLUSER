@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.12 - 2026-05-26
+# Version 6.3.17 - 2026-05-29
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
 #
@@ -908,6 +908,25 @@ def main(lsf=None, standalone=False, dry_run=False):
                         lsf.write_output(f'WARNING: Supervisor stabilization script exited with code {exit_code}')
                         wcp_certs_ok = False
 
+                    # ---- Target 3: Supervisor API cluster_proxy_config (SET or CLEAR) ----
+                    # Runs after stabilizer so the vCenter API is reachable.
+                    _wld_vc_for_proxy = wcp_vcenter if wcp_vcenter else 'vc-wld01-a.site-a.vcf.lab'
+                    try:
+                        if _proxy_required:
+                            lsf.write_output('  Configuring Supervisor API proxy (Target 3)...')
+                            lsf.set_supervisor_api_proxy(
+                                _wld_vc_for_proxy, 'administrator@wld.sso',
+                                lsf.get_password(), dry_run=dry_run,
+                            )
+                        else:
+                            lsf.write_output('  Clearing Supervisor API proxy (Target 3)...')
+                            lsf.clear_supervisor_api_proxy(
+                                _wld_vc_for_proxy, 'administrator@wld.sso',
+                                lsf.get_password(), dry_run=dry_run,
+                            )
+                    except Exception as _t3_err:
+                        lsf.write_output(f'  WARNING: Supervisor API proxy step skipped: {_t3_err}')
+
                 except Exception as wcp_err:
                     lsf.write_output(f'WARNING: Error running Supervisor stabilization script: {wcp_err}')
                     lsf.write_output('  Continuing with startup - WCP may need manual attention')
@@ -1412,6 +1431,55 @@ echo "PROXY_CONFIGURED"
                     lsf.write_output(f'  Found {len(vsp_node_ips)} VSP nodes: {", ".join(vsp_node_ips)}')
                     if _proxy_required:
                         apply_proxy_to_nodes(vsp_node_ips)
+                    else:
+                        lsf.write_output(f'  Clearing proxy from {len(vsp_node_ips)} VSP nodes...')
+                        for _node_ip in vsp_node_ips:
+                            lsf.clear_vsp_node_proxy(_node_ip, password)
+
+                # ---- SDDC Manager proxy (SET or CLEAR) ──────────────────────
+                _sddc_host = lsf.config.get('VCF', 'sddc_manager_host',
+                                             fallback='sddcmanager-a.site-a.vcf.lab')
+                _sddc_ip   = lsf.config.get('VCF', 'sddc_manager_ip',
+                                             fallback='10.1.1.20')
+                lsf.write_output(f'  {"Setting" if _proxy_required else "Clearing"} proxy on SDDC Manager {_sddc_host}...')
+                if _proxy_required:
+                    lsf.set_sddc_proxy(_sddc_host, _sddc_ip, 'admin@local', password)
+                else:
+                    lsf.clear_sddc_proxy(_sddc_host, _sddc_ip, 'admin@local', password)
+
+                # ---- Ops Manager proxy (SET or CLEAR) ───────────────────────
+                _ops_host = lsf.config.get('VCF', 'ops_manager_host',
+                                            fallback='ops-a.site-a.vcf.lab')
+                lsf.write_output(f'  {"Setting" if _proxy_required else "Clearing"} proxy on Ops Manager {_ops_host}...')
+                if _proxy_required:
+                    lsf.set_ops_proxy(_ops_host, 'admin', password)
+                else:
+                    lsf.clear_ops_proxy(_ops_host, 'admin', password)
+
+                # ---- ESXi UserVars.HttpProxyHost (SET or CLEAR) ─────────────
+                # Build a structured list from the vcenters_list config strings
+                # (format: hostname:os_type:sso_user@domain).
+                _vcenter_list = []
+                for _vc_line in vcenters_list:
+                    _vc_parts = _vc_line.split(':')
+                    if not _vc_parts:
+                        continue
+                    _vcenter_list.append({
+                        'host': _vc_parts[0].strip(),
+                        'sso_user': _vc_parts[2].strip() if len(_vc_parts) >= 3 else 'administrator@vsphere.local',
+                    })
+                for _vc_entry in _vcenter_list:
+                    lsf.write_output(
+                        f'  {"Setting" if _proxy_required else "Clearing"} '
+                        f'vCenter VAMI proxy (ESXi 9.x) via {_vc_entry["host"]}...'
+                    )
+                    if _proxy_required:
+                        lsf.set_esxi_proxy(
+                            _vc_entry['host'], _vc_entry['sso_user'], password,
+                            f'{lsf.proxy}:3128',
+                        )
+                    else:
+                        lsf.clear_esxi_proxy(_vc_entry['host'], _vc_entry['sso_user'], password)
 
                 # ---- Kubernetes certificate check/renewal (VSP + VCFA) ----
                 # Runs before component scale-up so the API server is healthy
@@ -3230,7 +3298,7 @@ echo "PROXY_CONFIGURED"
     
     nsx_mgr_entries = lsf.get_config_list('VCF', 'vcfnsxmgr')
     nsx_users = ['admin', 'root', 'audit']
-    nsx_expiry_days = 9999
+    nsx_expiry_days = 999
     nsx_expiry_threshold_days = 90   # Only update if current expiry < this
     nsx_task_failed = False
     password = lsf.get_password()
@@ -3300,14 +3368,15 @@ echo "PROXY_CONFIGURED"
                         # Key absent in response → no expiry configured → skip
                         lsf.write_output(
                             f'  {nsx_fqdn}: {user} — no expiry configured '
-                            f'(password_change_frequency=0) — SKIP')
-                        continue
-                    elif current == 0:
-                        # NSX "no expiry" sentinel value → skip
-                        lsf.write_output(
-                            f'  {nsx_fqdn}: {user} — API reports 0 days '
-                            f'(non-expiring) — SKIP')
-                        continue
+                            f'setting to {nsx_expiry_days}d')
+                        #     f'(password_change_frequency=0) — SKIP')
+                        # continue
+                    # elif current == 0:
+                    #     # NSX "no expiry" sentinel value → skip
+                    #     lsf.write_output(
+                    #         f'  {nsx_fqdn}: {user} — API reports 0 days '
+                    #         f'(non-expiring) — SKIP')
+                    #     continue
                     elif current > nsx_expiry_threshold_days:
                         lsf.write_output(
                             f'  {nsx_fqdn}: {user} — expires in {current}d '

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.11 - 2026-05-26
+# Version 3.12 - 2026-05-28
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -306,6 +306,16 @@ def main(lsf=None, standalone=False, dry_run=False):
         if dashboard:
             dashboard.update_task('prelim', 'vscode_proxy', 'complete')
             dashboard.generate_html()
+    elif not loader.requires_proxy_filter():
+        # Non-HOL lab type: clear proxy settings so VS Code goes direct
+        if not dry_run:
+            console_host = 'root@console.site-a.vcf.lab'
+            lsf.clear_vscode_proxy(console_host, lsf.get_password())
+        else:
+            lsf.write_output('Would clear VS Code proxy on console (non-HOL lab type)')
+        if dashboard:
+            dashboard.update_task('prelim', 'vscode_proxy', 'complete')
+            dashboard.generate_html()
     else:
         lsf.write_output('VS Code proxy configuration disabled (enablevscodeproxy = false)')
         if dashboard:
@@ -353,29 +363,56 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     #==========================================================================
     # TASK 8: Firefox LMC tuning (proxy + lightweight prefs in user.js on console home)
+    # HOL lab type  → set manual Squid proxy
+    # non-HOL types → clear proxy (network.proxy.type=0) + same perf prefs
     #==========================================================================
-    
-    # if dashboard:
-    #     dashboard.update_task('prelim', 'firefox_lmchol_tune', 'running')
-    #     dashboard.generate_html()
-    
-    # if os.path.isdir(lsf.lmcholroot):
-    #     try:
-    #         from Tools.firefox_lmchol_tuning import apply_firefox_lmchol_tuning
 
-    #         if not apply_firefox_lmchol_tuning(lsf, dry_run=dry_run):
-    #             lsf.write_output(
-    #                 'WARNING: Firefox LMC user.js tuning failed for one or more profiles'
-    #             )
-    #     except Exception as e:
-    #         lsf.write_output(f'WARNING: Firefox LMC tuning skipped: {e}')
-    # else:
-    #     lsf.write_output('firefox_lmchol_tuning: console home not mounted at lsf.lmcholroot; skip')
-    
-    # if dashboard:
-    #     dashboard.update_task('prelim', 'firefox_lmchol_tune', 'complete')
-    #     dashboard.generate_html()
-    
+    if dashboard:
+        dashboard.update_task('prelim', 'firefox_lmchol_tune', 'running')
+        dashboard.generate_html()
+
+    if os.path.isdir(lsf.lmcholroot):
+        try:
+            from Tools.firefox_lmchol_tuning import apply_firefox_lmchol_tuning
+
+            _ff_clear = not loader.requires_proxy_filter()
+            if not apply_firefox_lmchol_tuning(lsf, dry_run=dry_run, clear=_ff_clear):
+                lsf.write_output(
+                    'WARNING: Firefox LMC user.js tuning failed for one or more profiles'
+                )
+        except Exception as e:
+            lsf.write_output(f'WARNING: Firefox LMC tuning skipped: {e}')
+    else:
+        lsf.write_output('firefox_lmchol_tuning: console home not mounted at lsf.lmcholroot; skip')
+
+    if dashboard:
+        dashboard.update_task('prelim', 'firefox_lmchol_tune', 'complete')
+        dashboard.generate_html()
+
+    #==========================================================================
+    # TASK 8b: Console VM OS proxy (/etc/environment)
+    # HOL lab type  → set http_proxy / NO_PROXY
+    # non-HOL types → strip all proxy lines
+    #==========================================================================
+
+    if dashboard:
+        dashboard.update_task('prelim', 'console_os_proxy', 'running')
+        dashboard.generate_html()
+
+    try:
+        _console_host = 'root@console.site-a.vcf.lab'
+        _pw = lsf.get_password()
+        if loader.requires_proxy_filter():
+            lsf.set_console_os_proxy(_console_host, _pw, dry_run)
+        else:
+            lsf.clear_console_os_proxy(_console_host, _pw, dry_run)
+    except Exception as e:
+        lsf.write_output(f'WARNING: Console OS proxy step skipped: {e}')
+
+    if dashboard:
+        dashboard.update_task('prelim', 'console_os_proxy', 'complete')
+        dashboard.generate_html()
+
     #==========================================================================
     # TASK 9: Install Playwright on Manager (if required by config)
     #
