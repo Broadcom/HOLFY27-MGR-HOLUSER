@@ -1,7 +1,7 @@
 ---
 name: vcf-troubleshooting
 description: Diagnose and resolve common issues in VMware Cloud Foundation (VCF) 9.0 and 9.1 Holodeck nested virtualization lab environments. Covers Supervisor configuration failures, WCP certificate issues, K8s node NotReady flapping, VCF Automation volume attachment stalls, content library sync failures, VCF component shutdown/startup, vCenter service autostart failures, console black screen, proxy/DNS issues, CSI password rotation after upgrade, SSH host key mismatches, VCF Automation microservice scaling, Fleet LCM failures, VCF Automation API shutdown issues, SDDC Manager credential remediation failures, VSP cluster image pull failures, vCenter VAMI shell/PAM SSH breakage, holorouter auth.vcf.lab / vault.vcf.lab TLS expiry, vCenter OIDC federation / Authentik discovery failures, VIDB auth source test errors, VCF SSO UI still showing local-only login after API integration, Fleet SSO Overview get-started empty despite prerequisites, Authentik outgoing SCIM sync errors (ServiceProviderConfig 404, “Network error communicating with remote system”), federated SSO login failure when SCIM users exist (OIDC sub vs ExternalId mismatch), Authentik SCIM syncing 0 users due to empty property_mappings, and Authentik missing group memberships due to empty vCenter SCIM group payload. Use when troubleshooting VCF, Supervisor stuck, WCP errors, Kubernetes NotReady, VCF Automation down, content library sync, lab startup failures, black console screen, proxy issues, CSI controller crash, SSH host key changed, VCFA 503 errors, SDDC Manager passwords, credential UNKNOWN status, resource locks, password remediation failures, VSP ImagePullBackOff, containerd NO_PROXY, vCenter SSH broken, sshpass exit 5, VAMI shell, pam_mgmt_cli, Guest Operations, Firefox slow or untrusted Vault CA, auth.vcf.lab certificate expired, OIDC identity provider, SCIM, Authentik integration, VCF SSO wizard, Join SSO, Fleet IAM idpId missing, SSO prerequisites checkboxes, prod-readonly group sync, Authentik worker SCIM logs, prod-admin login failed, OIDC sub ExternalId, SCIM 0 users, property_mappings empty, vcf_viewer role, SCIM members array missing, force_vcf_scim_group_memberships, patch_compare_users bug, VCFA login 500, vcfapostgres pending, system-shutdown Argo Workflow, prelude deployments 0 replicas, node cordoned after startup, lock-vmsp-platform mutex, Fleet LCM stale workflow, or auto-platform-a-b7nps SchedulingDisabled, cert-manager Certificate not-Ready, tls-for-opensearch expired, vcf-cluster-ca expired, spec.duration short, vsp_cert_renewer, VSP certificate renewal, CA rotation ImagePullBackOff, ECDSA verification failure vcf-cluster-ca, registry-certificate broken after CA rotation, or vodap ImagePullBackOff after boot.
-last_updated: 2026-05-22
+last_updated: 2026-05-28
 ---
 
 # VCF 9.x Troubleshooting Guide
@@ -64,6 +64,8 @@ This environment is a **Holodeck nested virtualization lab**. All passwords are 
 | VCF Automation `https://auto-a.site-a.vcf.lab/login` returns HTTP 500 | Login page returns 500 shortly after lab startup; `vcfapostgres-0` in Pending state; all prelude deployments at 0/0 | Stale `system-shutdown-*` Argo Workflows in `vmsp-platform` resume after node uncordon, re-cordon node and scale all prelude deployments to 0 | 50 |
 | VSP cert-manager certs expire within lab lifecycle | cert-manager `Certificate` resources not-Ready or expiring within days/weeks; short default `spec.duration` from template freeze-date; `tls-for-opensearch`, cluster CAs expire ~3y after template build | cert-manager default or VMware-set durations (8760h–27740h) do not account for template reuse; fix by extending CAs to 10y then leaf certs to 5y | 51 |
 | VSP ImagePullBackOff after CA rotation | pods in `vodap`/`ops-logs` fail with `ECDSA verification failure` for `vcf-cluster-ca`; image pulls from `registry.vmsp-platform.svc.cluster.local:5000` fail | Phase 3.0 CA rotation generates new key pair; VCF operator reverts spec.duration causing repeat rotations; leaf certs signed by old key become unverifiable | 52 |
+| ESXi `UserVars.HttpProxyHost` invalid error | vSphere tasks fail with `'UserVars.HttpProxyHost' is invalid or exceeds the maximum number of characters permitted` | Advanced option removed in ESXi 9.x; use vCenter VAMI REST API `PUT /api/appliance/networking/proxy/{http\|https}` instead | 53 |
+| Supervisor shows "No proxy settings" after prelim+VCFfinal | `cluster_proxy_config.proxy_settings_source` is NOT_FOUND after startup scripts run | Supervisor proxy PATCH was only in `confighol.configure_vsp_proxy()`, not in VCFfinal startup sequence | 54 |
 
 ---
 
@@ -2321,3 +2323,69 @@ kubectl delete pod <stuck-pod-name> -n vodap --force --grace-period=0
 **Fix (permanent, `vsp_cert_renewer.py` v1.7+)**:
 - `CA_MIN_REMAINING_H` was lowered from `43830` (5 years) to `8760` (1 year). A fresh template deployment has ~3y on the CA so Phase 3.0 no longer fires on every boot.
 - `_phase3_extend_ca()` now returns `True` if a CA was actually rotated. `_check_cluster()` passes `force_all=True` to `_phase3_certmanager()` when the CA was rotated, forcing immediate renewal of **all** leaf certs regardless of their notAfter date — because the old CA key is no longer valid for any cert signed with it.
+
+## 53. ESXi UserVars.HttpProxyHost Removed in ESXi 9.x — Proxy via VAMI API Instead
+
+**Symptom**: vSphere recent tasks show `Update option values` errors: `'UserVars.HttpProxyHost' is invalid or exceeds the maximum number of characters permitted.` when any startup script tries to set ESXi advanced proxy options. No ESXi hosts get proxy configured.
+
+**Diagnosis**:
+```bash
+# Query ESXi supported advanced options — UserVars.HttpProxyHost is absent
+python3 -c "
+import ssl
+from pyVim import connect
+from pyVmomi import vim
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+si = connect.SmartConnect(host='vc-wld01-a.site-a.vcf.lab', user='administrator@wld.sso', pwd='<pw>', sslContext=ctx)
+view = si.content.viewManager.CreateContainerView(si.content.rootFolder, [vim.HostSystem], True)
+host = list(view.view)[0]; view.Destroy()
+proxy_keys = {o.key for o in host.configManager.advancedOption.supportedOption if 'proxy' in o.key.lower()}
+print(proxy_keys)  # Will NOT contain UserVars.HttpProxyHost or UserVars.HttpProxyPort
+"
+```
+
+**Root Cause**: `UserVars.HttpProxyHost` and `UserVars.HttpProxyPort` advanced settings were removed in ESXi 9.x. The `vim.fault.InvalidName` error is thrown because the key does not exist as a supported option.
+
+**Fix**: Configure proxy at the vCenter VAMI level via the REST API. ESXi hosts inherit the proxy from their managing vCenter:
+```python
+# Set vCenter VAMI proxy — the server field requires a URL (with scheme), not a hostname
+import requests, urllib3
+urllib3.disable_warnings()
+vc = 'vc-wld01-a.site-a.vcf.lab'
+r = requests.post(f'https://{vc}/api/session', auth=('administrator@wld.sso', pw), verify=False, timeout=15)
+tok = r.json()
+hdrs = {'vmware-api-session-id': tok, 'Content-Type': 'application/json'}
+body = {'enabled': True, 'server': 'http://proxy.site-a.vcf.lab', 'port': 3128}
+for proto in ('http', 'https'):
+    r = requests.put(f'https://{vc}/api/appliance/networking/proxy/{proto}', headers=hdrs, json=body, verify=False)
+    print(f'{proto}: HTTP {r.status_code}')  # Expected 204
+```
+`lsf.set_esxi_proxy()` in `lsfunctions.py v3.11+` implements this VAMI-based approach and replaces the defunct UserVars method.
+
+## 54. Supervisor Proxy Not Configured After Running prelim.py + VCFfinal.py
+
+**Symptom**: vSphere Client > supervisor-wld01-a > Configure > Network > Supervisor Proxy Configuration shows "No proxy settings on this Supervisor — The Supervisor does not use any proxy settings, inherited or custom."
+
+**Diagnosis**:
+```python
+# Check Supervisor cluster_proxy_config via REST API
+import requests, urllib3
+urllib3.disable_warnings()
+r = requests.post('https://vc-wld01-a.site-a.vcf.lab/api/session', auth=('administrator@wld.sso', pw), verify=False, timeout=15)
+tok = r.json()
+hdrs = {'vmware-api-session-id': tok}
+clusters = requests.get('https://vc-wld01-a.site-a.vcf.lab/api/vcenter/namespace-management/clusters', headers=hdrs, verify=False).json()
+cid = clusters[0]['cluster']
+cfg = requests.get(f'https://vc-wld01-a.site-a.vcf.lab/api/vcenter/namespace-management/clusters/{cid}', headers=hdrs, verify=False).json()['cluster_proxy_config']
+print(cfg.get('proxy_settings_source'))  # Shows NOT_FOUND or empty
+```
+
+**Root Cause**: The Supervisor namespace-management API proxy PATCH was only in `confighol-9.1.py::configure_vsp_proxy()`, which is NOT in the regular startup sequence (`prelim` → ... → `VCFfinal`). Running only `prelim.py` + `VCFfinal.py` never calls `configure_vsp_proxy()`.
+
+**Fix**: `VCFfinal.py v6.3.15+` calls `lsf.set_supervisor_api_proxy()` (or `clear_`) right after the `supervisor_stabilizer.py` subprocess in Task 2c. This PATCH sets `CLUSTER_CONFIGURED` mode with `LAB_PROXY_URL` (http://10.1.1.1:3128) and `LAB_NO_PROXY_PARTS`:
+```python
+# In VCFfinal.py Task 2c — after proc.wait()
+lsf.set_supervisor_api_proxy('vc-wld01-a.site-a.vcf.lab', 'administrator@wld.sso', password)
+```
+`lsf.set_supervisor_api_proxy()` in `lsfunctions.py v3.11+` is idempotent (skips if already matching) and non-fatal.
