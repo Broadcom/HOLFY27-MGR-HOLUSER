@@ -1,10 +1,11 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.8 - 2026-05-28
+# Version 3.14 - 2026-05-28
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
 
 import os
+import base64
 import subprocess
 import errno
 import socket
@@ -69,7 +70,9 @@ holorouter_dir = '/tmp/holorouter'  # NFS exported directory for router communic
 # Canonical proxy constants — single source of truth for all lab scripts.
 # Update only here; consumers call build_lab_no_proxy() / build_vscode_no_proxy().
 # ---------------------------------------------------------------------------
-LAB_PROXY_URL = "http://10.1.1.1:3128"
+LAB_PROXY_URL  = "http://10.1.1.1:3128"
+LAB_PROXY_IP   = "10.1.1.1"   # bare IP used in API host fields (SDDC Manager, Ops Manager)
+LAB_PROXY_PORT = 3128
 
 LAB_NO_PROXY_PARTS = [
     "localhost", "127.0.0.1",
@@ -110,12 +113,17 @@ def build_vscode_no_proxy():
 #==============================================================================
 
 def clear_supervisor_api_proxy(vc_host, sso_user, password, dry_run=False):
-    """PATCH empty cluster_proxy_config on every Supervisor cluster for vc_host.
+    """Deactivate cluster_proxy_config on every Supervisor cluster for vc_host.
 
     Authenticates with a vCenter REST session (POST /api/session), lists all
     Supervisor clusters (GET /api/vcenter/namespace-management/clusters), and
-    PATCHes each one with proxy_settings_source=CLUSTER_CONFIGURED and empty
-    http_proxy_config, https_proxy_config, and no_proxy_config=[].
+    PATCHes each one with proxy_settings_source=VC_INHERITED.
+
+    NOTE: The namespace-management API REJECTS PATCHing CLUSTER_CONFIGURED with
+    empty http_proxy_config strings (HTTP 400 'Invalid HTTP proxy url.').  The
+    only supported way to deactivate a cluster-configured proxy is to switch the
+    source back to VC_INHERITED, which makes the Supervisor follow the vCenter
+    appliance proxy (also cleared for non-HOL labtypes), i.e. effectively none.
 
     :param vc_host: Hostname or IP of the vCenter (e.g. 'vc-wld01-a.site-a.vcf.lab')
     :param sso_user: SSO user for REST auth (e.g. 'administrator@wld.sso')
@@ -164,10 +172,7 @@ def clear_supervisor_api_proxy(vc_host, sso_user, password, dry_run=False):
 
     proxy_body = {
         'cluster_proxy_config': {
-            'proxy_settings_source': 'CLUSTER_CONFIGURED',
-            'http_proxy_config': '',
-            'https_proxy_config': '',
-            'no_proxy_config': [],
+            'proxy_settings_source': 'VC_INHERITED',
         }
     }
     ok = True
@@ -175,15 +180,153 @@ def clear_supervisor_api_proxy(vc_host, sso_user, password, dry_run=False):
         cluster_id = cluster.get('cluster') or cluster.get('cluster_id') or cluster.get('id', '')
         if not cluster_id:
             continue
+
+        # Idempotency: skip if already VC_INHERITED (proxy already deactivated)
+        try:
+            cur_resp = requests.get(
+                f'{base}/api/vcenter/namespace-management/clusters/{cluster_id}',
+                headers=headers, verify=False, timeout=20,
+            )
+            if cur_resp.status_code == 200:
+                cur_cfg = cur_resp.json().get('cluster_proxy_config', {})
+                if cur_cfg.get('proxy_settings_source') == 'VC_INHERITED':
+                    write_output(f'{label}: Supervisor cluster {cluster_id} proxy already deactivated (VC_INHERITED) — skipping')
+                    continue
+        except Exception:
+            pass  # best-effort idempotency; proceed to PATCH
+
         try:
             patch_resp = requests.patch(
                 f'{base}/api/vcenter/namespace-management/clusters/{cluster_id}',
                 headers=headers, json=proxy_body, verify=False, timeout=30,
             )
             if patch_resp.status_code in (200, 204):
-                write_output(f'{label}: Supervisor cluster {cluster_id} proxy config cleared')
+                write_output(f'{label}: Supervisor cluster {cluster_id} proxy deactivated (VC_INHERITED)')
             else:
                 write_output(f'WARNING: {label}: cluster {cluster_id} PATCH HTTP {patch_resp.status_code}: {patch_resp.text[:120]}')
+                ok = False
+        except Exception as e:
+            write_output(f'WARNING: {label}: cluster {cluster_id} PATCH error: {e}')
+            ok = False
+
+    try:
+        requests.delete(f'{base}/api/session', headers=headers, verify=False, timeout=15)
+    except Exception:
+        pass
+
+    return ok
+
+
+def set_supervisor_api_proxy(vc_host, sso_user, password, dry_run=False):
+    """PATCH cluster_proxy_config on every Supervisor cluster for vc_host.
+
+    Sets CLUSTER_CONFIGURED mode with the canonical LAB_PROXY_URL and
+    LAB_NO_PROXY_PARTS list so the Supervisor uses the Squid proxy for
+    image pulls and container traffic.
+
+    Idempotent: checks current proxy source before patching; skips if already
+    CLUSTER_CONFIGURED with a matching http_proxy.
+    Non-fatal: logs WARNING and returns False on any error.
+
+    :param vc_host:   Hostname or IP of the vCenter (e.g. 'vc-wld01-a.site-a.vcf.lab')
+    :param sso_user:  SSO user for REST auth (e.g. 'administrator@wld.sso')
+    :param password:  Password for sso_user
+    :param dry_run:   If True, log intent but make no changes.
+    :return: True if all clusters were configured (or no clusters found), False on error.
+    """
+    label = vc_host.split('.')[0]
+    if dry_run:
+        write_output(
+            f'[dry-run] would PATCH Supervisor cluster_proxy_config (CLUSTER_CONFIGURED '
+            f'http_proxy={LAB_PROXY_URL}) via {vc_host}'
+        )
+        return True
+
+    base = f'https://{vc_host}'
+    session_token = None
+    try:
+        resp = requests.post(
+            f'{base}/api/session',
+            auth=(sso_user, password),
+            verify=False, timeout=30,
+        )
+        if resp.status_code not in (200, 201):
+            write_output(
+                f'WARNING: {label}: REST session failed HTTP {resp.status_code} '
+                f'— skipping Supervisor API proxy set'
+            )
+            return False
+        session_token = resp.json()
+    except Exception as e:
+        write_output(f'WARNING: {label}: REST session error — skipping Supervisor API proxy set: {e}')
+        return False
+
+    headers = {'vmware-api-session-id': session_token, 'Content-Type': 'application/json'}
+    try:
+        clusters_resp = requests.get(
+            f'{base}/api/vcenter/namespace-management/clusters',
+            headers=headers, verify=False, timeout=30,
+        )
+        if clusters_resp.status_code != 200:
+            write_output(
+                f'WARNING: {label}: GET clusters HTTP {clusters_resp.status_code} '
+                f'— skipping Supervisor API proxy set'
+            )
+            return False
+        clusters = clusters_resp.json()
+    except Exception as e:
+        write_output(f'WARNING: {label}: GET clusters error: {e}')
+        return False
+
+    if not clusters:
+        write_output(f'{label}: No Supervisor clusters found — nothing to configure')
+        return True
+
+    proxy_body = {
+        'cluster_proxy_config': {
+            'proxy_settings_source': 'CLUSTER_CONFIGURED',
+            'http_proxy_config': LAB_PROXY_URL,
+            'https_proxy_config': LAB_PROXY_URL,
+            'no_proxy_config': LAB_NO_PROXY_PARTS,
+        }
+    }
+    ok = True
+    for cluster in clusters:
+        cluster_id = cluster.get('cluster') or cluster.get('cluster_id') or cluster.get('id', '')
+        if not cluster_id:
+            continue
+
+        # Idempotency: skip if already configured with the same proxy
+        try:
+            cur_resp = requests.get(
+                f'{base}/api/vcenter/namespace-management/clusters/{cluster_id}',
+                headers=headers, verify=False, timeout=20,
+            )
+            if cur_resp.status_code == 200:
+                cur = cur_resp.json()
+                cur_cfg = cur.get('cluster_proxy_config', {})
+                if (cur_cfg.get('proxy_settings_source') == 'CLUSTER_CONFIGURED'
+                        and cur_cfg.get('http_proxy_config') == LAB_PROXY_URL):
+                    write_output(f'{label}: Supervisor cluster {cluster_id} proxy already set — skipping PATCH')
+                    continue
+        except Exception:
+            pass  # best-effort idempotency; proceed to PATCH
+
+        try:
+            patch_resp = requests.patch(
+                f'{base}/api/vcenter/namespace-management/clusters/{cluster_id}',
+                headers=headers, json=proxy_body, verify=False, timeout=30,
+            )
+            if patch_resp.status_code in (200, 204):
+                write_output(
+                    f'{label}: Supervisor cluster {cluster_id} proxy set '
+                    f'(CLUSTER_CONFIGURED http+https={LAB_PROXY_URL})'
+                )
+            else:
+                write_output(
+                    f'WARNING: {label}: cluster {cluster_id} PATCH HTTP '
+                    f'{patch_resp.status_code}: {patch_resp.text[:120]}'
+                )
                 ok = False
         except Exception as e:
             write_output(f'WARNING: {label}: cluster {cluster_id} PATCH error: {e}')
@@ -332,6 +475,701 @@ def clear_vscode_proxy(console_host, password, dry_run=False):
             os.remove(tmp_path)
         except Exception:
             pass
+
+
+#==============================================================================
+# PROXY SET/CLEAR HELPERS — Extended targets
+# Apply or clear proxy on SDDC Manager, Ops Manager, ESXi hosts, and the
+# console VM OS.  All functions are non-fatal (warn + return False on error).
+# Calling modules gate these on LabTypeLoader.requires_proxy_filter().
+#==============================================================================
+
+# ---------------------------------------------------------------------------
+# Shared helper: SDDC Manager Bearer token
+# ---------------------------------------------------------------------------
+
+def _sddc_bearer_token(sddc_host, api_user, password):
+    """Return a Bearer accessToken from SDDC Manager /v1/tokens, or None on failure."""
+    try:
+        resp = requests.post(
+            f'https://{sddc_host}/v1/tokens',
+            json={'username': api_user, 'password': password},
+            verify=False, timeout=30,
+        )
+        if resp.status_code not in (200, 201):
+            write_output(f'WARNING: {sddc_host}: SDDC Manager token request HTTP {resp.status_code}')
+            return None
+        return resp.json().get('accessToken')
+    except Exception as e:
+        write_output(f'WARNING: {sddc_host}: SDDC Manager token request error: {e}')
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Group A: SDDC Manager (OS /etc/sysconfig/proxy + REST /v1/system/proxy-configuration)
+# ---------------------------------------------------------------------------
+
+def set_sddc_proxy(sddc_host, sddc_ip, api_user, password, dry_run=False):
+    """Set proxy on SDDC Manager: OS /etc/sysconfig/proxy and REST API.
+
+    1. SSH to root@sddc_ip and write /etc/sysconfig/proxy + strip /etc/environment.
+    2. Bearer-token PATCH /v1/system/proxy-configuration (idempotent: checks first).
+
+    Uses LAB_PROXY_URL (proxy hostname) and build_lab_no_proxy() as the canonical
+    proxy values.  Bearer token requires api_user='admin@local' on VCF 9.1 C4.
+
+    :param sddc_host: FQDN of SDDC Manager (e.g. 'sddcmanager-a.site-a.vcf.lab')
+    :param sddc_ip:   IP for SSH access (e.g. '10.1.1.20')
+    :param api_user:  Token API user — use 'admin@local' for VCF 9.1
+    :param password:  Lab password
+    :param dry_run:   If True log intent, make no changes
+    :return: True on success, False on error (non-fatal)
+    """
+    label = sddc_host.split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would set proxy on SDDC Manager {sddc_host} (OS + API)')
+        return True
+
+    no_proxy_str = build_lab_no_proxy()
+    ok = True
+
+    # ── OS: /etc/sysconfig/proxy ─────────────────────────────────────────────
+    sysconfig = (
+        'PROXY_ENABLED="yes"\n'
+        f'HTTP_PROXY="{LAB_PROXY_URL}"\n'
+        f'HTTPS_PROXY="{LAB_PROXY_URL}"\n'
+        'FTP_PROXY=""\nGOPHER_PROXY=""\nSOCKS_PROXY=""\nSOCKS5_SERVER=""\n'
+        f'NO_PROXY="{no_proxy_str}"\n'
+    )
+    sc_b64 = base64.b64encode(sysconfig.encode()).decode()
+    cmd = (
+        "sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;"
+        "/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment; "
+        f"echo {sc_b64} | base64 -d > /etc/sysconfig/proxy"
+    )
+    result = ssh(cmd, f'root@{sddc_ip}', password)
+    if result.returncode == 0:
+        write_output(f'{label}: OS proxy written ({LAB_PROXY_URL})')
+    else:
+        write_output(f'WARNING: {label}: OS proxy write failed (ssh rc={result.returncode})')
+        ok = False
+
+    # ── API: PATCH /v1/system/proxy-configuration ────────────────────────────
+    tok = _sddc_bearer_token(sddc_host, api_user, password)
+    if not tok:
+        write_output(f'WARNING: {label}: cannot set API proxy — token request failed')
+        return False
+
+    hdrs = {'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'}
+    try:
+        cur = requests.get(
+            f'https://{sddc_host}/v1/system/proxy-configuration',
+            headers=hdrs, verify=False, timeout=20,
+        )
+        if cur.status_code == 200:
+            cur_data = cur.json()
+            if cur_data.get('isEnabled') and cur_data.get('host') == LAB_PROXY_IP:
+                write_output(f'{label}: API proxy already configured — skipping PATCH')
+                return ok
+    except Exception:
+        pass  # best-effort idempotency check; proceed to PATCH
+
+    excludes = [e for e in no_proxy_str.split(',') if e.strip()]
+    body = {'host': LAB_PROXY_IP, 'port': LAB_PROXY_PORT, 'isEnabled': True, 'excludes': excludes}
+    try:
+        resp = requests.patch(
+            f'https://{sddc_host}/v1/system/proxy-configuration',
+            headers=hdrs, json=body, verify=False, timeout=30,
+        )
+        if resp.status_code in (200, 204):
+            write_output(f'{label}: API proxy set (host={LAB_PROXY_IP} port={LAB_PROXY_PORT} isEnabled=true)')
+        else:
+            write_output(f'WARNING: {label}: API proxy PATCH HTTP {resp.status_code}: {resp.text[:120]}')
+            ok = False
+    except Exception as e:
+        write_output(f'WARNING: {label}: API proxy PATCH error: {e}')
+        ok = False
+
+    return ok
+
+
+def clear_sddc_proxy(sddc_host, sddc_ip, api_user, password, dry_run=False):
+    """Clear proxy on SDDC Manager: OS /etc/sysconfig/proxy and REST API (isEnabled=false).
+
+    Non-fatal: logs WARNING and returns False on any error.
+    """
+    label = sddc_host.split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would clear proxy on SDDC Manager {sddc_host} (OS + API)')
+        return True
+
+    ok = True
+
+    # ── OS clear ─────────────────────────────────────────────────────────────
+    sysconfig_clear = (
+        'PROXY_ENABLED="no"\nHTTP_PROXY=""\nHTTPS_PROXY=""\n'
+        'FTP_PROXY=""\nGOPHER_PROXY=""\nSOCKS_PROXY=""\nSOCKS5_SERVER=""\nNO_PROXY=""\n'
+    )
+    sc_b64 = base64.b64encode(sysconfig_clear.encode()).decode()
+    cmd = (
+        "sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;"
+        "/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment; "
+        f"echo {sc_b64} | base64 -d > /etc/sysconfig/proxy"
+    )
+    result = ssh(cmd, f'root@{sddc_ip}', password)
+    if result.returncode == 0:
+        write_output(f'{label}: OS proxy cleared')
+    else:
+        write_output(f'WARNING: {label}: OS proxy clear failed (ssh rc={result.returncode})')
+        ok = False
+
+    # ── API clear ─────────────────────────────────────────────────────────────
+    tok = _sddc_bearer_token(sddc_host, api_user, password)
+    if not tok:
+        write_output(f'WARNING: {label}: cannot clear API proxy — token request failed')
+        return False
+
+    hdrs = {'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'}
+    try:
+        resp = requests.patch(
+            f'https://{sddc_host}/v1/system/proxy-configuration',
+            headers=hdrs, json={'isEnabled': False}, verify=False, timeout=30,
+        )
+        if resp.status_code in (200, 204):
+            write_output(f'{label}: API proxy cleared (isEnabled=false)')
+        else:
+            write_output(f'WARNING: {label}: API proxy clear PATCH HTTP {resp.status_code}: {resp.text[:120]}')
+            ok = False
+    except Exception as e:
+        write_output(f'WARNING: {label}: API proxy clear PATCH error: {e}')
+        ok = False
+
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Group B: Ops Manager (OS /etc/sysconfig/proxy + suite-api REST)
+# ---------------------------------------------------------------------------
+
+def _ops_web_session(ops_host, ops_user, password):
+    """Log in to VCF Operations web UI and return (session, secureToken).
+
+    VCF Operations 9.1 removed /suite-api/api/deployment/proxy.
+    The Global Settings proxy requires the plug/ops API which needs:
+      - JSESSIONID cookie scoped to /vcf-operations/plug/ops
+      - OPS_SESSION cookie scoped to /vcf-operations
+      - secureToken from commonJS.action?mainAction=getApplicationGlobalData
+
+    Flow:
+      1. GET /ui/login.action  (establishes initial /ui JSESSIONID)
+      2. POST /ui/login.action (response 'ok' on success)
+      3. GET /ui/login.action?vcf=1 without following redirect (302 sets the
+         /vcf-operations/plug/ops JSESSIONID and /vcf-operations OPS_SESSION)
+      4. Follow redirect to /vcf-operations/ui/ to activate session
+      5. GET commonJS.action?mainAction=getApplicationGlobalData → secureToken
+
+    Login uses authSourceId=localItem (VCF 9.1) or local (VCF 9.0).
+    forceLogin=true bypasses concurrent session prompts automatically.
+
+    Returns (requests.Session, str) on success, or (None, None) on failure.
+    """
+    import re as _re
+    s = requests.Session()
+    s.verify = False
+
+    base = f'https://{ops_host}'
+    try:
+        s.get(f'{base}/ui/login.action', timeout=20)
+    except Exception:
+        pass
+
+    logged_in = False
+    for auth_source_id in ('localItem', 'local'):
+        try:
+            login_data = {
+                'mainAction': 'login',
+                'userName': ops_user,
+                'password': password,
+                'authSourceId': auth_source_id,
+                'authSourceName': 'Local Account',
+                'authSourceType': 'LOCAL',
+                'forceLogin': 'true',
+                'timezone': '0',
+                'languageCode': 'us',
+                'vcf': '1',
+            }
+            resp = s.post(f'{base}/ui/login.action', data=login_data, timeout=30)
+            if resp.status_code == 200 and resp.text.strip().lower() in ('ok', ''):
+                logged_in = True
+                break
+            if resp.status_code == 200 and resp.text.strip().lower().startswith('ok'):
+                logged_in = True
+                break
+        except Exception:
+            continue
+
+    if not logged_in:
+        return None, None
+
+    try:
+        # GET the login page while authenticated: the 302 redirect response sets
+        # the /vcf-operations/plug/ops JSESSIONID and /vcf-operations OPS_SESSION
+        # cookies needed by the plug API.  allow_redirects=False to capture the
+        # Set-Cookie headers before the redirect is followed.
+        redir = s.get(f'{base}/ui/login.action?vcf=1', timeout=20, allow_redirects=False)
+
+        # Follow the redirect manually so both the redirect response cookies
+        # and the destination page cookies are captured.
+        if redir.status_code in (301, 302, 303, 307, 308):
+            loc = redir.headers.get('Location', '')
+            if not loc.startswith('http'):
+                loc = f'{base}/{loc.lstrip("/")}' if loc.startswith('/') else f'{base}/vcf-operations/ui/'
+            s.get(loc, timeout=20, allow_redirects=True)
+
+        # Simulate the Angular SPA bootstrap calls the browser makes after loading
+        # /vcf-operations/ui/.  These calls initialize the server-side plug session
+        # context; without them /vcf-operations/plug/ops/index.action returns HTTP
+        # 400 with "pluginTypesMap is null".
+        for _spa_path in (
+            '/vcf-operations/getUserSettings',
+            '/vcf-operations/getUserBaseInfo',
+        ):
+            try:
+                s.get(f'{base}{_spa_path}', timeout=15, allow_redirects=True)
+            except Exception:
+                pass
+
+        # GET the plug/ops index to fully activate the plug session
+        s.get(f'{base}/vcf-operations/plug/ops/index.action', timeout=20, allow_redirects=True)
+
+        # Retrieve secureToken
+        r = s.get(
+            f'{base}/vcf-operations/plug/ops/commonJS.action',
+            params={'mainAction': 'getApplicationGlobalData', 'timezone': '0'},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return None, None
+        m = _re.search(r'"secureToken"\s*:\s*"([^"]+)"', r.text)
+        if not m:
+            return None, None
+        return s, m.group(1)
+    except Exception:
+        return None, None
+
+
+def set_ops_proxy(ops_host, ops_user, password, dry_run=False):
+    """Set proxy on VCF Operations Manager: OS /etc/sysconfig/proxy and Global Settings API.
+
+    OS step SSHes as root; skipped gracefully if SSH is unavailable.
+    API step uses the VCF Operations 9.1 globalSettings.action plug endpoint
+    (?mainAction=setGlobalHttpProxy) which requires a web session + secureToken.
+    The legacy suite-api/api/deployment/proxy endpoint returns HTTP 404 in
+    VCF Operations 9.1 and is no longer used.
+    Idempotent: reads current state before posting.
+
+    :param ops_host: FQDN of Ops Manager (e.g. 'ops-a.site-a.vcf.lab')
+    :param ops_user: Web UI username (e.g. 'admin')
+    :param password: Lab password
+    :param dry_run:  If True log intent, make no changes
+    :return: True on success, False on error (non-fatal)
+    """
+    label = ops_host.split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would set proxy on Ops Manager {ops_host} (OS + API)')
+        return True
+
+    no_proxy_str = build_lab_no_proxy()
+    ok = True
+
+    # ── OS: /etc/sysconfig/proxy ─────────────────────────────────────────────
+    sysconfig = (
+        'PROXY_ENABLED="yes"\n'
+        f'HTTP_PROXY="{LAB_PROXY_URL}"\n'
+        f'HTTPS_PROXY="{LAB_PROXY_URL}"\n'
+        'FTP_PROXY=""\nGOPHER_PROXY=""\nSOCKS_PROXY=""\nSOCKS5_SERVER=""\n'
+        f'NO_PROXY="{no_proxy_str}"\n'
+    )
+    sc_b64 = base64.b64encode(sysconfig.encode()).decode()
+    cmd = (
+        "sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;"
+        "/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment; "
+        f"echo {sc_b64} | base64 -d > /etc/sysconfig/proxy"
+    )
+    result = ssh(cmd, f'root@{ops_host}', password)
+    if result.returncode == 0:
+        write_output(f'{label}: OS proxy written ({LAB_PROXY_URL})')
+    else:
+        write_output(f'WARNING: {label}: OS proxy write failed (ssh rc={result.returncode}) — continuing to API step')
+        ok = False
+
+    # ── API: globalSettings.action?mainAction=setGlobalHttpProxy ─────────────
+    base = f'https://{ops_host}'
+    plug_url = f'{base}/vcf-operations/plug/ops/globalSettings.action'
+    try:
+        sess, token = _ops_web_session(ops_host, ops_user, password)
+        if not sess or not token:
+            write_output(f'WARNING: {label}: could not obtain Ops web session for proxy API')
+            return False
+
+        # Idempotency check
+        info_resp = sess.post(plug_url, data={
+            'mainAction': 'getInfo', 'currentComponentInfo': 'TODO', 'secureToken': token,
+        }, timeout=20)
+        if info_resp.status_code == 200:
+            try:
+                import json as _json
+                info_data = _json.loads(info_resp.text)
+                for s in info_data.get('globalSettings', []):
+                    if s.get('name') == 'globalHttpProxy' and s.get('value') is True:
+                        write_output(f'{label}: API proxy already enabled — skipping')
+                        return ok
+            except Exception:
+                pass
+
+        resp = sess.post(
+            plug_url,
+            params={'mainAction': 'setGlobalHttpProxy'},
+            data={
+                'url': LAB_PROXY_IP,
+                'port': str(LAB_PROXY_PORT),
+                'username': '',
+                'currentComponentInfo': 'TODO',
+                'secureToken': token,
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200 and 'success' in resp.text.lower():
+            write_output(f'{label}: API proxy set via globalSettings (url={LAB_PROXY_IP} port={LAB_PROXY_PORT})')
+        else:
+            write_output(f'WARNING: {label}: API proxy set HTTP {resp.status_code}: {resp.text[:120]}')
+            ok = False
+    except Exception as e:
+        write_output(f'WARNING: {label}: API proxy set error: {e}')
+        ok = False
+
+    return ok
+
+
+def clear_ops_proxy(ops_host, ops_user, password, dry_run=False):
+    """Clear proxy on VCF Operations Manager: OS /etc/sysconfig/proxy and Global Settings API.
+
+    API step uses the VCF Operations 9.1 globalSettings.action plug endpoint
+    (?mainAction=deleteGlobalHttpProxy).  Non-fatal: logs WARNING on errors.
+    """
+    label = ops_host.split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would clear proxy on Ops Manager {ops_host} (OS + API)')
+        return True
+
+    ok = True
+
+    # ── OS clear ─────────────────────────────────────────────────────────────
+    sysconfig_clear = (
+        'PROXY_ENABLED="no"\nHTTP_PROXY=""\nHTTPS_PROXY=""\n'
+        'FTP_PROXY=""\nGOPHER_PROXY=""\nSOCKS_PROXY=""\nSOCKS5_SERVER=""\nNO_PROXY=""\n'
+    )
+    sc_b64 = base64.b64encode(sysconfig_clear.encode()).decode()
+    cmd = (
+        "sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;"
+        "/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment; "
+        f"echo {sc_b64} | base64 -d > /etc/sysconfig/proxy"
+    )
+    result = ssh(cmd, f'root@{ops_host}', password)
+    if result.returncode == 0:
+        write_output(f'{label}: OS proxy cleared')
+    else:
+        write_output(f'WARNING: {label}: OS proxy clear failed (ssh rc={result.returncode}) — continuing to API step')
+        ok = False
+
+    # ── API: globalSettings.action?mainAction=deleteGlobalHttpProxy ───────────
+    plug_url = f'https://{ops_host}/vcf-operations/plug/ops/globalSettings.action'
+    try:
+        sess, token = _ops_web_session(ops_host, ops_user, password)
+        if not sess or not token:
+            write_output(f'WARNING: {label}: could not obtain Ops web session for proxy API')
+            return False
+
+        resp = sess.post(
+            plug_url,
+            params={'mainAction': 'deleteGlobalHttpProxy'},
+            data={'currentComponentInfo': 'TODO', 'secureToken': token},
+            timeout=30,
+        )
+        if resp.status_code == 200 and 'success' in resp.text.lower():
+            write_output(f'{label}: API proxy cleared via globalSettings (deleteGlobalHttpProxy)')
+        elif resp.status_code == 200:
+            write_output(f'{label}: API proxy delete returned HTTP 200 (proxy may have been absent)')
+        else:
+            write_output(f'WARNING: {label}: API proxy delete HTTP {resp.status_code}: {resp.text[:120]}')
+            ok = False
+    except Exception as e:
+        write_output(f'WARNING: {label}: API proxy delete error: {e}')
+        ok = False
+
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Group C: ESXi UserVars.HttpProxyHost (via vCenter pyVmomi)
+# ---------------------------------------------------------------------------
+
+def set_esxi_proxy(vc_host, sso_user, password, proxy_value=None, dry_run=False):
+    """Configure HTTP/HTTPS proxy on the vCenter that manages the ESXi hosts.
+
+    In ESXi 9.x the ``UserVars.HttpProxyHost`` advanced setting was removed.
+    Proxy for ESXi hosts is now configured by enabling the proxy on the managing
+    vCenter Appliance via the vCenter REST API:
+
+      ``PUT /api/appliance/networking/proxy/{http|https}``
+        { "enabled": true, "server": "http://<host>", "port": <int> }
+
+    ``proxy_value`` accepts "host:port", "http://host:port", or "host" format.
+    Passing ``proxy_value=''`` delegates to ``clear_esxi_proxy()``.
+
+    Idempotent: reads the current VAMI proxy state and skips if already matching.
+    Non-fatal: logs WARNING and returns False if vCenter is unreachable.
+
+    :param vc_host:     vCenter hostname or IP
+    :param sso_user:    SSO username (e.g. 'administrator@vsphere.local')
+    :param password:    Password
+    :param proxy_value: "host:port" or "http://host:port" to set, "" to clear.
+                        Default: '{proxy}:3128'
+    :param dry_run:     If True log intent, make no changes
+    :return: True on success, False if vCenter unreachable
+    """
+    label = vc_host.split('.')[0]
+
+    if proxy_value == '':
+        return clear_esxi_proxy(vc_host, sso_user, password, dry_run=dry_run)
+
+    # Parse proxy_value → (server_url, port_int)
+    raw = proxy_value if proxy_value is not None else f'{proxy}:3128'
+    # Strip scheme prefix if present for consistent parsing
+    raw_stripped = raw
+    for scheme in ('http://', 'https://'):
+        if raw_stripped.startswith(scheme):
+            raw_stripped = raw_stripped[len(scheme):]
+            break
+    if ':' in raw_stripped:
+        parts = raw_stripped.rsplit(':', 1)
+        proxy_server_url = f'http://{parts[0]}'
+        try:
+            proxy_port = int(parts[1])
+        except ValueError:
+            proxy_port = 3128
+    else:
+        proxy_server_url = f'http://{raw_stripped}'
+        proxy_port = 3128
+
+    if dry_run:
+        write_output(
+            f'[dry-run] would set vCenter VAMI proxy on {vc_host}: '
+            f'http+https → {proxy_server_url}:{proxy_port}'
+        )
+        return True
+
+    base = f'https://{vc_host}'
+    try:
+        sess_resp = requests.post(
+            f'{base}/api/session',
+            auth=(sso_user, password),
+            verify=False, timeout=30,
+        )
+        if sess_resp.status_code not in (200, 201):
+            write_output(
+                f'WARNING: {label}: vCenter REST session failed HTTP {sess_resp.status_code}'
+                f' — skipping VAMI proxy set'
+            )
+            return False
+        session_token = sess_resp.json()
+    except Exception as e:
+        write_output(f'WARNING: {label}: vCenter REST session error — skipping VAMI proxy set: {e}')
+        return False
+
+    hdrs = {'vmware-api-session-id': session_token, 'Content-Type': 'application/json'}
+    body = {'enabled': True, 'server': proxy_server_url, 'port': proxy_port}
+    ok = True
+    for proto in ('http', 'https'):
+        # Idempotency: read current value
+        try:
+            cur = requests.get(
+                f'{base}/api/appliance/networking/proxy/{proto}',
+                headers=hdrs, verify=False, timeout=15,
+            )
+            if cur.status_code == 200:
+                cur_data = cur.json()
+                if (cur_data.get('enabled') and
+                        cur_data.get('server') == proxy_server_url and
+                        cur_data.get('port') == proxy_port):
+                    write_output(f'{label}: vCenter VAMI {proto} proxy already set — skipping')
+                    continue
+        except Exception:
+            pass  # best-effort idempotency
+
+        try:
+            r = requests.put(
+                f'{base}/api/appliance/networking/proxy/{proto}',
+                headers=hdrs, json=body, verify=False, timeout=20,
+            )
+            if r.status_code in (200, 204):
+                write_output(
+                    f'{label}: vCenter VAMI {proto} proxy set '
+                    f'→ {proxy_server_url}:{proxy_port}'
+                )
+            else:
+                write_output(
+                    f'WARNING: {label}: VAMI {proto} proxy PUT HTTP {r.status_code}: {r.text[:120]}'
+                )
+                ok = False
+        except Exception as e:
+            write_output(f'WARNING: {label}: VAMI {proto} proxy PUT error: {e}')
+            ok = False
+
+    try:
+        requests.delete(f'{base}/api/session', headers=hdrs, verify=False, timeout=15)
+    except Exception:
+        pass
+
+    return ok
+
+
+def clear_esxi_proxy(vc_host, sso_user, password, dry_run=False):
+    """Disable the HTTP/HTTPS proxy on the vCenter VAMI (ESXi 9.x replacement).
+
+    Sets ``enabled: false`` on both http and https protocol entries via:
+      ``PUT /api/appliance/networking/proxy/{http|https}``
+
+    Non-fatal: logs WARNING and returns False if vCenter is unreachable.
+    """
+    label = vc_host.split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would disable vCenter VAMI http/https proxy on {vc_host}')
+        return True
+
+    base = f'https://{vc_host}'
+    try:
+        sess_resp = requests.post(
+            f'{base}/api/session',
+            auth=(sso_user, password),
+            verify=False, timeout=30,
+        )
+        if sess_resp.status_code not in (200, 201):
+            write_output(
+                f'WARNING: {label}: vCenter REST session failed HTTP {sess_resp.status_code}'
+                f' — skipping VAMI proxy clear'
+            )
+            return False
+        session_token = sess_resp.json()
+    except Exception as e:
+        write_output(f'WARNING: {label}: vCenter REST session error — skipping VAMI proxy clear: {e}')
+        return False
+
+    hdrs = {'vmware-api-session-id': session_token, 'Content-Type': 'application/json'}
+    body = {'enabled': False, 'server': '', 'port': -1}
+    ok = True
+    for proto in ('http', 'https'):
+        try:
+            cur = requests.get(
+                f'{base}/api/appliance/networking/proxy/{proto}',
+                headers=hdrs, verify=False, timeout=15,
+            )
+            if cur.status_code == 200 and not cur.json().get('enabled', True):
+                write_output(f'{label}: vCenter VAMI {proto} proxy already disabled — skipping')
+                continue
+        except Exception:
+            pass
+
+        try:
+            r = requests.put(
+                f'{base}/api/appliance/networking/proxy/{proto}',
+                headers=hdrs, json=body, verify=False, timeout=20,
+            )
+            if r.status_code in (200, 204):
+                write_output(f'{label}: vCenter VAMI {proto} proxy disabled')
+            else:
+                write_output(
+                    f'WARNING: {label}: VAMI {proto} proxy clear HTTP {r.status_code}: {r.text[:120]}'
+                )
+                ok = False
+        except Exception as e:
+            write_output(f'WARNING: {label}: VAMI {proto} proxy clear error: {e}')
+            ok = False
+
+    try:
+        requests.delete(f'{base}/api/session', headers=hdrs, verify=False, timeout=15)
+    except Exception:
+        pass
+
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Group D: Console VM OS proxy (/etc/environment)
+# ---------------------------------------------------------------------------
+
+def set_console_os_proxy(console_host, password, dry_run=False):
+    """Set http_proxy / NO_PROXY in /etc/environment on the console VM.
+
+    Strips stale proxy lines first (idempotent via sed), then appends the
+    current LAB_PROXY_URL and build_lab_no_proxy() values in both lower-
+    and upper-case forms consumed by most Linux processes.
+
+    :param console_host: SSH target, e.g. 'root@console.site-a.vcf.lab'
+    :param password:     SSH password
+    :param dry_run:      If True log intent, make no changes
+    :return: True on success, False on SSH error (non-fatal)
+    """
+    label = console_host.split('@')[-1].split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would set OS proxy in /etc/environment on {console_host}')
+        return True
+
+    no_proxy_str = build_lab_no_proxy()
+    env_lines = (
+        f'http_proxy={LAB_PROXY_URL}\n'
+        f'https_proxy={LAB_PROXY_URL}\n'
+        f'no_proxy={no_proxy_str}\n'
+        f'HTTP_PROXY={LAB_PROXY_URL}\n'
+        f'HTTPS_PROXY={LAB_PROXY_URL}\n'
+        f'NO_PROXY={no_proxy_str}\n'
+    )
+    env_b64 = base64.b64encode(env_lines.encode()).decode()
+    cmd = (
+        "sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;"
+        "/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment && "
+        f"echo {env_b64} | base64 -d >> /etc/environment"
+    )
+    result = ssh(cmd, console_host, password)
+    if result.returncode == 0:
+        write_output(f'{label}: OS proxy set in /etc/environment ({LAB_PROXY_URL})')
+        return True
+    else:
+        write_output(f'WARNING: {label}: OS proxy set failed (ssh rc={result.returncode})')
+        return False
+
+
+def clear_console_os_proxy(console_host, password, dry_run=False):
+    """Strip all proxy lines from /etc/environment on the console VM.
+
+    Non-fatal: logs WARNING and returns False on SSH error.
+    """
+    label = console_host.split('@')[-1].split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would clear OS proxy from /etc/environment on {console_host}')
+        return True
+
+    cmd = (
+        "sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;"
+        "/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment"
+    )
+    result = ssh(cmd, console_host, password)
+    if result.returncode == 0:
+        write_output(f'{label}: OS proxy cleared from /etc/environment')
+        return True
+    else:
+        write_output(f'WARNING: {label}: OS proxy clear failed (ssh rc={result.returncode})')
+        return False
 
 
 # Log file name
