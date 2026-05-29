@@ -17,9 +17,3 @@ cp ../../Startup/VCFfinal.py ./VCFfinal.py
 2. Edit your copy. Place custom code in the `CUSTOM` section at the bottom of the module.
 
 3. Commit to this repo. The override takes effect on next boot for all Discovery labs.
-
-## Discovery-Specific Notes
-
-- Discovery labs run with **no firewall and no proxy filtering** (`firewall: False`, `proxy_filter: False`)
-- Uses `named` repo pattern: SKU format is `Discovery-Name` (not year-based like `HOL-XXYY`)
-- Consider overriding `prelim.py` to skip proxy-related checks
