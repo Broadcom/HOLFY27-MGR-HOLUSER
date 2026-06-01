@@ -7,7 +7,7 @@
 #
 # v 3.7 Changes (2026-06-01):
 # - Phase 2b: Replaced kubectl scale-down approach with
-#   vcf_services_runtime_shutdown.sh subprocess call (Broadcom-provided script).
+#   vcf_services_runtime_shutdown.sh subprocess call (Broadcom-provided script, source: https://knowledge.broadcom.com/external/article/440874/how-to-safely-shutdown-all-nodes-within.html).
 #   Called once per VSP site VIP from [VCFFINAL] vspcontrolplaneip/vspcontrolplaneips.
 #   Credentials (VMSP_PASSWORD, VCENTER_USERNAME, VCENTER_PASSWORD) passed via env vars.
 #   Script gracefully drains K8s workloads, sets power-off-marker (auto-recovery on

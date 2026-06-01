@@ -28,7 +28,7 @@
 #   - All vCenter and license VM power operations use direct ESXi connections
 #     (established in Phase 4 before vCenter goes down in Phase 5)
 #
-# VSP cluster shutdown uses the Broadcom vcf_services_runtime_shutdown.sh
+# VSP cluster shutdown uses the Broadcom vcf_services_runtime_shutdown.sh source: https://knowledge.broadcom.com/external/article/440874/how-to-safely-shutdown-all-nodes-within.html
 # script (Phase 1) which gracefully drains all K8s workloads via the port-5480
 # management API and then powers off VSP VMs via govc. The script also sets
 # a power-off-marker that triggers automatic component recovery on next boot.
