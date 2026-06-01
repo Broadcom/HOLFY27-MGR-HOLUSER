@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 # VVFshutdown.py - HOLFY27 Core VVF Shutdown Module
-# Version 1.1 - 2026-06-01
+# Version 1.2 - 2026-06-01
 #
 # CHANGELOG:
+# v1.2 - 2026-06-01 (hung shutdown fix):
+#   - Phase 1b (NEW): After VSP graceful K8s drain, SSH to each ESXi host and
+#     force-power-off any remaining vsp-* VMs. vcf_services_runtime_shutdown.sh
+#     fails to power off VMs when govc cannot locate them via vCenter API (MoRef
+#     missing). Without Phase 1b, those VMs block all hosts from entering
+#     maintenance mode, causing Phase 8 to wait forever (observed in production).
+#   - shutdown_host() fix: Use --vsanmode noAction to skip vSAN data evacuation
+#     (all VMs are off by Phase 8, no migration needed). Without this flag, ESXi
+#     tries to evacuate vSAN objects and fails with "General vSAN error", leaving
+#     the host out of maintenance mode and rejecting the poweroff command.
+#   - shutdown_host() fix: Increase maintenance mode timeout from 60s to 300s.
 # v1.1 - 2026-06-01 (full cycle test fixes):
 #   - Phase 2: Replace lsf.connect_vcenters() with single-attempt lsf.connect_vc()
 #     per host. connect_vcenters() retries 20×30s per host, causing 10-minute hangs
@@ -209,16 +220,45 @@ def wait_for_elevator_completion(lsf, hosts: list, username: str, password: str,
 
 
 def shutdown_host(lsf, host: str, username: str, password: str):
-    """Send powerdown command to an ESXi host via SSH."""
+    """Enter maintenance mode (vSAN noAction) then send poweroff to an ESXi host via SSH.
+
+    --vsanmode noAction: skip vSAN data evacuation entirely. By Phase 8 all VMs
+    are powered off so no data migration is needed. Without this flag ESXi tries
+    to evacuate vSAN objects across remaining hosts, fails with "General vSAN
+    error", and rejects the subsequent poweroff command.
+    --timeout 300: allow 5 minutes for maintenance mode entry (60s was too short
+    when cluster health checks are slow).
+    """
+    import subprocess as _sp
+    import shlex as _shlex
+
+    def _ssh_cmd(cmd_str):
+        """Run a command on the ESXi host; return (returncode, combined_output)."""
+        args = [
+            'sshpass', '-p', password, 'ssh',
+            '-o', 'StrictHostKeyChecking=accept-new',
+            '-o', 'ConnectTimeout=15',
+            f'{username}@{host}',
+            cmd_str,
+        ]
+        r = _sp.run(args, capture_output=True, text=True, timeout=320)
+        return r.returncode, (r.stdout + r.stderr).strip()
+
     try:
-        lsf.ssh('esxcli system maintenanceMode set --enable true --timeout 60',
-                f'{username}@{host}', password)
-    except Exception:
-        pass
+        rc, out = _ssh_cmd(
+            'esxcli system maintenanceMode set --enable true '
+            '--vsanmode noAction --timeout 300')
+        if rc != 0:
+            vvf_write(lsf, f'  WARNING: {host}: maintenance mode non-zero rc={rc}: {out}')
+    except Exception as e:
+        vvf_write(lsf, f'  WARNING: {host}: maintenance mode SSH failed: {e}')
+
     try:
-        lsf.ssh('esxcli system shutdown poweroff --reason "VVF Lab Shutdown"',
-                f'{username}@{host}', password)
-        vvf_write(lsf, f'  {host}: shutdown command sent')
+        rc, out = _ssh_cmd('esxcli system shutdown poweroff --reason "VVF Lab Shutdown"')
+        if rc == 0:
+            vvf_write(lsf, f'  {host}: shutdown command sent')
+        else:
+            vvf_write(lsf, f'  WARNING: {host}: poweroff rc={rc}: {out}')
     except Exception as e:
         vvf_write(lsf, f'  WARNING: Could not shutdown {host}: {e}')
 
@@ -362,6 +402,94 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                     vvf_write(lsf, f'  ERROR: VSP shutdown script timed out for {vip} — continuing')
                 except Exception as e:
                     vvf_write(lsf, f'  ERROR: VSP shutdown script failed for {vip}: {e} — continuing')
+
+    #==========================================================================
+    # PHASE 1b: Force Power-Off Remaining VSP VMs via ESXi SSH
+    #
+    # vcf_services_runtime_shutdown.sh gracefully drains all K8s workloads via
+    # the 5480 management API, then powers off VSP VMs via govc. When govc
+    # cannot locate a VM through vCenter (MoRef missing or vCenter API failure),
+    # it logs "has no VM MoRef — skipping" or "Failed to power off VM" and
+    # moves on. This leaves VSP VMs running, which blocks maintenance mode entry
+    # and causes Phase 8 to wait indefinitely.
+    #
+    # After the K8s drain it is safe to hard-power-off any remaining vsp-* VMs
+    # directly via ESXi SSH. This phase SSHs to every ESXi host and issues
+    # vim-cmd vmsvc/power.off for any vsp-* VM that is still powered on.
+    # Non-fatal: errors are logged and shutdown continues.
+    #==========================================================================
+
+    if should_run('1b'):
+        vvf_write(lsf, '='*60)
+        vvf_write(lsf, 'PHASE 1b: Force Power-Off Remaining VSP VMs (ESXi SSH)')
+        vvf_write(lsf, '='*60)
+        update_shutdown_status('1b', 'Force Power-Off VSP VMs', dry_run)
+
+        if not dry_run and esx_hosts:
+            import subprocess as _sp1b
+
+            def _force_off_vsp_on_host(host_fqdn):
+                """SSH to host and hard-power-off any running vsp-* VMs.
+                Uses two commands: list all VMs, then power-off each vsp-* VM
+                that reports 'Powered on'. Returns count of VMs powered off.
+                """
+                forced = 0
+                try:
+                    list_args = [
+                        'sshpass', '-p', password, 'ssh',
+                        '-o', 'StrictHostKeyChecking=accept-new',
+                        '-o', 'ConnectTimeout=15',
+                        f'root@{host_fqdn}',
+                        'vim-cmd vmsvc/getallvms 2>/dev/null',
+                    ]
+                    r = _sp1b.run(list_args, capture_output=True, text=True, timeout=30)
+                    for line in r.stdout.splitlines()[1:]:  # skip header
+                        parts = line.split()
+                        if len(parts) < 2:
+                            continue
+                        vmid, vmname = parts[0], parts[1]
+                        if not vmname.startswith('vsp-'):
+                            continue
+                        # Check power state
+                        state_args = [
+                            'sshpass', '-p', password, 'ssh',
+                            '-o', 'StrictHostKeyChecking=accept-new',
+                            '-o', 'ConnectTimeout=10',
+                            f'root@{host_fqdn}',
+                            f'vim-cmd vmsvc/power.getstate {vmid} 2>/dev/null | tail -1',
+                        ]
+                        sr = _sp1b.run(state_args, capture_output=True, text=True, timeout=15)
+                        if 'Powered on' not in sr.stdout:
+                            continue
+                        # Force power off
+                        off_args = [
+                            'sshpass', '-p', password, 'ssh',
+                            '-o', 'StrictHostKeyChecking=accept-new',
+                            '-o', 'ConnectTimeout=10',
+                            f'root@{host_fqdn}',
+                            f'vim-cmd vmsvc/power.off {vmid}',
+                        ]
+                        _sp1b.run(off_args, capture_output=True, text=True, timeout=20)
+                        vvf_write(lsf, f'  {host_fqdn}: forced off {vmname} (vmid={vmid})')
+                        forced += 1
+                except Exception as exc:
+                    vvf_write(lsf, f'  WARNING: Phase 1b SSH failed for {host_fqdn}: {exc} (non-fatal)')
+                return forced
+
+            total_forced = 0
+            vvf_write(lsf, f'Checking {len(esx_hosts)} ESXi host(s) for remaining vsp-* VMs...')
+            for esx_host in esx_hosts:
+                count = _force_off_vsp_on_host(esx_host)
+                if count == 0:
+                    vvf_write(lsf, f'  {esx_host}: no running vsp-* VMs found')
+                total_forced += count
+
+            vvf_write(lsf, f'Phase 1b complete: {total_forced} VSP VM(s) force-powered-off')
+        elif dry_run:
+            vvf_write(lsf, f'Would check {len(esx_hosts)} host(s) for remaining vsp-* VMs '
+                           f'and force-power-off any still running after K8s drain')
+        else:
+            vvf_write(lsf, 'Phase 1b skipped (no ESXi hosts configured)')
 
     #==========================================================================
     # PHASE 2: Connect to vCenters (single-attempt per host — shutdown context)
@@ -745,6 +873,7 @@ if __name__ == '__main__':
         epilog="""
 Phase IDs for --phase:
   1     VSP Cluster Graceful Shutdown (vcf_services_runtime_shutdown.sh per site)
+  1b    Force Power-Off Remaining VSP VMs (ESXi SSH — handles MoRef/govc failures)
   2     Connect to vCenters
   3     Shutdown VCF Operations VMs (ops-a, ops-b)
   4     Establish ESXi Direct Connections (BEFORE vCenter shutdown)
