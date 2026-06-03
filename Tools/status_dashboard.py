@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # status_dashboard.py - HOLFY27 Lab Startup Status Dashboard
-# Version 1.4 - 2026-05-22
+# Version 1.5 - 2026-06-01
 # Author - Burke Azbill and HOL Core Team
 # Generates an auto-refreshing HTML status page for lab startup monitoring
 
@@ -185,13 +185,13 @@ class StatusDashboard:
             ]),
             
             # Group 4: VVF.py - VVF Startup (skipped for VCF labs)
-            # Note: exit_maintenance is performed inside mgmt_cluster in VVF.py (not a separate step)
             ('vvf', '4. VVF Startup (VVF.py)', [
-                ('mgmt_cluster', 'Management Cluster', 'Connect to VVF hosts and exit maintenance mode'),
-                ('datastore', 'Datastore Verification', 'Verify VVF management datastore'),
-                ('nsx_mgr', 'NSX Manager', 'Start and verify NSX Manager VM'),
-                ('nsx_edges', 'NSX Edge VMs', 'Start NSX Edge virtual machines'),
-                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server'),
+                ('mgmt_cluster', 'Management Cluster', 'Connect to VVF management cluster ESXi hosts'),
+                ('exit_maintenance', 'Exit Maintenance Mode', 'Remove hosts from maintenance mode'),
+                ('datastore', 'Datastore Verification', 'Verify VVF management datastores (both sites)'),
+                ('nsx_mgr', 'NSX Manager', 'NSX Manager (skipped — VVF has no NSX)'),
+                ('nsx_edges', 'NSX Edge VMs', 'NSX Edges (skipped — VVF has no NSX)'),
+                ('vcenter', 'vCenter Server', 'Start and verify vCenter Server VMs'),
             ]),
             
             # Group 5: vSphere.py - vSphere Configuration
@@ -254,6 +254,17 @@ class StatusDashboard:
                 ('nsx_passwords', 'NSX Password Config', 'Clear NSX password expiration'),
             ]),
             
+            # Group 10b: VVFfinal.py - VVF Final Tasks (skipped for VCF labs)
+            ('vvffinal', '10b. VVF Final Tasks (VVFfinal.py)', [
+                ('vsp_vms', 'VSP Platform VMs', 'Power on VSP Platform VMs (both sites)'),
+                ('vsp_api_health', 'VSP API Health', 'Wait for VSP management API (port 5480) per site — '
+                 'power-off-marker from shutdown triggers automatic component recovery'),
+                ('k8s_certs', 'K8s Certificate Check/Renewal',
+                 'Check and renew expiring K8s certs on VSP clusters via vsp_cert_renewer.py'),
+                ('vcf_component_urls', 'VCF Component URL Checks',
+                 'Verify Fleet LCM endpoints (fleet-01a, fleet-01b) return HTTP 200/401'),
+            ]),
+
             # Group 11: final.py - Final Checks
             ('final', '11. Final Checks (final.py)', [
                 ('custom', 'Custom Checks', 'Lab-specific final checks'),

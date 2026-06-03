@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.19 - 2026-05-22
+# Version 2.21 - 2026-06-01
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
 # This script is named according to the VCF version it was developed and
 # tested against: confighol-9.1.py for VCF 9.1.x. Future VCF versions may
 # require a new script version (e.g., confighol-9.5.py for VCF 9.5.x).
+# Supports both VCF 9.1 and VVF 9.1 lab types (VVF-only steps are skipped).
 #
 # CHANGELOG:
+# v2.21 - 2026-06-01:
+#   - Added VCF vs VVF lab product detection (is_vcf / is_vvf) after lsf.init().
+#   - Steps 3 (NSX), 4 (SDDC Manager), 5 (VCF Automation), and 7 (SDDC auto-rotate)
+#     are now guarded with `if is_vcf:` — they are silently skipped for VVF labs.
+#   - All other steps (Steps 0a/0b/0c, 1 ESXi, 2 vCenters, 6 Ops VMs, 8 Fleet
+#     Password Policy, 9 Proxy, 10 K8s certs, 11 spherelet certs, 12 cleanup)
+#     execute for both VCF and VVF labs.
+#   - Detects VVF via config.has_section('VVF') and not config.has_section('VCF').
+#   - Updated main() docstring to annotate VCF-only steps.
+#
 # v2.20 - 2026-05-22:
 #   - Step 9 now covers ALL 4 proxy targets (was only Supervisor API + VSP nodes):
 #     Target 1 (vCenter OS: /etc/environment, /etc/sysconfig/proxy, VAMI REST)
@@ -333,7 +344,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.20'
+SCRIPT_VERSION = '2.21'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -5405,21 +5416,25 @@ def perform_final_cleanup(dry_run: bool = False) -> bool:
 def main():
     """
     Main entry point for HOLification tool.
-    
+
+    Supports both VCF 9.1 and VVF 9.1 lab types.  Detection is automatic:
+    is_vcf = config has [VCF]; is_vvf = config has [VVF] and not [VCF].
+    Steps marked [VCF only] are skipped when is_vvf is True.
+
     Orchestrates all HOLification steps in the correct order:
     0a. Vault root CA import to Firefox on console VM (with SKIP/RETRY/FAIL options)
     0b. Vault CA trust distribution across VCF suite (vCenters, ESXi, NSX, SDDC Mgr, VCFA, Ops)
     0c. vCenter CA certificates import to Firefox on console VM (with SKIP/RETRY/FAIL options)
-    1. Pre-checks and environment setup
-    2. ESXi host configuration
-    3. vCenter configuration
-    4. NSX configuration (Managers and Edges)
-    5. SDDC Manager configuration
-    6. VCF Automation VMs configuration (uses vmware-system-user)
-    7. Operations VMs configuration
-    8. Disable SDDC Manager auto-rotate policies (prevents post-deployment failures)
-    9. Configure proxy/NO_PROXY on all 4 targets (vCenter OS, Supervisor CP, Supervisor API,
-       VSP nodes) — interactive Y/N prompt showing resolved PROXY_URL and NO_PROXY values.
+    1.  ESXi host configuration
+    2.  vCenter configuration
+    3.  NSX configuration (Managers and Edges)              [VCF only]
+    4.  SDDC Manager configuration                          [VCF only]
+    5.  VCF Automation VMs configuration                    [VCF only]
+    6.  Operations VMs configuration
+    7.  Disable SDDC Manager auto-rotate policies           [VCF only]
+    8.  Configure VCF Operations Fleet Password Policy
+    9.  Configure proxy/NO_PROXY on all 4 targets (vCenter OS, Supervisor CP, Supervisor API,
+        VSP nodes) — interactive Y/N prompt showing resolved PROXY_URL and NO_PROXY values.
     10. K8s certificate pre-provisioning — VSP + VCFA (kubeadm, kubelet, cert-manager, Antrea → 5y)
     11. Supervisor spherelet certificate pre-provisioning (ESXi agent certs → 5y)
     12. Final cleanup
@@ -5492,7 +5507,18 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
     # Initialize lsfunctions
     lsf.init(router=False)
     password = lsf.get_password()
-    
+
+    # Detect lab product: VCF vs VVF.
+    # VVF labs have [VVF] but not [VCF] in config.ini.
+    # VCF takes precedence if both are present (should not occur in practice).
+    is_vcf = lsf.config.has_section('VCF')
+    is_vvf = lsf.config.has_section('VVF') and not is_vcf
+    lab_product = 'VCF' if is_vcf else ('VVF' if is_vvf else 'UNKNOWN')
+    lsf.write_output(f'Lab product detected: {lab_product}')
+    if lab_product == 'VVF':
+        lsf.write_output('VVF lab: Steps 3 (NSX), 4 (SDDC Mgr), 5 (VCF Automation), '
+                         '7 (SDDC auto-rotate) will be skipped.')
+
     # Pre-checks
     if not os.path.exists('/usr/bin/expect'):
         lsf.write_output("ERROR: 'expect' utility not found. Please install expect.")
@@ -5570,22 +5596,33 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
         configure_vcenter(entry, auth_keys_file, password, 
                          args.skip_vcshell, args.dry_run)
     
-    # Step 3: Configure NSX components
-    configure_nsx_components(auth_keys_file, password, args.skip_nsx, args.dry_run)
-    
-    # Step 4: Configure SDDC Manager
-    configure_sddc_manager(auth_keys_file, password, args.dry_run)
-    
-    # Step 5: Configure VCF Automation VMs
-    configure_aria_automation_vms(auth_keys_file, password, args.dry_run)
-    
-    # Step 6: Configure Operations VMs
+    # Step 3: Configure NSX components [VCF only]
+    if is_vcf:
+        configure_nsx_components(auth_keys_file, password, args.skip_nsx, args.dry_run)
+    else:
+        lsf.write_output('Step 3: NSX configuration skipped (VVF lab — no NSX)')
+
+    # Step 4: Configure SDDC Manager [VCF only]
+    if is_vcf:
+        configure_sddc_manager(auth_keys_file, password, args.dry_run)
+    else:
+        lsf.write_output('Step 4: SDDC Manager configuration skipped (VVF lab — no SDDC Manager)')
+
+    # Step 5: Configure VCF Automation VMs [VCF only]
+    if is_vcf:
+        configure_aria_automation_vms(auth_keys_file, password, args.dry_run)
+    else:
+        lsf.write_output('Step 5: VCF Automation configuration skipped (VVF lab — no VCF Automation)')
+
+    # Step 6: Configure Operations VMs (VCF and VVF both have ops VMs)
     configure_operations_vms(auth_keys_file, password, args.dry_run)
-    
-    # Step 7: Disable SDDC Manager auto-rotate policies
+
+    # Step 7: Disable SDDC Manager auto-rotate policies [VCF only]
     # This prevents credential rotation failures when the lab template is deployed
-    if 'VCF' in lsf.config or not args.esx_only:
+    if is_vcf:
         disable_sddc_auto_rotate(args.dry_run)
+    else:
+        lsf.write_output('Step 7: SDDC Manager auto-rotate disable skipped (VVF lab — no SDDC Manager)')
     
     # Step 8: Configure VCF Operations Fleet Password Policy
     # Creates "MaxExpiration" policy, assigns ALL inventory (MANAGEMENT + INSTANCE), remediates

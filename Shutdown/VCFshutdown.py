@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 3.6 - 2026-05-14
+# Version 3.7 - 2026-06-01
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 3.7 Changes (2026-06-01):
+# - Phase 2b: Replaced kubectl scale-down approach with
+#   vcf_services_runtime_shutdown.sh subprocess call (Broadcom-provided script, source: https://knowledge.broadcom.com/external/article/440874/how-to-safely-shutdown-all-nodes-within.html).
+#   Called once per VSP site VIP from [VCFFINAL] vspcontrolplaneip/vspcontrolplaneips.
+#   Credentials (VMSP_PASSWORD, VCENTER_USERNAME, VCENTER_PASSWORD) passed via env vars.
+#   Script gracefully drains K8s workloads, sets power-off-marker (auto-recovery on
+#   next boot), and powers off VSP VMs via govc — eliminating separate VSP VM shutdown.
 #
 # v 3.6 Changes (2026-05-14):
 # - vcf_write() no longer calls lsf.write_output() — shutdown output is only
@@ -249,7 +257,7 @@ Shutdown Order (this module) - aligned with VCF 9.0/9.1 docs:
 PHASE 1:   Fleet Operations (VCF Operations Suite shutdown via API)
 PHASE 1b:  VCF Automation VM shutdown via vCenter (always; SSH K8s cleanup first)
 PHASE 2:   Connect to vCenters (while still available)
-PHASE 2b:  Annotate VCF Component Services (K8s on VSP) for graceful drain
+PHASE 2b:  VSP Cluster Graceful Shutdown via vcf_services_runtime_shutdown.sh
 PHASE 3b:  Graceful Supervisor Workload Shutdown — DISABLED (WCP manages this in Phase 3)
 PHASE 3:   Stop WCP (Workload Control Plane) services
 PHASE 4:   Shutdown Workload VMs (Tanzu, K8s) + Dynamic Discovery
@@ -1367,7 +1375,84 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
             vcf_write(lsf, 'Continuing with next phase...')
 
     #==========================================================================
-    
+    # PHASE 2b: VSP Cluster Graceful Shutdown via vcf_services_runtime_shutdown.sh
+    # Replaces the previous kubectl scale-down approach. The Broadcom-provided
+    # script is called once per site VIP, authenticating to the port-5480
+    # management API, draining all K8s workloads, setting a power-off-marker
+    # (auto-recovery on next boot), and powering off VSP VMs via govc.
+    #
+    # Credentials are passed as environment variables (never on CLI):
+    #   VMSP_PASSWORD     = vmware-system-user password (lab default)
+    #   VCENTER_USERNAME  = administrator@vsphere.local
+    #   VCENTER_PASSWORD  = lab default password
+    # GOVC_URL is auto-discovered by the script from VSP component config.
+    #==========================================================================
+    if should_run('2b'):
+        try:
+            _vcf_phase_entry(lsf, '2b', dry_run, mgmt_hosts, eta)
+            vcf_write(lsf, '='*60)
+            vcf_write(lsf, 'PHASE 2b: VSP Cluster Graceful Shutdown')
+            vcf_write(lsf, '='*60)
+            update_shutdown_status(2, 'VSP Cluster Shutdown', dry_run)
+
+            _vsp_shutdown_script = '/home/holuser/hol/Tools/vcf_services_runtime_shutdown.sh'
+
+            # Read VSP control plane IP(s) from [VCFFINAL] vspcontrolplaneip(s)
+            _vsp_vips = []
+            if lsf.config.has_option('VCFFINAL', 'vspcontrolplaneips'):
+                _vsp_vips = lsf.get_config_list('VCFFINAL', 'vspcontrolplaneips')
+            elif lsf.config.has_option('VCFFINAL', 'vspcontrolplaneip'):
+                _vsp_vips = lsf.get_config_list('VCFFINAL', 'vspcontrolplaneip')
+
+            if not os.path.isfile(_vsp_shutdown_script):
+                vcf_write(lsf, f'WARNING: VSP shutdown script not found: {_vsp_shutdown_script}')
+                vcf_write(lsf, 'Skipping Phase 2b — VSP components will be handled by host shutdown')
+            elif not _vsp_vips:
+                vcf_write(lsf, 'No VSP control plane IPs configured ([VCFFINAL] vspcontrolplaneip/s)')
+                vcf_write(lsf, 'Skipping Phase 2b')
+            elif not dry_run:
+                _env = os.environ.copy()
+                _env['VMSP_PASSWORD'] = password
+                _env['VCENTER_USERNAME'] = 'administrator@vsphere.local'
+                _env['VCENTER_PASSWORD'] = password
+
+                for _vip in _vsp_vips:
+                    vcf_write(lsf, f'Calling VSP shutdown script for site VIP: {_vip}')
+                    try:
+                        import subprocess as _subproc
+                        _cmd = [_vsp_shutdown_script, '--node-ip', _vip, '--skip-snapshot-check']
+                        vcf_write(lsf, f'  Running: {" ".join(_cmd)}')
+                        _proc = _subproc.Popen(
+                            _cmd,
+                            stdout=_subproc.PIPE,
+                            stderr=_subproc.STDOUT,
+                            env=_env,
+                            text=True,
+                            bufsize=1
+                        )
+                        for _line in _proc.stdout:
+                            vcf_write(lsf, f'  {_line.rstrip()}')
+                        _proc.wait(timeout=1800)  # 30-minute timeout per site
+
+                        if _proc.returncode == 0:
+                            vcf_write(lsf, f'  VSP shutdown complete for {_vip}')
+                        else:
+                            vcf_write(lsf, f'  WARNING: VSP shutdown script returned code '
+                                          f'{_proc.returncode} for {_vip} — continuing')
+                    except Exception as _vsp_err:
+                        vcf_write(lsf, f'  ERROR: VSP shutdown failed for {_vip}: {_vsp_err}')
+                        vcf_write(lsf, '  Continuing with shutdown...')
+            else:
+                for _vip in _vsp_vips:
+                    vcf_write(lsf, f'[DRY-RUN] Would run: {_vsp_shutdown_script} '
+                                   f'--node-ip {_vip} --skip-snapshot-check')
+
+        except Exception as _phase_err:
+            vcf_write(lsf, f'ERROR in Phase 2b: {_phase_err}')
+            vcf_write(lsf, 'Continuing with next phase...')
+
+    #==========================================================================
+
     # Phase 3b disabled (v3.1): WCP manages Supervisor workload shutdown via the
     # WCP Stop in Phase 3. Re-enable by removing the `and False` guard below.
     #==========================================================================
@@ -2856,7 +2941,7 @@ Phase IDs for --phase:
   1     Fleet Operations (VCF Operations Suite) Shutdown
   1b    VCF Automation VM fallback (if Fleet API failed)
   2     Connect to vCenters
-  2b    Scale Down VCF Component Services (K8s on VSP)
+  2b    VSP Cluster Graceful Shutdown (vcf_services_runtime_shutdown.sh per site VIP)
   3b    Graceful Supervisor Workload Shutdown (VKS, Harbor)
   3     Stop Workload Control Plane (WCP)
   4     Shutdown Workload VMs (Tanzu, K8s) + Dynamic Discovery

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.12 - 2026-05-28
+# Version 3.13 - 2026-06-01
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -730,6 +730,94 @@ def main(lsf=None, standalone=False, dry_run=False):
                 'No authentik_groups or authentik_users in config'
             )
             dashboard.generate_html()
+
+    #==========================================================================
+    # TASK 13: Ensure govc is installed on the manager
+    #
+    # govc (govmomi CLI) is used by supervisor_stabilizer.py and other tools
+    # for Content Library trust management and vCenter operations. It should
+    # always be present on the manager so any tool can invoke it without
+    # needing to self-install at runtime.
+    #
+    # Installs to ~/.local/bin if not already on PATH. Idempotent.
+    #==========================================================================
+
+    if dashboard:
+        try:
+            dashboard.update_task('prelim', 'govc_install', 'running')
+            dashboard.generate_html()
+        except Exception:
+            pass
+
+    import shutil as _shutil
+    import subprocess as _govc_sub
+
+    GOVC_VERSION = 'v0.37.1'
+    GOVC_URL = (
+        f'https://github.com/vmware/govmomi/releases/download/'
+        f'{GOVC_VERSION}/govc_Linux_x86_64.tar.gz'
+    )
+
+    if _shutil.which('govc'):
+        lsf.write_output(f'govc already on PATH ({_shutil.which("govc")}) — skipping install.')
+        _govc_ok = True
+    elif dry_run:
+        lsf.write_output(f'[dry-run] Would install govc {GOVC_VERSION} to ~/.local/bin')
+        _govc_ok = True
+    else:
+        _govc_bin_dir = os.path.expanduser('~/.local/bin')
+        os.makedirs(_govc_bin_dir, exist_ok=True)
+        lsf.write_output(f'govc not found — installing {GOVC_VERSION} to {_govc_bin_dir}...')
+        _govc_archive = os.path.join(_govc_bin_dir, 'govc.tgz')
+        _govc_ok = False
+
+        _dl = _govc_sub.run(
+            f'curl -fsSL -o {_govc_archive} {GOVC_URL}',
+            shell=True, capture_output=True, text=True, timeout=120
+        )
+        if _dl.returncode != 0:
+            lsf.write_output(
+                f'WARNING: govc download failed (rc={_dl.returncode}): '
+                f'{(_dl.stderr or _dl.stdout).strip()[:300]}'
+            )
+        else:
+            _ex = _govc_sub.run(
+                f'tar -xzf {_govc_archive} -C {_govc_bin_dir} govc',
+                shell=True, capture_output=True, text=True, timeout=30
+            )
+            if _ex.returncode != 0:
+                lsf.write_output(
+                    f'WARNING: govc extract failed (rc={_ex.returncode}): '
+                    f'{(_ex.stderr or _ex.stdout).strip()[:300]}'
+                )
+            else:
+                _govc_bin = os.path.join(_govc_bin_dir, 'govc')
+                os.chmod(_govc_bin, 0o755)
+                try:
+                    os.unlink(_govc_archive)
+                except Exception:
+                    pass
+                # Make available to the rest of this Python process
+                os.environ['PATH'] = f'{_govc_bin_dir}:{os.environ.get("PATH", "")}'
+                if _shutil.which('govc'):
+                    lsf.write_output(f'govc {GOVC_VERSION} installed successfully at {_govc_bin}.')
+                    _govc_ok = True
+                else:
+                    lsf.write_output(
+                        f'WARNING: govc still not on PATH after install — '
+                        f'ensure {_govc_bin_dir} is in $PATH.'
+                    )
+
+    if dashboard:
+        try:
+            dashboard.update_task(
+                'prelim', 'govc_install',
+                'complete' if _govc_ok else 'failed',
+                '' if _govc_ok else 'Install failed — see log'
+            )
+            dashboard.generate_html()
+        except Exception:
+            pass
 
     ##=========================================================================
     ## End Core Team code
