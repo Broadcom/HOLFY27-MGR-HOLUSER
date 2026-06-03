@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 # Shutdown.py - HOLFY27 Lab Shutdown Orchestration
-# Version 2.5 - 2026-05-14
+# Version 2.6 - 2026-06-01
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # Main shutdown script for graceful lab environment shutdown
+#
+# v 2.6 Changes (2026-06-01):
+# - Added run_vvf_shutdown() helper that imports VVFshutdown and routes VVF labs
+#   to the dedicated 8-phase VVF shutdown sequence.
+# - Detection logic: if [VVF] section present AND no [VCF] section → VVF path.
+#   VCF takes precedence if both sections exist (should not occur in practice).
+# - Updated CLI help text to include VVF shutdown phases.
 #
 # v 2.5 Changes (2026-05-14):
 # - Replaced remaining lsf.write_output() calls (module import error paths) with
@@ -106,7 +113,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 SCRIPT_NAME = 'Shutdown'
-SCRIPT_VERSION = '2.5'
+SCRIPT_VERSION = '2.6'
 SCRIPT_DESCRIPTION = 'HOLFY27 Lab Shutdown Orchestration'
 
 # Log files
@@ -320,6 +327,34 @@ def run_vcf_shutdown(lsf, dry_run: bool = False, phase=None,
         return {'success': False, 'esx_hosts': []}
 
 
+def run_vvf_shutdown(lsf, dry_run: bool = False, phase=None) -> dict:
+    """
+    Run the VVF shutdown module (8-phase graceful shutdown for VVF labs).
+
+    :param lsf: lsfunctions module
+    :param dry_run: Preview mode
+    :param phase: Run only this VVF shutdown phase (single, e.g. '1', '5')
+    :return: Dictionary with 'success' status and 'esx_hosts' list
+    """
+    module = import_shutdown_module('VVFshutdown', lsf)
+
+    if module is None:
+        write_shutdown_output('VVFshutdown module not available')
+        return {'success': False, 'esx_hosts': []}
+
+    try:
+        result = module.main(lsf=lsf, dry_run=dry_run, phase=phase)
+        if isinstance(result, dict):
+            return result
+        else:
+            return {'success': bool(result), 'esx_hosts': []}
+    except Exception as e:
+        write_shutdown_output(f'VVFshutdown failed: {e}', lsf)
+        import traceback
+        write_shutdown_output(f'Traceback: {traceback.format_exc()}', lsf)
+        return {'success': False, 'esx_hosts': []}
+
+
 def wait_for_hosts_poweroff(lsf, hosts: list, dry_run: bool = False,
                             max_wait: int = 1800, poll_interval: int = 15):
     """
@@ -488,13 +523,36 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
                 write_shutdown_output(f'Docker host {docker_host} not reachable, skipping', lsf)
     
     #==========================================================================
-    # VCF Shutdown (Main) - phases 1-20 are handled inside VCFshutdown.py
+    # VCF/VVF Shutdown (Main)
+    # Detection: [VVF] section present AND no [VCF] section → VVF shutdown path.
+    # VCF takes precedence if both sections present (should not occur in practice).
     #==========================================================================
-    
+
     esx_hosts = []
     vcf_result = {'success': False, 'esx_hosts': []}
-    
-    if lab_type.upper() in VCF_LAB_TYPES:
+
+    # Determine whether this lab uses the VVF shutdown path.
+    # VVF labs have [VVF] but not [VCF] in config.ini.
+    is_vvf_lab = (lsf.config.has_section('VVF') and
+                  not lsf.config.has_section('VCF'))
+
+    if is_vvf_lab:
+        if phase is None and phases is None:
+            write_shutdown_output('VVF lab detected — using VVF shutdown procedure (8 phases)', lsf)
+
+        if skip_vsan_wait and not dry_run:
+            if not lsf.config.has_section('SHUTDOWN'):
+                lsf.config.add_section('SHUTDOWN')
+            lsf.config.set('SHUTDOWN', 'vsan_timeout', '0')
+
+        if skip_host_shutdown and not dry_run:
+            if not lsf.config.has_section('SHUTDOWN'):
+                lsf.config.add_section('SHUTDOWN')
+            lsf.config.set('SHUTDOWN', 'shutdown_hosts', 'false')
+
+        vcf_result = run_vvf_shutdown(lsf, dry_run, phase=phase)
+
+    elif lab_type.upper() in VCF_LAB_TYPES:
         if phase is None and phases is None:
             write_shutdown_output(f'Lab type {lab_type} uses VCF shutdown procedure', lsf)
 
@@ -510,11 +568,7 @@ def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
 
         vcf_result = run_vcf_shutdown(
             lsf, dry_run, phase=phase, phases=phases, fleet_products=fleet_products)
-    elif lab_type.upper() == 'VVF':
-        if phase is None and phases is None:
-            write_shutdown_output('VVF lab type - using VVF shutdown procedure', lsf)
-        vcf_result = run_vcf_shutdown(
-            lsf, dry_run, phase=phase, phases=phases, fleet_products=fleet_products)
+
     else:
         if phase is None and phases is None:
             write_shutdown_output(f'Lab type {lab_type} - using default VCF shutdown procedure', lsf)
@@ -606,7 +660,7 @@ VCF Shutdown Phases (for --phase / --phases):
     1     Fleet Operations (VCF Operations Suite) Shutdown
     1b    VCF Automation VM fallback (if Fleet API failed)
     2     Connect to vCenters
-    2b    Scale Down VCF Component Services (K8s on VSP)
+    2b    VSP Cluster Graceful Shutdown (vcf_services_runtime_shutdown.sh per site VIP)
     3b    Graceful Supervisor Workload Shutdown (VKS, Harbor, etc.)
     3     Stop Workload Control Plane (WCP)
     4     Shutdown Workload VMs (Tanzu, K8s) + Dynamic Discovery
@@ -624,12 +678,22 @@ VCF Shutdown Phases (for --phase / --phases):
     16    Shutdown SDDC Manager
     17    Shutdown Management vCenter
     17b   Connect to ESXi Hosts directly
-    17c   Shutdown Post-Edge VMs (optional)
+    17c   Shutdown Post-Edge VMs (License Servers, etc.)
     18    Set Host Advanced Settings
     19    vSAN Elevator Operations
     19b   Shutdown VSP Platform VMs
     19c   Pre-ESXi Shutdown Audit
     20    Shutdown ESXi Hosts
+
+VVF Shutdown Phases (auto-selected when [VVF] section in config.ini):
+    1     VSP Cluster Graceful Shutdown (vcf_services_runtime_shutdown.sh per site VIP)
+    2     Connect to vCenters
+    3     Shutdown VCF Operations VMs (ops-a, ops-b)
+    4     Establish ESXi Direct Connections (BEFORE vCenter shutdown)
+    5     Shutdown vCenter VMs (via ESXi direct)
+    6     Shutdown License VMs (via ESXi direct, AFTER vCenter off)
+    7     vSAN Elevator Operations (OSA only — ESA auto-detected and skipped)
+    8     Shutdown ESXi Hosts
 
 Configuration:
     Add a [SHUTDOWN] section to /tmp/config.ini for customization:

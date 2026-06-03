@@ -36,8 +36,8 @@ DNS_CHECKS = {
     }
 }
 
-TIMEOUT_MINUTES = 5
-CHECK_INTERVAL_SECONDS = 30
+TIMEOUT_MINUTES = 12
+CHECK_INTERVAL_SECONDS = 45
 
 #==============================================================================
 # FUNCTIONS

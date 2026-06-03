@@ -1,5 +1,5 @@
 # labtypes.py - HOLFY27 LabType Execution Path Manager
-# Version 1.0 - 2026-04-28
+# Version 1.1 - 2026-06-01
 # Author - Burke Azbill and HOL Core Team
 # Manages different startup sequences for HOL, Discovery, VXP, ATE, EDU lab types
 
@@ -18,6 +18,7 @@ _DEFAULT_SEQUENCE: List[str] = [
     'Kubernetes',
     'urls',
     'VCFfinal',
+    'VVFfinal',
     'final',
     'odyssey'
 ]
