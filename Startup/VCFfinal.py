@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.17 - 2026-05-29
+# Version 6.3.18 - 2026-06-08
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.18 Changes:
+# - End-of-startup fix for Fleet-LCM component friendly names in VCF Operations Manager.
+#   Root cause: vcf-fleet-build-service ComponentPublicNameCache caches an empty VCF release
+#   list (returned when vcf-fleet-upgrade-service is not yet ready at boot) for 2 hours via
+#   Caffeine MemoizeWithFallback. The UI then displays internal type codes (OPS, VCFA) instead
+#   of friendly product names. Fix: (1) POST /fleet-lcm/v1/depot-metadata?action=sync to
+#   populate the upgrade-service release table, then (2) crictl stop+rm the fleet-build-service
+#   container on the VSP node so kubelet restarts it and the cache reloads with correct names.
+#   Replaces the unreliable "Fix JWT Parse Error" commented block. No DB or source changes.
 #
 # v6.3.12 Changes:
 # - Task 4b Step 5b: Before the seaweedfs stale-pod check (Step 6), delete
@@ -3691,30 +3701,178 @@ echo "PROXY_CONFIGURED"
         except Exception as e:
             lsf.write_output(f'WARNING: Failed to check or scale VCFA microservices: {e}')
 
-        # ---- Fix JWT Parse Error (vcf-fleet-lcm, vidb) ----
-        # Force restart vidb and fleet-lcm pods after cold boot so they
-        # reload their JWT signing keys. Without this, the fleet-lcm API
-        # returns 401 JWT_PARSE_ERR and the Operations Manager UI shows
-        # no components or "Unknown" status for components or internal names.
-        # Must be done at the very end of startup, AFTER opsnet and opslogs 
-        # VMs/services are fully powered on and responding to URL checks, 
-        # so that fleet-lcm initial inventory sync can successfully pull friendly names.
-        # lsf.write_output('Restarting vidb, fleet-lcm, and sddc-lcm pods in sequence to reload JWT keys and sync inventory...')
-        # try:
-        #     # Restart vidb first and wait for it to initialize a new JWT key
-        #     cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no {vsp_user}@10.1.1.142 \"echo '{password}' | sudo -S -i kubectl --kubeconfig=/etc/kubernetes/admin.conf delete pod --all -n vidb-external 2>/dev/null\""
-        #     subprocess.run(cmd, shell=True, check=False)
-            
-        #     lsf.write_output('  Waiting 30 seconds for vidb to become ready...')
-        #     time.sleep(30)
-            
-        #     # Then restart fleet-lcm and sddc-lcm so they fetch the new key during startup and successfully push capabilities (friendly names)
-        #     cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no {vsp_user}@10.1.1.142 \"echo '{password}' | sudo -S -i kubectl --kubeconfig=/etc/kubernetes/admin.conf delete pod --all -n vcf-fleet-lcm 2>/dev/null\""
-        #     subprocess.run(cmd, shell=True, check=False)
-        #     cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no {vsp_user}@10.1.1.142 \"echo '{password}' | sudo -S -i kubectl --kubeconfig=/etc/kubernetes/admin.conf delete pod --all -n vcf-sddc-lcm 2>/dev/null\""
-        #     subprocess.run(cmd, shell=True, check=False)
-        # except Exception as e:
-        #     lsf.write_output(f'WARNING: Failed to restart vidb, fleet-lcm, and sddc-lcm pods: {e}')
+        # ---- Fix Fleet-LCM Component Friendly Names ----
+        # Root cause: On cold boot, vcf-fleet-build-service starts before vcf-fleet-upgrade-service
+        # is fully ready. Its ComponentPublicNameCache gets a ConnectException on first load, then
+        # retries after 5 minutes, but upgrade-service returns 0 VCF releases because FDS
+        # download-service was still initializing. The empty result is cached with a 2-hour success
+        # TTL, so the UI displays internal type codes (OPS, VCFA) instead of friendly product names.
+        # Fix: (1) trigger depot-metadata sync to populate the VCF release table with public names,
+        # (2) restart fleet-build-service container so ComponentPublicNameCache reloads fresh data.
+        # No source code or database modifications required — all via REST API + crictl.
+        # Only applies to HOL-2701, HOL-2702, HOL-2703.
+        _fleet_fix_skus = {'HOL-2701', 'HOL-2702', 'HOL-2703'}
+        if lsf.lab_sku not in _fleet_fix_skus:
+            lsf.write_output(
+                f'Skipping Fleet-LCM friendly names fix (not applicable for {lsf.lab_sku})')
+        else:
+            lsf.write_output('Fixing Fleet-LCM component friendly names...')
+            try:
+                import requests as _req
+                import base64 as _b64
+                import socket as _sock
+                import re as _re
+
+                _fleet_fqdn = 'fleet-01a.site-a.vcf.lab'
+                _fleet_url = f'https://{_fleet_fqdn}'
+                _vsp_user = 'vmware-system-user'
+
+                # --- Step 1: Discover VSP control plane IP and read IAM client credentials ---
+                _vsp_worker_ip = _sock.gethostbyname('vsp-01a.site-a.vcf.lab')
+                _node_conf = lsf.ssh(
+                    f"echo '{password}' | sudo -S grep server: /etc/kubernetes/node-agent.conf",
+                    f'{_vsp_user}@{_vsp_worker_ip}'
+                ).stdout.strip()
+                _vsp_cp_ip = None
+                for _line in _node_conf.splitlines():
+                    if 'server:' in _line:
+                        _m = _re.search(r'https?://([0-9.]+):', _line)
+                        if _m:
+                            _vsp_cp_ip = _m.group(1)
+                            break
+                if not _vsp_cp_ip:
+                    raise ValueError('Could not determine VSP control plane IP from node-agent.conf')
+
+                _secret_out = lsf.ssh(
+                    f"echo '{password}' | sudo -S -i kubectl get secret vcf-iam-vcfa-admin "
+                    f"-n vcf-fleet-lcm -o jsonpath='{{.data}}' 2>/dev/null",
+                    f'{_vsp_user}@{_vsp_cp_ip}'
+                ).stdout.strip()
+                _json_start = _secret_out.find('{')
+                _secret_data = json.loads(_secret_out[_json_start:])
+                _client_id = _b64.b64decode(_secret_data['clientId']).decode()
+                _client_secret = _b64.b64decode(_secret_data['clientSecret']).decode()
+                _basic_creds = _b64.b64encode(f'{_client_id}:{_client_secret}'.encode()).decode()
+
+                # --- Step 2: Obtain fleet-lcm JWT token (OAuth2 password grant) ---
+                _tok_resp = _req.post(
+                    f'{_fleet_url}/api/v1/identity/token',
+                    data={'grant_type': 'password', 'username': 'admin', 'password': password},
+                    headers={
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Authorization': f'Basic {_basic_creds}',
+                    },
+                    verify=False, timeout=20
+                )
+                _tok_resp.raise_for_status()
+                _jwt = _tok_resp.json()['access_token']
+                lsf.write_output('  Fleet-LCM JWT token obtained')
+
+                # --- Step 3: Trigger depot-metadata sync to populate VCF release table ---
+                # This ensures vcf-fleet-upgrade-service has publicName data for all VCF components
+                # before fleet-build-service restarts and reloads its ComponentPublicNameCache.
+                _sync_resp = _req.post(
+                    f'{_fleet_url}/fleet-lcm/v1/depot-metadata?action=sync',
+                    headers={'Authorization': f'Bearer {_jwt}'},
+                    verify=False, timeout=30
+                )
+                if _sync_resp.status_code in (200, 202):
+                    _task_id = None
+                    try:
+                        _sync_body = _sync_resp.json()
+                        _task_id = _sync_body.get('id') or _sync_body.get('taskId')
+                    except Exception:
+                        pass
+                    lsf.write_output(f'  Depot-metadata sync triggered (task={_task_id})')
+                    if _task_id:
+                        for _ in range(24):  # Poll up to 120 seconds
+                            time.sleep(5)
+                            _tr = _req.get(
+                                f'{_fleet_url}/fleet-lcm/v1/tasks/{_task_id}',
+                                headers={'Authorization': f'Bearer {_jwt}'},
+                                verify=False, timeout=15
+                            )
+                            _ts = _tr.json().get('status', '')
+                            if _ts in ('SUCCEEDED', 'COMPLETED', 'FAILED', 'ERROR'):
+                                lsf.write_output(f'  Depot-metadata sync completed: {_ts}')
+                                break
+                    else:
+                        time.sleep(5)
+                else:
+                    lsf.write_output(
+                        f'  WARNING: Depot-metadata sync returned HTTP {_sync_resp.status_code}')
+
+                # --- Step 4: Restart fleet-build-service container on VSP nodes ---
+                # Scanning VSP node IP range for the fleetbuild crictl container.
+                # After crictl stop + rm, kubelet immediately restarts a fresh container
+                # that loads ComponentPublicNameCache from the now-populated release data.
+                lsf.write_output('  Restarting fleet-build-service to reload name cache...')
+                _fbs_restarted = False
+                for _vsp_ip in [f'10.1.1.{i}' for i in range(128, 155)]:
+                    try:
+                        _cid_res = subprocess.run(
+                            f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
+                            f" -o ConnectTimeout=3 {_vsp_user}@{_vsp_ip}"
+                            f" \"echo '{password}' | sudo -S crictl ps 2>/dev/null"
+                            f" | grep fleetbuild | awk '{{print $1}}'\"",
+                            shell=True, capture_output=True, text=True, timeout=8
+                        )
+                        _cid = _cid_res.stdout.strip()
+                        if _cid:
+                            subprocess.run(
+                                f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
+                                f" {_vsp_user}@{_vsp_ip}"
+                                f" \"echo '{password}' | sudo -S crictl stop {_cid} 2>/dev/null;"
+                                f" echo '{password}' | sudo -S crictl rm {_cid} 2>/dev/null\"",
+                                shell=True, capture_output=True, timeout=15
+                            )
+                            lsf.write_output(
+                                f'  Restarted fleet-build-service on {_vsp_ip} (container {_cid[:12]})')
+                            _fbs_restarted = True
+                            break
+                    except Exception:
+                        continue
+
+                if not _fbs_restarted:
+                    lsf.write_output(
+                        '  WARNING: Could not find fleet-build-service container on any VSP node')
+                else:
+                    # --- Step 5: Verify friendly names are loaded (up to 90 seconds) ---
+                    lsf.write_output(
+                        '  Waiting up to 90s for fleet-build-service to reload name cache...')
+                    for _attempt in range(18):
+                        time.sleep(5)
+                        try:
+                            _vr = _req.get(
+                                f'{_fleet_url}/fleet-lcm/v1/components',
+                                headers={'Authorization': f'Bearer {_jwt}'},
+                                verify=False, timeout=15
+                            )
+                            if _vr.status_code == 200:
+                                _comps = _vr.json()
+                                if isinstance(_comps, dict):
+                                    _comps = _comps.get('components', [])
+                                _named = [
+                                    c for c in _comps
+                                    if c.get('componentTypeDescription')
+                                    and c['componentTypeDescription'] != c.get('componentType')
+                                ]
+                                if _named:
+                                    _ex = _named[0]
+                                    lsf.write_output(
+                                        f'  Friendly names confirmed: '
+                                        f'{_ex["componentType"]} → '
+                                        f'"{_ex["componentTypeDescription"]}"'
+                                    )
+                                    break
+                        except Exception:
+                            pass
+                    else:
+                        lsf.write_output(
+                            '  WARNING: Fleet-LCM components may still show internal names; '
+                            'cache reload may still be in progress')
+            except Exception as e:
+                lsf.write_output(f'WARNING: Failed to fix fleet-lcm component friendly names: {e}')
 
     lsf.write_output(f'{MODULE_NAME} completed')
     return not module_failed
@@ -3759,4 +3917,3 @@ if __name__ == '__main__':
         print()
     
     main(lsf=lsf, standalone=args.standalone, dry_run=args.dry_run)
-
