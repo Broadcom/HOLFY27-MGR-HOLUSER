@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.8.3 - 2026-06-08
+# Version 2.8.5 - 2026-06-08
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.8.5 - 2026-06-08:
+#   - --json and --html now use consistent optional-path behavior via nargs='?':
+#     omit PATH → auto-named vpodchecker_<timestamp>.{json,html} in CWD;
+#     supply PATH → write to that file.  Both log the saved path.
+#   - Replaces v2.8.4 which only fixed --json (leaving --html path-required).
+#
 # v2.8.3 - 2026-06-08:
 #   - Added VCF Automation to check_component_versions(): discovers appliances
 #     from [VCFFINAL][vraurls], queries GET /vco/api/about (no auth required),
@@ -100,10 +106,10 @@ Usage:
     python3 vpodchecker.py [options]
     
 Options:
-    --report-only   Don't fix issues, just report
-    --json          Output as JSON
-    --html          Generate HTML report
-    --verbose       Verbose output
+    --report-only       Don't fix issues, just report
+    --json [PATH]       Save results as JSON; auto-names vpodchecker_<timestamp>.json if PATH omitted
+    --html [PATH]       Save results as HTML report; auto-names vpodchecker_<timestamp>.html if PATH omitted
+    --verbose           Verbose output
 """
 
 import sys
@@ -3186,8 +3192,10 @@ def check_component_versions() -> List[CheckResult]:
 def main():
     parser = argparse.ArgumentParser(description='HOLFY27 VPod Checker')
     parser.add_argument('--report-only', action='store_true', help="Don't fix issues, just report")
-    parser.add_argument('--json', action='store_true', help='Output as JSON')
-    parser.add_argument('--html', type=str, help='Generate HTML report to specified file')
+    parser.add_argument('--json', nargs='?', const='', default=None, metavar='PATH',
+                        help='Save results as JSON; auto-names vpodchecker_<timestamp>.json if PATH omitted')
+    parser.add_argument('--html', nargs='?', const='', default=None, metavar='PATH',
+                        help='Save results as HTML report; auto-names vpodchecker_<timestamp>.html if PATH omitted')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     args = parser.parse_args()
     
@@ -3419,15 +3427,21 @@ def main():
     print("\n" + "=" * 60)
     print(f"Overall Status: {report.overall_status}")
     
-    # Output formats
-    if args.json:
-        print(report.to_json())
-    
-    if args.html:
+    # Output formats — args.json/args.html are None (not requested), '' (auto-name), or a path
+    if args.json is not None:
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        json_file = os.path.abspath(args.json if args.json else f'vpodchecker_{ts}.json')
+        with open(json_file, 'w') as f:
+            f.write(report.to_json())
+        print(f"JSON report written to: {json_file}")
+
+    if args.html is not None:
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        html_file = os.path.abspath(args.html if args.html else f'vpodchecker_{ts}.html')
         html = generate_html_report(report)
-        with open(args.html, 'w') as f:
+        with open(html_file, 'w') as f:
             f.write(html)
-        print(f"HTML report written to: {args.html}")
+        print(f"HTML report written to: {html_file}")
     
     if lsf and PYVMOMI_AVAILABLE:
         for si in lsf.sis:
