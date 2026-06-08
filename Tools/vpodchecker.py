@@ -1,10 +1,53 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.7 - 2026-05-22
+# Version 2.8.5 - 2026-06-08
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.8.5 - 2026-06-08:
+#   - --json and --html now use consistent optional-path behavior via nargs='?':
+#     omit PATH → auto-named vpodchecker_<timestamp>.{json,html} in CWD;
+#     supply PATH → write to that file.  Both log the saved path.
+#   - Replaces v2.8.4 which only fixed --json (leaving --html path-required).
+#
+# v2.8.3 - 2026-06-08:
+#   - Added VCF Automation to check_component_versions(): discovers appliances
+#     from [VCFFINAL][vraurls], queries GET /vco/api/about (no auth required),
+#     and reports version/build in the COMPONENT VERSIONS table.
+#
+# v2.8.2 - 2026-06-08:
+#   - COMPONENT VERSIONS now appears as the very first report section: moved
+#     lsf.connect_vcenters() call before SSL checks so vCenter/ESXi version
+#     data is collected first.
+#   - Added print_component_versions_table(): dedicated display function with
+#     Type/FQDN/Version/Build columns matching the reference CSV structure from
+#     get-vcf-vcenter-esx-nsx-info.py rather than the generic Name/Status/Message
+#     format used by other sections.
+#   - Added _component_versions_html(): dedicated HTML table renderer with the
+#     same four-column layout.  generate_html_report() now uses this instead of
+#     the generic section renderer for the component versions data.
+#
+# v2.8.1 - 2026-06-08:
+#   - Fixed check_component_versions() ordering: call now runs AFTER
+#     lsf.connect_vcenters() so lsf.sis is populated and vCenter/ESXi versions
+#     are collected correctly.
+#   - Fixed SDDC Manager version query: VCF 9.1 /v1/about returns HTML (web UI)
+#     rather than JSON.  Switched to /v1/vcf-services which returns per-service
+#     versions in JSON; VCF platform version is derived from COMMON_SERVICES or
+#     LCM build string (format M.m.p.h.build → short form M.m.p).
+#
+# v2.8 - 2026-06-08:
+#   - Added check_component_versions(): collects software version info for all
+#     VCF infrastructure components (SDDC Manager, vCenter, ESXi hosts, NSX
+#     Manager) using config.ini discovery and lsf.get_password() — no hardcoded
+#     credentials or hostnames.  Results appear as a "COMPONENT VERSIONS" table
+#     at the top of the report and are included in the HTML export.
+#   - Added _discover_sddc_managers() private helper (refactored from the inline
+#     block in check_password_expirations()) so SDDC Manager FQDN discovery is
+#     shared between the password check and the new version check.
+#   - Added component_version_checks field to ValidationReport dataclass.
+#
 # v2.7 - 2026-05-22:
 #   - Added check_k8s_certificates(): checks Kubernetes certificate expiration
 #     across VCFA, VSP, and Supervisor environments by calling
@@ -63,10 +106,10 @@ Usage:
     python3 vpodchecker.py [options]
     
 Options:
-    --report-only   Don't fix issues, just report
-    --json          Output as JSON
-    --html          Generate HTML report
-    --verbose       Verbose output
+    --report-only       Don't fix issues, just report
+    --json [PATH]       Save results as JSON; auto-names vpodchecker_<timestamp>.json if PATH omitted
+    --html [PATH]       Save results as HTML report; auto-names vpodchecker_<timestamp>.html if PATH omitted
+    --verbose           Verbose output
 """
 
 import sys
@@ -157,6 +200,7 @@ class ValidationReport:
     firefox_ca_checks: List[CheckResult] = field(default_factory=list)
     drs_isolation_checks: List[CheckResult] = field(default_factory=list)
     k8s_cert_checks: List[CheckResult] = field(default_factory=list)
+    component_version_checks: List[CheckResult] = field(default_factory=list)
     overall_status: str = "PASS"
     
     def to_dict(self) -> Dict:
@@ -842,6 +886,93 @@ def _sort_license_results(results: List[CheckResult]) -> List[CheckResult]:
 # REPORT GENERATION
 #==============================================================================
 
+def print_component_versions_table(results: List[CheckResult]) -> None:
+    """
+    Print the component versions inventory using dedicated Type/FQDN/Version/Build
+    columns.  This gives a cleaner layout than the generic Name/Status/Message
+    format used by other check sections, and directly mirrors the structure of
+    get-vcf-vcenter-esx-nsx-info.py --mode manager output.
+    """
+    print("\n==== COMPONENT VERSIONS ====")
+
+    if not results:
+        print("  (no data)")
+        return
+
+    # If the only result is a SKIPPED sentinel, just print it and return
+    if len(results) == 1 and results[0].status == 'SKIPPED':
+        print(f"  SKIPPED: {results[0].message}")
+        return
+
+    if PRETTYTABLE_AVAILABLE:
+        table = PrettyTable()
+        table.field_names = ['Type', 'FQDN', 'Version', 'Build']
+        table.align = 'l'
+
+        for r in results:
+            if r.status == 'SKIPPED':
+                continue
+            d         = r.details or {}
+            raw_type  = d.get('component_type', r.name)
+            comp_type = raw_type.replace('_', ' ').title()
+            fqdn      = d.get('fqdn', '')
+            version   = d.get('version', '')
+            build     = d.get('build', '')
+            icon      = {'PASS': '✅', 'WARN': '⚠️', 'FAIL': '❌'}.get(r.status, '❓')
+
+            if r.status != 'PASS':
+                # Show the failure reason in the Version column
+                version = r.message[:50]
+                build   = ''
+
+            table.add_row([f'{icon} {comp_type}', fqdn, version, build])
+
+        print(table)
+    else:
+        for r in results:
+            if r.status == 'SKIPPED':
+                continue
+            d   = r.details or {}
+            print(
+                f"  {r.status}: {d.get('component_type','?')}"
+                f"  {d.get('fqdn', r.name)}"
+                f"  v{d.get('version','')}  build={d.get('build','')}"
+            )
+
+
+def _component_versions_html(results: List[CheckResult]) -> str:
+    """
+    Generate a dedicated HTML table for component versions with
+    Type / FQDN / Version / Build columns.
+    """
+    html = '''        <h2>Component Versions</h2>
+        <table>
+            <tr><th>Type</th><th>FQDN</th><th>Version</th><th>Build</th></tr>
+'''
+    for r in results:
+        if r.status == 'SKIPPED':
+            continue
+        d         = r.details or {}
+        comp_type = d.get('component_type', r.name).replace('_', ' ').title()
+        fqdn      = d.get('fqdn', '')
+        version   = d.get('version', '')
+        build     = d.get('build', '')
+        sc        = f"status-{r.status.lower()}"
+        if r.status != 'PASS':
+            version = r.message[:60]
+            build   = ''
+        html += (
+            f'            <tr>'
+            f'<td>{comp_type}</td>'
+            f'<td>{fqdn}</td>'
+            f'<td class="{sc}">{version}</td>'
+            f'<td>{build}</td>'
+            f'</tr>\n'
+        )
+    html += '        </table>\n'
+    return html
+
+
 def print_results_table(title: str, results: List[CheckResult],
                         max_message_width: int = 72):
     """Print results as a table with word-wrapping for long messages.
@@ -917,15 +1048,19 @@ def generate_html_report(report: ValidationReport) -> str:
 '''
     
     # Add sections for each check type
+    # Component versions gets its own dedicated multi-column table
+    if report.component_version_checks:
+        html += _component_versions_html(report.component_version_checks)
+
     sections = [
         ('SSL Certificate Checks', report.ssl_checks),
         ('License Checks', report.license_checks),
         ('NTP Configuration', report.ntp_checks),
         ('VM Configuration', report.vm_config_checks),
         ('VM Resources', report.vm_resource_checks),
-        ('Password Expiration Checks', report.password_expiration_checks)
+        ('Password Expiration Checks', report.password_expiration_checks),
     ]
-    
+
     for title, checks in sections:
         if checks:
             html += f'''
@@ -1323,6 +1458,44 @@ def _get_nsx_manager_for_edge_check(edge_hostname: str) -> Optional[str]:
     return nsx_managers[0] if nsx_managers else None
 
 
+def _discover_sddc_managers() -> List[str]:
+    """
+    Return a deduplicated list of SDDC Manager FQDNs discovered from config.ini.
+
+    Discovery order (first hit wins per hostname):
+      1. [VCF] sddcmanager key — explicit list
+      2. [RESOURCES] URLs / urls — any entry whose URL contains 'sddcmanager'
+
+    :return: List of SDDC Manager FQDN strings (may be empty if none configured)
+    """
+    sddc_managers: List[str] = []
+    if not lsf:
+        return sddc_managers
+
+    # Method 1: explicit VCF.sddcmanager key
+    if lsf.config.has_section('VCF') and lsf.config.has_option('VCF', 'sddcmanager'):
+        for entry in lsf.config.get('VCF', 'sddcmanager').split('\n'):
+            if not entry or entry.strip().startswith('#'):
+                continue
+            hostname = entry.split(':')[0].strip()
+            if hostname and hostname not in sddc_managers:
+                sddc_managers.append(hostname)
+
+    # Method 2: URLs containing 'sddcmanager'
+    for opt in ('URLs', 'urls'):
+        if lsf.config.has_option('RESOURCES', opt):
+            for entry in lsf.config.get('RESOURCES', opt).split('\n'):
+                if 'sddcmanager' not in entry.lower():
+                    continue
+                url = entry.split(',')[0].strip()
+                if '://' in url:
+                    hostname = url.split('://')[1].split('/')[0].split(':')[0]
+                    if hostname and hostname not in sddc_managers:
+                        sddc_managers.append(hostname)
+
+    return sddc_managers
+
+
 def check_password_expirations() -> List[CheckResult]:
     """
     Check password expiration for all known user accounts.
@@ -1591,30 +1764,8 @@ def check_password_expirations() -> List[CheckResult]:
                     details={'hostname': hostname, 'username': user, 'error': str(e)}
                 ))
     
-    # Check SDDC Manager - look in URLs for sddcmanager hosts
-    sddc_managers = []
-    
-    # Method 1: Check VCF.sddcmanager if it exists
-    if lsf.config.has_section('VCF') and lsf.config.has_option('VCF', 'sddcmanager'):
-        sddc_raw = lsf.config.get('VCF', 'sddcmanager').split('\n')
-        for entry in sddc_raw:
-            if not entry or entry.strip().startswith('#'):
-                continue
-            hostname = entry.split(':')[0].strip()
-            if hostname:
-                sddc_managers.append(hostname)
-    
-    # Method 2: Extract from URLs containing 'sddcmanager'
-    if lsf.config.has_option('RESOURCES', 'urls'):
-        urls_raw = lsf.config.get('RESOURCES', 'urls').split('\n')
-        for entry in urls_raw:
-            if 'sddcmanager' in entry.lower():
-                url = entry.split(',')[0].strip()
-                # Extract hostname from URL
-                if '://' in url:
-                    hostname = url.split('://')[1].split('/')[0].split(':')[0]
-                    if hostname and hostname not in sddc_managers:
-                        sddc_managers.append(hostname)
+    # Check SDDC Manager - discover FQDNs via shared helper
+    sddc_managers = _discover_sddc_managers()
     
     for hostname in sddc_managers:
         # SDDC Manager only allows SSH as 'vcf' user (root SSH disabled).
@@ -2760,14 +2911,291 @@ def check_k8s_certificates() -> List[CheckResult]:
 
 
 #==============================================================================
+# COMPONENT VERSION CHECKS
+#==============================================================================
+
+def check_component_versions() -> List[CheckResult]:
+    """
+    Collect software version information for all VCF infrastructure components.
+
+    Queries:
+      - SDDC Manager    : GET /v1/vcf-services  (Bearer token, tries admin@local then vcf)
+      - vCenter         : pyVmomi si.content.about  (reuses existing lsf.sis connections)
+      - ESXi hosts      : pyVmomi host.config.product  (via same vCenter sessions)
+      - NSX Manager     : GET /api/v1/node/version  (Basic Auth admin/<password>)
+      - VCF Automation  : GET /vco/api/about  (no auth required)
+
+    All host discovery and credentials come from config.ini via lsf.config and
+    lsf.get_password() — no hardcoded values.
+
+    Status:
+      PASS    — component is reachable and version was retrieved
+      WARN    — component is unreachable, auth failed, or version unavailable
+      SKIPPED — lsfunctions or requests library is not available
+
+    :return: List[CheckResult] — one entry per discovered component.
+    """
+    results: List[CheckResult] = []
+
+    if not lsf:
+        return [CheckResult(
+            name='Component Versions',
+            status='SKIPPED',
+            message='lsfunctions not available',
+        )]
+
+    try:
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except ImportError:
+        return [CheckResult(
+            name='Component Versions',
+            status='SKIPPED',
+            message='requests library not available',
+        )]
+
+    password = lsf.get_password()
+
+    # ── SDDC Manager ─────────────────────────────────────────────────────────
+    for sddc_fqdn in _discover_sddc_managers():
+        token: Optional[str] = None
+        for sddc_user in ('admin@local', 'vcf'):
+            try:
+                resp = requests.post(
+                    f'https://{sddc_fqdn}/v1/tokens',
+                    json={'username': sddc_user, 'password': password},
+                    verify=False, timeout=15,
+                )
+                if resp.status_code == 200:
+                    token = resp.json().get('accessToken') or resp.json().get('token')
+                    if token:
+                        break
+            except Exception:
+                continue
+
+        if token:
+            try:
+                # VCF 9.1+: /v1/about returns HTML (web UI). Use /v1/vcf-services
+                # which returns JSON with per-service versions (e.g. COMMON_SERVICES:
+                # 9.1.0.0.25262058). The version field has format M.m.p.h.build so
+                # we extract the first three parts as the VCF platform version.
+                svc_resp = requests.get(
+                    f'https://{sddc_fqdn}/v1/vcf-services',
+                    headers={'Authorization': f'Bearer {token}',
+                             'Accept': 'application/json'},
+                    verify=False, timeout=15,
+                )
+                if svc_resp.status_code == 200:
+                    svc_data  = svc_resp.json()
+                    full_ver  = ''
+                    for svc in svc_data.get('elements', []):
+                        if svc.get('name') in ('COMMON_SERVICES', 'LCM'):
+                            full_ver = svc.get('version', '')
+                            break
+                    if not full_ver and svc_data.get('elements'):
+                        full_ver = svc_data['elements'][0].get('version', '')
+                    # Derive short VCF version: "9.1.0.0.25262058" → "9.1.0"
+                    parts   = full_ver.split('.')
+                    vcf_ver = '.'.join(parts[:3]) if len(parts) >= 3 else full_ver
+                    build   = parts[-1] if len(parts) >= 2 else ''
+                    msg = f'VCF {vcf_ver} (build {build})' if build else f'VCF {vcf_ver}'
+                    results.append(CheckResult(
+                        name=f'SDDC Manager: {sddc_fqdn}',
+                        status='PASS',
+                        message=msg,
+                        details={'component_type': 'SDDC_MANAGER', 'fqdn': sddc_fqdn,
+                                 'version': vcf_ver, 'build': build,
+                                 'full_version': full_ver},
+                    ))
+                else:
+                    results.append(CheckResult(
+                        name=f'SDDC Manager: {sddc_fqdn}',
+                        status='WARN',
+                        message=f'HTTP {svc_resp.status_code} from /v1/vcf-services',
+                        details={'component_type': 'SDDC_MANAGER', 'fqdn': sddc_fqdn},
+                    ))
+            except Exception as exc:
+                results.append(CheckResult(
+                    name=f'SDDC Manager: {sddc_fqdn}',
+                    status='WARN',
+                    message=f'Could not retrieve version: {str(exc)[:80]}',
+                    details={'component_type': 'SDDC_MANAGER', 'fqdn': sddc_fqdn},
+                ))
+        else:
+            results.append(CheckResult(
+                name=f'SDDC Manager: {sddc_fqdn}',
+                status='WARN',
+                message='Authentication failed (tried admin@local, vcf)',
+                details={'component_type': 'SDDC_MANAGER', 'fqdn': sddc_fqdn},
+            ))
+
+    # ── vCenter + ESXi hosts (reuse existing lsf.sis connections) ────────────
+    if lsf.sis and PYVMOMI_AVAILABLE:
+        # Build an ordered list of vCenter FQDNs matching the lsf.sis connection order
+        vc_fqdns: List[str] = []
+        if lsf.config.has_option('RESOURCES', 'vCenters'):
+            for entry in lsf.config.get('RESOURCES', 'vCenters').split('\n'):
+                if not entry or entry.strip().startswith('#'):
+                    continue
+                vc_host = entry.split(':')[0].strip()
+                if vc_host:
+                    vc_fqdns.append(vc_host)
+
+        for idx, si in enumerate(lsf.sis):
+            vc_fqdn = vc_fqdns[idx] if idx < len(vc_fqdns) else f'vCenter-{idx + 1}'
+            try:
+                ab = si.content.about
+                results.append(CheckResult(
+                    name=f'vCenter: {vc_fqdn}',
+                    status='PASS',
+                    message=f'{ab.fullName} (build {ab.build})',
+                    details={'component_type': 'VCENTER', 'fqdn': vc_fqdn,
+                             'version': ab.version, 'build': ab.build,
+                             'full_name': ab.fullName},
+                ))
+
+                # ESXi hosts managed by this vCenter
+                try:
+                    host_objs = lsf.get_all_objs(si.content, [vim.HostSystem])
+                    for host in host_objs.keys():
+                        try:
+                            p = host.config.product
+                            results.append(CheckResult(
+                                name=f'ESXi: {host.name}',
+                                status='PASS',
+                                message=f'ESXi {p.version} (build {p.build})',
+                                details={'component_type': 'ESXI', 'fqdn': host.name,
+                                         'version': p.version, 'build': p.build},
+                            ))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            except Exception as exc:
+                results.append(CheckResult(
+                    name=f'vCenter: {vc_fqdn}',
+                    status='WARN',
+                    message=f'Could not retrieve version: {str(exc)[:80]}',
+                    details={'component_type': 'VCENTER', 'fqdn': vc_fqdn},
+                ))
+
+    # ── NSX Manager(s) ───────────────────────────────────────────────────────
+    if lsf.config.has_section('VCF') and lsf.config.has_option('VCF', 'vcfnsxmgr'):
+        for entry in lsf.config.get('VCF', 'vcfnsxmgr').split('\n'):
+            if not entry or entry.strip().startswith('#'):
+                continue
+            nsx_fqdn = entry.split(':')[0].strip()
+            if not nsx_fqdn:
+                continue
+            try:
+                resp = requests.get(
+                    f'https://{nsx_fqdn}/api/v1/node/version',
+                    auth=('admin', password),
+                    verify=False, timeout=15,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    pv       = data.get('product_version', 'unknown')
+                    node_ver = data.get('node_version', '')
+                    msg = f'NSX {pv}' + (f' (node: {node_ver})' if node_ver else '')
+                    results.append(CheckResult(
+                        name=f'NSX Manager: {nsx_fqdn}',
+                        status='PASS',
+                        message=msg,
+                        details={'component_type': 'NSX_MANAGER', 'fqdn': nsx_fqdn,
+                                 'version': pv, 'build': node_ver},
+                    ))
+                else:
+                    results.append(CheckResult(
+                        name=f'NSX Manager: {nsx_fqdn}',
+                        status='WARN',
+                        message=f'HTTP {resp.status_code} from /api/v1/node/version',
+                        details={'component_type': 'NSX_MANAGER', 'fqdn': nsx_fqdn},
+                    ))
+            except Exception as exc:
+                results.append(CheckResult(
+                    name=f'NSX Manager: {nsx_fqdn}',
+                    status='WARN',
+                    message=f'Could not retrieve version: {str(exc)[:80]}',
+                    details={'component_type': 'NSX_MANAGER', 'fqdn': nsx_fqdn},
+                ))
+
+    # ── VCF Automation ───────────────────────────────────────────────────────
+    # Discover appliances from [VCFFINAL][vraurls].  The /vco/api/about endpoint
+    # is publicly accessible (no auth) and returns version + build number.
+    # vraurls may list the same host multiple times (different paths) — deduplicate.
+    if lsf.config.has_section('VCFFINAL') and lsf.config.has_option('VCFFINAL', 'vraurls'):
+        _seen_auto: set = set()
+        for raw_entry in lsf.config.get('VCFFINAL', 'vraurls').split('\n'):
+            entry = raw_entry.split(',')[0].strip()
+            if not entry or entry.startswith('#'):
+                continue
+            # Entries may be bare FQDNs or full URLs; extract hostname only
+            from urllib.parse import urlparse as _urlparse
+            parsed    = _urlparse(entry if '://' in entry else f'https://{entry}')
+            auto_fqdn = parsed.hostname or entry.split('/')[0]
+            if not auto_fqdn or auto_fqdn in _seen_auto:
+                continue
+            _seen_auto.add(auto_fqdn)
+            try:
+                resp = requests.get(
+                    f'https://{auto_fqdn}/vco/api/about',
+                    verify=False, timeout=15,
+                )
+                if resp.status_code == 200:
+                    data      = resp.json()
+                    full_ver  = data.get('version', '')
+                    build     = data.get('build-number', '')
+                    # Derive short version: "9.1.0.0.25218892" → "9.1.0"
+                    parts     = full_ver.split('.')
+                    short_ver = '.'.join(parts[:3]) if len(parts) >= 3 else full_ver
+                    msg = f'VCF Automation {short_ver} (build {build})' if build else f'VCF Automation {short_ver}'
+                    results.append(CheckResult(
+                        name=f'VCF Automation: {auto_fqdn}',
+                        status='PASS',
+                        message=msg,
+                        details={'component_type': 'VCF_AUTOMATION', 'fqdn': auto_fqdn,
+                                 'version': short_ver, 'build': build,
+                                 'full_version': full_ver},
+                    ))
+                else:
+                    results.append(CheckResult(
+                        name=f'VCF Automation: {auto_fqdn}',
+                        status='WARN',
+                        message=f'HTTP {resp.status_code} from /vco/api/about',
+                        details={'component_type': 'VCF_AUTOMATION', 'fqdn': auto_fqdn},
+                    ))
+            except Exception as exc:
+                results.append(CheckResult(
+                    name=f'VCF Automation: {auto_fqdn}',
+                    status='WARN',
+                    message=f'Could not retrieve version: {str(exc)[:80]}',
+                    details={'component_type': 'VCF_AUTOMATION', 'fqdn': auto_fqdn},
+                ))
+
+    if not results:
+        results.append(CheckResult(
+            name='Component Versions',
+            status='SKIPPED',
+            message='No VCF components found in config.ini (check [VCF] and [RESOURCES] sections)',
+        ))
+
+    return results
+
+
+#==============================================================================
 # MAIN
 #==============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description='HOLFY27 VPod Checker')
     parser.add_argument('--report-only', action='store_true', help="Don't fix issues, just report")
-    parser.add_argument('--json', action='store_true', help='Output as JSON')
-    parser.add_argument('--html', type=str, help='Generate HTML report to specified file')
+    parser.add_argument('--json', nargs='?', const='', default=None, metavar='PATH',
+                        help='Save results as JSON; auto-names vpodchecker_<timestamp>.json if PATH omitted')
+    parser.add_argument('--html', nargs='?', const='', default=None, metavar='PATH',
+                        help='Save results as HTML report; auto-names vpodchecker_<timestamp>.html if PATH omitted')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     args = parser.parse_args()
     
@@ -2864,19 +3292,9 @@ def main():
         except Exception:
             pass
     
-    # Run SSL checks for URLs
-    print("\nChecking SSL certificates...")
-    report.ssl_checks = check_ssl_certificates(urls, min_exp_date)
-    
-    # Run SSL checks for ESXi hosts
-    if esxi_hosts:
-        print("\nChecking ESXi host SSL certificates...")
-        esxi_ssl_checks = check_ssl_certificates(esxi_hosts, min_exp_date)
-        report.ssl_checks.extend(esxi_ssl_checks)
-    
-    print_results_table("SSL CERTIFICATES", report.ssl_checks)
-    
-    # Connect to vCenters and run vSphere checks
+    # Connect to vCenters FIRST so the component version inventory (which needs
+    # lsf.sis for pyVmomi queries) can appear at the top of the report before
+    # the SSL, NTP, and other check sections.
     if lsf and PYVMOMI_AVAILABLE:
         try:
             if 'vCenters' in lsf.config['RESOURCES'].keys():
@@ -2884,7 +3302,29 @@ def main():
                 lsf.connect_vcenters(vcenters)
         except Exception as e:
             print(f"Could not connect to vCenters: {e}")
-        
+
+    # Component version inventory — first section in the report
+    print("\nCollecting component versions...")
+    try:
+        report.component_version_checks = check_component_versions()
+        print_component_versions_table(report.component_version_checks)
+    except Exception as e:
+        print(f"Component version check failed: {e}")
+
+    # Run SSL checks for URLs
+    print("\nChecking SSL certificates...")
+    report.ssl_checks = check_ssl_certificates(urls, min_exp_date)
+
+    # Run SSL checks for ESXi hosts
+    if esxi_hosts:
+        print("\nChecking ESXi host SSL certificates...")
+        esxi_ssl_checks = check_ssl_certificates(esxi_hosts, min_exp_date)
+        report.ssl_checks.extend(esxi_ssl_checks)
+
+    print_results_table("SSL CERTIFICATES", report.ssl_checks)
+
+    # vSphere checks — reuse the already-established lsf.sis connections
+    if lsf and PYVMOMI_AVAILABLE:
         if lsf.sis:
             # NTP checks
             print("\nChecking NTP configuration...")
@@ -2973,7 +3413,8 @@ def main():
         report.fleet_password_policy_checks +
         report.firefox_ca_checks +
         report.drs_isolation_checks +
-        report.k8s_cert_checks
+        report.k8s_cert_checks +
+        report.component_version_checks
     )
     
     if any(c.status == 'FAIL' for c in all_checks):
@@ -2986,15 +3427,21 @@ def main():
     print("\n" + "=" * 60)
     print(f"Overall Status: {report.overall_status}")
     
-    # Output formats
-    if args.json:
-        print(report.to_json())
-    
-    if args.html:
+    # Output formats — args.json/args.html are None (not requested), '' (auto-name), or a path
+    if args.json is not None:
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        json_file = os.path.abspath(args.json if args.json else f'vpodchecker_{ts}.json')
+        with open(json_file, 'w') as f:
+            f.write(report.to_json())
+        print(f"JSON report written to: {json_file}")
+
+    if args.html is not None:
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        html_file = os.path.abspath(args.html if args.html else f'vpodchecker_{ts}.html')
         html = generate_html_report(report)
-        with open(args.html, 'w') as f:
+        with open(html_file, 'w') as f:
             f.write(html)
-        print(f"HTML report written to: {args.html}")
+        print(f"HTML report written to: {html_file}")
     
     if lsf and PYVMOMI_AVAILABLE:
         for si in lsf.sis:
