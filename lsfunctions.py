@@ -1,5 +1,5 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.14 - 2026-05-28
+# Version 3.19 - 2026-06-09
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
@@ -16,6 +16,7 @@ import fileinput
 import glob
 import shutil
 import sys
+import tempfile
 import urllib3
 import logging
 import json
@@ -1169,6 +1170,306 @@ def clear_console_os_proxy(console_host, password, dry_run=False):
         return True
     else:
         write_output(f'WARNING: {label}: OS proxy clear failed (ssh rc={result.returncode})')
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Group D-2: Console VM .bashrc proxy (holuser + root via NFS mount)
+#
+# /lmchol/home/holuser/.bashrc  → writable directly (owned by holuser)
+# /lmchol/root/.bashrc          → requires sudo (root-owned, inaccessible to holuser)
+#
+# The regex covers the two-line pattern used by existing .bashrc files:
+#   HTTP_PROXY=http://proxy:3128     ← bare assignment  (no 'export' prefix)
+#   export HTTP_PROXY                ← standalone export (no '=' value)
+# as well as the single-line form written by this script:
+#   export HTTP_PROXY=http://...     ← combined export+assignment
+# ---------------------------------------------------------------------------
+
+_BASHRC_PROXY_RE = re.compile(
+    r'^(?:export\s+)?(http_proxy|https_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|NO_PROXY)'
+    r'(?:=|\s*$)'
+)
+
+_BASHRC_TARGETS = [
+    '/lmchol/home/holuser/.bashrc',
+]
+
+
+def _filter_proxy_lines(lines, proxy_lines):
+    """Return *lines* with all proxy export/assignment lines removed.
+
+    If *proxy_lines* is non-empty the new block is appended after the
+    filtered content with a preceding blank-line separator.
+    """
+    filtered = [ln for ln in lines if not _BASHRC_PROXY_RE.match(ln)]
+    if proxy_lines:
+        if filtered and not filtered[-1].endswith('\n'):
+            filtered[-1] += '\n'
+        filtered.append('\n')
+        for line in proxy_lines:
+            filtered.append(line if line.endswith('\n') else line + '\n')
+    return filtered
+
+
+def _update_single_bashrc(path, proxy_lines):
+    """Read-filter-write a single .bashrc file via direct NFS file I/O."""
+    with open(path, 'r') as fh:
+        lines = fh.readlines()
+    filtered = _filter_proxy_lines(lines, proxy_lines)
+    with open(path, 'w') as fh:
+        fh.writelines(filtered)
+
+
+def _update_single_bashrc_sudo(path, proxy_lines):
+    """Read-filter-write a single .bashrc file via sudo for root-owned paths.
+
+    Reads current content with 'sudo -S cat', builds filtered content, then
+    writes back via a temp file + 'sudo -S cp'.  Password is read from
+    /home/holuser/creds.txt.  Raises OSError on failure.
+    """
+    try:
+        with open('/home/holuser/creds.txt', 'r') as fh:
+            password = fh.read().strip()
+    except OSError as exc:
+        raise OSError(f'cannot read creds.txt: {exc}') from exc
+
+    # Read via sudo cat
+    read_result = subprocess.run(
+        ['sudo', '-S', 'cat', path],
+        input=password + '\n',
+        capture_output=True, text=True, timeout=15,
+    )
+    if read_result.returncode != 0:
+        stderr = read_result.stderr.strip()
+        if 'No such file' in stderr or 'no such file' in stderr:
+            raise FileNotFoundError(f'{path}: no such file')
+        raise OSError(f'sudo cat {path} failed (rc={read_result.returncode}): {stderr}')
+
+    lines = read_result.stdout.splitlines(keepends=True)
+    filtered = _filter_proxy_lines(lines, proxy_lines)
+    new_content = ''.join(filtered)
+
+    # Write via temp file + sudo cp (avoids stdin collision with sudo -S)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.bashrc_tmp',
+                                         delete=False) as tf:
+            tf.write(new_content)
+            tmp_path = tf.name
+        write_result = subprocess.run(
+            ['sudo', '-S', 'cp', tmp_path, path],
+            input=password + '\n',
+            capture_output=True, text=True, timeout=15,
+        )
+        if write_result.returncode != 0:
+            raise OSError(
+                f'sudo cp {tmp_path} {path} failed '
+                f'(rc={write_result.returncode}): {write_result.stderr.strip()}'
+            )
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _update_bashrc_proxy(proxy_lines):
+    """Rewrite the proxy export block in each .bashrc target file.
+
+    Attempts a direct NFS write first.  On PermissionError the function falls
+    back to a sudo-based read/write using the credential in creds.txt.  All
+    errors are non-fatal: a WARNING is logged and the return value is False.
+
+    :param proxy_lines: list of 'export VAR=value' strings to append, or []
+    :return: True if all accessible files were updated, False on any error
+    """
+    ok = True
+    action = 'set' if proxy_lines else 'cleared'
+    for path in _BASHRC_TARGETS:
+        # --- direct NFS write (works for holuser-owned files) ---
+        try:
+            _update_single_bashrc(path, proxy_lines)
+            write_output(f'{path}: proxy exports {action}')
+            continue
+        except FileNotFoundError:
+            write_output(f'WARNING: {path} not found — skipping .bashrc proxy update')
+            continue
+        except PermissionError:
+            pass   # fall through to sudo
+        except OSError as exc:
+            write_output(f'WARNING: could not update {path}: {exc}')
+            ok = False
+            continue
+
+        # --- sudo fallback (root-owned files, non-fatal) ---
+        try:
+            _update_single_bashrc_sudo(path, proxy_lines)
+            write_output(f'{path}: proxy exports {action} (via sudo)')
+        except FileNotFoundError:
+            write_output(f'WARNING: {path} not found — skipping .bashrc proxy update')
+        except Exception as exc:
+            write_output(f'WARNING: could not update {path} via sudo: {exc}')
+            ok = False
+    return ok
+
+
+def set_console_bashrc_proxy(dry_run=False):
+    """Inject proxy export lines into holuser and root .bashrc on the console.
+
+    Uses the NFS mount at /lmchol.  Idempotent: strips stale proxy export
+    lines before appending the current LAB_PROXY_URL / build_lab_no_proxy()
+    values.
+
+    :param dry_run: If True log intent, make no changes
+    :return: True on success, False on any file I/O error (non-fatal)
+    """
+    if dry_run:
+        write_output('[dry-run] would set proxy exports in console .bashrc files')
+        return True
+
+    no_proxy_str = build_lab_no_proxy()
+    proxy_lines = [
+        f'export http_proxy={LAB_PROXY_URL}',
+        f'export https_proxy={LAB_PROXY_URL}',
+        f'export no_proxy={no_proxy_str}',
+        f'export HTTP_PROXY={LAB_PROXY_URL}',
+        f'export HTTPS_PROXY={LAB_PROXY_URL}',
+        f'export NO_PROXY={no_proxy_str}',
+    ]
+    return _update_bashrc_proxy(proxy_lines)
+
+
+def clear_console_bashrc_proxy(dry_run=False):
+    """Strip all proxy export lines from holuser and root .bashrc on the console.
+
+    Uses the NFS mount at /lmchol.  Non-fatal: logs warning on file I/O error.
+
+    :param dry_run: If True log intent, make no changes
+    :return: True on success, False on any file I/O error (non-fatal)
+    """
+    if dry_run:
+        write_output('[dry-run] would clear proxy exports from console .bashrc files')
+        return True
+
+    return _update_bashrc_proxy([])
+
+
+# ---------------------------------------------------------------------------
+# Group D-3: Console VM GNOME system proxy (gsettings via SSH)
+#
+# GNOME Network Settings live in holuser's dconf database — independent of
+# /etc/environment and .bashrc.  Modifying dconf requires a live D-Bus
+# session-bus socket (/run/user/<UID>/bus).
+#
+# Key constraints discovered through testing:
+#  1. ssh() wraps the command in double quotes via shell=True, so inner
+#     double quotes break the command.  Solution: base64-encode a bash script
+#     and decode+execute on the remote side — only alphanumerics in transit.
+#  2. sudo strips DBUS_SESSION_BUS_ADDRESS by default.  Solution: use
+#     su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings ..."
+#     so bash expands ${BUS} before passing the -c argument to su.
+#  3. 'dconf reset -f' reverts the GVDB file but does not override values
+#     already set in the live dconf-service cache.  Solution: use
+#     'gsettings set mode none' which writes through the running service.
+#  4. GVariant array syntax for ignore-hosts: each element must be single-
+#     quoted inside the array, e.g. ['localhost','127.0.0.1','.vcf.lab'].
+#     The array itself must be double-quoted at the bash level.
+#
+# HOL labtype  → gsettings set mode=manual + http/https host/port/ignore-hosts
+# non-HOL      → gsettings set mode=none
+# ---------------------------------------------------------------------------
+
+def set_console_gnome_proxy(console_host, password, dry_run=False):
+    """Set GNOME system proxy to manual mode in holuser's dconf on the console.
+
+    Builds a base64-encoded bash script that runs gsettings via
+    'su - holuser -c "DBUS_SESSION_BUS_ADDRESS=<bus> gsettings set ..."'
+    for each key.  The base64 transport sidesteps all SSH/shell quoting issues.
+
+    :param console_host: SSH target, e.g. 'root@console.site-a.vcf.lab'
+    :param password:     SSH password
+    :param dry_run:      If True log intent, make no changes
+    :return: True on success, False on SSH error (non-fatal)
+    """
+    label = console_host.split('@')[-1].split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would set GNOME proxy (gsettings) on {console_host}')
+        return True
+
+    # GVariant array: each entry single-quoted, e.g. ['localhost','10.0.0.0/8']
+    ignore_hosts_gv = "['" + "','".join(LAB_NO_PROXY_PARTS) + "']"
+
+    # Non-f-string lines: ${HUID}/${BUS} are bash variables — not expanded by Python.
+    # f-string lines:     ${{BUS}} → ${BUS}; {proxy}/{LAB_PROXY_PORT} → Python values.
+    script_lines = [
+        'HUID=$(id -u holuser)',
+        'BUS="unix:path=/run/user/${HUID}/bus"',
+        'su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} '
+            'gsettings set org.gnome.system.proxy mode manual"',
+        f'su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${{BUS}} '
+            f'gsettings set org.gnome.system.proxy.http host {proxy}"',
+        f'su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${{BUS}} '
+            f'gsettings set org.gnome.system.proxy.http port {LAB_PROXY_PORT}"',
+        f'su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${{BUS}} '
+            f'gsettings set org.gnome.system.proxy.https host {proxy}"',
+        f'su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${{BUS}} '
+            f'gsettings set org.gnome.system.proxy.https port {LAB_PROXY_PORT}"',
+        # ignore-hosts array: bash needs the GVariant array wrapped in escaped double
+        # quotes so the shell passes it as a single argument to gsettings.
+        f"su - holuser -c \"DBUS_SESSION_BUS_ADDRESS=${{BUS}} "
+            f"gsettings set org.gnome.system.proxy ignore-hosts \\\"{ignore_hosts_gv}\\\"\"",
+    ]
+    script = '\n'.join(script_lines) + '\n'
+    script_b64 = base64.b64encode(script.encode()).decode()
+    cmd = f"echo {script_b64} | base64 -d | bash"
+    result = ssh(cmd, console_host, password)
+    if result.returncode == 0:
+        write_output(f'{label}: GNOME proxy set (gsettings manual, {proxy}:{LAB_PROXY_PORT})')
+        return True
+    else:
+        write_output(
+            f'WARNING: {label}: GNOME proxy set failed (ssh rc={result.returncode}): '
+            f'{result.stderr.strip()}'
+        )
+        return False
+
+
+def clear_console_gnome_proxy(console_host, password, dry_run=False):
+    """Set GNOME system proxy mode to 'none' in holuser's dconf on the console.
+
+    Uses 'gsettings set mode none' which correctly updates the live dconf
+    service (unlike 'dconf reset -f' which may not override in-session cache).
+    The command is base64-encoded to avoid SSH shell-quoting issues.
+
+    :param console_host: SSH target, e.g. 'root@console.site-a.vcf.lab'
+    :param password:     SSH password
+    :param dry_run:      If True log intent, make no changes
+    :return: True on success, False on SSH error (non-fatal)
+    """
+    label = console_host.split('@')[-1].split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would clear GNOME proxy (gsettings mode=none) on {console_host}')
+        return True
+
+    script = (
+        'HUID=$(id -u holuser)\n'
+        'BUS="unix:path=/run/user/${HUID}/bus"\n'
+        'su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} '
+        'gsettings set org.gnome.system.proxy mode none"\n'
+    )
+    script_b64 = base64.b64encode(script.encode()).decode()
+    cmd = f"echo {script_b64} | base64 -d | bash"
+    result = ssh(cmd, console_host, password)
+    if result.returncode == 0:
+        write_output(f'{label}: GNOME proxy cleared (gsettings mode=none)')
+        return True
+    else:
+        write_output(
+            f'WARNING: {label}: GNOME proxy clear failed (ssh rc={result.returncode}): '
+            f'{result.stderr.strip()}'
+        )
         return False
 
 
