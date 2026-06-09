@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Author: Burke Azbill and HOL Core Team
-Version: 1.1 2026-05-28
+Version: 1.2 2026-06-09
 
 Tune Firefox user.js on the Main Linux Console (LMC) profile.
 
@@ -96,7 +96,30 @@ def _hol_proxy_clear_block() -> str:
     return "\n".join(lines)
 
 
-def _hol_block(proxy_host: str, proxy_port: int) -> str:
+_FIREFOX_NO_PROXY_FALLBACK = (
+    "localhost, 127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/16,"
+    " *.vcf.lab, *.svc, *.cluster.local"
+)
+
+
+def _build_firefox_no_proxy(lsf: Any) -> str:
+    """Build the Firefox no_proxies_on string from lsf.LAB_NO_PROXY_PARTS.
+
+    Converts dot-prefix entries (e.g. ``.vcf.lab``) to Firefox wildcard form
+    (``*.vcf.lab``).  CIDR entries are passed through unchanged — Firefox Gecko
+    supports CIDR notation in ``network.proxy.no_proxies_on`` since Firefox 88.
+    Falls back to _FIREFOX_NO_PROXY_FALLBACK if the attribute is absent.
+    """
+    parts = getattr(lsf, "LAB_NO_PROXY_PARTS", None)
+    if not parts:
+        return _FIREFOX_NO_PROXY_FALLBACK
+    converted = []
+    for entry in parts:
+        converted.append("*" + entry if entry.startswith(".") else entry)
+    return ", ".join(converted)
+
+
+def _hol_block(proxy_host: str, proxy_port: int, no_proxy: str = _FIREFOX_NO_PROXY_FALLBACK) -> str:
     # Manual proxy (type 1). PAC type 2 with http_* set is invalid and stalls startup.
     lines = [
         BEGIN,
@@ -107,8 +130,7 @@ def _hol_block(proxy_host: str, proxy_port: int) -> str:
         f'user_pref("network.proxy.ssl_port", {proxy_port});',
         'user_pref("network.proxy.share_proxy_settings", true);',
         # Internal lab traffic should bypass Squid (DNS, vCenter, Vault NodePort, etc.)
-        'user_pref("network.proxy.no_proxies_on", "localhost, 127.0.0.1, 10.1.1.1, '
-        '192.168.0.2, *.vcf.lab, *.site-a.vcf.lab, *.site-b.vcf.lab");',
+        f'user_pref("network.proxy.no_proxies_on", "{no_proxy}");',
         # Urlbar / disk: reduce SQLite churn (large suggest.sqlite) and speculative work
         'user_pref("browser.urlbar.quicksuggest.enabled", false);',
         'user_pref("browser.urlbar.suggest.quicksuggest.sponsored", false);',
@@ -261,6 +283,7 @@ def apply_firefox_lmchol_tuning(
     log: Callable[[str], Any] = getattr(lsf, "write_output", print)
     mc = getattr(lsf, "mc", "/lmchol")
     host = proxy_host or getattr(lsf, "proxy", "proxy.site-a.vcf.lab")
+    no_proxy = _build_firefox_no_proxy(lsf)
     mode_desc = "clear (no proxy)" if clear else f"set (manual proxy {host}:{proxy_port})"
 
     profiles = _firefox_profile_dirs(mc)
@@ -289,7 +312,10 @@ def apply_firefox_lmchol_tuning(
                     f"— proxy cleared (type=0)"
                 )
             else:
-                _rewrite_user_js(uj, host, proxy_port)
+                _rewrite_user_js(
+                    uj, host, proxy_port,
+                    override_block=_hol_block(host, proxy_port, no_proxy),
+                )
                 log(
                     f"firefox_lmchol_tuning: user.js {os.path.basename(prof)} "
                     f"— manual proxy {host}:{proxy_port}"
@@ -321,10 +347,12 @@ def main() -> None:
     args = p.parse_args()
 
     lsf.init(router=False)
-    # Minimal shim: only mc + proxy + write_output used
+    # Minimal shim: forwards the attributes consumed by apply_firefox_lmchol_tuning
+    # and _build_firefox_no_proxy so the canonical lsf values are always used.
     class _Shim:
         mc = args.mc_base
         proxy = args.proxy_host or lsf.proxy
+        LAB_NO_PROXY_PARTS = lsf.LAB_NO_PROXY_PARTS
         write_output = staticmethod(print)
 
     apply_firefox_lmchol_tuning(_Shim(), dry_run=args.dry_run, proxy_port=args.proxy_port)
