@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 vsp_cert_renewer.py
-Version 1.8 - 2026-05-22
-Author: Burke Azbill and HOL Core Team
+Version 2.0 - 2026-06-09
+Author: Burke Azbill, Kevin Tebear, and HOL Core Team
 
 Proactive Kubernetes certificate check and renewal for VSP and VCFA clusters.
 
@@ -14,16 +14,48 @@ Threshold: THRESHOLD_DAYS (60). Any cert expiring within 60 days is renewed
 to 5 years via kubeadm --config certificateValidityPeriod (confirmed valid on
 VMware kubeadm v1.34.2). Falls back to default 1-year renewal on older builds.
 
-Phases per cluster:
-  1.   kubeadm control-plane certs  — runs on the CP node
-  2.   Kubelet serving certs        — runs on every node individually
-  3.0  Cluster CA extension         — VSP only; extends vcf-cluster-ca and
-                                       vcf-external-cluster-ca-cert to 10 years
-                                       so leaf certs can get full 5-year validity
-  3.1  cert-manager leaf certs      — VSP only; renews certs that are not-Ready
-                                       OR expiring within threshold_days; patches
-                                       spec.duration to 5 years before reissuance
-  4.   Antrea controller TLS        — VSP only (not applicable to VCFA)
+PHASE EXECUTION ORDER (v2.0):
+
+  All CA-authority work runs FIRST for VSP, before any leaf-cert operations.
+  This guarantees that every certificate issued or renewed in the same run is
+  signed by the most current CA key pair.
+
+  ┌─ VSP ONLY — CA / pre-check ───────────────────────────────────────────────┐
+  │  3.0  Cluster CA extension   extend vcf-cluster-ca + vcf-external-cluster  │
+  │                              ca-cert to 10 years if < 1 year remaining.    │
+  │                              Returns ca_rotated=True when the CA key pair  │
+  │                              is replaced (new Secret issued by cert-mgr).  │
+  │                              ca_rotated propagates to Phase 3.1 force_all. │
+  │                                                                             │
+  │  Pre   CA key consistency    openssl verify registry-certificate against   │
+  │        check                 current vcf-cluster-ca.  Detects the cross-   │
+  │                              session failure where Phase 3.0 ran in a prior │
+  │                              boot, Phase 3.1 then missed some certs, and   │
+  │                              the certs appear valid-by-date but carry the  │
+  │                              old CA key.  Sets ca_key_mismatch=True, which │
+  │                              also propagates to Phase 3.1 force_all.       │
+  └───────────────────────────────────────────────────────────────────────────┘
+  ┌─ ALL CLUSTERS — leaf certs against now-current CA ────────────────────────┐
+  │  1.   kubeadm CP certs       API server, etcd, front-proxy certs on CP.   │
+  │                              Uses the kubeadm PKI CA (/etc/kubernetes/pki) │
+  │                              which is separate from vcf-cluster-ca.        │
+  │  2.   Kubelet serving certs  Per-node kubelet.crt via KCM CSR signing.    │
+  │                              Also uses kubeadm PKI CA (same CA as above). │
+  └───────────────────────────────────────────────────────────────────────────┘
+  ┌─ VSP ONLY — cert-manager + containerd ────────────────────────────────────┐
+  │  3.1  cert-manager leaf      Renew certs that are not-Ready OR expiring   │
+  │                              within threshold_days.  Runs with force_all   │
+  │                              when ca_rotated OR ca_key_mismatch is True —  │
+  │                              all vcf-cluster-issuer certs are force-signed │
+  │                              with the verified current CA key.             │
+  │  4.   Antrea controller TLS  Self-signed 5-year cert injected into Secret. │
+  │  5.   containerd CA sync     Node CA file sync + pod restarts.            │
+  │                              Step 1b runs as a SAFETY NET: re-verifies     │
+  │                              registry-cert against CA after Phase 3.1.    │
+  │                              Triggers pod restarts when leaf_certs_renewed │
+  │                              OR leaf_certs_prerenewed (Phase 3.1 force)   │
+  │                              OR any node CA file was updated.              │
+  └───────────────────────────────────────────────────────────────────────────┘
 
 Log format per cert:
   CHECK  : <name> — EXPIRES: <date> — RESIDUAL: <Nd>
@@ -32,6 +64,49 @@ Log format per cert:
   SKIP   : <name> — valid for ><N>d
   WARN   : <description>
   ERROR  : <description>
+
+v2.0 Changes:
+- Phase ordering corrected: ALL CA-authority operations now execute BEFORE any
+  leaf-cert renewal.  The previous ordering (Phase 1 kubeadm → Phase 2 kubelet
+  → Phase 3.0 CA extension → Phase 3.1 leaf certs) left a window where Phases
+  1 and 2 could renew certs against a CA that was about to be rotated by Phase
+  3.0.  Although Phases 1/2 use the kubeadm PKI CA (separate from vcf-cluster-ca),
+  the correct architectural principle is: CAs current before ANY cert issuance.
+  New order: Phase 3.0 (CA) → CA pre-check → Phase 1 → Phase 2 → Phase 3.1 →
+             Phase 4 → Phase 5.
+- New _check_ca_key_consistency() pre-check: runs between Phase 3.0 and Phase 1.
+  Calls openssl verify on registry-certificate against vcf-cluster-ca BEFORE
+  Phase 3.1 runs.  When a cross-session CA key mismatch is detected (CA rotated
+  in a prior boot, leaf certs appear valid-by-date but carry the old key),
+  ca_key_mismatch=True is set and propagated to Phase 3.1 as force_all=True,
+  so cert-manager re-signs all vcf-cluster-issuer certs in Phase 3.1 rather
+  than deferring to Phase 5's post-Phase-3.1 safety net.
+- _phase5_casync() gains leaf_certs_prerenewed parameter.  When Phase 3.1
+  already force-renewed due to ca_rotated or ca_key_mismatch, Phase 5 carries
+  that signal for the pod-restart decision in Step 4.  Phase 5 Step 1b still
+  runs as a final safety net; pod restarts now trigger when EITHER Step 1b OR
+  leaf_certs_prerenewed is True OR node CA files were updated.
+
+v1.9 Changes:
+- Phase 5 (casync): Detects and repairs two independent failure modes that both
+  cause x509 ECDSA verification failures, ImagePullBackOff, and 'Stage VCF
+  services runtime' errors when installing VCF components.
+  Mode A (CA file stale): containerd reads its registry CA trust from a raw
+  file (/etc/containerd/certs.d/.../ca.crt) written once at node deploy time
+  and never updated by prior startup scripts.  Phase 5 compares that file to
+  vcf-cluster-ca-secret ca.crt across all nodes and pushes the current CA
+  via inline base64 echo (no SCP), restarting containerd only on stale nodes.
+  Mode B (leaf certs signed by old CA key): cert-manager leaf certs may have
+  been issued BEFORE the current CA key pair was created — i.e., Phase 3.0
+  rotated the CA key in a previous session, but Phase 3.1 force-renewal either
+  raced with cert-manager's cache or was skipped in subsequent boots (certs
+  appear Ready with >60d remaining).  Phase 5 runs openssl verify on the CP
+  node to compare registry-certificate against the current CA cert.  On
+  failure, it deletes all vcf-cluster-issuer backed Secrets (30 certs across
+  6 namespaces) so cert-manager re-signs them with the current key, then waits
+  up to 120s for all certs to be Ready.
+  In both modes, zot-1-0, metadata-service, and vmsp-identity are restarted
+  after any fix so they reload updated certs.  VSP only.  --skip-casync bypasses.
 
 v1.8 Changes:
 - THRESHOLD_DAYS lowered from 365 (1 year) to 60 days.  Some certs cannot be
@@ -74,6 +149,7 @@ Usage:
                                [--dry-run]
                                [--skip-kubeadm] [--skip-kubelet]
                                [--skip-certmanager] [--skip-antrea]
+                               [--skip-casync]
 """
 
 import argparse
@@ -88,8 +164,8 @@ import time
 from datetime import datetime, timezone
 
 # ─── Version ──────────────────────────────────────────────────────────────────
-VERSION = "1.8"
-DATE    = "2026-05-22"
+VERSION = "2.0"
+DATE    = "2026-06-09"
 
 # ─── Global constants ─────────────────────────────────────────────────────────
 THRESHOLD_DAYS = 60            # renew if any cert expires within 60 days
@@ -97,6 +173,16 @@ THRESHOLD_SEC  = THRESHOLD_DAYS * 86400
 CERT_VALIDITY  = "43830h0m0s"  # 5 years via kubeadm certificateValidityPeriod
 CREDS_FILE     = "/home/holuser/creds.txt"
 VSP_USER       = "vmware-system-user"
+
+# Phase 5: containerd CA trust sync
+CONTAINERD_CA_PATH = (
+    '/etc/containerd/certs.d/'
+    'registry.vmsp-platform.svc.cluster.local:5000/ca.crt'
+)
+CA_SECRET_NAME = 'vcf-cluster-ca-secret'
+CA_SECRET_NS   = 'vmsp-platform'
+ZOT_POD        = 'zot-1-0'
+ZOT_NS         = 'vmsp-platform'
 
 # ─── Cluster registry ─────────────────────────────────────────────────────────
 # worker_fqdn:    DNS name of any VSP worker node — used to discover the CP IP
@@ -112,7 +198,7 @@ CLUSTERS = {
     "vsp": {
         "label":          "VSP",
         "worker_fqdn":    "vsp-01a.site-a.vcf.lab",
-        "phases":         ["kubeadm", "kubelet", "extendca", "certmanager", "antrea"],
+        "phases":         ["kubeadm", "kubelet", "extendca", "certmanager", "antrea", "casync"],
         # VSP workers use serverTLSBootstrap: true — patch KCM --cluster-signing-duration
         # before Phase 2 so newly-signed kubelet CSRs get CERT_VALIDITY (5 years)
         # instead of the default 1-year duration.
@@ -1439,6 +1525,352 @@ def _phase4_antrea(cluster_cfg, cp_ip, password, kubeconfig, dry_run, threshold_
     log_renewed(f"{secret_nm} — NEW EXPIRY: {new_expiry}")
 
 
+# ─── CA key consistency pre-check (VSP only) ─────────────────────────────────
+def _check_ca_key_consistency(cp_ip, password, kubeconfig):
+    """Pre-check: does registry-certificate verify against the CURRENT vcf-cluster-ca key?
+
+    Called at the top of _check_cluster() for VSP BEFORE Phase 1/2/3.1 so that
+    Phase 3.1 can use force_all=True when a cross-session CA key mismatch exists.
+
+    Cross-session failure mode: Phase 3.0 ran in boot N and rotated the CA key
+    pair (new Secret issued).  Phase 3.1 in boot N force-renewed leaf certs but
+    may have missed some, OR subsequent boots (N+1, N+2…) skip Phase 3.0 (CA
+    now has >1y remaining) AND skip Phase 3.1 (leaf certs appear Ready with
+    >60d remaining) — but those leaf certs are signed by the OLD CA key and will
+    fail x509 ECDSA verification at runtime.
+
+    Returns True  (mismatch detected)  → caller sets force_all=True for Phase 3.1
+    Returns False (consistent)         → no corrective action needed from pre-check
+    On any SSH / parse failure: logs WARN, returns False (safe default — do not
+    accidentally force-renew when the cluster is unreachable).
+    """
+    kc_flag = f"--kubeconfig={kubeconfig}" if kubeconfig else ""
+    log_sep()
+    log_info("CA Key Consistency Pre-Check (runs before Phase 1)")
+    log_info(f"  CA source : {CA_SECRET_NS}/{CA_SECRET_NAME}")
+    log_info("  Leaf probe: registry-certificate in vmsp-platform")
+
+    verify_cmd = (
+        f"kubectl {kc_flag} get secret {CA_SECRET_NAME} -n {CA_SECRET_NS} "
+        f"-o jsonpath='{{{{.data.ca\\.crt}}}}' 2>/dev/null | base64 -d > /tmp/precheck_ca.pem && "
+        f"kubectl {kc_flag} get secret registry-certificate -n vmsp-platform "
+        f"-o jsonpath='{{{{.data.tls\\.crt}}}}' 2>/dev/null | base64 -d > /tmp/precheck_reg.pem && "
+        f"openssl verify -CAfile /tmp/precheck_ca.pem /tmp/precheck_reg.pem 2>&1; "
+        f"RET=$?; rm -f /tmp/precheck_ca.pem /tmp/precheck_reg.pem; exit $RET"
+    )
+    rc_v, v_out = _ssh_exec(cp_ip, password, verify_cmd, timeout=25)
+
+    if rc_v == 0 and "OK" in v_out:
+        log_info("  Pre-check PASSED — registry-certificate consistent with current CA key")
+        return False
+
+    log_warn(
+        f"  Pre-check FAILED — registry-certificate does NOT verify against "
+        f"vcf-cluster-ca (rc={rc_v}): {v_out[:100]}"
+    )
+    log_warn(
+        "  Root cause: vcf-cluster-ca key pair was rotated in a prior session; "
+        "leaf certs appear Ready/valid-by-date but carry the OLD CA key."
+    )
+    log_warn(
+        "  Consequence: Phase 3.1 will run with force_all=True — all "
+        "vcf-cluster-issuer certs will be re-signed with the current CA key "
+        "BEFORE Phase 1 kubeadm / Phase 2 kubelet renewal begins."
+    )
+    return True
+
+
+# ─── Phase 5: containerd CA trust sync (VSP only) ────────────────────────────
+
+def _phase5_renew_leaf_certs(cp_ip, password, kc_flag, dry_run):
+    """Force-renew all cert-manager Certificates backed by vcf-cluster-issuer.
+
+    Called when the registry serving cert fails openssl verify against the
+    current cluster CA — meaning the CA key pair was rotated after the leaf
+    certs were issued and Phase 3.1 did not force-renew them (because the
+    rotation was not detected in the current session's Phase 3.0 run).
+
+    Failure mode: Phase 3.0 rotates the CA; Phase 3.1 force-renews leaf certs
+    via delete-Secret → cert-manager re-issues.  On a SUBSEQUENT boot, Phase
+    3.0 is skipped (CA has >1y remaining), Phase 3.1 is skipped (leaf certs
+    have >60d remaining), but the leaf certs are still signed by the old key.
+
+    Returns True if any Secret deletions were submitted.
+    """
+    log_info("  Step 1b: Identifying all vcf-cluster-issuer backed certs for renewal...")
+    rc, certs_out = _ssh_exec(
+        cp_ip, password,
+        f"kubectl {kc_flag} get certificates -A -o json 2>/dev/null",
+        timeout=30,
+    )
+    if rc != 0 or "{" not in certs_out:
+        log_warn("  Could not list Certificates — skipping leaf-cert renewal")
+        return False
+
+    try:
+        certs_data = json.loads(certs_out[certs_out.find("{"):])
+    except Exception as exc:
+        log_warn(f"  Could not parse Certificates JSON: {exc} — skipping")
+        return False
+
+    to_renew = []
+    for item in certs_data.get("items", []):
+        issuer_ref = item.get("spec", {}).get("issuerRef", {})
+        if issuer_ref.get("name") == "vcf-cluster-issuer":
+            ns     = item.get("metadata", {}).get("namespace", "")
+            secret = item.get("spec", {}).get("secretName", "")
+            name   = item.get("metadata", {}).get("name", "")
+            if ns and secret:
+                to_renew.append((ns, name, secret))
+
+    if not to_renew:
+        log_warn("  No vcf-cluster-issuer backed certs found — skipping")
+        return False
+
+    log_action(
+        f"  CA rotation detected — force-renewing {len(to_renew)} "
+        f"vcf-cluster-issuer cert(s) by deleting their Secrets..."
+    )
+
+    if dry_run:
+        for ns, name, secret in to_renew:
+            log_info(f"  [dry-run] would delete {ns}/{secret} to re-sign {name}")
+        return True
+
+    for ns, name, secret in to_renew:
+        _ssh_exec(
+            cp_ip, password,
+            f"kubectl {kc_flag} delete secret {secret} -n {ns} --ignore-not-found 2>/dev/null",
+            timeout=15,
+        )
+        log_info(f"  Deleted {ns}/{secret} (cert: {name})")
+
+    # Wait up to 120s for all certs to be Ready
+    log_action(f"  Waiting up to 120s for {len(to_renew)} cert(s) to be re-issued...")
+    _all_ready = False
+    for elapsed in range(0, 121, 15):
+        if elapsed > 0:
+            time.sleep(15)
+        rc_w, pending_out = _ssh_exec(
+            cp_ip, password,
+            f"kubectl {kc_flag} get certificates -A --no-headers 2>/dev/null | grep -v ' True '",
+            timeout=20,
+        )
+        if rc_w == 0 and not pending_out.strip():
+            log_info(f"  All certs Ready after {elapsed}s")
+            _all_ready = True
+            break
+
+    if not _all_ready:
+        log_warn("  Some certs not Ready after 120s — continuing (pod restarts will still follow)")
+
+    return True
+
+
+def _phase5_casync(cluster_cfg, cp_ip, password, kubeconfig, dry_run,
+                   leaf_certs_prerenewed=False):
+    """Sync vcf-cluster-ca-secret ca.crt to every VSP node's containerd trust
+    file, and run a final CA key consistency safety-net check.
+
+    v2.0: leaf_certs_prerenewed is True when Phase 3.1 already force-renewed all
+    vcf-cluster-issuer certs this session (due to ca_rotated from Phase 3.0 OR
+    ca_key_mismatch from the pre-check).  Step 1b still runs as a SAFETY NET
+    for any cert that Phase 3.1 may have missed (e.g. --skip-certmanager), but
+    pod restarts are triggered in Step 4 based on EITHER:
+      • leaf_certs_prerenewed  (Phase 3.1 re-signed certs — pods must reload)
+      • leaf_certs_renewed     (Step 1b detected a remaining mismatch and fixed it)
+      • updated                (at least one node CA file was stale and synced)
+
+    Failure modes handled:
+      A. Node CA file stale — push current CA via inline base64, restart
+         containerd on affected nodes only.
+      B. Leaf cert CA key mismatch that SURVIVED Phase 3.1 (safety net only
+         when leaf_certs_prerenewed=False or --skip-certmanager was used) —
+         _phase5_renew_leaf_certs() deletes all vcf-cluster-issuer Secrets and
+         waits up to 120s for cert-manager to re-issue.
+    """
+    kc_flag = f"--kubeconfig={kubeconfig}" if kubeconfig else ""
+    log_sep()
+    log_info("Phase 5: containerd CA trust sync + leaf cert CA verification (safety net)")
+    log_info(f"  CA source            : {CA_SECRET_NS}/{CA_SECRET_NAME}")
+    log_info(f"  Node CA path         : {CONTAINERD_CA_PATH}")
+    log_info(f"  leaf_certs_prerenewed: {leaf_certs_prerenewed} "
+             f"(Phase 3.1 already force-renewed — pods will restart)"
+             if leaf_certs_prerenewed else
+             f"  leaf_certs_prerenewed: False (Step 1b safety net is active)")
+
+    # ── Step 1: read current cluster CA from vcf-cluster-ca-secret ──────────
+    rc, out = _ssh_exec(
+        cp_ip, password,
+        f"kubectl {kc_flag} get secret {CA_SECRET_NAME} -n {CA_SECRET_NS} -o json",
+        timeout=20,
+    )
+    if rc != 0 or "{" not in out:
+        log_warn("Could not read vcf-cluster-ca-secret — skipping Phase 5")
+        return
+
+    try:
+        secret_data = json.loads(out[out.find("{"):])
+        b64_field = secret_data.get("data", {}).get("ca.crt", "")
+        if not b64_field:
+            log_warn("ca.crt field missing from vcf-cluster-ca-secret — skipping Phase 5")
+            return
+        current_ca = base64.b64decode(b64_field).decode()
+    except Exception as exc:
+        log_warn(f"Could not parse vcf-cluster-ca-secret: {exc} — skipping Phase 5")
+        return
+    log_info(f"  Cluster CA obtained ({len(current_ca)} bytes)")
+
+    # ── Step 1b: CA key consistency SAFETY NET ───────────────────────────────
+    # In v2.0, _check_ca_key_consistency() runs BEFORE Phase 1 and propagates
+    # any mismatch to Phase 3.1 via force_all.  By the time Phase 5 runs,
+    # Phase 3.1 should have already corrected any CA key mismatch.
+    # Step 1b is kept as a final safety net for cases where Phase 3.1 was
+    # skipped (--skip-certmanager) or failed to renew some certs.
+    # When leaf_certs_prerenewed=True, we still run the verify; if it passes
+    # (as expected after Phase 3.1 re-signed everything), leaf_certs_renewed
+    # stays False — but pod restarts are still triggered via leaf_certs_prerenewed.
+    leaf_certs_renewed = False
+    log_info("  Step 1b (safety net): verifying registry-certificate against current CA...")
+    verify_cmd = (
+        f"kubectl {kc_flag} get secret {CA_SECRET_NAME} -n {CA_SECRET_NS} "
+        f"-o jsonpath='{{{{.data.ca\\.crt}}}}' 2>/dev/null | base64 -d > /tmp/p5ca.pem && "
+        f"kubectl {kc_flag} get secret registry-certificate -n vmsp-platform "
+        f"-o jsonpath='{{{{.data.tls\\.crt}}}}' 2>/dev/null | base64 -d > /tmp/p5reg.pem && "
+        f"openssl verify -CAfile /tmp/p5ca.pem /tmp/p5reg.pem 2>&1; "
+        f"RET=$?; rm -f /tmp/p5ca.pem /tmp/p5reg.pem; exit $RET"
+    )
+    rc_v, v_out = _ssh_exec(cp_ip, password, verify_cmd, timeout=25)
+    if rc_v == 0 and "OK" in v_out:
+        log_skip("registry-certificate verifies against current CA — leaf certs OK")
+    else:
+        log_warn(
+            f"registry-certificate FAILED verification against current CA "
+            f"(rc={rc_v}): {v_out[:100]}"
+        )
+        log_warn(
+            "Root cause: CA key pair was rotated after leaf certs were issued — "
+            "Phase 3.1 did not re-sign them (rotation not detected this session)"
+        )
+        try:
+            leaf_certs_renewed = _phase5_renew_leaf_certs(
+                cp_ip, password, kc_flag, dry_run
+            )
+        except Exception as exc:
+            log_error(f"_phase5_renew_leaf_certs raised: {exc}")
+
+    # ── Step 2: discover all VSP node IPs via kubectl get nodes ─────────────
+    rc2, nodes_out = _ssh_exec(
+        cp_ip, password,
+        f"kubectl {kc_flag} get nodes -o json",
+        timeout=20,
+    )
+    node_ips = []
+    if rc2 == 0 and "{" in nodes_out:
+        try:
+            for item in json.loads(nodes_out[nodes_out.find("{"):]).get("items", []):
+                for addr in item.get("status", {}).get("addresses", []):
+                    if addr.get("type") == "InternalIP":
+                        node_ips.append(addr["address"])
+                        break
+        except Exception as exc:
+            log_warn(f"Could not parse node list: {exc}")
+    if not node_ips:
+        log_warn("No node IPs returned by kubectl — skipping node CA sync")
+    else:
+        log_info(f"  Nodes ({len(node_ips)}): {', '.join(node_ips)}")
+
+    # ── Step 3: compare and sync CA file on each node ────────────────────────
+    updated = []
+    for node_ip in node_ips:
+        rc_r, node_ca = _ssh_exec(
+            node_ip, password,
+            f"cat '{CONTAINERD_CA_PATH}' 2>/dev/null || echo MISSING",
+            timeout=15,
+        )
+        if node_ca.strip() == "MISSING":
+            log_warn(f"  {node_ip}: containerd CA path not found — skipping node")
+            continue
+        if node_ca.strip() == current_ca.strip():
+            log_skip(f"{node_ip} — containerd CA already current")
+            continue
+
+        log_action(f"{node_ip} — containerd CA STALE — syncing...")
+        if dry_run:
+            log_info(f"  [dry-run] would push CA and restart containerd on {node_ip}")
+            updated.append(node_ip)
+            continue
+
+        # Write the CA PEM to the node inline: base64-encode it, echo through
+        # base64 -d on the remote host.  _ssh_exec base64-encodes the entire
+        # command string, so the embedded ca_b64 is safely transported.
+        ca_b64 = base64.b64encode(current_ca.encode()).decode()
+        target_dir = CONTAINERD_CA_PATH.rsplit("/", 1)[0]
+        write_cmd = (
+            f"echo '{ca_b64}' | base64 -d > /tmp/vsp-cluster-ca-new.crt && "
+            f"mkdir -p '{target_dir}' && "
+            f"cp /tmp/vsp-cluster-ca-new.crt '{CONTAINERD_CA_PATH}' && "
+            "rm -f /tmp/vsp-cluster-ca-new.crt && "
+            "systemctl daemon-reload && "
+            "systemctl restart containerd && "
+            "sleep 3 && "
+            "systemctl is-active containerd && echo CONTAINERD_OK"
+        )
+        rc_w, w_out = _ssh_exec(node_ip, password, write_cmd, timeout=60)
+        if rc_w == 0 and "CONTAINERD_OK" in w_out:
+            log_renewed(f"{node_ip} — CA synced, containerd restarted")
+            updated.append(node_ip)
+        else:
+            log_warn(f"{node_ip} — sync failed (rc={rc_w}): {w_out[:120]}")
+
+    # ── Step 4: restart registry + identity pods if ANY fix was applied ──────
+    # Trigger pod restarts when:
+    #   leaf_certs_prerenewed — Phase 3.1 re-signed certs (CA key sync or rotation)
+    #   leaf_certs_renewed    — Step 1b safety net caught a remaining mismatch
+    #   updated               — at least one node CA file was stale and synced
+    # zot-1-0 must reload its serving cert from the registry-certificate Secret
+    # and containerd must already trust the CA that signed that cert.
+    need_restart = updated or leaf_certs_renewed or leaf_certs_prerenewed
+    if need_restart and not dry_run:
+        reason_parts = []
+        if leaf_certs_prerenewed:
+            reason_parts.append("leaf certs pre-renewed by Phase 3.1")
+        if leaf_certs_renewed:
+            reason_parts.append("leaf certs re-signed by Phase 5 safety net")
+        if updated:
+            reason_parts.append(f"node CA file synced: {', '.join(updated)}")
+        log_action(
+            f"Restarting zot-1-0, metadata-service, vmsp-identity "
+            f"({'; '.join(reason_parts)})..."
+        )
+        _ssh_exec(cp_ip, password,
+                  f"kubectl {kc_flag} delete pod {ZOT_POD} -n {ZOT_NS} --ignore-not-found",
+                  timeout=20)
+        _ssh_exec(cp_ip, password,
+                  f"kubectl {kc_flag} rollout restart daemonset/metadata-service -n vmsp-platform",
+                  timeout=20)
+        _ssh_exec(cp_ip, password,
+                  f"kubectl {kc_flag} rollout restart deployment/vmsp-identity -n vmsp-platform",
+                  timeout=20)
+        log_info("  Waiting 35s for pods to restart...")
+        time.sleep(35)
+    elif need_restart and dry_run:
+        log_info("[dry-run] would restart zot-1-0, metadata-service, vmsp-identity")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    if not updated and not leaf_certs_renewed and not leaf_certs_prerenewed:
+        log_info("Phase 5 complete — all checks passed, no action taken")
+    else:
+        summary_parts = []
+        if leaf_certs_prerenewed:
+            summary_parts.append("Phase 3.1 force-renewed vcf-cluster-issuer certs")
+        if leaf_certs_renewed:
+            summary_parts.append("Phase 5 safety net force-renewed remaining certs")
+        if updated:
+            summary_parts.append(f"CA file synced on {len(updated)} node(s): {', '.join(updated)}")
+        log_info(f"Phase 5 complete — {'; '.join(summary_parts)}")
+
+
 # ─── Per-cluster runner ───────────────────────────────────────────────────────
 def _check_cluster(cluster_name, cluster_cfg, args):
     """Run all configured phases for one cluster.  Never raises."""
@@ -1479,29 +1911,11 @@ def _check_cluster(cluster_name, cluster_cfg, args):
 
     phases_cfg = cluster_cfg.get("phases", [])
 
-    # ── Phase 1: kubeadm ──────────────────────────────────────────────────────
-    if "kubeadm" in phases_cfg and not args.skip_kubeadm:
-        try:
-            _phase1_kubeadm(
-                cluster_cfg, cp_ip, password, kubeconfig,
-                args.dry_run, args.threshold_days,
-            )
-        except Exception as exc:
-            log_error(f"Phase 1 (kubeadm) raised unexpected exception: {exc}")
-    else:
-        log_info(f"Phase 1 (kubeadm): skipped")
-
-    # ── Phase 2: kubelet serving ──────────────────────────────────────────────
-    if "kubelet" in phases_cfg and not args.skip_kubelet:
-        try:
-            _phase2_kubelet(
-                cluster_cfg, cp_ip, password, kubeconfig,
-                args.dry_run, args.threshold_days,
-            )
-        except Exception as exc:
-            log_error(f"Phase 2 (kubelet) raised unexpected exception: {exc}")
-    else:
-        log_info(f"Phase 2 (kubelet): skipped")
+    # ════════════════════════════════════════════════════════════════════════
+    # CA-AUTHORITY WORK FIRST (VSP only)
+    # All CA operations must complete before any leaf-cert renewal so that
+    # every cert issued in this run is signed by the most current CA key.
+    # ════════════════════════════════════════════════════════════════════════
 
     # ── Phase 3.0: extend cluster CAs to 10 years (VSP only) ────────────────
     _ca_rotated = False
@@ -1519,20 +1933,67 @@ def _check_cluster(cluster_name, cluster_cfg, args):
         except Exception as exc:
             log_error(f"Phase 3.0 (extend-ca) raised unexpected exception: {exc}")
     else:
-        log_info(f"Phase 3.0 (extend-ca): skipped")
+        log_info("Phase 3.0 (extend-ca): skipped")
+
+    # ── CA key consistency pre-check (VSP only) ──────────────────────────────
+    # Detects the cross-session failure: Phase 3.0 rotated the CA in boot N,
+    # Phase 3.1 missed some certs or was skipped, and subsequent boots find
+    # leaf certs that appear Ready/valid-by-date but carry the OLD CA key.
+    # Running this BEFORE Phases 1/2/3.1 ensures Phase 3.1 force-renews ALL
+    # leaf certs in the same run, before any kubeadm/kubelet work begins.
+    _ca_key_mismatch = False
+    if "casync" in phases_cfg:   # casync phase implies VSP with registry infra
+        try:
+            _ca_key_mismatch = _check_ca_key_consistency(cp_ip, password, kubeconfig)
+        except Exception as exc:
+            log_error(f"CA key pre-check raised unexpected exception: {exc}")
+
+    # force_all propagates to Phase 3.1: either the CA was rotated THIS session
+    # (ca_rotated) or a prior session's rotation left stale-key certs (ca_key_mismatch).
+    _force_leaf_renewal = _ca_rotated or _ca_key_mismatch
+
+    # ════════════════════════════════════════════════════════════════════════
+    # LEAF CERT RENEWAL (all clusters — kubeadm PKI is separate from vcf-cluster-ca)
+    # ════════════════════════════════════════════════════════════════════════
+
+    # ── Phase 1: kubeadm CP certs ─────────────────────────────────────────────
+    if "kubeadm" in phases_cfg and not args.skip_kubeadm:
+        try:
+            _phase1_kubeadm(
+                cluster_cfg, cp_ip, password, kubeconfig,
+                args.dry_run, args.threshold_days,
+            )
+        except Exception as exc:
+            log_error(f"Phase 1 (kubeadm) raised unexpected exception: {exc}")
+    else:
+        log_info("Phase 1 (kubeadm): skipped")
+
+    # ── Phase 2: kubelet serving certs ───────────────────────────────────────
+    if "kubelet" in phases_cfg and not args.skip_kubelet:
+        try:
+            _phase2_kubelet(
+                cluster_cfg, cp_ip, password, kubeconfig,
+                args.dry_run, args.threshold_days,
+            )
+        except Exception as exc:
+            log_error(f"Phase 2 (kubelet) raised unexpected exception: {exc}")
+    else:
+        log_info("Phase 2 (kubelet): skipped")
 
     # ── Phase 3.1: cert-manager leaf cert renewal (VSP only) ─────────────────
+    # force_all=True when ca_rotated OR ca_key_mismatch: guarantees all
+    # vcf-cluster-issuer certs are re-signed with the verified current CA key.
     if "certmanager" in phases_cfg and not args.skip_certmanager:
         try:
             _phase3_certmanager(
                 cluster_cfg, cp_ip, password, kubeconfig,
                 args.dry_run, args.threshold_days,
-                force_all=_ca_rotated,
+                force_all=_force_leaf_renewal,
             )
         except Exception as exc:
             log_error(f"Phase 3.1 (cert-manager) raised unexpected exception: {exc}")
     else:
-        log_info(f"Phase 3.1 (cert-manager): skipped")
+        log_info("Phase 3.1 (cert-manager): skipped")
 
     # ── Phase 4: Antrea TLS (VSP only) ────────────────────────────────────────
     if "antrea" in phases_cfg and not args.skip_antrea:
@@ -1544,7 +2005,23 @@ def _check_cluster(cluster_name, cluster_cfg, args):
         except Exception as exc:
             log_error(f"Phase 4 (antrea) raised unexpected exception: {exc}")
     else:
-        log_info(f"Phase 4 (antrea): skipped")
+        log_info("Phase 4 (antrea): skipped")
+
+    # ── Phase 5: containerd CA trust sync + safety-net verify (VSP only) ─────
+    # leaf_certs_prerenewed tells Phase 5 Step 4 that Phase 3.1 already
+    # force-renewed leaf certs this session, so pods must restart even if
+    # Phase 5's own Step 1b safety-net verify now passes cleanly.
+    if "casync" in phases_cfg and not args.skip_casync:
+        try:
+            _phase5_casync(
+                cluster_cfg, cp_ip, password, kubeconfig,
+                args.dry_run,
+                leaf_certs_prerenewed=_force_leaf_renewal,
+            )
+        except Exception as exc:
+            log_error(f"Phase 5 (casync) raised unexpected exception: {exc}")
+    else:
+        log_info("Phase 5 (casync): skipped")
 
     log_sep()
     log_info(f"══ Certificate check/renewal complete ══")
@@ -1586,6 +2063,8 @@ def main():
                         help="Skip Phase 3.1 (cert-manager leaf cert renewal)")
     parser.add_argument("--skip-antrea",      action="store_true",
                         help="Skip Phase 4 (Antrea TLS renewal)")
+    parser.add_argument("--skip-casync",      action="store_true",
+                        help="Skip Phase 5 (containerd CA trust sync)")
     parser.add_argument(
         "--no-timestamps",
         action="store_true",
