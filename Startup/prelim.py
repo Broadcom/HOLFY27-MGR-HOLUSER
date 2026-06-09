@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.13 - 2026-06-01
+# Version 3.15 - 2026-06-09
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -408,6 +408,28 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.clear_console_os_proxy(_console_host, _pw, dry_run)
     except Exception as e:
         lsf.write_output(f'WARNING: Console OS proxy step skipped: {e}')
+
+    # Update proxy export lines in holuser and root .bashrc via NFS mount
+    try:
+        if loader.requires_proxy_filter():
+            lsf.set_console_bashrc_proxy(dry_run)
+            lsf.write_output(f'Console .bashrc proxy set...')
+        else:
+            lsf.clear_console_bashrc_proxy(dry_run)
+            lsf.write_output(f'Console .bashrc proxy cleared...')
+    except Exception as e:
+        lsf.write_output(f'WARNING: Console .bashrc proxy step skipped: {e}')
+
+    # GNOME Network Settings proxy (dconf for holuser on the console)
+    try:
+        _console_host = 'root@console.site-a.vcf.lab'
+        _pw = lsf.get_password()
+        if loader.requires_proxy_filter():
+            lsf.set_console_gnome_proxy(_console_host, _pw, dry_run)
+        else:
+            lsf.clear_console_gnome_proxy(_console_host, _pw, dry_run)
+    except Exception as e:
+        lsf.write_output(f'WARNING: Console GNOME proxy step skipped: {e}')
 
     if dashboard:
         dashboard.update_task('prelim', 'console_os_proxy', 'complete')
