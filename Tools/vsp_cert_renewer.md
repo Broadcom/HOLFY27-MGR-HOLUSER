@@ -1,6 +1,6 @@
 # vsp_cert_renewer.py — Reference Guide
 
-**Version:** 2.2 — 2026-06-10  
+**Version:** 2.6 — 2026-06-10  
 **Script:** `Tools/vsp_cert_renewer.py`  
 **Called by:** `Startup/VCFfinal.py` Task 2e (before VCF component scale-up)
 
@@ -57,24 +57,28 @@ Reasons:
 3. **Forward-compatibility.** If Phase 3.0 is ever extended to also manage the kubeadm PKI
    CA, running Phases 1 and 2 after Phase 3.0 is the only correct ordering.
 
-### The pre-check (new in v2.0)
+### The pre-check (new in v2.0, hardened in v2.6)
 
 `_check_ca_key_consistency()` runs between Phase 3.0 and Phase 1. It performs:
 
 ```bash
 kubectl get secret vcf-cluster-ca-secret -n vmsp-platform → /tmp/precheck_ca.pem
 kubectl get secret registry-certificate -n vmsp-platform  → /tmp/precheck_reg.pem
+# v2.6: validate both files are >10 bytes before verify
+stat -c%s /tmp/precheck_ca.pem  (if <10 → INCONCLUSIVE, return False)
 openssl verify -CAfile /tmp/precheck_ca.pem /tmp/precheck_reg.pem
 ```
 
 - **PASS** → no cross-session drift; `ca_key_mismatch = False`
+- **INCONCLUSIVE** (v2.6) → Secret data not yet available on CP node during early boot;
+  `ca_key_mismatch = False` (safe default — avoids false-positive force_all cascade)
 - **FAIL** → stale-key leaf certs detected; `ca_key_mismatch = True` → Phase 3.1 runs
-  with `force_all = True`, re-signing all vcf-cluster-issuer certs **before** Phase 1 kubeadm
-  and Phase 2 kubelet work begins.
+  with `force_all = True`, re-signing all vcf-cluster-issuer **leaf** certs (CAs excluded)
+  **before** Phase 1 kubeadm and Phase 2 kubelet work begins.
 
 ---
 
-## Phase Execution Order (v2.0)
+## Phase Execution Order (v2.6)
 
 ```plain
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -91,15 +95,19 @@ openssl verify -CAfile /tmp/precheck_ca.pem /tmp/precheck_reg.pem
 │                                                                              │
 │  ── force_all = ca_rotated OR ca_key_mismatch ────────────────────────────── │
 │                                                                              │
-│  Phase 3.2   trust-manager + vmsp-operator re-sync       (when force_all)   │
+│  Phase 3.2   trust-manager + vmsp-operator + cert-manager re-sync (force_all)│
 │              (a) Restarts trust-manager Deployment; waits for Ready; deletes │
 │              platform-trust ConfigMaps in vmsp-platform, vcf-fleet-depot,   │
 │              vcf-fleet-lcm, ops-logs so trust-manager recreates them with   │
 │              the new CA cert.                                                │
-│              (b) After ConfigMaps are rebuilt, restarts vmsp-operator        │
-│              Deployment. The vmsp-operator bundle controller caches TLS root │
-│              CAs at Go startup and does NOT auto-reload updated ConfigMap    │
-│              volumes — restart ensures it starts with the correct CA pool.  │
+│              (b) Restarts vmsp-operator Deployment. Its Go binary caches TLS│
+│              root CAs at startup and does NOT auto-reload — restart forces  │
+│              fresh CA pool load so bundle controller avoids ECDSA errors.   │
+│              (c) Restarts cert-manager Deployment. cert-manager can cache   │
+│              the old CA Issuer key for seconds after CA rotation. Without   │
+│              this restart, Phase 3.1 re-issues ALL leaf certs with the OLD  │
+│              CA key (wrong AKI), breaking SeaWeedFS mTLS, vmsp-identity,   │
+│              synthetic-checker, and the component install precheck.         │
 │              Without both restarts, Stage VCF services runtime fails with   │
 │              "ECDSA verification failure" when pushing images to zot-1.      │
 │                                                                              │
@@ -116,10 +124,15 @@ openssl verify -CAfile /tmp/precheck_ca.pem /tmp/precheck_reg.pem
 ├──────────────────────────────────────────────────────────────────────────────┤
 │  VSP-ONLY LEAF CERT RENEWAL  (informed by CA state above)                    │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│  Phase 3.1   cert-manager leaf certs                                         │
+│  Phase 3.1   cert-manager LEAF certs (CA certs SKIPPED — Phase 3.0 manages) │
 │              Renews all vcf-cluster-issuer certs not-Ready or < 60d.         │
-│              When force_all=True: renews ALL regardless of expiry —          │
-│              ensuring every cert is signed by the current vcf-cluster-ca key.│
+│              CA certificates (spec.isCA: true) are always excluded.         │
+│              When force_all=True: renews all LEAF certs regardless of        │
+│              expiry — ensuring every leaf cert is signed by the current      │
+│              vcf-cluster-ca key without touching the CA itself.             │
+│              After renewal: restarts Kyverno background-controller to       │
+│              re-sync cloned secrets (seaweedfs-client-cert, etc.) to        │
+│              component namespaces (vidb-external, salt, vcf-fleet-*, etc.). │
 │                                                                              │
 │  Phase 4     Antrea controller TLS                                           │
 │              Self-signed 5-year cert injected into antrea-controller-tls.    │
@@ -127,9 +140,25 @@ openssl verify -CAfile /tmp/precheck_ca.pem /tmp/precheck_reg.pem
 │  VSP-ONLY TRUST SYNC  (after all cert work is done)                          │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │  Phase 5     containerd CA file sync + safety-net verify                     │
-│              Node CA files synced. Step 1b re-runs openssl verify as a       │
-│              safety net for anything Phase 3.1 missed. Pod restarts if any   │
-│              of: leaf_certs_prerenewed, leaf_certs_renewed, nodes_updated.   │
+│              Step 1: Read vcf-cluster-ca-secret ca.crt.                      │
+│              Step 1b SAFETY NET: wait up to 30s for registry-certificate     │
+│              tls.crt to be non-empty (race guard — Phase 3.1 may have just  │
+│              deleted the secret and cert-manager may not have re-issued it   │
+│              yet).  Then openssl verify registry-certificate against current │
+│              CA.  If still missing after 30s, skip verify; Step 3b covers.  │
+│              Step 2–3: SSH to each VSP node; compare and sync CA file.      │
+│              Nodes with SSH auth failure (sshpass exit 5) are skipped after  │
+│              one attempt to prevent pam_faillock lockout on CP node.        │
+│              Step 3b: kubectl rollout restart daemonset/zot-1-configure-node │
+│              when certs changed.  Copies registry-cert ca.crt to each node  │
+│              containerd trust store — covers SSH-unreachable nodes.          │
+│              Step 4b: rollout restart seaweedfs-filer/master/volume          │
+│              StatefulSets. SeaWeedFS uses mTLS and holds its cert in memory. │
+│              Step 5: resolve hooks-server-synthetic-checker ClusterIP via    │
+│              kubectl get svc (dynamic, varies per deployment — never         │
+│              hardcoded). Poll /healthz with curl (wget fallback) every 20s  │
+│              up to 300s until {"status":"OK"} so Fleet LCM install-component │
+│              synthetic pre-check always finds a stable platform.             │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -217,14 +246,17 @@ flowchart TD
     ENTRY --> P31_GATE{skip-certmanager?}
     P31_GATE -- skip --> P4_GATE
 
-    subgraph PH31["── Phase 3.1: cert-manager Leaf Certs (VSP only) ─────────"]
+    subgraph PH31["── Phase 3.1: cert-manager LEAF Certs (VSP only) ─────────"]
         P31A["Get all Certificate resources\nkubectl get certificates -A -o json"]
-        P31A --> P31B{"force_all = True?\n(ca_rotated OR ca_key_mismatch)"}
-        P31B -- "Yes — CA key changed\nor cross-session drift detected" --> P31FALL["Force-renew ALL certs\nregardless of expiry or Ready state"]
+        P31A --> P31CA{"spec.isCA: true?"}
+        P31CA -- "Yes (CA cert)" --> P31CAS["SKIP — CA managed by Phase 3.0\n(deleting CA Secret = unintended\nCA rotation + Kyverno clone loss)"]
+        P31CA -- "No (leaf cert)" --> P31B{"force_all = True?\n(ca_rotated OR ca_key_mismatch)"}
+        P31B -- "Yes — CA key changed\nor cross-session drift detected" --> P31FALL["Force-renew ALL leaf certs\nregardless of expiry or Ready state"]
         P31B -- "No" --> P31C{"cert not-Ready\nOR < threshold_days?"}
         P31C -- No --> P31S["SKIP — cert OK"]
         P31C -- Yes --> P31ACT
         P31FALL --> P31ACT["Patch spec.duration → 5 years\n(skip if ownerReferences)\nDelete backing Secret\ncert-manager re-issues immediately"]
+        P31ACT --> P31KY["Restart Kyverno background-controller\nto re-sync cloned secrets\n(seaweedfs-client-cert etc.)\nto component namespaces"]
     end
 
     P31_GATE -- run --> P31A
@@ -278,13 +310,20 @@ Pre-check ──► ca_key_mismatch ──────────────�
                                                   │
                                 leaf_certs_prerenewed = force_all
                                                   │
+                               Post-Phase-3.1 verify (when force_all=True)
+                               openssl verify registry-certificate → CA
+                               PASS: log early success
+                               FAIL: log early warning — Phase 5 will repair
+                                                  │
                                             Phase 5 ◄── leaf_certs_prerenewed
                                                   │
                      Phase 5 Step 1b (safety net) │
+                     (race guard: wait ≤30s for   │
+                      registry-certificate ready) │
                                   │               │
                      leaf_certs_renewed           │
                                   │               │
-                                  └──► need_restart = leaf_certs_prerenewed
+                                  └──► certs_changed = leaf_certs_prerenewed
                                                       OR leaf_certs_renewed
                                                       OR nodes_updated
                                                   │
@@ -292,6 +331,12 @@ Pre-check ──► ca_key_mismatch ──────────────�
                                             zot-1-0
                                             metadata-service
                                             vmsp-identity
+                                            seaweedfs-filer/master/volume
+                                                  │
+                                       Phase 5 Step 5:
+                                       Resolve ClusterIP dynamically via
+                                       kubectl get svc (curl/wget fallback)
+                                       Poll synthetic health → {"status":"OK"}
 ```
 
 ---
@@ -326,6 +371,18 @@ python3 vsp_cert_renewer.py --cluster vsp|vcfa|all
 | `x509: ECDSA verification failure` but node CA file is current | Leaf certs signed by old CA key pair (cross-session drift) | CA pre-check → Phase 3.1 force_all (v2.0); or Phase 5 Step 1b safety net |
 | `x509: ECDSA verification failure` in `vmsp-operator` during Stage VCF services | `platform-trust` ConfigMap stale (trust-manager missed CA secret recreation event) | Phase 3.2 Step 1-3: restart trust-manager, delete+recreate platform-trust (v2.1) |
 | `x509: ECDSA verification failure` in `vmsp-operator` after platform-trust updated | `vmsp-operator` Go binary caches TLS root CAs at startup; does not auto-reload ConfigMap volumes | Phase 3.2 Step 4: restart vmsp-operator after ConfigMaps rebuilt (v2.2) |
+| All leaf certs signed by OLD CA key immediately after CA rotation (wrong AKI) | `cert-manager` caches the old CA Issuer in memory; a restart is needed to flush the cache before Phase 3.1 re-issues leaf certs | Phase 3.2 Step 7-8: restart cert-manager before Phase 3.1 (v2.3) |
+| `ImagePullBackOff` (`x509: certificate signed by unknown authority`) on worker nodes after CA rotation | `containerd` trust store on nodes not updated — SSH-unreachable nodes missed Phase 5 Steps 2–3 | Phase 5 Step 3b: `kubectl rollout restart daemonset/zot-1-configure-node` (v2.3) |
+| `seaweedfs-filer: wrong resource state: InProgress - Ready: 0/1` in synthetic health precheck | SeaWeedFS pods hold mTLS certs in memory; after cert-manager re-issues with new CA, running pods still serve old cert until restarted | Phase 5 Step 4b: rollout restart all SeaWeedFS StatefulSets (v2.3) |
+| `install-component` fails with exit code 218 immediately after `stage-component` succeeds | Synthetic health pre-check ran while VSP cluster was still stabilising after cert restarts (SeaWeedFS stale TCP connections, newly restarted pods initialising) | Phase 5 Step 5: poll synthetic health checker until OK before exiting (v2.4) |
+| Phase 5 Step 5 synthetic poll silently never runs (wrong ClusterIP) | Hardcoded ClusterIP (198.18.227.67) varies per deployment — correct IP must be queried from the cluster | Phase 5 Step 5 now resolves ClusterIP dynamically via `kubectl get svc` (v2.5) |
+| Phase 5 Step 5 fails with `curl: command not found` on CP node | Minimal Photon builds may lack `curl` | Phase 5 Step 5 now probes for `curl`; falls back to `wget -qO- --no-check-certificate` (v2.5) |
+| Phase 5 Step 1b openssl verify fails spuriously after Phase 3.1 | Phase 3.1 just deleted `registry-certificate` and cert-manager has not yet re-issued it; openssl verify runs on empty data, triggers unnecessary double-renewal | Phase 5 Step 1b now waits up to 30s for `registry-certificate` `tls.crt` to be non-empty before running verify (v2.5) |
+| SSH lockout on CP node (10.1.1.142 / 10.1.1.143) during Phase 5 Step 3 | Repeated SSH auth failures trigger `pam_faillock` — Step 3 retried auth on CP whose password differs from workers | Phase 5 Step 3 now skips any node where `sshpass` exits 5 (auth failure) after the first attempt (v2.5) |
 | `ImagePullBackOff` on VSP pods | Either Mode A or Mode B above; zot-1-0 presents cert that containerd cannot verify | Phase 5 pod restarts after either fix |
 | Phase 3.1 force-renews all certs on every boot | CA_MIN_REMAINING_H threshold too high — Phase 3.0 rotates CA on every boot | Lower threshold (already set to 8760h / 1y in v1.7) |
 | cert-manager certs appear Ready but pods still fail TLS | openssl verify fails — `registry-certificate` signed by old key, appears Ready | CA pre-check (new in v2.0) catches before Phase 3.1 |
+| Post-Phase-3.1: registry-certificate still mismatched after force-renewal | cert-manager re-issued with stale cached key (Phase 3.2 cert-manager restart may not have propagated in time) | Post-Phase-3.1 verify now logs early warning; Phase 5 Step 1b safety net repairs (v2.5) |
+| `CreateContainerConfigError: secret "vmsp-proxy-service-secret" not found` in vidb-external | Phase 3.1 deleted source secrets in vmsp-platform; Kyverno deleted clones but its background-controller missed the re-sync after cert-manager recreated the sources | Phase 3.1 now restarts Kyverno background-controller after cert renewals (v2.6); also, CA certs are no longer deleted (v2.6) |
+| Phase 3.1 triggers unintended CA rotation (new key pair) on every boot | `force_all=True` caused Phase 3.1 to include CA certificates (spec.isCA: true) in the renewal list, deleting the CA Secret and causing cert-manager to regenerate the key pair | Phase 3.1 now skips all CA certificates — CA lifecycle is managed exclusively by Phase 3.0 (v2.6) |
+| False-positive `force_all=True` on fresh template boot | CA pre-check ran before API server fully loaded Secrets; empty `ca.crt` data caused openssl `Error loading file` → `ca_key_mismatch=True` | Pre-check now validates files are >10 bytes before verify; returns INCONCLUSIVE (safe False) when data unavailable (v2.6) |
