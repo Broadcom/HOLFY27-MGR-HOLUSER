@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 vsp_cert_renewer.py
-Version 2.0 - 2026-06-09
+Version 2.1 - 2026-06-10
 Author: Burke Azbill, Kevin Tebear, and HOL Core Team
 
 Proactive Kubernetes certificate check and renewal for VSP and VCFA clusters.
@@ -34,6 +34,16 @@ PHASE EXECUTION ORDER (v2.0):
   │                              the certs appear valid-by-date but carry the  │
   │                              old CA key.  Sets ca_key_mismatch=True, which │
   │                              also propagates to Phase 3.1 force_all.       │
+  │                                                                             │
+  │  3.2  trust-manager sync     When ca_rotated OR ca_key_mismatch: restarts  │
+  │                              the trust-manager Deployment, then deletes     │
+  │                              platform-trust ConfigMaps in key namespaces    │
+  │                              so trust-manager recreates them with the new   │
+  │                              CA cert.  Fixes ECDSA verification failures    │
+  │                              when the fleet-depot pod pushes images to the  │
+  │                              zot-1 registry during Stage VCF services.      │
+  │                              Must run BEFORE Phase 3.1 (leaf cert issuance) │
+  │                              so bundles are current before new certs appear.│
   └───────────────────────────────────────────────────────────────────────────┘
   ┌─ ALL CLUSTERS — leaf certs against now-current CA ────────────────────────┐
   │  1.   kubeadm CP certs       API server, etcd, front-proxy certs on CP.   │
@@ -64,6 +74,20 @@ Log format per cert:
   SKIP   : <name> — valid for ><N>d
   WARN   : <description>
   ERROR  : <description>
+
+v2.1 Changes:
+- New Phase 3.2 (_phase3_sync_trust_manager): after a CA rotation (ca_rotated) OR
+  a cross-session CA key mismatch (ca_key_mismatch), trust-manager is restarted and
+  all platform-trust ConfigMaps in key namespaces (vmsp-platform, vcf-fleet-depot,
+  vcf-fleet-lcm, ops-logs) are deleted so trust-manager recreates them with the new
+  CA cert included.  Root cause: trust-manager's Kubernetes informer misses the
+  delete+create cycle of vcf-cluster-ca-secret during CA rotation, leaving stale CA
+  data in platform-trust ConfigMaps for up to 19h.  The fleet-depot pod uses
+  platform-trust to verify TLS connections to the zot-1 internal registry — a stale
+  bundle causes every stage-component image push to fail with "ECDSA verification
+  failure", blocking Log management and other VCF component installations.  Phase 3.2
+  runs BEFORE Phase 3.1 (leaf cert renewal) so bundles are correct before new certs
+  are issued.
 
 v2.0 Changes:
 - Phase ordering corrected: ALL CA-authority operations now execute BEFORE any
@@ -164,8 +188,8 @@ import time
 from datetime import datetime, timezone
 
 # ─── Version ──────────────────────────────────────────────────────────────────
-VERSION = "2.0"
-DATE    = "2026-06-09"
+VERSION = "2.1"
+DATE    = "2026-06-10"
 
 # ─── Global constants ─────────────────────────────────────────────────────────
 THRESHOLD_DAYS = 60            # renew if any cert expires within 60 days
@@ -1120,6 +1144,120 @@ def _phase3_extend_ca(cluster_cfg, cp_ip, password, kubeconfig, dry_run):
     return rotated  # True if ≥1 CA was replaced; caller must force-renew leaf certs
 
 
+# ─── Phase 3.2: trust-manager bundle re-sync after CA rotation ───────────────
+# When Phase 3.0 (or a cross-session CA key mismatch) causes new CA key pairs
+# to be issued, the trust-manager Bundle controller must re-sync so that every
+# namespace's platform-trust ConfigMap includes the freshly issued CA cert.
+#
+# Root cause: trust-manager watches labeled Secrets for changes.  When Phase 3.0
+# deletes and recreates vcf-cluster-ca-secret, trust-manager's watch can miss the
+# creation event (Kubernetes informer race on delete+create within a tight window),
+# leaving ALL platform-trust ConfigMaps with the OLD CA cert.  Pods in the fleet-
+# depot namespace use platform-trust to verify TLS connections to the internal zot-1
+# registry — if the ConfigMap doesn't include the new CA cert, every image push
+# during Stage VCF services runtime fails with "ECDSA verification failure".
+#
+# Fix: restart the trust-manager Deployment (forces a full re-list of all sources),
+# wait for it to become ready, then delete the stale platform-trust ConfigMaps in
+# critical namespaces so trust-manager recreates them with the new CA cert included.
+_TRUST_MANAGER_NS     = "vmsp-platform"
+_TRUST_MANAGER_DEPLOY = "trust-manager"
+_PLATFORM_TRUST_CM    = "platform-trust"
+_PLATFORM_TRUST_NAMESPACES = [
+    "vmsp-platform",
+    "vcf-fleet-depot",
+    "vcf-fleet-lcm",
+    "ops-logs",
+]
+
+
+def _phase3_sync_trust_manager(cluster_cfg, cp_ip, password, kubeconfig, dry_run):
+    """Restart trust-manager and force-refresh platform-trust ConfigMaps.
+
+    Called after Phase 3.0 rotates a CA (ca_rotated=True) OR when a CA key
+    mismatch is detected (ca_key_mismatch=True).  Ensures all pods that use
+    the platform-trust bundle for TLS verification can trust certs signed by
+    the new CA key — critical for the stage-component fleet-depot → zot-1 push.
+    """
+    label   = cluster_cfg["label"]
+    kc_flag = f"--kubeconfig={kubeconfig}" if kubeconfig else ""
+    log_sep()
+    log_info(f"Phase 3.2 [{label}]: trust-manager bundle re-sync after CA rotation")
+
+    if dry_run:
+        log_info("[dry-run] would restart trust-manager and delete platform-trust ConfigMaps")
+        return
+
+    # Step 1: restart trust-manager Deployment to force a full re-list
+    log_action(f"Restarting {_TRUST_MANAGER_DEPLOY} deployment in {_TRUST_MANAGER_NS}")
+    _ssh_exec(
+        cp_ip, password,
+        f"kubectl {kc_flag} rollout restart deployment {_TRUST_MANAGER_DEPLOY} "
+        f"-n {_TRUST_MANAGER_NS} 2>/dev/null",
+        timeout=20,
+    )
+
+    # Step 2: wait up to 60s for trust-manager pod to become Running (1/1)
+    log_info("Waiting for trust-manager pod to become Ready...")
+    ready = False
+    for attempt in range(30):
+        time.sleep(2)
+        rc, out = _ssh_exec(
+            cp_ip, password,
+            f"kubectl {kc_flag} get pods -n {_TRUST_MANAGER_NS} "
+            f"-l app=trust-manager --no-headers 2>/dev/null | "
+            f"awk '{{print $2, $3}}' | grep -c '1/1 Running'",
+            timeout=15,
+        )
+        if rc == 0 and out.strip() == "1":
+            ready = True
+            break
+    if not ready:
+        log_warn("trust-manager pod did not reach 1/1 Running within 60s — proceeding anyway")
+    else:
+        log_info("trust-manager is Running — waiting 5s for initial reconcile")
+        time.sleep(5)
+
+    # Step 3: delete stale platform-trust ConfigMaps in critical namespaces so
+    # trust-manager recreates them with the current CA cert included.
+    log_action(f"Deleting stale platform-trust ConfigMaps in: {_PLATFORM_TRUST_NAMESPACES}")
+    for ns in _PLATFORM_TRUST_NAMESPACES:
+        rc, out = _ssh_exec(
+            cp_ip, password,
+            f"kubectl {kc_flag} delete configmap {_PLATFORM_TRUST_CM} -n {ns} "
+            f"--ignore-not-found=true 2>/dev/null && echo OK",
+            timeout=15,
+        )
+        status = "deleted" if "OK" in out else "skip/error"
+        log_info(f"  {ns}/{_PLATFORM_TRUST_CM}: {status}")
+
+    # Step 4: wait up to 30s for trust-manager to recreate ConfigMaps
+    log_info("Waiting for trust-manager to recreate ConfigMaps...")
+    all_ok = False
+    for attempt in range(15):
+        time.sleep(2)
+        missing = []
+        for ns in _PLATFORM_TRUST_NAMESPACES:
+            rc, out = _ssh_exec(
+                cp_ip, password,
+                f"kubectl {kc_flag} get configmap {_PLATFORM_TRUST_CM} -n {ns} "
+                f"-o jsonpath='{{.data.bundle\\.pem}}' 2>/dev/null | grep -c 'BEGIN CERTIFICATE'",
+                timeout=15,
+            )
+            cert_count = int(out.strip()) if out.strip().isdigit() else 0
+            if cert_count < 5:
+                missing.append(ns)
+        if not missing:
+            all_ok = True
+            break
+    if all_ok:
+        log_renewed("Platform-trust ConfigMaps recreated with updated CA bundle")
+    else:
+        log_warn(f"Some platform-trust ConfigMaps may not be updated yet: {missing}")
+
+    log_info(f"Phase 3.2 [{label}]: trust-manager re-sync complete")
+
+
 # ─── Phase 3.1: cert-manager leaf cert renewal (VSP only) ────────────────────
 def _phase3_certmanager(cluster_cfg, cp_ip, password, kubeconfig, dry_run,
                         threshold_days, force_all=False):
@@ -1951,6 +2089,28 @@ def _check_cluster(cluster_name, cluster_cfg, args):
     # force_all propagates to Phase 3.1: either the CA was rotated THIS session
     # (ca_rotated) or a prior session's rotation left stale-key certs (ca_key_mismatch).
     _force_leaf_renewal = _ca_rotated or _ca_key_mismatch
+
+    # ── Phase 3.2: trust-manager re-sync after CA rotation (VSP only) ────────
+    # Runs when EITHER the CA was rotated this session (ca_rotated) OR a cross-
+    # session CA key mismatch is detected (ca_key_mismatch).  In both cases the
+    # platform-trust ConfigMaps across all namespaces may be stale — they carry
+    # the old CA cert but NOT the key pair that cert-manager now uses to sign
+    # new leaf certs.  Pods using platform-trust for TLS verification (e.g. the
+    # fleet-depot pod pushing images to the zot-1 registry) will fail with
+    # "ECDSA verification failure" until the bundles are refreshed.
+    #
+    # Phase 3.2 must run BEFORE Phase 3.1 so that by the time new leaf certs are
+    # issued, the platform-trust bundles already carry the new CA cert.
+    if "casync" in phases_cfg and _force_leaf_renewal:
+        try:
+            _phase3_sync_trust_manager(
+                cluster_cfg, cp_ip, password, kubeconfig,
+                args.dry_run,
+            )
+        except Exception as exc:
+            log_error(f"Phase 3.2 (trust-manager sync) raised unexpected exception: {exc}")
+    elif "casync" in phases_cfg:
+        log_info("Phase 3.2 (trust-manager sync): skipped — no CA rotation or key mismatch")
 
     # ════════════════════════════════════════════════════════════════════════
     # LEAF CERT RENEWAL (all clusters — kubeadm PKI is separate from vcf-cluster-ca)
