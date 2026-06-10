@@ -1,6 +1,6 @@
 # vsp_cert_renewer.py — Reference Guide
 
-**Version:** 2.0 — 2026-06-09  
+**Version:** 2.2 — 2026-06-10  
 **Script:** `Tools/vsp_cert_renewer.py`  
 **Called by:** `Startup/VCFfinal.py` Task 2e (before VCF component scale-up)
 
@@ -90,6 +90,19 @@ openssl verify -CAfile /tmp/precheck_ca.pem /tmp/precheck_reg.pem
 │              Detects cross-session CA key drift. Sets ca_key_mismatch=True.  │
 │                                                                              │
 │  ── force_all = ca_rotated OR ca_key_mismatch ────────────────────────────── │
+│                                                                              │
+│  Phase 3.2   trust-manager + vmsp-operator re-sync       (when force_all)   │
+│              (a) Restarts trust-manager Deployment; waits for Ready; deletes │
+│              platform-trust ConfigMaps in vmsp-platform, vcf-fleet-depot,   │
+│              vcf-fleet-lcm, ops-logs so trust-manager recreates them with   │
+│              the new CA cert.                                                │
+│              (b) After ConfigMaps are rebuilt, restarts vmsp-operator        │
+│              Deployment. The vmsp-operator bundle controller caches TLS root │
+│              CAs at Go startup and does NOT auto-reload updated ConfigMap    │
+│              volumes — restart ensures it starts with the correct CA pool.  │
+│              Without both restarts, Stage VCF services runtime fails with   │
+│              "ECDSA verification failure" when pushing images to zot-1.      │
+│                                                                              │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │  LEAF CERT RENEWAL  (all clusters — kubeadm PKI, separate from vcf-cluster)  │
 ├──────────────────────────────────────────────────────────────────────────────┤
@@ -151,7 +164,19 @@ flowchart TD
     end
 
     PRES & PREF --> FORCE["force_all = ca_rotated OR ca_key_mismatch\nleaf_certs_prerenewed = force_all"]
-    FORCE --> PH1_GATE
+
+    FORCE --> PH32_GATE{"force_all?\n(ca_rotated OR\nca_key_mismatch)"}
+    PH32_GATE -- No --> PH1_GATE
+    PH32_GATE -- Yes --> PH32_BOX
+
+    subgraph PH32_BOX["── Phase 3.2: trust-manager + vmsp-operator Re-sync (VSP only) ──"]
+        P32A["1. kubectl rollout restart trust-manager\n   Wait ≤ 60s for 1/1 Running"]
+        P32A --> P32B["2. Delete platform-trust ConfigMaps in:\n   vmsp-platform, vcf-fleet-depot,\n   vcf-fleet-lcm, ops-logs\n   trust-manager recreates with new CA"]
+        P32B --> P32C["3. Wait ≤ 30s for ConfigMaps to appear\n   (cert_count >= 5 per namespace)"]
+        P32C --> P32D["4. kubectl rollout restart vmsp-operator\n   Wait ≤ 90s for 1/1 Running\n   (clears stale in-memory CA pool)"]
+    end
+
+    PH32_BOX --> PH1_GATE
 
     PH1_GATE{skip-kubeadm?}
     PH1_GATE -- skip --> PH2_GATE
@@ -297,8 +322,10 @@ python3 vsp_cert_renewer.py --cluster vsp|vcfa|all
 
 | Symptom | Root Cause | Phase that catches it |
 | --- | --- | --- |
-| `x509: ECDSA verification failure` during VCF component staging | `containerd` node CA file stale — old CA cert in `/etc/containerd/certs.d/…/ca.crt` | Phase 5 Steps 2–3 (Mode A) |
+| `x509: ECDSA verification failure` during VCF component staging (containerd) | `containerd` node CA file stale — old CA cert in `/etc/containerd/certs.d/…/ca.crt` | Phase 5 Steps 2–3 (Mode A) |
 | `x509: ECDSA verification failure` but node CA file is current | Leaf certs signed by old CA key pair (cross-session drift) | CA pre-check → Phase 3.1 force_all (v2.0); or Phase 5 Step 1b safety net |
+| `x509: ECDSA verification failure` in `vmsp-operator` during Stage VCF services | `platform-trust` ConfigMap stale (trust-manager missed CA secret recreation event) | Phase 3.2 Step 1-3: restart trust-manager, delete+recreate platform-trust (v2.1) |
+| `x509: ECDSA verification failure` in `vmsp-operator` after platform-trust updated | `vmsp-operator` Go binary caches TLS root CAs at startup; does not auto-reload ConfigMap volumes | Phase 3.2 Step 4: restart vmsp-operator after ConfigMaps rebuilt (v2.2) |
 | `ImagePullBackOff` on VSP pods | Either Mode A or Mode B above; zot-1-0 presents cert that containerd cannot verify | Phase 5 pod restarts after either fix |
 | Phase 3.1 force-renews all certs on every boot | CA_MIN_REMAINING_H threshold too high — Phase 3.0 rotates CA on every boot | Lower threshold (already set to 8760h / 1y in v1.7) |
 | cert-manager certs appear Ready but pods still fail TLS | openssl verify fails — `registry-certificate` signed by old key, appears Ready | CA pre-check (new in v2.0) catches before Phase 3.1 |

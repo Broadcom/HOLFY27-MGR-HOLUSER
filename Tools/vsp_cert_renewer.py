@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 vsp_cert_renewer.py
-Version 2.1 - 2026-06-10
+Version 2.2 - 2026-06-10
 Author: Burke Azbill, Kevin Tebear, and HOL Core Team
 
 Proactive Kubernetes certificate check and renewal for VSP and VCFA clusters.
@@ -35,13 +35,17 @@ PHASE EXECUTION ORDER (v2.0):
   │                              old CA key.  Sets ca_key_mismatch=True, which │
   │                              also propagates to Phase 3.1 force_all.       │
   │                                                                             │
-  │  3.2  trust-manager sync     When ca_rotated OR ca_key_mismatch: restarts  │
-  │                              the trust-manager Deployment, then deletes     │
-  │                              platform-trust ConfigMaps in key namespaces    │
-  │                              so trust-manager recreates them with the new   │
-  │                              CA cert.  Fixes ECDSA verification failures    │
-  │                              when the fleet-depot pod pushes images to the  │
-  │                              zot-1 registry during Stage VCF services.      │
+  │  3.2  trust-manager +         When ca_rotated OR ca_key_mismatch:           │
+  │       vmsp-operator sync     (a) Restarts trust-manager Deployment, deletes │
+  │                              platform-trust ConfigMaps in key namespaces so  │
+  │                              trust-manager recreates them with the new CA   │
+  │                              cert. Fixes ECDSA verification failures when   │
+  │                              the vmsp-operator bundle controller pushes     │
+  │                              images to zot-1 (Stage VCF services).          │
+  │                              (b) Restarts vmsp-operator Deployment because  │
+  │                              its Go binary caches TLS root CAs from startup │
+  │                              and does NOT auto-reload updated ConfigMap      │
+  │                              volumes — restart forces fresh CA load.        │
   │                              Must run BEFORE Phase 3.1 (leaf cert issuance) │
   │                              so bundles are current before new certs appear.│
   └───────────────────────────────────────────────────────────────────────────┘
@@ -74,6 +78,17 @@ Log format per cert:
   SKIP   : <name> — valid for ><N>d
   WARN   : <description>
   ERROR  : <description>
+
+v2.2 Changes:
+- Phase 3.2 extended: vmsp-operator Deployment is now also restarted (Steps 5-6)
+  after trust-manager recreates the platform-trust ConfigMaps.  Root cause: the
+  vmsp-operator bundle controller is responsible for downloading component tarballs
+  and pushing OCI images to the zot-1 registry.  Its Go binary caches TLS root CAs
+  at startup and does NOT auto-reload updated ConfigMap volumes at runtime.  Without
+  this restart, even after trust-manager fixes the ConfigMaps, the vmsp-operator
+  continues using the stale in-memory CA pool and fails with "ECDSA verification
+  failure" when pushing images to zot-1.  The restart ensures it starts with the
+  correct CA pool, allowing Stage VCF services runtime to succeed on the first try.
 
 v2.1 Changes:
 - New Phase 3.2 (_phase3_sync_trust_manager): after a CA rotation (ca_rotated) OR
@@ -188,7 +203,7 @@ import time
 from datetime import datetime, timezone
 
 # ─── Version ──────────────────────────────────────────────────────────────────
-VERSION = "2.1"
+VERSION = "2.2"
 DATE    = "2026-06-10"
 
 # ─── Global constants ─────────────────────────────────────────────────────────
@@ -1144,24 +1159,36 @@ def _phase3_extend_ca(cluster_cfg, cp_ip, password, kubeconfig, dry_run):
     return rotated  # True if ≥1 CA was replaced; caller must force-renew leaf certs
 
 
-# ─── Phase 3.2: trust-manager bundle re-sync after CA rotation ───────────────
+# ─── Phase 3.2: trust-manager + vmsp-operator re-sync after CA rotation ──────
 # When Phase 3.0 (or a cross-session CA key mismatch) causes new CA key pairs
-# to be issued, the trust-manager Bundle controller must re-sync so that every
-# namespace's platform-trust ConfigMap includes the freshly issued CA cert.
+# to be issued, two platform controllers must be restarted to pick up the new CA:
 #
-# Root cause: trust-manager watches labeled Secrets for changes.  When Phase 3.0
-# deletes and recreates vcf-cluster-ca-secret, trust-manager's watch can miss the
-# creation event (Kubernetes informer race on delete+create within a tight window),
-# leaving ALL platform-trust ConfigMaps with the OLD CA cert.  Pods in the fleet-
-# depot namespace use platform-trust to verify TLS connections to the internal zot-1
-# registry — if the ConfigMap doesn't include the new CA cert, every image push
-# during Stage VCF services runtime fails with "ECDSA verification failure".
+# (A) trust-manager:
+#   trust-manager watches labeled Secrets for changes.  When Phase 3.0 deletes and
+#   recreates vcf-cluster-ca-secret, trust-manager's watch can miss the creation
+#   event (Kubernetes informer race on delete+create within a tight window), leaving
+#   ALL platform-trust ConfigMaps with the OLD CA cert.  Pods in the fleet-depot and
+#   vmsp-platform namespaces use platform-trust to verify TLS connections to the
+#   internal zot-1 registry.
+#   Fix: restart trust-manager Deployment, then delete stale platform-trust
+#   ConfigMaps so trust-manager recreates them with the new CA cert.
 #
-# Fix: restart the trust-manager Deployment (forces a full re-list of all sources),
-# wait for it to become ready, then delete the stale platform-trust ConfigMaps in
-# critical namespaces so trust-manager recreates them with the new CA cert included.
+# (B) vmsp-operator:
+#   The vmsp-operator bundle controller is responsible for downloading component
+#   tarballs from fleet-01a and pushing OCI images to the zot-1 registry
+#   (registry.vmsp-platform.svc.cluster.local:5000).  Its Go binary loads TLS root
+#   CAs at startup and caches them in memory — it does NOT auto-reload updated
+#   ConfigMap volumes.  After trust-manager recreates the platform-trust ConfigMaps
+#   with the new CA cert, the vmsp-operator is still using the stale in-memory CA
+#   pool and will reject zot-1's TLS certificate ("ECDSA verification failure").
+#   Fix: restart vmsp-operator Deployment after trust-manager has recreated the
+#   ConfigMaps, so the new pod starts with the correct CA pool.
+#
+# Both restarts must complete BEFORE Phase 3.1 (leaf cert issuance) so all bundles
+# are current before new certs are issued for zot-1 and other services.
 _TRUST_MANAGER_NS     = "vmsp-platform"
 _TRUST_MANAGER_DEPLOY = "trust-manager"
+_VMSP_OPERATOR_DEPLOY = "vmsp-operator"
 _PLATFORM_TRUST_CM    = "platform-trust"
 _PLATFORM_TRUST_NAMESPACES = [
     "vmsp-platform",
@@ -1172,20 +1199,26 @@ _PLATFORM_TRUST_NAMESPACES = [
 
 
 def _phase3_sync_trust_manager(cluster_cfg, cp_ip, password, kubeconfig, dry_run):
-    """Restart trust-manager and force-refresh platform-trust ConfigMaps.
+    """Restart trust-manager and vmsp-operator; force-refresh platform-trust ConfigMaps.
 
     Called after Phase 3.0 rotates a CA (ca_rotated=True) OR when a CA key
-    mismatch is detected (ca_key_mismatch=True).  Ensures all pods that use
-    the platform-trust bundle for TLS verification can trust certs signed by
-    the new CA key — critical for the stage-component fleet-depot → zot-1 push.
+    mismatch is detected (ca_key_mismatch=True).
+
+    Two controllers are restarted:
+      1. trust-manager — forces re-list of CA Secrets and recreates platform-trust
+         ConfigMaps in all critical namespaces with the new CA cert.
+      2. vmsp-operator — its Go binary caches TLS root CAs at startup and does NOT
+         auto-reload updated ConfigMap volumes.  Restarting it after trust-manager
+         recreates the ConfigMaps ensures it starts with the correct CA pool, so
+         the bundle controller can push images to zot-1 without ECDSA errors.
     """
     label   = cluster_cfg["label"]
     kc_flag = f"--kubeconfig={kubeconfig}" if kubeconfig else ""
     log_sep()
-    log_info(f"Phase 3.2 [{label}]: trust-manager bundle re-sync after CA rotation")
+    log_info(f"Phase 3.2 [{label}]: trust-manager + vmsp-operator re-sync after CA rotation")
 
     if dry_run:
-        log_info("[dry-run] would restart trust-manager and delete platform-trust ConfigMaps")
+        log_info("[dry-run] would restart trust-manager and vmsp-operator, delete platform-trust ConfigMaps")
         return
 
     # Step 1: restart trust-manager Deployment to force a full re-list
@@ -1255,7 +1288,40 @@ def _phase3_sync_trust_manager(cluster_cfg, cp_ip, password, kubeconfig, dry_run
     else:
         log_warn(f"Some platform-trust ConfigMaps may not be updated yet: {missing}")
 
-    log_info(f"Phase 3.2 [{label}]: trust-manager re-sync complete")
+    # Step 5: restart vmsp-operator Deployment so it reloads the updated CA pool.
+    # The vmsp-operator bundle controller caches TLS root CAs at Go startup — it
+    # does not re-read updated ConfigMap volumes at runtime.  Without this restart,
+    # the bundle controller continues using the old CA pool and fails with
+    # "ECDSA verification failure" when pushing images to zot-1.
+    log_action(f"Restarting {_VMSP_OPERATOR_DEPLOY} deployment in {_TRUST_MANAGER_NS}")
+    _ssh_exec(
+        cp_ip, password,
+        f"kubectl {kc_flag} rollout restart deployment {_VMSP_OPERATOR_DEPLOY} "
+        f"-n {_TRUST_MANAGER_NS} 2>/dev/null",
+        timeout=20,
+    )
+
+    # Step 6: wait up to 90s for vmsp-operator to become Running (1/1)
+    log_info("Waiting for vmsp-operator pod to become Ready...")
+    ready = False
+    for attempt in range(45):
+        time.sleep(2)
+        rc, out = _ssh_exec(
+            cp_ip, password,
+            f"kubectl {kc_flag} get pods -n {_TRUST_MANAGER_NS} "
+            f"-l app={_VMSP_OPERATOR_DEPLOY} --no-headers 2>/dev/null | "
+            f"awk '{{print $2, $3}}' | grep -c '1/1 Running'",
+            timeout=15,
+        )
+        if rc == 0 and out.strip() == "1":
+            ready = True
+            break
+    if not ready:
+        log_warn("vmsp-operator pod did not reach 1/1 Running within 90s — proceeding anyway")
+    else:
+        log_info("vmsp-operator is Running with fresh CA bundle")
+
+    log_info(f"Phase 3.2 [{label}]: trust-manager + vmsp-operator re-sync complete")
 
 
 # ─── Phase 3.1: cert-manager leaf cert renewal (VSP only) ────────────────────
