@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 vsp_cert_renewer.py
-Version 2.6 - 2026-06-10
+Version 2.10 - 2026-06-11
 Author: Burke Azbill, Kevin Tebear, and HOL Core Team
 
 Proactive Kubernetes certificate check and renewal for VSP and VCFA clusters.
@@ -122,6 +122,92 @@ v2.3 Changes:
   SeaWeedFS StatefulSets (seaweedfs-filer, seaweedfs-master, seaweedfs-volume) to reload
   their new mTLS certs from the updated Secrets.  Without this, SeaWeedFS components
   continue presenting the old cert from memory, causing "tls: bad certificate" errors.
+
+v2.10 Changes:
+- FIX: kubectl jsonpath expressions in _check_ca_key_consistency and Phase 5 Step 1b / verify_cmd
+  used `{{{{.data.FIELD\\\\.crt}}}}` in Python f-strings, which produces `{{.data.FIELD\\.crt}}`
+  (double braces) in the actual shell command.  kubectl jsonpath requires single braces
+  `{.data.FIELD\\.crt}`.  Double braces return empty output silently (rc=0), so:
+  (a) The pre-check's precheck_reg.pem was always empty → EMPTY_DATA path → safe-default
+      False → pre-check was NEVER actually verifying CA consistency; it always returned False.
+  (b) Phase 5 Step 1b always saw "tls.crt not yet present" and logged the 30s WARN on every
+      clean run even when the secret was perfectly healthy.
+  All five affected lines now use `{{.data.FIELD\\\\.crt}}` (single brace in output, correct).
+  Other jsonpath lines (1276, 1470, 1832, 1851, 1976, 2184) were already correct.
+- FIX: Phase 2 batched probe "EXISTS::0" (empty EXPIRY) on VSP worker nodes.
+  Root cause: unbraced `$VARNAME` is silently consumed by the outer login-shell layer in the
+  "echo PASSWORD | sudo -S -i bash -c \"$(decode)\"" chain on bash 5.2.0 (Photon worker nodes).
+  The variable IS set inside the inner script, and ${VARNAME} expands correctly, but $VARNAME
+  without braces expands to empty.  Confirmed via set -x trace and minimal repro (A="hello";
+  echo "$A" → empty, echo "${A}" → "hello").  Fix: (1) changed echo separator from colon to
+  pipe | to avoid conflict with colons in the openssl date string
+  (e.g. "notAfter=Jun  6 16:49:43 2027 GMT"), (2) capture RC=$? before echo, (3) use
+  ${EXPIRY}/${RC} curly-brace form in the echo, (4) update parser to split on | instead of :.
+  Also: if expiry_raw is still empty and checkend_rc=="0", log SKIP (not WARN) as a safe
+  fallback for any cert format that openssl -enddate cannot parse.
+
+v2.9 Changes:
+- FIX: CA pre-check file-size guard now uses POSIX `[ ! -s file ]` (file exists AND
+  non-empty) instead of `wc -c` or `stat -c%s`.  Both prior approaches produced
+  `[: : integer expression expected` bash errors on Photon Linux when run through the
+  base64/sudo SSH tunnel — the arithmetic comparison received an empty or
+  whitespace-only string.  The guard was silently bypassed, empty files reached
+  openssl verify, which returned a non-zero exit but with "Error" output (not "OK"),
+  causing the pre-check to return True (mismatch = false positive) and triggering
+  force_all=True on every run.  `[ ! -s file ]` is pure shell built-in with no
+  arithmetic comparison and no external command output to parse.
+- FIX: Phase 3.1 log message "N expiring within Xd" was WRONG when force_all=True.
+  Every Ready cert in to_renew was counted as "expiring", even 1826d-valid certs being
+  force-renewed due to CA key mismatch.  Now counts three categories separately:
+  not-Ready, expiring (within threshold), and force-renewed (CA key mismatch/rotation).
+  Example before: "38 cert(s) require renewal (0 not-Ready, 38 expiring within 30d)"
+  Example after:  "38 cert(s) require renewal (38 force-renewed (CA key mismatch/rotation))"
+- FIX: Phase 3.2 cert-manager restart now waits 15s AFTER the pod reaches 1/1 Running
+  before returning.  Root cause: Kubernetes marks a pod Ready when its HTTP readiness
+  probe passes, but cert-manager's Issuer cache (holding the CA signing key) loads
+  asynchronously from the API server 3–10 s later.  If Phase 3.1 deleted secrets during
+  that window, cert-manager re-issued them with the old in-memory CA key (wrong AKI),
+  producing a CA key mismatch that the pre-check caught on the NEXT run.  This was why
+  the pre-check kept finding mismatches even after Phase 3.1 had "fixed" everything.
+
+v2.8 Changes:
+- PERF: Phase 3.2 trust-manager and vmsp-operator restarts are now fire-and-forget.
+  Only cert-manager must be Ready before Phase 3.1 runs (leaf cert re-issuance).
+  trust-manager is given 20s to start before ConfigMaps are deleted, then vmsp-operator
+  is restarted concurrently while cert-manager comes up.  Sequential wait for vmsp-operator
+  (up to 90s) eliminated.  Phase 3.2 worst-case time reduced from ~4.5 min to ~2 min.
+- PERF: Phase 5 fixed sleep(60) before DaemonSet rollout replaced with direct
+  `kubectl rollout status --timeout=120s` (exits as soon as the rollout completes
+  rather than always sleeping the full 60 s regardless).
+- PERF: Phase 5 fixed sleep(35) after zot-1/identity restarts replaced with polled
+  `kubectl rollout status --timeout=60s` for zot-1 and vmsp-identity.
+- PERF: Phase 5 fixed sleep(90) after SeaWeedFS StatefulSet restarts replaced with
+  polled `kubectl rollout status --timeout=120s` per StatefulSet (exits early when ready).
+- PERF: Phase 2 kubelet cert check now uses a single batched SSH call per node
+  (exist + expiry + checkend in one shell invocation) instead of 3 sequential SSH calls,
+  saving ~2 round-trip overhead per node.
+- FIX: _check_ca_key_consistency now uses `wc -c` instead of `stat -c%s` for file-size
+  checks.  `stat -c%s` returned an empty string on some Photon/Linux builds when piped
+  through the base64 SSH tunnel, producing `[: : integer expression expected` bash errors
+  and potentially allowing false-positive openssl verify failures to bypass the EMPTY_DATA
+  guard.  `wc -c` is POSIX-compliant and always outputs a numeric value.
+- CLEANUP: Removed the immediate post-Phase-3.1 _check_ca_key_consistency call.  That
+  check always fired before cert-manager finished writing the new Secret, producing
+  false-positive "STILL mismatched" warnings.  Phase 5 Step 1b (with its 30s settle wait)
+  is the definitive CA-consistency check and already handles repair.
+
+v2.7 Changes:
+- CRITICAL FIX: Phase 3.1 cert-manager health check queried non-existent namespace
+  "cert-manager" (kubectl -n cert-manager), which always returned exit code 1 and caused
+  Phase 3.1 to silently skip on EVERY run.  cert-manager runs in vmsp-platform, not a
+  separate namespace.  This meant the primary leaf cert renewal path was never executed —
+  only the Phase 5 Step 1b safety net could catch CA key mismatches.  Fixed to use
+  _TRUST_MANAGER_NS (vmsp-platform) with label selector app=cert-manager.
+  This bug was present since Phase 3.1 was introduced and explains why CA key mismatches
+  persisted across multiple iterations: force_all=True had no effect because Phase 3.1
+  was always gated out before processing any certs.
+- Also added an explicit check for empty pod output (no cert-manager pods found) which
+  previously fell through to the unhealthy-check with an empty list (silently passing).
 
 v2.6 Changes:
 - CRITICAL FIX: Phase 3.1 now SKIPS CA certificates (spec.isCA: true).  Previously,
@@ -271,8 +357,8 @@ import time
 from datetime import datetime, timezone
 
 # ─── Version ──────────────────────────────────────────────────────────────────
-VERSION = "2.6"
-DATE    = "2026-06-10"
+VERSION = "2.10"
+DATE    = "2026-06-11"
 
 # ─── Global constants ─────────────────────────────────────────────────────────
 THRESHOLD_DAYS = 60            # renew if any cert expires within 60 days
@@ -957,16 +1043,30 @@ def _phase2_one_node(label, node_name, node_ip, password, cp_ip,
     cert_path = "/var/lib/kubelet/pki/kubelet.crt"
     key_path  = "/var/lib/kubelet/pki/kubelet.key"
 
-    # Check if kubelet.crt exists and SSH works
-    rc_e, exist_out = _ssh_exec(
+    # Batch exist + expiry + threshold check into a single SSH call to minimise
+    # round-trip overhead (3 SSH calls → 1 per node saves ~2s per node).
+    # Output format: "EXISTS|<notAfter-line>|<0|1>" or "MISSING"
+    #
+    # IMPORTANT: Use ${VAR} curly-brace form for all variable references in the
+    # echo.  Unbraced $VAR is silently consumed by the outer shell layer in the
+    # "sudo -S -i bash -c "$(decode)" chain on bash 5.2 (the variable appears set
+    # inside the script but $VARNAME expands to empty in the echo while ${VARNAME}
+    # expands correctly).  Confirmed on Photon-based VSP worker nodes (bash 5.2.0).
+    # Use | as separator to avoid conflicts with the colons in the date field
+    # (e.g. "notAfter=Jun  6 16:49:43 2027 GMT").
+    rc_e, probe_out = _ssh_exec(
         node_ip, password,
-        f"test -f {cert_path} && echo EXISTS || echo MISSING",
-        timeout=15,
+        f"if [ -f {cert_path} ]; then "
+        f"  EXPIRY=$(openssl x509 -in {cert_path} -noout -enddate 2>&1); "
+        f"  openssl x509 -in {cert_path} -noout -checkend {threshold_sec} >/dev/null 2>&1; "
+        f"  RC=${{?}}; echo \"EXISTS|${{EXPIRY}}|${{RC}}\"; "
+        f"else echo MISSING; fi",
+        timeout=20,
     )
     if rc_e != 0:
         log_warn(f"{node_name} ({node_ip}): SSH failed — skipping")
         return
-    if "MISSING" in exist_out:
+    if "MISSING" in probe_out:
         # Control-plane nodes on VSP use the kubeadm PKI for kubelet serving
         # and may not have a standalone kubelet.crt.  This is normal.
         log_info(
@@ -975,28 +1075,27 @@ def _phase2_one_node(label, node_name, node_ip, password, cp_ip,
         )
         return
 
-    # Get expiry date (for logging)
-    rc_d, expiry_out = _ssh_exec(
-        node_ip, password,
-        f"openssl x509 -in {cert_path} -noout -enddate 2>&1",
-        timeout=15,
-    )
-    if rc_d != 0 or "notAfter=" not in expiry_out:
-        log_warn(f"{node_name}: cannot read kubelet.crt expiry — "
-                 f"rc={rc_d}: {expiry_out[:100]}")
+    # Parse the batched output: EXISTS|<notAfter=...>|<checkend_rc>
+    # Pipe | separator avoids conflicts with the colons in the date string
+    # (e.g. "notAfter=Jun  6 16:49:43 2027 GMT").
+    probe_out = probe_out.strip()
+    if not probe_out.startswith("EXISTS|"):
+        log_warn(f"{node_name}: unexpected probe output — {probe_out[:100]}")
+        return
+    parts = probe_out.split("|", 2)  # ["EXISTS", "notAfter=...", "0" or "1"]
+    expiry_raw = parts[1] if len(parts) > 1 else ""
+    checkend_rc = parts[2].strip() if len(parts) > 2 else "1"
+    if "notAfter=" not in expiry_raw:
+        # openssl enddate produced no output; fall back to checkend result.
+        if checkend_rc == "0":
+            log_skip(f"kubelet.crt on {node_name} — expiry unreadable but checkend confirms valid for >{threshold_days}d")
+        else:
+            log_warn(f"{node_name}: cannot parse kubelet.crt expiry — {probe_out[:100]}")
         return
 
-    # "notAfter=Mar 13 18:20:42 2027 GMT"
-    expiry_str = expiry_out.split("notAfter=", 1)[-1].strip()
-
-    # Check if within threshold
-    rc_c, _ = _ssh_exec(
-        node_ip, password,
-        f"openssl x509 -in {cert_path} -noout -checkend {threshold_sec} 2>&1",
-        timeout=15,
-    )
-    # rc=0 → cert is valid beyond threshold; rc=1 → expires within threshold
-    expiring = (rc_c == 1)
+    expiry_str = expiry_raw.split("notAfter=", 1)[-1].strip()
+    # checkend rc=0 → valid beyond threshold; rc=1 → expires within threshold
+    expiring = (checkend_rc == "1")
 
     log_check(
         f"kubelet.crt on {node_name} ({node_ip}) — "
@@ -1305,7 +1404,10 @@ def _phase3_sync_trust_manager(cluster_cfg, cp_ip, password, kubeconfig, dry_run
         log_info("[dry-run] would restart trust-manager, vmsp-operator, cert-manager, delete platform-trust ConfigMaps")
         return
 
-    # Step 1: restart trust-manager Deployment to force a full re-list
+    # Step 1: restart trust-manager Deployment to force a full re-list.
+    # Fire-and-forget: we only need trust-manager to have STARTED reconciling by
+    # the time we delete the ConfigMaps below.  We do not wait for it to become
+    # fully Ready — it continues coming up in parallel with the rest of Phase 3.2.
     log_action(f"Restarting {_TRUST_MANAGER_DEPLOY} deployment in {_TRUST_MANAGER_NS}")
     _ssh_exec(
         cp_ip, password,
@@ -1313,29 +1415,14 @@ def _phase3_sync_trust_manager(cluster_cfg, cp_ip, password, kubeconfig, dry_run
         f"-n {_TRUST_MANAGER_NS} 2>/dev/null",
         timeout=20,
     )
+    # Brief pause so trust-manager pod is Terminating (old) / ContainerCreating (new)
+    # before we delete ConfigMaps.  The old pod may briefly reconcile stale CMs;
+    # the new pod will see the deleted CMs on startup and recreate them with the
+    # fresh CA.  20 s is enough for the scheduler to evict the old pod.
+    log_info("  Waiting 20s for trust-manager restart to take effect...")
+    time.sleep(20)
 
-    # Step 2: wait up to 60s for trust-manager pod to become Running (1/1)
-    log_info("Waiting for trust-manager pod to become Ready...")
-    ready = False
-    for attempt in range(30):
-        time.sleep(2)
-        rc, out = _ssh_exec(
-            cp_ip, password,
-            f"kubectl {kc_flag} get pods -n {_TRUST_MANAGER_NS} "
-            f"-l app=trust-manager --no-headers 2>/dev/null | "
-            f"awk '{{print $2, $3}}' | grep -c '1/1 Running'",
-            timeout=15,
-        )
-        if rc == 0 and out.strip() == "1":
-            ready = True
-            break
-    if not ready:
-        log_warn("trust-manager pod did not reach 1/1 Running within 60s — proceeding anyway")
-    else:
-        log_info("trust-manager is Running — waiting 5s for initial reconcile")
-        time.sleep(5)
-
-    # Step 3: delete stale platform-trust ConfigMaps in critical namespaces so
+    # Step 2: delete stale platform-trust ConfigMaps in critical namespaces so
     # trust-manager recreates them with the current CA cert included.
     log_action(f"Deleting stale platform-trust ConfigMaps in: {_PLATFORM_TRUST_NAMESPACES}")
     for ns in _PLATFORM_TRUST_NAMESPACES:
@@ -1348,11 +1435,70 @@ def _phase3_sync_trust_manager(cluster_cfg, cp_ip, password, kubeconfig, dry_run
         status = "deleted" if "OK" in out else "skip/error"
         log_info(f"  {ns}/{_PLATFORM_TRUST_CM}: {status}")
 
-    # Step 4: wait up to 30s for trust-manager to recreate ConfigMaps
-    log_info("Waiting for trust-manager to recreate ConfigMaps...")
+    # Step 3: restart vmsp-operator so it reloads the updated CA pool.
+    # The vmsp-operator Go binary caches TLS root CAs at startup.  Without a
+    # restart it continues using the old CA pool and fails with "ECDSA
+    # verification failure" when pushing images to zot-1.
+    # Fire-and-forget: vmsp-operator does not need to be Ready before Phase 3.1
+    # (leaf cert issuance).  It must be restarted before stage-component runs
+    # (which is much later in the boot sequence).
+    log_action(f"Restarting {_VMSP_OPERATOR_DEPLOY} deployment in {_TRUST_MANAGER_NS} (fire-and-forget)")
+    _ssh_exec(
+        cp_ip, password,
+        f"kubectl {kc_flag} rollout restart deployment {_VMSP_OPERATOR_DEPLOY} "
+        f"-n {_TRUST_MANAGER_NS} 2>/dev/null",
+        timeout=20,
+    )
+    log_info("  vmsp-operator restart triggered — will finish coming up in background")
+
+    # Step 4: restart cert-manager so it reloads the new CA Issuer key.
+    # cert-manager caches the CA Secret's key material in memory.  If Phase 3.1
+    # (leaf cert re-issuance) runs while cert-manager still holds the OLD key,
+    # ALL leaf certs are silently re-signed with the wrong CA key.
+    # MUST be Ready before Phase 3.1 runs → we wait here.
+    log_action(f"Restarting {_CERTMANAGER_DEPLOY} deployment in {_TRUST_MANAGER_NS}")
+    _ssh_exec(
+        cp_ip, password,
+        f"kubectl {kc_flag} rollout restart deployment {_CERTMANAGER_DEPLOY} "
+        f"-n {_TRUST_MANAGER_NS} 2>/dev/null",
+        timeout=20,
+    )
+
+    # Step 5: wait up to 90s for cert-manager to become Running (1/1).
+    # Poll every 3s for faster detection of a ready pod.
+    log_info("Waiting for cert-manager pod to become Ready (required before Phase 3.1)...")
+    ready = False
+    for attempt in range(30):
+        time.sleep(3)
+        rc, out = _ssh_exec(
+            cp_ip, password,
+            f"kubectl {kc_flag} get pods -n {_TRUST_MANAGER_NS} "
+            f"-l app={_CERTMANAGER_DEPLOY} --no-headers 2>/dev/null | "
+            f"awk '{{print $2, $3}}' | grep -c '1/1 Running'",
+            timeout=15,
+        )
+        if rc == 0 and out.strip() == "1":
+            ready = True
+            break
+    if not ready:
+        log_warn("cert-manager pod did not reach 1/1 Running within 90s — proceeding anyway")
+    else:
+        # Kubernetes sets pod Ready as soon as the HTTP readiness probe passes.
+        # cert-manager's Issuer cache (which holds the CA signing key) loads
+        # asynchronously from the API server AFTER the probe passes — typically
+        # 3–10 s.  If Phase 3.1 deletes secrets while this cache is still loading,
+        # cert-manager will re-sign with the old cached key (wrong AKI), causing
+        # another CA key mismatch on the next run.  A 15 s settle time is enough.
+        log_info("cert-manager is Running — waiting 15s for Issuer cache to load before Phase 3.1...")
+        time.sleep(15)
+
+    # Step 6: poll until trust-manager has recreated the ConfigMaps (or timeout).
+    # This is best-effort: even if trust-manager is still starting up, the
+    # ConfigMaps will be ready well before stage-component runs.
+    log_info("Polling for trust-manager to recreate platform-trust ConfigMaps (up to 60s)...")
     all_ok = False
-    for attempt in range(15):
-        time.sleep(2)
+    for attempt in range(20):
+        time.sleep(3)
         missing = []
         for ns in _PLATFORM_TRUST_NAMESPACES:
             rc, out = _ssh_exec(
@@ -1370,74 +1516,8 @@ def _phase3_sync_trust_manager(cluster_cfg, cp_ip, password, kubeconfig, dry_run
     if all_ok:
         log_renewed("Platform-trust ConfigMaps recreated with updated CA bundle")
     else:
-        log_warn(f"Some platform-trust ConfigMaps may not be updated yet: {missing}")
-
-    # Step 5: restart vmsp-operator Deployment so it reloads the updated CA pool.
-    # The vmsp-operator bundle controller caches TLS root CAs at Go startup — it
-    # does not re-read updated ConfigMap volumes at runtime.  Without this restart,
-    # the bundle controller continues using the old CA pool and fails with
-    # "ECDSA verification failure" when pushing images to zot-1.
-    log_action(f"Restarting {_VMSP_OPERATOR_DEPLOY} deployment in {_TRUST_MANAGER_NS}")
-    _ssh_exec(
-        cp_ip, password,
-        f"kubectl {kc_flag} rollout restart deployment {_VMSP_OPERATOR_DEPLOY} "
-        f"-n {_TRUST_MANAGER_NS} 2>/dev/null",
-        timeout=20,
-    )
-
-    # Step 6: wait up to 90s for vmsp-operator to become Running (1/1)
-    log_info("Waiting for vmsp-operator pod to become Ready...")
-    ready = False
-    for attempt in range(45):
-        time.sleep(2)
-        rc, out = _ssh_exec(
-            cp_ip, password,
-            f"kubectl {kc_flag} get pods -n {_TRUST_MANAGER_NS} "
-            f"-l app={_VMSP_OPERATOR_DEPLOY} --no-headers 2>/dev/null | "
-            f"awk '{{print $2, $3}}' | grep -c '1/1 Running'",
-            timeout=15,
-        )
-        if rc == 0 and out.strip() == "1":
-            ready = True
-            break
-    if not ready:
-        log_warn("vmsp-operator pod did not reach 1/1 Running within 90s — proceeding anyway")
-    else:
-        log_info("vmsp-operator is Running with fresh CA bundle")
-
-    # Step 7: restart cert-manager so it reloads the new CA Issuer key.
-    # cert-manager caches the CA Secret's key material in memory.  If Phase 3.1
-    # (leaf cert re-issuance) runs while cert-manager still holds the OLD key,
-    # ALL leaf certs are silently re-signed with the wrong CA key.  This causes
-    # mTLS failures between SeaWeedFS, vmsp-identity, vmsp-operator-webhook, and
-    # any other service whose cert is verified by a peer using platform-trust.
-    log_action(f"Restarting {_CERTMANAGER_DEPLOY} deployment in {_TRUST_MANAGER_NS}")
-    _ssh_exec(
-        cp_ip, password,
-        f"kubectl {kc_flag} rollout restart deployment {_CERTMANAGER_DEPLOY} "
-        f"-n {_TRUST_MANAGER_NS} 2>/dev/null",
-        timeout=20,
-    )
-
-    # Step 8: wait up to 90s for cert-manager to become Running (1/1)
-    log_info("Waiting for cert-manager pod to become Ready...")
-    ready = False
-    for attempt in range(45):
-        time.sleep(2)
-        rc, out = _ssh_exec(
-            cp_ip, password,
-            f"kubectl {kc_flag} get pods -n {_TRUST_MANAGER_NS} "
-            f"-l app={_CERTMANAGER_DEPLOY} --no-headers 2>/dev/null | "
-            f"awk '{{print $2, $3}}' | grep -c '1/1 Running'",
-            timeout=15,
-        )
-        if rc == 0 and out.strip() == "1":
-            ready = True
-            break
-    if not ready:
-        log_warn("cert-manager pod did not reach 1/1 Running within 90s — proceeding anyway")
-    else:
-        log_info("cert-manager is Running and will use the new CA key for leaf cert issuance")
+        log_warn(f"Some platform-trust ConfigMaps may not be updated yet: {missing} "
+                 f"— trust-manager will finish recreating them in the background")
 
     log_info(f"Phase 3.2 [{label}]: trust-manager + vmsp-operator + cert-manager re-sync complete")
 
@@ -1476,14 +1556,20 @@ def _phase3_certmanager(cluster_cfg, cp_ip, password, kubeconfig, dry_run,
         log_info(f"  Force-all mode : ENABLED — CA was rotated; renewing ALL leaf certs"
                  f" regardless of expiry (old CA key no longer valid)")
 
-    # Check cert-manager health
+    # Check cert-manager health — cert-manager runs in vmsp-platform (not a
+    # separate "cert-manager" namespace).  Label selector targets the controller.
     rc_h, health_out = _ssh_exec(
         cp_ip, password,
-        f"kubectl {kc_flag} get pods -n cert-manager --no-headers 2>/dev/null",
+        f"kubectl {kc_flag} get pods -n {_TRUST_MANAGER_NS} "
+        f"-l app={_CERTMANAGER_DEPLOY} --no-headers 2>/dev/null",
         timeout=20,
     )
     if rc_h != 0:
-        log_warn(f"cert-manager namespace not accessible — skipping phase")
+        log_warn(f"cert-manager pods not accessible in {_TRUST_MANAGER_NS} — skipping phase")
+        return
+
+    if not health_out.strip():
+        log_warn(f"No cert-manager pods found in {_TRUST_MANAGER_NS} — skipping phase")
         return
 
     unhealthy = [
@@ -1577,6 +1663,8 @@ def _phase3_certmanager(cluster_cfg, cp_ip, password, kubeconfig, dry_run,
                 "has_owners":  has_owners,
                 "old_expiry":  not_after_str,
                 "is_ready":    is_ready,
+                "expiring":    expiring,    # True → within threshold; False → forced
+                "forced":      (is_ready and not expiring and force_all),
             })
 
     if ca_skipped:
@@ -1591,10 +1679,18 @@ def _phase3_certmanager(cluster_cfg, cp_ip, password, kubeconfig, dry_run,
         return
 
     not_ready_n = sum(1 for c in to_renew if not c["is_ready"])
-    expiring_n  = sum(1 for c in to_renew if c["is_ready"])  # ready but expiring
+    expiring_n  = sum(1 for c in to_renew if c.get("expiring") and c["is_ready"])
+    forced_n    = sum(1 for c in to_renew if c.get("forced"))
+    reason_parts = []
+    if not_ready_n:
+        reason_parts.append(f"{not_ready_n} not-Ready")
+    if expiring_n:
+        reason_parts.append(f"{expiring_n} expiring within {threshold_days}d")
+    if forced_n:
+        reason_parts.append(f"{forced_n} force-renewed (CA key mismatch/rotation)")
     log_action(
         f"{len(to_renew)} cert(s) require renewal "
-        f"({not_ready_n} not-Ready, {expiring_n} expiring within {threshold_days}d) — "
+        f"({', '.join(reason_parts)}) — "
         f"patching duration and deleting Secrets"
     )
 
@@ -1955,15 +2051,19 @@ def _check_ca_key_consistency(cp_ip, password, kubeconfig):
     # yet, causing kubectl jsonpath to return nothing.  An empty file fed to
     # openssl produces "Error loading file" which is a FALSE POSITIVE — it must
     # NOT trigger force_all=True.  The safe default is False (docstring contract).
+    #
+    # Size check uses POSIX [ -s file ] (exists AND non-empty) to avoid any
+    # arithmetic comparison issues.  Both stat -c%s and wc -c produced
+    # [: : integer expression expected bash errors on this Photon build when
+    # piped through the base64/sudo SSH tunnel, causing the guard to be silently
+    # bypassed and empty files to reach openssl verify (false-positive FAIL).
     verify_cmd = (
         f"kubectl {kc_flag} get secret {CA_SECRET_NAME} -n {CA_SECRET_NS} "
-        f"-o jsonpath='{{{{.data.ca\\.crt}}}}' 2>/dev/null | base64 -d > /tmp/precheck_ca.pem; "
+        f"-o jsonpath='{{.data.ca\\.crt}}' 2>/dev/null | base64 -d > /tmp/precheck_ca.pem; "
         f"kubectl {kc_flag} get secret registry-certificate -n vmsp-platform "
-        f"-o jsonpath='{{{{.data.tls\\.crt}}}}' 2>/dev/null | base64 -d > /tmp/precheck_reg.pem; "
-        f"CA_SZ=$(stat -c%s /tmp/precheck_ca.pem 2>/dev/null || echo 0); "
-        f"REG_SZ=$(stat -c%s /tmp/precheck_reg.pem 2>/dev/null || echo 0); "
-        f"if [ \"$CA_SZ\" -lt 10 ] || [ \"$REG_SZ\" -lt 10 ]; then "
-        f"  echo \"EMPTY_DATA ca=$CA_SZ reg=$REG_SZ\"; "
+        f"-o jsonpath='{{.data.tls\\.crt}}' 2>/dev/null | base64 -d > /tmp/precheck_reg.pem; "
+        f"if [ ! -s /tmp/precheck_ca.pem ] || [ ! -s /tmp/precheck_reg.pem ]; then "
+        f"  echo \"EMPTY_DATA\"; "
         f"  rm -f /tmp/precheck_ca.pem /tmp/precheck_reg.pem; exit 99; "
         f"fi; "
         f"openssl verify -CAfile /tmp/precheck_ca.pem /tmp/precheck_reg.pem 2>&1; "
@@ -2249,7 +2349,7 @@ def _phase5_casync(cluster_cfg, cp_ip, password, kubeconfig, dry_run,
         _rc_exist, _exist_out = _ssh_exec(
             cp_ip, password,
             f"kubectl {kc_flag} get secret registry-certificate -n vmsp-platform "
-            f"-o jsonpath='{{{{.data.tls\\.crt}}}}' 2>/dev/null",
+            f"-o jsonpath='{{.data.tls\\.crt}}' 2>/dev/null",
             timeout=15,
         )
         if _rc_exist == 0 and _exist_out.strip():
@@ -2271,9 +2371,9 @@ def _phase5_casync(cluster_cfg, cp_ip, password, kubeconfig, dry_run,
     else:
         verify_cmd = (
             f"kubectl {kc_flag} get secret {CA_SECRET_NAME} -n {CA_SECRET_NS} "
-            f"-o jsonpath='{{{{.data.ca\\.crt}}}}' 2>/dev/null | base64 -d > /tmp/p5ca.pem && "
+            f"-o jsonpath='{{.data.ca\\.crt}}' 2>/dev/null | base64 -d > /tmp/p5ca.pem && "
             f"kubectl {kc_flag} get secret registry-certificate -n vmsp-platform "
-            f"-o jsonpath='{{{{.data.tls\\.crt}}}}' 2>/dev/null | base64 -d > /tmp/p5reg.pem && "
+            f"-o jsonpath='{{.data.tls\\.crt}}' 2>/dev/null | base64 -d > /tmp/p5reg.pem && "
             f"openssl verify -CAfile /tmp/p5ca.pem /tmp/p5reg.pem 2>&1; "
             f"RET=$?; rm -f /tmp/p5ca.pem /tmp/p5reg.pem; exit $RET"
         )
@@ -2390,13 +2490,12 @@ def _phase5_casync(cluster_cfg, cp_ip, password, kubeconfig, dry_run,
             f"-n {_TRUST_MANAGER_NS} 2>/dev/null",
             timeout=20,
         )
-        log_info(f"  Waiting 60s for DaemonSet rollout to complete across all nodes...")
-        time.sleep(60)
+        log_info(f"  Waiting up to 120s for DaemonSet rollout to complete across all nodes...")
         rc_ds, ds_out = _ssh_exec(
             cp_ip, password,
             f"kubectl {kc_flag} rollout status daemonset/{_ZOT_CONFIGURE_NODE_DS} "
-            f"-n {_TRUST_MANAGER_NS} --timeout=60s 2>/dev/null",
-            timeout=75,
+            f"-n {_TRUST_MANAGER_NS} --timeout=120s 2>/dev/null",
+            timeout=130,
         )
         if "successfully rolled out" in ds_out:
             log_renewed(f"{_ZOT_CONFIGURE_NODE_DS} DaemonSet rollout complete — containerd CA updated on all nodes")
@@ -2435,8 +2534,27 @@ def _phase5_casync(cluster_cfg, cp_ip, password, kubeconfig, dry_run,
         _ssh_exec(cp_ip, password,
                   f"kubectl {kc_flag} rollout restart deployment/vmsp-identity -n vmsp-platform",
                   timeout=20)
-        log_info("  Waiting 35s for registry + identity pods to restart...")
-        time.sleep(35)
+        log_info("  Waiting for zot-1 + vmsp-identity to become Ready (up to 60s)...")
+        rc_z, z_out = _ssh_exec(
+            cp_ip, password,
+            f"kubectl {kc_flag} rollout status statefulset/zot-1 "
+            f"-n {ZOT_NS} --timeout=60s 2>/dev/null",
+            timeout=70,
+        )
+        if "partitioned roll out complete" in z_out or "rolling update complete" in z_out or "successfully rolled out" in z_out:
+            log_renewed("zot-1 rollout complete")
+        else:
+            log_warn(f"zot-1 rollout status: {z_out.strip()[:80]}")
+        rc_id, id_out = _ssh_exec(
+            cp_ip, password,
+            f"kubectl {kc_flag} rollout status deployment/vmsp-identity "
+            f"-n vmsp-platform --timeout=30s 2>/dev/null",
+            timeout=40,
+        )
+        if "successfully rolled out" in id_out:
+            log_renewed("vmsp-identity rollout complete")
+        else:
+            log_warn(f"vmsp-identity rollout status: {id_out.strip()[:80]}")
 
         # Step 4b: restart SeaWeedFS StatefulSets so they pick up new certs.
         # seaweedfs-filer, seaweedfs-master, and seaweedfs-volume mount their
@@ -2452,8 +2570,18 @@ def _phase5_casync(cluster_cfg, cp_ip, password, kubeconfig, dry_run,
                 timeout=20,
             )
             log_info(f"  Rollout restart triggered: {sts}")
-        log_info("  Waiting 90s for SeaWeedFS StatefulSets to settle...")
-        time.sleep(90)
+        log_info("  Waiting for SeaWeedFS StatefulSets to become Ready (up to 120s)...")
+        for sts in _SEAWEEDFS_STATEFULSETS:
+            rc_s, s_out = _ssh_exec(
+                cp_ip, password,
+                f"kubectl {kc_flag} rollout status statefulset/{sts} "
+                f"-n {_TRUST_MANAGER_NS} --timeout=120s 2>/dev/null",
+                timeout=130,
+            )
+            if "successfully rolled out" in s_out or "rolling update complete" in s_out or "partitioned roll out complete" in s_out:
+                log_renewed(f"{sts} rollout complete")
+            else:
+                log_warn(f"{sts} rollout status: {s_out.strip()[:80]}")
     elif need_restart and dry_run:
         log_info("[dry-run] would restart zot-1, metadata-service, vmsp-identity, SeaWeedFS")
 
@@ -2630,23 +2758,11 @@ def _check_cluster(cluster_name, cluster_cfg, args):
         except Exception as exc:
             log_error(f"Phase 3.1 (cert-manager) raised unexpected exception: {exc}")
 
-        # Post-Phase-3.1 verification: when force_all was True, confirm that
-        # registry-certificate is now signed by the current CA.  A mismatch here
-        # means cert-manager re-issued with a stale cached key; Phase 5 Step 1b
-        # safety net will catch and repair it, but this gives early log visibility.
-        if _force_leaf_renewal and not args.dry_run:
-            log_info("Post-Phase-3.1: re-checking registry-certificate CA consistency...")
-            _post_mismatch = _check_ca_key_consistency(cp_ip, password, kubeconfig)
-            if _post_mismatch:
-                log_error(
-                    "Post-Phase-3.1 verify: registry-certificate STILL mismatched "
-                    "after force-renewal — Phase 5 Step 1b safety net will attempt repair"
-                )
-            else:
-                log_renewed(
-                    "Post-Phase-3.1 verify: registry-certificate now consistent "
-                    "with current CA — Phase 3.1 succeeded"
-                )
+        # Note: no immediate post-Phase-3.1 verify here.  cert-manager takes
+        # several seconds to finish writing the new Secret after renew; running
+        # openssl verify right away produces false-positive mismatches.
+        # Phase 5 Step 1b waits up to 30s for the Secret to settle and then
+        # performs the definitive CA-consistency check.
     else:
         log_info("Phase 3.1 (cert-manager): skipped")
 

@@ -1,6 +1,6 @@
 # vsp_cert_renewer.py — Reference Guide
 
-**Version:** 2.6 — 2026-06-10  
+**Version:** 2.10 — 2026-06-11  
 **Script:** `Tools/vsp_cert_renewer.py`  
 **Called by:** `Startup/VCFfinal.py` Task 2e (before VCF component scale-up)
 
@@ -64,8 +64,10 @@ Reasons:
 ```bash
 kubectl get secret vcf-cluster-ca-secret -n vmsp-platform → /tmp/precheck_ca.pem
 kubectl get secret registry-certificate -n vmsp-platform  → /tmp/precheck_reg.pem
-# v2.6: validate both files are >10 bytes before verify
-stat -c%s /tmp/precheck_ca.pem  (if <10 → INCONCLUSIVE, return False)
+# v2.9: POSIX [ ! -s file ] (exists AND non-empty) replaces all byte-count approaches.
+# stat -c%s and wc -c both produced [: : integer expression expected on Photon builds;
+# the guard was bypassed, openssl received empty files → false-positive FAIL.
+if [ ! -s /tmp/precheck_ca.pem ] || [ ! -s /tmp/precheck_reg.pem ] → INCONCLUSIVE, return False
 openssl verify -CAfile /tmp/precheck_ca.pem /tmp/precheck_reg.pem
 ```
 
@@ -78,7 +80,7 @@ openssl verify -CAfile /tmp/precheck_ca.pem /tmp/precheck_reg.pem
 
 ---
 
-## Phase Execution Order (v2.6)
+## Phase Execution Order (v2.8)
 
 ```plain
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -96,20 +98,18 @@ openssl verify -CAfile /tmp/precheck_ca.pem /tmp/precheck_reg.pem
 │  ── force_all = ca_rotated OR ca_key_mismatch ────────────────────────────── │
 │                                                                              │
 │  Phase 3.2   trust-manager + vmsp-operator + cert-manager re-sync (force_all)│
-│              (a) Restarts trust-manager Deployment; waits for Ready; deletes │
-│              platform-trust ConfigMaps in vmsp-platform, vcf-fleet-depot,   │
-│              vcf-fleet-lcm, ops-logs so trust-manager recreates them with   │
-│              the new CA cert.                                                │
-│              (b) Restarts vmsp-operator Deployment. Its Go binary caches TLS│
-│              root CAs at startup and does NOT auto-reload — restart forces  │
-│              fresh CA pool load so bundle controller avoids ECDSA errors.   │
-│              (c) Restarts cert-manager Deployment. cert-manager can cache   │
-│              the old CA Issuer key for seconds after CA rotation. Without   │
-│              this restart, Phase 3.1 re-issues ALL leaf certs with the OLD  │
-│              CA key (wrong AKI), breaking SeaWeedFS mTLS, vmsp-identity,   │
-│              synthetic-checker, and the component install precheck.         │
-│              Without both restarts, Stage VCF services runtime fails with   │
-│              "ECDSA verification failure" when pushing images to zot-1.      │
+│              (a) Restarts trust-manager Deployment (fire-and-forget).       │
+│              After 20s, deletes platform-trust ConfigMaps in vmsp-platform, │
+│              vcf-fleet-depot, vcf-fleet-lcm, ops-logs so trust-manager      │
+│              recreates them with the new CA cert. Polls ≤60s for completion.│
+│              (b) Restarts vmsp-operator Deployment (fire-and-forget). Its   │
+│              Go binary caches TLS root CAs at startup — restart forces fresh│
+│              CA pool load so bundle controller avoids ECDSA errors. Does NOT│
+│              wait for Ready (does not block Phase 3.1).                     │
+│              (c) Restarts cert-manager Deployment; WAITS ≤90s for Ready.   │
+│              cert-manager must be Ready before Phase 3.1 re-issues leaf     │
+│              certs — otherwise it re-signs with the stale cached CA key.    │
+│              vmsp-operator and trust-manager continue coming up in parallel. │
 │                                                                              │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │  LEAF CERT RENEWAL  (all clusters — kubeadm PKI, separate from vcf-cluster)  │
@@ -121,6 +121,8 @@ openssl verify -CAfile /tmp/precheck_ca.pem /tmp/precheck_reg.pem
 │  Phase 2     Kubelet serving certs                                           │
 │              Per-node kubelet.crt via KCM CSR signing.                       │
 │              Also uses kubeadm PKI CA.                                       │
+│              v2.8: exist + expiry + checkend batched into a single SSH call  │
+│              per node (was 3 calls; saves ~2 round-trip overhead per node).  │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │  VSP-ONLY LEAF CERT RENEWAL  (informed by CA state above)                    │
 ├──────────────────────────────────────────────────────────────────────────────┤
@@ -198,11 +200,12 @@ flowchart TD
     PH32_GATE -- No --> PH1_GATE
     PH32_GATE -- Yes --> PH32_BOX
 
-    subgraph PH32_BOX["── Phase 3.2: trust-manager + vmsp-operator Re-sync (VSP only) ──"]
-        P32A["1. kubectl rollout restart trust-manager\n   Wait ≤ 60s for 1/1 Running"]
+    subgraph PH32_BOX["── Phase 3.2: trust-manager + vmsp-operator + cert-manager Re-sync (VSP only) ──"]
+        P32A["1. kubectl rollout restart trust-manager\n   (fire-and-forget; wait 20s)"]
         P32A --> P32B["2. Delete platform-trust ConfigMaps in:\n   vmsp-platform, vcf-fleet-depot,\n   vcf-fleet-lcm, ops-logs\n   trust-manager recreates with new CA"]
-        P32B --> P32C["3. Wait ≤ 30s for ConfigMaps to appear\n   (cert_count >= 5 per namespace)"]
-        P32C --> P32D["4. kubectl rollout restart vmsp-operator\n   Wait ≤ 90s for 1/1 Running\n   (clears stale in-memory CA pool)"]
+        P32B --> P32D2["3. kubectl rollout restart vmsp-operator\n   (fire-and-forget — does not block Phase 3.1)"]
+        P32D2 --> P32CM["4. kubectl rollout restart cert-manager\n   WAIT ≤ 90s for 1/1 Running\n   (cert-manager MUST be Ready before Phase 3.1)"]
+        P32CM --> P32C["5. Poll ≤ 60s for ConfigMaps to appear\n   (cert_count >= 5 per namespace)\n   trust-manager/vmsp-operator finish in background"]
     end
 
     PH32_BOX --> PH1_GATE
@@ -289,7 +292,7 @@ flowchart TD
 
         P5NS & P5NR --> P5J{"need_restart?\nleaf_certs_prerenewed (Phase 3.1)\nOR leaf_certs_renewed (Step 1b)\nOR nodes updated"}
         P5J -- "No — nothing changed" --> P5DONE["Phase 5 complete\nno action taken"]
-        P5J -- Yes --> P5R["Step 4 — Restart pods:\n  zot-1-0 (registry)\n  metadata-service daemonset\n  vmsp-identity deployment\nWait 35 s for cert reload"]
+        P5J -- Yes --> P5R["Step 3b — Rollout restart zot-1-configure-node DaemonSet\n   kubectl rollout status --timeout=120s (exits early when done)\nStep 4 — Restart pods:\n  zot-1-0 StatefulSet  → rollout status --timeout=60s\n  metadata-service daemonset\n  vmsp-identity deployment → rollout status --timeout=30s\nStep 4b — SeaWeedFS StatefulSets\n  per-sts rollout status --timeout=120s (exits early)"]
     end
 
     P5DONE & P5R --> DONE([Done — all VSP phases complete])
@@ -310,10 +313,10 @@ Pre-check ──► ca_key_mismatch ──────────────�
                                                   │
                                 leaf_certs_prerenewed = force_all
                                                   │
-                               Post-Phase-3.1 verify (when force_all=True)
-                               openssl verify registry-certificate → CA
-                               PASS: log early success
-                               FAIL: log early warning — Phase 5 will repair
+                               (no immediate post-Phase-3.1 verify — v2.8 removed;
+                                cert-manager needs time to write the new Secret.
+                                Phase 5 Step 1b with its 30s settle wait is the
+                                definitive CA-consistency check and handles repair.)
                                                   │
                                             Phase 5 ◄── leaf_certs_prerenewed
                                                   │
@@ -386,3 +389,12 @@ python3 vsp_cert_renewer.py --cluster vsp|vcfa|all
 | `CreateContainerConfigError: secret "vmsp-proxy-service-secret" not found` in vidb-external | Phase 3.1 deleted source secrets in vmsp-platform; Kyverno deleted clones but its background-controller missed the re-sync after cert-manager recreated the sources | Phase 3.1 now restarts Kyverno background-controller after cert renewals (v2.6); also, CA certs are no longer deleted (v2.6) |
 | Phase 3.1 triggers unintended CA rotation (new key pair) on every boot | `force_all=True` caused Phase 3.1 to include CA certificates (spec.isCA: true) in the renewal list, deleting the CA Secret and causing cert-manager to regenerate the key pair | Phase 3.1 now skips all CA certificates — CA lifecycle is managed exclusively by Phase 3.0 (v2.6) |
 | False-positive `force_all=True` on fresh template boot | CA pre-check ran before API server fully loaded Secrets; empty `ca.crt` data caused openssl `Error loading file` → `ca_key_mismatch=True` | Pre-check now validates files are >10 bytes before verify; returns INCONCLUSIVE (safe False) when data unavailable (v2.6) |
+| Phase 3.1 silently skipped on every run (`cert-manager namespace not accessible`) | Health check queried hardcoded `-n cert-manager` namespace which does not exist; cert-manager runs in `vmsp-platform`. Exit code 1 → Phase 3.1 skipped → leaf certs never renewed by the primary path, only by the Phase 5 safety net | Phase 3.1 health check now uses `_TRUST_MANAGER_NS` (`vmsp-platform`) with label selector `app=cert-manager` (v2.7) |
+| `[: : integer expression expected` bash errors during CA pre-check; pre-check fires `force_all` on EVERY run | Both `stat -c%s` (v2.6) and `wc -c` (v2.8) returned empty or whitespace strings on Photon Linux in the base64/sudo SSH tunnel; the arithmetic `[ "$SZ" -lt 10 ]` comparison failed with a bash error, the guard was silently bypassed, empty files reached openssl verify which returned "Error" (not "OK"), causing false-positive `force_all=True` every run | Pre-check now uses pure-shell POSIX `[ ! -s file ]` (no arithmetic, no external command output to parse) — exits 99 (INCONCLUSIVE) when either file is empty (v2.9) |
+| Phase 3.1 log says "N expiring within Xd" when force_all=True even for 1826d-valid certs | Every Ready cert in `to_renew` was counted as "expiring" regardless of whether it was force-renewed due to CA key mismatch | Log now counts three categories: not-Ready, expiring (within threshold), force-renewed (CA key mismatch/rotation) (v2.9) |
+| CA key mismatch detected on EVERY run even after Phase 3.1 force-renewal completes | cert-manager pod reaches `1/1 Running` (readiness probe passes) but its Issuer CA cache loads asynchronously 3–10s later; Phase 3.1 fired secrets deletion during this window, so cert-manager re-issued with the old cached CA key | Phase 3.2 now waits 15s after cert-manager is Running before returning, giving the Issuer cache time to load before Phase 3.1 deletes secrets (v2.9) |
+| Script takes 16+ minutes even when all certs are healthy | Fixed `sleep(60/35/90)` in Phase 5 always waited the full duration; Phase 3.2 waited sequentially for trust-manager (60s) then vmsp-operator (90s) before cert-manager (90s); Phase 2 used 3 SSH calls per node | Phase 3.2: trust-manager and vmsp-operator are now fire-and-forget; Phase 5 sleeps replaced with polled `kubectl rollout status` (exits as soon as rollout completes); Phase 2: batched into 1 SSH call per node (v2.8) |
+| Post-Phase-3.1 "STILL mismatched" warning logged even after successful renewal | Verify ran immediately after cert delete — before cert-manager finished writing the new Secret — always producing a false-positive "still mismatched" log | Post-Phase-3.1 immediate verify removed; Phase 5 Step 1b (30s settle wait + verify) is the definitive check (v2.8) |
+| Phase 5 Step 1b always logs "registry-certificate tls.crt not yet present" WARN on every clean run | `{{{{.data.tls\\.crt}}}}` f-string produced `{{.data.FIELD\.crt}}` (double braces) — kubectl jsonpath requires single braces; double braces return empty (rc=0), so the check always saw empty and waited 30s | Fixed all 5 jsonpath expressions to `{{.data.FIELD\\.crt}}` → `{.data.FIELD\.crt}` (v2.10) |
+| CA pre-check (`_check_ca_key_consistency`) never actually verified CA consistency — always returned False via EMPTY_DATA safe default | Same double-brace jsonpath bug caused `precheck_reg.pem` to always be empty → `[ ! -s ]` always true → rc=99 EMPTY_DATA → safe default False → pre-check could never detect a real mismatch | Same jsonpath fix (v2.10) |
+| Phase 2 logs WARN "cannot parse kubelet.crt expiry — EXISTS::0" on VSP worker nodes | Unbraced `$EXPIRY` is silently consumed by the outer login-shell layer in `sudo -S -i bash -c "$(decode)"` on bash 5.2.0 (Photon VSP workers); `${EXPIRY}` (curly braces) expands correctly. Also: colon separator in `echo "EXISTS:$EXPIRY:$?"` split at the date colons (e.g. "16:49:43"). | Changed echo to pipe separator `EXISTS|${EXPIRY}|${RC}` (capture RC=$? before echo), updated parser to split on `|` instead of `:` (v2.10) |
