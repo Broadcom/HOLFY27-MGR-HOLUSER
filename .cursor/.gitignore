@@ -8,7 +8,7 @@ subagents/
 blocklist
 unified_repo_list.json
 ide_state.json
-
+skills/
 # Only track these (the negations below):
 #   skills/         - Custom agent skills (vcf-9-api, vcf-troubleshooting)
 #   rules/          - Workspace rules (.mdc files)
