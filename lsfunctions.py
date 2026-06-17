@@ -1,5 +1,5 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.19 - 2026-06-09
+# Version 3.20 - 2026-06-17
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
@@ -759,6 +759,34 @@ def _ops_web_session(ops_host, ops_user, password):
         return None, None
 
 
+def _ops_web_logout(session, ops_host):
+    """Log out of the VCF Operations web UI to release the server-side session.
+
+    Calls POST /vcf-operations/logout which is the Spring Security logout endpoint
+    for the /vcf-operations webapp.  This invalidates the concurrent-session
+    registry entry for the admin user so that subsequent users are not greeted
+    with "There is another active session for this user" when opening the UI.
+
+    The /ui/login.action?mainAction=logOut path does NOT clear the concurrent
+    session (returns HTTP 400 from an authenticated session).  Only the Spring
+    Security endpoint at /vcf-operations/logout actually removes the user from
+    the SessionRegistry.
+
+    Non-fatal — errors are silently ignored since logout is a best-effort cleanup.
+
+    :param session:  requests.Session object returned by _ops_web_session()
+    :param ops_host: FQDN of the Ops Manager (e.g. 'ops-a.site-a.vcf.lab')
+    """
+    try:
+        session.post(
+            f'https://{ops_host}/vcf-operations/logout',
+            timeout=15,
+            allow_redirects=False,
+        )
+    except Exception:
+        pass
+
+
 def set_ops_proxy(ops_host, ops_user, password, dry_run=False):
     """Set proxy on VCF Operations Manager: OS /etc/sysconfig/proxy and Global Settings API.
 
@@ -807,6 +835,7 @@ def set_ops_proxy(ops_host, ops_user, password, dry_run=False):
     # ── API: globalSettings.action?mainAction=setGlobalHttpProxy ─────────────
     base = f'https://{ops_host}'
     plug_url = f'{base}/vcf-operations/plug/ops/globalSettings.action'
+    sess = None
     try:
         sess, token = _ops_web_session(ops_host, ops_user, password)
         if not sess or not token:
@@ -848,6 +877,11 @@ def set_ops_proxy(ops_host, ops_user, password, dry_run=False):
     except Exception as e:
         write_output(f'WARNING: {label}: API proxy set error: {e}')
         ok = False
+    finally:
+        # Always logout to release the server-side web session.  Without this,
+        # subsequent users see "admin is already logged in" when opening the UI.
+        if sess:
+            _ops_web_logout(sess, ops_host)
 
     return ok
 
@@ -885,6 +919,7 @@ def clear_ops_proxy(ops_host, ops_user, password, dry_run=False):
 
     # ── API: globalSettings.action?mainAction=deleteGlobalHttpProxy ───────────
     plug_url = f'https://{ops_host}/vcf-operations/plug/ops/globalSettings.action'
+    sess = None
     try:
         sess, token = _ops_web_session(ops_host, ops_user, password)
         if not sess or not token:
@@ -907,6 +942,9 @@ def clear_ops_proxy(ops_host, ops_user, password, dry_run=False):
     except Exception as e:
         write_output(f'WARNING: {label}: API proxy delete error: {e}')
         ok = False
+    finally:
+        if sess:
+            _ops_web_logout(sess, ops_host)
 
     return ok
 
