@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.21 - 2026-06-01
+# Version 2.22 - 2026-06-17
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -4589,6 +4589,7 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
         
         # Step 1: Authenticate
         lsf.write_output(f'{ops_fqdn}: Authenticating to VCF Operations Manager...')
+        token = None
         try:
             token_resp = requests.post(
                 f"{api_base}/api/auth/token/acquire",
@@ -4827,7 +4828,19 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
             lsf.write_output(f'{ops_fqdn}: INFO - Please remediate manually via VCF Operations Manager UI:')
             lsf.write_output(f'{ops_fqdn}: INFO -   {base_url}/vcf-operations/ui/manage/fleet/fleet-settings')
             lsf.write_output(f'{ops_fqdn}: INFO -   Navigate to Fleet Settings > select MaxExpiration > Remediate All')
-    
+
+        # Release token so admin is not left "logged in" when users open the UI.
+        if token:
+            try:
+                requests.post(
+                    f"{api_base}/api/auth/token/release",
+                    headers={"Authorization": f"OpsToken {token}", "Accept": "application/json"},
+                    verify=False, timeout=10,
+                )
+                lsf.write_output(f'{ops_fqdn}: OpsToken released')
+            except Exception:
+                pass
+
     lsf.write_output('VCF Operations Fleet Password Policy configuration complete')
     return overall_success
 

@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.22 - 2026-06-17
+# Version 6.3.23 - 2026-06-17
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.23 Changes:
+# - Fleet password policy block: release OpsToken after use via
+#   POST /suite-api/api/auth/token/release so the admin session does not
+#   persist and users are not greeted with "admin is already logged in"
+#   when opening VCF Operations for the first time after lab startup.
+# - lsfunctions.py _ops_web_logout(): fixed logout endpoint from the broken
+#   GET /ui/login.action?mainAction=logOut (HTTP 400) to the correct Spring
+#   Security endpoint POST /vcf-operations/logout which actually removes the
+#   user from the SessionRegistry. This is called by set_ops_proxy() and
+#   clear_ops_proxy() via the finally block added in v6.3.23.
 #
 # v6.3.22 Changes:
 # - Task 2e: Added ClickHouse cert freshness check after Salt stabilization.
@@ -3823,6 +3834,7 @@ echo "PROXY_CONFIGURED"
         
         if not dry_run:
             import requests
+            _ops_token = None
             try:
                 session = requests.Session()
                 session.verify = False
@@ -3834,10 +3846,10 @@ echo "PROXY_CONFIGURED"
                     timeout=30
                 )
                 token_resp.raise_for_status()
-                token = token_resp.json()['token']
+                _ops_token = token_resp.json()['token']
                 
                 headers = {
-                    'Authorization': f'OpsToken {token}',
+                    'Authorization': f'OpsToken {_ops_token}',
                     'Accept': 'application/json',
                     'Content-Type': 'application/json',
                     'X-vRealizeOps-API-use-unsupported': 'true'
@@ -3882,6 +3894,20 @@ echo "PROXY_CONFIGURED"
                 
             except Exception as e:
                 lsf.write_output(f'  Fleet policy check failed: {e}')
+            finally:
+                # Release the OpsToken so admin is not left "logged in" and
+                # subsequent users are not warned of a concurrent session.
+                if _ops_token:
+                    try:
+                        session.post(
+                            f'https://{ops_fqdn}/suite-api/api/auth/token/release',
+                            headers={'Authorization': f'OpsToken {_ops_token}',
+                                     'Accept': 'application/json'},
+                            timeout=10,
+                        )
+                        lsf.write_output('  OpsToken released')
+                    except Exception:
+                        pass
         else:
             lsf.write_output('  Would trigger fleet policy compliance check/remediation')
     else:
