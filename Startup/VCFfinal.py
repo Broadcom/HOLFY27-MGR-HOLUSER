@@ -233,16 +233,7 @@
 #   use the kube-dns-lb LoadBalancer VIP.  To prevent kapp from reverting
 #   the patch during its 10-minute reconciliation cycle, it also injects
 #   kapp rebase rules into the carvel-services-overlay secret.
-#
-# v4.3 Changes:
-# - Added Task 2c2: Supervisor DNS Health Check
-#   After an ungraceful shutdown the kube-dns K8s Endpoint can point to
-#   the kube-dns-lb LoadBalancer external IP (10.1.0.x) instead of the
-#   actual CoreDNS pod IPs (172.16.200.x). This causes the NSX
-#   Distributed Load Balancer on ESXi to forward ClusterIP DNS traffic
-#   to a routed IP, creating an asymmetric path that drops all DNS
-#   responses for vSphere Pods. The new check detects this and patches
-#   the endpoint to point directly to CoreDNS pod IPs.
+
 
 import os
 import sys
