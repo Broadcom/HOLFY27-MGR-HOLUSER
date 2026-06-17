@@ -1,8 +1,27 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.21 - 2026-06-17
+# Version 6.3.22 - 2026-06-17
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.22 Changes:
+# - Task 2e: Added ClickHouse cert freshness check after Salt stabilization.
+#   Root cause: cert-manager updates vcf-obs-clickhouse-cert secret when the
+#   90-day cert approaches expiry, but ClickHouse loads its TLS cert at pod
+#   startup and never hot-reloads. If ClickHouse starts before cert-manager
+#   finishes writing the updated secret (race on cold boot), it will serve the
+#   old expired cert. The BouncyCastle FIPS TLS library in the vodap Java
+#   services (vcf-obs-data-query-service, vcf-obs-netops-collector-service)
+#   strictly validates cert expiry and refuses to connect → startup probe fails
+#   → CrashLoopBackOff. Fix: detect whether the cert in the secret was recently
+#   renewed (notBefore within 48h) or is close to expiry (<7 days remaining)
+#   and restart ClickHouse so it picks up the refreshed secret.
+# - Task 2e: Added logging-operator-fluentd disk cleanup. The readiness probe
+#   checks /buffers disk usage (< 80%) and active buffer file count (< 10,000).
+#   Over weeks of continuous operation, /buffers/backup accumulates old chunks
+#   (86K+ files, 8+ GB after 89 days) pushing usage above the 80% threshold.
+#   A pod restart does NOT fix this because the PVC persists. Fix: exec into
+#   the running container and purge /buffers/backup/.
 #
 # v6.3.21 Changes:
 # - Task 2e: Replaced conditional salt-raas fix with unconditional rollout-restart approach.
@@ -233,7 +252,16 @@
 #   use the kube-dns-lb LoadBalancer VIP.  To prevent kapp from reverting
 #   the patch during its 10-minute reconciliation cycle, it also injects
 #   kapp rebase rules into the carvel-services-overlay secret.
-
+#
+# v4.3 Changes:
+# - Added Task 2c2: Supervisor DNS Health Check
+#   After an ungraceful shutdown the kube-dns K8s Endpoint can point to
+#   the kube-dns-lb LoadBalancer external IP (10.1.0.x) instead of the
+#   actual CoreDNS pod IPs (172.16.200.x). This causes the NSX
+#   Distributed Load Balancer on ESXi to forward ClusterIP DNS traffic
+#   to a routed IP, creating an asymmetric path that drops all DNS
+#   responses for vSphere Pods. The new check detects this and patches
+#   the endpoint to point directly to CoreDNS pod IPs.
 
 import os
 import sys
@@ -1812,6 +1840,191 @@ echo "PROXY_CONFIGURED"
                 except Exception as _salt_exc:
                     lsf.write_output(
                         f'  WARNING: Salt infrastructure stabilization failed: {_salt_exc}'
+                    )
+
+                # ---- Vodap ClickHouse cert freshness check ----
+                # cert-manager rotates vcf-obs-clickhouse-cert every 90 days.  ClickHouse
+                # loads its TLS cert at pod startup and never hot-reloads.  If ClickHouse
+                # restarts (operator reconcile or node eviction) in the narrow window
+                # between the old cert expiring and cert-manager finishing the secret
+                # update, it will serve the old expired cert.  The vodap Java services
+                # (vcf-obs-data-query-service, vcf-obs-netops-collector-service) use
+                # BouncyCastle FIPS which rejects expired certs → startup probe fails →
+                # CrashLoopBackOff.  Also handles the startup race on cold boot where
+                # ClickHouse may scale up before cert-manager has updated the secret.
+                lsf.write_output('  Checking ClickHouse cert freshness (vodap)...')
+                try:
+                    import subprocess as _sp_chi
+                    import base64 as _b64_chi
+                    import json as _json_chi
+                    import datetime as _dt_chi
+
+                    _chi_sec = vsp_kubectl(
+                        'kubectl get secret vcf-obs-clickhouse-cert -n vodap '
+                        '-o json 2>/dev/null'
+                    )
+                    _chi_sec_out = (getattr(_chi_sec, 'stdout', '') or '').strip()
+                    _chi_sec_js  = _chi_sec_out.find('{')
+                    _needs_chi_restart = False
+
+                    if _chi_sec_js >= 0:
+                        _chi_sec_data  = _json_chi.loads(_chi_sec_out[_chi_sec_js:])
+                        _chi_cert_b64  = _chi_sec_data.get('data', {}).get('tls.crt', '')
+                        if _chi_cert_b64:
+                            _chi_pem = _b64_chi.b64decode(_chi_cert_b64)
+
+                            # Check if cert expires within 7 days
+                            _chi_chk7 = _sp_chi.run(
+                                ['openssl', 'x509', '-noout', '-checkend',
+                                 str(7 * 86400)],
+                                input=_chi_pem, capture_output=True
+                            )
+                            _cert_expiring_soon = (_chi_chk7.returncode != 0)
+
+                            # Check if cert was recently renewed (notBefore < 48h ago)
+                            _chi_dates_raw = _sp_chi.run(
+                                ['openssl', 'x509', '-noout', '-dates'],
+                                input=_chi_pem, capture_output=True
+                            ).stdout.decode('utf-8', errors='ignore')
+                            _chi_not_before_str = ''
+                            for _dln in _chi_dates_raw.splitlines():
+                                if _dln.startswith('notBefore='):
+                                    _chi_not_before_str = _dln.split('=', 1)[1].strip()
+                            _cert_recently_renewed = False
+                            if _chi_not_before_str:
+                                try:
+                                    _chi_nb = _dt_chi.datetime.strptime(
+                                        _chi_not_before_str, '%b %d %H:%M:%S %Y %Z'
+                                    ).replace(tzinfo=_dt_chi.timezone.utc)
+                                    _chi_hours = (
+                                        _dt_chi.datetime.now(_dt_chi.timezone.utc) - _chi_nb
+                                    ).total_seconds() / 3600
+                                    _cert_recently_renewed = _chi_hours < 48
+                                    if _cert_recently_renewed:
+                                        lsf.write_output(
+                                            f'  ClickHouse cert renewed '
+                                            f'{_chi_hours:.1f}h ago — restarting to '
+                                            f'ensure fresh cert pickup'
+                                        )
+                                except ValueError:
+                                    pass
+
+                            if _cert_expiring_soon:
+                                lsf.write_output(
+                                    '  ClickHouse cert expires within 7 days — restarting'
+                                )
+                                _needs_chi_restart = True
+                            elif _cert_recently_renewed:
+                                _needs_chi_restart = True
+                            else:
+                                lsf.write_output(
+                                    '  ClickHouse cert: OK (no restart needed)'
+                                )
+
+                    if _needs_chi_restart:
+                        vsp_kubectl(
+                            'kubectl rollout restart '
+                            'statefulset/chi-vcf-obs-vcf-obs-0-0 -n vodap 2>/dev/null'
+                        )
+                        lsf.write_output(
+                            '  Waiting up to 120s for ClickHouse rollout...'
+                        )
+                        _chi_ro = vsp_kubectl(
+                            'kubectl rollout status '
+                            'statefulset/chi-vcf-obs-vcf-obs-0-0 '
+                            '-n vodap --timeout=120s 2>/dev/null'
+                        )
+                        _chi_ro_out = (getattr(_chi_ro, 'stdout', '') or '').strip()
+                        if ('successfully rolled out' in _chi_ro_out
+                                or 'roll out complete' in _chi_ro_out.lower()):
+                            lsf.write_output(
+                                '  ClickHouse rollout complete — '
+                                'vodap pods will recover automatically'
+                            )
+                        else:
+                            lsf.write_output(
+                                '  ClickHouse rollout did not complete within 120s '
+                                '— continuing (vodap-fix.py can remediate later)'
+                            )
+
+                except Exception as _chi_exc:
+                    lsf.write_output(
+                        f'  WARNING: ClickHouse cert freshness check failed: {_chi_exc}'
+                    )
+
+                # ---- logging-operator-fluentd disk cleanup ----
+                # The fluentd readiness probe checks BUFFER_PATH disk usage (< 80%)
+                # and active .buffer file count (< 10,000).  Over weeks of continuous
+                # operation, /buffers/backup accumulates old chunks that push disk
+                # usage above the 80% threshold.  A pod restart does NOT help because
+                # the buffer PVC persists.  Fix: purge /buffers/backup inside the
+                # running container, then wait for the readiness probe to pass.
+                lsf.write_output('  Checking logging-operator-fluentd readiness...')
+                try:
+                    import json as _json_fld
+                    _fld_pod = vsp_kubectl(
+                        'kubectl get pod logging-operator-fluentd-0 '
+                        '-n vmsp-platform -o json 2>/dev/null'
+                    )
+                    _fld_out = (getattr(_fld_pod, 'stdout', '') or '').strip()
+                    _fld_js  = _fld_out.find('{')
+                    if _fld_js >= 0:
+                        _fld_data   = _json_fld.loads(_fld_out[_fld_js:])
+                        _fld_cstats = _fld_data.get('status', {}).get(
+                            'containerStatuses', []
+                        )
+                        _fld_ready  = sum(
+                            1 for cs in _fld_cstats if cs.get('ready', False)
+                        )
+                        _fld_total  = len(_fld_cstats)
+                        if _fld_total > 0 and _fld_ready < _fld_total:
+                            lsf.write_output(
+                                f'  logging-operator-fluentd-0: '
+                                f'{_fld_ready}/{_fld_total} ready — checking disk...'
+                            )
+                            # Check /buffers disk usage via exec
+                            _buf_check = vsp_kubectl(
+                                "kubectl exec -n vmsp-platform "
+                                "logging-operator-fluentd-0 -c fluentd -- "
+                                "sh -c 'df -h /buffers | tail -1' 2>/dev/null"
+                            )
+                            _buf_out = (getattr(_buf_check, 'stdout', '') or '').strip()
+                            _buf_pct = 0
+                            for _bl in _buf_out.splitlines():
+                                _bp = _bl.split()
+                                if len(_bp) >= 5 and '%' in _bp[4]:
+                                    try:
+                                        _buf_pct = int(_bp[4].rstrip('%'))
+                                    except ValueError:
+                                        pass
+                            if _buf_pct >= 80:
+                                lsf.write_output(
+                                    f'  /buffers at {_buf_pct}% — purging stale '
+                                    f'backup chunks...'
+                                )
+                                vsp_kubectl(
+                                    "kubectl exec -n vmsp-platform "
+                                    "logging-operator-fluentd-0 -c fluentd -- "
+                                    "sh -c 'rm -rf /buffers/backup/* 2>/dev/null' "
+                                    "2>/dev/null"
+                                )
+                                lsf.write_output(
+                                    '  Backup chunks purged — probe should pass '
+                                    'within 15-30s'
+                                )
+                            else:
+                                lsf.write_output(
+                                    f'  /buffers at {_buf_pct}% — probe may '
+                                    f'resolve on its own'
+                                )
+                        else:
+                            lsf.write_output(
+                                f'  logging-operator-fluentd: '
+                                f'{_fld_ready}/{_fld_total} containers ready — OK'
+                            )
+                except Exception as _fld_exc:
+                    lsf.write_output(
+                        f'  WARNING: fluentd readiness check failed: {_fld_exc}'
                     )
 
                 # ---- Update Component CRD annotations to Running ----
