@@ -1,8 +1,33 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.18 - 2026-06-08
+# Version 6.3.21 - 2026-06-17
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.21 Changes:
+# - Task 2e: Replaced conditional salt-raas fix with unconditional rollout-restart approach.
+#   Root cause: After cold boot, cert rotation (vsp_cert_renewer) runs ~18s AFTER Redis
+#   starts. Redis loads the old (expired) TLS cert into memory at startup and never
+#   hot-reloads from the volume mount. RAAS Celery worker gets SSL CERTIFICATE_VERIFY_FAILED
+#   when connecting to Redis and crash-loops for the entire startup window. salt-master gets
+#   500/530 from the broken RAAS SSE API, salt-minion permanently stops.
+#   Previous fix tried conditional detection (empty endpoints, CrashLoopBackOff, etc.) but
+#   these checks are timing-dependent and missed the window on fresh labs.
+#   New fix: unconditionally rollout-restart in dependency order:
+#     (1) Fix pgdata permissions if pgdatabase-0 is not 3/3
+#     (2) rollout restart redis (wait 30s)
+#     (3) rollout restart raas  (wait 60s)
+#     (4) rollout restart salt-master (wait 45s)
+#     (5) rollout restart salt-minion
+#   Each layer waits for kubectl rollout status to confirm completion before proceeding.
+#   This ensures every component loads fresh post-rotation certs and connects to healthy deps.
+#
+# v6.3.20/6.3.19 Changes (superseded by v6.3.21):
+# - Conditional salt-raas fixes (pgdata permissions, Redis cert endpoint check,
+#   CrashLoopBackOff detection, salt-master/minion restart). Replaced by the
+#   unconditional rollout-restart approach in v6.3.21 because conditional
+#   detection was timing-dependent and missed the failure window on fresh labs.
+# - kube-vip vip_preserve_on_leadership_loss + kube-controller-manager fix retained.
 #
 # v6.3.18 Changes:
 # - End-of-startup fix for Fleet-LCM component friendly names in VCF Operations Manager.
@@ -1314,6 +1339,77 @@ def main(lsf=None, standalone=False, dry_run=False):
                 else:
                     lsf.write_output(f'  VSP VIP {vsp_vip} is reachable — no restore needed')
 
+                # ---- Fix kube-vip vip_preserve_on_leadership_loss + clear kube-controller-manager backoff ----
+                # kube-vip panics during leader election when the K8s API is briefly busy,
+                # removes the VIP (vip_preserve_on_leadership_loss=false default), then crashes.
+                # Without the VIP: kube-scheduler and kube-controller-manager lose their API
+                # connection, crash, and enter a 5-minute CrashLoopBackOff. The stalled
+                # kube-controller-manager no longer updates Endpoints/EndpointSlices, so
+                # restarted pods (e.g. Redis in salt-raas) are never added to their Services.
+                # Fix step 1: set vip_preserve_on_leadership_loss=true so the VIP stays on
+                # the interface even if kube-vip panics. This breaks the crash cascade.
+                # Fix step 2: force-remove the kube-controller-manager container if it is in
+                # CrashLoopBackOff so kubelet immediately creates a fresh one.
+                lsf.write_output('  Fixing kube-vip and kube-controller-manager on VSP control plane...')
+                try:
+                    _cp_ssh = f'{vsp_user}@{vsp_control_plane_ip}'
+
+                    # Step 1: patch kube-vip manifest
+                    _kvip_result = lsf.ssh(
+                        f"echo '{password}' | sudo -S sed -i "
+                        f"'/vip_preserve_on_leadership_loss/{{n; s/\"false\"/\"true\"/}}' "
+                        f"/etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null && "
+                        f"echo '{password}' | sudo -S grep -A1 vip_preserve "
+                        f"/etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null",
+                        _cp_ssh
+                    )
+                    _kvip_out = getattr(_kvip_result, 'stdout', '') or ''
+                    if 'true' in _kvip_out:
+                        lsf.write_output('  kube-vip: vip_preserve_on_leadership_loss=true confirmed')
+                    else:
+                        lsf.write_output('  kube-vip: manifest patch returned no confirmation (may already be set)')
+
+                    # Step 2: check whether kube-controller-manager is in CrashLoopBackOff
+                    # (kubelet back-off 5m0s) and force-remove its container so kubelet
+                    # immediately creates a fresh one without waiting for the backoff.
+                    _kcm_ps = lsf.ssh(
+                        f"echo '{password}' | sudo -S crictl ps -a 2>/dev/null | grep kube-controller",
+                        _cp_ssh
+                    )
+                    _kcm_out = getattr(_kcm_ps, 'stdout', '') or ''
+                    _kcm_running = 'Running' in _kcm_out
+                    if not _kcm_running and _kcm_out.strip():
+                        lsf.write_output(
+                            '  kube-controller-manager is Exited/crashed — '
+                            'removing containers to reset CrashLoopBackOff'
+                        )
+                        lsf.ssh(
+                            f"echo '{password}' | sudo -S bash -c "
+                            f"\"crictl ps -a 2>/dev/null | grep kube-controller | "
+                            f"awk '{{print \\$1}}' | xargs -r crictl rm -f 2>/dev/null\" "
+                            f"&& echo KCM_CLEARED",
+                            _cp_ssh
+                        )
+                        # Give kubelet ~15s to spin up a fresh container
+                        lsf.labstartup_sleep(15)
+                        _kcm_check = lsf.ssh(
+                            f"echo '{password}' | sudo -S crictl ps 2>/dev/null | grep kube-controller",
+                            _cp_ssh
+                        )
+                        _kcm_check_out = getattr(_kcm_check, 'stdout', '') or ''
+                        if 'Running' in _kcm_check_out:
+                            lsf.write_output('  kube-controller-manager: Running after reset')
+                        else:
+                            lsf.write_output(
+                                '  kube-controller-manager: not yet Running after reset — continuing'
+                            )
+                    elif _kcm_running:
+                        lsf.write_output('  kube-controller-manager: already Running — no action needed')
+                    else:
+                        lsf.write_output('  kube-controller-manager: no container found — kubelet will create it')
+                except Exception as _kfix_exc:
+                    lsf.write_output(f'  WARNING: kube-vip/controller-manager fix failed: {_kfix_exc}')
+
                 # ---- Detect sudo mode on the control plane ----
                 sudo_needs_password = True  # Default to password-required (VCF 9.1.x)
                 sudo_check = lsf.ssh(
@@ -1629,6 +1725,104 @@ echo "PROXY_CONFIGURED"
                                 f'--all -n {fallback_ns} database.vmsp.vmware.com/suspended- 2>/dev/null'
                             )
                 
+                # ---- Stabilize Salt infrastructure (salt-raas + salt namespaces) ----
+                # Multiple cascading issues break Salt after cold boot:
+                #   1. Postgres pgdata permissions may be != 0700 → postgres refuses to start
+                #   2. Redis loads its TLS cert at startup but cert rotation (vsp_cert_renewer)
+                #      happens ~18s later → Redis serves an expired cert in memory → RAAS
+                #      Celery worker gets SSL CERTIFICATE_VERIFY_FAILED → RAAS crash-loops
+                #   3. salt-master gets 500/530 from RAAS SSE API → broken event queue
+                #   4. salt-minion can't auth with broken master → permanently stops
+                # Conditional detection of each failure mode is fragile because the checks
+                # can run before or after the failure window. The reliable fix is:
+                #   Step 1: Fix pgdata permissions if pgdatabase-0 is not 3/3
+                #   Step 2: Unconditionally rollout-restart redis, raas, salt-master, salt-minion
+                #           in dependency order, with waits between each layer
+                # This ensures every component loads fresh certs and connects to healthy deps.
+                lsf.write_output('  Stabilizing Salt infrastructure...')
+                try:
+                    import json as _json_salt
+
+                    # Step 1: Fix pgdata permissions if needed (same as before)
+                    _pg_result = vsp_kubectl(
+                        'kubectl get pod -n salt-raas pgdatabase-0 -o json 2>/dev/null'
+                    )
+                    _pg_out = getattr(_pg_result, 'stdout', '') or ''
+                    _pg_js = _pg_out.find('{')
+                    if _pg_js >= 0:
+                        try:
+                            _pg_data = _json_salt.loads(_pg_out[_pg_js:])
+                            _cstats = _pg_data.get('status', {}).get('containerStatuses', [])
+                            _ready = sum(1 for cs in _cstats if cs.get('ready', False))
+                            _total = len(_cstats)
+                            if _ready < _total and _total > 0:
+                                lsf.write_output(
+                                    f'  pgdatabase-0 is {_ready}/{_total} — fixing pgdata permissions'
+                                )
+                                _chmod = vsp_kubectl(
+                                    'kubectl exec -n salt-raas pgdatabase-0 -c walg -- '
+                                    'chmod 700 /home/postgres/pgdata/pgroot/data 2>/dev/null '
+                                    '&& echo CHMOD_OK'
+                                )
+                                if 'CHMOD_OK' in (getattr(_chmod, 'stdout', '') or ''):
+                                    lsf.write_output('  pgdata permissions fixed — restarting pgdatabase-0')
+                                    vsp_kubectl(
+                                        'kubectl delete pod -n salt-raas pgdatabase-0 '
+                                        '--grace-period=0 2>/dev/null'
+                                    )
+                                    for _pw in range(18):
+                                        lsf.labstartup_sleep(5)
+                                        _pwr = vsp_kubectl(
+                                            'kubectl get pod -n salt-raas pgdatabase-0 '
+                                            '-o jsonpath="{.status.containerStatuses[*].ready}" '
+                                            '2>/dev/null'
+                                        )
+                                        _pwo = (getattr(_pwr, 'stdout', '') or '').strip()
+                                        if _pwo.count('true') == 3:
+                                            lsf.write_output('  pgdatabase-0 healthy (3/3)')
+                                            break
+                            else:
+                                lsf.write_output(f'  pgdatabase-0 is {_ready}/{_total} — OK')
+                        except (ValueError, Exception) as _e:
+                            lsf.write_output(f'  WARNING: pgdatabase-0 check failed: {_e}')
+
+                    # Step 2: Rollout-restart Redis → wait → RAAS → wait → salt-master → wait → salt-minion
+                    # Using rollout restart ensures a clean zero-downtime pod replacement.
+                    # Each step waits for the previous layer to stabilize.
+                    _salt_steps = [
+                        ('redis',       'salt-raas', 'deployment/redis',       30),
+                        ('raas',        'salt-raas', 'deployment/raas',        60),
+                        ('salt-master', 'salt',      'deployment/salt-master', 45),
+                        ('salt-minion', 'salt',      'deployment/salt-minion', 0),
+                    ]
+                    for _sname, _sns, _sres, _swait in _salt_steps:
+                        lsf.write_output(f'  Rolling restart {_sname} ({_sns}/{_sres})...')
+                        vsp_kubectl(
+                            f'kubectl rollout restart {_sres} -n {_sns} 2>/dev/null'
+                        )
+                        if _swait > 0:
+                            # Wait for rollout to complete (timeout = _swait seconds)
+                            lsf.write_output(f'  Waiting up to {_swait}s for {_sname} rollout...')
+                            _ro = vsp_kubectl(
+                                f'kubectl rollout status {_sres} -n {_sns} '
+                                f'--timeout={_swait}s 2>/dev/null'
+                            )
+                            _ro_out = (getattr(_ro, 'stdout', '') or '').strip()
+                            if 'successfully rolled out' in _ro_out:
+                                lsf.write_output(f'  {_sname}: rollout complete')
+                            else:
+                                lsf.write_output(
+                                    f'  {_sname}: rollout did not complete within '
+                                    f'{_swait}s — continuing'
+                                )
+
+                    lsf.write_output('  Salt infrastructure stabilization complete')
+
+                except Exception as _salt_exc:
+                    lsf.write_output(
+                        f'  WARNING: Salt infrastructure stabilization failed: {_salt_exc}'
+                    )
+
                 # ---- Update Component CRD annotations to Running ----
                 # The VCF Services Runtime UI reads the annotation
                 # "component.vmsp.vmware.com/operational-status" on each
