@@ -59,11 +59,29 @@ HARBOR_NS = "svc-harbor-zjx6i"
 HARBOR_FQDN = "harbor-01a.site-a.vcf.lab"
 VAULT_ROOT_CA_CN = "vcf.lab Root Authority"
 
-# cert-manager Certificate spec values — must be kept exactly
+# cert-manager Certificate spec values — must be kept exactly, See NOTE below
 HARBOR_CERT_CN = "harbor"
 HARBOR_CERT_DNS_SPEC = ["harbor.yourdomain.com", "depot.kube-system.svc"]
 HARBOR_CERT_IP = ["10.1.8.137"]
 HARBOR_CERT_TTL = "17520h"
+
+# It's not needed for connectivity — nothing in the lab actually resolves or uses harbor.yourdomain.com. 
+# It's a Harbor Helm chart default placeholder for externalURL, which the vSphere Supervisor Service kapp package 
+# bakes into the Certificate spec when no real external hostname is configured.
+
+# The reason it's in our cert is cert-manager enforcement: the Certificate spec harbor-tls-cert lists it in 
+# spec.dnsNames, and cert-manager v1.18 checks that every SAN in the spec is present in the actual cert (subset check). 
+# If harbor.yourdomain.com is missing from the cert we issue, cert-manager immediately sees the cert as not satisfying 
+# the spec and re-issues from harbor-ca-issuer.
+
+# So the constraint is:
+
+# cert-manager spec requires: [harbor.yourdomain.com, depot.kube-system.svc]
+# Our cert must contain: [harbor.yourdomain.com, depot.kube-system.svc, 10.1.8.137] at minimum
+# We add: harbor-01a.site-a.vcf.lab as an extra SAN (allowed — cert-manager only enforces the subset, not equality)
+# Dropping harbor.yourdomain.com from our cert would immediately trigger a re-issue from Harbor CA. 
+# The Harbor operator controls the Certificate spec and we can't remove that entry without kapp reverting it in ~9 minutes.
+
 
 # cert-manager namespace (ClusterIssuer token Secret goes here)
 CERT_MANAGER_NS = "vmware-system-cert-manager"
