@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.23 - 2026-06-17
+# Version 6.3.24 - 2026-06-19
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.24 Changes:
+# - Task 7: Added NSX VNA/Edge transport-node password expiration block
+#   immediately after NSX Manager password expiration. Uses transport-nodes
+#   proxy API (PUT /api/v1/transport-nodes/{id}/node/users/{userid}) — no
+#   SSH to edge/VNA nodes required. Targets admin, audit, root on all
+#   EdgeNode/VirtualNetworkAppliance transport nodes on each NSX Manager.
+# - Task 7: Updated NSX Manager password expiration output to use consistent
+#   [+]/[-]/[~]/[!] prefix format with (id=N) user identification, matching
+#   the VNA section output style.
 #
 # v6.3.23 Changes:
 # - Fleet password policy block: release OpsToken after use via
@@ -3761,72 +3771,151 @@ echo "PROXY_CONFIGURED"
 
     if nsx_mgr_entries:
         lsf.write_output(
-            f'Checking NSX Manager password expiration '
-            f'(threshold: {nsx_expiry_threshold_days}d)...'
+            f'NSX Manager password expiration '
+            f'(threshold: {nsx_expiry_threshold_days}d):'
         )
         lsf.write_vpodprogress('NSX Password Config', 'GOOD-8')
 
         for entry in nsx_mgr_entries:
             nsx_host = entry.split(':')[0].strip()
             nsx_fqdn = f'{nsx_host}.site-a.vcf.lab' if '.' not in nsx_host else nsx_host
+            lsf.write_output(f'  -> {nsx_fqdn}')
 
             if not dry_run:
                 if not lsf.test_tcp_port(nsx_fqdn, 22, timeout=5):
-                    lsf.write_output(f'  {nsx_fqdn}: SSH not reachable - skipping')
+                    lsf.write_output(f'     [!] SSH not reachable — skipping')
                     continue
 
                 for user in nsx_users:
+                    uid_str = str(_nsx_user_id.get(user, '?'))
                     current = _nsx_days_until_expiry(nsx_fqdn, password, user)
 
                     if current == _NSX_EXPIRY_API_ERROR:
-                        # REST call failed — can't verify; update as safe fallback
-                        lsf.write_output(
-                            f'  {nsx_fqdn}: {user} — REST API check failed, '
-                            f'updating as safe fallback')
+                        current_display = 'check-failed'
                     elif current is None:
-                        # Key absent in response → no expiry configured → skip
-                        lsf.write_output(
-                            f'  {nsx_fqdn}: {user} — no expiry configured '
-                            f'setting to {nsx_expiry_days}d')
-                        #     f'(password_change_frequency=0) — SKIP')
-                        # continue
-                    # elif current == 0:
-                    #     # NSX "no expiry" sentinel value → skip
-                    #     lsf.write_output(
-                    #         f'  {nsx_fqdn}: {user} — API reports 0 days '
-                    #         f'(non-expiring) — SKIP')
-                    #     continue
+                        current_display = 'no-expiry'
                     elif current > nsx_expiry_threshold_days:
                         lsf.write_output(
-                            f'  {nsx_fqdn}: {user} — expires in {current}d '
-                            f'(> {nsx_expiry_threshold_days}d threshold) — SKIP')
+                            f'     [~] {user} (id={uid_str}): {current}d — '
+                            f'skip (> {nsx_expiry_threshold_days}d threshold)')
                         continue
                     else:
-                        # Expires within threshold — update
-                        lsf.write_output(
-                            f'  {nsx_fqdn}: {user} — expires in {current}d '
-                            f'(≤ {nsx_expiry_threshold_days}d) — setting to '
-                            f'{nsx_expiry_days}d')
+                        current_display = f'{current}d'
+
                     result = lsf.ssh(
                         f'set user {user} password-expiration {nsx_expiry_days}',
                         f'admin@{nsx_fqdn}', password
                     )
                     if result.returncode == 0:
                         lsf.write_output(
-                            f'  {nsx_fqdn}: {user} password expiration '
-                            f'updated to {nsx_expiry_days} days')
+                            f'     [+] {user} (id={uid_str}): '
+                            f'{current_display} -> {nsx_expiry_days}d  [OK]')
                     else:
                         lsf.write_output(
-                            f'  {nsx_fqdn}: WARNING — could not set {user} '
-                            f'password expiration (exit {result.returncode})')
+                            f'     [-] {user} (id={uid_str}): FAILED '
+                            f'(exit {result.returncode})')
                         nsx_task_failed = True
             else:
                 lsf.write_output(
-                    f'  Would check NSX user expiry on {nsx_fqdn} and update '
-                    f'any user expiring within {nsx_expiry_threshold_days}d '
-                    f'to {nsx_expiry_days}d'
-                )
-    
+                    f'     [DRY-RUN] Would check/set user expiry '
+                    f'(threshold: {nsx_expiry_threshold_days}d -> {nsx_expiry_days}d)')
+
+    # ---- NSX VNA/Edge transport-node password expiration ----------------
+    # Transport-nodes proxy API — no SSH to edge/VNA nodes required.
+    if nsx_mgr_entries:
+        lsf.write_output('NSX VNA/Edge transport-node password expiration:')
+        if not dry_run:
+            import requests as _vna_req
+            import urllib3 as _vna_urllib3
+            _vna_urllib3.disable_warnings(
+                _vna_urllib3.exceptions.InsecureRequestWarning)
+            _vna_auth = ('admin', password)
+            _vna_target_users = {'admin', 'audit', 'root'}
+
+            for entry in nsx_mgr_entries:
+                nsx_host = entry.split(':')[0].strip()
+                nsx_fqdn = (f'{nsx_host}.site-a.vcf.lab'
+                            if '.' not in nsx_host else nsx_host)
+                lsf.write_output(f'  -> {nsx_fqdn}')
+
+                try:
+                    resp = _vna_req.get(
+                        f'https://{nsx_fqdn}/api/v1/transport-nodes',
+                        auth=_vna_auth, verify=False, timeout=30)
+                    resp.raise_for_status()
+                    all_nodes = resp.json().get('results', [])
+                except Exception as e:
+                    lsf.write_output(f'     [!] transport-nodes query failed: {e}')
+                    nsx_task_failed = True
+                    continue
+
+                vna_nodes = [
+                    n for n in all_nodes
+                    if n.get('node_deployment_info', {}).get('resource_type', '')
+                       in ('EdgeNode', 'VirtualNetworkAppliance')
+                    or 'vna' in n.get('display_name', '').lower()
+                    or n.get('display_name', '').lower().startswith('edge-')
+                ]
+
+                if not vna_nodes:
+                    lsf.write_output(f'     (no VNA/Edge transport nodes found)')
+                    continue
+
+                for node in vna_nodes:
+                    node_id = node['id']
+                    node_name = node.get('display_name', node_id)
+                    rt = (node.get('node_deployment_info', {})
+                               .get('resource_type', 'unknown'))
+                    lsf.write_output(f'     -> {node_name}  (type={rt})')
+
+                    try:
+                        uresp = _vna_req.get(
+                            f'https://{nsx_fqdn}/api/v1/transport-nodes'
+                            f'/{node_id}/node/users',
+                            auth=_vna_auth, verify=False, timeout=30)
+                        uresp.raise_for_status()
+                        node_users = uresp.json().get('results', [])
+                    except Exception as e:
+                        lsf.write_output(f'        [!] users query failed: {e}')
+                        nsx_task_failed = True
+                        continue
+
+                    for user_data in node_users:
+                        uname = user_data.get('username')
+                        uid = user_data.get('userid')
+                        if uname not in _vna_target_users:
+                            continue
+                        current = user_data.get('password_change_frequency',
+                                                'unset')
+                        user_data['password_change_frequency'] = nsx_expiry_days
+                        try:
+                            presp = _vna_req.put(
+                                f'https://{nsx_fqdn}/api/v1/transport-nodes'
+                                f'/{node_id}/node/users/{uid}',
+                                json=user_data, auth=_vna_auth,
+                                verify=False, timeout=30)
+                            if presp.status_code == 200:
+                                lsf.write_output(
+                                    f'        [+] {uname} (id={uid}): '
+                                    f'{current} -> {nsx_expiry_days}d  [OK]')
+                            else:
+                                lsf.write_output(
+                                    f'        [-] {uname} (id={uid}): FAILED '
+                                    f'HTTP {presp.status_code}')
+                                nsx_task_failed = True
+                        except Exception as e:
+                            lsf.write_output(
+                                f'        [-] {uname} (id={uid}): FAILED — {e}')
+                            nsx_task_failed = True
+        else:
+            for entry in nsx_mgr_entries:
+                nsx_host = entry.split(':')[0].strip()
+                nsx_fqdn = (f'{nsx_host}.site-a.vcf.lab'
+                            if '.' not in nsx_host else nsx_host)
+                lsf.write_output(
+                    f'  [DRY-RUN] Would set VNA/Edge password expiration to '
+                    f'{nsx_expiry_days}d on transport nodes via {nsx_fqdn}')
+
     # Fleet password policy remediation via ops-a suite-api
     ops_fqdn = 'ops-a.site-a.vcf.lab'
     if lsf.test_tcp_port(ops_fqdn, 443, timeout=5):
