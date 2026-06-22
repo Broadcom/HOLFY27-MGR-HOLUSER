@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # VVFshutdown.py - HOLFY27 Core VVF Shutdown Module
-# Version 1.2 - 2026-06-01
+# Version 1.3 - 2026-06-22
 #
 # CHANGELOG:
+# v1.3 - 2026-06-22 (Phase 1 idempotency):
+#   - Phase 1: Added TCP pre-check on port 5480 per VIP before invoking
+#     vcf_services_runtime_shutdown.sh. If the management API is unreachable
+#     (VSP already down), the VIP is skipped immediately (~5s) instead of
+#     waiting up to 30 minutes for the script's internal timeout. Makes
+#     Phase 1 safe to re-run on a partially or fully-shut-down environment.
 # v1.2 - 2026-06-01 (hung shutdown fix):
 #   - Phase 1b (NEW): After VSP graceful K8s drain, SSH to each ESXi host and
 #     force-power-off any remaining vsp-* VMs. vcf_services_runtime_shutdown.sh
@@ -90,7 +96,7 @@ logging.basicConfig(
 
 MODULE_NAME = 'VVFshutdown'
 MODULE_DESCRIPTION = 'VVF Graceful Shutdown'
-MODULE_VERSION = '1.1'
+MODULE_VERSION = '1.3'
 
 SHUTDOWN_LOG = '/home/holuser/hol/shutdown.log'
 STATUS_FILE = '/lmchol/hol/startup_status.txt'
@@ -371,6 +377,13 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                 if dry_run:
                     vvf_write(lsf, f'  [DRY-RUN] Would run: {VSP_SHUTDOWN_SCRIPT} '
                                    f'--node-ip {vip} --skip-snapshot-check')
+                    continue
+
+                # Pre-check: if the VSP management API (port 5480) is already
+                # unreachable, the cluster is already down — skip immediately
+                # rather than waiting 30 minutes for the script's internal timeout.
+                if not lsf.test_tcp_port(vip, 5480, timeout=5):
+                    vvf_write(lsf, f'  {vip}: port 5480 unreachable — VSP already down, skipping')
                     continue
 
                 try:

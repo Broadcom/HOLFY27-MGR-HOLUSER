@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 3.7 - 2026-06-01
+# Version 3.8 - 2026-06-22
 # Author - Burke Azbill and HOL Core Team
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
 #
+# v 3.8 Changes (2026-06-22):
+# - Phase 2b: Added TCP pre-check on port 5480 per VSP VIP before invoking
+#   vcf_services_runtime_shutdown.sh. If the management API is unreachable
+#   (VSP already down), the VIP is skipped immediately (~5s) instead of
+#   waiting up to 30 minutes for the script's internal timeout. Mirrors the
+#   same fix applied to VVFshutdown.py Phase 1 (v1.3 2026-06-22).
 # v 3.7 Changes (2026-06-01):
 # - Phase 2b: Replaced kubectl scale-down approach with
 #   vcf_services_runtime_shutdown.sh subprocess call (Broadcom-provided script, source: https://knowledge.broadcom.com/external/article/440874/how-to-safely-shutdown-all-nodes-within.html).
@@ -323,7 +329,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 MODULE_NAME = 'VCFshutdown'
-MODULE_VERSION = '2.8'
+MODULE_VERSION = '2.9'
 MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 9.x compliant)'
 
 # Status file for console display
@@ -1418,6 +1424,14 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
 
                 for _vip in _vsp_vips:
                     vcf_write(lsf, f'Calling VSP shutdown script for site VIP: {_vip}')
+
+                    # Pre-check: if the VSP management API (port 5480) is already
+                    # unreachable, the cluster is already down — skip immediately
+                    # rather than waiting 30 minutes for the script's internal timeout.
+                    if not lsf.test_tcp_port(_vip, 5480, timeout=5):
+                        vcf_write(lsf, f'  {_vip}: port 5480 unreachable — VSP already down, skipping')
+                        continue
+
                     try:
                         import subprocess as _subproc
                         _cmd = [_vsp_shutdown_script, '--node-ip', _vip, '--skip-snapshot-check']
