@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # VVFshutdown.py - HOLFY27 Core VVF Shutdown Module
-# Version 1.3 - 2026-06-22
+# Version 1.4 - 2026-06-22
 #
 # CHANGELOG:
+# v1.4 - 2026-06-22 (elevator bug fixes):
+#   - check_vsan_esa() SSH fallback: fixed 'ESA' in result where result is a
+#     CompletedProcess object (raises TypeError, caught by except → always False).
+#     Now extracts result.stdout before the 'in' check.
+#   - wait_for_elevator_completion(): fixed val = str(result).strip() which
+#     produced the CompletedProcess repr, never '0'. Now uses result.stdout.
+#     Added early-exit for rc=255 (SSH unreachable — host already off) and
+#     rc!=0 with vsish path error in stderr (ESA hosts — lsom path absent).
 # v1.3 - 2026-06-22 (Phase 1 idempotency):
 #   - Phase 1: Added TCP pre-check on port 5480 per VIP before invoking
 #     vcf_services_runtime_shutdown.sh. If the management API is unreachable
@@ -96,7 +104,7 @@ logging.basicConfig(
 
 MODULE_NAME = 'VVFshutdown'
 MODULE_DESCRIPTION = 'VVF Graceful Shutdown'
-MODULE_VERSION = '1.3'
+MODULE_VERSION = '1.4'
 
 SHUTDOWN_LOG = '/home/holuser/hol/shutdown.log'
 STATUS_FILE = '/lmchol/hol/startup_status.txt'
@@ -165,7 +173,8 @@ def check_vsan_esa(lsf, host: str, username: str, password: str) -> bool:
     try:
         result = lsf.ssh('esxcli vsan cluster get 2>&1',
                          f'{username}@{host}', password)
-        if result and 'ESA' in result:
+        stdout = result.stdout if hasattr(result, 'stdout') and result.stdout else ''
+        if stdout and 'ESA' in stdout:
             return True
     except Exception:
         pass
@@ -205,12 +214,24 @@ def wait_for_elevator_completion(lsf, hosts: list, username: str, password: str,
             try:
                 result = lsf.ssh('vsish -e get /storage/lsom/elevatorRunning',
                                   f'{username}@{host}', password)
-                val = str(result).strip()
-                if val == '0':
+                rc = result.returncode if hasattr(result, 'returncode') else -1
+                stdout = result.stdout.strip() if hasattr(result, 'stdout') and result.stdout else ''
+                stderr = result.stderr if hasattr(result, 'stderr') and result.stderr else ''
+                if rc == 255:
+                    # SSH unreachable — host already powered off, treat as done
+                    vvf_write(lsf, f'  {host}: SSH unreachable — treating as complete')
+                    newly_done.add(host)
+                elif rc != 0 and ('mal-formed path' in stderr or 'Extraneous' in stderr):
+                    # ESA host — vsish /storage/lsom path does not exist, skip
+                    vvf_write(lsf, f'  {host}: ESA host (no lsom path) — skipping elevator')
+                    newly_done.add(host)
+                elif stdout == '0':
                     vvf_write(lsf, f'  {host}: elevator complete (elapsed {int(time.time()-start)}s)')
                     newly_done.add(host)
+                elif stdout == '1':
+                    vvf_write(lsf, f'  {host}: still flushing')
                 else:
-                    vvf_write(lsf, f'  {host}: still running ({val})')
+                    vvf_write(lsf, f'  {host}: unexpected response (rc={rc}, out={repr(stdout)}) — retry')
             except Exception as e:
                 vvf_write(lsf, f'  {host}: poll error ({e}) — will retry')
 
