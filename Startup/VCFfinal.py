@@ -1,8 +1,25 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.24 - 2026-06-19
+# Version 6.3.25 - 2026-06-24
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.25 Changes:
+# - Task 2e: Pre-flight block (KB 440862) enhanced with full manual recovery:
+#   Step B now fetches power-off-marker ConfigMap as JSON, parses vmspcontent
+#   (vmsp-platform deployments, name=N) and content (tenant services,
+#   namespace.kind.name=N) fields and scales each resource to its exact saved
+#   replica count, then deletes the ConfigMap. Falls through to existing generic
+#   component scaling for anything not covered (empty fields, parse error, or
+#   ConfigMap absent). Step C now parses nodes as JSON and excludes any node
+#   with ToBeDeletedByClusterAutoscaler taint from uncordon, with text-based
+#   fallback if JSON decode fails.
+# - Task 2e: Added pre-flight block (KB 440862) immediately after vsp_kubectl
+#   is defined. Deletes stale system-shutdown Argo Workflows in vmsp-platform,
+#   checks power-off-marker ConfigMap, and uncordons any SchedulingDisabled
+#   nodes before proxy config and component scaling. Prevents the boot deadlock
+#   where the auto-recovery workflow waits for schedulable nodes while nodes
+#   remain cordoned from the prior shutdown.
 #
 # v6.3.24 Changes:
 # - Task 7: Added NSX VNA/Edge transport-node password expiration block
@@ -1467,7 +1484,173 @@ def main(lsf=None, standalone=False, dry_run=False):
                     else:
                         ssh_cmd = f"sudo -i bash -c '{kubectl_cmd}'"
                     return lsf.ssh(ssh_cmd, f'{vsp_user}@{vsp_control_plane_ip}')
-                
+
+                # ---- Pre-flight: KB 440862 — stale Argo cleanup + uncordon SchedulingDisabled nodes ----
+                # The power-off-marker auto-recovery workflow waits for all nodes to be schedulable
+                # before scaling services up. If any node is SchedulingDisabled (stale cordon from
+                # the previous graceful shutdown), the workflow deadlocks — the API at port 5480 never
+                # comes up, and component scaling attempts below succeed at the API level but pods never
+                # schedule. Delete stale Argo workflows first (they re-cordon if resumed by the Argo
+                # controller), then uncordon any stuck nodes so auto-recovery can proceed.
+                lsf.write_output('  Pre-flight: checking for KB 440862 boot deadlock conditions...')
+                try:
+                    # Step A: delete stale system-shutdown Argo Workflows
+                    _pf_wf_out = (getattr(vsp_kubectl(
+                        'kubectl get workflow -n vmsp-platform --no-headers 2>/dev/null'
+                    ), 'stdout', '') or '')
+                    _pf_stale_wfs = [
+                        l.split()[0] for l in _pf_wf_out.splitlines()
+                        if 'system-shutdown' in l and l.split()
+                    ]
+                    if _pf_stale_wfs:
+                        lsf.write_output(
+                            f'  Pre-flight: deleting {len(_pf_stale_wfs)} stale Argo workflow(s)...')
+                        for _pf_wf in _pf_stale_wfs:
+                            vsp_kubectl(
+                                f'kubectl delete workflow -n vmsp-platform '
+                                f'{_pf_wf} --grace-period=0 2>/dev/null'
+                            )
+                            lsf.write_output(f'  Pre-flight: deleted Argo workflow {_pf_wf}')
+                    else:
+                        lsf.write_output('  Pre-flight: no stale Argo workflows found')
+
+                    # Step B: power-off-marker recovery (KB 440862 steps 2-5)
+                    # Fetch ConfigMap as JSON, parse vmspcontent (vmsp-platform deployments)
+                    # and content (tenant services, namespace.kind.name=replicas tuples), scale
+                    # each resource to its exact saved replica count, then delete the ConfigMap.
+                    # If a field is empty or the ConfigMap is absent, the existing generic
+                    # component scaling below (vcfcomponents / Postgres unsuspend / etc.) acts
+                    # as the automatic fallback — nothing is left unrecovered.
+                    import json as _pf_json
+                    _pf_pom_raw = (getattr(vsp_kubectl(
+                        'kubectl get configmap power-off-marker -n vmsp-platform'
+                        ' -o json 2>/dev/null'
+                    ), 'stdout', '') or '')
+                    _pf_pom_js = _pf_pom_raw.find('{')
+                    if _pf_pom_js >= 0:
+                        lsf.write_output(
+                            '  Pre-flight: power-off-marker ConfigMap found'
+                            ' — applying manual recovery (KB 440862 steps 2-5)...')
+                        try:
+                            _pf_cm = _pf_json.loads(_pf_pom_raw[_pf_pom_js:])
+                            _pf_vmsp_data   = _pf_cm.get('data', {}).get('vmspcontent', '')
+                            _pf_tenant_data = _pf_cm.get('data', {}).get('content', '')
+
+                            # Scale vmsp-platform deployments (vmspcontent: name=N,name=N,...)
+                            _pf_vmsp_scaled = 0
+                            if _pf_vmsp_data:
+                                for _pf_e in _pf_vmsp_data.split(','):
+                                    _pf_n, _, _pf_r = _pf_e.strip().partition('=')
+                                    if _pf_n.strip() and _pf_r.strip().isdigit():
+                                        vsp_kubectl(
+                                            f'kubectl scale deploy {_pf_n.strip()}'
+                                            f' --replicas={_pf_r.strip()}'
+                                            f' -n vmsp-platform 2>/dev/null'
+                                        )
+                                        _pf_vmsp_scaled += 1
+                                lsf.write_output(
+                                    f'  Pre-flight: scaled {_pf_vmsp_scaled}'
+                                    f' vmsp-platform deployment(s) from ConfigMap data')
+                            else:
+                                lsf.write_output(
+                                    '  Pre-flight: vmspcontent empty'
+                                    ' — vmsp-platform uses generic scaling fallback below')
+
+                            # Scale tenant services (content: namespace.kind.name=N,...)
+                            _pf_tenant_scaled = 0
+                            if _pf_tenant_data:
+                                for _pf_e in _pf_tenant_data.split(','):
+                                    _pf_k, _, _pf_r = _pf_e.strip().partition('=')
+                                    _pf_parts = _pf_k.strip().split('.', 2)
+                                    if len(_pf_parts) == 3 and _pf_r.strip().isdigit():
+                                        _pf_ns, _pf_kind, _pf_name = _pf_parts
+                                        vsp_kubectl(
+                                            f'kubectl scale {_pf_kind.lower().strip()}'
+                                            f' {_pf_name.strip()}'
+                                            f' --replicas={_pf_r.strip()}'
+                                            f' -n {_pf_ns.strip()} 2>/dev/null'
+                                        )
+                                        _pf_tenant_scaled += 1
+                                lsf.write_output(
+                                    f'  Pre-flight: scaled {_pf_tenant_scaled}'
+                                    f' tenant service(s) from ConfigMap data')
+                            else:
+                                lsf.write_output(
+                                    '  Pre-flight: content field empty'
+                                    ' — tenant services use generic scaling fallback below')
+
+                            # Delete ConfigMap — signals that recovery is complete
+                            vsp_kubectl(
+                                'kubectl delete configmap power-off-marker'
+                                ' -n vmsp-platform 2>/dev/null'
+                            )
+                            lsf.write_output(
+                                '  Pre-flight: power-off-marker ConfigMap deleted'
+                                ' — manual recovery complete')
+
+                        except Exception as _pf_pom_exc:
+                            lsf.write_output(
+                                f'  WARNING: power-off-marker parse/scale failed'
+                                f' (non-fatal): {_pf_pom_exc}')
+                            lsf.write_output(
+                                '  Pre-flight: falling through to generic component scaling')
+                    else:
+                        lsf.write_output(
+                            '  Pre-flight: power-off-marker ConfigMap absent'
+                            ' (cold boot or already recovered'
+                            ' — generic scaling below is the active path)')
+
+                    # Step C: uncordon non-condemned SchedulingDisabled nodes
+                    # Fetch nodes as JSON and inspect spec.taints to exclude any node carrying
+                    # ToBeDeletedByClusterAutoscaler — condemned nodes must not be uncordoned.
+                    # Falls back to text-based parsing if JSON decode fails.
+                    _pf_nd_raw = (getattr(vsp_kubectl(
+                        'kubectl get nodes -o json 2>/dev/null'
+                    ), 'stdout', '') or '')
+                    _pf_nd_js = _pf_nd_raw.find('{')
+                    try:
+                        _pf_nodes = (
+                            _pf_json.loads(_pf_nd_raw[_pf_nd_js:])
+                            if _pf_nd_js >= 0 else {}
+                        )
+                        _pf_to_uncordon = []
+                        _pf_condemned   = []
+                        for _pf_item in _pf_nodes.get('items', []):
+                            _pf_nm      = _pf_item.get('metadata', {}).get('name', '')
+                            _pf_taints  = _pf_item.get('spec', {}).get('taints', [])
+                            _pf_unsched = _pf_item.get('spec', {}).get('unschedulable', False)
+                            if _pf_unsched:
+                                if any(t.get('key') == 'ToBeDeletedByClusterAutoscaler'
+                                       for t in _pf_taints):
+                                    _pf_condemned.append(_pf_nm)
+                                else:
+                                    _pf_to_uncordon.append(_pf_nm)
+                        if _pf_condemned:
+                            lsf.write_output(
+                                f'  Pre-flight: skipping condemned node(s)'
+                                f' (ToBeDeletedByClusterAutoscaler):'
+                                f' {", ".join(_pf_condemned)}')
+                        for _pf_node in _pf_to_uncordon:
+                            vsp_kubectl(f'kubectl uncordon {_pf_node} 2>/dev/null')
+                            lsf.write_output(f'  Pre-flight: uncordoned {_pf_node}')
+                        if not _pf_to_uncordon:
+                            lsf.write_output('  Pre-flight: no SchedulingDisabled nodes — OK')
+                    except Exception as _pf_nd_exc:
+                        lsf.write_output(
+                            f'  Pre-flight: JSON node parse failed, using text fallback:'
+                            f' {_pf_nd_exc}')
+                        for _pf_line in (getattr(vsp_kubectl(
+                            'kubectl get nodes --no-headers 2>/dev/null'
+                        ), 'stdout', '') or '').splitlines():
+                            if 'SchedulingDisabled' in _pf_line and _pf_line.split():
+                                _pf_fb_node = _pf_line.split()[0]
+                                vsp_kubectl(f'kubectl uncordon {_pf_fb_node} 2>/dev/null')
+                                lsf.write_output(
+                                    f'  Pre-flight: uncordoned {_pf_fb_node} (text fallback)')
+                except Exception as _pf_exc:
+                    lsf.write_output(
+                        f'  WARNING: VSP pre-flight check failed (non-fatal): {_pf_exc}')
+
                 # ---- Apply PROXY and NO_PROXY to VSP cluster nodes (HOL only) ----
                 # Inject proxy configuration to avoid ImagePullBackOff for opsnet/opslogs.
                 # Skipped for non-HOL labtypes (DISCOVERY, VXP, ATE, EDU) that have direct
