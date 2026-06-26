@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VCFA Complete Stabilization Script v2.7
-# Version 2.7 - 2026-05-13
+# VCFA Complete Stabilization Script v2.8
+# Version 2.8 - 2026-06-26
 # Author - HOL Core Team
 #
 # Default-run philosophy (v2.6+): one run of the script with no flags should leave the VCFA in a
@@ -18,6 +18,7 @@
 #   - etcd defrag (only when slack >= 30%)
 # What's a runtime backstop (re-applied every run, harmless if already correct):
 #   - eth0 VIP pinning for .69, .70, .72 (kube-vip will reclaim, this is just a fallback)
+#   - ccs-k3s service-tls cert freshness check (NEW v2.8)
 # What's conditional (only applied when we detect actual trouble):
 #   - kyverno --forceFailurePolicyIgnore=true + webhook Fail->Ignore. Triggers when load1>30, OR
 #     kyverno pods not Ready, OR kube-controller-manager restarts>5. Reason: vmsp-operator owns
@@ -25,6 +26,18 @@
 #     unconditionally just churns rollouts. Set FORCE_KYVERNO_FIX=1 to bypass the heuristic.
 #
 # See VCFA_Stabilizer_Incident_Apr2026.md for the gateway/EnvoyProxy guidance and HTTP 503 recovery.
+#
+# v2.8 changelog (2026-06-26):
+#  * NEW check_and_fix_ccs_k3s_cert(): detects and remediates stale service-tls certs across ALL
+#    24 prelude deployments that share the service-tls Secret. cert-manager auto-renews the Secret
+#    (~90-day validity) but every pod must restart to mount the new cert data. Without a restart
+#    pods continue serving expired certs and Envoy rejects upstream TLS with CERTIFICATE_VERIFY_FAILED
+#    → HTTP 503 on any affected route (/cci/*, /automation, and others).
+#    Detection: compare cert notBefore (from Secret) vs each pod's startTime (from kubectl) — pure
+#    kubectl, no network probe needed, ~2-3s on a healthy cluster. Stale deployments get parallel
+#    rollout restarts, then we wait up to 120s for all to become ready.
+#    Called from main() BEFORE the idempotency early-exit so it runs on every lab startup.
+#    Impact: ~2-3s when all certs fresh; ~60-120s when stale (eliminates the 30-min URL retry loop).
 #
 # v2.7 changelog (2026-05-13):
 #  * Added robust idempotency check to main() based on persistent configuration changes
@@ -1469,10 +1482,166 @@ VFEOF
     success "Verification script created at $out"
 }
 
+# Detect and remediate stale service-tls certificates across all prelude deployments.
+#
+# cert-manager auto-renews the service-tls Secret (~90-day cert) but every pod
+# that mounts it must restart to pick up the new cert data. Without that restart
+# each pod keeps serving the expired cert → Envoy upstream TLS verification fails
+# → HTTP 503 on any route whose backend has a stale pod. This affects 24+ prelude
+# deployments including cloud-automation-ui-app (/automation), ccs-k3s-app (/cci/),
+# and many service backends.
+#
+# Detection (pure kubectl, no network probe, ~2-3s on a healthy cluster):
+#   1. Read cert notBefore epoch from the service-tls Secret.
+#   2. For each affected deployment, get the running pod's startTime.
+#   3. If pod.startTime < cert.notBefore → pod has stale cert → rollout restart.
+#   Rollouts are issued in parallel (kubectl rollout restart is non-blocking).
+#   Then we wait up to 120s for all restarted deployments to become ready.
+#
+# Called from main() BEFORE the idempotency early-exit so it runs on every
+# lab startup, not just the first time the stabilizer is applied.
+check_and_fix_ccs_k3s_cert() {
+    local K="kubectl --kubeconfig=/etc/kubernetes/admin.conf --server=${API_SERVER}"
+    local kc
+    kc=$(vcfa_kubectl_invoker)
+
+    info "Checking service-tls certificate freshness across prelude deployments..."
+
+    # --- Get cert notBefore from the service-tls Secret (epoch seconds) ---
+    local cert_nbf cert_exp
+    cert_nbf=$(vcfa_ssh_nosudo \
+        "${kc}${K} get secret service-tls -n ${PRELUDE_NAMESPACE} \
+         -o jsonpath='{.data.tls\.crt}' 2>/dev/null \
+         | base64 -d \
+         | openssl x509 -noout -startdate 2>/dev/null \
+         | cut -d= -f2 \
+         | xargs -I{} date -d '{}' +%s 2>/dev/null" \
+        2>/dev/null | tr -d '[:space:]') || true
+
+    if [[ -z "$cert_nbf" || ! "$cert_nbf" =~ ^[0-9]+$ ]]; then
+        warning "service-tls: could not read cert from secret — skipping freshness check"
+        return 0
+    fi
+
+    cert_exp=$(vcfa_ssh_nosudo \
+        "${kc}${K} get secret service-tls -n ${PRELUDE_NAMESPACE} \
+         -o jsonpath='{.data.tls\.crt}' 2>/dev/null \
+         | base64 -d \
+         | openssl x509 -noout -enddate 2>/dev/null \
+         | cut -d= -f2" \
+        2>/dev/null | tr -d '\r\n') || cert_exp="unknown"
+
+    local cert_ts
+    cert_ts=$(date -d "@${cert_nbf}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${cert_nbf}")
+    info "  service-tls cert: notBefore=${cert_ts}, notAfter=${cert_exp}"
+
+    # --- All deployments in prelude that mount service-tls ---
+    # This list covers every deployment confirmed to use the shared service-tls Secret.
+    local service_tls_deployments=(
+        abx-service-app
+        approval-service-app
+        catalog-service-app
+        ccs-avi-eas-app
+        ccs-gateway-app
+        ccs-infra-eas-app
+        ccs-k3s-app
+        ccs-nsx-eas-app
+        ccs-vksm-eas
+        cgs-service-app
+        cloud-automation-ui-app
+        ebs-app
+        encryption-manager
+        extensibility-ui-app
+        hcmp-service-app
+        orchestration-ui-app
+        provisioning-service-app
+        provisioning-ui-app
+        relocation-service-app
+        relocation-ui-app
+        tango-blueprint-service-app
+        tango-uber-service-app
+        terraform-service-app
+        vcfa-service-manager
+    )
+
+    # --- Check each deployment and collect stale ones ---
+    local stale_deployments=()
+
+    for deploy in "${service_tls_deployments[@]}"; do
+        local app_label pod_start pod_epoch
+        app_label=$(vcfa_ssh_nosudo \
+            "${kc}${K} get deployment ${deploy} -n ${PRELUDE_NAMESPACE} \
+             -o jsonpath='{.spec.selector.matchLabels.app}' 2>/dev/null" \
+            2>/dev/null | tr -d '[:space:]') || true
+        [[ -z "$app_label" ]] && app_label="$deploy"
+
+        pod_start=$(vcfa_ssh_nosudo \
+            "${kc}${K} get pod -n ${PRELUDE_NAMESPACE} \
+             -l app=${app_label} --field-selector='status.phase=Running' \
+             -o jsonpath='{.items[0].status.startTime}' 2>/dev/null \
+             | xargs -I{} date -d '{}' +%s 2>/dev/null" \
+            2>/dev/null | tr -d '[:space:]') || true
+
+        if [[ -z "$pod_start" || ! "$pod_start" =~ ^[0-9]+$ ]]; then
+            continue  # No running pod (e.g. replicas=0) — skip silently
+        fi
+
+        if [[ "$pod_start" -lt "$cert_nbf" ]]; then
+            local pod_ts
+            pod_ts=$(date -d "@${pod_start}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${pod_start}")
+            warning "  STALE: ${deploy} (pod started ${pod_ts} < cert renewed ${cert_ts})"
+            stale_deployments+=("$deploy")
+        fi
+    done
+
+    if [[ ${#stale_deployments[@]} -eq 0 ]]; then
+        success "service-tls: all prelude pods started after cert renewal — no restarts needed"
+        return 0
+    fi
+
+    info "Issuing rollout restarts for ${#stale_deployments[@]} stale deployment(s)..."
+    for deploy in "${stale_deployments[@]}"; do
+        execute_remote \
+            "${K} rollout restart deployment/${deploy} -n ${PRELUDE_NAMESPACE}" \
+            "rollout restart ${deploy} (stale service-tls cert)" true
+    done
+
+    # --- Wait for all restarted deployments to become ready (max 120s) ---
+    info "Waiting up to 120s for restarted deployments to become ready..."
+    local waited=0
+    while [[ $waited -lt 120 ]]; do
+        sleep 10
+        waited=$((waited + 10))
+        local still_pending=0
+        for deploy in "${stale_deployments[@]}"; do
+            local ready
+            ready=$(vcfa_ssh_nosudo \
+                "${kc}${K} get deployment ${deploy} -n ${PRELUDE_NAMESPACE} \
+                 -o jsonpath='{.status.readyReplicas}' 2>/dev/null" \
+                2>/dev/null | tr -d '[:space:]' | grep -oE '^[0-9]+$' || echo "")
+            local desired
+            desired=$(vcfa_ssh_nosudo \
+                "${kc}${K} get deployment ${deploy} -n ${PRELUDE_NAMESPACE} \
+                 -o jsonpath='{.spec.replicas}' 2>/dev/null" \
+                2>/dev/null | tr -d '[:space:]' | grep -oE '^[0-9]+$' || echo "1")
+            [[ -z "$desired" ]] && desired=1
+            if [[ "$ready" != "$desired" ]]; then
+                still_pending=$((still_pending + 1))
+            fi
+        done
+        if [[ $still_pending -eq 0 ]]; then
+            success "service-tls: all ${#stale_deployments[@]} deployment(s) ready after ${waited}s — fresh certs mounted"
+            return 0
+        fi
+        info "  ${still_pending}/${#stale_deployments[@]} deployment(s) still rolling out (${waited}s / 120s)..."
+    done
+    warning "service-tls: ${#stale_deployments[@]} deployment(s) restarted but rollout not confirmed within 120s — proceeding"
+}
+
 # Main execution function
 main() {
     echo "======================================================================"
-        echo "           VCFA Complete Stabilization Script v2.6"
+        echo "           VCFA Complete Stabilization Script v2.8"
     echo "======================================================================"
     echo "Comprehensive VCFA stability solution for nested environments"
     echo "Default run is prophylactic: control-plane preflight + auth + core + SDS"
@@ -1484,7 +1653,12 @@ main() {
     echo ""
     
     check_prerequisites
-    
+
+    # Always check ccs-k3s service-tls cert freshness — runs before the idempotency early-exit
+    # because cert expiry is time-based and must be checked on every startup regardless of
+    # whether the rest of the stabilizer has already been applied.
+    check_and_fix_ccs_k3s_cert
+
     # Check if the stabilizer has already been applied by looking for persistent settings it creates:
     # 1. The durable systemd watcher script (from Phase 3.5)
     # 2. The kube-vip lease duration tuning (from Phase 1.5)
