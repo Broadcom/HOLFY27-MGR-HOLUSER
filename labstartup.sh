@@ -1,6 +1,6 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.11 - 2026-05-19
+# Version 3.12 - 2026-06-30
 # Changes:
 # - Firefox profile rebuild gate (FIREFOX_PROFILE_REBUILD_REQUIRED in script): deploy
 #   rebuild-firefox-profile.sh, compare to ~/.local/state/firefox_profile_rebuild.count on LMC,
@@ -8,6 +8,9 @@
 # - Added functionality to set branch to "ft" if the first 3 characters of the content of /tmp/deploymentpool.txt is "FT-"
 # - Update branch detection logic
 # - Added functionality to git stash local changes for prod.
+# - Deploy import-firefox-bookmarks.sh to console ~/.local/bin/ via _deploy_console_file.
+# - Auto-import bookmarks*.json from vpodgitdir/console/ (priority) or vpodgitdir/ into
+#   Firefox profile via push_console_files_nfs() after Firefox LMC tuning.
 # Author - Burke Azbill and HOL Core Team
 # Enhanced with NFS-based router communication, DNS import support
 
@@ -610,6 +613,14 @@ push_console_files_nfs() {
                     log_msg "${src_label}: console/${filename} -> .local/bin/" "${logfile}"
                 fi
                 ;;
+            import-firefox-bookmarks.sh)
+                local bin_dest="/lmchol/home/holuser/.local/bin"
+                mkdir -p "${bin_dest}" 2>/dev/null
+                if cp "$src_file" "${bin_dest}/${filename}" 2>/dev/null; then
+                    chmod +x "${bin_dest}/${filename}" 2>/dev/null
+                    log_msg "${src_label}: console/${filename} -> .local/bin/" "${logfile}"
+                fi
+                ;;
             *)
                 if cp "$src_file" "${desktop_dest}/${filename}" 2>/dev/null; then
                     log_msg "${src_label}: console/${filename} -> desktop-hol/" "${logfile}"
@@ -706,6 +717,32 @@ push_console_files_nfs() {
             log_msg "Firefox LMC tuning completed." "${logfile}"
         else
             log_msg "Firefox LMC tuning returned non-zero (see ${logfile})." "${logfile}"
+        fi
+    fi
+
+    # Import vpodrepo bookmarks into the Firefox profile (if provided by the lab).
+    # Search order: vpodgitdir/console/bookmarks*.json (highest priority),
+    # then vpodgitdir/bookmarks*.json (fallback). The most recently modified
+    # file in the winning location is selected. If neither location has a
+    # bookmarks*.json the existing profile bookmarks are left untouched.
+    local _bm_src=""
+    _bm_src=$(ls -t "${vpodgitdir}/console"/bookmarks*.json 2>/dev/null | head -1)
+    if [[ -z "$_bm_src" ]]; then
+        _bm_src=$(ls -t "${vpodgitdir}"/bookmarks*.json 2>/dev/null | head -1)
+    fi
+    if [[ -n "$_bm_src" ]]; then
+        log_msg "Found bookmark file for console: ${_bm_src}" "${logfile}"
+        if cp "$_bm_src" "/lmchol/home/holuser/bookmarks-lab.json" 2>/dev/null; then
+            log_msg "Copied to /lmchol/home/holuser/bookmarks-lab.json" "${logfile}"
+            if bash "${holroot}/console/import-firefox-bookmarks.sh" \
+                    --bookmark-file "/lmchol/home/holuser/bookmarks-lab.json" \
+                    --mc-base /lmchol >>"${logfile}" 2>&1; then
+                log_msg "Firefox bookmark import completed." "${logfile}"
+            else
+                log_msg "Firefox bookmark import returned non-zero (see ${logfile})." "${logfile}"
+            fi
+        else
+            log_msg "WARNING: Failed to copy bookmark file to console home." "${logfile}"
         fi
     fi
 
