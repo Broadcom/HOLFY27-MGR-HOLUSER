@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VCF.py - HOLFY27 Core VCF Startup Module
-# Version 3.5 - February 2026
+# Version 3.6 - 2026-07-01
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation startup sequence
 #
@@ -36,6 +36,15 @@
 #   match fails. Some VMs (e.g., VCF Automation appliances) are deployed with a
 #   random suffix (auto-a -> auto-a-45zgb). The fallback uses get_vm_match()
 #   with pattern ^name(-|$) to find the VM without false positives.
+# v3.6 Changes:
+# - TASK 2 datastore check is now type-aware. VCF.py connects directly to ESXi
+#   hosts (not vCenter), so ds.vm returns only VMs registered on that specific
+#   host. A host with no local VMs (e.g. esx-01a) returns [] even when the
+#   cluster is healthy, causing false failures. Fix:
+#   - vSAN: declare available when accessible=True AND capacity > 0. Capacity is
+#     a cluster-level metric, unaffected by per-host VM registration.
+#   - NFS/VMFS: aggregate ds.vm across all sis entries (all host connections)
+#     and require at least one host to report VMs before checking connectivity.
 #
 
 import os
@@ -384,22 +393,64 @@ def main(lsf=None, standalone=False, dry_run=False):
                         break
                     
                     if ds.summary.accessible:
-                        vms = ds.vm
-                        if len(vms) == 0:
-                            raise Exception(f'No VMs on datastore: {datastore}')
-                        
-                        # Check if VMs are connected
-                        all_connected = True
-                        for vm in vms:
-                            if vm.runtime.connectionState != 'connected':
-                                all_connected = False
-                                lsf.write_output(f'VM {vm.config.name} not connected - waiting...')
-                                lsf.labstartup_sleep(30)
+                        ds_type = getattr(ds.summary, 'type', '').lower()
+
+                        if ds_type == 'vsan':
+                            # For vSAN: accessible + non-zero capacity is the definitive
+                            # health signal. VCF.py connects directly to ESXi hosts (not
+                            # vCenter), so ds.vm only returns VMs registered on that
+                            # specific host. A host with no local VMs returns [] even when
+                            # the vSAN cluster is fully healthy (e.g., esx-01a with no
+                            # registered VMs). Capacity > 0 proves vSAN has mounted and
+                            # calculated usable space — it cannot be a stale flag.
+                            if ds.summary.capacity > 0:
+                                cap_gib = ds.summary.capacity // (1024 ** 3)
+                                lsf.write_output(
+                                    f'Datastore {datastore} is available '
+                                    f'(vSAN, capacity={cap_gib} GiB)'
+                                )
                                 break
-                        
-                        if all_connected:
-                            lsf.write_output(f'Datastore {datastore} is available')
-                            break
+                            else:
+                                raise Exception(
+                                    f'vSAN datastore {datastore} is accessible but '
+                                    f'capacity is 0 — vSAN may still be initializing'
+                                )
+                        else:
+                            # For NFS/VMFS: aggregate ds.vm across all host connections
+                            # to get a cluster-wide view. A single host connection may
+                            # have no VMs registered locally even on a healthy datastore.
+                            all_vms = []
+                            for si_iter in lsf.sis:
+                                try:
+                                    ds_objs = lsf.get_all_objs(
+                                        si_iter.content, [lsf.vim.Datastore]
+                                    )
+                                    for d in ds_objs:
+                                        if d.name == datastore:
+                                            all_vms.extend(d.vm)
+                                            break
+                                except Exception:
+                                    pass
+
+                            if len(all_vms) == 0:
+                                raise Exception(
+                                    f'No VMs found on datastore {datastore} from any host'
+                                )
+
+                            disconnected = [
+                                v for v in all_vms
+                                if v.runtime.connectionState != 'connected'
+                            ]
+                            if disconnected:
+                                names = [v.config.name for v in disconnected]
+                                lsf.write_output(
+                                    f'VMs not yet connected on {datastore}: '
+                                    f'{names} — waiting...'
+                                )
+                                lsf.labstartup_sleep(30)
+                            else:
+                                lsf.write_output(f'Datastore {datastore} is available')
+                                break
                     else:
                         lsf.write_output(f'Datastore {datastore} not accessible')
                         lsf.labstartup_sleep(30)
