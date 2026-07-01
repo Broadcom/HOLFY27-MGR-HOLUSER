@@ -1,10 +1,79 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.5 - 2026-05-28
+Version 2.9 - 2026-07-01
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
+
+v2.9 Changes:
+- Replaced fragile STALE_POD_FILTER string-matching with two complementary
+  constants: TERMINAL_POD_PHASES (["Failed","Succeeded"]) and STUCK_POD_FILTER.
+  Root cause: vSphere Supervisor assigns custom reason strings such as
+  "AgentUnreachable" (25 pods) and "PodVMAnnotationsMissing" (4 pods) that
+  appear in the kubectl STATUS column but were never in any fixed list.
+  The pre-sweep diagnostic (v2.8) confirmed this in labstartup.log.
+- Added _get_pods_to_clean(): shared detection helper combining (1) phase-based
+  field-selector queries (reason-agnostic — catches all future vSphere-specific
+  reason strings automatically) and (2) STUCK_POD_FILTER STATUS grep for
+  non-terminal stuck containers.  Used by both _run_pod_cleanup_for_cluster
+  and _cleanup_stale_pods_with_wait so detection logic is a single source of
+  truth.
+- _run_pod_cleanup_for_cluster(): removed the old per-pod expect-based
+  deletion loop that referenced the now-removed STALE_POD_FILTER.  Initial
+  sweep now uses _get_pods_to_clean() cluster-wide, groups by namespace, and
+  issues one kubectl delete --field-selector per phase per namespace (efficient
+  for large pod counts) plus per-pod deletes for stuck containers.  Logs pod
+  names and counts per namespace so deletions are visible in labstartup.log.
+  Two-pass readiness wait re-queries via _get_pods_to_clean for consistency.
+- Pre-sweep diagnostic now also logs phase=Failed/Succeeded counts from the
+  field selector so the log shows exactly what the phase-based sweep will see.
+- _cleanup_stale_pods_with_wait(): _get_stale() and _delete_stale() updated
+  to use _get_pods_to_clean() and phase-based batch deletes respectively.
+
+v2.8 Changes:
+- STALE_POD_FILTER: added CrashLoopBackOff and Completed.
+  For pods with RestartPolicy=Always (all Supervisor service pods), the
+  pod phase never reaches "Failed" — the kubelet restarts the container with
+  exponential backoff and kubectl STATUS stays "CrashLoopBackOff".  The
+  vSphere Client displays these as "Failed".  CrashLoopBackOff was not in
+  the old filter so crash-looping pods were silently skipped by every cleanup
+  path, allowing them to accumulate.  Completed (exit 0) pods are also safe
+  to remove as housekeeping.
+- _run_pod_cleanup_for_cluster(): added pre-sweep diagnostic that logs the
+  non-Running pod status distribution (count by STATUS) before the initial
+  sweep.  This makes filter gaps immediately visible in labstartup.log
+  without requiring a manual kubectl session.
+
+v2.7 Changes:
+- Extracted Phase D workload recovery into _run_pod_cleanup_for_cluster() so
+  the same logic is shared by both Phase 2 (after proxy/cert fixes) and the
+  new Phase 5.
+- Added Phase 5 (cleanup_stale_pods): a standalone stale-pod cleanup that
+  always runs regardless of --skip-proxy.  This ensures non-HOL labtypes
+  (which call supervisor_stabilizer with --skip-vcenter-proxy --skip-proxy)
+  still get pod cleanup.  When Phase 2 also ran, Phase 5 is a harmless second
+  pass that catches new failures that appeared while certs/proxy were fixed.
+- Added --skip-pod-cleanup flag to opt out of Phase 5 if needed.
+- Updated "all phases skipped" guard and active-phases banner to include
+  pod-cleanup.
+
+v2.6 Changes:
+- Phase D stale-pod cleanup: replaced hardcoded CCI/ArgoCD/Harbor namespace
+  discovery with a single cluster-wide `kubectl get pods --all-namespaces`
+  query so the two-pass cleanup with deployment-readiness wait now covers
+  every namespace in the Supervisor (kube-system, vmware-system-*,
+  svc-cci-ns-*, argocd, svc-harbor-*, user namespaces, etc.) rather than
+  only the three hardcoded service namespace patterns.  Namespaces with no
+  stale pods are never visited (single SSH call to discover, not one per
+  namespace).
+- Introduced module-level STALE_POD_FILTER constant used by all three pod
+  cleanup paths (fire-and-forget sweep, two-pass namespace discovery, and
+  _cleanup_stale_pods_with_wait).  Expanded the filter to include Error,
+  OOMKilled, Evicted, and ErrImagePull: the vSphere Client shows pod phase
+  "Failed" but kubectl STATUS for those pods is typically "Error", "OOMKilled",
+  or "Evicted" — NOT the literal string "Failed" — so those pods were
+  silently skipped by all cleanup paths until now.
 
 v2.5 Changes:
 - apply_proxy_to_vcenter(): added clear=False parameter.  When clear=True,
@@ -200,10 +269,13 @@ Phases (all enabled by default; each has a --skip-* flag):
           cert-manager regenerates fresh mTLS material.
        c. Scales up CCI, ArgoCD, and Harbor workloads (may be at 0 replicas
           after a shutdown cycle).
-       d. Performs a two-pass stale pod cleanup per service namespace (CCI,
-          ArgoCD, Harbor) with a deployment-readiness wait between passes to
-          catch pods that re-appear when a scheduler reschedules on a node still
-          reconnecting its spherelet.
+       d. Performs a two-pass stale pod cleanup across all namespaces using
+          phase-based field-selector queries (catches AgentUnreachable,
+          PodVMAnnotationsMissing, and all vSphere-specific reason strings
+          without enumeration) plus a STUCK_POD_FILTER STATUS grep for
+          non-terminal stuck containers.  A deployment-readiness wait between
+          passes catches pods that re-appear when a scheduler reschedules on a
+          node still reconnecting its spherelet.
 
   Phase 3  — ESXi spherelet certificate renewal (native Python)
        ESXi hosts acting as Supervisor worker nodes carry 1-year spherelet
@@ -224,6 +296,16 @@ Phases (all enabled by default; each has a --skip-* flag):
        config_status=RUNNING and kubernetes_status=READY, or the 30-minute
        timeout is reached. Provides an authoritative pass/fail signal that
        matches what the vCenter UI shows.
+
+  Phase 5  — Stale pod cleanup (always runs; use --skip-pod-cleanup to opt out)
+       Runs cleanup_stale_pods() independently of --skip-proxy so that
+       Failed/Error/OOMKilled/Evicted/Evicted/ErrImagePull/ImagePullBackOff
+       pods are cleaned up regardless of whether Phase 2 was skipped (e.g.
+       non-HOL labtypes pass --skip-vcenter-proxy --skip-proxy from VCFfinal).
+       Uses the same decryptK8Pwd → SSH-probe → kubeconfig-probe connection
+       flow as Phase 2.  When Phase 2 also ran, Phase 5 is a harmless second
+       pass catching any new failures that appeared while certs/proxy were
+       being fixed.
 
 All phases are idempotent. Run --dry-run first to preview every action.
 
@@ -322,6 +404,40 @@ SSH_OPTS = (
     "-o UserKnownHostsFile=/dev/null "
     "-o LogLevel=ERROR "
     "-o ConnectTimeout=15"
+)
+
+# ── Pod cleanup filter constants ──────────────────────────────────────────────
+#
+# Strategy: two complementary approaches cover every failed/stuck pod.
+#
+# 1. TERMINAL_POD_PHASES — detected via kubectl --field-selector status.phase=X
+#    These are pods whose phase == "Failed" or "Succeeded" as reported by the
+#    Kubernetes API.  The vSphere Client "Failed" badge maps directly to
+#    phase=Failed.  Using a field selector is reason-agnostic: it catches
+#    AgentUnreachable, PodVMAnnotationsMissing, Error, OOMKilled, Evicted,
+#    NotFound, ProviderFailed, and any future vSphere-specific reason strings
+#    without needing to enumerate them.
+#    "Succeeded" (exit 0) pods are also cleaned up as housekeeping.
+#
+# 2. STUCK_POD_FILTER — matched against the STATUS column of kubectl get pods
+#    These are non-terminal container states (pod phase stays Running/Pending)
+#    that indicate a broken container which will never recover on its own.
+#    Phase-selection misses them because the pod is technically still alive
+#    from Kubernetes' perspective, but the container is stuck.
+#
+# Why string-matching the STATUS column alone was insufficient:
+#   vSphere Supervisor assigns custom reason strings such as "AgentUnreachable"
+#   and "PodVMAnnotationsMissing" which appear in the STATUS column but are not
+#   covered by any fixed list.  The field-selector approach above supersedes the
+#   old STALE_POD_FILTER and eliminates that whack-a-mole problem entirely.
+
+TERMINAL_POD_PHASES = ["Failed", "Succeeded"]
+
+STUCK_POD_FILTER = (
+    "CrashLoopBackOff"
+    "|ImagePullBackOff|ErrImagePull"
+    "|InvalidImageName"
+    "|CreateContainerError|CreateContainerConfigError|RunContainerError"
 )
 
 
@@ -1353,6 +1469,90 @@ def fix_supervisor_control_plane(vc, password, dry_run, only_cluster=None,
     return overall_ok
 
 
+def cleanup_stale_pods(vc, password, dry_run, only_cluster=None, only_ip=None):
+    """Discover Supervisor clusters and clean up stale pods on each (Phase 5).
+
+    Runs _run_pod_cleanup_for_cluster() independently of the proxy/certificate
+    phases so stale pod cleanup always happens whether or not --skip-proxy was
+    passed (e.g. non-HOL labtypes skip Phase 2 entirely, but still need pod
+    cleanup).
+
+    Uses the same decryptK8Pwd → SSH-probe → kubeconfig-probe connection
+    setup as fix_supervisor_control_plane(); only the work performed differs.
+    """
+    label = vc["label"]
+    log("")
+    log(f"--- {label} ({vc['host']}) -- stale pod cleanup ---")
+
+    log("  Retrieving Supervisor control plane credentials via "
+        "decryptK8Pwd.py ...")
+    decrypt = ssh_to_vcenter(
+        vc["host"], vc["root_user"], password,
+        "PAGER=cat TERM=dumb /usr/lib/vmware-wcp/decryptK8Pwd.py 2>&1 | cat",
+    )
+    clusters = parse_decrypt_k8_pwd(decrypt)
+    if not clusters:
+        log(f"  [{label}] No Supervisor clusters found — skipping pod cleanup.")
+        return True
+
+    if only_cluster:
+        clusters = [c for c in clusters if only_cluster in c["cluster"]]
+        if not clusters:
+            log(f"  [{label}] --supervisor-cluster filter matched no clusters.")
+            return True
+    if only_ip:
+        for c in clusters:
+            c["ip"] = only_ip
+
+    overall_ok = True
+    for cluster in clusters:
+        cid = cluster["cluster"]
+        scp_ip = cluster["ip"]
+        scp_pass = cluster["pwd"]
+
+        log("")
+        log(f"  >>> {label} :: {cid} (pod cleanup)")
+        log(f"      VIP from decryptK8Pwd.py: {scp_ip}")
+
+        if ssh_probe_scp(vc, password, scp_ip, scp_pass):
+            log(f"      SSH ok to {scp_ip}.")
+        else:
+            log(f"      SSH to {scp_ip} failed - searching VPX DB for a "
+                f"working Supervisor node ...", level="WARN")
+            candidates = discover_scp_node_ips(vc, password)
+            seen = {scp_ip}
+            candidates = [c for c in candidates if c not in seen
+                          and not seen.add(c)]
+            log(f"      VPX DB returned {len(candidates)} candidate IP(s).")
+            chosen = None
+            for cand in candidates:
+                log(f"      probing {cand} ...")
+                if ssh_probe_scp(vc, password, cand, scp_pass):
+                    chosen = cand
+                    break
+            if not chosen:
+                log(f"      [{cid}] No Supervisor node responded to SSH — "
+                    f"skipping pod cleanup for this cluster.", level="ERROR")
+                overall_ok = False
+                continue
+            log(f"      Using fallback node IP {chosen}.")
+            scp_ip = chosen
+
+        kubeconfig = _probe_scp_kubeconfig(vc, password, scp_ip, scp_pass)
+        if "super-admin" in kubeconfig:
+            log(f"      [{cid}] Using super-admin.conf.")
+        elif "admin.conf" in kubeconfig:
+            log(f"      [{cid}] Using admin.conf (fallback).", level="WARN")
+        else:
+            log(f"      [{cid}] No kubeconfig found — kubectl commands may "
+                f"fail.", level="WARN")
+
+        _run_pod_cleanup_for_cluster(vc, password, scp_ip, scp_pass,
+                                     kubeconfig, cid, dry_run)
+
+    return overall_ok
+
+
 def ssh_to_scp_direct(vc, password, scp_ip, scp_pass, command, timeout=60):
     """Run a single command on the SCP by hopping through the vCenter SSH.
 
@@ -1381,13 +1581,85 @@ def ssh_to_scp_direct(vc, password, scp_ip, scp_pass, command, timeout=60):
     return ssh_to_vcenter(vc["host"], vc["root_user"], password, hop_cmd)
 
 
+def _get_pods_to_clean(vc, password, scp_ip, scp_pass, K, namespace=None):
+    """Return a list of (namespace, pod_name) tuples that should be deleted.
+
+    Combines two complementary detection strategies:
+
+    1. Phase-based (reason-agnostic): queries the Kubernetes API with
+       --field-selector status.phase=Failed and status.phase=Succeeded.
+       This catches every terminal pod regardless of the vSphere-specific
+       reason string (AgentUnreachable, PodVMAnnotationsMissing, Error,
+       OOMKilled, Evicted, NotFound, ProviderFailed, etc.).
+
+    2. Stuck-container filter: greps the STATUS column for non-terminal
+       container states (CrashLoopBackOff, ImagePullBackOff, etc.) whose
+       pod phase stays Running/Pending and therefore isn't caught by the
+       field selector above.
+
+    When namespace is None the search is cluster-wide (--all-namespaces /
+    -A).  When namespace is provided only that namespace is queried.
+
+    Returns a deduplicated list of (ns, name) tuples, sorted by namespace
+    then name for deterministic logging.
+    """
+    scope_flag = f"-n {namespace}" if namespace else "-A"
+    ns_col = "1" if not namespace else None  # column index for namespace in output
+
+    results = {}  # keyed by (ns, name) to deduplicate across queries
+
+    # ── Query 1 & 2: terminal phases via field selector ───────────────────────
+    for phase in TERMINAL_POD_PHASES:
+        raw = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            f"{K} get pods {scope_flag} --field-selector status.phase={phase}"
+            f" --no-headers"
+            f" -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name"
+            f" 2>/dev/null",
+        )
+        for line in raw.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                ns_val, name_val = parts[0].strip(), parts[1].strip()
+                if ns_val and name_val and ns_val != "NS":
+                    results[(ns_val, name_val)] = True
+
+    # ── Query 3: stuck-container states via STATUS column grep ────────────────
+    if namespace:
+        raw_stuck = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            f"{K} get pods -n {namespace} --no-headers 2>/dev/null"
+            f" | grep -E '{STUCK_POD_FILTER}'",
+        )
+        for line in raw_stuck.splitlines():
+            parts = line.split()
+            if parts:
+                name_val = parts[0].strip()
+                if name_val:
+                    results[(namespace, name_val)] = True
+    else:
+        raw_stuck = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            f"{K} get pods -A --no-headers 2>/dev/null"
+            f" | grep -E '{STUCK_POD_FILTER}'",
+        )
+        for line in raw_stuck.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                ns_val, name_val = parts[0].strip(), parts[1].strip()
+                if ns_val and name_val:
+                    results[(ns_val, name_val)] = True
+
+    return sorted(results.keys())
+
+
 def _cleanup_stale_pods_with_wait(vc, password, scp_ip, scp_pass, namespace,
                                    kubeconfig, label, max_wait=120):
     """Delete stale pods in a namespace and wait for deployments to stabilise.
 
     Makes two passes:
-      1. Delete pods in NotFound / ProviderFailed / Unknown /
-         ImagePullBackOff / Failed state.
+      1. Delete all terminal (phase=Failed/Succeeded) and stuck-container
+         (CrashLoopBackOff, ImagePullBackOff, etc.) pods via _get_pods_to_clean.
       2. Wait up to max_wait seconds for all deployments to reach
          desired == ready replicas.
       3. Second sweep for newly-appeared stale pods (common when a
@@ -1399,17 +1671,22 @@ def _cleanup_stale_pods_with_wait(vc, password, scp_ip, scp_pass, namespace,
     """
     K = f"kubectl --kubeconfig={kubeconfig}"
 
-    STALE_FILTER = "NotFound|ProviderFailed|Unknown|ImagePullBackOff|Failed"
-
     def _get_stale(ns):
-        out = ssh_to_scp_direct(
-            vc, password, scp_ip, scp_pass,
-            f"{K} get pods -n {ns} --no-headers 2>/dev/null "
-            f"| grep -E '{STALE_FILTER}' | awk '{{print $1}}'",
-        )
-        return [p for p in out.splitlines() if p.strip()]
+        # Use the shared robust helper: phase field-selector + stuck STATUS grep
+        pods = _get_pods_to_clean(vc, password, scp_ip, scp_pass, K,
+                                  namespace=ns)
+        return [name for _, name in pods]
 
     def _delete_stale(ns, pods):
+        # Phase-based batch deletes first (efficient for large counts)
+        for phase in TERMINAL_POD_PHASES:
+            ssh_to_scp_direct(
+                vc, password, scp_ip, scp_pass,
+                f"{K} delete pods -n {ns}"
+                f" --field-selector status.phase={phase}"
+                f" --force --grace-period=0 2>/dev/null || true",
+            )
+        # Per-pod deletes for stuck-container pods (no field-selector for STATUS)
         for pod in pods:
             ssh_to_scp_direct(
                 vc, password, scp_ip, scp_pass,
@@ -1449,6 +1726,137 @@ def _cleanup_stale_pods_with_wait(vc, password, scp_ip, scp_pass, namespace,
         _delete_stale(namespace, stale2)
 
     return True
+
+
+def _run_pod_cleanup_for_cluster(vc, password, scp_ip, scp_pass,
+                                  kubeconfig, cid, dry_run):
+    """Execute workload recovery for one Supervisor cluster (Phase D / Phase 5).
+
+    Scale up CCI, ArgoCD, and Harbor workloads, then delete every terminal or
+    stuck pod across all namespaces using two complementary strategies:
+      - phase-based field-selector (reason-agnostic, catches AgentUnreachable,
+        PodVMAnnotationsMissing, Error, OOMKilled, Evicted, and all future
+        vSphere-specific reason strings without needing to enumerate them)
+      - stuck-container STATUS grep for non-terminal CrashLoopBackOff etc.
+    A two-pass cleanup with deployment-readiness wait follows for any namespace
+    that still has stale pods after the initial sweep.
+
+    Extracted from _stabilize_one_supervisor() so it can be called both as
+    Phase D (after proxy/cert fixes in Phase 2) and as Phase 5 (standalone,
+    always runs regardless of --skip-proxy).
+    """
+    K = f"kubectl --kubeconfig={kubeconfig}"
+
+    if dry_run:
+        log(f"      [{cid}] [dry-run] would scale up cci, argocd, harbor and "
+            f"clean up stale/terminal pods across all namespaces.")
+        return
+
+    # ── Diagnostic: log pod status + phase counts before the sweep ────────────
+    # STATUS column distribution (non-Running entries show filter gaps)
+    diag_raw = ssh_to_scp_direct(
+        vc, password, scp_ip, scp_pass,
+        f"{K} get pods --all-namespaces --no-headers 2>/dev/null"
+        f" | awk '{{print $4}}' | sort | uniq -c | sort -rn",
+    )
+    if diag_raw.strip():
+        non_running = [ln.strip() for ln in diag_raw.strip().splitlines()
+                       if ln.strip() and "Running" not in ln]
+        if non_running:
+            log(f"      [{cid}] Non-Running pod statuses before sweep: "
+                + ", ".join(non_running))
+        else:
+            log(f"      [{cid}] All pods are Running — no stale pods expected.")
+    else:
+        log(f"      [{cid}] Pod status query returned no output (kubectl may "
+            f"not be reachable yet).", level="WARN")
+    # Phase counts via field-selector (confirms what the phase-based sweep will see)
+    for phase in TERMINAL_POD_PHASES:
+        phase_count_raw = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            f"{K} get pods -A --field-selector status.phase={phase}"
+            f" --no-headers 2>/dev/null | wc -l",
+        ).strip()
+        count = phase_count_raw if phase_count_raw.isdigit() else "?"
+        log(f"      [{cid}] Pods with phase={phase} before sweep: {count}")
+
+    # ── Scale up services (CCI, ArgoCD, Harbor) via run_on_scp ───────────────
+    log(f"      [{cid}] Scaling up services...")
+    scale_cmds = [
+        # Scale up CCI (dynamic namespace discovery)
+        f"CCI_NS=$({K} get ns --no-headers | grep 'svc-cci-ns' | awk '{{print $1}}');"
+        f" if [ -n \"$CCI_NS\" ]; then {K} -n $CCI_NS scale deployment --all --replicas=1; fi",
+        # Scale up ArgoCD
+        f"if {K} get ns argocd >/dev/null 2>&1; then {K} -n argocd scale deployment --all --replicas=1; fi",
+        # Scale up Harbor (both statefulsets and deployments)
+        f"HARBOR_NS=$({K} get ns --no-headers | grep 'svc-harbor' | awk '{{print $1}}');"
+        f" if [ -n \"$HARBOR_NS\" ]; then {K} -n $HARBOR_NS scale sts --all --replicas=1;"
+        f" {K} -n $HARBOR_NS scale deployment --all --replicas=1; fi",
+    ]
+    run_on_scp(
+        vc["host"], vc["root_user"], password,
+        scp_ip, scp_pass, scale_cmds,
+        description=f"      [{cid}] Scaling up service workloads on SCP",
+        timeout=120,
+    )
+
+    # ── Initial sweep: phase-based + stuck-container deletion ─────────────────
+    # Discover all (namespace, pod) pairs to delete using the robust helper.
+    log(f"      [{cid}] Discovering stale/terminal pods across all namespaces...")
+    pods_to_delete = _get_pods_to_clean(vc, password, scp_ip, scp_pass, K)
+
+    if not pods_to_delete:
+        log(f"      [{cid}] No stale pods found — skipping initial sweep.")
+    else:
+        # Group by namespace for efficient batched field-selector deletes.
+        ns_pods: dict = {}
+        for ns, name in pods_to_delete:
+            ns_pods.setdefault(ns, []).append(name)
+
+        total_deleted = 0
+        for ns, names in sorted(ns_pods.items()):
+            # Delete all terminal-phase pods in this namespace with one call
+            # per phase (much faster than per-pod deletes for large counts).
+            for phase in TERMINAL_POD_PHASES:
+                ssh_to_scp_direct(
+                    vc, password, scp_ip, scp_pass,
+                    f"{K} delete pods -n {ns}"
+                    f" --field-selector status.phase={phase}"
+                    f" --force --grace-period=0 2>/dev/null || true",
+                )
+            # Delete stuck-container pods individually (no field-selector for STATUS)
+            for name in names:
+                ssh_to_scp_direct(
+                    vc, password, scp_ip, scp_pass,
+                    f"{K} delete pod -n {ns} {name}"
+                    f" --force --grace-period=0 2>/dev/null || true",
+                )
+            log(f"      [{cid}] {ns}: deleted {len(names)} stale pod(s) — "
+                + ", ".join(names[:5])
+                + (f" ... (+{len(names)-5} more)" if len(names) > 5 else ""))
+            total_deleted += len(names)
+        log(f"      [{cid}] Initial sweep complete — {total_deleted} pod(s) "
+            f"deleted across {len(ns_pods)} namespace(s).")
+
+    # ── Two-pass cleanup with deployment-readiness wait ───────────────────────
+    # Re-query after initial sweep; build namespace list from _get_pods_to_clean
+    # so the same robust detection (phase + stuck) drives both passes.
+    log(f"      [{cid}] Re-scanning for remaining/newly-appeared stale pods...")
+    remaining = _get_pods_to_clean(vc, password, scp_ip, scp_pass, K)
+    stale_namespaces = sorted({ns for ns, _ in remaining})
+
+    if stale_namespaces:
+        log(f"      [{cid}] Running two-pass stale-pod cleanup with "
+            f"readiness wait on {len(stale_namespaces)} namespace(s): "
+            f"{', '.join(stale_namespaces)}")
+        for ns in stale_namespaces:
+            _cleanup_stale_pods_with_wait(
+                vc, password, scp_ip, scp_pass, ns, kubeconfig, cid,
+                max_wait=120,
+            )
+    else:
+        log(f"      [{cid}] No remaining stale pods — two-pass cleanup not "
+            f"needed.")
 
 
 def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60,
@@ -1783,85 +2191,8 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60,
         log(f"      [{cid}] Management proxy regeneration submitted on {scp_ip}.")
 
     # --- Phase D: Workload Recovery ---
-    if dry_run:
-        log(f"      [{cid}] [dry-run] would scale up cci, argocd, harbor and "
-            f"clean up stale pods.")
-    else:
-        log(f"      [{cid}] Scaling up services and running initial stale-pod "
-            f"sweep...")
-        recovery_cmds = [
-            # Scale up CCI (dynamic namespace discovery)
-            f"CCI_NS=$({K} get ns --no-headers | grep 'svc-cci-ns' | awk '{{print $1}}');"
-            f" if [ -n \"$CCI_NS\" ]; then {K} -n $CCI_NS scale deployment --all --replicas=1; fi",
-            # Scale up ArgoCD
-            f"if {K} get ns argocd >/dev/null 2>&1; then {K} -n argocd scale deployment --all --replicas=1; fi",
-            # Scale up Harbor (both statefulsets and deployments)
-            f"HARBOR_NS=$({K} get ns --no-headers | grep 'svc-harbor' | awk '{{print $1}}');"
-            f" if [ -n \"$HARBOR_NS\" ]; then {K} -n $HARBOR_NS scale sts --all --replicas=1;"
-            f" {K} -n $HARBOR_NS scale deployment --all --replicas=1; fi",
-            # First stale-pod sweep across all namespaces (fire-and-forget via
-            # expect). Written as a single compound line — multiline for/if
-            # blocks put the shell into continuation mode (> prompt) which the
-            # expect script can never match.
-            f"for ns in $({K} get ns --no-headers | awk '{{print $1}}'); do"
-            f" stale=$({K} get pods -n $ns --no-headers 2>/dev/null"
-            f" | grep -E 'NotFound|ProviderFailed|Unknown|ImagePullBackOff|Failed'"
-            f" | awk '{{print $1}}');"
-            f" if [ -n \"$stale\" ]; then for p in $stale; do"
-            f" {K} delete pod -n $ns $p --force --grace-period=0 2>/dev/null; done; fi; done",
-        ]
-        run_on_scp(
-            vc["host"], vc["root_user"], password,
-            scp_ip, scp_pass, recovery_cmds,
-            description=f"      [{cid}] Executing initial workload recovery on SCP",
-            timeout=300,
-        )
-
-        # Per-namespace two-pass cleanup with deployment-readiness wait.
-        # Discover actual namespace names dynamically via ssh_to_scp_direct so
-        # we aren't hard-coding domain-specific suffixes like -domain-c10.
-        log(f"      [{cid}] Running per-namespace stale-pod cleanup with "
-            f"readiness wait...")
-
-        cci_raw = ssh_to_scp_direct(
-            vc, password, scp_ip, scp_pass,
-            f"{K} get ns --no-headers 2>/dev/null | grep 'svc-cci-ns' | awk '{{print $1}}'",
-        )
-        argocd_check = ssh_to_scp_direct(
-            vc, password, scp_ip, scp_pass,
-            f"{K} get ns argocd --no-headers 2>/dev/null | awk '{{print $1}}'",
-        )
-        harbor_raw = ssh_to_scp_direct(
-            vc, password, scp_ip, scp_pass,
-            f"{K} get ns --no-headers 2>/dev/null | grep 'svc-harbor' | awk '{{print $1}}'",
-        )
-
-        # Validate that namespace names look like real k8s namespaces
-        # (lowercase alphanumeric + hyphens).  If ssh_to_scp_direct returned
-        # an error string the bad value is silently dropped rather than
-        # being passed to _cleanup_stale_pods_with_wait as the namespace.
-        _VALID_NS = re.compile(r'^[a-z0-9][a-z0-9\-]*$')
-
-        def _add_ns(raw, namespaces):
-            for ns in raw.splitlines():
-                ns = ns.strip()
-                if ns and _VALID_NS.match(ns):
-                    namespaces.append(ns)
-                elif ns:
-                    log(f"      [{cid}] namespace discovery returned unexpected "
-                        f"value (ignored): {ns!r}", level="WARN")
-
-        service_namespaces = []
-        _add_ns(cci_raw, service_namespaces)
-        if "argocd" in argocd_check and _VALID_NS.match("argocd"):
-            service_namespaces.append("argocd")
-        _add_ns(harbor_raw, service_namespaces)
-
-        for ns in service_namespaces:
-            _cleanup_stale_pods_with_wait(
-                vc, password, scp_ip, scp_pass, ns, kubeconfig, cid,
-                max_wait=120,
-            )
+    _run_pod_cleanup_for_cluster(vc, password, scp_ip, scp_pass,
+                                 kubeconfig, cid, dry_run)
 
     return True
 
@@ -2611,6 +2942,13 @@ def parse_args():
              "need to apply fixes without waiting for full readiness.",
     )
     p.add_argument(
+        "--skip-pod-cleanup", action="store_true",
+        help="Don't run the standalone stale-pod cleanup phase (Phase 5). "
+             "Phase 5 always runs regardless of --skip-proxy so that Failed / "
+             "Error / OOMKilled / Evicted pods are cleaned up even on non-HOL "
+             "labtypes that skip Phase 2 entirely.",
+    )
+    p.add_argument(
         "--supervisor-cluster", default=None,
         help="Substring to match against the cluster id reported by "
              "decryptK8Pwd.py (e.g. 'domain-c10'). When a vCenter hosts more "
@@ -2652,12 +2990,14 @@ def main():
         "" if args.skip_proxy else "proxy",
         "" if args.skip_spherelet else "spherelet",
         "" if args.skip_supervisor_poll else "supervisor-poll",
+        "" if args.skip_pod_cleanup else "pod-cleanup",
     ]))
     log(f"phases                 : {_active or '(none!)'}")
 
     if (args.skip_vcenter_proxy and args.skip_vcenter_services
             and args.skip_content_lib and args.skip_proxy
-            and args.skip_spherelet and args.skip_supervisor_poll):
+            and args.skip_spherelet and args.skip_supervisor_poll
+            and args.skip_pod_cleanup):
         fail("All phases skipped - nothing to do.")
 
     for tool in ("openssl", "sshpass", "expect"):
@@ -2736,6 +3076,22 @@ def main():
             ok = poll_supervisor_ready(vc, password, args.dry_run)
             if not ok:
                 failures.append(f"supervisor-poll:{vc['label']}")
+
+    # ---- Phase 5: Stale pod cleanup (always runs unless --skip-pod-cleanup) -
+    # Runs independently of Phase 2 so Failed/Error/OOMKilled/Evicted pods are
+    # cleaned up even when --skip-proxy is passed (e.g. non-HOL labtypes).
+    # When Phase 2 also ran, this is a harmless second pass that catches any
+    # new failures that appeared while certs and proxy were being fixed.
+    if not args.skip_pod_cleanup:
+        banner("Phase 5: Stale pod cleanup")
+        for vc in vcenters:
+            ok = cleanup_stale_pods(
+                vc, password, args.dry_run,
+                only_cluster=args.supervisor_cluster,
+                only_ip=args.supervisor_ip,
+            )
+            if not ok:
+                failures.append(f"pod-cleanup:{vc['label']}")
 
     banner("Summary")
     if failures:
