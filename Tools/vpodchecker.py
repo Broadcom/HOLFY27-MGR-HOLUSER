@@ -2715,6 +2715,19 @@ def check_k8s_certificates() -> List[CheckResult]:
     results = []
     tools_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
 
+    # ── Detect VCFA presence via vravms in config.ini ─────────────────────────
+    has_vravms = False
+    if lsf and hasattr(lsf, 'config'):
+        for section in ['VCFFINAL', 'VCF', 'RESOURCES']:
+            if lsf.config.has_section(section) and lsf.config.has_option(section, 'vravms'):
+                lines = lsf.config.get(section, 'vravms').split('\n')
+                for line in lines:
+                    if line.strip() and not line.strip().startswith('#'):
+                        has_vravms = True
+                        break
+            if has_vravms:
+                break
+
     # ── Regex patterns for both scripts ───────────────────────────────────────
     # vsp_cert_renewer.py patterns:
     #   [LABEL]  CHECK  : <name> — EXPIRES: <date> — RESIDUAL: <N>d
@@ -2747,10 +2760,16 @@ def check_k8s_certificates() -> List[CheckResult]:
     # ── Subprocess A: vsp_cert_renewer.py ─────────────────────────────────────
     renewer = os.path.join(tools_dir, 'vsp_cert_renewer.py')
     if os.path.isfile(renewer):
+        renewer_cluster = 'all' if has_vravms else 'vsp'
+        if not has_vravms:
+            results.append(CheckResult(
+                name='VCFA Kubernetes',
+                status='SKIPPED',
+                message='vravms not defined in config.ini'))
         cmd_a = [
             'python3', '-u', renewer,
             '--dry-run',
-            '--cluster', 'all',
+            '--cluster', renewer_cluster,
             '--no-timestamps',
         ]
         try:
