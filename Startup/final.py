@@ -301,7 +301,42 @@ def main(lsf=None, standalone=False, dry_run=False):
         if result.returncode != 0:
             lsf.labfail("lab-update.py failed - check labstartup.log for details")
         lsf.write_output("Finished Lab updates")
-    
+
+    # Run labtype-specific lab-update.sh if present.
+    # Search order: external team repo (/home/holuser/{labtype}/) first,
+    # then in-repo (/home/holuser/hol/{labtype}/). First found wins.
+    labtype_update_sh = None
+    for candidate in [
+        f"{lsf.home}/{lsf.labtype}/lab-update.sh",
+        f"{lsf.holroot}/{lsf.labtype}/lab-update.sh",
+    ]:
+        if os.path.isfile(candidate):
+            labtype_update_sh = candidate
+            break
+    if labtype_update_sh:
+        lsf.write_output(f"Running labtype ({lsf.labtype}) lab-update.sh from {labtype_update_sh}")
+        lsf.run_command(f"chmod +x {labtype_update_sh}")
+        lsf.run_command(f"/bin/bash {labtype_update_sh}")
+        lsf.write_output(f"Finished labtype ({lsf.labtype}) lab updates (sh)")
+
+    # Run labtype-specific lab-update.py if present.
+    # Search order: external team repo first, then in-repo. First found wins.
+    labtype_update_py = None
+    for candidate in [
+        f"{lsf.home}/{lsf.labtype}/lab-update.py",
+        f"{lsf.holroot}/{lsf.labtype}/lab-update.py",
+    ]:
+        if os.path.isfile(candidate):
+            labtype_update_py = candidate
+            break
+    if labtype_update_py:
+        lsf.write_output(f"Running labtype ({lsf.labtype}) lab-update.py from {labtype_update_py}")
+        lsf.run_command(f"chmod +x {labtype_update_py}")
+        result = lsf.run_command(f"/usr/bin/python3 {labtype_update_py}", timeout=1800)
+        if result.returncode != 0:
+            lsf.labfail(f"labtype ({lsf.labtype}) lab-update.py failed - check labstartup.log for details")
+        lsf.write_output(f"Finished labtype ({lsf.labtype}) lab updates (py)")
+
 
     ##=========================================================================
     ## End Core Team code

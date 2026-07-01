@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Author: Burke Azbill and HOL Core Team
-Version: 1.2 2026-06-09
+Version: 1.4 2026-06-30
 
 Tune Firefox user.js on the Main Linux Console (LMC) profile.
 
@@ -24,6 +24,19 @@ import shutil
 from typing import Any, Callable, List, Optional
 
 BEGIN = "# --- BEGIN HOL LMC Firefox tuning ---"
+
+# v1.3 Changes:
+# - Added _resolve_ff_base() to support both apt and snap Firefox profile paths.
+#   Apt Firefox stores profiles at ~/.mozilla/firefox/ (preferred); snap Firefox
+#   stores them at ~/snap/firefox/common/.mozilla/firefox/. The helper tries the
+#   apt path first and falls back to the snap path, so the module works before,
+#   during, and after a snap→apt migration with no code changes required.
+# v1.4 Changes:
+# - Added crash reporter disable prefs to both HOL blocks (toolkit.crashreporter.enabled,
+#   browser.tabs.crashReporting.sendReport, browser.crashReports.unsubmittedCheck.*).
+#   In VM/VNC environments Firefox can hang on exit waiting for a crash reporter dialog
+#   the user can never see or dismiss, causing "Firefox is already running" errors on
+#   the next open attempt. Disabling the crash reporter breaks this deadlock.
 END = "# --- END HOL LMC Firefox tuning ---"
 
 # Lines we remove from the rest of user.js (will be re-applied inside HOL block).
@@ -36,13 +49,29 @@ _STRIP_LINE_RES = (
     re.compile(r'^\s*user_pref\s*\(\s*["\']browser\.shell\.checkDefaultBrowser'),
     re.compile(r'^\s*user_pref\s*\(\s*["\']browser\.sessionstore\.resume_from_crash'),
     re.compile(r'^\s*user_pref\s*\(\s*["\']privacy\.clear(History|OnShutdown_v2|SiteData)\.'),
+    re.compile(r'^\s*user_pref\s*\(\s*["\']toolkit\.crashreporter\.'),
+    re.compile(r'^\s*user_pref\s*\(\s*["\']browser\.tabs\.crashReporting\.'),
+    re.compile(r'^\s*user_pref\s*\(\s*["\']browser\.crashReports\.unsubmittedCheck\.'),
 )
 
 
-def _firefox_profile_dirs(mc_base: str) -> List[str]:
-    base = os.path.join(
+def _resolve_ff_base(mc_base: str) -> str:
+    """Return the Firefox profiles base directory, preferring the apt path.
+
+    Apt Firefox (deb package) stores profiles at ``~/.mozilla/firefox/``.
+    Snap Firefox stores them at ``~/snap/firefox/common/.mozilla/firefox/``.
+    We try the apt path first so the module works seamlessly after a snap→apt
+    migration without requiring any configuration change.
+    """
+    apt_path  = os.path.join(mc_base, "home", "holuser", ".mozilla", "firefox")
+    snap_path = os.path.join(
         mc_base, "home", "holuser", "snap", "firefox", "common", ".mozilla", "firefox"
     )
+    return apt_path if os.path.isdir(apt_path) else snap_path
+
+
+def _firefox_profile_dirs(mc_base: str) -> List[str]:
+    base = _resolve_ff_base(mc_base)
     if not os.path.isdir(base):
         return []
     out: List[str] = []
@@ -78,6 +107,13 @@ def _hol_proxy_clear_block() -> str:
         'user_pref("browser.safebrowsing.phish.enabled", false);',
         'user_pref("browser.shell.checkDefaultBrowser", false);',
         'user_pref("browser.sessionstore.resume_from_crash", false);',
+        # Disable crash reporter — prevents hang-on-exit and "already running" errors in VMs.
+        # When Firefox exits uncleanly it launches crashreporter and waits for it; in a VM
+        # the dialog is invisible and Firefox's parent process never releases the profile lock.
+        'user_pref("toolkit.crashreporter.enabled", false);',
+        'user_pref("browser.tabs.crashReporting.sendReport", false);',
+        'user_pref("browser.crashReports.unsubmittedCheck.enabled", false);',
+        'user_pref("browser.crashReports.unsubmittedCheck.autoSubmit2", false);',
         # Preserve saved usernames and form history across sessions
         'user_pref("privacy.clearHistory.formdata", false);',
         'user_pref("privacy.clearOnShutdown_v2.formdata", false);',
@@ -142,6 +178,11 @@ def _hol_block(proxy_host: str, proxy_port: int, no_proxy: str = _FIREFOX_NO_PRO
         'user_pref("browser.safebrowsing.phish.enabled", false);',
         'user_pref("browser.shell.checkDefaultBrowser", false);',
         'user_pref("browser.sessionstore.resume_from_crash", false);',
+        # Disable crash reporter — prevents hang-on-exit and "already running" errors in VMs.
+        'user_pref("toolkit.crashreporter.enabled", false);',
+        'user_pref("browser.tabs.crashReporting.sendReport", false);',
+        'user_pref("browser.crashReports.unsubmittedCheck.enabled", false);',
+        'user_pref("browser.crashReports.unsubmittedCheck.autoSubmit2", false);',
         # Preserve saved usernames and form history across sessions
         'user_pref("privacy.clearHistory.formdata", false);',
         'user_pref("privacy.clearOnShutdown_v2.formdata", false);',
@@ -212,9 +253,7 @@ def _clear_crashes_and_idb(
     mc_base: str, profiles: List[str], log: Callable[[str], Any], dry_run: bool
 ) -> None:
     # 1. Clear Crash Reports
-    base = os.path.join(
-        mc_base, "home", "holuser", "snap", "firefox", "common", ".mozilla", "firefox"
-    )
+    base = _resolve_ff_base(mc_base)
     for subdir in ["pending", "submitted"]:
         target_dir = os.path.join(base, "Crash Reports", subdir)
         if os.path.isdir(target_dir):
