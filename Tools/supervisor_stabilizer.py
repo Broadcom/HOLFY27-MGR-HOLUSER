@@ -1,10 +1,74 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.9 - 2026-07-01
+Version 2.13 - 2026-07-01
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
+
+v2.13 Changes:
+- _run_pod_cleanup_for_cluster(): replaced the monolithic run_on_scp()
+  service scale-up call (which timed out at 150 s because namespace discovery
+  and all three kubectl scale commands ran inside a single expect session) with:
+    1. A pre-flight ssh_to_scp_direct() call (timeout 20s) that lists all
+       namespaces once and emits KEY=NS lines for CCI, ArgoCD, and Harbor.
+    2. Individual per-service ssh_to_scp_direct() scale calls (timeout 30s
+       each) that only run for services that were actually found.
+  When none of the service namespaces exist the scale-up is skipped entirely
+  with a single log line, avoiding the 150 s wait that occurred previously.
+  Also fixed a latent bug: the original code stored all matching namespace
+  names in a single shell variable and passed them to kubectl -n, which fails
+  when more than one match is found; the new code takes only the first match
+  per service pattern (awk NR==1 equivalent via exit).
+
+v2.12 Changes:
+- Phase C (supervisor-management-proxy cert regeneration): added a pre-flight
+  check (ssh_to_scp_direct, timeout 20s) that runs BEFORE committing to the
+  regeneration process.  Four outcomes are possible:
+    SKIP_NO_DEPLOY       — deployment absent on this Supervisor build; skipped.
+    SKIP_CERT_VALID      — TLS cert valid for 60+ days; skipped.
+    REGEN_NO_CERT        — TLS secret missing; regeneration proceeds.
+    REGEN_CERT_EXPIRING  — cert expiring within 60 days; regeneration proceeds.
+  If the pre-flight SSH call fails or returns unexpected output the script
+  proceeds with regeneration as a safe default.
+- Phase C: replaced the single monolithic run_on_scp() call (which embedded
+  `rollout status --timeout=180s` inside the expect session, causing 270s
+  silent waits) with three discrete ssh_to_scp_direct() steps:
+    [1/3] Deleting existing proxy TLS secrets...    (timeout 30s)
+    [2/3] Submitting rollout restart...              (timeout 30s)
+    [3/3] Waiting for rollout to complete (up to 120s)... (timeout 150s)
+  Each step logs its own progress line so the operator can see what phase
+  the script is in, and the rollout-status wait can be independently
+  cancelled/timed-out without hanging the entire expect session.
+
+v2.11 Changes:
+- ssh_to_vcenter(): added configurable timeout parameter (default 60s) and a
+  subprocess.TimeoutExpired handler so callers are no longer silently broken by
+  the hardcoded limit.
+- ssh_to_scp_direct(): the timeout parameter was previously accepted but never
+  forwarded; it is now passed through to ssh_to_vcenter so per-call time limits
+  are actually honoured.
+- Phase B (proxy configuration): replaced the single monolithic run_on_scp()
+  call (which produced one log line then silent waiting for up to 4 minutes)
+  with three discrete ssh_to_scp_direct() steps, each prefixed by its own
+  progress log line:
+    [1/3] Writing proxy configuration files...  (fast, ~5s, timeout 30s)
+    [2/3] Reloading systemd unit files...        (fast, ~2s, timeout 30s)
+    [3/3] Restarting containerd (may take 30–90s)...  (slow, timeout 120s)
+  A final verify step checks `systemctl is-active containerd` and logs the
+  result (active or a WARN with the actual status string).
+
+v2.10 Changes:
+- run_on_scp(): added subprocess.TimeoutExpired handler.  Previously an
+  unhandled TimeoutExpired propagated all the way up to main() and crashed
+  the entire script when any run_on_scp call exceeded its time limit.  The
+  exception is now caught, logged as WARN, and the function returns "" so
+  the caller continues with remaining phases.  Root cause: on some lab
+  topologies `systemctl restart containerd` in Phase B (proxy configuration)
+  takes longer than the previous 120-second expect timeout.
+- Phase B proxy configuration: increased run_on_scp timeout from 120s to
+  240s (subprocess wall-clock limit becomes 270s) to give containerd more
+  headroom on slower or cold-boot systems.
 
 v2.9 Changes:
 - Replaced fragile STALE_POD_FILTER string-matching with two complementary
@@ -1134,14 +1198,17 @@ def fix_content_library_trust(vc, password, target_domain, auto, pem,
 # approach, kept here so the combined script has zero external imports.)
 # ---------------------------------------------------------------------------
 
-def ssh_to_vcenter(vcenter_host, vcenter_user, vcenter_pass, command):
+def ssh_to_vcenter(vcenter_host, vcenter_user, vcenter_pass, command, timeout=60):
     escaped = command.replace("'", "'\"'\"'")
     cmd = (
         f"sshpass -p '{vcenter_pass}' ssh {SSH_OPTS} "
         f"{vcenter_user}@{vcenter_host} '{escaped}'"
     )
-    res = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                         timeout=60)
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                             timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return ""
     out = res.stdout.strip()
     return "\n".join(
         l for l in out.splitlines() if "Shell access is granted to" not in l
@@ -1239,11 +1306,18 @@ def run_on_scp(vcenter_host, vcenter_user, vcenter_pass, scp_ip, scp_pass,
 
     try:
         os.chmod(script_path, 0o700)
-        result = subprocess.run(
-            f"expect {script_path}",
-            shell=True, capture_output=True, text=True,
-            timeout=timeout + 30,
-        )
+        try:
+            result = subprocess.run(
+                f"expect {script_path}",
+                shell=True, capture_output=True, text=True,
+                timeout=timeout + 30,
+            )
+        except subprocess.TimeoutExpired:
+            log(f"  expect script timed out after {timeout + 30}s — "
+                f"commands may not have completed. Continuing.",
+                level="WARN")
+            return ""
+
         # Strip ALL ANSI/VT100 escape sequences (not just SGR colour codes)
         # and bare carriage-return characters.  The previous pattern
         # r"\x1b\[[0-9;]*m" only removed colour codes; sequences such as
@@ -1578,7 +1652,7 @@ def ssh_to_scp_direct(vc, password, scp_ip, scp_pass, command, timeout=60):
         f"root@{scp_ip} bash -s < /tmp/.scpcmd_hop 2>&1; "
         f"rm -f /tmp/.scppwd_hop /tmp/.scpcmd_hop"
     )
-    return ssh_to_vcenter(vc["host"], vc["root_user"], password, hop_cmd)
+    return ssh_to_vcenter(vc["host"], vc["root_user"], password, hop_cmd, timeout=timeout)
 
 
 def _get_pods_to_clean(vc, password, scp_ip, scp_pass, K, namespace=None):
@@ -1780,25 +1854,69 @@ def _run_pod_cleanup_for_cluster(vc, password, scp_ip, scp_pass,
         count = phase_count_raw if phase_count_raw.isdigit() else "?"
         log(f"      [{cid}] Pods with phase={phase} before sweep: {count}")
 
-    # ── Scale up services (CCI, ArgoCD, Harbor) via run_on_scp ───────────────
+    # ── Scale up services (CCI, ArgoCD, Harbor) ──────────────────────────────
+    # Pre-flight: discover which service namespaces are actually present before
+    # committing to any scale calls.  A single ssh_to_scp_direct call lists all
+    # namespaces once; individual scale calls follow per service found.  This
+    # replaces a monolithic run_on_scp expect-session that timed out (150 s)
+    # when none of the services existed or kubectl was slow.
+    # Note: awk '{print $1; exit}' intentionally takes only the FIRST matching
+    # namespace — the original code passed all matches to kubectl -n which fails
+    # if more than one namespace is returned.
     log(f"      [{cid}] Scaling up services...")
-    scale_cmds = [
-        # Scale up CCI (dynamic namespace discovery)
-        f"CCI_NS=$({K} get ns --no-headers | grep 'svc-cci-ns' | awk '{{print $1}}');"
-        f" if [ -n \"$CCI_NS\" ]; then {K} -n $CCI_NS scale deployment --all --replicas=1; fi",
-        # Scale up ArgoCD
-        f"if {K} get ns argocd >/dev/null 2>&1; then {K} -n argocd scale deployment --all --replicas=1; fi",
-        # Scale up Harbor (both statefulsets and deployments)
-        f"HARBOR_NS=$({K} get ns --no-headers | grep 'svc-harbor' | awk '{{print $1}}');"
-        f" if [ -n \"$HARBOR_NS\" ]; then {K} -n $HARBOR_NS scale sts --all --replicas=1;"
-        f" {K} -n $HARBOR_NS scale deployment --all --replicas=1; fi",
-    ]
-    run_on_scp(
-        vc["host"], vc["root_user"], password,
-        scp_ip, scp_pass, scale_cmds,
-        description=f"      [{cid}] Scaling up service workloads on SCP",
-        timeout=120,
-    )
+    _ns_preflight = "\n".join([
+        f"NS_OUT=$({K} get ns --no-headers 2>/dev/null)",
+        "echo \"$NS_OUT\" | awk '/svc-cci-ns/{print \"CCI_NS=\" $1; exit}'",
+        "echo \"$NS_OUT\" | grep -q '^argocd ' && echo 'ARGOCD_NS=argocd' || true",
+        "echo \"$NS_OUT\" | awk '/svc-harbor/{print \"HARBOR_NS=\" $1; exit}'",
+    ])
+    _ns_raw = ssh_to_scp_direct(
+        vc, password, scp_ip, scp_pass, _ns_preflight, timeout=20,
+    ).strip()
+
+    _ns_map: dict = {}
+    for _ln in _ns_raw.splitlines():
+        if "=" in _ln:
+            _k, _v = _ln.split("=", 1)
+            _ns_map[_k.strip()] = _v.strip()
+
+    _cci_ns    = _ns_map.get("CCI_NS", "")
+    _argocd_ns = _ns_map.get("ARGOCD_NS", "")
+    _harbor_ns = _ns_map.get("HARBOR_NS", "")
+
+    _found_svcs = [s for s in [
+        f"CCI ({_cci_ns})" if _cci_ns else "",
+        "ArgoCD"           if _argocd_ns else "",
+        f"Harbor ({_harbor_ns})" if _harbor_ns else "",
+    ] if s]
+
+    if not _found_svcs:
+        log(f"      [{cid}]   No scalable service workloads found — skipping scale-up.")
+    else:
+        log(f"      [{cid}]   Services present: {', '.join(_found_svcs)}")
+        if _cci_ns:
+            log(f"      [{cid}]   Scaling CCI deployments in {_cci_ns}...")
+            ssh_to_scp_direct(
+                vc, password, scp_ip, scp_pass,
+                f"{K} -n {_cci_ns} scale deployment --all --replicas=1",
+                timeout=30,
+            )
+        if _argocd_ns:
+            log(f"      [{cid}]   Scaling ArgoCD deployments...")
+            ssh_to_scp_direct(
+                vc, password, scp_ip, scp_pass,
+                f"{K} -n argocd scale deployment --all --replicas=1",
+                timeout=30,
+            )
+        if _harbor_ns:
+            log(f"      [{cid}]   Scaling Harbor statefulsets and deployments "
+                f"in {_harbor_ns}...")
+            ssh_to_scp_direct(
+                vc, password, scp_ip, scp_pass,
+                f"{K} -n {_harbor_ns} scale sts --all --replicas=1 2>/dev/null || true\n"
+                f"{K} -n {_harbor_ns} scale deployment --all --replicas=1",
+                timeout=30,
+            )
 
     # ── Initial sweep: phase-based + stuck-container deletion ─────────────────
     # Discover all (namespace, pod) pairs to delete using the robust helper.
@@ -1996,12 +2114,8 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60,
         action = "CLEAR" if clear_proxy else "configure"
         log(f"      [{cid}] [dry-run] would {action} /etc/environment and containerd proxy.")
     else:
-        # Build the containerd drop-in content and base64-encode it so it
-        # can be written with a single echo | base64 -d > command.  A heredoc
-        # (cat >> file << 'EOF') cannot be used here because it puts the shell
-        # into continuation mode (the '>' prompt) which never matches the
-        # expect pattern root@.*# — causing a timeout before systemctl ever
-        # runs and leaving containerd without proxy settings.
+        # Build the containerd drop-in content.  Base64-encoding avoids shell
+        # quoting issues when writing the file over the SSH hop.
         if clear_proxy:
             # CLEAR mode: strip proxy env-vars (no append), write empty drop-in.
             _proxy_conf_b64 = base64.b64encode((
@@ -2010,14 +2124,13 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60,
                 'Environment="HTTPS_PROXY="\n'
                 'Environment="NO_PROXY="\n'
             ).encode()).decode()
-            proxy_commands = [
+            _file_script = "\n".join([
                 "sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;"
                 "/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment",
-                f"mkdir -p /etc/systemd/system/containerd.service.d",
-                f"echo {_proxy_conf_b64} | base64 -d > /etc/systemd/system/containerd.service.d/http-proxy.conf",
-                "systemctl daemon-reload",
-                "systemctl restart containerd",
-            ]
+                "mkdir -p /etc/systemd/system/containerd.service.d",
+                f"echo {_proxy_conf_b64} | base64 -d"
+                " > /etc/systemd/system/containerd.service.d/http-proxy.conf",
+            ])
         else:
             # NORMAL mode: write HOL proxy values.
             _proxy_conf_b64 = base64.b64encode((
@@ -2026,26 +2139,43 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60,
                 f'Environment="HTTPS_PROXY={HTTPS_PROXY}"\n'
                 f'Environment="NO_PROXY={NO_PROXY}"\n'
             ).encode()).decode()
-            proxy_commands = [
-                f"sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment",
+            _file_script = "\n".join([
+                "sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;"
+                "/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment",
                 f"echo 'http_proxy={HTTP_PROXY}' >> /etc/environment",
                 f"echo 'https_proxy={HTTPS_PROXY}' >> /etc/environment",
                 f"echo 'no_proxy={NO_PROXY}' >> /etc/environment",
                 f"echo 'HTTP_PROXY={HTTP_PROXY}' >> /etc/environment",
                 f"echo 'HTTPS_PROXY={HTTPS_PROXY}' >> /etc/environment",
                 f"echo 'NO_PROXY={NO_PROXY}' >> /etc/environment",
-                f"mkdir -p /etc/systemd/system/containerd.service.d",
-                f"echo {_proxy_conf_b64} | base64 -d > /etc/systemd/system/containerd.service.d/http-proxy.conf",
-                f"systemctl daemon-reload",
-                f"systemctl restart containerd",
-            ]
+                "mkdir -p /etc/systemd/system/containerd.service.d",
+                f"echo {_proxy_conf_b64} | base64 -d"
+                " > /etc/systemd/system/containerd.service.d/http-proxy.conf",
+            ])
+
         action_desc = "Clearing" if clear_proxy else "Applying"
-        run_on_scp(
-            vc["host"], vc["root_user"], password,
-            scp_ip, scp_pass, proxy_commands,
-            description=f"      [{cid}] {action_desc} proxy settings and restarting containerd",
-            timeout=120,
-        )
+        log(f"      [{cid}] {action_desc} proxy settings and restarting containerd")
+
+        log(f"      [{cid}]   [1/3] Writing proxy configuration files...")
+        ssh_to_scp_direct(vc, password, scp_ip, scp_pass, _file_script, timeout=30)
+
+        log(f"      [{cid}]   [2/3] Reloading systemd unit files...")
+        ssh_to_scp_direct(vc, password, scp_ip, scp_pass,
+                          "systemctl daemon-reload", timeout=30)
+
+        log(f"      [{cid}]   [3/3] Restarting containerd (may take 30–90s)...")
+        ssh_to_scp_direct(vc, password, scp_ip, scp_pass,
+                          "systemctl restart containerd", timeout=120)
+
+        _ct_status = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass,
+            "systemctl is-active containerd 2>&1", timeout=15,
+        ).strip()
+        if _ct_status == "active":
+            log(f"      [{cid}]   containerd is active.")
+        else:
+            log(f"      [{cid}]   containerd status: {_ct_status or '(no output)'}",
+                level="WARN")
 
     # Resolve the best available kubeconfig on this SCP node.
     # See _probe_scp_kubeconfig() for the full rationale.
@@ -2156,39 +2286,96 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60,
         time.sleep(20)
 
     # 2. Regenerate supervisor-management-proxy certs (live mode only).
-    #    All commands are guarded so they are silent no-ops when the
-    #    resources don't exist (e.g. newer Supervisor builds that have
-    #    removed or renamed this component).
+    #
+    #    Pre-flight check (via ssh_to_scp_direct so no expect session is needed):
+    #      • SKIP_NO_DEPLOY   — deployment absent on this Supervisor build; skip.
+    #      • SKIP_CERT_VALID  — TLS cert valid for 60+ more days; skip.
+    #      • REGEN_NO_CERT    — TLS secret missing; must regenerate.
+    #      • REGEN_CERT_EXPIRING — cert expiring within 60 days; must regenerate.
+    #      • (empty / other)  — SSH/kubectl failed; regenerate as a precaution.
     if dry_run:
-        log(f"      [{cid}] [dry-run] would regenerate supervisor-management-proxy "
-            f"certs on {scp_ip}.")
+        log(f"      [{cid}] [dry-run] would check and possibly regenerate "
+            f"supervisor-management-proxy certs on {scp_ip}.")
     else:
-        commands = [
-            # Delete cert-manager proxy secrets only when any actually exist.
-            # Without the guard, an empty subshell produces "error: resource(s)
-            # were provided, but no name was specified".
-            f"PROXY_SC=$({K} get secret -n cert-manager -o name 2>/dev/null"
-            f" | grep supervisor-management-proxy);"
-            f" if [ -n \"$PROXY_SC\" ]; then {K} delete -n cert-manager $PROXY_SC; fi",
-            # --ignore-not-found silences NotFound errors for the well-known
-            # kube-system secrets on builds where they don't exist.
-            f"{K} -n kube-system delete secret "
-            f"supervisor-management-proxy-ca supervisor-management-proxy-tls"
-            f" --ignore-not-found",
-            # Roll the deployment only if it exists; absent on some builds.
-            f"if {K} -n kube-system get deploy supervisor-management-proxy"
-            f" >/dev/null 2>&1; then"
-            f" {K} -n kube-system rollout restart deploy supervisor-management-proxy"
-            f" && {K} -n kube-system rollout status deploy"
-            f" supervisor-management-proxy --timeout=180s; fi",
-        ]
-        run_on_scp(
-            vc["host"], vc["root_user"], password,
-            scp_ip, scp_pass, commands,
-            description=f"      [{cid}] Executing proxy-cert regeneration on SCP",
-            timeout=240,
-        )
-        log(f"      [{cid}] Management proxy regeneration submitted on {scp_ip}.")
+        # go-template uses index so the literal dot in 'tls.crt' is not
+        # misinterpreted as a field separator.
+        _gt_tls = '{{index .data "tls.crt"}}'
+        _preflight = "\n".join([
+            f"DEPLOY=$({K} -n kube-system get deploy supervisor-management-proxy"
+            " --ignore-not-found -o name 2>/dev/null)",
+            '[ -z "$DEPLOY" ] && { echo SKIP_NO_DEPLOY; exit 0; }',
+            f"CERT_B64=$({K} -n kube-system get secret"
+            " supervisor-management-proxy-tls --ignore-not-found"
+            f" -o go-template='{_gt_tls}' 2>/dev/null | tr -d '\\n')",
+            '[ -z "$CERT_B64" ] && { echo REGEN_NO_CERT; exit 0; }',
+            "echo \"$CERT_B64\" | base64 -d 2>/dev/null |"
+            " openssl x509 -noout -checkend 5184000 >/dev/null 2>&1"
+            " && echo SKIP_CERT_VALID || echo REGEN_CERT_EXPIRING",
+        ])
+        log(f"      [{cid}] Checking supervisor-management-proxy cert status...")
+        _pf = ssh_to_scp_direct(
+            vc, password, scp_ip, scp_pass, _preflight, timeout=20,
+        ).strip()
+
+        _do_regen = not _pf.startswith("SKIP")
+        if _pf == "SKIP_NO_DEPLOY":
+            log(f"      [{cid}]   supervisor-management-proxy not present on "
+                f"this build — skipping cert regeneration.")
+        elif _pf == "SKIP_CERT_VALID":
+            log(f"      [{cid}]   supervisor-management-proxy-tls cert is valid "
+                f"for 60+ days — skipping regeneration.")
+        elif _pf == "REGEN_NO_CERT":
+            log(f"      [{cid}]   supervisor-management-proxy-tls cert absent — "
+                f"regenerating.")
+        elif _pf == "REGEN_CERT_EXPIRING":
+            log(f"      [{cid}]   supervisor-management-proxy-tls cert expiring "
+                f"within 60 days — regenerating.")
+        else:
+            log(f"      [{cid}]   preflight inconclusive ({_pf!r}) — "
+                f"proceeding with regeneration as a precaution.", level="WARN")
+
+        if _do_regen:
+            # Step 1: Delete existing proxy secrets so cert-manager reissues them.
+            log(f"      [{cid}]   [1/3] Deleting existing proxy TLS secrets...")
+            _del_script = "\n".join([
+                f"PROXY_SC=$({K} get secret -n cert-manager -o name 2>/dev/null"
+                " | grep supervisor-management-proxy)",
+                "if [ -n \"$PROXY_SC\" ]; then"
+                f" {K} delete -n cert-manager $PROXY_SC; fi",
+                f"{K} -n kube-system delete secret"
+                " supervisor-management-proxy-ca supervisor-management-proxy-tls"
+                " --ignore-not-found",
+            ])
+            ssh_to_scp_direct(vc, password, scp_ip, scp_pass,
+                              _del_script, timeout=30)
+
+            # Step 2: Trigger the rollout restart.
+            log(f"      [{cid}]   [2/3] Submitting rollout restart...")
+            ssh_to_scp_direct(
+                vc, password, scp_ip, scp_pass,
+                f"{K} -n kube-system rollout restart"
+                f" deploy supervisor-management-proxy",
+                timeout=30,
+            )
+
+            # Step 3: Wait for rollout completion in a separate SSH call so
+            # the overall script is not blocked if the deployment stalls.
+            log(f"      [{cid}]   [3/3] Waiting for rollout to complete "
+                f"(may take up to 120s)...")
+            _rs = ssh_to_scp_direct(
+                vc, password, scp_ip, scp_pass,
+                f"{K} -n kube-system rollout status"
+                f" deploy supervisor-management-proxy --timeout=120s 2>&1",
+                timeout=150,
+            ).strip()
+            if "successfully rolled out" in _rs:
+                log(f"      [{cid}]   supervisor-management-proxy rolled out "
+                    f"successfully.")
+            else:
+                log(f"      [{cid}]   Rollout status: {_rs[:200]}",
+                    level="WARN")
+            log(f"      [{cid}] Management proxy cert regeneration complete on "
+                f"{scp_ip}.")
 
     # --- Phase D: Workload Recovery ---
     _run_pod_cleanup_for_cluster(vc, password, scp_ip, scp_pass,
