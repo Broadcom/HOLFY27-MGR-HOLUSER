@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
 Author: Burke Azbill and HOL Core Team
-Version: 1.6 2026-07-02
+Version: 1.8 2026-07-02
 
 Configure Firefox on the Main Linux Console (LMC) via enterprise policies.
 
-Lab automation (prelim, manager scripts) runs this module via ``/lmchol``
-on the *manager* VM (NFS client mounting the console root export).  On the
-*console* VM, Firefox reads ``~/snap/firefox/...`` and ``/etc/firefox/``
-from **local disk**.
-
-This module writes two system-level files that apply to every Firefox profile
-and survive profile resets:
+Lab automation (prelim, manager scripts) runs this module on the *manager*
+VM.  Firefox profile discovery/cleanup still uses ``/lmchol`` (NFS client
+mounting the console root export) since those paths are ``holuser``-owned
+and writable over NFS.  The two system-level files below are root-owned on
+the console, so they are written over SSH as root instead:
 
   /etc/firefox/policies/policies.json
       Enterprise policy file read by snap Firefox via the ``etc-firefox``
@@ -37,12 +35,27 @@ v1.6  Full migration from user.js prefs to enterprise policies.  Removes all
       user.js writing code.  The policies.json now carries the complete tuning
       set.  The crash reporter is handled via MOZ_CRASHREPORTER_DISABLE=1 in
       /etc/environment instead of an ineffective pref.
+v1.7  Fixed policies.json/environment never being written: both files are
+      root-owned on the console, but the write went through the /lmchol NFS
+      mount as the unprivileged holuser, which always failed with EACCES
+      (logged as a WARNING and silently ignored).  Both writes now go over
+      SSH as root via lsf.set_console_firefox_policies() /
+      lsf.set_console_crashreporter_env(), mirroring the existing
+      set_console_os_proxy() pattern used for the same /etc/environment file
+      elsewhere in prelim.py.  A write failure now also fails the overall
+      call so it can no longer be silently swallowed.
+v1.8  Stopped hardcoding the proxy host/port.  The Firefox Proxy policy now
+      defaults to lsf.LAB_PROXY_IP / lsf.LAB_PROXY_PORT — the canonical proxy
+      constants lsfunctions.py already uses for every other proxy consumer —
+      instead of the local "proxy.site-a.vcf.lab" / 3128 literals.  This
+      also fixes the proxy_host/proxy_port parameters being effectively
+      unusable from prelim.py (which never passed them, so the hardcoded
+      defaults always won regardless of lsfunctions.py's actual config).
 """
 
 from __future__ import annotations
 
 import glob
-import json
 import os
 import re
 import shutil
@@ -219,100 +232,6 @@ def _build_policies(
     }
 
 
-def _write_firefox_policies(
-    mc_base: str,
-    policies: Dict[str, Any],
-    log: Callable[[str], Any],
-    dry_run: bool,
-) -> None:
-    """Create or update /etc/firefox/policies/policies.json via mc_base.
-
-    When run from the manager VM, mc_base is ``/lmchol`` (NFS mount of the
-    console root), so the effective path on the console is
-    ``/etc/firefox/policies/policies.json``.
-
-    Snap Firefox has the ``etc-firefox`` system-files interface connected,
-    which means it reads enterprise policies from ``/etc/firefox/policies/``.
-    The write is idempotent — the file is only updated when the content changes.
-    """
-    policies_dir  = os.path.join(mc_base, "etc", "firefox", "policies")
-    policies_path = os.path.join(policies_dir, "policies.json")
-    desired       = json.dumps(policies, indent=2) + "\n"
-
-    if dry_run:
-        log(f"firefox_lmchol_tuning: dry-run — would write {policies_path}")
-        return
-
-    try:
-        os.makedirs(policies_dir, exist_ok=True)
-    except OSError as e:
-        log(f"WARNING: firefox_lmchol_tuning: cannot create {policies_dir}: {e}")
-        return
-
-    existing: Optional[str] = None
-    if os.path.isfile(policies_path):
-        try:
-            with open(policies_path, "r", encoding="utf-8") as fh:
-                existing = fh.read()
-        except OSError:
-            pass
-
-    if existing == desired:
-        log(f"firefox_lmchol_tuning: {policies_path} already up-to-date")
-        return
-
-    try:
-        with open(policies_path, "w", encoding="utf-8") as fh:
-            fh.write(desired)
-        log(f"firefox_lmchol_tuning: wrote {policies_path}")
-    except OSError as e:
-        log(f"WARNING: firefox_lmchol_tuning: cannot write {policies_path}: {e}")
-
-
-def _write_crashreporter_env(
-    mc_base: str, log: Callable[[str], Any], dry_run: bool
-) -> None:
-    """Ensure MOZ_CRASHREPORTER_DISABLE=1 is present in /etc/environment.
-
-    The toolkit.crashreporter.enabled pref is ineffective in snap Firefox
-    because the crash reporter process is spawned before profile prefs are
-    read.  Setting this environment variable suppresses it at the OS level.
-
-    The write is idempotent — the line is only appended when absent.
-    A console re-login or reboot is required for a running session to pick
-    up the change.
-    """
-    env_path = os.path.join(mc_base, "etc", "environment")
-    marker   = "MOZ_CRASHREPORTER_DISABLE"
-    new_line = "MOZ_CRASHREPORTER_DISABLE=1\n"
-
-    if dry_run:
-        log(f"firefox_lmchol_tuning: dry-run — would ensure {marker} in {env_path}")
-        return
-
-    existing = ""
-    if os.path.isfile(env_path):
-        try:
-            with open(env_path, "r", encoding="utf-8", errors="replace") as fh:
-                existing = fh.read()
-        except OSError as e:
-            log(f"WARNING: firefox_lmchol_tuning: cannot read {env_path}: {e}")
-            return
-
-    if marker in existing:
-        log(f"firefox_lmchol_tuning: {marker} already present in {env_path}")
-        return
-
-    try:
-        with open(env_path, "a", encoding="utf-8") as fh:
-            if existing and not existing.endswith("\n"):
-                fh.write("\n")
-            fh.write(new_line)
-        log(f"firefox_lmchol_tuning: added {marker} to {env_path}")
-    except OSError as e:
-        log(f"WARNING: firefox_lmchol_tuning: cannot write {env_path}: {e}")
-
-
 def _clear_crashes_and_idb(
     mc_base: str, profiles: List[str], log: Callable[[str], Any], dry_run: bool
 ) -> None:
@@ -428,43 +347,58 @@ def apply_firefox_lmchol_tuning(
     dry_run: bool = False,
     clear: bool = False,
     proxy_host: Optional[str] = None,
-    proxy_port: int = 3128,
+    proxy_port: Optional[int] = None,
+    console_host: str = "root@console.site-a.vcf.lab",
 ) -> bool:
     """Apply Firefox LMC tuning via enterprise policies and environment variable.
 
-    Writes ``/etc/firefox/policies/policies.json`` (via mc_base) with the full
-    policy set covering proxy, Nimbus/experiments, telemetry, form-data
-    preservation, and perf/startup settings.  Appends
-    ``MOZ_CRASHREPORTER_DISABLE=1`` to ``/etc/environment``.  Strips the legacy
-    user.js HOL block from each profile.
+    Writes ``/etc/firefox/policies/policies.json`` with the full policy set
+    covering proxy, Nimbus/experiments, telemetry, form-data preservation,
+    and perf/startup settings.  Appends ``MOZ_CRASHREPORTER_DISABLE=1`` to
+    ``/etc/environment``.  Strips the legacy user.js HOL block from each
+    profile.
+
+    Both system files are root-owned on the console, so they are written
+    over SSH as root (``lsf.set_console_firefox_policies`` /
+    ``lsf.set_console_crashreporter_env``) rather than through the ``/lmchol``
+    NFS mount, which is only writable as the unprivileged holuser.  Profile
+    discovery and the user.js purge still use ``/lmchol`` since those paths
+    are holuser-owned.
 
     When ``clear=False`` (default / HOL lab types): the Proxy policy uses
-    Mode=manual pointing at proxy_host:proxy_port.
+    Mode=manual pointing at proxy_host:proxy_port, sourced from lsfunctions.py's
+    canonical LAB_PROXY_IP / LAB_PROXY_PORT constants unless overridden.
 
     When ``clear=True`` (non-HOL lab types — DISCOVERY, VXP, ATE, EDU): the
     Proxy policy uses Mode=none (direct connection).
 
-    :param lsf:        lsfunctions module reference (or any object with
-                       ``write_output``, ``mc``, and ``proxy`` attributes).
-    :param dry_run:    If True log intent but make no changes.
-    :param clear:      If True write the no-proxy policy variant.
-    :param proxy_host: Squid host (default from lsf.proxy).
-    :param proxy_port: Squid port (default 3128).
+    :param lsf:          lsfunctions module reference (or any object with
+                         ``write_output``, ``mc``, ``LAB_PROXY_IP``,
+                         ``LAB_PROXY_PORT``, ``LAB_NO_PROXY_PARTS``, and
+                         ``get_password`` attributes).
+    :param dry_run:      If True log intent but make no changes.
+    :param clear:        If True write the no-proxy policy variant.
+    :param proxy_host:   Proxy host override (default lsf.LAB_PROXY_IP).
+    :param proxy_port:   Proxy port override (default lsf.LAB_PROXY_PORT).
+    :param console_host: SSH target for the root-owned file writes, e.g.
+                         'root@console.site-a.vcf.lab'.
     :return: True if all operations succeeded or no profiles found; False on
              any write error.
     """
     log:  Callable[[str], Any] = getattr(lsf, "write_output", print)
     mc         = getattr(lsf, "mc", "/lmchol")
-    host       = proxy_host or getattr(lsf, "proxy", "proxy.site-a.vcf.lab")
+    host       = proxy_host or getattr(lsf, "LAB_PROXY_IP", "10.1.1.1")
+    port       = proxy_port or getattr(lsf, "LAB_PROXY_PORT", 3128)
     no_proxy   = _build_firefox_no_proxy(lsf)
-    mode_desc  = "clear (no proxy)" if clear else f"set (manual proxy {host}:{proxy_port})"
+    password   = lsf.get_password()
+    mode_desc  = "clear (no proxy)" if clear else f"set (manual proxy {host}:{port})"
 
     profiles = _firefox_profile_dirs(mc)
     if not profiles:
         log("firefox_lmchol_tuning: no Firefox profiles under LMC; skip")
         return True
 
-    policies = _build_policies(clear, host, proxy_port, no_proxy)
+    policies = _build_policies(clear, host, port, no_proxy)
 
     if dry_run:
         log(
@@ -472,16 +406,18 @@ def apply_firefox_lmchol_tuning(
             f"({mode_desc})"
         )
         _clear_crashes_and_idb(mc, profiles, log, dry_run=True)
-        _write_firefox_policies(mc, policies, log, dry_run=True)
-        _write_crashreporter_env(mc, log, dry_run=True)
+        lsf.set_console_firefox_policies(console_host, password, policies, dry_run=True)
+        lsf.set_console_crashreporter_env(console_host, password, dry_run=True)
         for prof in profiles:
             _purge_user_js_block(_user_js_path(prof), log, dry_run=True)
         return True
 
     ok_all = True
     _clear_crashes_and_idb(mc, profiles, log, dry_run=False)
-    _write_firefox_policies(mc, policies, log, dry_run=False)
-    _write_crashreporter_env(mc, log, dry_run=False)
+    if not lsf.set_console_firefox_policies(console_host, password, policies, dry_run=False):
+        ok_all = False
+    if not lsf.set_console_crashreporter_env(console_host, password, dry_run=False):
+        ok_all = False
     for prof in profiles:
         try:
             _purge_user_js_block(_user_js_path(prof), log, dry_run=False)
@@ -505,13 +441,21 @@ def main() -> None:
         ),
     )
     p.add_argument(
-        "--proxy-host", default=None, help="Squid host (default from lsf.proxy)"
+        "--proxy-host", default=None, help="Proxy host override (default from lsf.LAB_PROXY_IP)"
     )
-    p.add_argument("--proxy-port", type=int, default=3128)
+    p.add_argument(
+        "--proxy-port", type=int, default=None,
+        help="Proxy port override (default from lsf.LAB_PROXY_PORT)",
+    )
     p.add_argument(
         "--clear",
         action="store_true",
         help="Write no-proxy policy variant (non-HOL lab types)",
+    )
+    p.add_argument(
+        "--console-host",
+        default="root@console.site-a.vcf.lab",
+        help="SSH target for the root-owned policies.json/environment writes",
     )
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
@@ -521,15 +465,21 @@ def main() -> None:
     # and _build_firefox_no_proxy so the canonical lsf values are always used.
     class _Shim:
         mc = args.mc_base
-        proxy = args.proxy_host or lsf.proxy
+        LAB_PROXY_IP = lsf.LAB_PROXY_IP
+        LAB_PROXY_PORT = lsf.LAB_PROXY_PORT
         LAB_NO_PROXY_PARTS = lsf.LAB_NO_PROXY_PARTS
         write_output = staticmethod(print)
+        get_password = staticmethod(lsf.get_password)
+        set_console_firefox_policies = staticmethod(lsf.set_console_firefox_policies)
+        set_console_crashreporter_env = staticmethod(lsf.set_console_crashreporter_env)
 
     apply_firefox_lmchol_tuning(
         _Shim(),
         dry_run=args.dry_run,
         clear=args.clear,
+        proxy_host=args.proxy_host,
         proxy_port=args.proxy_port,
+        console_host=args.console_host,
     )
 
 
