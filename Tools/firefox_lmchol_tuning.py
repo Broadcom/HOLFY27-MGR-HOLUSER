@@ -23,7 +23,7 @@ import re
 import shutil
 from typing import Any, Callable, List, Optional
 
-BEGIN = "# --- BEGIN HOL LMC Firefox tuning ---"
+BEGIN = "// --- BEGIN HOL LMC Firefox tuning ---"
 
 # v1.3 Changes:
 # - Added _resolve_ff_base() to support both apt and snap Firefox profile paths.
@@ -37,7 +37,7 @@ BEGIN = "# --- BEGIN HOL LMC Firefox tuning ---"
 #   In VM/VNC environments Firefox can hang on exit waiting for a crash reporter dialog
 #   the user can never see or dismiss, causing "Firefox is already running" errors on
 #   the next open attempt. Disabling the crash reporter breaks this deadlock.
-END = "# --- END HOL LMC Firefox tuning ---"
+END = "// --- END HOL LMC Firefox tuning ---"
 
 # Lines we remove from the rest of user.js (will be re-applied inside HOL block).
 _STRIP_LINE_RES = (
@@ -126,6 +126,7 @@ def _hol_proxy_clear_block() -> str:
         'user_pref("signon.autofillForms", true);',
         'user_pref("signon.includeOtherSubdomainsInLookup", false);',
         # Gate the Nimbus experiments
+        'user_pref("nimbus.experimentation.active", false);',
         'user_pref("app.normandy.enabled", false);',
         'user_pref("app.shield.optoutstudies.enabled", false);',
         'user_pref("datareporting.healthreport.uploadEnabled", false);',
@@ -198,6 +199,7 @@ def _hol_block(proxy_host: str, proxy_port: int, no_proxy: str = _FIREFOX_NO_PRO
         'user_pref("signon.autofillForms", true);',
         'user_pref("signon.includeOtherSubdomainsInLookup", false);',
         # Gate the Nimbus experiments
+        'user_pref("nimbus.experimentation.active", false);',
         'user_pref("app.normandy.enabled", false);',
         'user_pref("app.shield.optoutstudies.enabled", false);',
         'user_pref("datareporting.healthreport.uploadEnabled", false);',
