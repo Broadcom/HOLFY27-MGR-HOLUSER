@@ -1,5 +1,5 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.20 - 2026-06-17
+# Version 3.21 - 2026-07-02
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
@@ -1208,6 +1208,69 @@ def clear_console_os_proxy(console_host, password, dry_run=False):
         return True
     else:
         write_output(f'WARNING: {label}: OS proxy clear failed (ssh rc={result.returncode})')
+        return False
+
+
+def set_console_firefox_policies(console_host, password, policies, dry_run=False):
+    """Write /etc/firefox/policies/policies.json on the console VM via SSH+root.
+
+    /etc/firefox is root-owned, so this must run over SSH as root rather than
+    through the /lmchol NFS mount (mounted read/write as the unprivileged
+    holuser, which cannot create files under /etc on the console).
+
+    :param console_host: SSH target, e.g. 'root@console.site-a.vcf.lab'
+    :param password:     SSH password
+    :param policies:     dict to serialize as the policies.json content
+    :param dry_run:      If True log intent, make no changes
+    :return: True on success, False on SSH error (non-fatal)
+    """
+    label = console_host.split('@')[-1].split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would write /etc/firefox/policies/policies.json on {console_host}')
+        return True
+
+    desired = json.dumps(policies, indent=2) + '\n'
+    policies_b64 = base64.b64encode(desired.encode()).decode()
+    cmd = (
+        'mkdir -p /etc/firefox/policies && '
+        f'echo {policies_b64} | base64 -d > /etc/firefox/policies/policies.json'
+    )
+    result = ssh(cmd, console_host, password)
+    if result.returncode == 0:
+        write_output(f'{label}: wrote /etc/firefox/policies/policies.json')
+        return True
+    else:
+        write_output(f'WARNING: {label}: policies.json write failed (ssh rc={result.returncode})')
+        return False
+
+
+def set_console_crashreporter_env(console_host, password, dry_run=False):
+    """Ensure MOZ_CRASHREPORTER_DISABLE=1 is present in /etc/environment on the console VM.
+
+    Uses SSH+root for the same reason as set_console_firefox_policies() —
+    /etc/environment is root-owned and unwritable via the NFS mount as holuser.
+    Idempotent: only appends the line when absent.
+
+    :param console_host: SSH target, e.g. 'root@console.site-a.vcf.lab'
+    :param password:     SSH password
+    :param dry_run:      If True log intent, make no changes
+    :return: True on success, False on SSH error (non-fatal)
+    """
+    label = console_host.split('@')[-1].split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would ensure MOZ_CRASHREPORTER_DISABLE in /etc/environment on {console_host}')
+        return True
+
+    cmd = (
+        "grep -q '^MOZ_CRASHREPORTER_DISABLE=' /etc/environment || "
+        "echo 'MOZ_CRASHREPORTER_DISABLE=1' >> /etc/environment"
+    )
+    result = ssh(cmd, console_host, password)
+    if result.returncode == 0:
+        write_output(f'{label}: MOZ_CRASHREPORTER_DISABLE ensured in /etc/environment')
+        return True
+    else:
+        write_output(f'WARNING: {label}: MOZ_CRASHREPORTER_DISABLE write failed (ssh rc={result.returncode})')
         return False
 
 
