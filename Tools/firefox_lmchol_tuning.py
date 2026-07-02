@@ -1,18 +1,56 @@
 #!/usr/bin/env python3
 """
 Author: Burke Azbill and HOL Core Team
-Version: 1.4 2026-06-30
+Version: 1.8 2026-07-02
 
-Tune Firefox user.js on the Main Linux Console (LMC) profile.
+Configure Firefox on the Main Linux Console (LMC) via enterprise policies.
 
-Lab automation (prelim, manager scripts) edits the same home tree via ``/lmchol``
-on the *manager* VM (NFS client mounting the console export). On the *console* VM,
-Firefox reads ``~/snap/firefox/...`` from **local disk** — the browser process does
-not use NFS for profile I/O there.
+Lab automation (prelim, manager scripts) runs this module on the *manager*
+VM.  Firefox profile discovery/cleanup still uses ``/lmchol`` (NFS client
+mounting the console root export) since those paths are ``holuser``-owned
+and writable over NFS.  The two system-level files below are root-owned on
+the console, so they are written over SSH as root instead:
 
-Wrong proxy settings (PAC type with a dead 10.0.0.1:3128) and heavy urlbar work
-cause multi-minute startup stalls. This module rewrites a bounded block in each
-profile's ``user.js``.
+  /etc/firefox/policies/policies.json
+      Enterprise policy file read by snap Firefox via the ``etc-firefox``
+      system-files interface.  Covers proxy, Nimbus/experiments, telemetry,
+      form-data preservation, and perf/startup settings.
+
+  /etc/environment
+      Adds ``MOZ_CRASHREPORTER_DISABLE=1`` to suppress the crash reporter at
+      launch (before any profile prefs are loaded, which is when the snap
+      crashreporter process is spawned).  A console re-login or reboot is
+      required for this to take effect on an already-running session.
+
+Any legacy ``user.js`` HOL block written by earlier versions of this module is
+purged from each profile so it cannot shadow or conflict with the policies.
+
+Version history
+---------------
+v1.3  Added _resolve_ff_base() for apt/snap Firefox path detection.
+v1.4  Added crash reporter disable prefs to HOL blocks.
+v1.5  Added _write_firefox_policies() for UserMessaging.FirefoxLabs=false
+      policy, fixing the RemoteSettingsExperimentLoader shutdown crash.
+v1.6  Full migration from user.js prefs to enterprise policies.  Removes all
+      user.js writing code.  The policies.json now carries the complete tuning
+      set.  The crash reporter is handled via MOZ_CRASHREPORTER_DISABLE=1 in
+      /etc/environment instead of an ineffective pref.
+v1.7  Fixed policies.json/environment never being written: both files are
+      root-owned on the console, but the write went through the /lmchol NFS
+      mount as the unprivileged holuser, which always failed with EACCES
+      (logged as a WARNING and silently ignored).  Both writes now go over
+      SSH as root via lsf.set_console_firefox_policies() /
+      lsf.set_console_crashreporter_env(), mirroring the existing
+      set_console_os_proxy() pattern used for the same /etc/environment file
+      elsewhere in prelim.py.  A write failure now also fails the overall
+      call so it can no longer be silently swallowed.
+v1.8  Stopped hardcoding the proxy host/port.  The Firefox Proxy policy now
+      defaults to lsf.LAB_PROXY_IP / lsf.LAB_PROXY_PORT — the canonical proxy
+      constants lsfunctions.py already uses for every other proxy consumer —
+      instead of the local "proxy.site-a.vcf.lab" / 3128 literals.  This
+      also fixes the proxy_host/proxy_port parameters being effectively
+      unusable from prelim.py (which never passed them, so the hardcoded
+      defaults always won regardless of lsfunctions.py's actual config).
 """
 
 from __future__ import annotations
@@ -21,25 +59,15 @@ import glob
 import os
 import re
 import shutil
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-BEGIN = "# --- BEGIN HOL LMC Firefox tuning ---"
+# Sentinel strings used to locate the legacy HOL block in user.js files so it
+# can be stripped during migration.  Not written by this version.
+_LEGACY_BEGIN = "// --- BEGIN HOL LMC Firefox tuning ---"
+_LEGACY_END   = "// --- END HOL LMC Firefox tuning ---"
 
-# v1.3 Changes:
-# - Added _resolve_ff_base() to support both apt and snap Firefox profile paths.
-#   Apt Firefox stores profiles at ~/.mozilla/firefox/ (preferred); snap Firefox
-#   stores them at ~/snap/firefox/common/.mozilla/firefox/. The helper tries the
-#   apt path first and falls back to the snap path, so the module works before,
-#   during, and after a snap→apt migration with no code changes required.
-# v1.4 Changes:
-# - Added crash reporter disable prefs to both HOL blocks (toolkit.crashreporter.enabled,
-#   browser.tabs.crashReporting.sendReport, browser.crashReports.unsubmittedCheck.*).
-#   In VM/VNC environments Firefox can hang on exit waiting for a crash reporter dialog
-#   the user can never see or dismiss, causing "Firefox is already running" errors on
-#   the next open attempt. Disabling the crash reporter breaks this deadlock.
-END = "# --- END HOL LMC Firefox tuning ---"
-
-# Lines we remove from the rest of user.js (will be re-applied inside HOL block).
+# Patterns matching individual prefs that were managed outside the HOL block in
+# older profiles.  Stripped alongside the block during user.js purge.
 _STRIP_LINE_RES = (
     re.compile(r'^\s*user_pref\s*\(\s*["\']network\.proxy\.'),
     re.compile(r'^\s*user_pref\s*\(\s*["\']browser\.urlbar\.quicksuggest'),
@@ -52,6 +80,11 @@ _STRIP_LINE_RES = (
     re.compile(r'^\s*user_pref\s*\(\s*["\']toolkit\.crashreporter\.'),
     re.compile(r'^\s*user_pref\s*\(\s*["\']browser\.tabs\.crashReporting\.'),
     re.compile(r'^\s*user_pref\s*\(\s*["\']browser\.crashReports\.unsubmittedCheck\.'),
+)
+
+_FIREFOX_NO_PROXY_FALLBACK = (
+    "localhost, 127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/16,"
+    " *.vcf.lab, *.svc, *.cluster.local"
 )
 
 
@@ -86,61 +119,6 @@ def _user_js_path(profile_dir: str) -> str:
     return os.path.join(profile_dir, "user.js")
 
 
-def _hol_proxy_clear_block() -> str:
-    """Return the user.js HOL block that disables the proxy (network.proxy.type=0).
-
-    Used for non-HOL lab types (DISCOVERY, VXP, ATE, EDU) where no proxy filter
-    is required.  Perf prefs (Quick Suggest, safe-browsing, etc.) are still
-    applied so Firefox starts cleanly regardless of lab type.
-    """
-    lines = [
-        BEGIN,
-        'user_pref("network.proxy.type", 0);',
-        # Urlbar / disk: reduce SQLite churn and speculative work
-        'user_pref("browser.urlbar.quicksuggest.enabled", false);',
-        'user_pref("browser.urlbar.suggest.quicksuggest.sponsored", false);',
-        'user_pref("browser.urlbar.suggest.quicksuggest.nonsponsored", false);',
-        'user_pref("browser.places.speculativeConnect.enabled", false);',
-        'user_pref("network.prefetch-next", false);',
-        # Skip network-heavy checks during startup (lab is trusted)
-        'user_pref("browser.safebrowsing.malware.enabled", false);',
-        'user_pref("browser.safebrowsing.phish.enabled", false);',
-        'user_pref("browser.shell.checkDefaultBrowser", false);',
-        'user_pref("browser.sessionstore.resume_from_crash", false);',
-        # Disable crash reporter — prevents hang-on-exit and "already running" errors in VMs.
-        # When Firefox exits uncleanly it launches crashreporter and waits for it; in a VM
-        # the dialog is invisible and Firefox's parent process never releases the profile lock.
-        'user_pref("toolkit.crashreporter.enabled", false);',
-        'user_pref("browser.tabs.crashReporting.sendReport", false);',
-        'user_pref("browser.crashReports.unsubmittedCheck.enabled", false);',
-        'user_pref("browser.crashReports.unsubmittedCheck.autoSubmit2", false);',
-        # Preserve saved usernames and form history across sessions
-        'user_pref("privacy.clearHistory.formdata", false);',
-        'user_pref("privacy.clearOnShutdown_v2.formdata", false);',
-        'user_pref("privacy.clearSiteData.formdata", false);',
-        'user_pref("privacy.clearSiteData.historyFormDataAndDownloads", false);',
-        'user_pref("browser.formfill.enable", true);',
-        'user_pref("browser.formfill.autoFill", true);',
-        'user_pref("browser.formfill.autoFill.passwords", true);',
-        'user_pref("browser.formfill.autoFill.forms", true);',
-        'user_pref("signon.autofillForms", true);',
-        'user_pref("signon.includeOtherSubdomainsInLookup", false);',
-        # Gate the Nimbus experiments
-        'user_pref("app.normandy.enabled", false);',
-        'user_pref("app.shield.optoutstudies.enabled", false);',
-        'user_pref("datareporting.healthreport.uploadEnabled", false);',
-        END,
-        "",
-    ]
-    return "\n".join(lines)
-
-
-_FIREFOX_NO_PROXY_FALLBACK = (
-    "localhost, 127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/16,"
-    " *.vcf.lab, *.svc, *.cluster.local"
-)
-
-
 def _build_firefox_no_proxy(lsf: Any) -> str:
     """Build the Firefox no_proxies_on string from lsf.LAB_NO_PROXY_PARTS.
 
@@ -158,101 +136,100 @@ def _build_firefox_no_proxy(lsf: Any) -> str:
     return ", ".join(converted)
 
 
-def _hol_block(proxy_host: str, proxy_port: int, no_proxy: str = _FIREFOX_NO_PROXY_FALLBACK) -> str:
-    # Manual proxy (type 1). PAC type 2 with http_* set is invalid and stalls startup.
-    lines = [
-        BEGIN,
-        'user_pref("network.proxy.type", 1);',
-        f'user_pref("network.proxy.http", "{proxy_host}");',
-        f'user_pref("network.proxy.http_port", {proxy_port});',
-        f'user_pref("network.proxy.ssl", "{proxy_host}");',
-        f'user_pref("network.proxy.ssl_port", {proxy_port});',
-        'user_pref("network.proxy.share_proxy_settings", true);',
-        # Internal lab traffic should bypass Squid (DNS, vCenter, Vault NodePort, etc.)
-        f'user_pref("network.proxy.no_proxies_on", "{no_proxy}");',
-        # Urlbar / disk: reduce SQLite churn (large suggest.sqlite) and speculative work
-        'user_pref("browser.urlbar.quicksuggest.enabled", false);',
-        'user_pref("browser.urlbar.suggest.quicksuggest.sponsored", false);',
-        'user_pref("browser.urlbar.suggest.quicksuggest.nonsponsored", false);',
-        'user_pref("browser.places.speculativeConnect.enabled", false);',
-        'user_pref("network.prefetch-next", false);',
-        # Skip network-heavy checks during startup (lab is trusted)
-        'user_pref("browser.safebrowsing.malware.enabled", false);',
-        'user_pref("browser.safebrowsing.phish.enabled", false);',
-        'user_pref("browser.shell.checkDefaultBrowser", false);',
-        'user_pref("browser.sessionstore.resume_from_crash", false);',
-        # Disable crash reporter — prevents hang-on-exit and "already running" errors in VMs.
-        'user_pref("toolkit.crashreporter.enabled", false);',
-        'user_pref("browser.tabs.crashReporting.sendReport", false);',
-        'user_pref("browser.crashReports.unsubmittedCheck.enabled", false);',
-        'user_pref("browser.crashReports.unsubmittedCheck.autoSubmit2", false);',
-        # Preserve saved usernames and form history across sessions
-        'user_pref("privacy.clearHistory.formdata", false);',
-        'user_pref("privacy.clearOnShutdown_v2.formdata", false);',
-        'user_pref("privacy.clearSiteData.formdata", false);',
-        'user_pref("privacy.clearSiteData.historyFormDataAndDownloads", false);',
-        'user_pref("browser.formfill.enable", true);',
-        'user_pref("browser.formfill.autoFill", true);',
-        'user_pref("browser.formfill.autoFill.passwords", true);',
-        'user_pref("browser.formfill.autoFill.forms", true);',
-        'user_pref("signon.autofillForms", true);',
-        'user_pref("signon.includeOtherSubdomainsInLookup", false);',
-        # Gate the Nimbus experiments
-        'user_pref("app.normandy.enabled", false);',
-        'user_pref("app.shield.optoutstudies.enabled", false);',
-        'user_pref("datareporting.healthreport.uploadEnabled", false);',
-        END,
-        "",
-    ]
-    return "\n".join(lines)
-
-
-def _rewrite_user_js(
-    path: str,
+def _build_policies(
+    clear: bool,
     proxy_host: str,
     proxy_port: int,
-    override_block: Optional[str] = None,
-) -> bool:
-    """Rewrite user.js, replacing the HOL marker block with a fresh one.
+    no_proxy: str,
+) -> Dict[str, Any]:
+    """Return the policies.json content dict for this lab variant.
 
-    :param override_block: If provided, insert this block instead of the
-                           default ``_hol_block(proxy_host, proxy_port)`` block.
-                           Pass the output of ``_hol_proxy_clear_block()`` to
-                           disable the proxy for non-HOL lab types.
+    :param clear:      When True, set proxy Mode=none (non-HOL lab types).
+                       When False, set Mode=manual with Squid settings (HOL).
+    :param proxy_host: Squid hostname, used only when clear=False.
+    :param proxy_port: Squid port, used only when clear=False.
+    :param no_proxy:   Comma-separated bypass list for the Proxy Passthrough
+                       field, used only when clear=False.
     """
-    if os.path.isfile(path):
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            raw_lines = f.readlines()
+    if clear:
+        proxy: Dict[str, Any] = {"Mode": "none", "Locked": True}
     else:
-        raw_lines = []
+        proxy = {
+            "Mode": "manual",
+            "HTTPProxy": f"{proxy_host}:{proxy_port}",
+            "SSLProxy": f"{proxy_host}:{proxy_port}",
+            "UseHTTPProxyForAllProtocols": True,
+            "Passthrough": no_proxy,
+            "Locked": True,
+        }
 
-    out: List[str] = []
-    skip = False
-    for line in raw_lines:
-        if BEGIN in line:
-            skip = True
-            continue
-        if skip:
-            if END in line:
-                skip = False
-            continue
-        if any(r.search(line) for r in _STRIP_LINE_RES):
-            continue
-        out.append(line)
-    # Trim trailing blank runs
-    while out and out[-1].strip() == "":
-        out.pop()
-    if out and not out[-1].endswith("\n"):
-        out[-1] += "\n"
-    if out and out[-1].strip() != "":
-        out.append("\n")
+    return {
+        "policies": {
+            # Proxy — manual Squid or direct depending on lab type.
+            "Proxy": proxy,
 
-    block = override_block if override_block is not None else _hol_block(proxy_host, proxy_port)
-    out.append(block)
-    text = "".join(out)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-    return True
+            # Telemetry — superset of datareporting.healthreport.uploadEnabled;
+            # also disables dataSubmission and telemetry archive.
+            "DisableTelemetry": True,
+
+            # Nimbus/experiments — three policies work together to force
+            # ExperimentAPI.enabled=False in Firefox 151:
+            #
+            #   DisableFirefoxStudies  → disallows "Shield"
+            #                           → studiesEnabled=False
+            #   DisableRemoteImprovements → disallows "NimbusRollouts"
+            #                           → rolloutsEnabled=False
+            #   UserMessaging.FirefoxLabs → disallows "FirefoxLabs"
+            #                           → labsEnabled=False
+            #
+            # With all three False, ExperimentAPI.enabled returns False,
+            # RemoteSettingsExperimentLoader.enable() returns early, and the
+            # async shutdown barrier that caused the SIGSEGV-on-close crash is
+            # never registered.  Prefs alone cannot achieve this because
+            # labsEnabled is Services.policies.isAllowed("FirefoxLabs") which
+            # ignores user prefs.
+            "DisableFirefoxStudies": True,
+            "DisableRemoteImprovements": True,
+            "UserMessaging": {"FirefoxLabs": False},
+
+            # Default browser prompt — lab machines are always the default.
+            "DontCheckDefaultBrowser": True,
+
+            # Form data preservation — boolean False locks
+            # privacy.sanitize.sanitizeOnShutdown=false and every
+            # clearOnShutdown category to false, preserving saved usernames and
+            # form history across sessions.
+            "SanitizeOnShutdown": False,
+
+            # Generic pref overrides — all within the Preferences policy
+            # allowlist (browser.*, network.*, signon.*, places.*).
+            # Flat form (non-object value) = set and lock.
+            "Preferences": {
+                # Urlbar/disk: reduce SQLite churn and speculative network work.
+                "browser.urlbar.quicksuggest.enabled": False,
+                "browser.urlbar.suggest.quicksuggest.sponsored": False,
+                "browser.urlbar.suggest.quicksuggest.nonsponsored": False,
+                "browser.places.speculativeConnect.enabled": False,
+                "network.prefetch-next": False,
+                # Skip network-heavy checks on startup (lab is trusted).
+                "browser.safebrowsing.malware.enabled": False,
+                "browser.safebrowsing.phish.enabled": False,
+                # Crash reporter UI prefs (belt-and-suspenders alongside the
+                # MOZ_CRASHREPORTER_DISABLE env var).
+                "browser.sessionstore.resume_from_crash": False,
+                "browser.tabs.crashReporting.sendReport": False,
+                "browser.crashReports.unsubmittedCheck.enabled": False,
+                "browser.crashReports.unsubmittedCheck.autoSubmit2": False,
+                # Autofill — preserve form and credential autofill behaviour.
+                "browser.formfill.enable": True,
+                "browser.formfill.autoFill": True,
+                "browser.formfill.autoFill.passwords": True,
+                "browser.formfill.autoFill.forms": True,
+                "signon.autofillForms": True,
+                "signon.includeOtherSubdomainsInLookup": False,
+            },
+        }
+    }
 
 
 def _clear_crashes_and_idb(
@@ -301,40 +278,127 @@ def _clear_crashes_and_idb(
                     log(f"firefox_lmchol_tuning: cleared remote-settings idb files in {os.path.basename(prof)}")
 
 
+def _purge_user_js_block(
+    path: str, log: Callable[[str], Any], dry_run: bool
+) -> None:
+    """Remove the legacy HOL BEGIN/END pref block from user.js.
+
+    With all tuning migrated to enterprise policies, user.js no longer needs
+    any HOL content.  This purge prevents stale prefs from shadowing or
+    conflicting with policy-set values.
+
+    Also strips any standalone HOL-managed prefs that may exist outside the
+    marker block in very old profiles (covered by _STRIP_LINE_RES).
+
+    Prefs the user added independently (e.g. ``general.useragent.override``)
+    are left untouched.
+    """
+    if not os.path.isfile(path):
+        return
+
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        raw_lines = fh.readlines()
+
+    out: List[str] = []
+    skip    = False
+    changed = False
+    for line in raw_lines:
+        if _LEGACY_BEGIN in line:
+            skip    = True
+            changed = True
+            continue
+        if skip:
+            if _LEGACY_END in line:
+                skip = False
+            continue
+        if any(r.search(line) for r in _STRIP_LINE_RES):
+            changed = True
+            continue
+        out.append(line)
+
+    profile_name = os.path.basename(os.path.dirname(path))
+
+    if not changed:
+        log(
+            f"firefox_lmchol_tuning: user.js {profile_name} "
+            f"— no legacy HOL block found, nothing to purge"
+        )
+        return
+
+    if dry_run:
+        log(f"firefox_lmchol_tuning: dry-run — would purge HOL block from {path}")
+        return
+
+    # Trim trailing blank lines then write back.
+    while out and out[-1].strip() == "":
+        out.pop()
+
+    text = "".join(out)
+    if text and not text.endswith("\n"):
+        text += "\n"
+
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    log(f"firefox_lmchol_tuning: purged HOL block from user.js {profile_name}")
+
+
 def apply_firefox_lmchol_tuning(
     lsf: Any,
     dry_run: bool = False,
     clear: bool = False,
     proxy_host: Optional[str] = None,
-    proxy_port: int = 3128,
+    proxy_port: Optional[int] = None,
+    console_host: str = "root@console.site-a.vcf.lab",
 ) -> bool:
-    """Update user.js in each LMC Firefox profile.
+    """Apply Firefox LMC tuning via enterprise policies and environment variable.
 
-    When ``clear=False`` (default / HOL lab types): writes the manual Squid
-    proxy block plus lightweight startup prefs.
+    Writes ``/etc/firefox/policies/policies.json`` with the full policy set
+    covering proxy, Nimbus/experiments, telemetry, form-data preservation,
+    and perf/startup settings.  Appends ``MOZ_CRASHREPORTER_DISABLE=1`` to
+    ``/etc/environment``.  Strips the legacy user.js HOL block from each
+    profile.
 
-    When ``clear=True`` (non-HOL lab types — DISCOVERY, VXP, ATE, EDU): writes
-    ``network.proxy.type=0`` (no proxy) plus the same startup perf prefs.
+    Both system files are root-owned on the console, so they are written
+    over SSH as root (``lsf.set_console_firefox_policies`` /
+    ``lsf.set_console_crashreporter_env``) rather than through the ``/lmchol``
+    NFS mount, which is only writable as the unprivileged holuser.  Profile
+    discovery and the user.js purge still use ``/lmchol`` since those paths
+    are holuser-owned.
 
-    :param lsf:        lsfunctions module reference (or any object with
-                       ``write_output``, ``mc``, and ``proxy`` attributes).
-    :param dry_run:    If True log intent but make no changes.
-    :param clear:      If True write the proxy-clear block instead of the
-                       proxy-set block.
-    :param proxy_host: Squid host (default from lsf.proxy).
-    :param proxy_port: Squid port (default 3128).
-    :return: True if all profiles updated or none found; False on write error.
+    When ``clear=False`` (default / HOL lab types): the Proxy policy uses
+    Mode=manual pointing at proxy_host:proxy_port, sourced from lsfunctions.py's
+    canonical LAB_PROXY_IP / LAB_PROXY_PORT constants unless overridden.
+
+    When ``clear=True`` (non-HOL lab types — DISCOVERY, VXP, ATE, EDU): the
+    Proxy policy uses Mode=none (direct connection).
+
+    :param lsf:          lsfunctions module reference (or any object with
+                         ``write_output``, ``mc``, ``LAB_PROXY_IP``,
+                         ``LAB_PROXY_PORT``, ``LAB_NO_PROXY_PARTS``, and
+                         ``get_password`` attributes).
+    :param dry_run:      If True log intent but make no changes.
+    :param clear:        If True write the no-proxy policy variant.
+    :param proxy_host:   Proxy host override (default lsf.LAB_PROXY_IP).
+    :param proxy_port:   Proxy port override (default lsf.LAB_PROXY_PORT).
+    :param console_host: SSH target for the root-owned file writes, e.g.
+                         'root@console.site-a.vcf.lab'.
+    :return: True if all operations succeeded or no profiles found; False on
+             any write error.
     """
-    log: Callable[[str], Any] = getattr(lsf, "write_output", print)
-    mc = getattr(lsf, "mc", "/lmchol")
-    host = proxy_host or getattr(lsf, "proxy", "proxy.site-a.vcf.lab")
-    no_proxy = _build_firefox_no_proxy(lsf)
-    mode_desc = "clear (no proxy)" if clear else f"set (manual proxy {host}:{proxy_port})"
+    log:  Callable[[str], Any] = getattr(lsf, "write_output", print)
+    mc         = getattr(lsf, "mc", "/lmchol")
+    host       = proxy_host or getattr(lsf, "LAB_PROXY_IP", "10.1.1.1")
+    port       = proxy_port or getattr(lsf, "LAB_PROXY_PORT", 3128)
+    no_proxy   = _build_firefox_no_proxy(lsf)
+    password   = lsf.get_password()
+    mode_desc  = "clear (no proxy)" if clear else f"set (manual proxy {host}:{port})"
 
     profiles = _firefox_profile_dirs(mc)
     if not profiles:
         log("firefox_lmchol_tuning: no Firefox profiles under LMC; skip")
         return True
+
+    policies = _build_policies(clear, host, port, no_proxy)
 
     if dry_run:
         log(
@@ -342,31 +406,23 @@ def apply_firefox_lmchol_tuning(
             f"({mode_desc})"
         )
         _clear_crashes_and_idb(mc, profiles, log, dry_run=True)
+        lsf.set_console_firefox_policies(console_host, password, policies, dry_run=True)
+        lsf.set_console_crashreporter_env(console_host, password, dry_run=True)
+        for prof in profiles:
+            _purge_user_js_block(_user_js_path(prof), log, dry_run=True)
         return True
 
-    _clear_crashes_and_idb(mc, profiles, log, dry_run=False)
-
     ok_all = True
+    _clear_crashes_and_idb(mc, profiles, log, dry_run=False)
+    if not lsf.set_console_firefox_policies(console_host, password, policies, dry_run=False):
+        ok_all = False
+    if not lsf.set_console_crashreporter_env(console_host, password, dry_run=False):
+        ok_all = False
     for prof in profiles:
-        uj = _user_js_path(prof)
         try:
-            if clear:
-                _rewrite_user_js(uj, host, proxy_port, override_block=_hol_proxy_clear_block())
-                log(
-                    f"firefox_lmchol_tuning: user.js {os.path.basename(prof)} "
-                    f"— proxy cleared (type=0)"
-                )
-            else:
-                _rewrite_user_js(
-                    uj, host, proxy_port,
-                    override_block=_hol_block(host, proxy_port, no_proxy),
-                )
-                log(
-                    f"firefox_lmchol_tuning: user.js {os.path.basename(prof)} "
-                    f"— manual proxy {host}:{proxy_port}"
-                )
+            _purge_user_js_block(_user_js_path(prof), log, dry_run=False)
         except OSError as e:
-            log(f"WARNING: firefox_lmchol_tuning: could not write {uj}: {e}")
+            log(f"WARNING: firefox_lmchol_tuning: could not purge {_user_js_path(prof)}: {e}")
             ok_all = False
     return ok_all
 
@@ -380,14 +436,27 @@ def main() -> None:
         "--mc-base",
         default="/lmchol",
         help=(
-            "Path to console home tree (/lmchol on manager = NFS export of "
+            "Path to console root tree (/lmchol on manager = NFS export of "
             "console; same paths are local disk when running on the console)"
         ),
     )
     p.add_argument(
-        "--proxy-host", default=None, help="Squid host (default from lsf.proxy)"
+        "--proxy-host", default=None, help="Proxy host override (default from lsf.LAB_PROXY_IP)"
     )
-    p.add_argument("--proxy-port", type=int, default=3128)
+    p.add_argument(
+        "--proxy-port", type=int, default=None,
+        help="Proxy port override (default from lsf.LAB_PROXY_PORT)",
+    )
+    p.add_argument(
+        "--clear",
+        action="store_true",
+        help="Write no-proxy policy variant (non-HOL lab types)",
+    )
+    p.add_argument(
+        "--console-host",
+        default="root@console.site-a.vcf.lab",
+        help="SSH target for the root-owned policies.json/environment writes",
+    )
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -396,11 +465,22 @@ def main() -> None:
     # and _build_firefox_no_proxy so the canonical lsf values are always used.
     class _Shim:
         mc = args.mc_base
-        proxy = args.proxy_host or lsf.proxy
+        LAB_PROXY_IP = lsf.LAB_PROXY_IP
+        LAB_PROXY_PORT = lsf.LAB_PROXY_PORT
         LAB_NO_PROXY_PARTS = lsf.LAB_NO_PROXY_PARTS
         write_output = staticmethod(print)
+        get_password = staticmethod(lsf.get_password)
+        set_console_firefox_policies = staticmethod(lsf.set_console_firefox_policies)
+        set_console_crashreporter_env = staticmethod(lsf.set_console_crashreporter_env)
 
-    apply_firefox_lmchol_tuning(_Shim(), dry_run=args.dry_run, proxy_port=args.proxy_port)
+    apply_firefox_lmchol_tuning(
+        _Shim(),
+        dry_run=args.dry_run,
+        clear=args.clear,
+        proxy_host=args.proxy_host,
+        proxy_port=args.proxy_port,
+        console_host=args.console_host,
+    )
 
 
 if __name__ == "__main__":

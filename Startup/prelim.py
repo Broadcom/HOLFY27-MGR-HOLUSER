@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.15 - 2026-06-09
+# Version 3.16 - 2026-07-02
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -376,9 +376,11 @@ def main(lsf=None, standalone=False, dry_run=False):
             from Tools.firefox_lmchol_tuning import apply_firefox_lmchol_tuning
 
             _ff_clear = not loader.requires_proxy_filter()
-            if not apply_firefox_lmchol_tuning(lsf, dry_run=dry_run, clear=_ff_clear):
+            _console_host = 'root@console.site-a.vcf.lab'
+            if not apply_firefox_lmchol_tuning(lsf, dry_run=dry_run, clear=_ff_clear,
+                                                console_host=_console_host):
                 lsf.write_output(
-                    'WARNING: Firefox LMC user.js tuning failed for one or more profiles'
+                    'WARNING: Firefox LMC tuning failed for one or more profiles'
                 )
         except Exception as e:
             lsf.write_output(f'WARNING: Firefox LMC tuning skipped: {e}')
