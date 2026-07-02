@@ -124,8 +124,11 @@ def _hol_proxy_clear_block() -> str:
         'user_pref("browser.formfill.autoFill.passwords", true);',
         'user_pref("browser.formfill.autoFill.forms", true);',
         'user_pref("signon.autofillForms", true);',
-        'user_pref("signon.includeOtherSubdomainsInLookup", false)',
-        'user_pref("messaging-system.rsexperimentloader.enabled", false);',
+        'user_pref("signon.includeOtherSubdomainsInLookup", false);',
+        # Gate the Nimbus experiments
+        'user_pref("app.normandy.enabled", false);',
+        'user_pref("app.shield.optoutstudies.enabled", false);',
+        'user_pref("datareporting.healthreport.uploadEnabled", false);',
         END,
         "",
     ]
@@ -193,8 +196,11 @@ def _hol_block(proxy_host: str, proxy_port: int, no_proxy: str = _FIREFOX_NO_PRO
         'user_pref("browser.formfill.autoFill.passwords", true);',
         'user_pref("browser.formfill.autoFill.forms", true);',
         'user_pref("signon.autofillForms", true);',
-        'user_pref("signon.includeOtherSubdomainsInLookup", false)',
-        'user_pref("messaging-system.rsexperimentloader.enabled", false);',
+        'user_pref("signon.includeOtherSubdomainsInLookup", false);',
+        # Gate the Nimbus experiments
+        'user_pref("app.normandy.enabled", false);',
+        'user_pref("app.shield.optoutstudies.enabled", false);',
+        'user_pref("datareporting.healthreport.uploadEnabled", false);',
         END,
         "",
     ]
