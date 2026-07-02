@@ -1,8 +1,55 @@
 #!/usr/bin/env python3
 # VVFshutdown.py - HOLFY27 Core VVF Shutdown Module
-# Version 1.4 - 2026-06-22
+# Version 1.9 - 2026-07-01
 #
 # CHANGELOG:
+# v1.9 - 2026-07-01 (_find_vm_with_timeout executor shutdown fix):
+#   - ThreadPoolExecutor 'with' block calls shutdown(wait=True) implicitly on
+#     exit, blocking until the background _search() thread completes even after
+#     TimeoutError is caught. Observed: vc-mgmt-a search timed out at 120s but
+#     total wall time was 330s (18:24:09–18:29:39) — an extra 210s waiting for
+#     the stale-connection traversal thread to finish. Fix: replace 'with' block
+#     with explicit executor lifecycle; call shutdown(wait=False) in both success
+#     and timeout paths so the caller returns immediately.
+# v1.8 - 2026-07-01 (Phase 7 ESA detection — multi-host probe, None return):
+#   - check_vsan_esa() previously returned False for both "OSA confirmed" and
+#     "host unreachable". On a partial re-run esx_hosts[0] (esx-01a) is already
+#     off; both the pyVmomi and SSH checks threw exceptions, fell through to
+#     return False, and Phase 7 ran the elevator unnecessarily (~24s timeout
+#     seen in log before "vSAN OSA detected").
+#   - Fix 1: check_vsan_esa() now returns True (ESA), False (OSA), or None
+#     (inconclusive / host unreachable). SSH check uses the literal string
+#     'vSAN ESA Enabled: true' for precision (not just 'ESA' substring).
+#   - Fix 2: Phase 7 now probes esx_hosts in order, skipping None results,
+#     until it gets a definitive True or False. If no host responds at all
+#     (all already off), the elevator is skipped with a warning — it cannot
+#     run on unreachable hosts anyway.
+# v1.7 - 2026-07-01 (Phase 5 & 6 VM search timeout — partial re-run safety):
+#   - lsf.get_vm_by_name() / lsf.get_vm_match() iterate all lsf.sis entries.
+#     On a partial re-run, stale connections to already-powered-off ESXi hosts
+#     each need to TCP-timeout individually — potentially tens of minutes across
+#     21 hosts. Added _find_vm_with_timeout(lsf, name, timeout=120) which runs
+#     the search in a thread and abandons it after 120s, logging a warning and
+#     treating the VM as already powered off. Applied to Phase 5 (vCenter VMs)
+#     and Phase 6 (license VMs).
+# v1.6 - 2026-07-01 (Phase 8 pyVmomi rewrite — no maintenance mode):
+#   - Root cause of timeout: Phase 8 used SSH + esxcli system shutdown poweroff,
+#     which requires the host to be in maintenance mode first. To satisfy that,
+#     shutdown_host() first ran esxcli system maintenanceMode set --enable true
+#     --vsanmode noAction --timeout 300. When processed sequentially, each host
+#     that powered off degraded the vSAN cluster for the next host; subsequent
+#     hosts could not complete the maintenance-mode handshake within 300s
+#     (observed: esx-01a succeeded, esx-02a/esx-03a timed out with rc=1).
+#   - VCFshutdown.py uses ShutdownHost_Task(force=True) via pyVmomi which
+#     bypasses maintenance mode entirely — the SSH/esxcli approach was
+#     unnecessarily complex and was the sole reason maintenance mode was needed.
+#   - Fix: replaced shutdown_host() / SSH approach with _shutdown_host_pyvmomi()
+#     which mirrors VCFshutdown.py: fresh direct pyVmomi connection per host,
+#     ShutdownHost_Task(force=True), disconnect. No maintenance mode step,
+#     no re-authentication loop, no SSH/esxcli dependency.
+#   - Phase 8 now disconnects stale lsf.sis sessions, then iterates hosts
+#     sequentially calling _shutdown_host_pyvmomi() — each call is fast
+#     (~2-5s) since the task is fire-and-forget.
 # v1.4 - 2026-06-22 (elevator bug fixes):
 #   - check_vsan_esa() SSH fallback: fixed 'ESA' in result where result is a
 #     CompletedProcess object (raises TypeError, caught by except → always False).
@@ -104,7 +151,7 @@ logging.basicConfig(
 
 MODULE_NAME = 'VVFshutdown'
 MODULE_DESCRIPTION = 'VVF Graceful Shutdown'
-MODULE_VERSION = '1.4'
+MODULE_VERSION = '1.9'
 
 SHUTDOWN_LOG = '/home/holuser/hol/shutdown.log'
 STATUS_FILE = '/lmchol/hol/startup_status.txt'
@@ -151,22 +198,23 @@ def update_shutdown_status(phase_num, phase_name: str, dry_run: bool = False):
 # vSAN HELPER FUNCTIONS (imported from VCFshutdown pattern)
 #==============================================================================
 
-def check_vsan_esa(lsf, host: str, username: str, password: str) -> bool:
-    """
-    Detect vSAN Express Storage Architecture (ESA) on the given host.
-    ESA does not use plog — the elevator wait is not needed.
-    Uses PyVmomi API first; falls back to SSH esxcli.
+def check_vsan_esa(lsf, host: str, username: str, password: str):
+    """Detect vSAN Express Storage Architecture (ESA) on the given host.
 
-    :return: True if ESA, False if OSA or unknown
+    ESA does not use plog — the elevator wait is not needed.
+    Tries PyVmomi first (existing direct connection), then SSH esxcli fallback.
+
+    :return: True  — ESA confirmed
+             False — OSA confirmed (host responded; vsanEsaEnabled absent/false)
+             None  — inconclusive (host unreachable; both methods raised exceptions)
     """
     try:
-        # PyVmomi API check — uses existing ESXi direct connection
         host_obj = lsf.get_host(host)
         if host_obj and hasattr(host_obj, 'config'):
             if hasattr(host_obj.config, 'vsanHostConfig'):
                 vc = host_obj.config.vsanHostConfig
-                if hasattr(vc, 'vsanEsaEnabled') and vc.vsanEsaEnabled:
-                    return True
+                # Host responded via pyVmomi — definitive answer
+                return bool(hasattr(vc, 'vsanEsaEnabled') and vc.vsanEsaEnabled)
     except Exception:
         pass
 
@@ -174,12 +222,13 @@ def check_vsan_esa(lsf, host: str, username: str, password: str) -> bool:
         result = lsf.ssh('esxcli vsan cluster get 2>&1',
                          f'{username}@{host}', password)
         stdout = result.stdout if hasattr(result, 'stdout') and result.stdout else ''
-        if stdout and 'ESA' in stdout:
-            return True
+        if stdout:
+            # Host responded via SSH — definitive answer
+            return 'vSAN ESA Enabled: true' in stdout
     except Exception:
         pass
 
-    return False
+    return None  # Both methods failed — host likely unreachable or powered off
 
 
 def set_vsan_elevator(lsf, host: str, username: str, password: str, enable: bool):
@@ -246,48 +295,95 @@ def wait_for_elevator_completion(lsf, hosts: list, username: str, password: str,
         vvf_write(lsf, 'vSAN elevator flush complete on all hosts')
 
 
-def shutdown_host(lsf, host: str, username: str, password: str):
-    """Enter maintenance mode (vSAN noAction) then send poweroff to an ESXi host via SSH.
+def _find_vm_with_timeout(lsf, name: str, match_pattern: str = None,
+                          timeout: int = 120):
+    """Search lsf.sis for a VM by name, with an overall wall-clock timeout.
 
-    --vsanmode noAction: skip vSAN data evacuation entirely. By Phase 8 all VMs
-    are powered off so no data migration is needed. Without this flag ESXi tries
-    to evacuate vSAN objects across remaining hosts, fails with "General vSAN
-    error", and rejects the subsequent poweroff command.
-    --timeout 300: allow 5 minutes for maintenance mode entry (60s was too short
-    when cluster health checks are slow).
+    On a partial re-run some ESXi connections may be stale (hosts already
+    powered off).  lsf.get_vm_by_name() iterates all SIs; each stale
+    connection must TCP-timeout individually before moving on, which can
+    block for many minutes across a 21-host cluster.  Running the search
+    in a thread and abandoning it after `timeout` seconds prevents the hang.
+
+    IMPORTANT: the executor is shut down with wait=False so the caller
+    returns immediately on timeout.  Using a 'with' block would call
+    shutdown(wait=True) implicitly, blocking until the background thread
+    finishes — defeating the purpose of the timeout.
+
+    :param name:          Exact VM display name to look up first.
+    :param match_pattern: Regex for the fallback lsf.get_vm_match() call.
+                          Defaults to `name` (substring match).
+    :param timeout:       Seconds to wait before giving up.
+    :return:  List of VM objects (may be empty), or None if timed out.
     """
-    import subprocess as _sp
-    import shlex as _shlex
+    import concurrent.futures as _cft
 
-    def _ssh_cmd(cmd_str):
-        """Run a command on the ESXi host; return (returncode, combined_output)."""
-        args = [
-            'sshpass', '-p', password, 'ssh',
-            '-o', 'StrictHostKeyChecking=accept-new',
-            '-o', 'ConnectTimeout=15',
-            f'{username}@{host}',
-            cmd_str,
-        ]
-        r = _sp.run(args, capture_output=True, text=True, timeout=320)
-        return r.returncode, (r.stdout + r.stderr).strip()
+    _pattern = match_pattern if match_pattern is not None else name
+
+    def _search():
+        vms = lsf.get_vm_by_name(name)
+        if not vms:
+            vms = [v for v in lsf.get_vm_match(_pattern) if v is not None]
+        return vms
+
+    _ex = _cft.ThreadPoolExecutor(max_workers=1)
+    _fut = _ex.submit(_search)
+    try:
+        result = _fut.result(timeout=timeout)
+        _ex.shutdown(wait=False)
+        return result
+    except _cft.TimeoutError:
+        _ex.shutdown(wait=False)  # abandon — do NOT block on the background thread
+        return None   # caller interprets None as "timed out / assume off"
+
+
+def _shutdown_host_pyvmomi(host_fqdn: str, username: str, password: str):
+    """Shut down an ESXi host via a fresh direct pyVmomi connection.
+
+    Uses ShutdownHost_Task(force=True) which bypasses the maintenance mode
+    requirement entirely — identical to VCFshutdown.py's shutdown_host().
+    Creates and immediately destroys its own ServiceInstance so it is
+    thread-safe and does not depend on lsf.sis state.
+
+    Returns (True, '') on success, (False, error_message) on failure.
+    """
+    import ssl as _ssl
+    from pyVmomi import vim as _vim
+    from pyVim import connect as _connect
 
     try:
-        rc, out = _ssh_cmd(
-            'esxcli system maintenanceMode set --enable true '
-            '--vsanmode noAction --timeout 300')
-        if rc != 0:
-            vvf_write(lsf, f'  WARNING: {host}: maintenance mode non-zero rc={rc}: {out}')
-    except Exception as e:
-        vvf_write(lsf, f'  WARNING: {host}: maintenance mode SSH failed: {e}')
+        ctx = _ssl._create_unverified_context()
+        try:
+            si = _connect.SmartConnect(host=host_fqdn, user=username, pwd=password,
+                                       port=443, sslContext=ctx)
+        except _vim.fault.InvalidLogin:
+            si = _connect.SmartConnect(host=host_fqdn, user=username, pwd='',
+                                       port=443, sslContext=ctx)
+        content = si.RetrieveContent()
+        host_obj = (content.rootFolder.childEntity[0]
+                    .hostFolder.childEntity[0].host[0])
+        host_obj.ShutdownHost_Task(force=True)
+        _connect.Disconnect(si)
+        return True, ''
+    except Exception as exc:
+        return False, str(exc)
 
-    try:
-        rc, out = _ssh_cmd('esxcli system shutdown poweroff --reason "VVF Lab Shutdown"')
-        if rc == 0:
-            vvf_write(lsf, f'  {host}: shutdown command sent')
-        else:
-            vvf_write(lsf, f'  WARNING: {host}: poweroff rc={rc}: {out}')
-    except Exception as e:
-        vvf_write(lsf, f'  WARNING: Could not shutdown {host}: {e}')
+
+def shutdown_host(lsf, host: str, username: str, password: str):
+    """Shut down an ESXi host via pyVmomi ShutdownHost_Task(force=True).
+
+    No maintenance mode required — force=True bypasses that check.
+    Delegates to _shutdown_host_pyvmomi() so Phase 8 can also call it
+    directly (e.g., for a single-phase run).
+    """
+    if not lsf.test_tcp_port(host, 443, timeout=5):
+        vvf_write(lsf, f'  {host}: port 443 not reachable — skipping')
+        return
+    ok, err = _shutdown_host_pyvmomi(host, username, password)
+    if ok:
+        vvf_write(lsf, f'  {host}: shutdown command sent')
+    else:
+        vvf_write(lsf, f'  WARNING: {host}: shutdown failed: {err}')
 
 
 #==============================================================================
@@ -668,16 +764,23 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
 
         if not dry_run:
             if vvfvCenter and lsf.sis:
+                import re as _re5
                 vc_shut = 0
                 for entry in vvfvCenter:
                     vc_name = entry.split(':')[0].strip()
-                    vvf_write(lsf, f'  Searching for vCenter VM: {vc_name}')
-                    vms = lsf.get_vm_by_name(vc_name)
+                    vvf_write(lsf, f'  Searching for vCenter VM: {vc_name} (timeout 120s)...')
+                    vms = _find_vm_with_timeout(
+                        lsf, vc_name,
+                        match_pattern=f'^{_re5.escape(vc_name)}(-|$)',
+                        timeout=120,
+                    )
+                    if vms is None:
+                        vvf_write(lsf, f'  WARNING: {vc_name}: VM search timed out — '
+                                       f'assuming already powered off, skipping')
+                        continue
                     if not vms:
-                        # Prefix match for VMs with random suffixes
-                        import re as _re
-                        vms = [v for v in lsf.get_vm_match(f'^{_re.escape(vc_name)}(-|$)')
-                               if v is not None]
+                        vvf_write(lsf, f'  {vc_name}: not found — assuming already powered off')
+                        continue
                     for vm in vms:
                         if lsf.is_vm_powered_on(vm):
                             vvf_write(lsf, f'  Shutting down vCenter: {vm.name}')
@@ -723,10 +826,15 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
 
                 for entry in vvfpostedgevms:
                     vm_name = entry.split(':')[0].strip()
-                    vvf_write(lsf, f'  Searching for license VM: {vm_name}')
-                    vms = lsf.get_vm_by_name(vm_name)
+                    vvf_write(lsf, f'  Searching for license VM: {vm_name} (timeout 120s)...')
+                    vms = _find_vm_with_timeout(lsf, vm_name, timeout=120)
+                    if vms is None:
+                        vvf_write(lsf, f'  WARNING: {vm_name}: VM search timed out — '
+                                       f'assuming already powered off, skipping')
+                        continue
                     if not vms:
-                        vms = lsf.get_vm_match(vm_name)
+                        vvf_write(lsf, f'  {vm_name}: not found — assuming already powered off')
+                        continue
                     for vm in vms:
                         if vm.name in seen:
                             continue
@@ -782,12 +890,31 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                        f'timeout: {vsan_timeout}s')
 
         if vsan_enabled and esx_hosts and not dry_run:
+            # Probe hosts in order until one gives a definitive answer.
+            # None = host unreachable (may already be off) — try the next one.
+            # True/False = ESA/OSA confirmed — stop probing.
             vvf_write(lsf, 'Checking vSAN architecture (OSA vs ESA)...')
-            is_esa = check_vsan_esa(lsf, esx_hosts[0], esx_username, password)
-            if is_esa:
-                vvf_write(lsf, f'vSAN ESA detected on {esx_hosts[0]} — elevator not required')
-            else:
-                vvf_write(lsf, f'vSAN OSA detected — running elevator on {len(esx_hosts)} host(s)')
+            is_esa = None
+            for _probe in esx_hosts:
+                _result = check_vsan_esa(lsf, _probe, esx_username, password)
+                if _result is True:
+                    vvf_write(lsf, f'vSAN ESA detected on {_probe} — elevator not required')
+                    is_esa = True
+                    break
+                elif _result is False:
+                    vvf_write(lsf, f'vSAN OSA confirmed on {_probe}')
+                    is_esa = False
+                    break
+                else:
+                    vvf_write(lsf, f'  {_probe}: unreachable — trying next host')
+
+            if is_esa is None:
+                vvf_write(lsf, 'WARNING: No host responded to ESA check — '
+                               'skipping elevator (hosts unreachable; elevator is a no-op)')
+                is_esa = True  # treat as ESA: if no host answered, elevator cannot run anyway
+
+            if not is_esa:
+                vvf_write(lsf, f'Running elevator on {len(esx_hosts)} host(s)')
 
                 # Re-authenticate to ESXi hosts (sessions may have timed out)
                 vvf_write(lsf, 'Re-authenticating to ESXi hosts (single-attempt each)...')
@@ -840,8 +967,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
         vvf_write(lsf, f'Host shutdown: {shutdown_hosts}, hosts: {len(esx_hosts)}')
 
         if shutdown_hosts and esx_hosts and not dry_run:
-            # Re-authenticate (sessions may have expired during elevator) — single-attempt
-            vvf_write(lsf, 'Re-authenticating to ESXi hosts for shutdown (single-attempt each)...')
+            # Disconnect any open sessions — hosts are about to power off
             for si in lsf.sis:
                 try:
                     connect.Disconnect(si)
@@ -849,29 +975,23 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None):
                     pass
             lsf.sis.clear()
             lsf.sisvc.clear()
-            for host in esx_hosts:
-                try:
-                    lsf.connect_vc(host, 'root', password)
-                except Exception as e:
-                    vvf_write(lsf, f'  {host}: re-auth failed ({e}) — skipping')
 
+            # ShutdownHost_Task(force=True) bypasses maintenance mode entirely,
+            # so no SSH/esxcli maintenance mode step is needed.  Each call
+            # creates a fresh direct pyVmomi connection per host, issues the
+            # task, and disconnects — identical to VCFshutdown.py Phase 20.
             vvf_write(lsf, f'Shutting down {len(esx_hosts)} ESXi host(s)...')
             for i, host in enumerate(esx_hosts, 1):
                 vvf_write(lsf, f'  [{i}/{len(esx_hosts)}] Initiating shutdown: {host}')
-                shutdown_host(lsf, host, esx_username, password)
-                time.sleep(5)
+                ok, err = _shutdown_host_pyvmomi(host, esx_username, password)
+                if ok:
+                    vvf_write(lsf, f'  {host}: shutdown command sent')
+                else:
+                    vvf_write(lsf, f'  WARNING: {host}: shutdown failed: {err}')
+                time.sleep(2)
 
             vvf_write(lsf, 'ESXi host shutdown commands sent')
             vvf_write(lsf, '  Note: Hosts may take several minutes to fully power off')
-
-            # Disconnect sessions (hosts are shutting down)
-            for si in lsf.sis:
-                try:
-                    connect.Disconnect(si)
-                except Exception:
-                    pass
-            lsf.sis.clear()
-            lsf.sisvc.clear()
 
         elif dry_run:
             vvf_write(lsf, f'Would shutdown ESXi hosts: {esx_hosts}')

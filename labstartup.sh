@@ -587,25 +587,6 @@ push_console_files_nfs() {
             .gitkeep)
                 # Skip placeholder files
                 ;;
-            firefox-prewarm.desktop)
-                log_msg "SKIPPING${src_label}: console/${filename} -> .config/autostart/" "${logfile}"
-                local autostart_dest="/lmchol/home/holuser/.config/autostart"
-                # if the file is present in the autostart_dest folder then delete it
-                if [ -f "${autostart_dest}/${filename}" ]; then
-                    rm "${autostart_dest}/${filename}"
-                fi
-                # mkdir -p "${autostart_dest}" 2>/dev/null
-                # if cp "$src_file" "${autostart_dest}/${filename}" 2>/dev/null; then
-                #     log_msg "${src_label}: console/${filename} -> .config/autostart/" "${logfile}"
-                # fi
-                ;;
-            firefox-prewarm.sh)
-                local bin_dest="/lmchol/home/holuser/.local/bin"
-                mkdir -p "${bin_dest}" 2>/dev/null
-                if cp "$src_file" "${bin_dest}/${filename}" 2>/dev/null; then
-                    log_msg "${src_label}: console/${filename} -> .local/bin/" "${logfile}"
-                fi
-                ;;
             rebuild-firefox-profile.sh)
                 local bin_dest="/lmchol/home/holuser/.local/bin"
                 mkdir -p "${bin_dest}" 2>/dev/null
@@ -667,26 +648,10 @@ push_console_files_nfs() {
     chmod +x "${desktop_dest}/conkywatch.sh" 2>/dev/null
     chmod +x "${conky_dest}/conky-startup.sh" 2>/dev/null
     chmod +x "/lmchol/hol/Tools/hol-ssl.py" 2>/dev/null
-    chmod +x "/lmchol/home/holuser/.local/bin/firefox-prewarm.sh" 2>/dev/null
     chmod +x "/lmchol/home/holuser/.local/bin/rebuild-firefox-profile.sh" 2>/dev/null
     # chmod 644 "/lmchol/home/holuser/.config/autostart/firefox-prewarm.desktop" 2>/dev/null
 
     _run_rebuild_firefox_profile_if_needed "${logfile}" || true
-    
-    # Trigger firefox-prewarm.sh on the console VM so it's ready before login
-    # log_msg "Triggering firefox-prewarm.sh on the console VM via SSH..." "${logfile}"
-    # if command -v sshpass >/dev/null 2>&1 && [ -f /home/holuser/creds.txt ]; then
-    #     (
-    #         for i in 1 2 3 4 5 6; do
-    #             if sshpass -f /home/holuser/creds.txt ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 holuser@console "nohup /home/holuser/.local/bin/firefox-prewarm.sh >/dev/null 2>&1 &" 2>/dev/null; then
-    #                 break
-    #             fi
-    #             sleep 5
-    #         done
-    #     ) &
-    # else
-    #     log_msg "sshpass or creds.txt not available, skipping console SSH execution." "${logfile}"
-    # fi
 
     # Now make sure the user-agent override is present in the Firefox profile:
     log_msg "Making sure user-agent override is present in Firefox profile." "${logfile}"

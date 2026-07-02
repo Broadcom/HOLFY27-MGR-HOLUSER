@@ -1,8 +1,42 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.25 - 2026-06-24
+# Version 6.3.26 - 2026-07-01
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.26 Changes:
+# - Pre-flight optimization pass: on a warm re-run against an already-Ready lab,
+#   the script was unconditionally scaling/rolling/patching things regardless of
+#   current state. Added health/state gates so each action only fires when the
+#   target is actually unhealthy or misconfigured; genuine cold-boot recovery is
+#   unchanged when a real problem is detected.
+# - Task 2e: Added shared pre-flight helpers (_deploy_health, _pod_health,
+#   _secret_cert_ok) next to vsp_kubectl for reuse across health checks.
+# - Task 2e: Salt stabilization (redis/raas/salt-master/salt-minion) now checks
+#   deployment Availability, container restart counts, and dynamically-discovered
+#   redis TLS cert freshness before rolling restart; SKIPS the restart loop
+#   entirely when everything is already healthy. Falls back to the full
+#   dependency-ordered restart (unchanged from v6.3.21) whenever any signal is
+#   unhealthy or unknown.
+# - Task 2e: apply_proxy_to_nodes() now stages the desired proxy files on each
+#   VSP node and diffs them against the live files before writing; containerd
+#   and kubelet (and the pod churn that causes) are only restarted when the
+#   proxy configuration actually changed, not on every run.
+# - Task 4b: VCFA microservices fix now discovers which node(s) are actually
+#   SchedulingDisabled instead of hardcoding 'auto-platform-a-b7nps', and only
+#   scales rabbitmq-ha/tenant-manager/vco-app statefulsets that are currently at
+#   0 replicas (matching the existing per-deployment check just below it).
+# - Task 7: NSX VNA/Edge transport-node password-expiration now checks the
+#   current password_change_frequency against the threshold before PUTting,
+#   mirroring the NSX Manager path — skips users already at/above the target.
+# - Task 4b: support-bundle-cluster-info-dump cronjob suspend now checks
+#   spec.suspend first and skips the patch if already suspended.
+# - Task 8b: Fleet-LCM friendly-names fix now checks whether component names
+#   are already friendly via GET /fleet-lcm/v1/components before triggering the
+#   depot-metadata sync and the disruptive crictl stop/rm of fleet-build-service.
+# - Bug fix: Task 4b stale seaweedfs-master-0 age check referenced an undefined
+#   `created_dt` (should be `createdt`), which raised a NameError caught by a
+#   bare except and silently skipped the >1hr staleness check on every run.
 #
 # v6.3.25 Changes:
 # - Task 2e: Pre-flight block (KB 440862) enhanced with full manual recovery:
@@ -1485,6 +1519,103 @@ def main(lsf=None, standalone=False, dry_run=False):
                         ssh_cmd = f"sudo -i bash -c '{kubectl_cmd}'"
                     return lsf.ssh(ssh_cmd, f'{vsp_user}@{vsp_control_plane_ip}')
 
+                # ---- Shared pre-flight health helpers ----
+                # Used to gate scale/rollout-restart/patch actions so they only run when the
+                # target is demonstrably unhealthy or misconfigured, instead of unconditionally
+                # on every startup run. All helpers fail conservatively: any parse error or
+                # missing data returns an "unhealthy/unknown" verdict so callers fall back to
+                # acting (matching pre-optimization behavior) rather than risk a false skip.
+                def _deploy_health(ns, name):
+                    """Return (desired, available, max_restarts) for a Deployment.
+
+                    desired/available come from the Deployment status; max_restarts is the
+                    highest container restartCount across that deployment's pods (found via
+                    the app label, falling back to the deployment name). Returns
+                    (None, None, None) if the deployment cannot be read/parsed.
+                    """
+                    import json as _json_dh
+                    try:
+                        _dh_out = (getattr(vsp_kubectl(
+                            f'kubectl get deployment {name} -n {ns} -o json 2>/dev/null'
+                        ), 'stdout', '') or '')
+                        _dh_js = _dh_out.find('{')
+                        if _dh_js < 0:
+                            return (None, None, None)
+                        _dh_data = _json_dh.loads(_dh_out[_dh_js:])
+                        _desired = _dh_data.get('spec', {}).get('replicas', None)
+                        _available = _dh_data.get('status', {}).get('availableReplicas', 0)
+
+                        _max_restarts = 0
+                        _pods_out = (getattr(vsp_kubectl(
+                            f'kubectl get pods -n {ns} -l app={name} -o json 2>/dev/null'
+                        ), 'stdout', '') or '')
+                        _pods_js = _pods_out.find('{')
+                        if _pods_js >= 0:
+                            _pods_data = _json_dh.loads(_pods_out[_pods_js:])
+                            for _pod in _pods_data.get('items', []):
+                                for _cs in _pod.get('status', {}).get('containerStatuses', []):
+                                    _max_restarts = max(_max_restarts, _cs.get('restartCount', 0))
+                        return (_desired, _available, _max_restarts)
+                    except Exception:
+                        return (None, None, None)
+
+                def _pod_health(ns, pod):
+                    """Return (ready_containers, total_containers, max_restarts, waiting_reason)
+                    for a single named pod. waiting_reason is e.g. 'CrashLoopBackOff' if any
+                    container is waiting, else ''. Returns (0, 0, 0, 'unknown') if unreadable.
+                    """
+                    import json as _json_ph
+                    try:
+                        _ph_out = (getattr(vsp_kubectl(
+                            f'kubectl get pod {pod} -n {ns} -o json 2>/dev/null'
+                        ), 'stdout', '') or '')
+                        _ph_js = _ph_out.find('{')
+                        if _ph_js < 0:
+                            return (0, 0, 0, 'unknown')
+                        _ph_data = _json_ph.loads(_ph_out[_ph_js:])
+                        _cstats = _ph_data.get('status', {}).get('containerStatuses', [])
+                        _ready = sum(1 for cs in _cstats if cs.get('ready', False))
+                        _total = len(_cstats)
+                        _max_restarts = max((cs.get('restartCount', 0) for cs in _cstats), default=0)
+                        _waiting_reason = ''
+                        for cs in _cstats:
+                            _w = cs.get('state', {}).get('waiting', {})
+                            if _w.get('reason'):
+                                _waiting_reason = _w['reason']
+                                break
+                        return (_ready, _total, _max_restarts, _waiting_reason)
+                    except Exception:
+                        return (0, 0, 0, 'unknown')
+
+                def _secret_cert_ok(ns, secret, key='tls.crt', min_days=7):
+                    """Return True only if the named secret's cert exists and does not expire
+                    within min_days (uses the same openssl -checkend pattern as the ClickHouse
+                    freshness check). Returns False (i.e. "needs attention") on any error so
+                    callers default to acting rather than silently skipping a real problem.
+                    """
+                    import json as _json_sc
+                    import base64 as _b64_sc
+                    import subprocess as _sp_sc
+                    try:
+                        _sc_out = (getattr(vsp_kubectl(
+                            f'kubectl get secret {secret} -n {ns} -o json 2>/dev/null'
+                        ), 'stdout', '') or '').strip()
+                        _sc_js = _sc_out.find('{')
+                        if _sc_js < 0:
+                            return False
+                        _sc_data = _json_sc.loads(_sc_out[_sc_js:])
+                        _cert_b64 = _sc_data.get('data', {}).get(key, '')
+                        if not _cert_b64:
+                            return False
+                        _pem = _b64_sc.b64decode(_cert_b64)
+                        _chk = _sp_sc.run(
+                            ['openssl', 'x509', '-noout', '-checkend', str(min_days * 86400)],
+                            input=_pem, capture_output=True
+                        )
+                        return _chk.returncode == 0
+                    except Exception:
+                        return False
+
                 # ---- Pre-flight: KB 440862 — stale Argo cleanup + uncordon SchedulingDisabled nodes ----
                 # The power-off-marker auto-recovery workflow waits for all nodes to be schedulable
                 # before scaling services up. If any node is SchedulingDisabled (stale cordon from
@@ -1681,15 +1812,21 @@ def main(lsf=None, standalone=False, dry_run=False):
                 def apply_proxy_to_nodes(node_ips):
                     if not node_ips:
                         return
-                    lsf.write_output(f'  Applying proxy config to {len(node_ips)} VSP nodes: {", ".join(node_ips)}')
+                    lsf.write_output(f'  Checking proxy config on {len(node_ips)} VSP nodes: {", ".join(node_ips)}')
                     PROXY_URL = lsf.LAB_PROXY_URL
                     NO_PROXY = lsf.build_lab_no_proxy()
-                    
+
+                    # Stages the desired proxy files and diffs them against the live files
+                    # before touching anything. containerd/kubelet are only restarted (which
+                    # churns every pod on the node) when the content actually differs from
+                    # what is already configured — not unconditionally on every run.
                     proxy_script = f'''#!/bin/bash
 PROXY_URL="{PROXY_URL}"
 NO_PROXY="{NO_PROXY}"
 
-cat > /etc/sysconfig/proxy << 'PROXYEOF'
+STAGE=$(mktemp -d)
+
+cat > "$STAGE/sysconfig_proxy" << 'PROXYEOF'
 PROXY_ENABLED="yes"
 HTTP_PROXY="{PROXY_URL}"
 HTTPS_PROXY="{PROXY_URL}"
@@ -1700,9 +1837,21 @@ SOCKS5_SERVER=""
 NO_PROXY="{NO_PROXY}"
 PROXYEOF
 
-touch /etc/environment
-sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment
-cat >> /etc/environment << 'ENVEOF'
+cat > "$STAGE/containerd_http-proxy.conf" << 'CTDEOF'
+[Service]
+Environment="HTTP_PROXY={PROXY_URL}"
+Environment="HTTPS_PROXY={PROXY_URL}"
+Environment="NO_PROXY={NO_PROXY}"
+CTDEOF
+
+cat > "$STAGE/kubelet_http-proxy.conf" << 'KUBEOF'
+[Service]
+Environment="HTTP_PROXY={PROXY_URL}"
+Environment="HTTPS_PROXY={PROXY_URL}"
+Environment="NO_PROXY={NO_PROXY}"
+KUBEOF
+
+cat > "$STAGE/environment_lines" << 'ENVEOF'
 http_proxy={PROXY_URL}
 https_proxy={PROXY_URL}
 no_proxy={NO_PROXY}
@@ -1711,21 +1860,32 @@ HTTPS_PROXY={PROXY_URL}
 NO_PROXY={NO_PROXY}
 ENVEOF
 
+touch /etc/environment
+NEEDS_UPDATE=0
+cmp -s "$STAGE/sysconfig_proxy" /etc/sysconfig/proxy 2>/dev/null || NEEDS_UPDATE=1
+cmp -s "$STAGE/containerd_http-proxy.conf" /etc/systemd/system/containerd.service.d/http-proxy.conf 2>/dev/null || NEEDS_UPDATE=1
+cmp -s "$STAGE/kubelet_http-proxy.conf" /etc/systemd/system/kubelet.service.d/http-proxy.conf 2>/dev/null || NEEDS_UPDATE=1
+CUR_ENV_SORTED=$(grep -E '^(http_proxy|https_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' /etc/environment 2>/dev/null | sort)
+WANT_ENV_SORTED=$(sort "$STAGE/environment_lines")
+[ "$CUR_ENV_SORTED" == "$WANT_ENV_SORTED" ] || NEEDS_UPDATE=1
+
+if [ "$NEEDS_UPDATE" -eq 0 ]; then
+    rm -rf "$STAGE"
+    echo "PROXY_UNCHANGED"
+    exit 0
+fi
+
+cp "$STAGE/sysconfig_proxy" /etc/sysconfig/proxy
+
 mkdir -p /etc/systemd/system/containerd.service.d
-cat > /etc/systemd/system/containerd.service.d/http-proxy.conf << 'CTDEOF'
-[Service]
-Environment="HTTP_PROXY={PROXY_URL}"
-Environment="HTTPS_PROXY={PROXY_URL}"
-Environment="NO_PROXY={NO_PROXY}"
-CTDEOF
+cp "$STAGE/containerd_http-proxy.conf" /etc/systemd/system/containerd.service.d/http-proxy.conf
 
 mkdir -p /etc/systemd/system/kubelet.service.d
-cat > /etc/systemd/system/kubelet.service.d/http-proxy.conf << 'KUBEOF'
-[Service]
-Environment="HTTP_PROXY={PROXY_URL}"
-Environment="HTTPS_PROXY={PROXY_URL}"
-Environment="NO_PROXY={NO_PROXY}"
-KUBEOF
+cp "$STAGE/kubelet_http-proxy.conf" /etc/systemd/system/kubelet.service.d/http-proxy.conf
+
+sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment
+cat "$STAGE/environment_lines" >> /etc/environment
+rm -rf "$STAGE"
 
 systemctl daemon-reload
 systemctl restart containerd
@@ -1745,7 +1905,14 @@ echo "PROXY_CONFIGURED"
                             else:
                                 run_cmd = "sudo bash /tmp/confighol_vsp_proxy.sh"
                             
-                            lsf.ssh(run_cmd, f'{vsp_user}@{node_ip}', password)
+                            _proxy_result = lsf.ssh(run_cmd, f'{vsp_user}@{node_ip}', password)
+                            _proxy_out = (getattr(_proxy_result, 'stdout', '') or '')
+                            if 'PROXY_UNCHANGED' in _proxy_out:
+                                lsf.write_output(f'    {node_ip}: SKIPPED (proxy already correct)')
+                            elif 'PROXY_CONFIGURED' in _proxy_out:
+                                lsf.write_output(f'    {node_ip}: proxy updated, containerd/kubelet restarted')
+                            else:
+                                lsf.write_output(f'    {node_ip}: WARNING — unexpected result applying proxy')
                             
                             if sudo_needs_password:
                                 lsf.ssh(f"echo '{password}' | sudo -S rm -f /tmp/confighol_vsp_proxy.sh", f'{vsp_user}@{node_ip}', password)
@@ -1957,11 +2124,17 @@ echo "PROXY_CONFIGURED"
                 #   3. salt-master gets 500/530 from RAAS SSE API → broken event queue
                 #   4. salt-minion can't auth with broken master → permanently stops
                 # Conditional detection of each failure mode is fragile because the checks
-                # can run before or after the failure window. The reliable fix is:
-                #   Step 1: Fix pgdata permissions if pgdatabase-0 is not 3/3
-                #   Step 2: Unconditionally rollout-restart redis, raas, salt-master, salt-minion
-                #           in dependency order, with waits between each layer
-                # This ensures every component loads fresh certs and connects to healthy deps.
+                # can run before or after the failure window during a genuine cold boot.
+                # However, on a warm re-run against an already-Ready lab there is no cert
+                # rotation race in progress, so unconditionally rolling every layer is pure
+                # churn. The fix is a health gate:
+                #   Step 1: Fix pgdata permissions if pgdatabase-0 is not 3/3 (unchanged)
+                #   Step 2: Only rollout-restart redis/raas/salt-master/salt-minion (in
+                #           dependency order, with waits between each layer) when a health
+                #           check shows a real problem: a deployment not fully Available, a
+                #           container with elevated restart counts, or (for redis) a TLS
+                #           cert that is expiring soon / already invalid. If everything
+                #           checks out healthy, skip the restarts entirely.
                 lsf.write_output('  Stabilizing Salt infrastructure...')
                 try:
                     import json as _json_salt
@@ -2009,35 +2182,104 @@ echo "PROXY_CONFIGURED"
                         except (ValueError, Exception) as _e:
                             lsf.write_output(f'  WARNING: pgdatabase-0 check failed: {_e}')
 
-                    # Step 2: Rollout-restart Redis → wait → RAAS → wait → salt-master → wait → salt-minion
-                    # Using rollout restart ensures a clean zero-downtime pod replacement.
-                    # Each step waits for the previous layer to stabilize.
+                    # Step 2: Pre-flight health check — only rollout-restart layers that are
+                    # actually unhealthy (or downstream of an unhealthy layer), instead of
+                    # unconditionally restarting all four on every run.
                     _salt_steps = [
                         ('redis',       'salt-raas', 'deployment/redis',       30),
                         ('raas',        'salt-raas', 'deployment/raas',        60),
                         ('salt-master', 'salt',      'deployment/salt-master', 45),
                         ('salt-minion', 'salt',      'deployment/salt-minion', 0),
                     ]
-                    for _sname, _sns, _sres, _swait in _salt_steps:
-                        lsf.write_output(f'  Rolling restart {_sname} ({_sns}/{_sres})...')
-                        vsp_kubectl(
-                            f'kubectl rollout restart {_sres} -n {_sns} 2>/dev/null'
-                        )
-                        if _swait > 0:
-                            # Wait for rollout to complete (timeout = _swait seconds)
-                            lsf.write_output(f'  Waiting up to {_swait}s for {_sname} rollout...')
-                            _ro = vsp_kubectl(
-                                f'kubectl rollout status {_sres} -n {_sns} '
-                                f'--timeout={_swait}s 2>/dev/null'
-                            )
-                            _ro_out = (getattr(_ro, 'stdout', '') or '').strip()
-                            if 'successfully rolled out' in _ro_out:
-                                lsf.write_output(f'  {_sname}: rollout complete')
+                    _restart_threshold = 3  # container restartCount above this = unhealthy
+
+                    # Discover the redis TLS secret dynamically from the deployment's pod
+                    # template volumes (name unknown/varies) rather than hardcoding a guess.
+                    # If it can't be found or parsed, treat the cert check as "unknown" so
+                    # the gate falls back to the old, safe unconditional-restart behavior.
+                    _redis_cert_ok = False
+                    try:
+                        _rdep_out = (getattr(vsp_kubectl(
+                            'kubectl get deployment redis -n salt-raas -o json 2>/dev/null'
+                        ), 'stdout', '') or '')
+                        _rdep_js = _rdep_out.find('{')
+                        if _rdep_js >= 0:
+                            _rdep_data = _json_salt.loads(_rdep_out[_rdep_js:])
+                            _rvols = (_rdep_data.get('spec', {}).get('template', {})
+                                      .get('spec', {}).get('volumes', []))
+                            _redis_secret_name = None
+                            for _rv in _rvols:
+                                _rsec = _rv.get('secret', {}).get('secretName', '')
+                                if _rsec and ('cert' in _rsec.lower() or 'tls' in _rsec.lower()):
+                                    _redis_secret_name = _rsec
+                                    break
+                            if _redis_secret_name:
+                                _redis_cert_ok = _secret_cert_ok('salt-raas', _redis_secret_name)
+                                lsf.write_output(
+                                    f'  redis TLS secret "{_redis_secret_name}": '
+                                    f'{"OK" if _redis_cert_ok else "expiring soon / invalid"}'
+                                )
                             else:
                                 lsf.write_output(
-                                    f'  {_sname}: rollout did not complete within '
-                                    f'{_swait}s — continuing'
+                                    '  redis TLS secret not identified — treating cert '
+                                    'check as unknown (fail-safe)'
                                 )
+                    except Exception as _rcert_exc:
+                        lsf.write_output(f'  redis TLS secret check failed: {_rcert_exc}')
+
+                    # Evaluate deployment health for all four layers up front.
+                    _salt_health = {}
+                    for _sname, _sns, _sres, _swait in _salt_steps:
+                        _dep_name = _sres.split('/', 1)[1]
+                        _desired, _available, _max_restarts = _deploy_health(_sns, _dep_name)
+                        _healthy = (
+                            _desired is not None and _available is not None
+                            and _available >= _desired and _desired > 0
+                            and _max_restarts <= _restart_threshold
+                        )
+                        _salt_health[_sname] = _healthy
+                        lsf.write_output(
+                            f'  {_sname}: desired={_desired} available={_available} '
+                            f'max_restarts={_max_restarts} -> '
+                            f'{"healthy" if _healthy else "UNHEALTHY"}'
+                        )
+
+                    _salt_all_healthy = all(_salt_health.values()) and _redis_cert_ok
+
+                    if _salt_all_healthy:
+                        lsf.write_output(
+                            '  Salt infrastructure healthy (all deployments Available, '
+                            'restarts nominal, redis cert fresh) — SKIPPED rollout restart'
+                        )
+                    else:
+                        # Any layer unhealthy (or cert unknown/expiring) — restart every
+                        # layer in dependency order, exactly as before, since a problem in
+                        # an upstream layer (e.g. redis cert) cascades downstream regardless
+                        # of what the downstream layer's own health check shows.
+                        lsf.write_output(
+                            '  Salt infrastructure needs attention — rolling restart in '
+                            'dependency order...'
+                        )
+                        for _sname, _sns, _sres, _swait in _salt_steps:
+                            lsf.write_output(f'  Rolling restart {_sname} ({_sns}/{_sres})...')
+                            vsp_kubectl(
+                                f'kubectl rollout restart {_sres} -n {_sns} 2>/dev/null'
+                            )
+                            if _swait > 0:
+                                # Wait for rollout to complete (timeout = _swait seconds)
+                                lsf.write_output(f'  Waiting up to {_swait}s for {_sname} rollout...')
+                                _ro = vsp_kubectl(
+                                    f'kubectl rollout status {_sres} -n {_sns} '
+                                    f'--timeout={_swait}s 2>/dev/null'
+                                )
+                                _ro_out = (getattr(_ro, 'stdout', '') or '').strip()
+                                if 'successfully rolled out' in _ro_out:
+                                    lsf.write_output(f'  {_sname}: rollout complete')
+                                else:
+                                    lsf.write_output(
+                                        f'  {_sname}: rollout did not complete within '
+                                        f'{_swait}s — continuing'
+                                    )
 
                     lsf.write_output('  Salt infrastructure stabilization complete')
 
@@ -3068,17 +3310,29 @@ echo "PROXY_CONFIGURED"
                         else:
                             lsf.write_output('  No support-bundle-cluster-info-dump pods found.')
 
-                        # Suspend the cronjob to prevent new dump jobs during startup
-                        lsf.write_output('  Suspending support-bundle-cluster-info-dump cronjob...')
-                        suspend_out = _get_stdout(vcfa_ssh(
-                            f'{kctl_prefix} kubectl patch cronjob -n vmsp-platform '
+                        # Suspend the cronjob to prevent new dump jobs during startup —
+                        # but only if it isn't already suspended.
+                        cj_suspended_raw = _get_stdout(vcfa_ssh(
+                            f'{kctl_prefix} kubectl get cronjob -n vmsp-platform '
                             f'support-bundle-cluster-info-dump '
-                            f'-p \'{{"spec":{{"suspend":true}}}}\' 2>/dev/null'
-                        ))
-                        if suspend_out.strip():
-                            lsf.write_output(f'  {suspend_out.strip()}')
+                            f'-o jsonpath="{{.spec.suspend}}" 2>/dev/null'
+                        )).strip()
+                        if cj_suspended_raw == 'true':
+                            lsf.write_output(
+                                '  support-bundle-cluster-info-dump cronjob already '
+                                'suspended — SKIPPED'
+                            )
                         else:
-                            lsf.write_output('  Cronjob patched (or not found — skipped).')
+                            lsf.write_output('  Suspending support-bundle-cluster-info-dump cronjob...')
+                            suspend_out = _get_stdout(vcfa_ssh(
+                                f'{kctl_prefix} kubectl patch cronjob -n vmsp-platform '
+                                f'support-bundle-cluster-info-dump '
+                                f'-p \'{{"spec":{{"suspend":true}}}}\' 2>/dev/null'
+                            ))
+                            if suspend_out.strip():
+                                lsf.write_output(f'  {suspend_out.strip()}')
+                            else:
+                                lsf.write_output('  Cronjob patched (or not found — skipped).')
 
                         # ---- Step 6: Stale seaweedfs-master-0 pod ----
                         lsf.write_output('Checking seaweedfs-master-0 for stale pod (>1hr old)...')
@@ -3099,7 +3353,7 @@ echo "PROXY_CONFIGURED"
                                     createdt = datetime.datetime.strptime(
                                         created, '%Y-%m-%dT%H:%M:%SZ'
                                     ).replace(tzinfo=datetime.timezone.utc)
-                                    age_secs = (datetime.datetime.now(datetime.timezone.utc) - created_dt).total_seconds()
+                                    age_secs = (datetime.datetime.now(datetime.timezone.utc) - createdt).total_seconds()
                                     if age_secs > 3600:
                                         lsf.write_output(f'  Stale seaweedfs-master-0 found ({int(age_secs)}s old), deleting...')
                                         vcfa_ssh(
@@ -4070,6 +4324,14 @@ echo "PROXY_CONFIGURED"
                             continue
                         current = user_data.get('password_change_frequency',
                                                 'unset')
+                        # Mirror the NSX Manager threshold check (line ~4188): only PUT
+                        # when the current value is not already at/above the desired
+                        # setting, instead of unconditionally writing on every run.
+                        if isinstance(current, (int, float)) and current >= nsx_expiry_threshold_days:
+                            lsf.write_output(
+                                f'        [~] {uname} (id={uid}): {current}d — '
+                                f'skip (>= {nsx_expiry_threshold_days}d threshold)')
+                            continue
                         user_data['password_change_frequency'] = nsx_expiry_days
                         try:
                             presp = _vna_req.put(
@@ -4378,11 +4640,63 @@ echo "PROXY_CONFIGURED"
                     _vcfa_kctl(f'kubectl delete workflow -n vmsp-platform {batch} --grace-period=0 2>/dev/null')
                 time.sleep(3)
 
-            # Ensure VCFA node is uncordoned (do this AFTER workflow cleanup)
-            _vcfa_kctl('kubectl uncordon auto-platform-a-b7nps 2>/dev/null')
-            
-            # Scale critical statefulsets to 1
-            _vcfa_kctl('kubectl scale statefulset rabbitmq-ha tenant-manager vco-app -n prelude --replicas=1 2>/dev/null')
+            # Ensure VCFA node(s) are uncordoned (do this AFTER workflow cleanup).
+            # Discover which nodes are actually SchedulingDisabled rather than
+            # hardcoding a single node name — only uncordon what is unschedulable.
+            nodes_out = _vcfa_kctl('kubectl get nodes -o json 2>/dev/null').stdout
+            if '{' in nodes_out:
+                nodes_json = '{' + nodes_out.split('{', 1)[1]
+                try:
+                    nodes_data = json.loads(nodes_json)
+                    cordoned = [
+                        n['metadata']['name'] for n in nodes_data.get('items', [])
+                        if n.get('spec', {}).get('unschedulable', False)
+                    ]
+                    if cordoned:
+                        lsf.write_output(f'  Uncordoning {len(cordoned)} node(s): {", ".join(cordoned)}')
+                        for _node_name in cordoned:
+                            _vcfa_kctl(f'kubectl uncordon {_node_name} 2>/dev/null')
+                    else:
+                        lsf.write_output('  All VCFA nodes already schedulable — SKIPPED uncordon')
+                except Exception as _node_exc:
+                    lsf.write_output(f'  WARNING: Could not parse node list ({_node_exc}) — SKIPPED uncordon')
+            else:
+                lsf.write_output('  WARNING: Could not read node list — SKIPPED uncordon')
+
+            # Scale critical statefulsets to 1, but only the ones currently at 0 replicas.
+            sts_out = _vcfa_kctl(
+                'kubectl get statefulset rabbitmq-ha tenant-manager vco-app '
+                '-n prelude -o json 2>/dev/null'
+            ).stdout
+            if '{' in sts_out:
+                sts_json = '{' + sts_out.split('{', 1)[1]
+                try:
+                    sts_data = json.loads(sts_json)
+                    sts_items = sts_data.get('items', [sts_data]) if 'items' in sts_data else [sts_data]
+                    for s in sts_items:
+                        s_name = s.get('metadata', {}).get('name', '')
+                        if not s_name:
+                            continue
+                        if s.get('spec', {}).get('replicas', 1) == 0:
+                            lsf.write_output(f'  Scaling VCFA statefulset {s_name} to 1 replica...')
+                            _vcfa_kctl(f'kubectl scale statefulset {s_name} -n prelude --replicas=1 2>/dev/null')
+                        else:
+                            lsf.write_output(f'  VCFA statefulset {s_name} already scaled — SKIPPED')
+                except Exception as _sts_exc:
+                    lsf.write_output(
+                        f'  WARNING: Could not parse statefulset list ({_sts_exc}) — '
+                        f'falling back to unconditional scale'
+                    )
+                    _vcfa_kctl(
+                        'kubectl scale statefulset rabbitmq-ha tenant-manager vco-app '
+                        '-n prelude --replicas=1 2>/dev/null'
+                    )
+            else:
+                lsf.write_output('  WARNING: Could not read statefulset list — falling back to unconditional scale')
+                _vcfa_kctl(
+                    'kubectl scale statefulset rabbitmq-ha tenant-manager vco-app '
+                    '-n prelude --replicas=1 2>/dev/null'
+                )
             
             # Scale all 0-replica deployments to 1
             dep_out = _vcfa_kctl('kubectl get deployments -n prelude -o json 2>/dev/null').stdout
@@ -4464,109 +4778,143 @@ echo "PROXY_CONFIGURED"
                 _jwt = _tok_resp.json()['access_token']
                 lsf.write_output('  Fleet-LCM JWT token obtained')
 
-                # --- Step 3: Trigger depot-metadata sync to populate VCF release table ---
-                # This ensures vcf-fleet-upgrade-service has publicName data for all VCF components
-                # before fleet-build-service restarts and reloads its ComponentPublicNameCache.
-                _sync_resp = _req.post(
-                    f'{_fleet_url}/fleet-lcm/v1/depot-metadata?action=sync',
-                    headers={'Authorization': f'Bearer {_jwt}'},
-                    verify=False, timeout=30
-                )
-                if _sync_resp.status_code in (200, 202):
-                    _task_id = None
-                    try:
-                        _sync_body = _sync_resp.json()
-                        _task_id = _sync_body.get('id') or _sync_body.get('taskId')
-                    except Exception:
-                        pass
-                    lsf.write_output(f'  Depot-metadata sync triggered (task={_task_id})')
-                    if _task_id:
-                        for _ in range(24):  # Poll up to 120 seconds
-                            time.sleep(5)
-                            _tr = _req.get(
-                                f'{_fleet_url}/fleet-lcm/v1/tasks/{_task_id}',
-                                headers={'Authorization': f'Bearer {_jwt}'},
-                                verify=False, timeout=15
-                            )
-                            _ts = _tr.json().get('status', '')
-                            if _ts in ('SUCCEEDED', 'COMPLETED', 'FAILED', 'ERROR'):
-                                lsf.write_output(f'  Depot-metadata sync completed: {_ts}')
-                                break
-                    else:
-                        time.sleep(5)
-                else:
-                    lsf.write_output(
-                        f'  WARNING: Depot-metadata sync returned HTTP {_sync_resp.status_code}')
+                # --- Pre-flight: check if friendly names are already loaded ---
+                # If ComponentPublicNameCache already has data (e.g. lab has been up for
+                # a while and the 2-hour TTL already refreshed), skip the depot-metadata
+                # sync and the disruptive crictl stop/rm of fleet-build-service entirely.
+                _names_already_friendly = False
+                try:
+                    _pf_vr = _req.get(
+                        f'{_fleet_url}/fleet-lcm/v1/components',
+                        headers={'Authorization': f'Bearer {_jwt}'},
+                        verify=False, timeout=15
+                    )
+                    if _pf_vr.status_code == 200:
+                        _pf_comps = _pf_vr.json()
+                        if isinstance(_pf_comps, dict):
+                            _pf_comps = _pf_comps.get('components', [])
+                        _pf_named = [
+                            c for c in _pf_comps
+                            if c.get('componentTypeDescription')
+                            and c['componentTypeDescription'] != c.get('componentType')
+                        ]
+                        # Require at least one named component and no unnamed ones to
+                        # consider the cache fully populated.
+                        if _pf_comps and len(_pf_named) == len(_pf_comps):
+                            _names_already_friendly = True
+                except Exception:
+                    pass  # unknown state — fall through and run the fix
 
-                # --- Step 4: Restart fleet-build-service container on VSP nodes ---
-                # Scanning VSP node IP range for the fleetbuild crictl container.
-                # After crictl stop + rm, kubelet immediately restarts a fresh container
-                # that loads ComponentPublicNameCache from the now-populated release data.
-                lsf.write_output('  Restarting fleet-build-service to reload name cache...')
-                _fbs_restarted = False
-                for _vsp_ip in [f'10.1.1.{i}' for i in range(128, 155)]:
-                    try:
-                        _cid_res = subprocess.run(
-                            f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
-                            f" -o ConnectTimeout=3 {_vsp_user}@{_vsp_ip}"
-                            f" \"echo '{password}' | sudo -S crictl ps 2>/dev/null"
-                            f" | grep fleetbuild | awk '{{print $1}}'\"",
-                            shell=True, capture_output=True, text=True, timeout=8
-                        )
-                        _cid = _cid_res.stdout.strip()
-                        if _cid:
-                            subprocess.run(
-                                f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
-                                f" {_vsp_user}@{_vsp_ip}"
-                                f" \"echo '{password}' | sudo -S crictl stop {_cid} 2>/dev/null;"
-                                f" echo '{password}' | sudo -S crictl rm {_cid} 2>/dev/null\"",
-                                shell=True, capture_output=True, timeout=15
-                            )
-                            lsf.write_output(
-                                f'  Restarted fleet-build-service on {_vsp_ip} (container {_cid[:12]})')
-                            _fbs_restarted = True
-                            break
-                    except Exception:
-                        continue
-
-                if not _fbs_restarted:
+                if _names_already_friendly:
                     lsf.write_output(
-                        '  WARNING: Could not find fleet-build-service container on any VSP node')
+                        '  Fleet-LCM component friendly names already loaded — '
+                        'SKIPPED depot sync + fleet-build-service restart'
+                    )
                 else:
-                    # --- Step 5: Verify friendly names are loaded (up to 90 seconds) ---
-                    lsf.write_output(
-                        '  Waiting up to 90s for fleet-build-service to reload name cache...')
-                    for _attempt in range(18):
-                        time.sleep(5)
+                    # --- Step 3: Trigger depot-metadata sync to populate VCF release table ---
+                    # This ensures vcf-fleet-upgrade-service has publicName data for all VCF
+                    # components before fleet-build-service restarts and reloads its
+                    # ComponentPublicNameCache.
+                    _sync_resp = _req.post(
+                        f'{_fleet_url}/fleet-lcm/v1/depot-metadata?action=sync',
+                        headers={'Authorization': f'Bearer {_jwt}'},
+                        verify=False, timeout=30
+                    )
+                    if _sync_resp.status_code in (200, 202):
+                        _task_id = None
                         try:
-                            _vr = _req.get(
-                                f'{_fleet_url}/fleet-lcm/v1/components',
-                                headers={'Authorization': f'Bearer {_jwt}'},
-                                verify=False, timeout=15
-                            )
-                            if _vr.status_code == 200:
-                                _comps = _vr.json()
-                                if isinstance(_comps, dict):
-                                    _comps = _comps.get('components', [])
-                                _named = [
-                                    c for c in _comps
-                                    if c.get('componentTypeDescription')
-                                    and c['componentTypeDescription'] != c.get('componentType')
-                                ]
-                                if _named:
-                                    _ex = _named[0]
-                                    lsf.write_output(
-                                        f'  Friendly names confirmed: '
-                                        f'{_ex["componentType"]} → '
-                                        f'"{_ex["componentTypeDescription"]}"'
-                                    )
-                                    break
+                            _sync_body = _sync_resp.json()
+                            _task_id = _sync_body.get('id') or _sync_body.get('taskId')
                         except Exception:
                             pass
+                        lsf.write_output(f'  Depot-metadata sync triggered (task={_task_id})')
+                        if _task_id:
+                            for _ in range(24):  # Poll up to 120 seconds
+                                time.sleep(5)
+                                _tr = _req.get(
+                                    f'{_fleet_url}/fleet-lcm/v1/tasks/{_task_id}',
+                                    headers={'Authorization': f'Bearer {_jwt}'},
+                                    verify=False, timeout=15
+                                )
+                                _ts = _tr.json().get('status', '')
+                                if _ts in ('SUCCEEDED', 'COMPLETED', 'FAILED', 'ERROR'):
+                                    lsf.write_output(f'  Depot-metadata sync completed: {_ts}')
+                                    break
+                        else:
+                            time.sleep(5)
                     else:
                         lsf.write_output(
-                            '  WARNING: Fleet-LCM components may still show internal names; '
-                            'cache reload may still be in progress')
+                            f'  WARNING: Depot-metadata sync returned HTTP {_sync_resp.status_code}')
+
+                    # --- Step 4: Restart fleet-build-service container on VSP nodes ---
+                    # Scanning VSP node IP range for the fleetbuild crictl container.
+                    # After crictl stop + rm, kubelet immediately restarts a fresh container
+                    # that loads ComponentPublicNameCache from the now-populated release data.
+                    lsf.write_output('  Restarting fleet-build-service to reload name cache...')
+                    _fbs_restarted = False
+                    for _vsp_ip in [f'10.1.1.{i}' for i in range(128, 155)]:
+                        try:
+                            _cid_res = subprocess.run(
+                                f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
+                                f" -o ConnectTimeout=3 {_vsp_user}@{_vsp_ip}"
+                                f" \"echo '{password}' | sudo -S crictl ps 2>/dev/null"
+                                f" | grep fleetbuild | awk '{{print $1}}'\"",
+                                shell=True, capture_output=True, text=True, timeout=8
+                            )
+                            _cid = _cid_res.stdout.strip()
+                            if _cid:
+                                subprocess.run(
+                                    f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
+                                    f" {_vsp_user}@{_vsp_ip}"
+                                    f" \"echo '{password}' | sudo -S crictl stop {_cid} 2>/dev/null;"
+                                    f" echo '{password}' | sudo -S crictl rm {_cid} 2>/dev/null\"",
+                                    shell=True, capture_output=True, timeout=15
+                                )
+                                lsf.write_output(
+                                    f'  Restarted fleet-build-service on {_vsp_ip} (container {_cid[:12]})')
+                                _fbs_restarted = True
+                                break
+                        except Exception:
+                            continue
+
+                    if not _fbs_restarted:
+                        lsf.write_output(
+                            '  WARNING: Could not find fleet-build-service container on any VSP node')
+                    else:
+                        # --- Step 5: Verify friendly names are loaded (up to 90 seconds) ---
+                        lsf.write_output(
+                            '  Waiting up to 90s for fleet-build-service to reload name cache...')
+                        for _attempt in range(18):
+                            time.sleep(5)
+                            try:
+                                _vr = _req.get(
+                                    f'{_fleet_url}/fleet-lcm/v1/components',
+                                    headers={'Authorization': f'Bearer {_jwt}'},
+                                    verify=False, timeout=15
+                                )
+                                if _vr.status_code == 200:
+                                    _comps = _vr.json()
+                                    if isinstance(_comps, dict):
+                                        _comps = _comps.get('components', [])
+                                    _named = [
+                                        c for c in _comps
+                                        if c.get('componentTypeDescription')
+                                        and c['componentTypeDescription'] != c.get('componentType')
+                                    ]
+                                    if _named:
+                                        _ex = _named[0]
+                                        lsf.write_output(
+                                            f'  Friendly names confirmed: '
+                                            f'{_ex["componentType"]} → '
+                                            f'"{_ex["componentTypeDescription"]}"'
+                                        )
+                                        break
+                            except Exception:
+                                pass
+                        else:
+                            lsf.write_output(
+                                '  WARNING: Fleet-LCM components may still show internal names; '
+                                'cache reload may still be in progress')
             except Exception as e:
                 lsf.write_output(f'WARNING: Failed to fix fleet-lcm component friendly names: {e}')
 
