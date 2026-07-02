@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Author: Burke Azbill and HOL Core Team
-Version: 1.4 2026-06-30
+Version: 1.5 2026-07-02
 
 Tune Firefox user.js on the Main Linux Console (LMC) profile.
 
@@ -13,11 +13,26 @@ not use NFS for profile I/O there.
 Wrong proxy settings (PAC type with a dead 10.0.0.1:3128) and heavy urlbar work
 cause multi-minute startup stalls. This module rewrites a bounded block in each
 profile's ``user.js``.
+
+v1.5 Changes:
+- Added _write_firefox_policies() to create /etc/firefox/policies/policies.json via
+  mc_base (writable from the manager over NFS).  The enterprise policy file sets
+  UserMessaging.FirefoxLabs=false which disallows the "FirefoxLabs" feature in
+  Firefox's policy engine.  This is the ONLY way to prevent ExperimentAPI.enabled
+  from returning true: the labsEnabled getter is Services.policies.isAllowed("FirefoxLabs")
+  and cannot be overridden by user.js prefs alone.  Without this policy, the
+  RemoteSettingsExperimentLoader registers an async shutdown barrier that waits for a
+  network fetch through the Squid proxy; when the proxy is slow or unreachable the
+  barrier times out and Firefox aborts with SIGSEGV on every close.
+  Also adds DisableFirefoxStudies and DisableRemoteImprovements as belt-and-suspenders
+  to ensure Nimbus studies and rollouts are policy-disabled in addition to the pref-
+  based disables already applied in user.js.
 """
 
 from __future__ import annotations
 
 import glob
+import json
 import os
 import re
 import shutil
@@ -303,6 +318,74 @@ def _clear_crashes_and_idb(
                     log(f"firefox_lmchol_tuning: cleared remote-settings idb files in {os.path.basename(prof)}")
 
 
+_FIREFOX_POLICIES = {
+    "policies": {
+        # Prevent RemoteSettingsExperimentLoader from initialising via the
+        # labsEnabled path (Services.policies.isAllowed("FirefoxLabs")).
+        # Without this policy, ExperimentAPI.enabled returns True even when
+        # all pref-based disables (app.shield.optoutstudies.enabled, etc.) are
+        # False, because labsEnabled is True by default.  That causes the loader
+        # to register an async shutdown barrier that waits for a network fetch;
+        # when the Squid proxy is slow the barrier times out and Firefox aborts.
+        "UserMessaging": {
+            "FirefoxLabs": False,
+        },
+        # Belt-and-suspenders: also policy-disable studies and rollouts so that
+        # studiesEnabled and rolloutsEnabled are False regardless of pref state.
+        "DisableFirefoxStudies": True,
+        "DisableRemoteImprovements": True,
+    }
+}
+
+
+def _write_firefox_policies(
+    mc_base: str, log: Callable[[str], Any], dry_run: bool
+) -> None:
+    """Create or update /etc/firefox/policies/policies.json via mc_base.
+
+    When run from the manager VM, mc_base is ``/lmchol`` (NFS mount of the
+    console root), so the effective path on the console is
+    ``/etc/firefox/policies/policies.json``.
+
+    Snap Firefox has the ``etc-firefox`` system-files interface connected, which
+    means it reads enterprise policies from ``/etc/firefox/policies/``.  This is
+    the only supported mechanism to disallow ``FirefoxLabs`` in the policy engine.
+    """
+    policies_dir = os.path.join(mc_base, "etc", "firefox", "policies")
+    policies_path = os.path.join(policies_dir, "policies.json")
+
+    desired = json.dumps(_FIREFOX_POLICIES, indent=2) + "\n"
+
+    if dry_run:
+        log(f"firefox_lmchol_tuning: dry-run — would write {policies_path}")
+        return
+
+    try:
+        os.makedirs(policies_dir, exist_ok=True)
+    except OSError as e:
+        log(f"WARNING: firefox_lmchol_tuning: cannot create {policies_dir}: {e}")
+        return
+
+    existing = None
+    if os.path.isfile(policies_path):
+        try:
+            with open(policies_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+        except OSError:
+            pass
+
+    if existing == desired:
+        log(f"firefox_lmchol_tuning: {policies_path} already up-to-date")
+        return
+
+    try:
+        with open(policies_path, "w", encoding="utf-8") as f:
+            f.write(desired)
+        log(f"firefox_lmchol_tuning: wrote {policies_path}")
+    except OSError as e:
+        log(f"WARNING: firefox_lmchol_tuning: cannot write {policies_path}: {e}")
+
+
 def apply_firefox_lmchol_tuning(
     lsf: Any,
     dry_run: bool = False,
@@ -344,9 +427,11 @@ def apply_firefox_lmchol_tuning(
             f"({mode_desc})"
         )
         _clear_crashes_and_idb(mc, profiles, log, dry_run=True)
+        _write_firefox_policies(mc, log, dry_run=True)
         return True
 
     _clear_crashes_and_idb(mc, profiles, log, dry_run=False)
+    _write_firefox_policies(mc, log, dry_run=False)
 
     ok_all = True
     for prof in profiles:
