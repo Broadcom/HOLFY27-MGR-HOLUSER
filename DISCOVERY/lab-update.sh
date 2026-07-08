@@ -11,7 +11,26 @@
 # Source the .bashrc file for settings/paths/etc...
 . /home/holuser/.bashrc
 # Insert your custom code here:
+echo "DISCOVERY lab-update.sh ran"
 
+# Read vPod_SKU from the vPod.txt file
+# shellcheck source=/dev/null
+. /lmchol/hol/vPod.txt
+
+# Update with additional case values, script calls as needed
+case "$vPod_SKU" in
+	"VCF-91-ALL")
+		echo "Processing Lab Updates for vPod_SKU: $vPod_SKU"
+    # Add your custom script(s)/command calls for VCF-91-ALL here...
+		;;
+	"VCF-91-SS")
+		echo "Processing Lab Updates for vPod_SKU: $vPod_SKU"
+    # Add your custom script(s)/command calls for VCF-91-SS here...
+		;;
+	*)
+		echo "No matching lab update logic for vPod_SKU: $vPod_SKU"
+		;;
+esac
 
 # Example to echo text into file on Console VM. 
 # NOTE: when this script runs, /lmchol is mounted to the "/" of the Console VM

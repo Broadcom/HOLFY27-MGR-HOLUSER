@@ -11,7 +11,7 @@
 # Source the .bashrc file for settings/paths/etc...
 . /home/holuser/.bashrc
 # Insert your custom code here:
-
+echo "ATE lab-update.sh ran"
 
 # Example to echo text into file on Console VM. 
 # NOTE: when this script runs, /lmchol is mounted to the "/" of the Console VM

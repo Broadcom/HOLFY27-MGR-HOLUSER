@@ -3994,24 +3994,24 @@ echo "PROXY_CONFIGURED"
                         f'chage: {_ce}')
 
         # If the lab_sku = HOL-2701, then run vcfa-stabilizer.sh
-        if lsf.lab_sku == 'HOL-2701':
-            lsf.write_output('Running vcfa-stabilizer.sh...')
-            try:
-                proc = subprocess.Popen(
-                    ['/bin/bash', '/home/holuser/hol/Tools/vcfa-stabilizer.sh'],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1
-                )
-                for line in proc.stdout:
-                    lsf.write_output(f'  {line.rstrip()}')
-                proc.wait(timeout=1800)
-            except subprocess.TimeoutExpired:
-                lsf.write_output('  [STDERR] Timeout executing vcfa-stabilizer.sh')
-                proc.kill()
-            except Exception as e:
-                lsf.write_output(f'  [STDERR] Error executing vcfa-stabilizer.sh: {e}')
+        #if lsf.lab_sku == 'HOL-2701':
+        lsf.write_output('Running vcfa-stabilizer.sh...')
+        try:
+            proc = subprocess.Popen(
+                ['/bin/bash', '/home/holuser/hol/Tools/vcfa-stabilizer.sh'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            for line in proc.stdout:
+                lsf.write_output(f'  {line.rstrip()}')
+            proc.wait(timeout=1800)
+        except subprocess.TimeoutExpired:
+            lsf.write_output('  [STDERR] Timeout executing vcfa-stabilizer.sh')
+            proc.kill()
+        except Exception as e:
+            lsf.write_output(f'  [STDERR] Error executing vcfa-stabilizer.sh: {e}')
 
         # vraurls already retrieved above
         
