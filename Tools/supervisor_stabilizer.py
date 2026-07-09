@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.13 - 2026-07-01
+Version 2.14 - 2026-07-09
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
 
+v2.14 Changes:
+- Added LAB_NO_PROXY_PARTS to the list of constants imported from lsfunctions.py.
+  This is used to determine which subnets and domains should bypass the proxy.
+  
 v2.13 Changes:
 - _run_pod_cleanup_for_cluster(): replaced the monolithic run_on_scp()
   service scale-up call (which timed out at 150 s because namespace discovery
@@ -456,6 +460,28 @@ except ImportError:
         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "198.18.0.0/16",
         ".vcf.lab", ".svc", ".cluster.local",
     ]
+
+# Extend NO_PROXY_PARTS with lab-specific domains from /tmp/config.ini.
+# This mirrors the lsfunctions.init() extension so that supervisor_stabilizer,
+# which runs as a subprocess (no lsf.init() call), also bypasses custom lab
+# DNS zones configured via no_proxy_lab_domains in config.ini.
+try:
+    _ss_cfg = configparser.ConfigParser()
+    if os.path.isfile('/tmp/config.ini'):
+        _ss_cfg.read('/tmp/config.ini')
+        if _ss_cfg.has_option('VPOD', 'no_proxy_lab_domains'):
+            for _ss_d in _ss_cfg.get('VPOD', 'no_proxy_lab_domains').splitlines():
+                _ss_d = _ss_d.strip()
+                if not _ss_d or _ss_d.startswith('#') or _ss_d.startswith(';'):
+                    continue
+                if not _ss_d.startswith('.') and '/' not in _ss_d and not _ss_d[0].isdigit():
+                    _ss_d = '.' + _ss_d
+                if _ss_d not in NO_PROXY_PARTS:
+                    NO_PROXY_PARTS.append(_ss_d)
+    del _ss_cfg
+except Exception:
+    pass
+
 NO_PROXY = ",".join(NO_PROXY_PARTS)
 
 GOVC_DOWNLOAD_URL = (
