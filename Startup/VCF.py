@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VCF.py - HOLFY27 Core VCF Startup Module
-# Version 3.6 - 2026-07-01
+# Version 3.7 - 2026-07-10
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation startup sequence
 #
@@ -45,6 +45,19 @@
 #     a cluster-level metric, unaffected by per-host VM registration.
 #   - NFS/VMFS: aggregate ds.vm across all sis entries (all host connections)
 #     and require at least one host to report VMs before checking connectivity.
+# v3.7 Changes:
+# - Fix: _start_vm_on_hosts only started ONE VM when a config entry was a
+#   wildcard/regex pattern (e.g., vcf_Avi-.*) matching MULTIPLE distinct VMs
+#   (e.g., all Avi NSX ALB Service Engines). The prefix-match fallback returned
+#   all matching VMs as candidates, but the power-on loop returned 'started'
+#   after the first success, leaving the remaining VMs powered off.
+#   Fix: after prefix matching, group results by unique VM name. If more than
+#   one distinct name is found, start each VM individually via recursive calls
+#   so all matching VMs are powered on.
+# - Fix: log messages during VM power-on used vm_name (the config pattern) instead
+#   of vm.name (the actual VM name). Now all per-VM log lines show the real VM
+#   name (e.g., "Powering on vcf_Avi-se-lzcam..." instead of "Powering on
+#   vcf_Avi-.*...").
 #
 
 import os
@@ -84,10 +97,16 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
     
     Strategy:
     1. Search ALL host connections for the VM by name (may return multiple)
-    2. If ANY registration reports poweredOn, the VM is running - done
-    3. If none are poweredOn, try to power on each one, starting with VMs in
+    2. If the exact name is not found, fall back to a prefix/regex match.
+       - If exactly one unique VM name is matched (e.g., auto-a -> auto-a-45zgb),
+         continue with the single-VM flow below.
+       - If multiple distinct VM names match (e.g., vcf_Avi-.* matching all Avi
+         Service Engines), start each VM individually via recursive calls and
+         return a combined result. This ensures ALL matching VMs are powered on.
+    3. If ANY registration reports poweredOn, the VM is running - done
+    4. If none are poweredOn, try to power on each one, starting with VMs in
        'connected' state. The first successful power-on wins.
-    4. If a power-on fails with FileNotFound / Device-busy (VMX locked), skip
+    5. If a power-on fails with FileNotFound / Device-busy (VMX locked), skip
        that stale registration and try the next one - the lock means another
        host owns the VM.
     
@@ -110,15 +129,36 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
     for find_attempt in range(1, VM_FIND_MAX_RETRIES + 1):
         candidates = lsf.get_vm_by_name(vm_name)
         if not candidates:
-            # Exact name match failed. Some VMs (e.g., VCF Automation appliances) are
-            # deployed with a random suffix appended to the base name (auto-a -> auto-a-45zgb).
-            # Fall back to a prefix match: find VMs whose name starts with vm_name followed
-            # by a dash or end-of-string. This avoids false positives (e.g., "auto-a" should
-            # NOT match "auto-ab" but SHOULD match "auto-a-45zgb").
+            # Exact name match failed. Two cases handled here:
+            # 1. Single VM with random suffix (auto-a -> auto-a-45zgb): prefix
+            #    match finds one unique name; fall through to the normal power-on.
+            # 2. Wildcard pattern matching multiple distinct VMs (vcf_Avi-.*
+            #    matching vcf_Avi-se-gwsie, vcf_Avi-se-lzcam, ...): start each
+            #    distinct VM individually via recursive calls, then return.
+            # The prefix pattern uses vm_name followed by a dash or end-of-string
+            # to avoid false positives (auto-a should NOT match auto-ab).
             prefix_pattern = f'^{vm_name}(-|$)'
             prefix_matches = lsf.get_vm_match(prefix_pattern)
             if prefix_matches:
-                actual_name = prefix_matches[0].name
+                unique_names = list(dict.fromkeys(m.name for m in prefix_matches))
+                if len(unique_names) > 1:
+                    # Multiple distinct VMs match the wildcard - start each one.
+                    lsf.write_output(f'{fail_label} wildcard "{vm_name}" matched '
+                                     f'{len(unique_names)} distinct VMs: {unique_names}')
+                    any_started = False
+                    all_failed_or_not_found = True
+                    for actual_name in unique_names:
+                        sub_result = _start_vm_on_hosts(lsf, actual_name, fail_label=fail_label)
+                        if sub_result == 'started':
+                            any_started = True
+                            all_failed_or_not_found = False
+                        elif sub_result == 'already_on':
+                            all_failed_or_not_found = False
+                    if all_failed_or_not_found:
+                        return 'failed'
+                    return 'started' if any_started else 'already_on'
+                # Single unique name - one VM with a random suffix.
+                actual_name = unique_names[0]
                 lsf.write_output(f'{fail_label} exact name "{vm_name}" not found, '
                                  f'but prefix match found: "{actual_name}"')
                 candidates = prefix_matches
@@ -140,13 +180,13 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
     # Log all registrations found
     for vm in vms:
         h = vm.runtime.host.name if vm.runtime.host else 'unknown'
-        lsf.write_output(f'  {vm_name}: found on {h} (power={vm.runtime.powerState}, conn={vm.runtime.connectionState})')
+        lsf.write_output(f'  {vm.name}: found on {h} (power={vm.runtime.powerState}, conn={vm.runtime.connectionState})')
     
     # Step 1: Check if ANY registration shows poweredOn
     for vm in vms:
         if vm.runtime.powerState == 'poweredOn':
             host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
-            lsf.write_output(f'{vm_name} already powered on (host: {host_name})')
+            lsf.write_output(f'{vm.name} already powered on (host: {host_name})')
             return 'already_on'
     
     # Step 2: Sort candidates - prefer connected VMs first, then by host name
@@ -165,20 +205,20 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
         max_wait = 30
         waited = 0
         while vm.runtime.connectionState != 'connected' and waited < max_wait:
-            lsf.write_output(f'  {vm_name} on {host_name}: connection state {vm.runtime.connectionState}, waiting...')
+            lsf.write_output(f'  {vm.name} on {host_name}: connection state {vm.runtime.connectionState}, waiting...')
             time.sleep(5)
             waited += 5
         
         if vm.runtime.connectionState != 'connected':
-            lsf.write_output(f'  {vm_name} on {host_name}: not connected after {max_wait}s, skipping')
+            lsf.write_output(f'  {vm.name} on {host_name}: not connected after {max_wait}s, skipping')
             continue
         
-        lsf.write_output(f'Powering on {vm_name} (host: {host_name})...')
+        lsf.write_output(f'Powering on {vm.name} (host: {host_name})...')
         
         try:
             task = vm.PowerOnVM_Task()
             WaitForTask(task)
-            lsf.write_output(f'Powered on {vm_name} (host: {host_name})')
+            lsf.write_output(f'Powered on {vm.name} (host: {host_name})')
             return 'started'
         except Exception as e:
             error_str = str(e)
@@ -192,10 +232,10 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
                         'Unable to load configuration file' in error_str)
             
             if is_stale:
-                lsf.write_output(f'  {vm_name} on {host_name}: VMX locked (stale registration), trying next host...')
+                lsf.write_output(f'  {vm.name} on {host_name}: VMX locked (stale registration), trying next host...')
                 continue
             else:
-                lsf.write_output(f'FAILED to power on {vm_name} on {host_name}: {e}')
+                lsf.write_output(f'FAILED to power on {vm.name} on {host_name}: {e}')
                 # Non-lock error is a real failure - still try remaining candidates
                 continue
     
