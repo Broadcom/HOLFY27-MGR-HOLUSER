@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VVF.py - HOLFY27 Core VVF Startup Module
-# Version 4.0 - 2026-06-01
+# Version 4.1 - 2026-07-10
 # Author - Burke Azbill and HOL Core Team
 # VMware Validated Foundation startup sequence
 #
@@ -16,6 +16,16 @@
 # - Host connection failure now calls lsf.labfail() immediately (matches VCF.py
 #   v3.4 behavior: missing ESXi hosts = lab fail, not silent continue).
 # - Dashboard skip_group improved: VCF and VCFfinal are both skipped for VVF labs.
+# v4.1 Changes (2026-07-10):
+# - Fix: _start_vm_on_hosts only started ONE VM when a config entry was a
+#   wildcard/regex pattern matching MULTIPLE distinct VMs. The prefix-match
+#   fallback returned all matching VMs as candidates, but the power-on loop
+#   returned 'started' after the first success, leaving the rest powered off.
+#   Fix: after prefix matching, group results by unique VM name. If more than
+#   one distinct name is found, start each VM individually via recursive calls.
+#   (Ported from VCF.py v3.7.)
+# - Fix: per-VM log lines used vm_name (the config pattern) instead of vm.name
+#   (the actual VM name). All log lines now show the real VM name.
 
 import os
 import sys
@@ -47,10 +57,15 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
 
     Identical strategy to VCF.py _start_vm_on_hosts:
     1. Search ALL host connections for the VM (retries for slow registration)
-    2. If ANY registration reports poweredOn, the VM is running — done
-    3. Sort candidates (connected first), try each until power-on succeeds
-    4. FileNotFound/Device-busy = stale registration on wrong host — skip
-    5. Re-check all registrations if all attempts exhausted
+    2. If the exact name is not found, fall back to a prefix/regex match.
+       - One unique name matched (e.g., license-a -> license-a-45zgb): continue
+         with the single-VM flow below.
+       - Multiple distinct names matched (wildcard pattern): start each VM
+         individually via recursive calls and return a combined result.
+    3. If ANY registration reports poweredOn, the VM is running — done
+    4. Sort candidates (connected first), try each until power-on succeeds
+    5. FileNotFound/Device-busy = stale registration on wrong host — skip
+    6. Re-check all registrations if all attempts exhausted
 
     :param lsf: lsfunctions module
     :param vm_name: VM name to find and power on
@@ -69,7 +84,25 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
             prefix_pattern = f'^{vm_name}(-|$)'
             prefix_matches = lsf.get_vm_match(prefix_pattern)
             if prefix_matches:
-                actual_name = prefix_matches[0].name
+                unique_names = list(dict.fromkeys(m.name for m in prefix_matches))
+                if len(unique_names) > 1:
+                    # Multiple distinct VMs match the wildcard - start each one.
+                    lsf.write_output(f'{fail_label} wildcard "{vm_name}" matched '
+                                     f'{len(unique_names)} distinct VMs: {unique_names}')
+                    any_started = False
+                    all_failed_or_not_found = True
+                    for actual_name in unique_names:
+                        sub_result = _start_vm_on_hosts(lsf, actual_name, fail_label=fail_label)
+                        if sub_result == 'started':
+                            any_started = True
+                            all_failed_or_not_found = False
+                        elif sub_result == 'already_on':
+                            all_failed_or_not_found = False
+                    if all_failed_or_not_found:
+                        return 'failed'
+                    return 'started' if any_started else 'already_on'
+                # Single unique name - one VM with a random suffix.
+                actual_name = unique_names[0]
                 lsf.write_output(f'{fail_label} exact name "{vm_name}" not found, '
                                  f'prefix match found: "{actual_name}"')
                 candidates = prefix_matches
@@ -90,13 +123,13 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
 
     for vm in vms:
         h = vm.runtime.host.name if vm.runtime.host else 'unknown'
-        lsf.write_output(f'  {vm_name}: found on {h} '
+        lsf.write_output(f'  {vm.name}: found on {h} '
                          f'(power={vm.runtime.powerState}, conn={vm.runtime.connectionState})')
 
     for vm in vms:
         if vm.runtime.powerState == 'poweredOn':
             host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
-            lsf.write_output(f'{vm_name} already powered on (host: {host_name})')
+            lsf.write_output(f'{vm.name} already powered on (host: {host_name})')
             return 'already_on'
 
     candidates = sorted(vms, key=lambda v: (
@@ -111,21 +144,21 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
         max_wait = 30
         waited = 0
         while vm.runtime.connectionState != 'connected' and waited < max_wait:
-            lsf.write_output(f'  {vm_name} on {host_name}: '
+            lsf.write_output(f'  {vm.name} on {host_name}: '
                              f'state={vm.runtime.connectionState}, waiting...')
             time.sleep(5)
             waited += 5
 
         if vm.runtime.connectionState != 'connected':
-            lsf.write_output(f'  {vm_name} on {host_name}: not connected after {max_wait}s, skipping')
+            lsf.write_output(f'  {vm.name} on {host_name}: not connected after {max_wait}s, skipping')
             continue
 
-        lsf.write_output(f'Powering on {vm_name} (host: {host_name})...')
+        lsf.write_output(f'Powering on {vm.name} (host: {host_name})...')
 
         try:
             task = vm.PowerOnVM_Task()
             WaitForTask(task)
-            lsf.write_output(f'Powered on {vm_name} (host: {host_name})')
+            lsf.write_output(f'Powered on {vm.name} (host: {host_name})')
             return 'started'
         except Exception as e:
             error_str = str(e)
@@ -134,10 +167,10 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
                         'Device or resource busy' in error_str or
                         'Unable to load configuration file' in error_str)
             if is_stale:
-                lsf.write_output(f'  {vm_name} on {host_name}: VMX locked (stale), trying next...')
+                lsf.write_output(f'  {vm.name} on {host_name}: VMX locked (stale), trying next...')
                 continue
             else:
-                lsf.write_output(f'FAILED to power on {vm_name} on {host_name}: {e}')
+                lsf.write_output(f'FAILED to power on {vm.name} on {host_name}: {e}')
                 continue
 
     lsf.write_output(f'  {vm_name}: all attempts failed, re-checking state...')

@@ -1,5 +1,5 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.21 - 2026-07-02
+# Version 3.22 - 2026-07-09
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
@@ -1640,6 +1640,7 @@ def init(router=True, **kwargs):
     """
     global LMC, mc, mcdesktop, desktop_config, logfiles
     global config, lab_sku, labtype, vpod_repo, max_minutes_before_fail, _password, password
+    global LAB_NO_PROXY_PARTS
     
     # Wait for LMC (Linux Main Console) mount
     while True:
@@ -1667,7 +1668,26 @@ def init(router=True, **kwargs):
         
         if config.has_option('VPOD', 'maxminutes'):
             max_minutes_before_fail = config.getint('VPOD', 'maxminutes')
-    
+
+        # Extend LAB_NO_PROXY_PARTS with lab-specific domains from config.
+        # Domain-like entries that lack a leading dot are normalized to dot-prefix
+        # form (.ans.lab) so that all subdomains are also bypassed, matching the
+        # convention used by the built-in .vcf.lab entry.
+        _extra_domains = get_config_list('VPOD', 'no_proxy_lab_domains')
+        if _extra_domains:
+            _added = []
+            for _d in _extra_domains:
+                if _d and not _d.startswith('.') and '/' not in _d and not _d[0].isdigit():
+                    _d = '.' + _d
+                if _d and _d not in LAB_NO_PROXY_PARTS:
+                    LAB_NO_PROXY_PARTS.append(_d)
+                    _added.append(_d)
+            if _added:
+                write_output(
+                    f'LAB_NO_PROXY_PARTS: added {len(_added)} lab-specific domain(s): '
+                    + ', '.join(_added)
+                )
+
     # Calculate vpod_repo path using labtype-aware function
     if lab_sku != bad_sku:
         _, vpod_repo, _ = get_repo_info(lab_sku, labtype)
