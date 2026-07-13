@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.26 - 2026-07-01
+# Version 6.3.27 - 2026-07-13
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.27 Changes:
+# - Task 2e: Added pre-flight check/remediation for VSP control-plane node flapping
+#   (etcd gRPC stall + Kyverno failurePolicy: Fail blocking node-lease renewal —
+#   see vcf-troubleshooting skill references/supervisor-k8s.md#3). Persistently sets
+#   --node-monitor-grace-period=90s on kube-controller-manager (idempotent), and only
+#   bounces etcd/kube-apiserver when a node is currently NotReady or a recent
+#   NodeNotReady event is found. Root cause (undersized 4 vCPU/10GB control-plane VM)
+#   is logged as a WARNING recommending manual vCenter resize; not resized automatically.
 #
 # v6.3.26 Changes:
 # - Pre-flight optimization pass: on a warm re-run against an already-Ready lab,
@@ -1781,6 +1790,116 @@ def main(lsf=None, standalone=False, dry_run=False):
                 except Exception as _pf_exc:
                     lsf.write_output(
                         f'  WARNING: VSP pre-flight check failed (non-fatal): {_pf_exc}')
+
+                # ---- Pre-flight: K8s control-plane node flapping (etcd gRPC stall) ----
+                # etcd gRPC connection drops on the VSP control-plane VM stall the API
+                # server; Kyverno's kyverno-resource-validating-webhook-cfg (failurePolicy:
+                # Fail, 10s timeout) then blocks all API writes, so kubelet cannot renew
+                # its node lease within the default 40s node-monitor-grace-period. The
+                # node flips NotReady, evicting pods across every VSP-hosted VCF component
+                # (fleet-lcm, vidb, depot-service, etc.) and producing the cascading pod
+                # restarts / HTTP 500s seen in the VCF Operations UI (Lifecycle "not
+                # available", Software Depot download errors). The underlying root cause
+                # is the control-plane VM being undersized (4 vCPU/10GB) — this pre-flight
+                # applies the documented mitigation (grace-period bump, and clearing stuck
+                # etcd/apiserver state only when flapping is actively observed) rather than
+                # resizing the VM, which requires a manual vCenter reconfigure/reboot.
+                lsf.write_output('  Pre-flight: checking for K8s control-plane node-flapping conditions...')
+                try:
+                    _nf_kcm_manifest = '/etc/kubernetes/manifests/kube-controller-manager.yaml'
+                    _nf_grace_check = vsp_kubectl(
+                        f'grep -q node-monitor-grace-period {_nf_kcm_manifest} && echo PRESENT || echo ABSENT'
+                    )
+                    _nf_grace_state = (getattr(_nf_grace_check, 'stdout', '') or '').strip()
+                    if 'ABSENT' in _nf_grace_state:
+                        vsp_kubectl(
+                            'sed -i "/- --use-service-account-credentials=true/'
+                            'a\\    - --node-monitor-grace-period=90s" '
+                            f'{_nf_kcm_manifest}'
+                        )
+                        lsf.write_output(
+                            '  Pre-flight: patched kube-controller-manager with'
+                            ' --node-monitor-grace-period=90s (was using the 40s default)')
+                    else:
+                        lsf.write_output(
+                            '  Pre-flight: node-monitor-grace-period already configured — OK')
+
+                    # Only bounce etcd/apiserver when there is live evidence of flapping —
+                    # a currently-NotReady node, or a recent NodeNotReady event — instead of
+                    # unconditionally restarting the control plane on every boot.
+                    import json as _nf_json
+                    _nf_nodes_raw = (getattr(vsp_kubectl(
+                        'kubectl get nodes -o json 2>/dev/null'
+                    ), 'stdout', '') or '')
+                    _nf_nodes_js = _nf_nodes_raw.find('{')
+                    _nf_notready = []
+                    if _nf_nodes_js >= 0:
+                        try:
+                            _nf_nodes = _nf_json.loads(_nf_nodes_raw[_nf_nodes_js:])
+                            for _nf_item in _nf_nodes.get('items', []):
+                                _nf_name = _nf_item.get('metadata', {}).get('name', '')
+                                for _nf_cond in _nf_item.get('status', {}).get('conditions', []):
+                                    if _nf_cond.get('type') == 'Ready' and _nf_cond.get('status') != 'True':
+                                        _nf_notready.append(_nf_name)
+                        except Exception:
+                            pass
+
+                    _nf_flap_out = (getattr(vsp_kubectl(
+                        'kubectl get events -A --field-selector reason=NodeNotReady'
+                        ' -o json 2>/dev/null'
+                    ), 'stdout', '') or '')
+                    _nf_recent_flap = False
+                    _nf_flap_js = _nf_flap_out.find('{')
+                    if _nf_flap_js >= 0:
+                        try:
+                            _nf_events = _nf_json.loads(_nf_flap_out[_nf_flap_js:])
+                            _nf_recent_flap = len(_nf_events.get('items', [])) > 0
+                        except Exception:
+                            _nf_recent_flap = False
+
+                    if _nf_notready:
+                        lsf.write_output(
+                            f'  Pre-flight: node(s) currently NotReady: {", ".join(_nf_notready)}'
+                            f' — restarting etcd/kube-apiserver to clear stuck gRPC state')
+                    elif _nf_recent_flap:
+                        lsf.write_output(
+                            '  Pre-flight: recent NodeNotReady event(s) found'
+                            ' — restarting etcd/kube-apiserver to clear stuck gRPC state')
+
+                    if _nf_notready or _nf_recent_flap:
+                        _nf_cp_out = (getattr(vsp_kubectl(
+                            'kubectl get nodes -l node-role.kubernetes.io/control-plane'
+                            ' --no-headers -o custom-columns=:metadata.name 2>/dev/null'
+                        ), 'stdout', '') or '')
+                        _nf_cp_nodes = [l.strip() for l in _nf_cp_out.splitlines() if l.strip()]
+                        for _nf_cp in _nf_cp_nodes:
+                            _nf_etcd_ids = (getattr(vsp_kubectl(
+                                f'crictl pods --name etcd-{_nf_cp} -s Ready -q 2>/dev/null'
+                            ), 'stdout', '') or '').strip().splitlines()
+                            if _nf_etcd_ids:
+                                vsp_kubectl(f'crictl stopp {_nf_etcd_ids[0]} 2>/dev/null')
+                                lsf.write_output(f'  Pre-flight: restarted etcd on {_nf_cp}')
+                        import time as _nf_time
+                        _nf_time.sleep(15)
+                        for _nf_cp in _nf_cp_nodes:
+                            _nf_api_ids = (getattr(vsp_kubectl(
+                                f'crictl pods --name kube-apiserver-{_nf_cp} -s Ready -q 2>/dev/null'
+                            ), 'stdout', '') or '').strip().splitlines()
+                            if _nf_api_ids:
+                                vsp_kubectl(f'crictl stopp {_nf_api_ids[0]} 2>/dev/null')
+                                lsf.write_output(f'  Pre-flight: restarted kube-apiserver on {_nf_cp}')
+                        _nf_time.sleep(20)
+                        lsf.write_output(
+                            '  Pre-flight: control-plane restart complete — NOTE: control-plane'
+                            ' VM is undersized (4 vCPU/9.7GB); increase to 8 vCPU/16GB via vCenter'
+                            ' to permanently resolve recurring flapping')
+                    else:
+                        lsf.write_output(
+                            '  Pre-flight: no active node-flapping detected'
+                            ' — etcd/apiserver restart skipped')
+                except Exception as _nf_exc:
+                    lsf.write_output(
+                        f'  WARNING: node-flapping pre-flight check failed (non-fatal): {_nf_exc}')
 
                 # ---- Apply PROXY and NO_PROXY to VSP cluster nodes (HOL only) ----
                 # Inject proxy configuration to avoid ImagePullBackOff for opsnet/opslogs.
