@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VCFA Complete Stabilization Script v2.8
-# Version 2.8 - 2026-06-26
+# VCFA Complete Stabilization Script v2.9
+# Version 2.9 - 2026-07-10
 # Author - HOL Core Team
 #
 # Default-run philosophy (v2.6+): one run of the script with no flags should leave the VCFA in a
@@ -13,12 +13,14 @@
 #
 # What's persistent (applied once, survives reboot, idempotent on re-runs):
 #   - kube-vip plndr-cp-lock lease tuning (60s/45s/10s, preserve_on_leadership_loss=true)
+#   - vmsp-platform kube-vip DaemonSet lease/probe tuning (NEW v2.9, see below)
 #   - kube-apiserver / kube-controller-manager / kube-scheduler probe timeouts
 #     (period=10 timeout=30 failureThreshold=8)
 #   - etcd defrag (only when slack >= 30%)
 # What's a runtime backstop (re-applied every run, harmless if already correct):
 #   - eth0 VIP pinning for .69, .70, .72 (kube-vip will reclaim, this is just a fallback)
 #   - ccs-k3s service-tls cert freshness check (NEW v2.8)
+#   - vcfa-vmsp-kube-vip-keeper.sh drift watcher (NEW v2.9, see below)
 # What's conditional (only applied when we detect actual trouble):
 #   - kyverno --forceFailurePolicyIgnore=true + webhook Fail->Ignore. Triggers when load1>30, OR
 #     kyverno pods not Ready, OR kube-controller-manager restarts>5. Reason: vmsp-operator owns
@@ -26,6 +28,30 @@
 #     unconditionally just churns rollouts. Set FORCE_KYVERNO_FIX=1 to bypass the heuristic.
 #
 # See VCFA_Stabilizer_Incident_Apr2026.md for the gateway/EnvoyProxy guidance and HTTP 503 recovery.
+#
+# v2.9 changelog (2026-07-10):
+#  * NEW Phase 1.5 step "6/6": harden the vmsp-platform/kube-vip DaemonSet the same way the
+#    kube-system control-plane kube-vip was already hardened. Root cause found on the
+#    `troubleshooting` lab: this DaemonSet (Services election, not control-plane) manages the
+#    vmsp-gateway (.69) and vcfa-gateway-configuration (.70 = auto-a) VIPs, but was still at
+#    chart defaults (vip_leaseduration=15 renewdeadline=10 retryperiod=2 preserve=false,
+#    livenessProbe timeoutSeconds=5 failureThreshold=3). Under nested-lab CPU contention its
+#    healthz check occasionally times out ("context deadline exceeded"), kubelet kills the pod,
+#    and on every restart kube-vip drops leader election and deletes both VIPs from eth0 for
+#    ~15-45s before re-electing and re-adding them -- this is the exact "VCFA refused, refresh
+#    fixes it for a minute" symptom users reported.
+#    Fix: (a) patch HelmRelease kube-vip -n vmsp-platform spec.values.env to the same hardened
+#    lease values already used for the CP instance (durable, Flux-reconciled channel); (b)
+#    directly patch the live DaemonSet env + livenessProbe now so the fix is effective
+#    immediately instead of waiting for the next 10m Flux reconcile; (c) install
+#    vcfa-vmsp-kube-vip-keeper.{sh,service,timer} (same 60s drift-watcher pattern as the existing
+#    vcfa-eg-mem-keeper.sh) because this DaemonSet is Flux/vmsp-operator-managed with
+#    driftDetection:enabled and can revert a bare kubectl patch on reconcile.
+#  * Fixed the idempotency early-exit in main(): it used to skip Phase 1.5 entirely if EITHER
+#    vcfa-eg-mem-keeper.sh OR the CP kube-vip lease=60 was already present. That's wrong once a
+#    lab has one persistent fix from an earlier version but not this one -- it would silently
+#    never apply the new vmsp-platform kube-vip hardening. Now requires all three persistent
+#    markers before concluding "already applied".
 #
 # v2.8 changelog (2026-06-26):
 #  * NEW check_and_fix_ccs_k3s_cert(): detects and remediates stale service-tls certs across ALL
@@ -960,7 +986,7 @@ REMOTE
 #   * After this fix, you should "ip addr replace" the manual VIPs to non-deprecated so they don't
 #     get aged out by the kernel before kube-vip fully owns them again.
 fix_overload_recovery() {
-    log "Control-plane preflight (etcd defrag + kube-vip lease + control-plane probes + kyverno failurePolicy)..."
+    log "Control-plane preflight (etcd defrag + kube-vip lease [CP + vmsp-platform] + control-plane probes + kyverno failurePolicy)..."
     local cp_vip="${VCFA_CP_VIP:-10.1.1.72}"
     local vmsp_gw_vip="${VMSP_GW_VIP:-10.1.1.69}"
     local vcfa_gw_vip="${VCFA_GW_VIP:-10.1.1.70}"
@@ -970,9 +996,10 @@ fix_overload_recovery() {
     local etcd_slack_pct="${ETCD_DEFRAG_SLACK_PCT:-30}"
     # Build the remote script body using a quoted heredoc (no $/() escaping needed). We inject our
     # local variable values as bash assignments at the top of the body.
+    local vmsp_ns="${VMSP_NAMESPACE}"
     local fix_prefix
-    fix_prefix=$(printf 'set -u\nK="kubectl --kubeconfig=/etc/kubernetes/admin.conf --server=%s"\nCP_VIP="%s"\nVMSP_GW_VIP="%s"\nVCFA_GW_VIP="%s"\nETCD_SLACK_PCT="%s"\nKEEP_KYVERNO_FAIL="%s"\n' \
-        "${API_SERVER}" "${cp_vip}" "${vmsp_gw_vip}" "${vcfa_gw_vip}" "${etcd_slack_pct}" "${keep_fail}")
+    fix_prefix=$(printf 'set -u\nK="kubectl --kubeconfig=/etc/kubernetes/admin.conf --server=%s"\nCP_VIP="%s"\nVMSP_GW_VIP="%s"\nVCFA_GW_VIP="%s"\nETCD_SLACK_PCT="%s"\nKEEP_KYVERNO_FAIL="%s"\nVMSP_NS="%s"\n' \
+        "${API_SERVER}" "${cp_vip}" "${vmsp_gw_vip}" "${vcfa_gw_vip}" "${etcd_slack_pct}" "${keep_fail}" "${vmsp_ns}")
     local fix_body
     fix_body=$(cat <<'REMOTE'
 
@@ -980,7 +1007,7 @@ echo "=== preflight: starting load average:"
 uptime
 echo
 
-echo "=== 1/5: ensure CP VIP ${CP_VIP}/32 + gateway VIPs are on eth0 (non-deprecated) ==="
+echo "=== 1/6: ensure CP VIP ${CP_VIP}/32 + gateway VIPs are on eth0 (non-deprecated) ==="
 # The control plane VIP must be reachable for in-cluster controllers (kubernetes.default).
 # We also keep the gateway VIPs (.69, .70) pinned because kube-vip drops them during a panic too.
 # 'ip addr replace ... preferred_lft forever' is idempotent and refreshes a deprecated address.
@@ -995,7 +1022,7 @@ for v in "${CP_VIP}" "${VMSP_GW_VIP}" "${VCFA_GW_VIP}"; do
 done
 
 echo
-echo "=== 2/5: etcd defrag (only if slack >= ${ETCD_SLACK_PCT}%) ==="
+echo "=== 2/6: etcd defrag (only if slack >= ${ETCD_SLACK_PCT}%) ==="
 ETCDCTL='etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/peer.crt --key=/etc/kubernetes/pki/etcd/peer.key --endpoints=https://127.0.0.1:2379'
 # Pull current slack% from etcdctl endpoint status JSON.
 # If the apiserver/etcd is unreachable, skip silently.
@@ -1021,7 +1048,7 @@ else
 fi
 
 echo
-echo "=== 3/5: harden kube-vip lease/renew/retry/preserve (static pod manifest) ==="
+echo "=== 3/6: harden kube-vip lease/renew/retry/preserve (static pod manifest) ==="
 M=/etc/kubernetes/manifests/kube-vip.yaml
 if [[ -f "$M" ]]; then
     KV_NEEDS=$(python3 - <<'PY'
@@ -1073,7 +1100,7 @@ else
 fi
 
 echo
-echo "=== 4/5: probe timeouts on kube-apiserver/kube-controller-manager/kube-scheduler ==="
+echo "=== 4/6: probe timeouts on kube-apiserver/kube-controller-manager/kube-scheduler ==="
 for kind in kube-apiserver kube-controller-manager kube-scheduler; do
     M=/etc/kubernetes/manifests/${kind}.yaml
     [[ -f "$M" ]] || { echo "  (${kind} manifest not found, skipping)"; continue; }
@@ -1123,7 +1150,7 @@ PY
 done
 
 echo
-echo "=== 5/5: kyverno failurePolicy (only if needed: trouble detected or STABILIZER_FORCE_KYVERNO_FIX=1) ==="
+echo "=== 5/6: kyverno failurePolicy (only if needed: trouble detected or STABILIZER_FORCE_KYVERNO_FIX=1) ==="
 # Why this is conditional, not unconditional:
 # vmsp-operator owns the kyverno HelmRelease via the 'vsp' Component CR. Helm-controller reverts
 # our --forceFailurePolicyIgnore=true patch on every helm upgrade reconcile (every ~10m) because
@@ -1254,6 +1281,150 @@ print(json.dumps(d) if changed else '__nochange__')")
                 || echo "  $vwc: WARN replace failed"
         fi
     done
+fi
+
+echo
+echo "=== 6/6: harden vmsp-platform kube-vip DaemonSet (gateway VIP flap fix) ==="
+# The vmsp-platform kube-vip DaemonSet (Services election: vmsp-gateway .69 + vcfa-gateway-configuration
+# .70 = auto-a) is a SEPARATE instance from the kube-system control-plane kube-vip hardened in step 3/6
+# above. It ships with chart defaults (lease=15 renew=10 retry=2 preserve=false, healthz timeoutSeconds=5
+# failureThreshold=3) that are too tight for a nested lab: a brief CPU-scheduling delay makes the healthz
+# probe miss its deadline, kubelet kills the pod, and on every restart kube-vip drops leader election and
+# deletes both gateway VIPs from eth0 for ~15-45s before re-electing -- this is the "VCFA refused, a
+# refresh fixes it" symptom. This DaemonSet is Flux-managed (HelmRelease kube-vip -n vmsp-platform,
+# driftDetection:enabled, created by vmsp-operator) so a bare kubectl patch can be reverted on the next
+# reconcile -- same class of problem as the envoy-gateway memory limit fixed in Phase 3.5, so this reuses
+# that exact drift-watcher pattern (vcfa-eg-mem-keeper.sh -> vcfa-vmsp-kube-vip-keeper.sh).
+if $K -n "${VMSP_NS}" get daemonset kube-vip >/dev/null 2>&1; then
+    # 6a. Durable channel: patch the Flux HelmRelease values so the next reconcile (and any future
+    # reinstall) lands the hardened lease settings instead of the chart defaults.
+    if $K -n "${VMSP_NS}" get helmrelease kube-vip >/dev/null 2>&1; then
+        HR_CUR=$($K -n "${VMSP_NS}" get helmrelease kube-vip -o jsonpath='{.spec.values.env.vip_leaseduration},{.spec.values.env.vip_renewdeadline},{.spec.values.env.vip_retryperiod},{.spec.values.env.vip_preserve_on_leadership_loss}' 2>/dev/null)
+        if [[ "$HR_CUR" == "60,45,10,true" ]]; then
+            echo "  HelmRelease ${VMSP_NS}/kube-vip values already hardened (no-op)"
+        else
+            $K -n "${VMSP_NS}" patch helmrelease kube-vip --type=merge -p '{"spec":{"values":{"env":{"vip_leaseduration":"60","vip_renewdeadline":"45","vip_retryperiod":"10","vip_preserve_on_leadership_loss":"true"}}}}' >/dev/null 2>&1 \
+                && echo "  HelmRelease ${VMSP_NS}/kube-vip values patched (was ${HR_CUR:-<unset>})" \
+                || echo "  WARN: HelmRelease ${VMSP_NS}/kube-vip patch failed"
+        fi
+    else
+        echo "  (no HelmRelease ${VMSP_NS}/kube-vip found, skipping durable-channel patch)"
+    fi
+
+    # 6b. Immediate effect: rewrite the live DaemonSet's env array (preserving every other var) and
+    # relax its liveness probe in one merge patch, but only if either has actually drifted.
+    NEW_SPEC=$($K -n "${VMSP_NS}" get daemonset kube-vip -o json 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+c = d['spec']['template']['spec']['containers'][0]
+env = c.get('env', []) or []
+want_env = {'vip_leaseduration':'60','vip_renewdeadline':'45','vip_retryperiod':'10','vip_preserve_on_leadership_loss':'true'}
+changed = False
+seen = set()
+for e in env:
+    n = e.get('name')
+    if n in want_env:
+        seen.add(n)
+        if e.get('value') != want_env[n]:
+            e['value'] = want_env[n]; changed = True
+for n, v in want_env.items():
+    if n not in seen:
+        env.append({'name': n, 'value': v}); changed = True
+lp = c.get('livenessProbe') or {}
+if str(lp.get('timeoutSeconds')) != '10':
+    lp['timeoutSeconds'] = 10; changed = True
+if str(lp.get('failureThreshold')) != '5':
+    lp['failureThreshold'] = 5; changed = True
+if changed:
+    print(json.dumps([
+        {'op':'replace','path':'/spec/template/spec/containers/0/env','value':env},
+        {'op':'replace','path':'/spec/template/spec/containers/0/livenessProbe','value':lp},
+    ]))
+")
+    if [[ -n "$NEW_SPEC" ]]; then
+        $K -n "${VMSP_NS}" patch daemonset kube-vip --type=json -p "$NEW_SPEC" >/dev/null 2>&1 \
+            && echo "  daemonset/kube-vip -n ${VMSP_NS} env + livenessProbe hardened now (lease=60 renew=45 retry=10 preserve=true, probe timeout=10s threshold=5)" \
+            || echo "  WARN: daemonset/kube-vip -n ${VMSP_NS} patch failed"
+    else
+        echo "  daemonset/kube-vip -n ${VMSP_NS} env + livenessProbe already hardened (no-op)"
+    fi
+
+    # 6c. Durable drift-watcher: vmsp-operator/Flux can revert 6b on its next reconcile (driftDetection
+    # is enabled on this HelmRelease). Re-assert every 60s, same pattern as vcfa-eg-mem-keeper.sh.
+    mkdir -p /usr/local/bin /etc/systemd/system
+    cat > /usr/local/bin/vcfa-vmsp-kube-vip-keeper.sh <<'KVKEEPER'
+#!/usr/bin/env bash
+set -u
+K="kubectl --kubeconfig=/etc/kubernetes/admin.conf"
+NS="vmsp-platform"
+$K -n "$NS" get daemonset kube-vip >/dev/null 2>&1 || exit 0
+NEW_SPEC=$($K -n "$NS" get daemonset kube-vip -o json 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+c = d['spec']['template']['spec']['containers'][0]
+env = c.get('env', []) or []
+want_env = {'vip_leaseduration':'60','vip_renewdeadline':'45','vip_retryperiod':'10','vip_preserve_on_leadership_loss':'true'}
+changed = False
+seen = set()
+for e in env:
+    n = e.get('name')
+    if n in want_env:
+        seen.add(n)
+        if e.get('value') != want_env[n]:
+            e['value'] = want_env[n]; changed = True
+for n, v in want_env.items():
+    if n not in seen:
+        env.append({'name': n, 'value': v}); changed = True
+lp = c.get('livenessProbe') or {}
+if str(lp.get('timeoutSeconds')) != '10':
+    lp['timeoutSeconds'] = 10; changed = True
+if str(lp.get('failureThreshold')) != '5':
+    lp['failureThreshold'] = 5; changed = True
+if changed:
+    print(json.dumps([
+        {'op':'replace','path':'/spec/template/spec/containers/0/env','value':env},
+        {'op':'replace','path':'/spec/template/spec/containers/0/livenessProbe','value':lp},
+    ]))
+")
+if [[ -n "$NEW_SPEC" ]]; then
+    $K -n "$NS" patch daemonset kube-vip --type=json -p "$NEW_SPEC" >/dev/null 2>&1 \
+        && echo "$(date -Is) drift corrected: kube-vip env/probe re-hardened"
+fi
+KVKEEPER
+    chmod +x /usr/local/bin/vcfa-vmsp-kube-vip-keeper.sh
+
+    cat > /etc/systemd/system/vcfa-vmsp-kube-vip-keeper.service <<'KVSVC'
+[Unit]
+Description=VCFA: keep vmsp-platform kube-vip DaemonSet lease/probe hardened (works around vmsp-operator/HR drift)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vcfa-vmsp-kube-vip-keeper.sh
+StandardOutput=journal
+StandardError=journal
+KVSVC
+
+    cat > /etc/systemd/system/vcfa-vmsp-kube-vip-keeper.timer <<'KVTIMER'
+[Unit]
+Description=VCFA: run vcfa-vmsp-kube-vip-keeper every 60s (drift watcher)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=vcfa-vmsp-kube-vip-keeper.service
+
+[Install]
+WantedBy=timers.target
+KVTIMER
+
+    systemctl daemon-reload
+    systemctl enable --now vcfa-vmsp-kube-vip-keeper.timer >/dev/null 2>&1 || true
+    echo "  vcfa-vmsp-kube-vip-keeper.timer enabled (60s drift watcher)"
+else
+    echo "  (no daemonset/kube-vip found in ${VMSP_NS}, skipping vmsp-platform kube-vip hardening)"
 fi
 
 echo
@@ -1659,10 +1830,15 @@ main() {
     # whether the rest of the stabilizer has already been applied.
     check_and_fix_ccs_k3s_cert
 
-    # Check if the stabilizer has already been applied by looking for persistent settings it creates:
-    # 1. The durable systemd watcher script (from Phase 3.5)
-    # 2. The kube-vip lease duration tuning (from Phase 1.5)
-    local check_cmd="test -f /usr/local/bin/vcfa-eg-mem-keeper.sh || grep -A 1 'name: vip_leaseduration' /etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null | grep -q 'value: \"60\"'"
+    # Check if the stabilizer has already been applied by looking for persistent settings it creates.
+    # v2.9: this used to be an OR across the first two markers, which meant a lab that already had
+    # marker 1 from an earlier stabilizer version would silently skip Phase 1.5 forever and never pick
+    # up a newer persistent fix (exactly what happened to the vmsp-platform kube-vip hardening below on
+    # labs that already had the envoy-gateway keeper installed). Require ALL THREE before short-circuiting:
+    # 1. The durable envoy-gateway memory watcher script (from Phase 3.5)
+    # 2. The kube-system control-plane kube-vip lease duration tuning (from Phase 1.5)
+    # 3. The vmsp-platform kube-vip DaemonSet watcher script (NEW v2.9, from Phase 1.5 step 6/6)
+    local check_cmd="test -f /usr/local/bin/vcfa-eg-mem-keeper.sh && (grep -A 1 'name: vip_leaseduration' /etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null | grep -q 'value: \"60\"') && test -f /usr/local/bin/vcfa-vmsp-kube-vip-keeper.sh"
     if vcfa_ssh_nosudo "$check_cmd" >/dev/null 2>&1; then
         echo "VCFA Stabilizer already applied..."
         exit 0
@@ -1680,6 +1856,7 @@ main() {
     #   - harden kube-vip plndr-cp-lock lease (60s/45s/10s, preserve_on_leadership_loss=true)
     #   - bump kube-apiserver/kcm/scheduler probe timeouts (period=10 timeout=30 failureThreshold=8)
     #   - suspend kyverno HelmRelease, set --forceFailurePolicyIgnore=true, flip resource webhook
+    #   - harden vmsp-platform kube-vip DaemonSet lease/probe + install its drift watcher (NEW v2.9)
     # Each step compares current vs desired and is a no-op when already correct, so this is safe to
     # run on every invocation (default-run, --full, --preflight).
     # Set STABILIZER_SKIP_OVERLOAD_PROPHYLAXIS=1 to skip this phase (legacy v2.5- behavior).
@@ -1744,7 +1921,7 @@ main() {
 # Handle script arguments
 case "${1:-}" in
     --help|-h)
-        echo "VCFA Complete Stabilization Script v2.6"
+        echo "VCFA Complete Stabilization Script v2.9"
         echo "See: ${SCRIPT_DIR}/VCFA_Stabilizer_Incident_Apr2026.md"
         echo ""
         echo "Usage: $0 [options]"
@@ -1762,6 +1939,10 @@ case "${1:-}" in
         echo "  - kyverno --forceFailurePolicyIgnore=true (CONDITIONAL: only applied when trouble is"
         echo "    detected -- load1>30, kyverno pods not Ready, or kcm restarts>5 -- because"
         echo "    vmsp-operator reverts the patch on every helm reconcile)"
+        echo "  - NEW v2.9: harden vmsp-platform kube-vip DaemonSet (Services LB, VIPs .69/.70) the same"
+        echo "    way -- lease=60/renew=45/retry=10/preserve=true, healthz probe timeout=10s threshold=5 --"
+        echo "    plus a 60s systemd drift watcher (vcfa-vmsp-kube-vip-keeper.timer) since this DaemonSet"
+        echo "    is Flux/vmsp-operator-managed and can revert a bare patch on reconcile."
         echo "On a healthy cluster Phase 1.5 prints status and changes nothing (no kubelet churn)."
         echo ""
         echo "Options:"
