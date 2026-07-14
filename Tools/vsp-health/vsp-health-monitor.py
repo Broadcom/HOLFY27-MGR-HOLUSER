@@ -101,7 +101,7 @@ SCRIPT_VERSION = '1.1'
 LOG_FILE = '/home/holuser/hol/vsp-health-monitor.log'
 
 DEFAULTS = {
-    'enabled': True,
+    'enabled': False,
     'remediate': True,
     'interval_seconds': 300,
     'vsp_control_plane_ip': '10.1.1.142',
