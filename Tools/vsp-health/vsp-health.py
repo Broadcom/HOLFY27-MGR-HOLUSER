@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 vsp-health.py
-Version 2.0.0 - 2026-06-17
+Version 2.2.0 - 2026-07-15
 Author: Burke Azbill and HOL Core Team
 
 Comprehensive, read-only health check of the VSP (Supervisor) cluster.
@@ -24,6 +24,10 @@ Remediation:
   Salt issues:          python3 salt-stabilize.py
   Control plane issues: python3 kube-fix.py
 
+Every line printed to the console is also appended (ANSI codes stripped) to
+LOG_FILE (/tmp/vsp-health.log) for a persistent, auditable record of the run
+— see the print() shadow below.
+
 Exit codes:
   0  All checks passed
   1  One or more checks failed
@@ -39,13 +43,14 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 
-VERSION = "2.1.0"
-DATE    = "2026-06-17"
+VERSION = "2.2.0"
+DATE    = "2026-07-15"
 
 CREDS_FILE = "/home/holuser/creds.txt"
 VSP_USER   = "vmware-system-user"
 VSP_WORKER = "vsp-01a.site-a.vcf.lab"
 VSP_VIP    = "10.1.1.142"
+LOG_FILE   = "/tmp/vsp-health.log"
 
 # Pod waiting reasons considered "bad" (trigger a FAIL row)
 BAD_REASONS = frozenset([
@@ -100,6 +105,30 @@ else:
 _OK   = f"{_GREEN}✓{_NC}"
 _FAIL = f"{_RED}✗{_NC}"
 _WARN = f"{_YELLOW}⚠{_NC}"
+
+
+# ─── Logging (mirrors vsp-health-monitor.py's on-disk record) ────────────────
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+_stdout_print = print  # keep a handle to the real builtin
+
+
+def print(*args, **kwargs):
+    """Shadow the builtin print(): behaves exactly like print() on the
+    console (every existing call site — header/rows/sections/summary/help —
+    needs no change), but also appends an ANSI-stripped copy of the same
+    text to LOG_FILE, so an interactive run leaves the same kind of
+    persistent, auditable record vsp-health-monitor.py already keeps.
+    Calls explicitly targeting stderr (file=sys.stderr) are still printed
+    normally but are not captured into LOG_FILE."""
+    _stdout_print(*args, **kwargs)
+    if kwargs.get('file') not in (None, sys.stdout):
+        return
+    text = kwargs.get('sep', ' ').join(str(a) for a in args)
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(_ANSI_RE.sub('', text) + '\n')
+    except Exception:
+        pass
 
 
 # ─── Help ─────────────────────────────────────────────────────────────────────

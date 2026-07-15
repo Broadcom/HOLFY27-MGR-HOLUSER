@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vsp-health-monitor.py - HOLFY27 VSP Cluster Health Monitor & Remediator
-# Version 1.0 - 2026-07-13
+# Version 1.4 - 2026-07-15
 # Author - Burke Azbill and HOL Core Team
 #
 # PURPOSE
@@ -56,10 +56,11 @@
 #   remediate                      = true            # false = detect/log only
 #   interval_seconds               = 300             # cron cadence (rounded to min)
 #   vsp_control_plane_ip           = 10.1.1.142
-#   checks                         = gateway,node_flap,crashloop_pods,vip
+#   checks                         = host_contention,vsp_size,gateway,node_flap,crashloop_pods,vip
 #   crashloop_restart_threshold    = 5               # min restartCount to act
 #   crashloop_max_restarts_per_cycle = 15            # safety cap per run
 #   crashloop_exclude_namespaces   =                 # extra ns to skip (csv)
+#   host_contention_load_multiplier = 1.5            # 1-min load > nproc*this -> skip remediation this cycle
 #
 # CHANGELOG
 #   v1.0 - 2026-07-13: Initial version. gateway, node_flap, crashloop_pods, vip
@@ -80,6 +81,34 @@
 #          and dropped — Kyverno re-asserts failurePolicy: Fail within ~2min, so a
 #          5-min re-assert is ineffective and a faster keeper fights Kyverno
 #          continuously; no durable in-cluster Kyverno lever exists. See #59.)
+#   v1.2 - 2026-07-15: Added host_contention check (runs FIRST, ahead of
+#          vsp_size) — the #59 storm can recur even with a correctly-sized
+#          (12-vCPU) CP when the underlying nested/physical ESXi host is itself
+#          oversubscribed (hypervisor CPU steal — see #62). nproc/Component.
+#          spec.size look "fine" from inside the guest in that case, so this
+#          check instead reads 1-min load average vs nproc directly from the CP
+#          node. If load is far above nproc, every other check for this cycle is
+#          downgraded to detect-only (no force-deletes/patches) — remediation
+#          itself is API-server write traffic, and piling that on top of a
+#          CPU-starved node compounds the storm instead of damping it. Safe to
+#          skip a cycle: kubelet's own crash-loop backoff rides it out, and the
+#          next cron pass (once contention clears) resumes normal remediation.
+#   v1.3 - 2026-07-15: Moved LOG_FILE to /tmp (was /home/holuser/hol). Console
+#          rendering restyled to match vsp-health.py's interactive look (same
+#          color palette, ✓/✗/⚠ symbols, boxed header, colored "RESULT: N/M"
+#          summary) instead of raw timestamped log lines. lsf.write_output()'s
+#          own console echo is now suppressed (console=False) so every line
+#          only prints once, through the new render layer — colors auto-drop
+#          to plain text when stdout isn't a tty (e.g. under cron), same as
+#          vsp-health.py. LOG_FILE/labstartup.log content is unchanged (still
+#          plain text, no ANSI codes, written by log() exactly as before).
+#   v1.4 - 2026-07-15: log() no longer calls lsf.write_output() at all —
+#          console=False (v1.3) only stopped the console echo; write_output()
+#          was still appending every message (with its own timestamp prefix)
+#          to the shared labstartup.log AND its lmchol NFS copy on every
+#          cycle. A 5-min cron job writing a dozen-plus lines per pass would
+#          steadily bury the lab's real startup/lifecycle log in monitor
+#          noise. log() now writes ONLY to our own LOG_FILE (/tmp).
 
 import os
 import sys
@@ -97,18 +126,19 @@ import lsfunctions as lsf
 # DEFAULTS
 #==============================================================================
 
-SCRIPT_VERSION = '1.1'
-LOG_FILE = '/home/holuser/hol/vsp-health-monitor.log'
+SCRIPT_VERSION = '1.4'
+LOG_FILE = '/tmp/vsp-health-monitor.log'
 
 DEFAULTS = {
     'enabled': False,
     'remediate': True,
     'interval_seconds': 300,
     'vsp_control_plane_ip': '10.1.1.142',
-    'checks': ['vsp_size', 'gateway', 'node_flap', 'crashloop_pods', 'vip'],
+    'checks': ['host_contention', 'vsp_size', 'gateway', 'node_flap', 'crashloop_pods', 'vip'],
     'crashloop_restart_threshold': 5,
     'crashloop_max_restarts_per_cycle': 15,
     'crashloop_exclude_namespaces': [],
+    'host_contention_load_multiplier': 1.5,
 }
 
 VSP_SSH_USER = 'vmware-system-user'
@@ -130,19 +160,76 @@ CRON_MARKER = '# vsp-health-monitor (HOLFY27 auto-installed)'
 # uninitialized servers before the lab has finished starting.
 LAB_STATUS_FILES = ('/lmchol/hol/startup_status.txt', '/wmchol/hol/startup_status.txt')
 
+# ─── Colors (same palette as vsp-health.py, for a consistent visual style
+# across both tools) ──────────────────────────────────────────────────────────
+if sys.stdout.isatty():
+    _CYAN, _BLUE, _GREEN, _RED, _YELLOW, _BOLD, _DIM, _NC = (
+        '\033[0;36m', '\033[38;2;0;176;255m', '\033[0;32m',
+        '\033[0;31m', '\033[1;33m', '\033[1m', '\033[2m', '\033[0m'
+    )
+else:
+    _CYAN = _BLUE = _GREEN = _RED = _YELLOW = _BOLD = _DIM = _NC = ''
+
+_OK   = f"{_GREEN}✓{_NC}"
+_FAIL = f"{_RED}✗{_NC}"
+_WARN = f"{_YELLOW}⚠{_NC}"
+_STATUS_SYMBOL = {'PASS': _OK, 'FAIL': _FAIL, 'WARN': _WARN}
+
 
 #==============================================================================
-# LOGGING
+# LOGGING (persists to disk; console is rendered separately, see below)
 #==============================================================================
 
 def log(msg):
-    """Write to both lsf output (console/labstartup.log) and our own log file."""
-    lsf.write_output(msg)
+    """Persist msg to our own LOG_FILE ONLY — deliberately does NOT call
+    lsf.write_output(), which would also append every message (with its own
+    timestamp prefix) to the shared labstartup.log / lmchol labstartup.log.
+    Those are the lab's real startup/lifecycle logs; a 5-min cron job
+    writing a dozen lines per cycle would steadily bury them in monitor
+    noise. Console echo is handled separately by
+    print_header()/print_row()/print_summary()."""
     try:
         with open(LOG_FILE, 'a') as f:
             f.write(f'{msg}\n')
     except Exception:
         pass
+
+
+#==============================================================================
+# CONSOLE RENDERING (styled to match vsp-health.py's interactive look)
+#==============================================================================
+
+def print_header(cfg, dry_run):
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    mode = 'DRY-RUN' if dry_run else ('remediate' if cfg['remediate'] else 'detect-only')
+    version_line = f'Version {SCRIPT_VERSION}  —  {len(cfg["checks"])} checks'
+    ts_line = f'{ts}  ({mode})'
+    W = 70
+    print(f"\n{_CYAN}╔{'═' * W}╗{_NC}")
+    print(f"{_CYAN}║{_NC}{_BLUE}{'VSP Health Monitor':^{W}}{_NC}{_CYAN}║{_NC}")
+    print(f"{_CYAN}║{_NC}{version_line:^{W}}{_CYAN}║{_NC}")
+    print(f"{_CYAN}║{_NC}{ts_line:^{W}}{_CYAN}║{_NC}")
+    print(f"{_CYAN}╚{'═' * W}╝{_NC}")
+
+
+def print_row(status, check, msgs):
+    symbol = _STATUS_SYMBOL.get(status, _WARN)
+    print(f"  {symbol} {check}")
+    for m in msgs:
+        print(f"      {_DIM}{m}{_NC}")
+
+
+def print_summary(total, failed, remediate):
+    color = _GREEN if failed == 0 else _RED
+    print(f"\n{_CYAN}{'─' * 64}{_NC}")
+    print(f"  {color}{_BOLD}RESULT: {total - failed}/{total} checks passed{_NC}")
+    if failed:
+        print(f"  {_RED}  {failed} check(s) require attention — see {_FAIL} rows above{_NC}")
+        if not remediate:
+            print(f"  {_DIM}  remediate=false (detect-only) — no changes were made{_NC}")
+    else:
+        print(f"  {_GREEN}  VSP cluster monitor: all checks passed{_NC}")
+    print(f"{_CYAN}{'─' * 64}{_NC}\n")
 
 
 #==============================================================================
@@ -171,6 +258,12 @@ def load_config():
             return list(default)
         return [x.strip() for x in raw.replace('\n', ',').split(',') if x.strip()]
 
+    def _get_float(key, default):
+        try:
+            return float(lsf.config.get('VSPMONITOR', key, fallback=str(default)).strip())
+        except (ValueError, TypeError):
+            return default
+
     cfg['enabled'] = _get_bool('enabled', DEFAULTS['enabled'])
     cfg['remediate'] = _get_bool('remediate', DEFAULTS['remediate'])
     cfg['interval_seconds'] = _get_int('interval_seconds', DEFAULTS['interval_seconds'])
@@ -184,6 +277,8 @@ def load_config():
         'crashloop_max_restarts_per_cycle', DEFAULTS['crashloop_max_restarts_per_cycle'])
     cfg['crashloop_exclude_namespaces'] = _get_list(
         'crashloop_exclude_namespaces', DEFAULTS['crashloop_exclude_namespaces'])
+    cfg['host_contention_load_multiplier'] = _get_float(
+        'host_contention_load_multiplier', DEFAULTS['host_contention_load_multiplier'])
     return cfg
 
 
@@ -230,6 +325,13 @@ def _parse_json(raw):
             except Exception:
                 continue
     return {}
+
+
+def ssh_run(cp_ip, remote_cmd, password):
+    """Run a plain UNPRIVILEGED command on the VSP control-plane node (no sudo
+    -- uptime/nproc need none of the root access kubectl/crictl require, so
+    skip the scp'd-script overhead that run_remote_script() needs for sudo)."""
+    return lsf.ssh(remote_cmd, f'{VSP_SSH_USER}@{cp_ip}', password)
 
 
 def kubectl(cp_ip, args, password):
@@ -299,6 +401,62 @@ def run_remote_script(cp_ip, script_text, password):
                 os.remove(local)
             except OSError:
                 pass
+
+
+#==============================================================================
+# CHECK: HOST CONTENTION GATE (supervisor-k8s #62). The #59 leader-election
+# storm can recur even with a correctly-sized (12-vCPU) CP when the underlying
+# nested/physical ESXi host is itself oversubscribed (hypervisor CPU steal) —
+# nproc/Component.spec.size look fine from inside the guest in that case, so
+# this reads 1-min load average vs nproc directly. Runs FIRST, ahead of
+# vsp_size: if the node is contended, every other check this cycle is
+# downgraded to detect-only (no force-deletes/patches). Remediation itself is
+# API-server write traffic; piling that onto an already CPU-starved node
+# compounds the storm instead of damping it. Safe to skip a cycle — kubelet's
+# own crash-loop backoff rides it out, and the next cron pass (once contention
+# clears) resumes normal remediation.
+#==============================================================================
+
+def get_node_load(cp_ip, password):
+    """Return (load1, nproc) read from the VSP control-plane node, or
+    (None, None) on any SSH/parse failure. Fails OPEN on a read failure (i.e.
+    does not report contention) — a measurement failure alone should not
+    suppress remediation; the per-check thresholds/caps already bound blast
+    radius on their own."""
+    res = ssh_run(cp_ip, 'uptime && nproc', password)
+    out = _clean_stdout(res) if res is not None else ''
+    if not out:
+        return None, None
+    try:
+        load_part = out.rsplit('load average:', 1)[1]
+        load1 = float(load_part.split(',')[0].strip())
+        nproc = int(out.strip().splitlines()[-1].strip())
+        return load1, nproc
+    except (IndexError, ValueError):
+        return None, None
+
+
+def check_host_contention(cp_ip, password, multiplier):
+    """Detect hypervisor-level CPU steal/contention on the CP node. Returns
+    (status, [messages], contended_bool)."""
+    load1, nproc = get_node_load(cp_ip, password)
+    if load1 is None or nproc is None:
+        return ('WARN',
+                ['host_contention: could not read uptime/nproc from CP node — '
+                 'skipping gate this cycle'],
+                False)
+
+    threshold = nproc * multiplier
+    if load1 > threshold:
+        return ('FAIL',
+                [f'host_contention: load1={load1:.2f} > {threshold:.1f} '
+                 f'({multiplier}x nproc={nproc}) — CP node under active host '
+                 f'contention'],
+                True)
+    return ('PASS',
+            [f'host_contention: load1={load1:.2f} <= {threshold:.1f} '
+             f'({multiplier}x nproc={nproc}) - OK'],
+            False)
 
 
 #==============================================================================
@@ -658,16 +816,35 @@ def run_all(cfg, dry_run):
     log(f'VSP Health Monitor v{SCRIPT_VERSION} — checks={",".join(cfg["checks"])} '
         f'remediate={cfg["remediate"]} dry_run={dry_run}')
     log('=' * 64)
+    print_header(cfg, dry_run)
 
+    print(f"{_DIM}  Testing connectivity to VSP control plane {cp_ip}...{_NC}",
+          end='', flush=True)
     if not lsf.test_ping(cp_ip, count=2, timeout=2):
-        log(f'VSP control plane VIP {cp_ip} not reachable — '
-            f'this lab may not use a VSP cluster; nothing to do')
+        print(f" {_FAIL}")
+        msg = (f'VSP control plane VIP {cp_ip} not reachable — '
+               f'this lab may not use a VSP cluster; nothing to do')
+        log(msg)
+        print(f"\n  {_WARN} {msg}\n")
         return 0
+    print(f" {_OK}\n")
 
     any_fail = False
+    checks_run = 0
+    failed_count = 0
     for check in cfg['checks']:
         try:
-            if check == 'vsp_size':
+            if check == 'host_contention':
+                st, msgs, contended = check_host_contention(
+                    cp_ip, password, cfg['host_contention_load_multiplier'])
+                if contended and remediate:
+                    msgs.append(
+                        'host_contention: downgrading this cycle to detect-only for '
+                        'all remaining checks (no force-deletes/patches) — remediating '
+                        'now would add more API-server write load on top of an '
+                        'already CPU-starved node and risks compounding the storm')
+                    remediate = False
+            elif check == 'vsp_size':
                 st, msgs = check_vsp_size(cp_ip, password, remediate, dry_run)
             elif check == 'gateway':
                 st, msgs = check_gateway(cp_ip, password, remediate, dry_run,
@@ -689,11 +866,15 @@ def run_all(cfg, dry_run):
 
         for m in msgs:
             log(f'  {m}')
+        log(f'  [{check}] {st}')
+        print_row(st, check, msgs)
+
+        checks_run += 1
         if st == 'FAIL':
             any_fail = True
-            log(f'  [{check}] FAIL')
-        else:
-            log(f'  [{check}] {st}')
+            failed_count += 1
+
+    print_summary(checks_run, failed_count, remediate)
 
     if any_fail and not remediate:
         log('One or more checks FAILED and remediate=false (detect-only) — '
