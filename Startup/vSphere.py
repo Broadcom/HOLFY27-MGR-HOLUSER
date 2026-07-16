@@ -249,7 +249,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('vsphere', 'drs', TaskStatus.RUNNING)
     
     #==========================================================================
-    # TASK 4: Wait for DRS to Enable
+    # TASK 4: Enable DRS on Specified Clusters
     #==========================================================================
     
     # Use get_config_list to properly filter commented-out values
@@ -265,12 +265,28 @@ def main(lsf=None, standalone=False, dry_run=False):
                 drs_clusters.append(cluster_name)
     
     if drs_clusters and not dry_run:
-        all_clusters = lsf.get_all_clusters()
-        for cluster in all_clusters:
-            if cluster.name in drs_clusters:
-                while not cluster.configuration.drsConfig.enabled:
-                    lsf.write_output(f'Waiting for DRS on {cluster.name}...')
-                    lsf.labstartup_sleep(lsf.sleep_seconds)
+        from pyVim.task import WaitForTask
+        for cluster_name in drs_clusters:
+            cluster = lsf.get_cluster(cluster_name)
+            if cluster:
+                if not cluster.configuration.drsConfig.enabled or cluster.configuration.drsConfig.defaultVmBehavior != vim.cluster.DrsConfigInfo.DrsBehavior.fullyAutomated:
+                    lsf.write_output(f'Enabling fully automated DRS on {cluster.name}...')
+                    try:
+                        spec = vim.cluster.ConfigSpecEx()
+                        drs_spec = vim.cluster.DrsConfigInfo()
+                        drs_spec.enabled = True
+                        drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.fullyAutomated
+                        spec.drsConfig = drs_spec
+                        
+                        task = cluster.ReconfigureComputeResource_Task(spec=spec, modify=True)
+                        WaitForTask(task)
+                        lsf.write_output(f'Successfully enabled fully automated DRS on {cluster.name}')
+                    except Exception as e:
+                        lsf.write_output(f'Failed to configure DRS on {cluster.name}: {str(e)}')
+                else:
+                    lsf.write_output(f'DRS is already fully automated on {cluster.name}')
+            else:
+                lsf.write_output(f'Could not find cluster {cluster_name} to configure DRS')
         
         lsf.write_output('DRS is configured on all required clusters')
     
