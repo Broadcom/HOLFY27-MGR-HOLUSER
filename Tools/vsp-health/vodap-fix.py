@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 vodap-fix.py
-Version 1.0.0 - 2026-06-17
+Version 1.1.0 - 2026-07-16
 Author: Burke Azbill and HOL Core Team
+
+v1.1.0: CP host resolution now tries candidates in order — explicit --host,
+then the hardcoded VSP_VIP, then auto-discovery via --worker — stopping at
+the first one that answers SSH, matching vsp-health.py's resolve_cp_host().
 
 Remediates ClickHouse TLS cert staleness and logging-operator-fluentd readiness
 failures in the VSP (Supervisor) cluster.
@@ -46,8 +50,8 @@ import sys
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.0.0"
-DATE    = "2026-06-17"
+VERSION = "1.1.0"
+DATE    = "2026-07-16"
 
 CREDS_FILE = "/home/holuser/creds.txt"
 VSP_USER   = "vmware-system-user"
@@ -84,11 +88,16 @@ def show_help():
     print(f"{_CYAN}╚{'═' * W}╝{_NC}\n")
     print(f"{_BOLD}USAGE:{_NC}\n    vodap-fix.py [--host IP] [--worker FQDN] [--dry-run] [-v]\n")
     print(f"{_BOLD}OPTIONS:{_NC}")
-    print(f"    {_GREEN}--host{_NC} <IP>       VSP control-plane host/VIP  (default: {VSP_VIP})")
-    print(f"    {_GREEN}--worker{_NC} <FQDN>   VSP worker FQDN for CP discovery (default: {VSP_WORKER})")
+    print(f"    {_GREEN}--host{_NC} <IP>       VSP control-plane host, tried first if set")
+    print(f"    {_GREEN}--worker{_NC} <FQDN>   VSP worker FQDN for CP auto-discovery (default: {VSP_WORKER})")
     print(f"    {_GREEN}--dry-run{_NC}         Show what would be done without making changes")
     print(f"    {_GREEN}-v, --verbose{_NC}     Show full command output")
     print(f"    {_GREEN}-h, --help{_NC}        Show this help message\n")
+    print(f"{_BOLD}CP HOST RESOLUTION ORDER:{_NC}")
+    print(f"    1. {_GREEN}--host{_NC} <IP>, if given")
+    print(f"    2. Hardcoded VIP  ({VSP_VIP})")
+    print(f"    3. Auto-discovery via {_GREEN}--worker{_NC}")
+    print(f"    Each candidate is tried via SSH; the first reachable one wins.\n")
     print(f"{_YELLOW}SYMPTOMS FIXED:{_NC}")
     print(f"    • vodap data-query-service or netops-collector-service stuck in")
     print(f"      CrashLoopBackOff with 'certificate expired' in logs")
@@ -179,6 +188,48 @@ def discover_cp(worker_fqdn, password):
         return m.group(1) if m else None
     except (json.JSONDecodeError, IndexError):
         return None
+
+
+def resolve_cp_host(host_arg, worker_fqdn, password):
+    """Pick the VSP control-plane host to use, trying candidates in order:
+    1. host_arg (--host), if given
+    2. the hardcoded VSP_VIP
+    3. auto-discovery via worker_fqdn (--worker)
+    Each candidate is SSH-tested; the first one that answers wins. Returns
+    (cp_host, tried) — cp_host is None if nothing answered, and tried lists
+    every candidate host attempted (for the error message)."""
+    tried = []
+    candidates = []
+    if host_arg:
+        candidates.append((host_arg, "--host"))
+    if VSP_VIP not in (c[0] for c in candidates):
+        candidates.append((VSP_VIP, "hardcoded VIP"))
+
+    for host, label in candidates:
+        tried.append(host)
+        print(f"{_DIM}  Testing SSH to {host} ({label})...{_NC}", end="", flush=True)
+        rc, _ = ssh_exec(host, password, "echo PONG", timeout=20)
+        if rc == 0:
+            print(f" {_OK}")
+            return host, tried
+        print(f" {_FAIL}")
+
+    print(f"\n{_DIM}Auto-discovering VSP control plane from {worker_fqdn}...{_NC}")
+    discovered = discover_cp(worker_fqdn, password)
+    if not discovered:
+        print(f"  {_WARN} Discovery failed — no control plane IP found")
+        return None, tried
+    print(f"  {_DIM}Control plane: {discovered}{_NC}")
+    if discovered in tried:
+        return None, tried
+    tried.append(discovered)
+    print(f"{_DIM}  Testing SSH to {discovered} (auto-discovered)...{_NC}", end="", flush=True)
+    rc, _ = ssh_exec(discovered, password, "echo PONG", timeout=20)
+    if rc == 0:
+        print(f" {_OK}")
+        return discovered, tried
+    print(f" {_FAIL}")
+    return None, tried
 
 
 def fetch_json(host, password, cmd, timeout=30):
@@ -551,25 +602,12 @@ def main():
     print(f"{_CYAN}║{_NC}{ts:^{W}}{_CYAN}║{_NC}")
     print(f"{_CYAN}╚{'═' * W}╝{_NC}")
 
-    # Discover CP
-    cp_host = args.host
+    # Determine CP host: --host, then hardcoded VIP, then auto-discovery.
+    cp_host, tried = resolve_cp_host(args.host, args.worker, password)
     if not cp_host:
-        print(f"\n{_DIM}Auto-discovering VSP control plane from {args.worker}...{_NC}")
-        cp_host = discover_cp(args.worker, password)
-        if cp_host:
-            print(f"  {_DIM}Control plane: {cp_host}{_NC}")
-        else:
-            cp_host = VSP_VIP
-            print(f"  {_WARN} Discovery failed — falling back to VIP {VSP_VIP}")
-
-    # Connectivity test
-    print(f"{_DIM}  Testing SSH to {cp_host}...{_NC}", end="", flush=True)
-    rc, _ = ssh_exec(cp_host, password, "echo PONG", timeout=20)
-    if rc != 0:
-        print()
-        print(f"\n{_RED}ERROR:{_NC} Cannot SSH to {cp_host} — is the VIP up?")
+        print(f"\n{_RED}ERROR:{_NC} Cannot SSH to any candidate host — is the VIP up?")
+        print(f"  Tried: {', '.join(tried)}")
         sys.exit(2)
-    print(f" {_OK}")
 
     total_errors = 0
     total_errors += fix_clickhouse(cp_host, password, args.dry_run, args.verbose)

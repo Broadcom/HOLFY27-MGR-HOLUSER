@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # ESXi.py - HOLFY27 Core ESXi Host Verification Module
-# Version 3.0 - January 2026
+# Version 3.1 - 2026-07-14
 # Author - Burke Azbill and HOL Core Team
 # Verifies ESXi hosts are online and responsive
+# v3.1: Enforce minimum resource requirements for vsp* VMs (12 CPU / 24 GB RAM)
 
 import os
 import sys
@@ -251,12 +252,146 @@ def main(lsf=None, standalone=False, dry_run=False):
     ##=========================================================================
     
     ##=========================================================================
-    ## CUSTOM - Insert your code here using the file in your vPod_repo
+    ## CUSTOM - vsp* VM minimum resource enforcement (12 CPU / 24 GB RAM)
+    ##
+    ## For each ESXi host, find all VMs whose name starts with 'vsp' (covers
+    ## both vsp-01a-* and vsp.* naming styles) and ensure they have at least
+    ## 12 vCPUs and 24 GB of RAM.  Reconfiguration is only applied to
+    ## powered-off VMs so the VM is never blocked from booting; powered-on VMs
+    ## that are under-spec are logged but left untouched.  Hosts with no
+    ## matching VMs are skipped silently.
     ##=========================================================================
-    
-    # Example: Add custom ESXi host checks or configuration here
-    # See prelim.py for detailed examples of common operations
-    
+
+    VSP_MIN_CPU    = 12
+    VSP_MIN_MEM_MB = 24 * 1024  # 24 GB
+
+    lsf.write_output('Checking vsp* VMs for minimum resource requirements '
+                     f'({VSP_MIN_CPU} CPUs / {VSP_MIN_MEM_MB} MB RAM)...')
+
+    if dry_run:
+        lsf.write_output('Dry-run: skipping vsp* resource enforcement')
+    elif not esx_hosts:
+        lsf.write_output('No ESXi hosts configured - skipping vsp* resource check')
+    else:
+        try:
+            import re
+            import ssl as _ssl_vsp
+            from pyVmomi import vim
+            from pyVim import connect as _vsp_connect
+            from pyVim.task import WaitForTask
+
+            _vsp_password = lsf.get_password()
+            _vsp_ctx = _ssl_vsp._create_unverified_context()
+
+            vsp_hosts_checked = 0
+            vsp_vms_found     = 0
+            vsp_vms_updated   = 0
+            vsp_vms_skipped_on = 0
+
+            for _entry in esx_hosts:
+                _host = _entry.split(':')[0].strip() if ':' in _entry else _entry.strip()
+
+                try:
+                    _si = _vsp_connect.SmartConnect(
+                        host=_host,
+                        user='root',
+                        pwd=_vsp_password,
+                        sslContext=_vsp_ctx
+                    )
+                    _content = _si.RetrieveContent()
+                    _container = _content.viewManager.CreateContainerView(
+                        _content.rootFolder, [vim.VirtualMachine], True
+                    )
+
+                    _vsp_vms = [
+                        vm for vm in _container.view
+                        if re.match(r'^vsp', vm.name, re.IGNORECASE)
+                    ]
+                    _container.Destroy()
+                    vsp_hosts_checked += 1
+
+                    if not _vsp_vms:
+                        lsf.write_output(f'  {_host}: no vsp* VMs found')
+                        _vsp_connect.Disconnect(_si)
+                        continue
+
+                    lsf.write_output(f'  {_host}: found {len(_vsp_vms)} vsp* VM(s)')
+
+                    for _vm in _vsp_vms:
+                        vsp_vms_found += 1
+                        _cur_cpu = _vm.config.hardware.numCPU
+                        _cur_mem = _vm.config.hardware.memoryMB
+                        _power   = _vm.runtime.powerState
+
+                        lsf.write_output(
+                            f'    {_vm.name}: CPUs={_cur_cpu}, '
+                            f'MemMB={_cur_mem} ({_cur_mem // 1024} GB), state={_power}'
+                        )
+
+                        _needs_cpu = _cur_cpu < VSP_MIN_CPU
+                        _needs_mem = _cur_mem < VSP_MIN_MEM_MB
+
+                        if not _needs_cpu and not _needs_mem:
+                            lsf.write_output(
+                                f'    {_vm.name}: already meets minimum requirements - no changes needed'
+                            )
+                            continue
+
+                        if _power == 'poweredOn':
+                            lsf.write_output(
+                                f'    {_vm.name}: WARNING - VM is powered on; '
+                                f'reconfiguration skipped to avoid disruption'
+                            )
+                            vsp_vms_skipped_on += 1
+                            continue
+
+                        # Powered off — safe to reconfigure
+                        _spec = vim.vm.ConfigSpec()
+                        _changes = []
+                        if _needs_cpu:
+                            _spec.numCPUs = VSP_MIN_CPU
+                            _changes.append(f'CPUs {_cur_cpu} -> {VSP_MIN_CPU}')
+                        if _needs_mem:
+                            _spec.memoryMB = VSP_MIN_MEM_MB
+                            _changes.append(
+                                f'MemMB {_cur_mem} -> {VSP_MIN_MEM_MB} '
+                                f'({VSP_MIN_MEM_MB // 1024} GB)'
+                            )
+
+                        lsf.write_output(
+                            f'    {_vm.name}: reconfiguring ({", ".join(_changes)})'
+                        )
+                        try:
+                            _task = _vm.ReconfigVM_Task(spec=_spec)
+                            WaitForTask(_task)
+                            lsf.write_output(f'    {_vm.name}: reconfiguration complete')
+                            vsp_vms_updated += 1
+                        except Exception as _reconfig_err:
+                            lsf.write_output(
+                                f'    {_vm.name}: reconfiguration FAILED: {_reconfig_err}'
+                            )
+
+                    _vsp_connect.Disconnect(_si)
+
+                except Exception as _host_err:
+                    lsf.write_output(
+                        f'  WARNING: could not connect to {_host} for vsp* check: {_host_err}'
+                    )
+
+            _summary_parts = [
+                f'{vsp_hosts_checked} host(s) checked',
+                f'{vsp_vms_found} vsp* VM(s) found',
+                f'{vsp_vms_updated} updated',
+            ]
+            if vsp_vms_skipped_on:
+                _summary_parts.append(f'{vsp_vms_skipped_on} skipped (powered on)')
+            lsf.write_output('vsp* resource check complete: ' + ', '.join(_summary_parts))
+
+        except Exception as _vsp_global_err:
+            lsf.write_output(
+                f'WARNING: vsp* VM resource check encountered an error: {_vsp_global_err}'
+            )
+
     ##=========================================================================
     ## End CUSTOM section
     ##=========================================================================

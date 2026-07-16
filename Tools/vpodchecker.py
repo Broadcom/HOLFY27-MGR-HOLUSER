@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.8.5 - 2026-06-08
+# Version 2.8.6 - 2026-07-13
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.8.6 - 2026-07-13:
+#   - Added check_vsp_node_resources(): verifies every VSP cluster node
+#     (control plane AND workers) has >= 12 vCPU / >= 24GB memory, reading
+#     capacity directly from each Node's status.capacity via kubectl (no
+#     vCenter/pyVmomi dependency). Catches the case where confighol-9.1.py's
+#     fix_vsp_controlplane_sizing() didn't run or didn't converge, or where a
+#     lab was built from an older template. Populates the previously-unused
+#     report.vm_resource_checks field; appears as "VSP NODE RESOURCES" in the
+#     console table and "VM Resources" in the HTML report (both pre-existing,
+#     generic renderers — no further wiring needed).
+#     See vcf-troubleshooting skill references/supervisor-k8s.md#56.
+#
 # v2.8.5 - 2026-06-08:
 #   - --json and --html now use consistent optional-path behavior via nargs='?':
 #     omit PATH → auto-named vpodchecker_<timestamp>.{json,html} in CWD;
@@ -580,6 +592,146 @@ def check_vm_configuration(vms: List, fix_issues: bool = True) -> List[CheckResu
             }
         ))
     
+    return results
+
+
+#==============================================================================
+# VSP NODE RESOURCE CHECKS
+#==============================================================================
+
+VSP_CP_VIP = '10.1.1.142'
+VSP_SSH_USER = 'vmware-system-user'
+VSP_MIN_NUMCPU = 12
+# ~24GB configured (24576 MiB) reports a bit lower via kubelet capacity due to
+# normal kernel/hypervisor reserve (observed ~24025MiB on a 24576MiB VM) —
+# threshold set with margin so correctly-sized nodes never false-FAIL.
+VSP_MIN_MEMORY_MIB = 23000
+
+
+def _k8s_quantity_to_mib(qty: str) -> Optional[float]:
+    """Parse a Kubernetes resource quantity string (e.g. '24601756Ki') to MiB."""
+    if not qty:
+        return None
+    qty = qty.strip()
+    try:
+        if qty.endswith('Ki'):
+            return float(qty[:-2]) / 1024
+        if qty.endswith('Mi'):
+            return float(qty[:-2])
+        if qty.endswith('Gi'):
+            return float(qty[:-2]) * 1024
+        return float(qty) / (1024 * 1024)  # bare bytes
+    except ValueError:
+        return None
+
+
+def check_vsp_node_resources() -> List[CheckResult]:
+    """
+    Verify every VSP cluster node (control plane AND workers) meets the
+    minimum sizing of >= 12 vCPU / >= 24GB memory.
+
+    Root cause this guards against (see vcf-troubleshooting skill
+    references/supervisor-k8s.md#56): the VSP ClusterClass ships the
+    control-plane node undersized (4 vCPU/8-10GB) relative to workers
+    (12 vCPU/24GB) by default. An undersized control plane starves
+    etcd/kube-apiserver under load, causing chronic node flapping that a
+    node-monitor-grace-period bump alone cannot fully prevent.
+    confighol-9.1.py's fix_vsp_controlplane_sizing() is the fix applied at
+    template-prep time; this check verifies the fix actually took (or that
+    it was never needed for a given lab type).
+
+    Reads CPU/memory directly from each Node's status.capacity via kubectl —
+    no vCenter/pyVmomi dependency, since kubelet's reported capacity is a
+    direct, reliable reflection of the underlying VM's hardware.
+    """
+    results: List[CheckResult] = []
+
+    if not lsf:
+        results.append(CheckResult(
+            name='VSP Node Resources',
+            status='SKIPPED',
+            message='lsfunctions not available'))
+        return results
+
+    password = lsf.get_password()
+
+    if not lsf.test_ping(VSP_CP_VIP):
+        results.append(CheckResult(
+            name='VSP Node Resources',
+            status='SKIPPED',
+            message=f'VSP control plane VIP ({VSP_CP_VIP}) not reachable '
+                    f'- this lab type may not use a VSP cluster'))
+        return results
+
+    cmd = f"echo '{password}' | sudo -S -i kubectl get nodes -o json"
+    result = lsf.ssh(cmd, f'{VSP_SSH_USER}@{VSP_CP_VIP}', password)
+    output = getattr(result, 'stdout', '') or getattr(result, 'output', '') or ''
+
+    if result.returncode != 0 or not output.strip():
+        results.append(CheckResult(
+            name='VSP Node Resources',
+            status='WARN',
+            message='Could not query VSP cluster nodes via kubectl'))
+        return results
+
+    try:
+        json_start = output.find('{')
+        nodes_data = json.loads(output[json_start:])
+        items = nodes_data.get('items', [])
+    except Exception as e:
+        results.append(CheckResult(
+            name='VSP Node Resources',
+            status='WARN',
+            message=f'Could not parse VSP node list JSON: {e}'))
+        return results
+
+    if not items:
+        results.append(CheckResult(
+            name='VSP Node Resources',
+            status='WARN',
+            message='VSP cluster reachable but returned no nodes'))
+        return results
+
+    for node in items:
+        name = node.get('metadata', {}).get('name', 'unknown')
+        labels = node.get('metadata', {}).get('labels', {})
+        is_control_plane = any(
+            k.startswith('node-role.kubernetes.io/control-plane') for k in labels
+        )
+        role = 'control-plane' if is_control_plane else 'worker'
+
+        capacity = node.get('status', {}).get('capacity', {})
+        cpu_str = capacity.get('cpu', '0')
+        mem_str = capacity.get('memory', '0Ki')
+
+        try:
+            cpu = int(cpu_str)
+        except ValueError:
+            cpu = 0
+        mem_mib = _k8s_quantity_to_mib(mem_str) or 0
+
+        issues = []
+        if cpu < VSP_MIN_NUMCPU:
+            issues.append(f'{cpu} vCPU (need >= {VSP_MIN_NUMCPU})')
+        if mem_mib < VSP_MIN_MEMORY_MIB:
+            issues.append(f'{mem_mib:.0f}MiB memory (need >= {VSP_MIN_MEMORY_MIB}MiB)')
+
+        if issues:
+            status = 'FAIL'
+            message = (f'{role} node undersized: {", ".join(issues)} - see '
+                        f'vcf-troubleshooting skill references/supervisor-k8s.md#56 '
+                        f'/ confighol-9.1.py fix_vsp_controlplane_sizing()')
+        else:
+            status = 'PASS'
+            message = f'{role} node sized correctly ({cpu} vCPU / {mem_mib:.0f}MiB)'
+
+        results.append(CheckResult(
+            name=f'VSP Node Resources: {name}',
+            status=status,
+            message=message,
+            details={'role': role, 'cpu': cpu, 'memory_mib': round(mem_mib)}
+        ))
+
     return results
 
 
@@ -3387,8 +3539,18 @@ def main():
             
             report.license_checks = _sort_license_results(report.license_checks)
             print_results_table("LICENSES", report.license_checks)
-            
-    
+
+
+    # VSP node resource checks (control plane + workers >= 12 vCPU / 24GB).
+    # Pure kubectl over SSH — does not need lsf.sis/PYVMOMI_AVAILABLE, so this
+    # runs unconditionally rather than nested inside the vSphere-checks block.
+    print("\nChecking VSP cluster node resources...")
+    try:
+        report.vm_resource_checks = check_vsp_node_resources()
+        print_results_table("VSP NODE RESOURCES", report.vm_resource_checks)
+    except Exception as e:
+        print(f"VSP node resource check failed: {e}")
+
     # Password expiration checks
     print("\nChecking password expirations...")
     try:

@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
 vsp-health.py
-Version 2.0.0 - 2026-06-17
+Version 2.5.0 - 2026-07-16
 Author: Burke Azbill and HOL Core Team
+
+v2.5.0: CP host resolution now tries candidates in order — explicit --host,
+then the hardcoded VSP_VIP, then auto-discovery via --worker — stopping at
+the first one that answers SSH, instead of auto-discovery being the only
+fallback for a missing --host.
+
+v2.4.0: Added total + per-section elapsed-time reporting (console and the
+--json output's "elapsed_seconds" field), so a slow run is visible without
+timing it by hand — added while investigating why vsp-health-monitor.py felt
+slow; this tool's sections are the same kubectl/SSH calls, so the same
+per-check granularity is useful here too.
 
 Comprehensive, read-only health check of the VSP (Supervisor) cluster.
 Dynamically discovers and reports the status of EVERY component running
@@ -12,17 +23,36 @@ Sections reported:
   1. CONTROL PLANE     kube-vip VIP, manifest setting, static pods via crictl
   2. KUBERNETES NODES  Ready status, SchedulingDisabled
   3. POD OVERVIEW      All pods across ALL namespaces — one line per namespace
-  4. VCF COMPONENTS    All 25 VCF-managed workloads (spec vs readyReplicas)
-  5. POSTGRESQL        All Zalando Spilo instances — readiness + suspended check
+  4. VCF COMPONENTS    All 25 VCF-managed workloads (spec vs readyReplicas),
+                       plus components.api.vmsp.vmware.com operational-status
+  5. POSTGRESQL        Zalando Spilo instances — readiness + suspended check +
+                       numberOfInstances vs. saved original-instances annotation
   6. REDIS & RAAS      Pod readiness, endpoint population, CrashLoopBackOff
   7. SALT STACK        Pod readiness + log tail for known error signatures
   8. TLS CERTIFICATES  cert-manager Certificate resources — readiness + expiry
-  9. ARGO WORKFLOWS    Stale system-shutdown workflows in vmsp-platform
+  9. ARGO WORKFLOWS    Stale system-shutdown workflows + power-off-marker
+                       ConfigMap (KB 440862 boot-deadlock signature)
+  10. VODAP HEALTH     ClickHouse served-cert-vs-secret mismatch (a cert-manager
+                       Certificate check alone can't see this — ClickHouse
+                       never hot-reloads) + logging-operator-fluentd buffers
+  11. NODE PROXY       VSP node proxy config vs. lsfunctions.LAB_PROXY_URL
+  12. KUBEADM CERTS    kubeadm's own cert population (separate from
+                       cert-manager's Certificate CRDs in section 8)
 
-No changes are made to the cluster — this is a check-only tool.
-Remediation:
+No changes are made to the cluster — this is a check-only tool. Every one of
+these failure modes IS actively remediated by the companion
+vsp-health-monitor.py (checks: kvip_manifest, cp_pod_crash, postgres,
+salt_stack, vodap, component_health, argo_cleanup, proxy_config,
+cert_renewal) on its 5-min cron cycle — this tool is for point-in-time
+diagnosis, not the fix path.
+Manual remediation tools (same fixes, run on demand):
   Salt issues:          python3 salt-stabilize.py
   Control plane issues: python3 kube-fix.py
+  Vodap/ClickHouse:     python3 vodap-fix.py
+
+Every line printed to the console is also appended (ANSI codes stripped) to
+LOG_FILE (/tmp/vsp-health.log) for a persistent, auditable record of the run
+— see the print() shadow below.
 
 Exit codes:
   0  All checks passed
@@ -39,13 +69,15 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 
-VERSION = "2.1.0"
-DATE    = "2026-06-17"
+VERSION = "2.5.0"
+DATE    = "2026-07-16"
 
 CREDS_FILE = "/home/holuser/creds.txt"
 VSP_USER   = "vmware-system-user"
 VSP_WORKER = "vsp-01a.site-a.vcf.lab"
 VSP_VIP    = "10.1.1.142"
+LOG_FILE   = "/tmp/vsp-health.log"
+LAB_PROXY_URL = "http://10.1.1.1:3128"  # same value as lsfunctions.LAB_PROXY_URL
 
 # Pod waiting reasons considered "bad" (trigger a FAIL row)
 BAD_REASONS = frozenset([
@@ -85,6 +117,9 @@ VCF_COMPONENTS = [
     ("vmsp-metrics-store", "deployment/vsp-metrics-store-operator"),
 ]
 
+# vodap deployments that depend on ClickHouse (section 10)
+CLICKHOUSE_CLIENTS = ["vcf-obs-data-query-service", "vcf-obs-netops-collector-service"]
+
 # Namespaces displayed first in the pod overview (priority order)
 _NS_PRIORITY = ["kube-system", "vmsp-platform", "cert-manager", "antrea", "istio-system"]
 
@@ -102,6 +137,30 @@ _FAIL = f"{_RED}✗{_NC}"
 _WARN = f"{_YELLOW}⚠{_NC}"
 
 
+# ─── Logging (mirrors vsp-health-monitor.py's on-disk record) ────────────────
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+_stdout_print = print  # keep a handle to the real builtin
+
+
+def print(*args, **kwargs):
+    """Shadow the builtin print(): behaves exactly like print() on the
+    console (every existing call site — header/rows/sections/summary/help —
+    needs no change), but also appends an ANSI-stripped copy of the same
+    text to LOG_FILE, so an interactive run leaves the same kind of
+    persistent, auditable record vsp-health-monitor.py already keeps.
+    Calls explicitly targeting stderr (file=sys.stderr) are still printed
+    normally but are not captured into LOG_FILE."""
+    _stdout_print(*args, **kwargs)
+    if kwargs.get('file') not in (None, sys.stdout):
+        return
+    text = kwargs.get('sep', ' ').join(str(a) for a in args)
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(_ANSI_RE.sub('', text) + '\n')
+    except Exception:
+        pass
+
+
 # ─── Help ─────────────────────────────────────────────────────────────────────
 def show_help():
     W = 70
@@ -111,12 +170,17 @@ def show_help():
     print(f"{_CYAN}╚{'═' * W}╝{_NC}\n")
     print(f"{_BOLD}USAGE:{_NC}\n    vsp-health.py [--host IP] [--worker FQDN] [--section NAME] [-v] [-j]\n")
     print(f"{_BOLD}OPTIONS:{_NC}")
-    print(f"    {_GREEN}--host{_NC} <IP>         VSP control-plane host/VIP  (default: {VSP_VIP})")
-    print(f"    {_GREEN}--worker{_NC} <FQDN>     VSP worker for CP discovery  (default: {VSP_WORKER})")
+    print(f"    {_GREEN}--host{_NC} <IP>         VSP control-plane host, tried first if set")
+    print(f"    {_GREEN}--worker{_NC} <FQDN>     VSP worker for CP auto-discovery  (default: {VSP_WORKER})")
     print(f"    {_GREEN}--section{_NC} <name>    Run only the named section (see below)")
     print(f"    {_GREEN}-v, --verbose{_NC}       Show raw command output and per-pod details")
     print(f"    {_GREEN}-j, --json{_NC}          Emit final summary as JSON to stdout")
     print(f"    {_GREEN}-h, --help{_NC}          Show this help message\n")
+    print(f"{_BOLD}CP HOST RESOLUTION ORDER:{_NC}")
+    print(f"    1. {_GREEN}--host{_NC} <IP>, if given")
+    print(f"    2. Hardcoded VIP  ({VSP_VIP})")
+    print(f"    3. Auto-discovery via {_GREEN}--worker{_NC}")
+    print(f"    Each candidate is tried via SSH; the first reachable one wins.\n")
     print(f"{_BOLD}SECTION NAMES:{_NC}  (use with --section)")
     for name, desc in [
         ("cp",       "Control plane (kube-vip, crictl, VIP)"),
@@ -127,7 +191,10 @@ def show_help():
         ("redis",    "Redis pod + service endpoints"),
         ("salt",     "Salt master/minion deep check + logs"),
         ("certs",    "cert-manager Certificate resources"),
-        ("argo",     "Argo Workflow stale shutdown check"),
+        ("argo",     "Argo Workflow stale shutdown + power-off-marker check"),
+        ("vodap",    "ClickHouse served-cert-vs-secret + fluentd buffers"),
+        ("proxy",    "VSP node proxy config drift"),
+        ("kubeadm",  "kubeadm cert population expiry"),
     ]:
         print(f"    {_GREEN}{name:<10}{_NC} {desc}")
     print(f"\n{_YELLOW}EXAMPLES:{_NC}")
@@ -194,6 +261,49 @@ def ssh_exec(host, password, cmd, timeout=60):
         return 1, "sshpass not found — install: apt-get install sshpass"
     except Exception as exc:
         return 1, str(exc)
+
+
+def resolve_cp_host(host_arg, worker_fqdn, password):
+    """Pick the VSP control-plane host to use, trying candidates in order:
+    1. host_arg (--host), if given
+    2. the hardcoded VSP_VIP
+    3. auto-discovery via worker_fqdn (--worker)
+    Each candidate is SSH-tested; the first one that answers wins. Returns
+    (cp_host, tried) — cp_host is None if nothing answered, and tried lists
+    every candidate host attempted (for the error message)."""
+    tried = []
+    candidates = []
+    if host_arg:
+        candidates.append((host_arg, "--host"))
+    if VSP_VIP not in (c[0] for c in candidates):
+        candidates.append((VSP_VIP, "hardcoded VIP"))
+
+    for host, label in candidates:
+        tried.append(host)
+        print(f"{_DIM}  Testing SSH to {host} ({label})...{_NC}", end="", flush=True)
+        rc, _ = ssh_exec(host, password, "echo PONG", timeout=20)
+        if rc == 0:
+            print(f" {_OK}")
+            return host, tried
+        print(f" {_FAIL}")
+
+    print(f"\n{_DIM}Auto-discovering VSP control plane from {worker_fqdn}...{_NC}")
+    discovered = discover_cp(worker_fqdn, password)
+    if not discovered:
+        print(f"  {_WARN} Discovery failed — no control plane IP found")
+        return None, tried
+    print(f"  {_DIM}Control plane: {discovered}{_NC}")
+    if discovered in tried:
+        # Already ruled out above — no point re-testing the same host.
+        return None, tried
+    tried.append(discovered)
+    print(f"{_DIM}  Testing SSH to {discovered} (auto-discovered)...{_NC}", end="", flush=True)
+    rc, _ = ssh_exec(discovered, password, "echo PONG", timeout=20)
+    if rc == 0:
+        print(f" {_OK}")
+        return discovered, tried
+    print(f" {_FAIL}")
+    return None, tried
 
 
 def discover_cp(worker_fqdn, password):
@@ -419,8 +529,11 @@ def chk_pod_overview(cp_host, password, verbose):
 
 
 # ─── Section 4: VCF Managed Components ───────────────────────────────────────
-def chk_vcf_components(deps_data, sts_data, verbose):
-    """Check all VCF-managed workloads — spec.replicas vs status.readyReplicas."""
+def chk_vcf_components(deps_data, sts_data, comp_data, verbose):
+    """Check all VCF-managed workloads — spec.replicas vs status.readyReplicas,
+    plus the components.api.vmsp.vmware.com CRDs' operational-status
+    annotation (vsp-health-monitor.py's component_health check fixes both of
+    these; this section is detect-only)."""
     results = []
 
     # Build lookup: (namespace, kind, name) -> {spec, ready}
@@ -456,19 +569,39 @@ def chk_vcf_components(deps_data, sts_data, verbose):
 
         if spec == 0:
             results.append(row_warn(f"{label:<{W}} 0/0",
-                                    "scaled to 0 — stopped; run VCFfinal.py Task 2e to scale up"))
+                                    "scaled to 0 — vsp-health-monitor.py component_health "
+                                    "will scale it back up within 5 min, or run VCFfinal.py Task 2e"))
         elif ready >= spec:
             results.append(row_ok(f"{label:<{W}} {ready}/{spec}"))
         else:
             results.append(row_fail(f"{label:<{W}} {ready}/{spec} ready",
                                     f"{spec - ready} pod(s) not yet ready"))
 
+    # components.api.vmsp.vmware.com operational-status annotation
+    if comp_data:
+        not_running = [
+            item.get("metadata", {}).get("name", "?")
+            for item in comp_data.get("items", [])
+            if item.get("metadata", {}).get("annotations", {}).get(
+                "component.vmsp.vmware.com/operational-status", "") == "NotRunning"
+        ]
+        if not_running:
+            results.append(row_fail("Component CRDs operational-status: all Running",
+                                    f"NotRunning: {', '.join(not_running)}"))
+        else:
+            results.append(row_ok("Component CRDs operational-status: all Running"))
+    else:
+        results.append(row_warn("Component CRDs (components.api.vmsp.vmware.com): readable",
+                                "no response"))
+
     return results
 
 
 # ─── Section 5: PostgreSQL ────────────────────────────────────────────────────
 def chk_postgres(cp_host, password, verbose):
-    """Check all Zalando Spilo postgres instances via CRD + direct pod queries."""
+    """Check all Zalando Spilo postgres instances via CRD + direct pod queries.
+    (vsp-health-monitor.py's postgres check fixes both suspension and replica
+    mismatches; this section is detect-only.)"""
     results = []
 
     # Suspended instances via CRD
@@ -488,6 +621,28 @@ def chk_postgres(cp_host, password, verbose):
         else:
             count = len(pg_inst.get("items", []))
             results.append(row_ok(f"Postgres instances: {count} found, none suspended"))
+
+        # Zalando numberOfInstances vs. saved vcf.lab/original-instances annotation
+        mismatched = []
+        for i in pg_inst.get("items", []):
+            ns   = i.get("metadata", {}).get("namespace", "?")
+            name = i.get("metadata", {}).get("name", "?")
+            zdata = fetch_json(cp_host, password,
+                               f"kubectl get postgresqls.acid.zalan.do {name} -n {ns} "
+                               f"-o json 2>/dev/null", timeout=15)
+            if not zdata:
+                continue
+            current = zdata.get("spec", {}).get("numberOfInstances", 0) or 0
+            anno = zdata.get("metadata", {}).get("annotations", {}).get(
+                "vcf.lab/original-instances", "")
+            intended = int(anno) if anno.isdigit() and int(anno) > 0 else 1
+            if current < intended:
+                mismatched.append(f"{ns}/{name}: {current}/{intended}")
+        if mismatched:
+            results.append(row_fail("Zalando numberOfInstances: all at intended count",
+                                    "; ".join(mismatched)))
+        else:
+            results.append(row_ok("Zalando numberOfInstances: all at intended count"))
 
     # pgdatabase-0 readiness via targeted pod query
     pg_data = fetch_json(cp_host, password,
@@ -673,7 +828,10 @@ def chk_certificates(certs_data, verbose):
 
 # ─── Section 9: Argo Workflows ────────────────────────────────────────────────
 def chk_argo(cp_host, password, verbose):
-    """Check for stale system-shutdown Argo Workflows in vmsp-platform."""
+    """Check for stale system-shutdown Argo Workflows and a leftover
+    power-off-marker ConfigMap in vmsp-platform (the KB 440862 boot-deadlock
+    signature). vsp-health-monitor.py's argo_cleanup check fixes both plus
+    uncordons any non-condemned SchedulingDisabled node; this is detect-only."""
     results = []
     _, out = ssh_exec(cp_host, password,
                       "kubectl get workflows -n vmsp-platform --no-headers 2>/dev/null",
@@ -681,26 +839,240 @@ def chk_argo(cp_host, password, verbose):
 
     if not out or "No resources found" in out or "error: the server doesn't have" in out:
         results.append(row_ok("Argo workflows: API available, none found"))
+    else:
+        all_wf  = [ln for ln in out.splitlines() if ln.strip()]
+        bad_wf  = [ln for ln in all_wf if "system-shutdown" in ln]
+        other   = len(all_wf) - len(bad_wf)
+
+        if other > 0:
+            results.append(row_ok(f"Argo workflows: {other} non-shutdown workflow(s) present"))
+
+        if bad_wf:
+            results.append(row_fail(
+                f"Stale system-shutdown workflows: 0 found",
+                f"{len(bad_wf)} stale — may re-cordon node and scale prelude to 0"
+            ))
+            if verbose:
+                for ln in bad_wf[:10]:
+                    row_verbose(f"  {ln.strip()}")
+        else:
+            results.append(row_ok("Stale system-shutdown Argo workflows: none"))
+
+    pom = fetch_json(cp_host, password,
+                     "kubectl get configmap power-off-marker -n vmsp-platform "
+                     "-o json 2>/dev/null", timeout=15)
+    if pom and "data" in pom:
+        results.append(row_fail("power-off-marker ConfigMap: absent",
+                                "present — KB 440862 recovery incomplete, saved "
+                                "replica counts not yet replayed"))
+    else:
+        results.append(row_ok("power-off-marker ConfigMap: absent"))
+
+    return results
+
+
+# ─── Section 10: Vodap (ClickHouse cert + fluentd buffers) ──────────────────
+def chk_vodap(cp_host, password, verbose):
+    """ClickHouse: compares the cert it's actually SERVING (live openssl
+    s_client) against the vcf-obs-clickhouse-cert secret — a cert-manager
+    Certificate resource alone can look Ready/valid while ClickHouse still
+    serves a stale cert in memory (it never hot-reloads at startup).
+    logging-operator-fluentd-0: readiness fails once /buffers disk usage or
+    backup-chunk file count crosses a threshold; a plain restart doesn't
+    help since the PVC persists. vsp-health-monitor.py's vodap check fixes
+    both; this is detect-only."""
+    results = []
+
+    sec = fetch_json(cp_host, password,
+                     "kubectl get secret vcf-obs-clickhouse-cert -n vodap "
+                     "-o json 2>/dev/null", timeout=20)
+    if not sec:
+        results.append(row_warn("vcf-obs-clickhouse-cert secret: found",
+                                "not found — vodap may not be deployed yet"))
+    else:
+        cert_b64 = sec.get("data", {}).get("tls.crt", "")
+        now = datetime.now(timezone.utc)
+        na = None
+        expiring_soon = False
+        if cert_b64:
+            secret_pem = base64.b64decode(cert_b64)
+            dates = subprocess.run(["openssl", "x509", "-noout", "-dates"],
+                                   input=secret_pem, capture_output=True)
+            for line in dates.stdout.decode("utf-8", errors="ignore").splitlines():
+                if line.startswith("notAfter="):
+                    try:
+                        na = datetime.strptime(line.split("=", 1)[1].strip(),
+                                               "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        pass
+            check7 = subprocess.run(["openssl", "x509", "-noout", "-checkend", str(7 * 86400)],
+                                    input=secret_pem, capture_output=True)
+            expiring_soon = check7.returncode != 0
+
+        _, svc_ip_out = ssh_exec(cp_host, password,
+                                 "kubectl get service clickhouse-vcf-obs -n vodap "
+                                 "-o jsonpath='{.spec.clusterIP}' 2>/dev/null", timeout=15)
+        chi_svc_ip = svc_ip_out.strip().strip('"').strip("'")
+
+        served_mismatch = False
+        served_na = None
+        if chi_svc_ip:
+            _, s_out = ssh_exec(cp_host, password,
+                                f"openssl s_client -connect {chi_svc_ip}:8443 -showcerts "
+                                f"</dev/null 2>/dev/null | openssl x509 -noout -dates 2>/dev/null",
+                                timeout=20)
+            served_str = ""
+            for ln in s_out.splitlines():
+                if ln.startswith("notAfter="):
+                    served_str = ln.split("=", 1)[1].strip()
+            if served_str:
+                try:
+                    served_na = datetime.strptime(served_str, "%b %d %H:%M:%S %Y %Z").replace(
+                        tzinfo=timezone.utc)
+                    if served_na < now:
+                        served_mismatch = True
+                    elif na and served_na.date() != na.date():
+                        served_mismatch = True
+                except ValueError:
+                    pass
+
+        if served_mismatch:
+            results.append(row_fail(
+                "ClickHouse served cert matches secret",
+                f"serving notAfter={served_na.date() if served_na else '?'}, "
+                f"secret notAfter={na.date() if na else '?'} — stale cert in memory, "
+                f"restart statefulset/chi-vcf-obs-vcf-obs-0-0"))
+        elif expiring_soon:
+            results.append(row_warn(f"ClickHouse secret cert expires "
+                                    f"{na.date() if na else '?'}", "within 7 days"))
+        else:
+            results.append(row_ok(f"ClickHouse cert: serving matches secret "
+                                  f"(notAfter={na.date() if na else '?'})"))
+
+        for dep in CLICKHOUSE_CLIENTS:
+            dep_data = fetch_json(cp_host, password,
+                                  f"kubectl get deployment {dep} -n vodap -o json 2>/dev/null",
+                                  timeout=20)
+            if dep_data:
+                ready = dep_data.get("status", {}).get("readyReplicas", 0) or 0
+                desired = dep_data.get("spec", {}).get("replicas", 1) or 1
+                if desired > 0 and ready < desired:
+                    results.append(row_fail(f"{dep} (vodap): {ready}/{desired} ready",
+                                            "ClickHouse-dependent client not ready"))
+                else:
+                    results.append(row_ok(f"{dep} (vodap): {ready}/{desired} ready"))
+
+    fpod = fetch_json(cp_host, password,
+                      "kubectl get pod logging-operator-fluentd-0 -n vmsp-platform "
+                      "-o json 2>/dev/null", timeout=20)
+    if not fpod or fpod.get("kind") != "Pod":
+        results.append(row_warn("logging-operator-fluentd-0: found",
+                                "pod not found or unreadable"))
         return results
 
-    all_wf  = [ln for ln in out.splitlines() if ln.strip()]
-    bad_wf  = [ln for ln in all_wf if "system-shutdown" in ln]
-    other   = len(all_wf) - len(bad_wf)
+    ready, total, _, _ = _pod_ready(fpod)
+    if total > 0 and ready == total:
+        results.append(row_ok(f"logging-operator-fluentd-0: {ready}/{total} Ready"))
+        return results
 
-    if other > 0:
-        results.append(row_ok(f"Argo workflows: {other} non-shutdown workflow(s) present"))
+    label = f"logging-operator-fluentd-0: {ready}/{total} Ready"
+    _, buf_out = ssh_exec(cp_host, password,
+                          "kubectl exec -n vmsp-platform logging-operator-fluentd-0 -c fluentd "
+                          "-- sh -c \"df -h /buffers | tail -1; "
+                          "find /buffers/backup -type f 2>/dev/null | wc -l\" 2>/dev/null",
+                          timeout=30)
+    lines = [l for l in buf_out.splitlines() if l.strip()]
+    disk_pct, backup_files = 0, 0
+    if lines:
+        parts = lines[0].split()
+        if len(parts) >= 5 and "%" in parts[4]:
+            try:
+                disk_pct = int(parts[4].rstrip("%"))
+            except ValueError:
+                pass
+    if len(lines) >= 2 and lines[1].strip().isdigit():
+        backup_files = int(lines[1].strip())
+    results.append(row_fail(label, f"buffer disk={disk_pct}% backup_files={backup_files} — "
+                            f"run vodap-fix.py or wait for vsp-health-monitor.py"))
+    return results
 
-    if bad_wf:
-        results.append(row_fail(
-            f"Stale system-shutdown workflows: 0 found",
-            f"{len(bad_wf)} stale — may re-cordon node and scale prelude to 0"
-        ))
-        if verbose:
-            for ln in bad_wf[:10]:
-                row_verbose(f"  {ln.strip()}")
+
+# ─── Section 11: Node Proxy Config ────────────────────────────────────────────
+def chk_proxy(cp_host, password, verbose):
+    """Compares each VSP node's proxy config against the lab's canonical
+    proxy URL (same value as lsfunctions.LAB_PROXY_URL — kept as a local
+    constant rather than importing lsfunctions, since this script is
+    otherwise fully self-contained). vsp-health-monitor.py's proxy_config
+    check repairs drift; this is detect-only."""
+    results = []
+    proxy_url = LAB_PROXY_URL
+
+    _, node_ips_out = ssh_exec(cp_host, password,
+                               "kubectl get nodes -o jsonpath='{range .items[*]}"
+                               "{.status.addresses[?(@.type==\"InternalIP\")].address}{\" \"}{end}' "
+                               "2>/dev/null", timeout=20)
+    node_ips = [ip for ip in node_ips_out.split() if ip]
+    if not node_ips:
+        results.append(row_warn("VSP node list: readable", "could not list node IPs"))
+        return results
+
+    drifted = []
+    for ip in node_ips:
+        _, out = ssh_exec(ip, password,
+                          f'grep -qF "{proxy_url}" /etc/sysconfig/proxy 2>/dev/null && '
+                          f'grep -qF "{proxy_url}" /etc/systemd/system/containerd.service.d/'
+                          f'http-proxy.conf 2>/dev/null && echo PROXY_OK || echo PROXY_DRIFT',
+                          timeout=15)
+        if "PROXY_OK" not in out:
+            drifted.append(ip)
+
+    if drifted:
+        results.append(row_fail(f"Proxy config: matches canonical on all {len(node_ips)} node(s)",
+                                f"drifted: {', '.join(drifted)} — run vsp-health-monitor.py "
+                                f"or VCFfinal.py to repair"))
     else:
-        results.append(row_ok("Stale system-shutdown Argo workflows: none"))
+        results.append(row_ok(f"Proxy config: matches canonical on all {len(node_ips)} node(s)"))
+    return results
 
+
+# ─── Section 12: Kubeadm Certificates ─────────────────────────────────────────
+def chk_kubeadm_certs(cp_host, password, verbose):
+    """kubeadm's own cert population (apiserver, etcd, front-proxy, etc.) is
+    a separate cert population from cert-manager's Certificate CRDs (section
+    8) — kubeadm certs never show up there. vsp_cert_renewer.py (invoked by
+    vsp-health-monitor.py's cert_renewal check) renews these; this is
+    detect-only."""
+    results = []
+    _, out = ssh_exec(cp_host, password, "kubeadm certs check-expiration 2>/dev/null",
+                      timeout=30)
+    if not out or "CERTIFICATE" not in out:
+        results.append(row_warn("kubeadm certs check-expiration: readable", "no response"))
+        return results
+
+    now = datetime.now(timezone.utc)
+    expiring = []
+    total = 0
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[0] in ("CERTIFICATE", "CERTIFICATE AUTHORITY"):
+            continue
+        # "CERTIFICATE  EXPIRES(3 tokens: 'Jun 06, 2031')  RESIDUAL_TIME  ..."
+        try:
+            exp_dt = datetime.strptime(" ".join(parts[1:4]), "%b %d, %Y").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        total += 1
+        days = (exp_dt - now).days
+        if days < 30:
+            expiring.append(f"{parts[0]}: {days}d")
+
+    if total == 0:
+        results.append(row_warn("kubeadm certs check-expiration: parsed", "no cert rows found"))
+    elif expiring:
+        results.append(row_fail(f"kubeadm certs: all {total} valid 30+ days",
+                                f"expiring soon: {'; '.join(expiring)}"))
+    else:
+        results.append(row_ok(f"kubeadm certs: all {total} valid 30+ days"))
     return results
 
 
@@ -715,6 +1087,9 @@ SECTION_MAP = {
     "salt":     "SALT STACK",
     "certs":    "TLS CERTIFICATES",
     "argo":     "ARGO WORKFLOWS",
+    "vodap":    "VODAP HEALTH",
+    "proxy":    "NODE PROXY CONFIG",
+    "kubeadm":  "KUBEADM CERTIFICATES",
 }
 
 
@@ -732,7 +1107,8 @@ def main():
     args = parser.parse_args()
 
     password = get_password()
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    run_start = datetime.now()
+    ts = run_start.strftime("%Y-%m-%d %H:%M:%S")
     W  = 70
 
     print(f"\n{_CYAN}╔{'═' * W}╗{_NC}")
@@ -742,26 +1118,13 @@ def main():
     print(f"{_CYAN}║{_NC}{ts:^{W}}{_CYAN}║{_NC}")
     print(f"{_CYAN}╚{'═' * W}╝{_NC}")
 
-    # Determine CP host
-    cp_host = args.host
+    # Determine CP host: --host, then hardcoded VIP, then auto-discovery.
+    cp_host, tried = resolve_cp_host(args.host, args.worker, password)
     if not cp_host:
-        print(f"\n{_DIM}Auto-discovering VSP control plane from {args.worker}...{_NC}")
-        cp_host = discover_cp(args.worker, password)
-        if cp_host:
-            print(f"  {_DIM}Control plane: {cp_host}{_NC}")
-        else:
-            cp_host = VSP_VIP
-            print(f"  {_WARN} Discovery failed — falling back to VIP {VSP_VIP}")
-
-    # Connectivity test
-    print(f"{_DIM}  Testing SSH to {cp_host}...{_NC}", end="", flush=True)
-    rc, _ = ssh_exec(cp_host, password, "echo PONG", timeout=20)
-    if rc != 0:
-        print()
-        print(f"\n{_RED}ERROR:{_NC} Cannot SSH to {cp_host} as {VSP_USER}.")
-        print(f"  If VIP is down: python3 vsp-health.py --host <actual-CP-node-IP>")
+        print(f"\n{_RED}ERROR:{_NC} Cannot SSH to any candidate host as {VSP_USER}.")
+        print(f"  Tried: {', '.join(tried)}")
+        print(f"  Specify a reachable CP node directly: python3 vsp-health.py --host <IP>")
         sys.exit(2)
-    print(f" {_OK}")
 
     # ── Bulk data fetch ────────────────────────────────────────────────────────
     want = args.section  # None = all sections
@@ -774,6 +1137,7 @@ def main():
     needs_sts    = want in (None, "vcf")
     needs_certs  = want in (None, "certs")
     needs_argo   = want in (None, "argo")
+    needs_comp   = want in (None, "vcf")
 
     crictl_out = ssh_exec(cp_host, password, "crictl ps 2>/dev/null", timeout=20)[1] \
                  if needs_crictl else ""
@@ -788,6 +1152,9 @@ def main():
                  if needs_sts else None
     certs_data = fetch_json(cp_host, password, "kubectl get certificates -A -o json 2>/dev/null", 30) \
                  if needs_certs else None
+    comp_data  = fetch_json(cp_host, password,
+                            "kubectl get components.api.vmsp.vmware.com -o json 2>/dev/null", 30) \
+                 if needs_comp else None
 
     # ── Run sections ──────────────────────────────────────────────────────────
     all_results: dict = {}
@@ -796,9 +1163,12 @@ def main():
         if want and want != key:
             return
         section(title)
+        section_start = datetime.now()
         rows = fn(*fn_args)
+        section_elapsed = (datetime.now() - section_start).total_seconds()
         for i, r in enumerate(rows):
             all_results[f"{key}_{i}"] = r
+        print(f"  {_DIM}({section_elapsed:.1f}s){_NC}")
 
     run("cp",       "CONTROL PLANE",
         chk_control_plane, cp_host, password, crictl_out, kvip_out, args.verbose)
@@ -810,7 +1180,7 @@ def main():
         chk_pod_overview, cp_host, password, args.verbose)
 
     run("vcf",      "VCF MANAGED COMPONENTS  (vcfcomponents)",
-        chk_vcf_components, deps_data, sts_data, args.verbose)
+        chk_vcf_components, deps_data, sts_data, comp_data, args.verbose)
 
     run("postgres", "POSTGRESQL INSTANCES",
         chk_postgres, cp_host, password, args.verbose)
@@ -827,16 +1197,29 @@ def main():
     run("argo",     "ARGO WORKFLOWS  (vmsp-platform)",
         chk_argo, cp_host, password, args.verbose)
 
+    run("vodap",    "VODAP HEALTH  (ClickHouse cert + fluentd buffers)",
+        chk_vodap, cp_host, password, args.verbose)
+
+    run("proxy",    "NODE PROXY CONFIG",
+        chk_proxy, cp_host, password, args.verbose)
+
+    run("kubeadm",  "KUBEADM CERTIFICATES",
+        chk_kubeadm_certs, cp_host, password, args.verbose)
+
     # ── Summary ───────────────────────────────────────────────────────────────
-    total  = len(all_results)
-    failed = sum(1 for v in all_results.values() if v is False)
-    color  = _GREEN if failed == 0 else _RED
+    total   = len(all_results)
+    failed  = sum(1 for v in all_results.values() if v is False)
+    color   = _GREEN if failed == 0 else _RED
+    elapsed = (datetime.now() - run_start).total_seconds()
 
     print(f"\n{_CYAN}{'─' * 64}{_NC}")
-    print(f"  {color}{_BOLD}RESULT: {total - failed}/{total} checks passed{_NC}")
+    print(f"  {color}{_BOLD}RESULT: {total - failed}/{total} checks passed{_NC}"
+          f"  {_DIM}(total: {elapsed:.1f}s){_NC}")
     if failed:
         print(f"  {_RED}  {failed} check(s) require attention — see {_FAIL} rows above{_NC}")
-        print(f"  {_DIM}  Remediation: python3 salt-stabilize.py | python3 kube-fix.py{_NC}")
+        print(f"  {_DIM}  Remediation: python3 salt-stabilize.py | python3 kube-fix.py | "
+              f"python3 vodap-fix.py{_NC}")
+        print(f"  {_DIM}  Or wait up to 5 min for vsp-health-monitor.py's next cron cycle{_NC}")
     else:
         print(f"  {_GREEN}  VSP cluster is healthy{_NC}")
     print(f"{_CYAN}{'─' * 64}{_NC}\n")
@@ -850,6 +1233,7 @@ def main():
             "checks_failed": failed,
             "checks_total": total,
             "healthy": failed == 0,
+            "elapsed_seconds": round(elapsed, 1),
             "detail": {k: v for k, v in all_results.items()},
         }
         print(json.dumps(summary, indent=2))
