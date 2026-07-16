@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VCFA Complete Stabilization Script v2.9
-# Version 2.9 - 2026-07-10
+# VCFA Complete Stabilization Script v2.11
+# Version 2.11 - 2026-07-14
 # Author - HOL Core Team
 #
 # Default-run philosophy (v2.6+): one run of the script with no flags should leave the VCFA in a
@@ -12,8 +12,11 @@
 # components -> SDS NACK fix -> wait -> verify -> monitoring setup.
 #
 # What's persistent (applied once, survives reboot, idempotent on re-runs):
-#   - kube-vip plndr-cp-lock lease tuning (60s/45s/10s, preserve_on_leadership_loss=true)
-#   - vmsp-platform kube-vip DaemonSet lease/probe tuning (NEW v2.9, see below)
+#   - kube-vip plndr-cp-lock renew/retry/preserve tuning (90s/10s, preserve_on_leadership_loss=true).
+#     NOTE (v2.11): lease DURATION is intentionally no longer managed here -- see the v2.11
+#     changelog entry below, kube-vip v1.0.2 ignores it for this Lease object.
+#   - vmsp-platform kube-vip DaemonSet lease/probe tuning (NEW v2.9, see below -- not yet confirmed
+#     to have the same lease-duration limitation; left as-is pending investigation)
 #   - kube-apiserver / kube-controller-manager / kube-scheduler probe timeouts
 #     (period=10 timeout=30 failureThreshold=8)
 #   - etcd defrag (only when slack >= 30%)
@@ -28,6 +31,53 @@
 #     unconditionally just churns rollouts. Set FORCE_KYVERNO_FIX=1 to bypass the heuristic.
 #
 # See VCFA_Stabilizer_Incident_Apr2026.md for the gateway/EnvoyProxy guidance and HTTP 503 recovery.
+#
+# v2.11 changelog (2026-07-14):
+#  * Removed the plndr-cp-lock LEASE DURATION enforcement (vip_leaseduration=120 in the kube-vip
+#    manifest, plus the "!=120, patch it" branch of the step 3/6 pre-flight). Root-caused via the
+#    auto-health.py tool on the troubleshooting pod: the manifest had vip_leaseduration="120"
+#    correctly set and UNCHANGED for over an hour (0 plndr-cp-lock leaseTransitions, same Lease
+#    uid/creationTimestamp across 3 kube-vip pod restarts), yet spec.leaseDurationSeconds stayed at
+#    15 the entire time. kube-vip v1.0.2's leaderelection renewal path re-writes its own hardcoded
+#    15s default into the Lease object on every renewal call -- it never reads vip_leaseduration
+#    for that field. A manual `kubectl patch` to 120 (what the old code did) visibly "succeeds" but
+#    gets stomped back to 15 within one retry cycle (~10-15s), so the fix was cosmetic-only and
+#    reverted long before anyone could observe it holding. Since this is a single-node control
+#    plane (no other candidate ever contends for plndr-cp-lock), leaseDurationSeconds=15 vs 120 has
+#    no operational consequence -- it's simply not a real problem, so we stopped pretending to fix
+#    it. See vcf-troubleshooting skill (VCF Automation reference) for the full writeup.
+#  * KEPT the emergency <10s "death-spiral" detection+patch (the original Apr 2026 incident showed
+#    leaseDurationSeconds=1, not the harmless 15s steady-state) -- that signature indicates active
+#    corruption under load, distinct from the routine 15-vs-120 cosmetic mismatch removed above.
+#  * vip_renewdeadline/vip_retryperiod/vip_preserve_on_leadership_loss are NOT known to have the
+#    same ignored-env-var problem (they configure kube-vip's own internal election timers, a
+#    separate code path from the Lease object's field write) and are still actively hardened.
+#  * Did NOT touch the vmsp-platform kube-vip DaemonSet's identical-looking vip_leaseduration=120
+#    setting (step 6/6, HelmRelease-managed) -- not independently verified to have the same
+#    limitation. Worth checking next time that DaemonSet's plndr-svcs-lock-equivalent Lease is
+#    inspected live.
+#  * Updated the Phase-1.5-already-applied idempotency marker (main()'s check_cmd) to check
+#    vip_renewdeadline="90" instead of vip_leaseduration="120", since the latter is no longer set.
+#
+# v2.10 changelog (2026-07-14):
+#  * Raised kube-vip desired lease from 60s→120s / renewDeadline 45s→90s for both the kube-system
+#    CP static-pod and vmsp-platform DaemonSet. Gives more headroom under CPU contention in nested
+#    labs and matches the original HOL troubleshooting recommendation.
+#  * Fixed step 3/6 lease pre-flight: was only acting when plndr-cp-lock leaseDurationSeconds < 10
+#    (the historical death-spiral signature). kube-vip v1.0.2 ignores vip_leaseduration env vars and
+#    always writes leaseDurationSeconds=15, so on labs where the manifest is already at desired but
+#    the live lease is still 15 the old check was a no-op. New logic:
+#      (a) Check actual lease against DESIRED_LEASE (120); if it differs, directly kubectl patch the
+#          Lease object to 120s (force-write) and also delete it so kube-vip recreates with correct
+#          values on next leader election.
+#      (b) The < 10 death-spiral branch is kept as a fast-path for historically-seen corruption.
+#  * Event-driven VIP watchdog: step 1/6 now also installs vcfa-vip-watchdog.{sh,service} if not
+#    already present. This runs `ip monitor addr` on eth0 and immediately re-pins any of the three
+#    VIPs (.69 .70 .72) that are deleted or deprecated by kube-vip restarts, complementing the
+#    per-run ip-addr-replace backstop with a persistent real-time guard.
+#  * Updated idempotency check to require manifest vip_leaseduration="120" (was "60").
+#  * Updated vmsp-platform HelmRelease patch, DaemonSet env, and vcfa-vmsp-kube-vip-keeper.sh to
+#    use the new 120/90/10 values consistently.
 #
 # v2.9 changelog (2026-07-10):
 #  * NEW Phase 1.5 step "6/6": harden the vmsp-platform/kube-vip DaemonSet the same way the
@@ -1021,6 +1071,71 @@ for v in "${CP_VIP}" "${VMSP_GW_VIP}" "${VCFA_GW_VIP}"; do
     fi
 done
 
+# 1/6 persistent: install event-driven VIP watchdog (vcfa-vip-watchdog.service).
+# This uses 'ip monitor addr' on eth0 to react in real-time to any address deletion or
+# deprecation and immediately re-pins the VCFA VIPs with preferred_lft forever.
+# Complements the per-run ip-addr-replace above with a 24/7 guard that survives kube-vip restarts.
+# Pre-flight: skip if script, service, and timer are already installed and active.
+_WATCHDOG_VIPS="${CP_VIP} ${VMSP_GW_VIP} ${VCFA_GW_VIP}"
+_WATCHDOG_SCRIPT=/usr/local/bin/vcfa-vip-watchdog.sh
+_WATCHDOG_SVC=/etc/systemd/system/vcfa-vip-watchdog.service
+_WD_NEEDS_INSTALL=0
+if [[ ! -f "$_WATCHDOG_SCRIPT" ]]; then
+    _WD_NEEDS_INSTALL=1
+    echo "  vcfa-vip-watchdog.sh not found -- installing"
+elif ! systemctl is-active --quiet vcfa-vip-watchdog.service 2>/dev/null; then
+    _WD_NEEDS_INSTALL=1
+    echo "  vcfa-vip-watchdog.service not active -- reinstalling"
+else
+    echo "  vcfa-vip-watchdog.service already installed and active (no-op)"
+fi
+if [[ "$_WD_NEEDS_INSTALL" == "1" ]]; then
+    mkdir -p /usr/local/bin /etc/systemd/system
+    cat > "$_WATCHDOG_SCRIPT" <<WDSCRIPT
+#!/bin/bash
+# Event-driven VCFA VIP watchdog. Installed by vcfa-stabilizer.sh v2.10+.
+# Uses 'ip monitor addr' to detect and immediately repair any deleted/deprecated VIP on eth0.
+VIPS="${_WATCHDOG_VIPS}"
+ETH=eth0
+fix_vips() {
+  for vip in \$VIPS; do
+    STATUS=\$(ip -oneline addr show dev \$ETH 2>/dev/null | grep -F "\${vip}/32" | head -1)
+    if [ -z "\$STATUS" ]; then
+      ip addr add \${vip}/32 dev \$ETH valid_lft forever preferred_lft forever 2>/dev/null || \
+        ip addr replace \${vip}/32 dev \$ETH valid_lft forever preferred_lft forever 2>/dev/null || true
+      command -v arping >/dev/null 2>&1 && arping -c 1 -A -I \$ETH \$vip &>/dev/null &
+    elif echo "\$STATUS" | grep -q deprecated; then
+      ip addr change \${vip}/32 dev \$ETH valid_lft forever preferred_lft forever 2>/dev/null || true
+    fi
+  done
+}
+fix_vips
+/usr/sbin/ip monitor addr dev \$ETH 2>&1 | while read line; do
+  echo "\$line" | grep -qEi "deleted|deprecated" && fix_vips
+done
+WDSCRIPT
+    chmod +x "$_WATCHDOG_SCRIPT"
+    cat > "$_WATCHDOG_SVC" <<'WDSVC'
+[Unit]
+Description=VCFA VIP Watchdog - keeps CP and gateway VIPs preferred_lft=forever
+After=network.target
+DefaultDependencies=no
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vcfa-vip-watchdog.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+WDSVC
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable --now vcfa-vip-watchdog.service 2>/dev/null \
+        && echo "  vcfa-vip-watchdog.service installed and started" \
+        || echo "  WARN: failed to enable vcfa-vip-watchdog.service"
+fi
+
 echo
 echo "=== 2/6: etcd defrag (only if slack >= ${ETCD_SLACK_PCT}%) ==="
 ETCDCTL='etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/peer.crt --key=/etc/kubernetes/pki/etcd/peer.key --endpoints=https://127.0.0.1:2379'
@@ -1051,13 +1166,36 @@ echo
 echo "=== 3/6: harden kube-vip lease/renew/retry/preserve (static pod manifest) ==="
 M=/etc/kubernetes/manifests/kube-vip.yaml
 if [[ -f "$M" ]]; then
+    # 3a. Remove unsupported CLI args that crash kube-vip v1.0.x.
+    # --leaseDuration / --renewDeadline / --retryPeriod are not valid flags in the kube-vip binary;
+    # passing them causes kube-vip to print --help and exit, putting it into a crash loop.
+    # Lease duration is configured via env vars (vip_leaseduration etc.) not CLI args.
+    python3 - <<'PY'
+import yaml, shutil, time, os
+p="/etc/kubernetes/manifests/kube-vip.yaml"
+m=yaml.safe_load(open(p))
+c=m["spec"]["containers"][0]
+bad=["--leaseDuration","--renewDeadline","--retryPeriod"]
+old=c.get("args",[])
+new=[a for a in old if not any(a.startswith(f) for f in bad)]
+if new!=old:
+    shutil.copy2(p,p+".bak."+str(int(time.time())))
+    c["args"]=new
+    yaml.dump(m,open(p,"w"),default_flow_style=False)
+    os.utime(p,None)
+    print("  removed unsupported CLI flags from kube-vip manifest: "+str([a for a in old if a not in new]))
+PY
+    # v2.11: vip_leaseduration removed from `desired` below -- confirmed live that kube-vip v1.0.2
+    # ignores it for the plndr-cp-lock Lease object's spec.leaseDurationSeconds field regardless of
+    # what the manifest says, so managing it here was cosmetic-only. See v2.11 changelog above.
     KV_NEEDS=$(python3 - <<'PY'
 import re
 p="/etc/kubernetes/manifests/kube-vip.yaml"
 s=open(p).read()
-desired={"vip_leaseduration":"60","vip_renewdeadline":"45","vip_retryperiod":"10","vip_preserve_on_leadership_loss":"true"}
+desired={"vip_renewdeadline":"90","vip_retryperiod":"10","vip_preserve_on_leadership_loss":"true"}
 def getv(text, name):
-    m=re.search(r'- name: ' + re.escape(name) + r'\s*\n\s+value: "([^"]*)"', text, re.M)
+    # Match both single-quoted and double-quoted YAML values (kube-vip manifests vary by build)
+    m=re.search(r'- name: ' + re.escape(name) + r'\s*\n\s+value: ["\']([^"\']*)["\']', text, re.M)
     return m.group(1) if m else None
 print("CHANGE" if any(getv(s,k)!=v for k,v in desired.items()) else "OK")
 PY
@@ -1068,32 +1206,37 @@ PY
 import re
 p="/etc/kubernetes/manifests/kube-vip.yaml"
 s=open(p).read()
-desired={"vip_leaseduration":"60","vip_renewdeadline":"45","vip_retryperiod":"10","vip_preserve_on_leadership_loss":"true"}
+desired={"vip_renewdeadline":"90","vip_retryperiod":"10","vip_preserve_on_leadership_loss":"true"}
 def setv(text, name, val):
-    pat=re.compile(r'(- name: ' + re.escape(name) + r'\s*\n\s+value: ")[^"]*(")', re.M)
-    new, n = pat.subn(r'\g<1>'+val+r'\g<2>', text)
+    # Match both single-quoted and double-quoted YAML values; always write double-quoted output
+    pat=re.compile(r'(- name: ' + re.escape(name) + r'\s*\n\s+value: )["\'][^"\']*["\']', re.M)
+    new, n = pat.subn(r'\g<1>"'+val+'"', text)
     return new if n>0 else text
 for k,v in desired.items(): s=setv(s,k,v)
 open(p,"w").write(s)
 PY
-        echo "  kube-vip manifest updated: lease=60s renew=45s retry=10s preserve=true"
-        # Nuke the corrupted plndr-cp-lock so kube-vip rebuilds it with the new lease duration.
-        $K -n kube-system delete lease plndr-cp-lock --ignore-not-found 2>&1 | head -1 || true
+        echo "  kube-vip manifest updated: renew=90s retry=10s preserve=true"
         # Touch the manifest to force kubelet to re-read (env-var changes alone don't trigger restart).
         touch "$M" 2>/dev/null || true
-        echo "  manifest touched, lease deleted; kubelet will recreate kube-vip pod within ~30s"
+        echo "  manifest touched; kubelet will recreate kube-vip pod within ~30s"
     else
-        echo "  kube-vip manifest already at desired values (lease=60 renew=45 retry=10 preserve=true) -- no-op"
-        # Only intervene if the lease is dangerously short (the death-spiral signature was
-        # leaseDurationSeconds=1). Some kube-vip builds ignore vip_leaseduration and pin to the
-        # default 15s -- that's healthy, leave it alone. Only act below 10s.
-        LEASE_DUR=$($K -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.leaseDurationSeconds}' 2>/dev/null || echo "")
-        if [[ -n "$LEASE_DUR" && "$LEASE_DUR" -lt 10 ]]; then
-            echo "  WARN: plndr-cp-lock has leaseDurationSeconds=${LEASE_DUR} (death-spiral signature); deleting so kube-vip rebuilds it"
-            $K -n kube-system delete lease plndr-cp-lock --ignore-not-found 2>&1 | head -1 || true
-        elif [[ -n "$LEASE_DUR" ]]; then
-            echo "  plndr-cp-lock leaseDurationSeconds=${LEASE_DUR} (>= 10, healthy) -- no action"
-        fi
+        echo "  kube-vip manifest already at desired values (renew=90 retry=10 preserve=true) -- no-op"
+    fi
+    # Emergency-only: detect the true death-spiral signature (leaseDurationSeconds<10, originally
+    # observed as =1 during the Apr 2026 control-plane overload incident) and patch it away. This
+    # is NOT the same as the routine "!=120" cosmetic mismatch removed in v2.11 -- a lease stuck at
+    # the kube-vip chart default (15s) is harmless on this single-node appliance (nothing else ever
+    # contends for the CP VIP), but <10s indicates active corruption under load and is worth a
+    # one-off patch attempt even though it likely won't persist once the renewal loop resumes.
+    LEASE_DUR=$($K -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.leaseDurationSeconds}' 2>/dev/null || echo "")
+    if [[ -n "$LEASE_DUR" && "$LEASE_DUR" -lt 10 ]]; then
+        echo "  WARN: plndr-cp-lock has leaseDurationSeconds=${LEASE_DUR} (death-spiral signature); deleting + patching to 120s"
+        $K -n kube-system delete lease plndr-cp-lock --ignore-not-found 2>&1 | head -1 || true
+        sleep 5
+        $K -n kube-system patch lease plndr-cp-lock --type=merge \
+            -p '{"spec":{"leaseDurationSeconds":120}}' 2>&1 | head -1 || true
+    elif [[ -n "$LEASE_DUR" ]]; then
+        echo "  plndr-cp-lock leaseDurationSeconds=${LEASE_DUR} (kube-vip v1.0.2 ignores vip_leaseduration for this field; not managed, harmless on single-node CP) -- no action"
     fi
 else
     echo "  /etc/kubernetes/manifests/kube-vip.yaml not found, skipping kube-vip hardening"
@@ -1300,10 +1443,10 @@ if $K -n "${VMSP_NS}" get daemonset kube-vip >/dev/null 2>&1; then
     # reinstall) lands the hardened lease settings instead of the chart defaults.
     if $K -n "${VMSP_NS}" get helmrelease kube-vip >/dev/null 2>&1; then
         HR_CUR=$($K -n "${VMSP_NS}" get helmrelease kube-vip -o jsonpath='{.spec.values.env.vip_leaseduration},{.spec.values.env.vip_renewdeadline},{.spec.values.env.vip_retryperiod},{.spec.values.env.vip_preserve_on_leadership_loss}' 2>/dev/null)
-        if [[ "$HR_CUR" == "60,45,10,true" ]]; then
+        if [[ "$HR_CUR" == "120,90,10,true" ]]; then
             echo "  HelmRelease ${VMSP_NS}/kube-vip values already hardened (no-op)"
         else
-            $K -n "${VMSP_NS}" patch helmrelease kube-vip --type=merge -p '{"spec":{"values":{"env":{"vip_leaseduration":"60","vip_renewdeadline":"45","vip_retryperiod":"10","vip_preserve_on_leadership_loss":"true"}}}}' >/dev/null 2>&1 \
+            $K -n "${VMSP_NS}" patch helmrelease kube-vip --type=merge -p '{"spec":{"values":{"env":{"vip_leaseduration":"120","vip_renewdeadline":"90","vip_retryperiod":"10","vip_preserve_on_leadership_loss":"true"}}}}' >/dev/null 2>&1 \
                 && echo "  HelmRelease ${VMSP_NS}/kube-vip values patched (was ${HR_CUR:-<unset>})" \
                 || echo "  WARN: HelmRelease ${VMSP_NS}/kube-vip patch failed"
         fi
@@ -1318,7 +1461,7 @@ import json, sys
 d = json.load(sys.stdin)
 c = d['spec']['template']['spec']['containers'][0]
 env = c.get('env', []) or []
-want_env = {'vip_leaseduration':'60','vip_renewdeadline':'45','vip_retryperiod':'10','vip_preserve_on_leadership_loss':'true'}
+want_env = {'vip_leaseduration':'120','vip_renewdeadline':'90','vip_retryperiod':'10','vip_preserve_on_leadership_loss':'true'}
 changed = False
 seen = set()
 for e in env:
@@ -1343,7 +1486,7 @@ if changed:
 ")
     if [[ -n "$NEW_SPEC" ]]; then
         $K -n "${VMSP_NS}" patch daemonset kube-vip --type=json -p "$NEW_SPEC" >/dev/null 2>&1 \
-            && echo "  daemonset/kube-vip -n ${VMSP_NS} env + livenessProbe hardened now (lease=60 renew=45 retry=10 preserve=true, probe timeout=10s threshold=5)" \
+            && echo "  daemonset/kube-vip -n ${VMSP_NS} env + livenessProbe hardened now (lease=120 renew=90 retry=10 preserve=true, probe timeout=10s threshold=5)" \
             || echo "  WARN: daemonset/kube-vip -n ${VMSP_NS} patch failed"
     else
         echo "  daemonset/kube-vip -n ${VMSP_NS} env + livenessProbe already hardened (no-op)"
@@ -1363,7 +1506,7 @@ import json, sys
 d = json.load(sys.stdin)
 c = d['spec']['template']['spec']['containers'][0]
 env = c.get('env', []) or []
-want_env = {'vip_leaseduration':'60','vip_renewdeadline':'45','vip_retryperiod':'10','vip_preserve_on_leadership_loss':'true'}
+want_env = {'vip_leaseduration':'120','vip_renewdeadline':'90','vip_retryperiod':'10','vip_preserve_on_leadership_loss':'true'}
 changed = False
 seen = set()
 for e in env:
@@ -1836,9 +1979,11 @@ main() {
     # up a newer persistent fix (exactly what happened to the vmsp-platform kube-vip hardening below on
     # labs that already had the envoy-gateway keeper installed). Require ALL THREE before short-circuiting:
     # 1. The durable envoy-gateway memory watcher script (from Phase 3.5)
-    # 2. The kube-system control-plane kube-vip lease duration tuning (from Phase 1.5)
+    # 2. The kube-system control-plane kube-vip renew/retry tuning (from Phase 1.5)
     # 3. The vmsp-platform kube-vip DaemonSet watcher script (NEW v2.9, from Phase 1.5 step 6/6)
-    local check_cmd="test -f /usr/local/bin/vcfa-eg-mem-keeper.sh && (grep -A 1 'name: vip_leaseduration' /etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null | grep -q 'value: \"60\"') && test -f /usr/local/bin/vcfa-vmsp-kube-vip-keeper.sh"
+    # v2.11: marker 2 now checks vip_renewdeadline="90" instead of vip_leaseduration="120" --
+    # the lease-duration setting was removed (kube-vip v1.0.2 ignores it; see v2.11 changelog).
+    local check_cmd="test -f /usr/local/bin/vcfa-eg-mem-keeper.sh && (grep -A 1 'name: vip_renewdeadline' /etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null | grep -q 'value: \"90\"') && test -f /usr/local/bin/vcfa-vmsp-kube-vip-keeper.sh && test -f /usr/local/bin/vcfa-vip-watchdog.sh"
     if vcfa_ssh_nosudo "$check_cmd" >/dev/null 2>&1; then
         echo "VCFA Stabilizer already applied..."
         exit 0
@@ -1921,7 +2066,7 @@ main() {
 # Handle script arguments
 case "${1:-}" in
     --help|-h)
-        echo "VCFA Complete Stabilization Script v2.9"
+        echo "VCFA Complete Stabilization Script v2.11"
         echo "See: ${SCRIPT_DIR}/VCFA_Stabilizer_Incident_Apr2026.md"
         echo ""
         echo "Usage: $0 [options]"
@@ -1934,13 +2079,13 @@ case "${1:-}" in
         echo "The control-plane preflight (1.5) applies these durable fixes idempotently:"
         echo "  - pin gateway+CP VIPs (.69/.70/.72) on eth0 non-deprecated (kube-vip backstop)"
         echo "  - defrag etcd if slack >= ETCD_DEFRAG_SLACK_PCT (default 30%)"
-        echo "  - harden kube-vip plndr-cp-lock lease (60s renew=45s retry=10s, preserve_on_leadership_loss=true)"
+        echo "  - harden kube-vip plndr-cp-lock renew=90s retry=10s preserve_on_leadership_loss=true"
         echo "  - bump kube-apiserver/kcm/scheduler probe timeouts (period=10 timeout=30 failureThreshold=8)"
         echo "  - kyverno --forceFailurePolicyIgnore=true (CONDITIONAL: only applied when trouble is"
         echo "    detected -- load1>30, kyverno pods not Ready, or kcm restarts>5 -- because"
         echo "    vmsp-operator reverts the patch on every helm reconcile)"
-        echo "  - NEW v2.9: harden vmsp-platform kube-vip DaemonSet (Services LB, VIPs .69/.70) the same"
-        echo "    way -- lease=60/renew=45/retry=10/preserve=true, healthz probe timeout=10s threshold=5 --"
+        echo "  - v2.9/v2.10: harden vmsp-platform kube-vip DaemonSet (Services LB, VIPs .69/.70) the same"
+        echo "    way -- lease=120/renew=90/retry=10/preserve=true, healthz probe timeout=10s threshold=5 --"
         echo "    plus a 60s systemd drift watcher (vcfa-vmsp-kube-vip-keeper.timer) since this DaemonSet"
         echo "    is Flux/vmsp-operator-managed and can revert a bare patch on reconcile."
         echo "On a healthy cluster Phase 1.5 prints status and changes nothing (no kubelet churn)."

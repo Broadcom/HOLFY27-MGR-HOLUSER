@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.22 - 2026-06-17
+# Version 2.24 - 2026-07-13
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -10,6 +10,40 @@
 # Supports both VCF 9.1 and VVF 9.1 lab types (VVF-only steps are skipped).
 #
 # CHANGELOG:
+# v2.24 - 2026-07-13:
+#   - Reworked Step 8b fix_vsp_controlplane_sizing() to use the SUPPORTED,
+#     operator-honored lever: it bumps the vsp ComponentVersion's ACTIVE size
+#     profile control-plane cpu to >= 12 (leaving the profile's `worker` size
+#     untouched, so worker nodes are unaffected and only the CP rolls). The
+#     prior approach (patching Cluster.spec.topology / VSphereMachineTemplates +
+#     HelmRelease driftDetection=warn) was REVERTED by vmsp-operator within ~90s
+#     — the operator continuously re-renders those from the vsp component package.
+#     The ComponentVersion `sizes` profile is the input the operator actually
+#     honors, so the change is durable. This addresses the root cause of the
+#     leader-election storm (an undersized 4-vCPU CP under size=small) that
+#     surfaces as gateway/fleet-lcm flapping + "Service or view is not available".
+#   - Evaluated and REMOVED a Kyverno --forceFailurePolicyIgnore step: that flag
+#     lives on a vmsp-operator-rendered deployment (reverts in ~90s; re-patching
+#     rolls the admission-controller), and the webhook configs are re-asserted by
+#     Kyverno itself in ~2min — no durable in-cluster override exists. Adequate
+#     CP sizing (above) removes the storm's resource-stress trigger; a supported
+#     forceFailurePolicyIgnore path would need Broadcom. See supervisor-k8s.md#59.
+#
+# v2.23 - 2026-07-13:
+#   - Added Step 8b: fix_vsp_controlplane_sizing() — patches
+#     Cluster.spec.topology.controlPlane.variables.overrides (and, defensively,
+#     every workers.machineDeployments[] override) to >= 12 vCPU / 24GB memory,
+#     matching worker sizing. The VSP ClusterClass ships the control-plane node
+#     undersized (4 vCPU/8-10GB) by default; since it runs etcd/kube-apiserver,
+#     this starves the most latency-sensitive node in the cluster, causing
+#     chronic flapping under load. Runs at template-prep time so every lab
+#     cloned from this template starts with a correctly-sized control plane —
+#     no per-lab-boot fix needed. Also sets vmsp-configs HelmRelease
+#     driftDetection.mode to "warn" (and unsuspends it if suspended) so Flux
+#     keeps reconciling without reverting the sizing fix. Idempotent and
+#     non-fatal; added --skip-vsp-sizing CLI flag.
+#     See vcf-troubleshooting skill references/supervisor-k8s.md#56.
+#
 # v2.21 - 2026-06-01:
 #   - Added VCF vs VVF lab product detection (is_vcf / is_vvf) after lsf.init().
 #   - Steps 3 (NSX), 4 (SDDC Manager), 5 (VCF Automation), and 7 (SDDC auto-rotate)
@@ -344,7 +378,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.21'
+SCRIPT_VERSION = '2.24'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -5117,6 +5151,199 @@ echo "PROXY_CONFIGURED"
     return success
 
 
+#==============================================================================
+# VSP CONTROL-PLANE SIZING
+#==============================================================================
+
+VSP_CP_VIP = '10.1.1.142'
+VSP_SSH_USER = 'vmware-system-user'
+VSP_TOPOLOGY_MIN_NUMCPU = 12
+VSP_TOPOLOGY_MIN_MEMORY_MIB = 24576
+
+
+def _vsp_kubectl(cmd: str, password: str) -> 'subprocess.CompletedProcess':
+    """Run a kubectl command on the VSP control plane VIP via sudo -S -i.
+
+    Matches the pattern already used by configure_vsp_proxy()'s discover_cmd —
+    a single remote shell invocation, no nested bash -c layers.
+    """
+    full_cmd = f"echo '{password}' | sudo -S -i kubectl {cmd}"
+    return lsf.ssh(full_cmd, f'{VSP_SSH_USER}@{VSP_CP_VIP}', password)
+
+
+def _apply_vsp_json_patch(resource: str, name: str, namespace: str,
+                           patch, password: str, ptype: str = 'merge') -> bool:
+    """Apply a patch to a resource on the VSP control plane.
+
+    ptype: 'merge' (JSON merge patch, dict) or 'json' (RFC-6902 op list).
+    Writes the patch to a local temp file and scp's it across rather than
+    embedding JSON inline in the SSH command string — nested SSH+sudo+kubectl
+    layers mangle embedded quoting (see vcf-troubleshooting skill
+    references/supervisor-k8s.md#56).
+    """
+    patch_json = json.dumps(patch)
+    local_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            f.write(patch_json)
+            local_path = f.name
+    except Exception as e:
+        lsf.write_output(f'  ERROR: Could not write local patch file: {e}')
+        return False
+
+    remote_path = f'/tmp/confighol_vsp_patch_{int(time.time())}.json'
+    try:
+        scp_result = lsf.scp(local_path, f'{VSP_SSH_USER}@{VSP_CP_VIP}:{remote_path}', password)
+        if scp_result.returncode != 0:
+            lsf.write_output('  ERROR: Could not copy patch file to VSP control plane')
+            return False
+
+        ns_arg = f'-n {namespace} ' if namespace else ''
+        patch_cmd = (
+            f"echo '{password}' | sudo -S -i kubectl patch {resource} {name} "
+            f"{ns_arg}--type={ptype} --patch-file={remote_path}"
+        )
+        result = lsf.ssh(patch_cmd, f'{VSP_SSH_USER}@{VSP_CP_VIP}', password)
+        lsf.ssh(f"echo '{password}' | sudo -S rm -f {remote_path}",
+                f'{VSP_SSH_USER}@{VSP_CP_VIP}', password)
+        return result.returncode == 0
+    finally:
+        if local_path:
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+
+
+
+def fix_vsp_controlplane_sizing(dry_run: bool = False) -> bool:
+    """
+    Ensure the VSP control-plane node gets >= 12 vCPU via the SUPPORTED,
+    operator-honored lever: the vsp ComponentVersion `sizes` profile.
+
+    Root cause (see vcf-troubleshooting references/supervisor-k8s.md#56/#59):
+    the `vsp` Component ships at size=small, whose control-plane profile caps
+    CP at 4 vCPU (workers get "large" = 12 vCPU). A 4-vCPU CP running etcd +
+    kube-apiserver + Kyverno's fail-closed admission webhooks is the stressed
+    foundation that lets a transient Kyverno blip ignite a self-sustaining
+    leader-election storm (kube-scheduler / controller-manager / envoy-gateway /
+    Kyverno all losing leases and restarting) — surfacing to end users as
+    gateway/fleet-lcm flapping and "Service or view is not available".
+
+    IMPORTANT — why THIS lever and not the earlier approaches: editing
+    Cluster.spec.topology.controlPlane.variables.overrides or the
+    VSphereMachineTemplates is REVERTED by vmsp-operator within ~90s (it
+    continuously re-renders those from the vsp component package). Likewise
+    HelmRelease driftDetection=warn is reverted. The durable input the operator
+    actually honors is the ComponentVersion's own `sizes` array. This function
+    bumps the ACTIVE size profile's control-plane cpu to >= 12 while leaving its
+    `worker` size untouched — so the CP grows (and only the CP node rolls) while
+    the worker nodes are completely unaffected.
+
+    Idempotent (skips if the active profile's CP is already >= 12); non-fatal
+    (logs + returns True if VSP isn't present/reachable). vpodchecker.py's
+    VSP Node Resources check and vsp-health-monitor.py verify/re-assert it.
+    """
+    lsf.write_output('')
+    lsf.write_output('=' * 60)
+    lsf.write_output('VSP Control-Plane Node Sizing (ComponentVersion size profile)')
+    lsf.write_output('=' * 60)
+
+    password = lsf.get_password()
+
+    if not lsf.test_ping(VSP_CP_VIP):
+        lsf.write_output(f'{VSP_CP_VIP}: VSP control plane VIP not reachable - '
+                         f'skipping (this lab type may not use a VSP cluster)')
+        return True
+
+    # ---- Discover the vsp Component: active size profile + ComponentVersion name ----
+    comp = _vsp_kubectl('get components.api.vmsp.vmware.com vsp -o json', password)
+    craw = (getattr(comp, 'stdout', '') or '')
+    cjs = craw.find('{')
+    if getattr(comp, 'returncode', 1) != 0 or cjs < 0:
+        lsf.write_output('vsp Component not found - skipping '
+                         '(this lab type may not use a VSP cluster)')
+        return True
+    try:
+        cdata = json.loads(craw[cjs:])
+        active_size = cdata.get('spec', {}).get('size', 'small')
+        cv_name = cdata.get('spec', {}).get('versionRef', {}).get('name', '')
+    except Exception as e:
+        lsf.write_output(f'WARNING: could not parse vsp Component: {e} - skipping')
+        return True
+    if not cv_name:
+        lsf.write_output('WARNING: vsp Component has no versionRef - skipping')
+        return True
+
+    lsf.write_output(f'vsp Component: active size profile="{active_size}", '
+                     f'ComponentVersion="{cv_name}"')
+
+    # ---- Read the ComponentVersion size profiles ----
+    cv = _vsp_kubectl(f'get componentversions.api.vmsp.vmware.com {cv_name} -o json', password)
+    cvraw = (getattr(cv, 'stdout', '') or '')
+    cvjs = cvraw.find('{')
+    if getattr(cv, 'returncode', 1) != 0 or cvjs < 0:
+        lsf.write_output(f'WARNING: could not read ComponentVersion {cv_name} - skipping')
+        return True
+    try:
+        cvdata = json.loads(cvraw[cvjs:])
+        sizes = cvdata.get('spec', {}).get('sizes', [])
+    except Exception as e:
+        lsf.write_output(f'WARNING: could not parse ComponentVersion sizes: {e} - skipping')
+        return True
+
+    prof = next((s for s in sizes if s.get('name') == active_size), None)
+    if prof is None:
+        lsf.write_output(f'WARNING: active size profile "{active_size}" not found in '
+                         f'ComponentVersion sizes - skipping')
+        return True
+
+    def _cpu_max(p):
+        try:
+            return float(str(p.get('resources', {}).get('cpu', {}).get('max', '0')))
+        except (ValueError, TypeError):
+            return 0.0
+
+    cur_cpu_max = _cpu_max(prof)
+    cur_worker = prof.get('worker', {}).get('size', '?')
+    if cur_cpu_max >= VSP_TOPOLOGY_MIN_NUMCPU:
+        lsf.write_output(f'  "{active_size}" profile CP cpu.max={cur_cpu_max} '
+                         f'(>= {VSP_TOPOLOGY_MIN_NUMCPU}), worker="{cur_worker}" - OK')
+        lsf.write_output('VSP control-plane sizing check complete - no changes needed')
+        return True
+
+    lsf.write_output(f'  "{active_size}" profile CP cpu.max={cur_cpu_max} is UNDERSIZED '
+                     f'(< {VSP_TOPOLOGY_MIN_NUMCPU}); worker="{cur_worker}" (leaving workers as-is). '
+                     f'Bumping CP cpu to max={VSP_TOPOLOGY_MIN_NUMCPU}/min=8.')
+    if dry_run:
+        lsf.write_output('  [DRY-RUN] Would patch ComponentVersion sizes '
+                         f'"{active_size}".resources.cpu -> max 12/min 8 (worker untouched)')
+        return True
+
+    # Rebuild the full sizes array (merge patch replaces the whole list); only
+    # the active profile's CP cpu is changed — memory/storage/worker preserved.
+    new_sizes = []
+    for s in sizes:
+        s = json.loads(json.dumps(s))  # deep copy
+        if s.get('name') == active_size:
+            s.setdefault('resources', {}).setdefault('cpu', {})
+            s['resources']['cpu']['max'] = str(VSP_TOPOLOGY_MIN_NUMCPU)
+            s['resources']['cpu']['min'] = '8'
+        new_sizes.append(s)
+
+    if _apply_vsp_json_patch('componentversions.api.vmsp.vmware.com', cv_name, '',
+                             {'spec': {'sizes': new_sizes}}, password):
+        lsf.write_output(f'  Patched ComponentVersion "{active_size}" profile CP cpu -> '
+                         f'12 (worker size "{cur_worker}" unchanged). The operator re-renders '
+                         f'the CP node to 12 vCPU; only the CP rolls, workers are untouched.')
+    else:
+        lsf.write_output('  ERROR: failed to patch ComponentVersion sizes')
+        return False
+
+    lsf.write_output('VSP control-plane sizing complete (durable via ComponentVersion profile)')
+    return True
+
+
 def configure_all_proxies(dry_run: bool = False,
                            auto_yes: bool = False) -> bool:
     """Configure PROXY and NO_PROXY settings across all 4 lab targets.
@@ -5446,6 +5673,8 @@ def main():
     6.  Operations VMs configuration
     7.  Disable SDDC Manager auto-rotate policies           [VCF only]
     8.  Configure VCF Operations Fleet Password Policy
+    8b. Fix VSP control-plane node sizing (>= 12 vCPU / 24GB, matching workers)
+    8c. Harden Kyverno failure policy (forceFailurePolicyIgnore=true) — storm prevention
     9.  Configure proxy/NO_PROXY on all 4 targets (vCenter OS, Supervisor CP, Supervisor API,
         VSP nodes) — interactive Y/N prompt showing resolved PROXY_URL and NO_PROXY values.
     10. K8s certificate pre-provisioning — VSP + VCFA (kubeadm, kubelet, cert-manager, Antrea → 5y)
@@ -5500,6 +5729,9 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
                         help='Skip Step 11: Supervisor ESXi spherelet '
                              'certificate pre-provisioning via '
                              'supervisor_stabilizer.py')
+    parser.add_argument('--skip-vsp-sizing', action='store_true',
+                        help='Skip Step 8b: VSP control-plane node sizing fix '
+                             '(numCPUs/memoryMiB topology override)')
     parser.add_argument('--version', action='version',
                         version=f'%(prog)s {SCRIPT_VERSION}')
     
@@ -5640,7 +5872,27 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
     # Step 8: Configure VCF Operations Fleet Password Policy
     # Creates "MaxExpiration" policy, assigns ALL inventory (MANAGEMENT + INSTANCE), remediates
     configure_vcf_fleet_password_policy(args.dry_run)
-    
+
+    # Step 8b: Fix VSP control-plane node sizing
+    # The VSP ClusterClass ships the control-plane node undersized (4 vCPU/8-10GB)
+    # relative to workers (12 vCPU/24GB) — the etcd/kube-apiserver node ends up
+    # the most resource-starved node in the cluster, causing chronic flapping
+    # under load. Patches Cluster.spec.topology.controlPlane.variables.overrides
+    # to match the worker sizing before the template is captured, so every lab
+    # cloned from this template starts with a correctly-sized control plane.
+    # See vcf-troubleshooting skill references/supervisor-k8s.md#56.
+    if not args.skip_vsp_sizing:
+        fix_vsp_controlplane_sizing(args.dry_run)
+
+    # (Kyverno failure-policy hardening was evaluated and removed: the
+    # --forceFailurePolicyIgnore flag lives on a vmsp-operator-rendered deployment
+    # that reverts within ~90s, and re-patching it rolls the admission-controller
+    # every cycle. There is no accessible in-cluster override for Kyverno's
+    # failurePolicy. The supported mitigation is adequate control-plane sizing
+    # (Step 8b), which removes the resource-stress TRIGGER for the leader-election
+    # storm. If storms still occur at proper size, escalate to Broadcom for a
+    # supported forceFailurePolicyIgnore path. See supervisor-k8s.md#59.)
+
     # Step 9: Configure proxy and NO_PROXY on all 4 targets
     # Shows resolved PROXY_URL + NO_PROXY values, asks Y/N (unless --yes-proxy).
     # Use --skip-proxy-config for non-HOL lab types that do not need a proxy.

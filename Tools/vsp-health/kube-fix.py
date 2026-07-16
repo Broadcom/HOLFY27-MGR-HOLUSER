@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 kube-fix.py
-Version 1.0.0 - 2026-06-17
+Version 1.1.0 - 2026-07-16
 Author: Burke Azbill and HOL Core Team
+
+v1.1.0: CP host resolution now tries candidates in order — explicit --host,
+then the hardcoded VSP_VIP, then auto-discovery via --worker — stopping at
+the first one that answers SSH, matching vsp-health.py's resolve_cp_host().
 
 Remediates Kubernetes control-plane instability on the VSP (Supervisor)
 cluster caused by kube-vip VIP drops and kube-controller-manager
@@ -48,8 +52,8 @@ import sys
 import time
 from datetime import datetime
 
-VERSION = "1.0.0"
-DATE    = "2026-06-17"
+VERSION = "1.1.0"
+DATE    = "2026-07-16"
 
 CREDS_FILE = "/home/holuser/creds.txt"
 VSP_USER   = "vmware-system-user"
@@ -83,8 +87,8 @@ def show_help():
     print(f"{_CYAN}╚{'═' * W}╝{_NC}\n")
     print(f"{_BOLD}USAGE:{_NC}\n    kube-fix.py [--host IP] [--worker FQDN] [--dry-run] [-v]\n")
     print(f"{_BOLD}OPTIONS:{_NC}")
-    print(f"    {_GREEN}--host{_NC} <IP>       VSP control-plane host/VIP  (default: {VSP_VIP})")
-    print(f"    {_GREEN}--worker{_NC} <FQDN>   VSP worker FQDN for CP discovery (default: {VSP_WORKER})")
+    print(f"    {_GREEN}--host{_NC} <IP>       VSP control-plane host, tried first if set")
+    print(f"    {_GREEN}--worker{_NC} <FQDN>   VSP worker FQDN for CP auto-discovery (default: {VSP_WORKER})")
     print(f"    {_GREEN}--vip{_NC} <IP>        Kubernetes VIP to restore if down (default: {VSP_VIP})")
     print(f"    {_GREEN}--skip-vip{_NC}        Skip VIP restore step")
     print(f"    {_GREEN}--skip-kvip{_NC}       Skip kube-vip manifest patch step")
@@ -92,6 +96,11 @@ def show_help():
     print(f"    {_GREEN}--dry-run{_NC}         Show what would be done without making changes")
     print(f"    {_GREEN}-v, --verbose{_NC}     Show full command output for each step")
     print(f"    {_GREEN}-h, --help{_NC}        Show this help message\n")
+    print(f"{_BOLD}CP HOST RESOLUTION ORDER:{_NC}")
+    print(f"    1. {_GREEN}--host{_NC} <IP>, if given")
+    print(f"    2. Hardcoded VIP  ({VSP_VIP})")
+    print(f"    3. Auto-discovery via {_GREEN}--worker{_NC}")
+    print(f"    Each candidate is tried via SSH; the first reachable one wins.\n")
     print(f"{_YELLOW}EXAMPLES:{_NC}")
     print(f"    {_GREEN}# Run all control-plane fixes (typical usage){_NC}")
     print(f"    python3 kube-fix.py\n")
@@ -171,6 +180,48 @@ def discover_cp(worker_fqdn, password):
                       "grep server: /etc/kubernetes/admin.conf 2>/dev/null")
     m = re.search(r'https?://([0-9.]+):', out)
     return m.group(1) if m else None
+
+
+def resolve_cp_host(host_arg, worker_fqdn, password):
+    """Pick the VSP control-plane host to use, trying candidates in order:
+    1. host_arg (--host), if given
+    2. the hardcoded VSP_VIP
+    3. auto-discovery via worker_fqdn (--worker)
+    Each candidate is SSH-tested; the first one that answers wins. Returns
+    (cp_host, tried) — cp_host is None if nothing answered, and tried lists
+    every candidate host attempted (for the error message)."""
+    tried = []
+    candidates = []
+    if host_arg:
+        candidates.append((host_arg, "--host"))
+    if VSP_VIP not in (c[0] for c in candidates):
+        candidates.append((VSP_VIP, "hardcoded VIP"))
+
+    for host, label in candidates:
+        tried.append(host)
+        print(f"{_DIM}  Testing SSH to {host} ({label})...{_NC}", end="", flush=True)
+        rc, _ = ssh_exec(host, password, "echo PONG", timeout=20)
+        if rc == 0:
+            print(f" {_OK}")
+            return host, tried
+        print(f" {_FAIL}")
+
+    print(f"\n{_DIM}Auto-discovering VSP control plane from {worker_fqdn}...{_NC}")
+    discovered = discover_cp(worker_fqdn, password)
+    if not discovered:
+        print(f"  {_WARN} Discovery failed — no control plane IP found")
+        return None, tried
+    print(f"  {_DIM}Control plane IP: {discovered}{_NC}")
+    if discovered in tried:
+        return None, tried
+    tried.append(discovered)
+    print(f"{_DIM}  Testing SSH to {discovered} (auto-discovered)...{_NC}", end="", flush=True)
+    rc, _ = ssh_exec(discovered, password, "echo PONG", timeout=20)
+    if rc == 0:
+        print(f" {_OK}")
+        return discovered, tried
+    print(f" {_FAIL}")
+    return None, tried
 
 
 def ping_host(ip, timeout=2):
@@ -432,23 +483,11 @@ def main():
     print(f"{_CYAN}║{_NC}{ts:^{W}}{_CYAN}║{_NC}")
     print(f"{_CYAN}╚{'═' * W}╝{_NC}")
 
-    # Discover CP host
-    cp_host = args.host
+    # Determine CP host: --host, then hardcoded VIP, then auto-discovery.
+    cp_host, tried = resolve_cp_host(args.host, args.worker, password)
     if not cp_host:
-        print(f"\n{_DIM}Auto-discovering VSP control plane from {args.worker}...{_NC}")
-        cp_host = discover_cp(args.worker, password)
-        if cp_host:
-            print(f"  {_DIM}Control plane IP: {cp_host}{_NC}")
-        else:
-            cp_host = args.vip
-            print(f"  {_WARN} Discovery failed — falling back to VIP {args.vip}")
-
-    # Connectivity test
-    print(f"\n{_DIM}Testing SSH connectivity to {cp_host}...{_NC}")
-    rc, _ = ssh_exec(cp_host, password, "echo PONG", timeout=20)
-    if rc != 0:
-        print(f"\n{_RED}ERROR:{_NC} Cannot SSH to {cp_host} as {VSP_USER}.")
-        print(f"  If VIP {args.vip} is down and SSH via VIP fails:")
+        print(f"\n{_RED}ERROR:{_NC} Cannot SSH to any candidate host as {VSP_USER}.")
+        print(f"  Tried: {', '.join(tried)}")
         print(f"  1. Find the actual CP node IP via vCenter console (look for the VSP CP VM)")
         print(f"  2. Retry: python3 kube-fix.py --host <actual-CP-IP>")
         sys.exit(2)

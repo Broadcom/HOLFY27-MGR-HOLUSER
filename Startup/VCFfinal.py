@@ -1,8 +1,37 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.27 - 2026-07-13
+# Version 6.3.30 - 2026-07-14
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.30 Changes:
+# - Task 2e: Added post-write self-verification to grace-period patch. Previously,
+#   vsp_kubectl ran sed -i and immediately logged "patched" without re-reading the
+#   manifest to confirm the write succeeded. If the SSH connection was dropped during
+#   a concurrent etcd/kube-apiserver bounce (which happens on the same tick at
+#   11:31:54), the sed exited 0 but the file was never modified — producing a
+#   false-positive "patched" log entry while the default 40s grace-period remained
+#   in effect for the entire session. Confirmed by: kube-controller-manager.yaml
+#   mtime staying at Jun 6 16:50 despite the "patched" log, and --node-monitor-
+#   grace-period absent from crictl inspect of the live KCM container. Fix: re-grep
+#   the manifest after the sed and log WARNING (not success) if ABSENT.
+#
+# v6.3.29 Changes:
+# - Task 2e: Salt health gate now includes a functional master→minion ping check
+#   after the K8s availability/restart check passes. Fixes false-positive where
+#   all pods show Running with restarts=1 (Redis TLS cert race condition) but
+#   7/8 minions are silently disconnected. Salt infrastructure is now confirmed
+#   healthy only when every accepted minion responds to 'salt * test.ping'.
+#
+# v6.3.28 Changes:
+# - End of main(): added VSP Cluster Health Monitor step. Runs
+#   Tools/vsp-health/vsp-health-monitor.py --install-timer, which installs/enables a
+#   manager-side systemd timer that re-checks and self-heals the VSP cluster
+#   every [VSPMONITOR] interval_seconds (default 300s) AND runs one
+#   check/remediate pass immediately so the lab comes up clean. Covers
+#   envoy/vmsp-gateway CrashLoopBackOff (fleet-01a/vsp-01a/instance-01a VIPs
+#   down — vcf-troubleshooting #57), CP node flapping (#3/#56), and cluster-wide
+#   CrashLoopBackOff pods. Config-gated ([VSPMONITOR] enabled=false), non-fatal.
 #
 # v6.3.27 Changes:
 # - Task 2e: Added pre-flight check/remediation for VSP control-plane node flapping
@@ -1817,9 +1846,24 @@ def main(lsf=None, standalone=False, dry_run=False):
                             'a\\    - --node-monitor-grace-period=90s" '
                             f'{_nf_kcm_manifest}'
                         )
-                        lsf.write_output(
-                            '  Pre-flight: patched kube-controller-manager with'
-                            ' --node-monitor-grace-period=90s (was using the 40s default)')
+                        # Self-verify: re-read the manifest to confirm the line was actually
+                        # written. vsp_kubectl uses lsf.ssh which can silently drop the write
+                        # if the connection is interrupted (e.g. during a concurrent
+                        # etcd/kube-apiserver bounce). Logging "patched" without verifying
+                        # produces a false-positive that masks the missing grace-period for the
+                        # rest of the session.
+                        _nf_verify = (getattr(vsp_kubectl(
+                            f'grep -q node-monitor-grace-period {_nf_kcm_manifest}'
+                            f' && echo PATCHED || echo FAILED'
+                        ), 'stdout', '') or '').strip()
+                        if 'PATCHED' in _nf_verify:
+                            lsf.write_output(
+                                '  Pre-flight: patched kube-controller-manager with'
+                                ' --node-monitor-grace-period=90s (was using the 40s default)')
+                        else:
+                            lsf.write_output(
+                                '  Pre-flight: WARNING — sed ran but grace-period NOT found in'
+                                f' manifest after write ({_nf_verify!r}); will retry next run')
                     else:
                         lsf.write_output(
                             '  Pre-flight: node-monitor-grace-period already configured — OK')
@@ -2366,15 +2410,58 @@ echo "PROXY_CONFIGURED"
                     _salt_all_healthy = all(_salt_health.values()) and _redis_cert_ok
 
                     if _salt_all_healthy:
+                        # K8s gate passed — verify the event pipeline is functional.
+                        # After cold boot the Redis TLS cert race can leave all pods
+                        # Running (low restart count) while the master→minion pipeline
+                        # is silently broken.  'salt * test.ping' from the master is
+                        # the ground-truth check: if every accepted minion replies
+                        # True, infrastructure is genuinely healthy.  If any are silent,
+                        # fall through to the full ordered restart.
+                        lsf.write_output(
+                            '  Salt K8s gate passed — verifying master→minion connectivity...'
+                        )
+                        try:
+                            _ping_out = (getattr(vsp_kubectl(
+                                "kubectl exec deployment/salt-master -n salt -- "
+                                "salt '*' test.ping --timeout=5 2>/dev/null"
+                            ), 'stdout', '') or '')
+                            _keys_out = (getattr(vsp_kubectl(
+                                "kubectl exec deployment/salt-master -n salt -- "
+                                "salt-key -l accepted 2>/dev/null"
+                            ), 'stdout', '') or '')
+                            _accepted_n = len([
+                                k for k in _keys_out.splitlines()
+                                if k.strip() and 'Keys' not in k
+                            ])
+                            _responding_n = _ping_out.count('    True')
+                            _salt_functional = (
+                                _accepted_n == 0          # no minions registered yet
+                                or _responding_n >= _accepted_n
+                            )
+                            lsf.write_output(
+                                f'  Salt functional check: {_responding_n}/{_accepted_n} '
+                                f'minions responding'
+                                + (' — PASS' if _salt_functional else ' — FAIL (needs restart)')
+                            )
+                            _salt_all_healthy = _salt_functional
+                        except Exception as _fe:
+                            lsf.write_output(
+                                f'  Salt functional check error: {_fe}'
+                                ' — treating as unhealthy (fail-safe)'
+                            )
+                            _salt_all_healthy = False
+
+                    if _salt_all_healthy:
                         lsf.write_output(
                             '  Salt infrastructure healthy (all deployments Available, '
-                            'restarts nominal, redis cert fresh) — SKIPPED rollout restart'
+                            'restarts nominal, redis cert fresh, all minions responding)'
+                            ' — SKIPPED rollout restart'
                         )
                     else:
-                        # Any layer unhealthy (or cert unknown/expiring) — restart every
-                        # layer in dependency order, exactly as before, since a problem in
-                        # an upstream layer (e.g. redis cert) cascades downstream regardless
-                        # of what the downstream layer's own health check shows.
+                        # Any layer unhealthy (or cert unknown/expiring, or minions not
+                        # responding) — restart every layer in dependency order.  A problem
+                        # in an upstream layer (e.g. redis cert) cascades downstream
+                        # regardless of what the downstream layer's own check shows.
                         lsf.write_output(
                             '  Salt infrastructure needs attention — rolling restart in '
                             'dependency order...'
@@ -5036,6 +5123,55 @@ echo "PROXY_CONFIGURED"
                                 'cache reload may still be in progress')
             except Exception as e:
                 lsf.write_output(f'WARNING: Failed to fix fleet-lcm component friendly names: {e}')
+
+    # ---- VSP Cluster Health Monitor: startup pass + install recurring timer ----
+    # Runs Tools/vsp-health/vsp-health-monitor.py --install-timer, which (a) installs/enables
+    # the manager-side cron job that re-checks and self-heals the VSP cluster
+    # every [VSPMONITOR] interval_seconds (default 300s), AND (b) runs one
+    # check/remediate pass immediately so the lab comes up clean. Covers the
+    # recurring failure modes seen this cycle: envoy/vmsp-gateway CrashLoopBackOff
+    # (fleet-01a/vsp-01a/instance-01a VIPs down), CP node flapping, and
+    # cluster-wide CrashLoopBackOff pods. See vcf-troubleshooting #3/#56/#57.
+    # Config-gated: [VSPMONITOR] enabled=false skips the entire block here before
+    # the script is even invoked. Non-fatal — a monitor failure never fails lab startup.
+    _vspmon_enabled = False
+    if lsf.config.has_section('VSPMONITOR') and lsf.config.has_option('VSPMONITOR', 'enabled'):
+        _raw = lsf.config.get('VSPMONITOR', 'enabled').strip().lower()
+        _vspmon_enabled = _raw not in ('0', 'false', 'no', 'off')
+    if not _vspmon_enabled:
+        lsf.write_output('VSP health monitor not enabled in [VSPMONITOR] — skipping')
+    else:
+        vsp_monitor_script = '/home/holuser/hol/Tools/vsp-health/vsp-health-monitor.py'
+        if os.path.isfile(vsp_monitor_script):
+            lsf.write_output('=' * 60)
+            lsf.write_output('VSP Cluster Health Monitor (startup pass + timer install)')
+            lsf.write_output('=' * 60)
+            try:
+                _vspm_cmd = ['python3', '-u', vsp_monitor_script]
+                if dry_run:
+                    _vspm_cmd.append('--dry-run')
+                else:
+                    _vspm_cmd.append('--install-timer')
+                _vspm_env = os.environ.copy()
+                _vspm_env['PYTHONUNBUFFERED'] = '1'
+                _vspm_proc = subprocess.Popen(
+                    _vspm_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, env=_vspm_env,
+                )
+                _vspm_start = time.time()
+                for _vspm_line in _vspm_proc.stdout:
+                    if time.time() - _vspm_start > 1800:  # 30 min safety cap
+                        _vspm_proc.kill()
+                        lsf.write_output('  WARNING: VSP health monitor timed out')
+                        break
+                    _vspm_line = _vspm_line.rstrip('\n')
+                    if _vspm_line.strip():
+                        lsf.write_output(f'  {_vspm_line.strip()}')
+                _vspm_proc.wait()
+            except Exception as _vspm_exc:
+                lsf.write_output(f'  WARNING: VSP health monitor step failed (non-fatal): {_vspm_exc}')
+        else:
+            lsf.write_output(f'VSP health monitor not found: {vsp_monitor_script} — skipping')
 
     lsf.write_output(f'{MODULE_NAME} completed')
     return not module_failed
