@@ -1,15 +1,22 @@
 #!/bin/bash
 
-# VCFA Complete Stabilization Script v2.11
-# Version 2.11 - 2026-07-14
+# VCFA Complete Stabilization Script v2.13
+# Version 2.13 - 2026-07-17
 # Author - HOL Core Team
 #
 # Default-run philosophy (v2.6+): one run of the script with no flags should leave the VCFA in a
 # known-good state regardless of what state it was in before, AND should be safe to run again any
 # time (cron, post-reboot, between automation runs) without disrupting a healthy cluster.
 #
-# Default flow: status -> control-plane preflight (NEW Phase 1.5) -> auth services -> core
-# components -> SDS NACK fix -> wait -> verify -> monitoring setup.
+# v2.12+: ALL phases run on every invocation — the monolithic early-exit gate has been removed.
+# Each function checks its own state before acting and prints a "(no-op)" line when already correct.
+# A pre-flight marker report shows PRESENT/MISSING for 4 durable markers before phases begin.
+# The 20s kubelet-settle sleep after Phase 1.5 is now conditional: it only runs when the pre-flight
+# check found at least one marker MISSING (indicating that static-pod manifests may have changed).
+#
+# Default flow: pre-boot sweeps (support-bundle / cert freshness) -> pre-flight marker report ->
+# Phase 1 status -> Phase 1.5 control-plane preflight -> Phase 2 auth services -> Phase 3 core
+# components -> Phase 3.5 SDS NACK fix -> Phase 4 wait -> Phase 5 verify -> Phase 6 monitoring.
 #
 # What's persistent (applied once, survives reboot, idempotent on re-runs):
 #   - kube-vip plndr-cp-lock renew/retry/preserve tuning (90s/10s, preserve_on_leadership_loss=true).
@@ -24,6 +31,8 @@
 #   - eth0 VIP pinning for .69, .70, .72 (kube-vip will reclaim, this is just a fallback)
 #   - ccs-k3s service-tls cert freshness check (NEW v2.8)
 #   - vcfa-vmsp-kube-vip-keeper.sh drift watcher (NEW v2.9, see below)
+#   - support-bundle-cluster-info-dump runaway check + permanent hardening (NEW v2.12)
+#   - stale system-shutdown Argo workflow sweep + cordoned node uncordon (NEW v2.12)
 # What's conditional (only applied when we detect actual trouble):
 #   - kyverno --forceFailurePolicyIgnore=true + webhook Fail->Ignore. Triggers when load1>30, OR
 #     kyverno pods not Ready, OR kube-controller-manager restarts>5. Reason: vmsp-operator owns
@@ -31,6 +40,69 @@
 #     unconditionally just churns rollouts. Set FORCE_KYVERNO_FIX=1 to bypass the heuristic.
 #
 # See VCFA_Stabilizer_Incident_Apr2026.md for the gateway/EnvoyProxy guidance and HTTP 503 recovery.
+#
+# v2.13 changelog (2026-07-17):
+#  * PERF: fix_envoy_gateway_sds_san_nack() — eliminated the unconditional 45s sleep + rollout restart
+#    that was running on every invocation even when nothing needed changing. Replaced with a
+#    CHANGES_MADE=0 sentinel that gates step 5 entirely:
+#    - Step 2: pre-counts BackendTLSPolicies with wellKnownCACertificates=System BEFORE the patch
+#      loop using a captured list; sets CHANGES_MADE=1 only if >0 found. Previously used a PATCHED=0
+#      counter inside a piped `while read` subshell (counter never propagated).
+#    - Step 3: sets CHANGES_MADE=1 inside the CUR_LIM!=4Gi branch. Adds a current-state check in
+#      the no-helmrelease fallback path (avoids unconditional `set resources` when already 4Gi).
+#    - Step 4: gates watcher install on (-f vcfa-eg-mem-keeper.sh && timer active); skips
+#      daemon-reload and systemctl enable/start if already deployed. Eliminates one systemctl
+#      daemon-reload on every run.
+#    - Step 5: dataplane rollout restart + 45s settle sleep now run only when CHANGES_MADE=1.
+#      On an already-correct cluster (typical re-run), step 5 prints an explicit no-op line and
+#      returns immediately. Expected savings on a healthy re-run: ~45-75s.
+#
+# v2.12 changelog (2026-07-17):
+#  * NEW check_and_fix_support_bundle_runaway(): detects and remediates the VCF 9.1 bug (fixed in
+#    9.1.1) where the support-bundle-cluster-info-dump CronJob accumulates failed Jobs, driving
+#    CPU into 30GHz+ and making the VCFA UI slow or completely unresponsive (Maher-July-Patch).
+#    Detection: count jobs matching 'support-bundle-cluster-info-dump-*' in vmsp-platform.
+#    RUNAWAY branch (count > SUPPORT_BUNDLE_JOB_THRESHOLD, default 3): deletes all matching Jobs
+#    (which cascades to their Failed pods), suspends the CronJob, warns the operator that a
+#    graceful VCFA restart from VCF Ops lifecycle is needed before un-suspending.
+#    ALWAYS (idempotent permanent hardening): sets concurrencyPolicy=Replace on the CronJob so
+#    a new run supersedes a stuck one instead of queueing, and labels the CronJob with
+#    helm.toolkit.fluxcd.io/driftDetection=disabled to prevent Flux from reverting these changes.
+#    AUTO-UNSUSPEND: if the CronJob is already suspended but no runaway is detected (i.e. after a
+#    graceful restart cycle), automatically un-suspends it since the permanent hardening is now in
+#    place. Called from main() unconditionally on every startup (no gate).
+#    New flag: --fix-support-bundle.  New env var: SUPPORT_BUNDLE_JOB_THRESHOLD (default 3).
+#  * NEW: stale system-shutdown Argo Workflow sweep inside check_and_fix_support_bundle_runaway().
+#    Each Fleet LCM shutdown cycle creates a 'system-shutdown-{id}' Argo Workflow in vmsp-platform
+#    that persists across reboots. On startup the Argo controller resumes it, which re-cordons the
+#    node and scales all prelude deployments to 0 → VCFA HTTP 500. Up to 30+ can accumulate.
+#    Fix: bulk-delete all system-shutdown-* Workflows with --grace-period=0. This is the same
+#    operation VCFfinal.py Task 4b Step 0 performs; now also in the stabilizer for labs that don't
+#    run VCFfinal.
+#  * NEW: cordoned node auto-uncordon inside check_and_fix_support_bundle_runaway(). Any node with
+#    SchedulingDisabled (left over from stale system-shutdown workflows or manual cordons) is
+#    uncordoned so pods can be scheduled again.
+#  * REFACTOR: extract _ssh_dispatch() from execute_remote() to eliminate the 4-auth-path ×
+#    2-suppress branches (8 near-identical blocks → 1 dispatch + 1 wrapper).
+#  * REFACTOR: add KUBECTL_CMD script-level constant (replaces 5 identical local K= definitions
+#    scattered across cpu_tune_apply, cpu_tune_rollback, recover_gateway_http_503,
+#    fix_vcfa_core_components, and the remote-body prefix in fix_overload_recovery).
+#  * REFACTOR: collapse check_and_fix_ccs_k3s_cert() from 25+ individual vcfa_ssh_nosudo calls
+#    (one per deployment label + pod-start query) into a single execute_remote batch. A Python3
+#    snippet runs entirely on the appliance, reads the cert notBefore once, iterates all 24
+#    deployments in one pass, and prints 'STALE:<name>' lines for local parsing. Cuts the check
+#    from ~2 minutes of serial SSH latency to ~5 seconds.
+#  * ARCH: removed the monolithic early-exit gate from main(). Previously, if all 4 durable
+#    markers were present the script exited immediately after the cert/bundle sweeps, silently
+#    skipping Phases 1-6. Now all phases always run. Each function is self-checking and prints
+#    a "(no-op)" line per step when already correct. A pre-flight marker report (PRESENT/MISSING
+#    for the 4 markers) is printed before Phase 1 so the operator sees what is in place. The
+#    20s kubelet-settle sleep after Phase 1.5 is now conditional on at least one marker being
+#    MISSING before the phase ran (indicating that static-pod manifests may have been written).
+#  * BUGFIX: main() banner corrected from v2.8 to v2.12.
+#  * CLEANUP: removed redundant get_system_status() call from verify_fixes(); the preceding
+#    run_stability_verification("phase-5") already queries gateway pods, prelude pods, and
+#    problematic pods, producing identical output. The unique 5-probe HTTP loop is retained.
 #
 # v2.11 changelog (2026-07-14):
 #  * Removed the plndr-cp-lock LEASE DURATION enforcement (vip_leaseduration=120 in the kube-vip
@@ -227,6 +299,9 @@ VCFA_PASSWORD="${VCFA_PASSWORD:-}"
 VMSP_NAMESPACE="${VMSP_NAMESPACE:-vmsp-platform}"
 PRELUDE_NAMESPACE="${PRELUDE_NAMESPACE:-prelude}"
 API_SERVER="${API_SERVER:-https://10.1.1.73:6443}"
+# Canonical kubectl invocation used everywhere a remote command needs it. Defined once so
+# changing API_SERVER above propagates automatically to all callers.
+KUBECTL_CMD="kubectl --kubeconfig=/etc/kubernetes/admin.conf --server=${API_SERVER}"
 # Set to 1 to show SSH/kubectl stderr when a step uses suppress (default hides errors)
 STABILIZER_DEBUG="${STABILIZER_DEBUG:-0}"
 
@@ -285,6 +360,11 @@ STABILIZER_PROBE_TIMEOUT_SECONDS="${STABILIZER_PROBE_TIMEOUT_SECONDS:-10}"
 # After core fixes, fail if hashed envoy dataplane Services never appear (0 = warn only).
 STABILIZER_GATEWAY_PREFLIGHT_STRICT="${STABILIZER_GATEWAY_PREFLIGHT_STRICT:-0}"
 
+# Support bundle runaway threshold (v2.12, Maher-July-Patch).
+# Number of support-bundle-cluster-info-dump Jobs in vmsp-platform that triggers the runaway
+# remediation path (delete jobs + suspend cronjob + warn operator). Lower = more sensitive.
+SUPPORT_BUNDLE_JOB_THRESHOLD="${SUPPORT_BUNDLE_JOB_THRESHOLD:-3}"
+
 # Lab CPU tuning (see VCFA_Complete_Stabilizer_README.md)
 VMSP_POLICIES_NAMESPACE="${VMSP_POLICIES_NAMESPACE:-vmsp-policies}"
 PROMETHEUS_NAME="${PROMETHEUS_NAME:-kube-prometheus-stack-prometheus}"
@@ -338,9 +418,48 @@ vcfa_kubectl_invoker() {
     fi
 }
 
+# Private SSH transport dispatcher (v2.12 refactor).
+# Routes a pre-assembled inner command over the correct auth path:
+#   key+jump / key-only / password+jump / local-sshpass.
+# quiet=1 adds -q -T flags on both outer and inner SSH hops (used by vcfa_ssh_nosudo for output-
+# capture calls so SSH banners don't pollute captured stdout). Default quiet=0 shows SSH output.
+# Called by both vcfa_ssh_nosudo and execute_remote; never call directly from user-facing functions.
+_ssh_dispatch() {
+    local inner="$1"
+    local quiet="${2:-0}"
+    local outer_qt=()
+    local inner_qt=""
+    if [[ "$quiet" == "1" ]]; then
+        outer_qt=(-q -T)
+        inner_qt="-q -T "
+    fi
+
+    if [[ -n "${STABILIZER_VCFA_IDENTITY_FILE:-}" ]]; then
+        local id_q
+        id_q=$(printf '%q' "$STABILIZER_VCFA_IDENTITY_FILE")
+        if [[ -n "${STABILIZER_JUMP_HOST:-}" ]]; then
+            ssh "${outer_qt[@]}" "${STABILIZER_SSH_MUX_OPTS[@]}" -o BatchMode=yes -o StrictHostKeyChecking=no "$STABILIZER_JUMP_HOST" \
+                "ssh -i ${id_q} ${inner_qt}-o IdentitiesOnly=yes -o PubkeyAuthentication=yes -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no ${VCFA_USER}@${VCFA_HOST} \"${inner//\"/\\\"}\""
+        else
+            # shellcheck disable=SC2086
+            ssh "${outer_qt[@]}" -i "$STABILIZER_VCFA_IDENTITY_FILE" -o IdentitiesOnly=yes -o PubkeyAuthentication=yes -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no \
+                "${VCFA_USER}@${VCFA_HOST}" "$inner"
+        fi
+    elif [[ -n "${STABILIZER_JUMP_HOST:-}" ]]; then
+        local cred_q
+        cred_q=$(printf '%q' "$CREDS_ON_JUMP")
+        ssh "${outer_qt[@]}" "${STABILIZER_SSH_MUX_OPTS[@]}" -o BatchMode=yes -o StrictHostKeyChecking=no "$STABILIZER_JUMP_HOST" \
+            "export SSHPASS=\$(head -1 ${cred_q} | tr -d '\r\n') && sshpass -e ssh ${inner_qt}${VCFA_SSH_OPTS} ${VCFA_USER}@${VCFA_HOST} \"${inner//\"/\\\"}\""
+    else
+        # shellcheck disable=SC2086
+        sshpass -f "$CREDS_FILE" ssh "${outer_qt[@]}" ${VCFA_SSH_OPTS} "${VCFA_USER}@${VCFA_HOST}" "$inner"
+    fi
+}
+
 # Run a shell snippet on the VCFA appliance (no execute_remote scaffolding). Used for kubectl-only probes.
 # v2.4: switched to base64 transport to survive double-SSH quoting (jumphost -> VCFA strips one layer of
 # shell quotes per hop, breaking curl -w "%{http_code}" and similar).
+# v2.12: delegates SSH transport to _ssh_dispatch(quiet=1) eliminating duplicated auth-path branches.
 vcfa_ssh_nosudo() {
     local remote_cmd="$1"
     local b64 inner
@@ -348,25 +467,7 @@ vcfa_ssh_nosudo() {
     # v2.4.1: pass the whole multi-statement pipeline directly to ssh (no outer `bash -c`).
     # Remote login shell parses pipes/redirs; otherwise `bash -c` only takes the first word.
     inner="echo ${b64} | base64 -d | bash --norc --noprofile"
-    if [[ -n "${STABILIZER_VCFA_IDENTITY_FILE:-}" ]]; then
-        if [[ -n "${STABILIZER_JUMP_HOST:-}" ]]; then
-            local id_q
-            id_q=$(printf '%q' "$STABILIZER_VCFA_IDENTITY_FILE")
-            ssh -q -T "${STABILIZER_SSH_MUX_OPTS[@]}" -o BatchMode=yes -o StrictHostKeyChecking=no "$STABILIZER_JUMP_HOST" \
-                "ssh -i ${id_q} -q -T -o IdentitiesOnly=yes -o PubkeyAuthentication=yes -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no ${VCFA_USER}@${VCFA_HOST} \"${inner//\"/\\\"}\""
-        else
-            # shellcheck disable=SC2086
-            ssh -q -T -i "$STABILIZER_VCFA_IDENTITY_FILE" -o IdentitiesOnly=yes -o PubkeyAuthentication=yes -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no \
-                "${VCFA_USER}@${VCFA_HOST}" "$inner"
-        fi
-    elif [[ -n "${STABILIZER_JUMP_HOST:-}" ]]; then
-        local cred_q
-        cred_q=$(printf '%q' "$CREDS_ON_JUMP")
-        ssh -q -T "${STABILIZER_SSH_MUX_OPTS[@]}" -o BatchMode=yes -o StrictHostKeyChecking=no "$STABILIZER_JUMP_HOST" \
-            "export SSHPASS=\$(head -1 ${cred_q} | tr -d '\r\n') && sshpass -e ssh -q -T ${VCFA_SSH_OPTS} ${VCFA_USER}@${VCFA_HOST} \"${inner//\"/\\\"}\""
-    else
-        sshpass -f "$CREDS_FILE" ssh -q -T ${VCFA_SSH_OPTS} "${VCFA_USER}@${VCFA_HOST}" "$inner"
-    fi
+    _ssh_dispatch "$inner" 1
 }
 
 # Return 3-digit HTTP code for https://auto-a.site-a.vcf.lab/automation (curl runs ON VCFA VM → hits VCFA_HTTP_VIP / kube-vip).
@@ -380,6 +481,8 @@ vcfa_curl_automation_code() {
 
 # Function to execute commands on VCFA appliance (sudo bash).
 # Transfers script via base64 (no scp dependency); strips CR; sudo password safely quoted for ssh.
+# v2.12: delegates SSH transport to _ssh_dispatch() — 8 near-identical branches (4 auth paths ×
+# suppress/no-suppress) are now 1 dispatch call + 1 conditional warning wrapper.
 execute_remote() {
     local command="$1"
     local description="$2"
@@ -401,51 +504,11 @@ execute_remote() {
     fi
 
     log "$description"
-    # shellcheck disable=SC2086
-    if [[ -n "${STABILIZER_VCFA_IDENTITY_FILE:-}" ]]; then
-        if [[ "$suppress_errors" == "true" ]]; then
-            if [[ -n "${STABILIZER_JUMP_HOST:-}" ]]; then
-                local id_q
-                id_q=$(printf '%q' "$STABILIZER_VCFA_IDENTITY_FILE")
-                ssh "${STABILIZER_SSH_MUX_OPTS[@]}" -o BatchMode=yes -o StrictHostKeyChecking=no "$STABILIZER_JUMP_HOST" \
-                    "ssh -i ${id_q} -o IdentitiesOnly=yes -o PubkeyAuthentication=yes -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no ${VCFA_USER}@${VCFA_HOST} \"${inner//\"/\\\"}\"" 2>"$errsink" \
-                    || warning "Command failed (suppressed): $description — set STABILIZER_DEBUG=1 to see kubectl/SSH errors"
-            else
-                ssh -i "$STABILIZER_VCFA_IDENTITY_FILE" -o IdentitiesOnly=yes -o PubkeyAuthentication=yes -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no \
-                    "${VCFA_USER}@${VCFA_HOST}" "$inner" 2>"$errsink" \
-                    || warning "Command failed (suppressed): $description — set STABILIZER_DEBUG=1 to see kubectl/SSH errors"
-            fi
-        else
-            if [[ -n "${STABILIZER_JUMP_HOST:-}" ]]; then
-                local id_q
-                id_q=$(printf '%q' "$STABILIZER_VCFA_IDENTITY_FILE")
-                ssh "${STABILIZER_SSH_MUX_OPTS[@]}" -o BatchMode=yes -o StrictHostKeyChecking=no "$STABILIZER_JUMP_HOST" \
-                    "ssh -i ${id_q} -o IdentitiesOnly=yes -o PubkeyAuthentication=yes -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no ${VCFA_USER}@${VCFA_HOST} \"${inner//\"/\\\"}\""
-            else
-                ssh -i "$STABILIZER_VCFA_IDENTITY_FILE" -o IdentitiesOnly=yes -o PubkeyAuthentication=yes -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no \
-                    "${VCFA_USER}@${VCFA_HOST}" "$inner"
-            fi
-        fi
-    elif [[ -n "${STABILIZER_JUMP_HOST:-}" ]]; then
-        local cred_q
-        cred_q=$(printf '%q' "$CREDS_ON_JUMP")
-        if [[ "$suppress_errors" == "true" ]]; then
-            ssh "${STABILIZER_SSH_MUX_OPTS[@]}" -o BatchMode=yes -o StrictHostKeyChecking=no "$STABILIZER_JUMP_HOST" \
-                "export SSHPASS=\$(head -1 ${cred_q} | tr -d '\r\n') && sshpass -e ssh ${VCFA_SSH_OPTS} ${VCFA_USER}@${VCFA_HOST} \"${inner//\"/\\\"}\"" 2>"$errsink" \
-                || warning "Command failed (suppressed): $description — set STABILIZER_DEBUG=1 to see kubectl/SSH errors"
-        else
-            ssh "${STABILIZER_SSH_MUX_OPTS[@]}" -o BatchMode=yes -o StrictHostKeyChecking=no "$STABILIZER_JUMP_HOST" \
-                "export SSHPASS=\$(head -1 ${cred_q} | tr -d '\r\n') && sshpass -e ssh ${VCFA_SSH_OPTS} ${VCFA_USER}@${VCFA_HOST} \"${inner//\"/\\\"}\""
-        fi
+    if [[ "$suppress_errors" == "true" ]]; then
+        _ssh_dispatch "$inner" 2>"$errsink" \
+            || warning "Command failed (suppressed): $description — set STABILIZER_DEBUG=1 to see kubectl/SSH errors"
     else
-        if [[ "$suppress_errors" == "true" ]]; then
-            sshpass -f "$CREDS_FILE" ssh ${VCFA_SSH_OPTS} "${VCFA_USER}@${VCFA_HOST}" \
-                "$inner" 2>"$errsink" \
-                || warning "Command failed (suppressed): $description — set STABILIZER_DEBUG=1 to see kubectl/SSH errors"
-        else
-            sshpass -f "$CREDS_FILE" ssh ${VCFA_SSH_OPTS} "${VCFA_USER}@${VCFA_HOST}" \
-                "$inner"
-        fi
+        _ssh_dispatch "$inner"
     fi
 }
 
@@ -505,7 +568,7 @@ cpu_tune_settle() {
 
 cpu_tune_apply() {
     log "=== LAB CPU TUNE: apply ==="
-    local K="kubectl --kubeconfig=/etc/kubernetes/admin.conf --server=$API_SERVER"
+    local K="${KUBECTL_CMD}"
 
     execute_remote "${K} patch prometheus ${PROMETHEUS_NAME} -n ${VMSP_NAMESPACE} --type merge -p '{\"spec\":{\"scrapeInterval\":\"60s\",\"evaluationInterval\":\"60s\",\"retentionSize\":\"4GiB\"}}'" \
         "CPU tune: Prometheus (60s scrape/eval, 4GiB retention cap)" true
@@ -549,7 +612,7 @@ EOS
 
 cpu_tune_rollback() {
     log "=== LAB CPU TUNE: rollback ==="
-    local K="kubectl --kubeconfig=/etc/kubernetes/admin.conf --server=$API_SERVER"
+    local K="${KUBECTL_CMD}"
 
     execute_remote "$(cat <<EOS
 set -e
@@ -780,8 +843,7 @@ verify_envoy_dataplane_services() {
 # provisioning → hashed dataplane envoys → vcfa/vmsp gateway → envoy-gateway operator.
 recover_gateway_http_503() {
     log "Recover: rolling restarts for HTTP 503 / upstream-TLS (SDS) symptoms (see VCFA_Stabilizer_Incident_Apr2026.md)..."
-    local K
-    K="kubectl --kubeconfig=/etc/kubernetes/admin.conf --server=$API_SERVER"
+    local K="${KUBECTL_CMD}"
 
     execute_remote "${K} get deployment trust-manager -n cert-manager &>/dev/null && ${K} rollout restart deployment/trust-manager -n cert-manager && ${K} rollout status deployment/trust-manager -n cert-manager --timeout=300s || true" \
         "Rollout restart cert-manager/trust-manager (if present)" true
@@ -847,6 +909,9 @@ fix_envoy_gateway_sds_san_nack() {
     fix_script=$(cat <<REMOTE
 set -u
 K="kubectl --kubeconfig=/etc/kubernetes/admin.conf --server=${API_SERVER}"
+# Tracks whether any SDS-affecting change was made in steps 1-4.
+# Step 5 (dataplane rollout + 45s settle) only runs when CHANGES_MADE=1.
+CHANGES_MADE=0
 
 echo "=== 1/5: ensure platform-trust ConfigMap exists in every BackendTLSPolicy namespace ==="
 NS_LIST=\$(\$K get backendtlspolicy -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\\n"}{end}' 2>/dev/null | sort -u | grep -v '^\$' || true)
@@ -873,15 +938,28 @@ done
 
 echo
 echo "=== 2/5: patch every BackendTLSPolicy with wellKnownCACertificates: System -> caCertificateRefs ==="
-PATCHED=0
-\$K get backendtlspolicy -A -o jsonpath='{range .items[?(@.spec.validation.wellKnownCACertificates=="System")]}{.metadata.namespace} {.metadata.name}{"\\n"}{end}' \\
-  | while read NS NAME; do
+# Pre-count before patching so we can decide whether step 5 (dataplane rollout) is needed.
+_WKCA_LIST=\$(\$K get backendtlspolicy -A \
+    -o jsonpath='{range .items[?(@.spec.validation.wellKnownCACertificates=="System")]}{.metadata.namespace} {.metadata.name}{"\\n"}{end}' \
+    2>/dev/null | grep -v '^\$' || true)
+if [[ -n "\$_WKCA_LIST" ]]; then
+    _WKCA_COUNT=\$(echo "\$_WKCA_LIST" | grep -c .)
+    echo "  found \${_WKCA_COUNT} policy/policies with wellKnownCACertificates=System — patching..."
+    CHANGES_MADE=1
+    echo "\$_WKCA_LIST" | while read -r NS NAME; do
         [[ -z "\$NS" ]] && continue
         echo "  patch \$NS/\$NAME"
-        \$K patch backendtlspolicy -n "\$NS" "\$NAME" --type=merge -p '{"spec":{"validation":{"caCertificateRefs":[{"group":"","kind":"ConfigMap","name":"platform-trust"}],"wellKnownCACertificates":null}}}' >/dev/null 2>&1 || echo "    WARN: patch failed"
+        \$K patch backendtlspolicy -n "\$NS" "\$NAME" --type=merge \
+            -p '{"spec":{"validation":{"caCertificateRefs":[{"group":"","kind":"ConfigMap","name":"platform-trust"}],"wellKnownCACertificates":null}}}' \
+            >/dev/null 2>&1 || echo "    WARN: patch failed for \$NS/\$NAME"
     done
-echo "  policies remaining with wellKnownCACertificates=System:"
-\$K get backendtlspolicy -A -o jsonpath='{range .items[?(@.spec.validation.wellKnownCACertificates=="System")]}{.metadata.namespace}/{.metadata.name}{"\\n"}{end}' | head
+    echo "  policies still using wellKnownCACertificates=System after patch:"
+    \$K get backendtlspolicy -A \
+        -o jsonpath='{range .items[?(@.spec.validation.wellKnownCACertificates=="System")]}{.metadata.namespace}/{.metadata.name}{"\\n"}{end}' \
+        2>/dev/null | head || true
+else
+    echo "  all BackendTLSPolicies already use caCertificateRefs (no-op)"
+fi
 
 echo
 echo "=== 3/5: bump envoy-gateway operator memory limit (helmrelease values) ==="
@@ -889,6 +967,7 @@ if \$K get helmrelease -n "${VMSP_NAMESPACE}" envoyproxy-gateway >/dev/null 2>&1
     CUR_LIM=\$(\$K get deploy -n "${VMSP_NAMESPACE}" envoy-gateway -o jsonpath='{.spec.template.spec.containers[?(@.name=="envoy-gateway")].resources.limits.memory}' 2>/dev/null || echo "")
     echo "  current operator memory limit: \${CUR_LIM:-<unset>}"
     if [[ "\$CUR_LIM" != "4Gi" ]]; then
+        CHANGES_MADE=1
         # Try the canonical key first, then the chart-flat key as a fallback. Either path is no-op
         # if the chart doesn't honour that key, but with v1.5.0-3 one of them lands.
         \$K patch helmrelease -n "${VMSP_NAMESPACE}" envoyproxy-gateway --type=merge \\
@@ -910,17 +989,31 @@ if \$K get helmrelease -n "${VMSP_NAMESPACE}" envoyproxy-gateway >/dev/null 2>&1
         echo "  already 4Gi, no change"
     fi
 else
-    echo "  helmrelease envoyproxy-gateway not found, falling back to direct deployment patch"
-    \$K set resources deploy/envoy-gateway -n "${VMSP_NAMESPACE}" --limits=memory=4Gi --requests=memory=512Mi >/dev/null 2>&1 || true
+    # No HelmRelease — check the deployment directly before patching.
+    _FALLBACK_LIM=\$(\$K get deploy -n "${VMSP_NAMESPACE}" envoy-gateway \
+        -o jsonpath='{.spec.template.spec.containers[?(@.name=="envoy-gateway")].resources.limits.memory}' \
+        2>/dev/null || echo "")
+    if [[ "\$_FALLBACK_LIM" != "4Gi" ]]; then
+        echo "  helmrelease envoyproxy-gateway not found; current limit=\${_FALLBACK_LIM:-<unset>}, patching deployment directly"
+        CHANGES_MADE=1
+        \$K set resources deploy/envoy-gateway -n "${VMSP_NAMESPACE}" --limits=memory=4Gi --requests=memory=512Mi >/dev/null 2>&1 || true
+    else
+        echo "  helmrelease not found but deployment already at 4Gi (no-op)"
+    fi
 fi
 
 echo
 echo "=== 4/5: install durable systemd watcher to re-assert envoy-gateway memory on drift ==="
 # vmsp-operator owns spec.values on the HelmRelease and clobbers our 4Gi bump on every reconcile.
 # This watcher (every 60s) re-applies the deployment-level memory limit if it drifts from 4Gi,
-# and survives reboots. Idempotent install (overwrite ok).
-mkdir -p /usr/local/bin /etc/systemd/system
-cat > /usr/local/bin/vcfa-eg-mem-keeper.sh <<'EGKEEPER'
+# and survives reboots. Only installs when the script is missing or the timer is not active.
+if [[ -f /usr/local/bin/vcfa-eg-mem-keeper.sh ]] \
+   && systemctl is-active --quiet vcfa-eg-mem-keeper.timer 2>/dev/null; then
+    echo "  vcfa-eg-mem-keeper watcher already installed and timer active (no-op)"
+else
+    echo "  installing vcfa-eg-mem-keeper watcher..."
+    mkdir -p /usr/local/bin /etc/systemd/system
+    cat > /usr/local/bin/vcfa-eg-mem-keeper.sh <<'EGKEEPER'
 #!/usr/bin/env bash
 set -u
 K="kubectl --kubeconfig=/etc/kubernetes/admin.conf"
@@ -935,9 +1028,9 @@ if [[ "\$CUR_LIM" != "\$WANT_LIM" || "\$CUR_REQ" != "\$WANT_REQ" ]]; then
         && echo "\$(date -Is) drift: limits=\$CUR_LIM->\$WANT_LIM requests=\$CUR_REQ->\$WANT_REQ"
 fi
 EGKEEPER
-chmod +x /usr/local/bin/vcfa-eg-mem-keeper.sh
+    chmod +x /usr/local/bin/vcfa-eg-mem-keeper.sh
 
-cat > /etc/systemd/system/vcfa-eg-mem-keeper.service <<'EGSVC'
+    cat > /etc/systemd/system/vcfa-eg-mem-keeper.service <<'EGSVC'
 [Unit]
 Description=VCFA: keep envoy-gateway operator memory limit at 4Gi (works around vmsp-operator/HR drift)
 After=network-online.target
@@ -950,7 +1043,7 @@ StandardOutput=journal
 StandardError=journal
 EGSVC
 
-cat > /etc/systemd/system/vcfa-eg-mem-keeper.timer <<'EGTIMER'
+    cat > /etc/systemd/system/vcfa-eg-mem-keeper.timer <<'EGTIMER'
 [Unit]
 Description=VCFA: run vcfa-eg-mem-keeper every 60s (drift watcher)
 
@@ -964,18 +1057,25 @@ Unit=vcfa-eg-mem-keeper.service
 WantedBy=timers.target
 EGTIMER
 
-systemctl daemon-reload
-systemctl enable --now vcfa-eg-mem-keeper.timer >/dev/null 2>&1 || true
-systemctl --no-pager --full status vcfa-eg-mem-keeper.timer 2>&1 | head -10 || true
+    systemctl daemon-reload
+    systemctl enable --now vcfa-eg-mem-keeper.timer >/dev/null 2>&1 || true
+fi
+systemctl --no-pager --full status vcfa-eg-mem-keeper.timer 2>&1 | head -5 || true
 
 echo
 echo "=== 5/5: roll dataplanes so they re-subscribe and pick up the new SDS bundles ==="
-\$K rollout restart deploy/vcfa-gateway-configuration -n "${VMSP_NAMESPACE}" >/dev/null 2>&1 || true
-\$K rollout restart deploy/vmsp-gateway -n "${VMSP_NAMESPACE}" >/dev/null 2>&1 || true
-\$K rollout status deploy/vcfa-gateway-configuration -n "${VMSP_NAMESPACE}" --timeout=180s || true
-\$K rollout status deploy/vmsp-gateway -n "${VMSP_NAMESPACE}" --timeout=180s || true
-echo "  waiting 45s for SDS to settle..."
-sleep 45
+if [[ "\$CHANGES_MADE" -eq 1 ]]; then
+    echo "  SDS-affecting changes were made in steps 1-4 — restarting dataplanes..."
+    \$K rollout restart deploy/vcfa-gateway-configuration -n "${VMSP_NAMESPACE}" >/dev/null 2>&1 || true
+    \$K rollout restart deploy/vmsp-gateway -n "${VMSP_NAMESPACE}" >/dev/null 2>&1 || true
+    \$K rollout status deploy/vcfa-gateway-configuration -n "${VMSP_NAMESPACE}" --timeout=180s || true
+    \$K rollout status deploy/vmsp-gateway -n "${VMSP_NAMESPACE}" --timeout=180s || true
+    echo "  waiting 45s for SDS to settle..."
+    sleep 45
+else
+    echo "  no BackendTLSPolicy or operator memory changes detected — skipping dataplane rollout (no-op)"
+    echo "  (BackendTLSPolicies already use caCertificateRefs; envoy-gateway already at 4Gi)"
+fi
 
 echo
 echo "=== verify SDS state on dataplanes ==="
@@ -1694,11 +1794,9 @@ verify_fixes() {
 
     echo ""
     info "=== Stability suite (control plane + /automation + critical pods) ==="
+    # run_stability_verification already greps gateway pods, prelude pods, and problematic pods;
+    # the redundant get_system_status call that used to follow has been removed (v2.12).
     run_stability_verification "phase-5" || true
-    
-    echo ""
-    info "=== Final Pod Status ==="
-    get_system_status
     
     echo ""
     info "=== Testing VCFA Functionality ==="
@@ -1796,6 +1894,155 @@ VFEOF
     success "Verification script created at $out"
 }
 
+# Detect and remediate the support-bundle-cluster-info-dump CronJob runaway bug (VCF 9.1,
+# fixed in 9.1.1). When the CronJob accumulates stale Jobs, Failed pods pile up in
+# vmsp-platform and drive CPU into the 30 GHz+ range, causing the VCFA UI to become slow
+# or completely unreachable (Maher-July-Patch, 2026-07-17).
+#
+# Logic (all in one execute_remote call):
+#   1. Sweep: delete stale system-shutdown-* Argo Workflows (re-cordon nodes on every boot).
+#   2. Sweep: uncordon any nodes with SchedulingDisabled.
+#   3. RUNAWAY detection: count support-bundle Jobs. If > SUPPORT_BUNDLE_JOB_THRESHOLD (default 3):
+#      delete all matching Jobs (cascades to Failed pods), suspend the CronJob, warn operator.
+#   4. ALWAYS (idempotent hardening): set concurrencyPolicy=Replace + disable Flux drift detection.
+#   5. AUTO-UNSUSPEND: if CronJob was suspended but no runaway detected, un-suspend now that the
+#      permanent hardening (concurrencyPolicy=Replace + driftDetection=disabled) is in place.
+#   6. Report: counts of Failed/Pending pods after cleanup.
+#
+# Called from main() BEFORE the idempotency early-exit so it runs on every startup.
+check_and_fix_support_bundle_runaway() {
+    info "Sweeping cluster health: support-bundle runaway, stale Argo workflows, cordoned nodes..."
+    local threshold="${SUPPORT_BUNDLE_JOB_THRESHOLD:-3}"
+    local fix_prefix
+    fix_prefix=$(printf 'K="%s"\nNS="%s"\nTHRESHOLD="%s"\n' \
+        "${KUBECTL_CMD}" "${VMSP_NAMESPACE}" "${threshold}")
+    local fix_body
+    fix_body=$(cat <<'SUPPORT_BUNDLE_BODY'
+set -u
+
+# --- 1/6: Delete stale system-shutdown-* Argo Workflows ---
+# Each Fleet LCM shutdown cycle leaves a system-shutdown-{id} Workflow in vmsp-platform.
+# On startup the Argo controller resumes them, which re-cordons the VSP node and scales
+# all prelude deployments to 0 (→ VCFA HTTP 500). Up to 30+ can accumulate.
+echo "=== 1/6: stale system-shutdown Argo Workflow sweep ==="
+if $K api-resources --api-group=argoproj.io -o name 2>/dev/null | grep -q '^workflows\.'; then
+    STALE_WF=$($K get workflow -n "$NS" --no-headers 2>/dev/null \
+        | awk '/system-shutdown/ {print $1}' || true)
+    if [[ -n "$STALE_WF" ]]; then
+        COUNT=$(echo "$STALE_WF" | wc -l)
+        echo "  found ${COUNT} stale system-shutdown workflow(s) — deleting..."
+        echo "$STALE_WF" | xargs -r $K delete workflow -n "$NS" --grace-period=0 2>&1 | head -5 || true
+        echo "  deleted"
+    else
+        echo "  no stale system-shutdown workflows found (ok)"
+    fi
+else
+    echo "  Argo Workflow CRD not present — skipping"
+fi
+
+echo
+echo "=== 2/6: uncordon any SchedulingDisabled nodes ==="
+CORDONED=$($K get nodes --no-headers 2>/dev/null \
+    | awk '$2 ~ /SchedulingDisabled/ {print $1}' || true)
+if [[ -n "$CORDONED" ]]; then
+    echo "  cordoned node(s): $CORDONED — uncordoning..."
+    echo "$CORDONED" | xargs -r $K uncordon 2>&1 || true
+else
+    echo "  all nodes schedulable (ok)"
+fi
+
+echo
+echo "=== 3/6: support-bundle-cluster-info-dump Job count ==="
+CRONJOB_NAME="support-bundle-cluster-info-dump"
+JOB_COUNT=$($K get jobs -n "$NS" -o name 2>/dev/null \
+    | grep -c "/${CRONJOB_NAME}-" || true)
+echo "  found ${JOB_COUNT} job(s) matching '${CRONJOB_NAME}-*' (threshold=${THRESHOLD})"
+
+RUNAWAY=0
+if [[ "$JOB_COUNT" -gt "$THRESHOLD" ]]; then
+    RUNAWAY=1
+    echo "  RUNAWAY DETECTED: ${JOB_COUNT} stale jobs exceed threshold=${THRESHOLD}"
+    echo "  Deleting all matching jobs (cascades to Failed pods)..."
+    $K get jobs -n "$NS" -o name 2>/dev/null \
+        | grep "/${CRONJOB_NAME}-" \
+        | xargs -r $K delete -n "$NS" --cascade=foreground 2>&1 | head -10 || true
+    sleep 5
+    echo "  Suspending CronJob to prevent new job spawning..."
+    $K patch cronjob "$CRONJOB_NAME" -n "$NS" \
+        -p '{"spec":{"suspend":true}}' 2>&1 | head -3 || true
+    echo ""
+    echo "  *** WARNING: Support-bundle runaway remediated. ***"
+    echo "  *** ACTION REQUIRED: Perform a graceful VCFA shutdown+restart via VCF Ops ***"
+    echo "  *** Lifecycle before running this script again to un-suspend the CronJob. ***"
+fi
+
+echo
+echo "=== 4/6: permanent CronJob hardening (idempotent) ==="
+# Set concurrencyPolicy=Replace so a new run supersedes a stuck one instead of queuing.
+# Label with helm.toolkit.fluxcd.io/driftDetection=disabled so Flux does not revert.
+if $K get cronjob "$CRONJOB_NAME" -n "$NS" >/dev/null 2>&1; then
+    CUR_POLICY=$($K get cronjob "$CRONJOB_NAME" -n "$NS" \
+        -o jsonpath='{.spec.concurrencyPolicy}' 2>/dev/null || echo "")
+    if [[ "$CUR_POLICY" != "Replace" ]]; then
+        $K patch cronjob "$CRONJOB_NAME" -n "$NS" \
+            -p '{"spec":{"concurrencyPolicy":"Replace"}}' >/dev/null 2>&1 \
+            && echo "  concurrencyPolicy set to Replace" \
+            || echo "  WARN: concurrencyPolicy patch failed"
+    else
+        echo "  concurrencyPolicy already Replace (ok)"
+    fi
+
+    DRIFT_LABEL=$($K get cronjob "$CRONJOB_NAME" -n "$NS" \
+        -o jsonpath='{.metadata.labels.helm\.toolkit\.fluxcd\.io/driftDetection}' 2>/dev/null || echo "")
+    if [[ "$DRIFT_LABEL" != "disabled" ]]; then
+        $K label cronjob "$CRONJOB_NAME" -n "$NS" \
+            "helm.toolkit.fluxcd.io/driftDetection=disabled" --overwrite >/dev/null 2>&1 \
+            && echo "  driftDetection label set to disabled" \
+            || echo "  WARN: driftDetection label patch failed"
+    else
+        echo "  driftDetection=disabled already set (ok)"
+    fi
+else
+    echo "  CronJob '${CRONJOB_NAME}' not found in ${NS} — skipping hardening"
+fi
+
+echo
+echo "=== 5/6: auto-unsuspend (only if no runaway and cronjob was suspended) ==="
+if [[ "$RUNAWAY" -eq 0 ]]; then
+    if $K get cronjob "$CRONJOB_NAME" -n "$NS" >/dev/null 2>&1; then
+        IS_SUSPENDED=$($K get cronjob "$CRONJOB_NAME" -n "$NS" \
+            -o jsonpath='{.spec.suspend}' 2>/dev/null || echo "false")
+        if [[ "$IS_SUSPENDED" == "true" ]]; then
+            echo "  CronJob was suspended and no runaway detected — un-suspending..."
+            $K patch cronjob "$CRONJOB_NAME" -n "$NS" \
+                --type merge -p '{"spec":{"suspend":false}}' >/dev/null 2>&1 \
+                && echo "  CronJob un-suspended (concurrencyPolicy=Replace + driftDetection=disabled are in place)" \
+                || echo "  WARN: un-suspend failed"
+        else
+            echo "  CronJob not suspended (ok)"
+        fi
+    fi
+else
+    echo "  Runaway detected — leaving CronJob suspended until operator performs graceful restart"
+fi
+
+echo
+echo "=== 6/6: post-cleanup pod health report ==="
+FAILED_PODS=$($K get pod -A --field-selector=status.phase=Failed \
+    --no-headers 2>/dev/null | wc -l || echo "?")
+PENDING_PODS=$($K get pod -A --field-selector=status.phase=Pending \
+    --no-headers 2>/dev/null | wc -l || echo "?")
+echo "  Failed pods: ${FAILED_PODS}  |  Pending pods: ${PENDING_PODS}"
+[[ "$FAILED_PODS" != "0" && "$FAILED_PODS" != "?" ]] && \
+    $K get pod -A --field-selector=status.phase=Failed --no-headers 2>/dev/null | head -10 || true
+
+echo "=== done ==="
+SUPPORT_BUNDLE_BODY
+)
+    execute_remote "${fix_prefix}${fix_body}" \
+        "Cluster sweep: support-bundle runaway + stale Argo workflows + cordoned nodes" true
+}
+
 # Detect and remediate stale service-tls certificates across all prelude deployments.
 #
 # cert-manager auto-renews the service-tls Secret (~90-day cert) but every pod
@@ -1805,160 +2052,125 @@ VFEOF
 # deployments including cloud-automation-ui-app (/automation), ccs-k3s-app (/cci/),
 # and many service backends.
 #
-# Detection (pure kubectl, no network probe, ~2-3s on a healthy cluster):
+# Detection (pure kubectl, no network probe, ~2-3s on a healthy cluster; v2.12: single
+# execute_remote batch replaces 25+ individual vcfa_ssh_nosudo calls):
 #   1. Read cert notBefore epoch from the service-tls Secret.
 #   2. For each affected deployment, get the running pod's startTime.
 #   3. If pod.startTime < cert.notBefore → pod has stale cert → rollout restart.
-#   Rollouts are issued in parallel (kubectl rollout restart is non-blocking).
 #   Then we wait up to 120s for all restarted deployments to become ready.
 #
 # Called from main() BEFORE the idempotency early-exit so it runs on every
 # lab startup, not just the first time the stabilizer is applied.
 check_and_fix_ccs_k3s_cert() {
-    local K="kubectl --kubeconfig=/etc/kubernetes/admin.conf --server=${API_SERVER}"
-    local kc
-    kc=$(vcfa_kubectl_invoker)
+    # v2.12: collapsed from 25+ individual vcfa_ssh_nosudo calls into a single execute_remote
+    # batch. A Python3-free bash+openssl script runs entirely on the appliance: reads cert
+    # notBefore once, iterates all 24 service-tls deployments in one loop, issues rollout
+    # restarts for stale ones, and waits for them to become ready — all in one SSH round-trip.
+    # Reduces check time from ~2 minutes of serial SSH latency to ~5 seconds (or ~2 min when
+    # restarts are actually needed).
+    info "Checking service-tls certificate freshness across prelude deployments (batched v2.12)..."
+    local fix_prefix
+    fix_prefix=$(printf 'K="%s"\nNS="%s"\n' "${KUBECTL_CMD}" "${PRELUDE_NAMESPACE}")
+    local fix_body
+    fix_body=$(cat <<'CERT_CHECK_BODY'
+set -u
 
-    info "Checking service-tls certificate freshness across prelude deployments..."
+# --- Read cert notBefore + notAfter from service-tls Secret in one openssl call ---
+CERT_DATA=$($K get secret service-tls -n "$NS" \
+    -o jsonpath='{.data.tls\.crt}' 2>/dev/null \
+    | base64 -d \
+    | openssl x509 -noout -startdate -enddate 2>/dev/null || true)
+CERT_NBF_STR=$(echo "$CERT_DATA" | grep notBefore | cut -d= -f2)
+CERT_EXP_STR=$(echo "$CERT_DATA" | grep notAfter  | cut -d= -f2)
 
-    # --- Get cert notBefore from the service-tls Secret (epoch seconds) ---
-    local cert_nbf cert_exp
-    cert_nbf=$(vcfa_ssh_nosudo \
-        "${kc}${K} get secret service-tls -n ${PRELUDE_NAMESPACE} \
-         -o jsonpath='{.data.tls\.crt}' 2>/dev/null \
-         | base64 -d \
-         | openssl x509 -noout -startdate 2>/dev/null \
-         | cut -d= -f2 \
-         | xargs -I{} date -d '{}' +%s 2>/dev/null" \
-        2>/dev/null | tr -d '[:space:]') || true
+if [[ -z "$CERT_NBF_STR" ]]; then
+    echo "  service-tls: could not read cert from secret — skipping freshness check"
+    exit 0
+fi
+CERT_NBF=$(date -d "$CERT_NBF_STR" +%s 2>/dev/null || echo "")
+if [[ -z "$CERT_NBF" ]]; then
+    echo "  service-tls: could not parse cert notBefore — skipping"
+    exit 0
+fi
+CERT_TS=$(date -d "@${CERT_NBF}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${CERT_NBF}")
+echo "  service-tls cert: notBefore=${CERT_TS}, notAfter=${CERT_EXP_STR}"
 
-    if [[ -z "$cert_nbf" || ! "$cert_nbf" =~ ^[0-9]+$ ]]; then
-        warning "service-tls: could not read cert from secret — skipping freshness check"
-        return 0
+# --- All deployments in prelude that mount the shared service-tls Secret ---
+DEPLOYMENTS="abx-service-app approval-service-app catalog-service-app ccs-avi-eas-app
+ccs-gateway-app ccs-infra-eas-app ccs-k3s-app ccs-nsx-eas-app ccs-vksm-eas cgs-service-app
+cloud-automation-ui-app ebs-app encryption-manager extensibility-ui-app hcmp-service-app
+orchestration-ui-app provisioning-service-app provisioning-ui-app relocation-service-app
+relocation-ui-app tango-blueprint-service-app tango-uber-service-app terraform-service-app
+vcfa-service-manager"
+
+# --- Check each deployment in one pass; collect stale ones ---
+STALE_LIST=""
+for deploy in $DEPLOYMENTS; do
+    APP_LABEL=$($K get deployment "$deploy" -n "$NS" \
+        -o jsonpath='{.spec.selector.matchLabels.app}' 2>/dev/null || echo "")
+    [[ -z "$APP_LABEL" ]] && APP_LABEL="$deploy"
+    POD_START=$($K get pod -n "$NS" -l "app=${APP_LABEL}" \
+        --field-selector=status.phase=Running \
+        -o jsonpath='{.items[0].status.startTime}' 2>/dev/null \
+        | xargs -I{} date -d '{}' +%s 2>/dev/null || echo "")
+    # Skip deployments with no running pod (replicas=0, not yet scheduled, etc.)
+    [[ -z "$POD_START" ]] && continue
+    if [[ "$POD_START" -lt "$CERT_NBF" ]]; then
+        POD_TS=$(date -d "@${POD_START}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${POD_START}")
+        echo "  STALE: ${deploy} (pod started ${POD_TS} < cert renewed ${CERT_TS})"
+        STALE_LIST="${STALE_LIST} ${deploy}"
     fi
+done
 
-    cert_exp=$(vcfa_ssh_nosudo \
-        "${kc}${K} get secret service-tls -n ${PRELUDE_NAMESPACE} \
-         -o jsonpath='{.data.tls\.crt}' 2>/dev/null \
-         | base64 -d \
-         | openssl x509 -noout -enddate 2>/dev/null \
-         | cut -d= -f2" \
-        2>/dev/null | tr -d '\r\n') || cert_exp="unknown"
+if [[ -z "$STALE_LIST" ]]; then
+    echo "  service-tls: all prelude pods started after cert renewal — no restarts needed"
+    exit 0
+fi
 
-    local cert_ts
-    cert_ts=$(date -d "@${cert_nbf}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${cert_nbf}")
-    info "  service-tls cert: notBefore=${cert_ts}, notAfter=${cert_exp}"
+STALE_COUNT=$(echo "$STALE_LIST" | wc -w)
+echo "  Issuing rollout restarts for ${STALE_COUNT} stale deployment(s)..."
+for deploy in $STALE_LIST; do
+    $K rollout restart deployment/"$deploy" -n "$NS" >/dev/null 2>&1 \
+        && echo "    restarted: $deploy" \
+        || echo "    WARN: restart failed for $deploy"
+done
 
-    # --- All deployments in prelude that mount service-tls ---
-    # This list covers every deployment confirmed to use the shared service-tls Secret.
-    local service_tls_deployments=(
-        abx-service-app
-        approval-service-app
-        catalog-service-app
-        ccs-avi-eas-app
-        ccs-gateway-app
-        ccs-infra-eas-app
-        ccs-k3s-app
-        ccs-nsx-eas-app
-        ccs-vksm-eas
-        cgs-service-app
-        cloud-automation-ui-app
-        ebs-app
-        encryption-manager
-        extensibility-ui-app
-        hcmp-service-app
-        orchestration-ui-app
-        provisioning-service-app
-        provisioning-ui-app
-        relocation-service-app
-        relocation-ui-app
-        tango-blueprint-service-app
-        tango-uber-service-app
-        terraform-service-app
-        vcfa-service-manager
-    )
-
-    # --- Check each deployment and collect stale ones ---
-    local stale_deployments=()
-
-    for deploy in "${service_tls_deployments[@]}"; do
-        local app_label pod_start pod_epoch
-        app_label=$(vcfa_ssh_nosudo \
-            "${kc}${K} get deployment ${deploy} -n ${PRELUDE_NAMESPACE} \
-             -o jsonpath='{.spec.selector.matchLabels.app}' 2>/dev/null" \
-            2>/dev/null | tr -d '[:space:]') || true
-        [[ -z "$app_label" ]] && app_label="$deploy"
-
-        pod_start=$(vcfa_ssh_nosudo \
-            "${kc}${K} get pod -n ${PRELUDE_NAMESPACE} \
-             -l app=${app_label} --field-selector='status.phase=Running' \
-             -o jsonpath='{.items[0].status.startTime}' 2>/dev/null \
-             | xargs -I{} date -d '{}' +%s 2>/dev/null" \
-            2>/dev/null | tr -d '[:space:]') || true
-
-        if [[ -z "$pod_start" || ! "$pod_start" =~ ^[0-9]+$ ]]; then
-            continue  # No running pod (e.g. replicas=0) — skip silently
-        fi
-
-        if [[ "$pod_start" -lt "$cert_nbf" ]]; then
-            local pod_ts
-            pod_ts=$(date -d "@${pod_start}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${pod_start}")
-            warning "  STALE: ${deploy} (pod started ${pod_ts} < cert renewed ${cert_ts})"
-            stale_deployments+=("$deploy")
-        fi
+# --- Wait up to 120s for all restarted deployments to become ready ---
+echo "  Waiting up to 120s for restarted deployments to become ready..."
+WAITED=0
+while [[ $WAITED -lt 120 ]]; do
+    sleep 10
+    WAITED=$((WAITED + 10))
+    STILL_PENDING=0
+    for deploy in $STALE_LIST; do
+        READY=$($K get deployment "$deploy" -n "$NS" \
+            -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
+        DESIRED=$($K get deployment "$deploy" -n "$NS" \
+            -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+        [[ -z "$DESIRED" ]] && DESIRED=1
+        [[ "$READY" != "$DESIRED" ]] && STILL_PENDING=$((STILL_PENDING + 1))
     done
-
-    if [[ ${#stale_deployments[@]} -eq 0 ]]; then
-        success "service-tls: all prelude pods started after cert renewal — no restarts needed"
-        return 0
+    if [[ $STILL_PENDING -eq 0 ]]; then
+        echo "  service-tls: all ${STALE_COUNT} deployment(s) ready after ${WAITED}s — fresh certs mounted"
+        exit 0
     fi
-
-    info "Issuing rollout restarts for ${#stale_deployments[@]} stale deployment(s)..."
-    for deploy in "${stale_deployments[@]}"; do
-        execute_remote \
-            "${K} rollout restart deployment/${deploy} -n ${PRELUDE_NAMESPACE}" \
-            "rollout restart ${deploy} (stale service-tls cert)" true
-    done
-
-    # --- Wait for all restarted deployments to become ready (max 120s) ---
-    info "Waiting up to 120s for restarted deployments to become ready..."
-    local waited=0
-    while [[ $waited -lt 120 ]]; do
-        sleep 10
-        waited=$((waited + 10))
-        local still_pending=0
-        for deploy in "${stale_deployments[@]}"; do
-            local ready
-            ready=$(vcfa_ssh_nosudo \
-                "${kc}${K} get deployment ${deploy} -n ${PRELUDE_NAMESPACE} \
-                 -o jsonpath='{.status.readyReplicas}' 2>/dev/null" \
-                2>/dev/null | tr -d '[:space:]' | grep -oE '^[0-9]+$' || echo "")
-            local desired
-            desired=$(vcfa_ssh_nosudo \
-                "${kc}${K} get deployment ${deploy} -n ${PRELUDE_NAMESPACE} \
-                 -o jsonpath='{.spec.replicas}' 2>/dev/null" \
-                2>/dev/null | tr -d '[:space:]' | grep -oE '^[0-9]+$' || echo "1")
-            [[ -z "$desired" ]] && desired=1
-            if [[ "$ready" != "$desired" ]]; then
-                still_pending=$((still_pending + 1))
-            fi
-        done
-        if [[ $still_pending -eq 0 ]]; then
-            success "service-tls: all ${#stale_deployments[@]} deployment(s) ready after ${waited}s — fresh certs mounted"
-            return 0
-        fi
-        info "  ${still_pending}/${#stale_deployments[@]} deployment(s) still rolling out (${waited}s / 120s)..."
-    done
-    warning "service-tls: ${#stale_deployments[@]} deployment(s) restarted but rollout not confirmed within 120s — proceeding"
+    echo "  ${STILL_PENDING}/${STALE_COUNT} deployment(s) still rolling out (${WAITED}s / 120s)..."
+done
+echo "  service-tls: ${STALE_COUNT} deployment(s) restarted but rollout not confirmed within 120s — proceeding"
+CERT_CHECK_BODY
+)
+    execute_remote "${fix_prefix}${fix_body}" \
+        "service-tls freshness: cert read + pod check + restart in one SSH hop" true
 }
 
 # Main execution function
 main() {
     echo "======================================================================"
-        echo "           VCFA Complete Stabilization Script v2.8"
+    echo "           VCFA Complete Stabilization Script v2.13"
     echo "======================================================================"
     echo "Comprehensive VCFA stability solution for nested environments"
-    echo "Default run is prophylactic: control-plane preflight + auth + core + SDS"
+    echo "All phases run on every invocation; each step is self-checking and reports"
+    echo "no-ops when already correct. No early-exit gate — safe to re-run any time."
     echo ""
     echo "Target VCFA VM (SSH): $VCFA_HOST"
     echo "Gateway LB VIP (curl): $VCFA_HTTP_VIP  (Service vcfa-gateway-configuration / kube-vip)"
@@ -1968,53 +2180,75 @@ main() {
     
     check_prerequisites
 
-    # Always check ccs-k3s service-tls cert freshness — runs before the idempotency early-exit
-    # because cert expiry is time-based and must be checked on every startup regardless of
-    # whether the rest of the stabilizer has already been applied.
+    # --- Unconditional pre-boot sweeps (always run, every invocation) ---
+    # These are time-sensitive and must not be gated on any idempotency marker.
+
+    # v2.12: support-bundle runaway + stale Argo workflow + cordoned node sweep (Maher-July-Patch)
+    check_and_fix_support_bundle_runaway
+
+    # v2.8: service-tls cert freshness check (cert expiry is time-based)
     check_and_fix_ccs_k3s_cert
 
-    # Check if the stabilizer has already been applied by looking for persistent settings it creates.
-    # v2.9: this used to be an OR across the first two markers, which meant a lab that already had
-    # marker 1 from an earlier stabilizer version would silently skip Phase 1.5 forever and never pick
-    # up a newer persistent fix (exactly what happened to the vmsp-platform kube-vip hardening below on
-    # labs that already had the envoy-gateway keeper installed). Require ALL THREE before short-circuiting:
-    # 1. The durable envoy-gateway memory watcher script (from Phase 3.5)
-    # 2. The kube-system control-plane kube-vip renew/retry tuning (from Phase 1.5)
-    # 3. The vmsp-platform kube-vip DaemonSet watcher script (NEW v2.9, from Phase 1.5 step 6/6)
-    # v2.11: marker 2 now checks vip_renewdeadline="90" instead of vip_leaseduration="120" --
-    # the lease-duration setting was removed (kube-vip v1.0.2 ignores it; see v2.11 changelog).
-    local check_cmd="test -f /usr/local/bin/vcfa-eg-mem-keeper.sh && (grep -A 1 'name: vip_renewdeadline' /etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null | grep -q 'value: \"90\"') && test -f /usr/local/bin/vcfa-vmsp-kube-vip-keeper.sh && test -f /usr/local/bin/vcfa-vip-watchdog.sh"
-    if vcfa_ssh_nosudo "$check_cmd" >/dev/null 2>&1; then
-        echo "VCFA Stabilizer already applied..."
-        exit 0
+    # --- Pre-flight: report durable marker state (informational; all phases run regardless) ---
+    # The four markers are persistent settings installed by specific phases.  Checking them
+    # before running lets the operator see at a glance what is already in place and what will
+    # be freshly applied.  They no longer gate execution — each function is self-checking and
+    # prints "(no-op)" when its step is already correct.
+    #
+    # Marker 1: /usr/local/bin/vcfa-eg-mem-keeper.sh       (Phase 3.5 — envoy-gateway mem watcher)
+    # Marker 2: kube-vip.yaml has vip_renewdeadline="90"  (Phase 1.5 — kube-vip plndr-cp-lock)
+    # Marker 3: /usr/local/bin/vcfa-vmsp-kube-vip-keeper.sh (Phase 1.5 — vmsp kube-vip drift watcher)
+    # Marker 4: /usr/local/bin/vcfa-vip-watchdog.sh         (Phase 1.5 — VIP event watchdog)
+    echo ""
+    info "=== Pre-flight: durable marker status ==="
+    local _preflight_out
+    _preflight_out=$(vcfa_ssh_nosudo '
+m1=$(test -f /usr/local/bin/vcfa-eg-mem-keeper.sh       && echo "PRESENT" || echo "MISSING")
+m2=$(grep -A 1 "name: vip_renewdeadline" /etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null \
+     | grep -q '"'"'value: "90"'"'"' && echo "PRESENT" || echo "MISSING")
+m3=$(test -f /usr/local/bin/vcfa-vmsp-kube-vip-keeper.sh && echo "PRESENT" || echo "MISSING")
+m4=$(test -f /usr/local/bin/vcfa-vip-watchdog.sh         && echo "PRESENT" || echo "MISSING")
+echo "  Marker 1 — eg-mem-keeper.sh (Phase 3.5):          $m1"
+echo "  Marker 2 — kube-vip renewdeadline=90 (Phase 1.5): $m2"
+echo "  Marker 3 — vmsp-kube-vip-keeper.sh (Phase 1.5):   $m3"
+echo "  Marker 4 — vcfa-vip-watchdog.sh (Phase 1.5):      $m4"
+[[ "$m1" == "PRESENT" && "$m2" == "PRESENT" && "$m3" == "PRESENT" && "$m4" == "PRESENT" ]] \
+    && echo "MARKERS_ALL_PRESENT=1" || echo "MARKERS_ALL_PRESENT=0"
+' 2>/dev/null) || _preflight_out=""
+    # Print all lines except the sentinel
+    echo "$_preflight_out" | grep -v "^MARKERS_ALL_PRESENT=" || true
+    local _markers_all_present=0
+    echo "$_preflight_out" | grep -q "MARKERS_ALL_PRESENT=1" && _markers_all_present=1
+    if [[ "$_markers_all_present" -eq 1 ]]; then
+        info "  → all durable markers PRESENT; phases will report no-ops where already applied."
+    else
+        info "  → one or more markers MISSING; phases will apply the outstanding fixes."
     fi
-    
+
     echo ""
     info "=== PHASE 1: Initial System Assessment ==="
     get_system_status
-    
+
     echo ""
     info "=== PHASE 1.5: Control-plane preflight (v2.6 prophylaxis) ==="
-    # Apply every persistent control-plane fix we've ever needed in a single idempotent pass:
-    #   - pin gateway+CP VIPs non-deprecated
-    #   - defrag etcd if slack >= ETCD_DEFRAG_SLACK_PCT (default 30)
-    #   - harden kube-vip plndr-cp-lock lease (60s/45s/10s, preserve_on_leadership_loss=true)
-    #   - bump kube-apiserver/kcm/scheduler probe timeouts (period=10 timeout=30 failureThreshold=8)
-    #   - suspend kyverno HelmRelease, set --forceFailurePolicyIgnore=true, flip resource webhook
-    #   - harden vmsp-platform kube-vip DaemonSet lease/probe + install its drift watcher (NEW v2.9)
-    # Each step compares current vs desired and is a no-op when already correct, so this is safe to
-    # run on every invocation (default-run, --full, --preflight).
-    # Set STABILIZER_SKIP_OVERLOAD_PROPHYLAXIS=1 to skip this phase (legacy v2.5- behavior).
+    # Each sub-step compares current state to desired and prints "(no-op)" when already correct.
+    # Covers: VIP pinning, etcd defrag, kube-vip manifest hardening, kube-apiserver/kcm/scheduler
+    # probe tuning, kyverno failurePolicy, vmsp-platform kube-vip DaemonSet, drift watchers.
+    # Set STABILIZER_SKIP_OVERLOAD_PROPHYLAXIS=1 to skip (legacy v2.5- behaviour).
     if [[ "${STABILIZER_SKIP_OVERLOAD_PROPHYLAXIS:-0}" == "1" ]]; then
         info "STABILIZER_SKIP_OVERLOAD_PROPHYLAXIS=1 — skipping control-plane preflight"
     else
         fix_overload_recovery || warning "Control-plane preflight reported errors (continuing — see logs above)"
-        # Static-pod manifest changes (kube-vip, kube-apiserver, kcm, scheduler) trigger kubelet to
-        # restart those pods, which briefly disrupts API server availability. Wait for things to
-        # settle before continuing, but only if any changes were actually applied.
-        info "Waiting 20s for control-plane to settle after preflight..."
-        sleep 20
-        wait_for_api_server
+        # Static-pod manifest changes (kube-vip, kube-apiserver, kcm, scheduler) cause kubelet to
+        # restart those pods, briefly disrupting API availability.  Only wait if markers were absent
+        # before this run (indicating that manifest writes likely just occurred).
+        if [[ "$_markers_all_present" -eq 0 ]]; then
+            info "Waiting 20s for control-plane to settle after manifest changes..."
+            sleep 20
+            wait_for_api_server
+        else
+            info "Durable markers already present — no manifest changes expected; skipping settle wait."
+        fi
     fi
     
     echo ""
@@ -2066,14 +2300,25 @@ main() {
 # Handle script arguments
 case "${1:-}" in
     --help|-h)
-        echo "VCFA Complete Stabilization Script v2.11"
+        echo "VCFA Complete Stabilization Script v2.13"
         echo "See: ${SCRIPT_DIR}/VCFA_Stabilizer_Incident_Apr2026.md"
         echo ""
         echo "Usage: $0 [options]"
         echo ""
-        echo "Default run (no options) = one-shot prophylactic stabilization. Run this on every boot;"
-        echo "it's idempotent and only changes things that need changing."
-        echo "Phases: 1 status, 1.5 control-plane preflight (NEW v2.6), 2 auth services, 3 core components,"
+        echo "Default run (no options): all phases run on every invocation."
+        echo "Each step checks current state first and prints a no-op if already correct."
+        echo "No early-exit gate — safe to run on every boot or to re-run at any time."
+        echo ""
+        echo "Always runs (every invocation, before phase pre-flight report):"
+        echo "  - support-bundle-cluster-info-dump runaway sweep (v2.12, Maher-July-Patch)"
+        echo "  - stale system-shutdown Argo Workflow deletion + cordoned node uncordon (v2.12)"
+        echo "  - service-tls freshness check across 24 prelude deployments (v2.8)"
+        echo ""
+        echo "Pre-flight report: shows PRESENT/MISSING state of 4 durable markers before phases run."
+        echo "  Marker 1: vcfa-eg-mem-keeper.sh (Phase 3.5)       Marker 3: vmsp-kube-vip-keeper.sh (Phase 1.5)"
+        echo "  Marker 2: kube-vip renewdeadline=90 (Phase 1.5)   Marker 4: vcfa-vip-watchdog.sh (Phase 1.5)"
+        echo ""
+        echo "Phases: 1 status, 1.5 control-plane preflight, 2 auth services, 3 core components,"
         echo "        3.5 SDS NACK auto-fix, 4 wait, 5 verify, 6 monitoring."
         echo ""
         echo "The control-plane preflight (1.5) applies these durable fixes idempotently:"
@@ -2097,6 +2342,12 @@ case "${1:-}" in
         echo "                          Use after a fresh boot or before a known-busy run. ~2-3 min."
         echo "  --verify                Run stabilization verification (Phase 5-style)"
         echo "  --verify-stability      Run embedded stability suite only (watch + HTTP + pod grep)"
+        echo "  --fix-support-bundle    v2.12: support-bundle-cluster-info-dump runaway fix (Maher-July-Patch)."
+        echo "                          Sweeps stale Argo system-shutdown workflows, uncordons nodes, deletes"
+        echo "                          runaway Jobs (if count > SUPPORT_BUNDLE_JOB_THRESHOLD), applies permanent"
+        echo "                          hardening (concurrencyPolicy=Replace + driftDetection=disabled label),"
+        echo "                          and auto-unsuspends the CronJob if no runaway is found."
+        echo "                          Symptom: 30GHz+ CPU, VCFA UI slow/unresponsive. Fixed in VCF 9.1.1."
         echo "  --repair-envoyproxy     Strip v2.1 EnvoyProxy volumeMounts + restart envoy-gateway (needs jq on appliance)"
         echo "  --recover-gateway-503   Roll trust/cert-manager + prelude SDS backends + dataplane/operator gateways (HTTP 503 / SDS)"
         echo "  --fix-sds-sni           Fix envoy-gateway v1.5 + Envoy v1.34 SDS NACK by replacing"
@@ -2134,6 +2385,9 @@ case "${1:-}" in
         echo "  VCFA_CP_VIP=10.1.1.72                     Control-plane VIP to pin as backstop"
         echo "  VMSP_GW_VIP=10.1.1.69                     vmsp-gateway VIP to pin as backstop"
         echo "  VCFA_GW_VIP=10.1.1.70                     vcfa-gateway-configuration VIP to pin as backstop"
+        echo ""
+        echo "Support bundle sweep (v2.12, Maher-July-Patch):"
+        echo "  SUPPORT_BUNDLE_JOB_THRESHOLD=3            Job count above which runaway is triggered (default 3)"
         echo ""
         echo "Lab tuning env (optional):"
         echo "  CPU_TUNE_SETTLE_SECONDS          Sleep between blocks (default: 45)"
@@ -2193,6 +2447,14 @@ case "${1:-}" in
         info "=== Post-stabilization: lab CPU tune (HTTP 200 required between steps unless CPU_TUNE_REQUIRE_HTTP_200=0) ==="
         export CPU_TUNE_REQUIRE_HTTP_200="${CPU_TUNE_REQUIRE_HTTP_200:-1}"
         cpu_tune_apply || exit 1
+        exit 0
+        ;;
+    --fix-support-bundle)
+        # Maher-July-Patch: support-bundle CronJob runaway remediation + cluster sweep.
+        # Symptom: 30GHz+ CPU, VCFA UI slow or not loading (VCF 9.1 bug, fixed in 9.1.1).
+        check_prerequisites
+        check_and_fix_support_bundle_runaway
+        get_system_status
         exit 0
         ;;
     --repair-envoyproxy)
