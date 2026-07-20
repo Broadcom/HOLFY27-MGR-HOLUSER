@@ -1,8 +1,40 @@
 #!/usr/bin/env python3
 # VCF.py - HOLFY27 Core VCF Startup Module
-# Version 3.7 - 2026-07-10
+# Version 3.9 - 2026-07-20
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation startup sequence
+#
+# v3.9 Changes:
+# - Fix: _start_vm_on_hosts crashed the whole VCF module with an uncaught
+#   vmodl.fault.ManagedObjectNotFound ("The object 'vim.VirtualMachine:N' has
+#   already been deleted or has not been completely created") while powering
+#   on vcf_Avi-se-* VMs registered on 2+ hosts. Root cause: only the
+#   PowerOnVM_Task()/WaitForTask() call was wrapped in try/except - the
+#   registration-logging loop, the "already poweredOn" scan, the sort key,
+#   and the connection-state wait all read vm.runtime.* unguarded. Any of
+#   those reads can throw ManagedObjectNotFound if a duplicate/stale
+#   registration gets cleaned up by ESXi between discovery and use (the same
+#   race the v3.3 FileNotFound/Device-busy handling addresses, just a
+#   different fault type). Fix: every vm.runtime.* read in this function is
+#   now guarded - vanished registrations are logged and skipped instead of
+#   crashing, and 'ManagedObjectNotFound'/'already been deleted' were added
+#   to the existing stale-registration detection in Step 3.
+# v3.8 Changes:
+# - Fix: _start_vm_on_hosts called WaitForTask(task) with no timeout. When
+#   powering on several VMs back-to-back against the same ESXi host connection
+#   (e.g. the 10 vcf_Avi-se-* Service Engine VMs from vcfpostedgevms), the
+#   PropertyCollector-based task-completion notification for that host's
+#   session can lag by minutes even though the VM has already powered on at
+#   the host level (confirmed via `vim-cmd vmsvc/power.getstate` while
+#   labstartup.py sat blocked on WaitForTask). Because the wait was unbounded,
+#   a single lagging notification stalled the entire post-edge VM phase (and
+#   everything after it - vCenter, NSX, etc.) with no way to recover, which
+#   surfaced to users as "lab startup fails during vcf_Avi-.* processing."
+#   Fix: WaitForTask now passes maxWaitTime=TASK_WAIT_TIMEOUT_SECONDS. If the
+#   wait times out, poll vm.runtime.powerState directly (bypassing the
+#   PropertyCollector) for up to POWERSTATE_POLL_RETRIES * POWERSTATE_POLL_DELAY
+#   seconds - if the VM is actually poweredOn, treat it as a successful start
+#   instead of failing the whole VM.
 #
 # v3.2 Changes:
 # - NSX Edge/NSX Manager/vCenter power-on is now host-agnostic. Since VCF.py
@@ -118,7 +150,17 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
              not found on any host
     """
     from pyVim.task import WaitForTask
-    
+
+    # PowerOnVM_Task completion is normally near-instant, but on a nested/
+    # resource-constrained ESXi host the PropertyCollector notification for
+    # that host's session can lag well behind the actual power-on (observed:
+    # 2m16s lag powering on vcf_Avi-se-* VMs back-to-back on the same host).
+    # Bound the wait so one lagging task can't stall the whole startup, and
+    # fall back to polling runtime.powerState directly on timeout.
+    TASK_WAIT_TIMEOUT_SECONDS = 90
+    POWERSTATE_POLL_RETRIES = 6
+    POWERSTATE_POLL_DELAY = 30  # 6 x 30s = up to 3 more minutes
+
     # VM discovery with retries - after a cold boot a VM's registration can take
     # a minute or two to become visible on the ESXi host even though it is already
     # running. Retry before declaring not_found to avoid a premature lab failure.
@@ -177,65 +219,117 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
                              f'{VM_FIND_MAX_RETRIES} attempts: {vm_name}')
             return 'not_found'
     
-    # Log all registrations found
+    # Log all registrations found. A registration can vanish between
+    # discovery (above) and here - e.g. ESXi cleans up a stale duplicate
+    # registration once it notices the VM is already running via another
+    # host's registration. That turns any vm.runtime.* property access into
+    # a vmodl.fault.ManagedObjectNotFound ("object has already been deleted").
+    # None of these property reads were previously guarded, so a vanished
+    # registration crashed the whole VCF module instead of just being
+    # skipped like the analogous FileNotFound/Device-busy case in Step 3.
+    live_vms = []
     for vm in vms:
-        h = vm.runtime.host.name if vm.runtime.host else 'unknown'
-        lsf.write_output(f'  {vm.name}: found on {h} (power={vm.runtime.powerState}, conn={vm.runtime.connectionState})')
-    
+        try:
+            h = vm.runtime.host.name if vm.runtime.host else 'unknown'
+            lsf.write_output(f'  {vm.name}: found on {h} (power={vm.runtime.powerState}, conn={vm.runtime.connectionState})')
+            live_vms.append(vm)
+        except Exception as e:
+            lsf.write_output(f'  {fail_label} "{vm_name}": a registration vanished during lookup '
+                             f'({e}) - stale duplicate, ignoring')
+    vms = live_vms
+
+    if not vms:
+        lsf.write_output(f'WARNING: {fail_label} "{vm_name}": all registrations vanished before power-on')
+        return 'not_found'
+
     # Step 1: Check if ANY registration shows poweredOn
     for vm in vms:
-        if vm.runtime.powerState == 'poweredOn':
-            host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
-            lsf.write_output(f'{vm.name} already powered on (host: {host_name})')
-            return 'already_on'
-    
+        try:
+            if vm.runtime.powerState == 'poweredOn':
+                host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
+                lsf.write_output(f'{vm.name} already powered on (host: {host_name})')
+                return 'already_on'
+        except Exception:
+            continue
+
     # Step 2: Sort candidates - prefer connected VMs first, then by host name
-    # for deterministic ordering
-    candidates = sorted(vms, key=lambda v: (
-        0 if v.runtime.connectionState == 'connected' else 1,
-        v.runtime.host.name if v.runtime.host else 'zzz'
-    ))
-    
+    # for deterministic ordering. Fall back to unsorted if a registration
+    # vanishes mid-sort rather than letting the sort itself crash.
+    try:
+        candidates = sorted(vms, key=lambda v: (
+            0 if v.runtime.connectionState == 'connected' else 1,
+            v.runtime.host.name if v.runtime.host else 'zzz'
+        ))
+    except Exception:
+        candidates = vms
+
     # Step 3: Try to power on each candidate until one succeeds
     last_error = None
     for vm in candidates:
-        host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
-        
-        # Wait briefly for VM to reach connected state
-        max_wait = 30
-        waited = 0
-        while vm.runtime.connectionState != 'connected' and waited < max_wait:
-            lsf.write_output(f'  {vm.name} on {host_name}: connection state {vm.runtime.connectionState}, waiting...')
-            time.sleep(5)
-            waited += 5
-        
-        if vm.runtime.connectionState != 'connected':
-            lsf.write_output(f'  {vm.name} on {host_name}: not connected after {max_wait}s, skipping')
-            continue
-        
-        lsf.write_output(f'Powering on {vm.name} (host: {host_name})...')
-        
+        host_name = 'unknown'
         try:
+            host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
+
+            # Wait briefly for VM to reach connected state
+            max_wait = 30
+            waited = 0
+            while vm.runtime.connectionState != 'connected' and waited < max_wait:
+                lsf.write_output(f'  {vm.name} on {host_name}: connection state {vm.runtime.connectionState}, waiting...')
+                time.sleep(5)
+                waited += 5
+
+            if vm.runtime.connectionState != 'connected':
+                lsf.write_output(f'  {vm.name} on {host_name}: not connected after {max_wait}s, skipping')
+                continue
+
+            lsf.write_output(f'Powering on {vm.name} (host: {host_name})...')
+
             task = vm.PowerOnVM_Task()
-            WaitForTask(task)
-            lsf.write_output(f'Powered on {vm.name} (host: {host_name})')
-            return 'started'
+            try:
+                WaitForTask(task, maxWaitTime=TASK_WAIT_TIMEOUT_SECONDS)
+                lsf.write_output(f'Powered on {vm.name} (host: {host_name})')
+                return 'started'
+            except Exception as wait_err:
+                if 'exceeded timeout' not in str(wait_err):
+                    raise
+                # The task itself didn't error - we just stopped hearing about
+                # it. Poll the VM's actual power state directly instead of
+                # trusting the (possibly stalled) PropertyCollector.
+                lsf.write_output(f'  {vm.name} on {host_name}: task completion '
+                                 f'notification timed out after {TASK_WAIT_TIMEOUT_SECONDS}s, '
+                                 f'polling power state directly...')
+                for poll_attempt in range(1, POWERSTATE_POLL_RETRIES + 1):
+                    time.sleep(POWERSTATE_POLL_DELAY)
+                    if vm.runtime.powerState == 'poweredOn':
+                        lsf.write_output(f'Powered on {vm.name} (host: {host_name}) '
+                                         f'[confirmed via direct poll, attempt {poll_attempt}]')
+                        return 'started'
+                # Still not showing poweredOn after polling - treat as a real failure.
+                raise Exception(f'power state still {vm.runtime.powerState} after '
+                                f'{TASK_WAIT_TIMEOUT_SECONDS + POWERSTATE_POLL_RETRIES * POWERSTATE_POLL_DELAY}s') from wait_err
         except Exception as e:
             error_str = str(e)
             last_error = error_str
-            
-            # FileNotFound / Device busy = VMX locked by another host
-            # This means the VM is actually running on a different host.
-            # Skip this stale registration and try the next one.
+
+            # FileNotFound / Device busy / ManagedObjectNotFound ("already
+            # been deleted") all mean the same thing: this registration is
+            # stale and another host actually owns (or already started) the
+            # VM. Skip it and try the next candidate rather than failing.
             is_stale = ('FileNotFound' in error_str or
                         'Device or resource busy' in error_str or
-                        'Unable to load configuration file' in error_str)
-            
+                        'Unable to load configuration file' in error_str or
+                        'ManagedObjectNotFound' in error_str or
+                        'already been deleted' in error_str)
+
+            try:
+                vm_label = vm.name
+            except Exception:
+                vm_label = vm_name
             if is_stale:
-                lsf.write_output(f'  {vm.name} on {host_name}: VMX locked (stale registration), trying next host...')
+                lsf.write_output(f'  {vm_label} on {host_name}: stale registration, trying next host...')
                 continue
             else:
-                lsf.write_output(f'FAILED to power on {vm.name} on {host_name}: {e}')
+                lsf.write_output(f'FAILED to power on {vm_label} on {host_name}: {e}')
                 # Non-lock error is a real failure - still try remaining candidates
                 continue
     
