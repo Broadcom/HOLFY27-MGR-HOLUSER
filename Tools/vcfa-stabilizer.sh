@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VCFA Complete Stabilization Script v2.17
-# Version 2.17 - 2026-07-22
+# VCFA Complete Stabilization Script v2.18
+# Version 2.18 - 2026-07-22
 # Author - HOL Core Team
 #
 # Default-run philosophy (v2.6+): one run of the script with no flags should leave the VCFA in a
@@ -36,6 +36,8 @@
 #   - vcfapostgres pgdata permission auto-remediation (NEW v2.15)
 #   - terminal Job/Workflow pod cleanup (Failed/Succeeded pods owned by a Job or Argo Workflow,
 #     cluster-wide) — clears configure-component-*-execute-script-* leftovers (NEW v2.16)
+#   - rabbitmq-ha StatefulSet copy-config init container presence check + AMQPS(5671) listener
+#     diagnostic, inside fix_vcf_final_edge_cases (NEW v2.18)
 # What's conditional (only applied when we detect actual trouble):
 #   - kyverno --forceFailurePolicyIgnore=true + webhook Fail->Ignore. Triggers when load1>30, OR
 #     kyverno pods not Ready, OR kube-controller-manager restarts>5. Reason: vmsp-operator owns
@@ -43,6 +45,41 @@
 #     unconditionally just churns rollouts. Set FORCE_KYVERNO_FIX=1 to bypass the heuristic.
 #
 # See VCFA_Stabilizer_Incident_Apr2026.md for the gateway/EnvoyProxy guidance and HTTP 503 recovery.
+#
+# v2.18 changelog (2026-07-22):
+#  * FIX (root cause, confirmed live on a broken pod): the "RabbitMQ .erlang.cookie" fix inside
+#    fix_vcf_final_edge_cases used `kubectl patch statefulset rabbitmq-ha --type=merge` on
+#    spec.template.spec.initContainers. --type=merge is a JSON Merge Patch (RFC 7386): it has no
+#    by-name list merging, so specifying "initContainers": [{fix-cookie}] REPLACED THE WHOLE ARRAY,
+#    silently deleting the StatefulSet's "copy-config" init container (the one that copies
+#    rabbitmq.conf/enabled_plugins/advanced.config from the "rabbitmq-ha" ConfigMap and
+#    definitions.json from the "db-credentials" Secret into the /etc/rabbitmq emptyDir before
+#    RabbitMQ starts). Once missing, rabbitmq-ha-0 boots with "Config file(s): (none)": no
+#    AMQPS(5671) listener, no management plugin, no queue definitions -- but `rabbitmq-diagnostics
+#    ping` (the liveness/startup probe) still succeeds, so Kubernetes reports the pod perfectly
+#    healthy. Every AMQP client then gets "Connection refused" on 5671; ebs-app's own
+#    /event-broker/healthcheck reports {"status":"DOWN", "...":"Connection refused"} (HTTP 503),
+#    which cascades into ~15 prelude Deployments stuck Pending/PodInitializing behind the
+#    ebs-service dependency check (approval-service-app, catalog-service-app, ccs-gateway-app,
+#    ccs-k3s-app, ccs-vksm-eas, cgs-service-app, hcmp-service-app, policy-view-service-server,
+#    provisioning-service-app, relocation-service-app, resource-manager-server, intent-server,
+#    tango-blueprint-service-app). This is a SEPARATE failure mode from the documented
+#    "ebs-app GC-only / heavy JVM startup" pattern in vcf-automation.md #35 -- that one is a slow
+#    cold start with no auto-fix; this one is a hard 503 caused by a missing RabbitMQ config that
+#    self-heals in minutes once the init container is restored, no matter how long you wait.
+#  * NEW: added a "RabbitMQ copy-config init container integrity" check (runtime backstop, runs
+#    every invocation of fix_vcf_final_edge_cases) that detects a missing "copy-config" init
+#    container via `kubectl get statefulset ... -o jsonpath` (cheap, no side effects when present)
+#    and restores it with a `kubectl patch --type=json` array-append ("add" at "/…/initContainers/-"),
+#    which can never wipe out other init containers the way --type=merge did. When it has to
+#    restore the container, it also deletes rabbitmq-ha-0 so the fix takes effect immediately
+#    (StatefulSets don't auto-recreate running pods on a template-only change). When copy-config is
+#    already present, it additionally runs a read-only `rabbitmqctl status | grep 'port: 5671'`
+#    diagnostic and WARNs (no auto-action) if the listener is still down for some other reason
+#    (e.g. a cert rotation) -- avoids restart-looping the pod for an unrelated problem.
+#  * FIX: converted the existing "fix-cookie" patch itself from --type=merge to the same safe
+#    --type=json array-append pattern (only runs if "fix-cookie" isn't already present), so this
+#    exact bug class can never recur even if that init container ever needs to be re-added.
 #
 # v2.17 changelog (2026-07-22):
 #  * NEW: step 8/8 inside check_and_fix_support_bundle_runaway — diagnostic-only check for any
@@ -1957,17 +1994,83 @@ for pg_info in "prelude vcfapostgres-0" "vcd-migrator vcd-migrator-postgres-0"; 
     fi
 done
 
+echo "=== RabbitMQ copy-config init container integrity (v2.18) ==="
+# Root cause (found live 2026-07-22): the "RabbitMQ .erlang.cookie" fix below used to run
+#   kubectl patch statefulset rabbitmq-ha --type=merge -p '{"...":{"initContainers":[{fix-cookie}]}}'
+# --type=merge is a JSON Merge Patch (RFC 7386): unlike a strategic merge patch, it has no concept
+# of merging list elements by name -- specifying "initContainers" REPLACES THE WHOLE ARRAY with
+# exactly what was given. That silently deleted the StatefulSet's "copy-config" init container
+# (the one that copies rabbitmq.conf/enabled_plugins/advanced.config from the "rabbitmq-ha"
+# ConfigMap and definitions.json from the "db-credentials" Secret into the /etc/rabbitmq emptyDir).
+# Once gone, rabbitmq-ha-0 starts with "Config file(s): (none)": no AMQPS(5671) listener, no
+# management plugin, no queue definitions. rabbitmq-diagnostics ping still succeeds (so k8s reports
+# the pod healthy) but every AMQP client gets a hard "Connection refused" on 5671. ebs-app's own
+# HTTPS healthcheck reports 503 (event-broker can't reach RabbitMQ), which cascades into ~15
+# prelude deployments stuck Pending/PodInitializing behind the ebs-service dependency check
+# (approval/catalog/ccs-gateway/ccs-k3s/ccs-vksm-eas/cgs/hcmp/policy-view/provisioning/relocation/
+# resource-manager-server/intent-server/tango-blueprint-service).
+# Fix: (1) this section defensively restores the "copy-config" init container via a JSON Patch
+# "add" op (array-append, never replaces the array) whenever it's missing -- idempotent, safe on a
+# healthy cluster since the check is a no-op when the container is already present. (2) the cookie
+# fix below was also converted from --type=merge to a targeted --type=json add, so it can never
+# repeat this bug even if it ever needs to add "fix-cookie" again.
+rmq_sts_exists=$($K get statefulset rabbitmq-ha -n $NS --no-headers 2>/dev/null || true)
+if [ -n "$rmq_sts_exists" ]; then
+    has_copy_config=$($K get statefulset rabbitmq-ha -n $NS -o jsonpath='{.spec.template.spec.initContainers[?(@.name=="copy-config")].name}' 2>/dev/null || true)
+    if [ -z "$has_copy_config" ]; then
+        echo "  rabbitmq-ha StatefulSet is missing its copy-config init container - restoring"
+        rmq_image=$($K get statefulset rabbitmq-ha -n $NS -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+        if [ -n "$rmq_image" ]; then
+            cat > /tmp/vcfa-rmq-copyconfig-patch.json <<COPYCONFIGPATCH
+[{"op":"add","path":"/spec/template/spec/initContainers/-","value":{"name":"copy-config","image":"${rmq_image}","imagePullPolicy":"IfNotPresent","command":["sh","-c","set -e; cp -L /config-src/* /etc/rabbitmq/ 2>/dev/null || true; if [ -f /definitions-src/definitions.json ]; then cp -L /definitions-src/definitions.json /etc/rabbitmq/definitions.json; fi; chmod 0644 /etc/rabbitmq/* 2>/dev/null || true; echo COPY_CONFIG_DONE"],"volumeMounts":[{"mountPath":"/etc/rabbitmq","name":"config"},{"mountPath":"/config-src","name":"configmap","readOnly":true},{"mountPath":"/definitions-src","name":"definitions","readOnly":true}],"resources":{},"terminationMessagePath":"/dev/termination-log","terminationMessagePolicy":"File"}}]
+COPYCONFIGPATCH
+            $K patch statefulset rabbitmq-ha -n $NS --type=json --patch-file=/tmp/vcfa-rmq-copyconfig-patch.json 2>&1
+            rm -f /tmp/vcfa-rmq-copyconfig-patch.json
+            echo "  Deleting rabbitmq-ha-0 so it picks up the restored init container..."
+            $K delete pod rabbitmq-ha-0 -n $NS --now 2>/dev/null || true
+            sleep 5
+        else
+            echo "  WARNING: could not determine rabbitmq-ha image, skipping copy-config restore"
+        fi
+    else
+        echo "  copy-config init container present (no-op)"
+        # Diagnostic-only: report whether the AMQPS(5671) listener is actually up. copy-config
+        # being present doesn't guarantee success (e.g. a cert rotation could still break TLS
+        # bring-up) -- this is visibility only, no auto-remediation, to avoid restart-looping on an
+        # unrelated cert problem.
+        rmq_running=$($K get pod rabbitmq-ha-0 -n $NS -o jsonpath='{.status.phase}' 2>/dev/null || true)
+        if [ "$rmq_running" = "Running" ]; then
+            if $K exec rabbitmq-ha-0 -n $NS -c rabbitmq-ha -- rabbitmqctl status 2>/dev/null | grep -q "port: 5671"; then
+                echo "  AMQPS listener on 5671 confirmed up"
+            else
+                echo "  WARNING: rabbitmq-ha-0 is Running but no AMQPS(5671) listener found - investigate TLS cert/config (not auto-fixed)"
+            fi
+        fi
+    fi
+else
+    echo "  rabbitmq-ha StatefulSet not found (skipping)"
+fi
+
 echo "=== RabbitMQ .erlang.cookie ==="
 rmq_status=$($K get pod rabbitmq-ha-0 -n $NS --no-headers 2>/dev/null || true)
 if echo "$rmq_status" | grep -qE "CrashLoopBackOff|Error"; then
     rmq_logs=$($K logs rabbitmq-ha-0 -n $NS -c rabbitmq-ha --tail 100 2>/dev/null || true)
     if echo "$rmq_logs" | grep -q "erlang.cookie" || echo "$rmq_logs" | grep -q "accessible by owner only"; then
         echo "  RabbitMQ .erlang.cookie has wrong permissions - fixing"
-        rmq_image=$($K get pod rabbitmq-ha-0 -n $NS -o jsonpath='{.spec.containers[0].image}' 2>/dev/null || true)
-        if [ -z "$rmq_image" ]; then
-            rmq_image=$($K get statefulset rabbitmq-ha -n $NS -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+        has_fix_cookie=$($K get statefulset rabbitmq-ha -n $NS -o jsonpath='{.spec.template.spec.initContainers[?(@.name=="fix-cookie")].name}' 2>/dev/null || true)
+        if [ -z "$has_fix_cookie" ]; then
+            rmq_image=$($K get pod rabbitmq-ha-0 -n $NS -o jsonpath='{.spec.containers[0].image}' 2>/dev/null || true)
+            if [ -z "$rmq_image" ]; then
+                rmq_image=$($K get statefulset rabbitmq-ha -n $NS -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+            fi
+            cat > /tmp/vcfa-rmq-fixcookie-patch.json <<FIXCOOKIEPATCH
+[{"op":"add","path":"/spec/template/spec/initContainers/-","value":{"name":"fix-cookie","image":"${rmq_image}","command":["sh","-c","chmod 400 /var/lib/rabbitmq/.erlang.cookie && echo FIXED"],"volumeMounts":[{"name":"rabbit-pvc","mountPath":"/var/lib/rabbitmq"}]}}]
+FIXCOOKIEPATCH
+            $K patch statefulset rabbitmq-ha -n $NS --type=json --patch-file=/tmp/vcfa-rmq-fixcookie-patch.json 2>&1
+            rm -f /tmp/vcfa-rmq-fixcookie-patch.json
+        else
+            echo "  fix-cookie init container already present (perms issue was likely transient) - just retrying the pod"
         fi
-        $K patch statefulset rabbitmq-ha -n $NS --type='merge' -p="{\"spec\":{\"template\":{\"spec\":{\"initContainers\":[{\"name\":\"fix-cookie\",\"image\":\"${rmq_image}\",\"command\":[\"sh\",\"-c\",\"chmod 400 /var/lib/rabbitmq/.erlang.cookie && echo FIXED\"],\"volumeMounts\":[{\"name\":\"rabbit-pvc\",\"mountPath\":\"/var/lib/rabbitmq\"}]}]}}}}" 2>/dev/null || true
         $K delete pod rabbitmq-ha-0 -n $NS --now 2>/dev/null || true
     fi
 else
@@ -2243,6 +2346,16 @@ EDGE_CASES_BODY
     if [[ -n "$rm_lines" ]]; then
         info "resource-manager-server bootstrap-deadlock check:"
         echo "$rm_lines" | sed 's/^/    /'
+    fi
+
+    # v2.18: surface the RabbitMQ copy-config integrity check the same way -- it's the kind of
+    # thing an operator needs to see (either "restoring" a missing init container, which just fixed
+    # a real outage, or a WARNING that the AMQPS listener is down for some other reason).
+    local rmq_lines
+    rmq_lines=$(echo "$out" | grep -aiE 'rabbitmq|copy-config|AMQPS listener|erlang.cookie' || true)
+    if [[ -n "$rmq_lines" ]]; then
+        info "RabbitMQ copy-config / AMQPS listener check:"
+        echo "$rmq_lines" | sed 's/^/    /'
     fi
 
     if echo "$out" | grep -q "NEEDS_DIR_CLI_RESET:"; then
