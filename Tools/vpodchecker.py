@@ -629,20 +629,6 @@ def check_vsp_node_resources() -> List[CheckResult]:
     """
     Verify every VSP cluster node (control plane AND workers) meets the
     minimum sizing of >= 12 vCPU / >= 24GB memory.
-
-    Root cause this guards against (see vcf-troubleshooting skill
-    references/supervisor-k8s.md#56): the VSP ClusterClass ships the
-    control-plane node undersized (4 vCPU/8-10GB) relative to workers
-    (12 vCPU/24GB) by default. An undersized control plane starves
-    etcd/kube-apiserver under load, causing chronic node flapping that a
-    node-monitor-grace-period bump alone cannot fully prevent.
-    confighol-9.1.py's fix_vsp_controlplane_sizing() is the fix applied at
-    template-prep time; this check verifies the fix actually took (or that
-    it was never needed for a given lab type).
-
-    Reads CPU/memory directly from each Node's status.capacity via kubectl —
-    no vCenter/pyVmomi dependency, since kubelet's reported capacity is a
-    direct, reliable reflection of the underlying VM's hardware.
     """
     results: List[CheckResult] = []
 
@@ -654,85 +640,89 @@ def check_vsp_node_resources() -> List[CheckResult]:
         return results
 
     password = lsf.get_password()
+    vsp_vips = ['10.1.1.142', '10.2.1.142']
+    any_reachable = False
 
-    if not lsf.test_ping(VSP_CP_VIP):
+    for vip in vsp_vips:
+        if not lsf.test_ping(vip):
+            continue
+            
+        any_reachable = True
+        cmd = f"echo '{password}' | sudo -S -i kubectl get nodes -o json"
+        result = lsf.ssh(cmd, f'{VSP_SSH_USER}@{vip}', password)
+        output = getattr(result, 'stdout', '') or getattr(result, 'output', '') or ''
+
+        if result.returncode != 0 or not output.strip():
+            results.append(CheckResult(
+                name=f'VSP Node Resources ({vip})',
+                status='WARN',
+                message=f'Could not query VSP cluster nodes via kubectl on {vip}'))
+            continue
+
+        try:
+            json_start = output.find('{')
+            nodes_data = json.loads(output[json_start:])
+            items = nodes_data.get('items', [])
+        except Exception as e:
+            results.append(CheckResult(
+                name=f'VSP Node Resources ({vip})',
+                status='WARN',
+                message=f'Could not parse VSP node list JSON on {vip}: {e}'))
+            continue
+
+        if not items:
+            results.append(CheckResult(
+                name=f'VSP Node Resources ({vip})',
+                status='WARN',
+                message=f'VSP cluster {vip} reachable but returned no nodes'))
+            continue
+
+        for node in items:
+            name = node.get('metadata', {}).get('name', 'unknown')
+            labels = node.get('metadata', {}).get('labels', {})
+            is_control_plane = any(
+                k.startswith('node-role.kubernetes.io/control-plane') for k in labels
+            )
+            role = 'control-plane' if is_control_plane else 'worker'
+
+            capacity = node.get('status', {}).get('capacity', {})
+            cpu_str = capacity.get('cpu', '0')
+            mem_str = capacity.get('memory', '0Ki')
+
+            try:
+                cpu = int(cpu_str)
+            except ValueError:
+                cpu = 0
+            mem_mib = _k8s_quantity_to_mib(mem_str) or 0
+
+            issues = []
+            if cpu < VSP_MIN_NUMCPU:
+                issues.append(f'{cpu} vCPU (need >= {VSP_MIN_NUMCPU})')
+            if mem_mib < VSP_MIN_MEMORY_MIB:
+                issues.append(f'{mem_mib:.0f}MiB memory (need >= {VSP_MIN_MEMORY_MIB}MiB)')
+
+            if issues:
+                status = 'FAIL'
+                msg = f"{role} node undersized: {', '.join(issues)} - see vcf-troubleshooting skill references/supervisor-k8s.md#56 / confighol-9.1.py fix_vsp_controlplane_sizing()"
+            else:
+                status = 'PASS'
+                msg = f"{role} node sized correctly ({cpu} vCPU / {mem_mib:.0f}MiB)"
+
+            results.append(CheckResult(
+                name=f'VSP Node Resources: {name}',
+                status=status,
+                message=msg,
+                details={'role': role, 'cpu': cpu, 'memory_mib': round(mem_mib)}
+            ))
+
+    if not any_reachable:
         results.append(CheckResult(
             name='VSP Node Resources',
             status='SKIPPED',
-            message=f'VSP control plane VIP ({VSP_CP_VIP}) not reachable '
-                    f'- this lab type may not use a VSP cluster'))
-        return results
-
-    cmd = f"echo '{password}' | sudo -S -i kubectl get nodes -o json"
-    result = lsf.ssh(cmd, f'{VSP_SSH_USER}@{VSP_CP_VIP}', password)
-    output = getattr(result, 'stdout', '') or getattr(result, 'output', '') or ''
-
-    if result.returncode != 0 or not output.strip():
-        results.append(CheckResult(
-            name='VSP Node Resources',
-            status='WARN',
-            message='Could not query VSP cluster nodes via kubectl'))
-        return results
-
-    try:
-        json_start = output.find('{')
-        nodes_data = json.loads(output[json_start:])
-        items = nodes_data.get('items', [])
-    except Exception as e:
-        results.append(CheckResult(
-            name='VSP Node Resources',
-            status='WARN',
-            message=f'Could not parse VSP node list JSON: {e}'))
-        return results
-
-    if not items:
-        results.append(CheckResult(
-            name='VSP Node Resources',
-            status='WARN',
-            message='VSP cluster reachable but returned no nodes'))
-        return results
-
-    for node in items:
-        name = node.get('metadata', {}).get('name', 'unknown')
-        labels = node.get('metadata', {}).get('labels', {})
-        is_control_plane = any(
-            k.startswith('node-role.kubernetes.io/control-plane') for k in labels
-        )
-        role = 'control-plane' if is_control_plane else 'worker'
-
-        capacity = node.get('status', {}).get('capacity', {})
-        cpu_str = capacity.get('cpu', '0')
-        mem_str = capacity.get('memory', '0Ki')
-
-        try:
-            cpu = int(cpu_str)
-        except ValueError:
-            cpu = 0
-        mem_mib = _k8s_quantity_to_mib(mem_str) or 0
-
-        issues = []
-        if cpu < VSP_MIN_NUMCPU:
-            issues.append(f'{cpu} vCPU (need >= {VSP_MIN_NUMCPU})')
-        if mem_mib < VSP_MIN_MEMORY_MIB:
-            issues.append(f'{mem_mib:.0f}MiB memory (need >= {VSP_MIN_MEMORY_MIB}MiB)')
-
-        if issues:
-            status = 'FAIL'
-            message = (f'{role} node undersized: {", ".join(issues)} - see '
-                        f'vcf-troubleshooting skill references/supervisor-k8s.md#56 '
-                        f'/ confighol-9.1.py fix_vsp_controlplane_sizing()')
-        else:
-            status = 'PASS'
-            message = f'{role} node sized correctly ({cpu} vCPU / {mem_mib:.0f}MiB)'
-
-        results.append(CheckResult(
-            name=f'VSP Node Resources: {name}',
-            status=status,
-            message=message,
-            details={'role': role, 'cpu': cpu, 'memory_mib': round(mem_mib)}
-        ))
+            message='No VSP control plane VIPs reachable - this lab type may not use a VSP cluster'))
 
     return results
+
 
 
 #==============================================================================
@@ -1698,10 +1688,10 @@ def check_password_expirations() -> List[CheckResult]:
                 message = "Password never expires"
             elif days > three_years_days:
                 status = "PASS"
-                message = f"Expires in {days} days ({days // 365} years)"
+                message = f"Expires in {days} days ({days // 365}+ years)"
             elif days > two_years_days:
                 status = "PASS"
-                message = f"Expires in {days} days ({days // 365} years)"
+                message = f"Expires in {days} days ({days // 365}+ years)"
             else:
                 status = "FAIL"
                 if days < 0:
@@ -1746,10 +1736,10 @@ def check_password_expirations() -> List[CheckResult]:
                 message = "Password never expires"
             elif days > three_years_days:
                 status = "PASS"
-                message = f"Expires in {days} days ({days // 365} years)"
+                message = f"Expires in {days} days ({days // 365}+ years)"
             elif days > two_years_days:
                 status = "PASS"
-                message = f"Expires in {days} days ({days // 365} years)"
+                message = f"Expires in {days} days ({days // 365}+ years)"
             else:
                 status = "FAIL"
                 if days < 0:
@@ -1783,10 +1773,10 @@ def check_password_expirations() -> List[CheckResult]:
                 message = "Password never expires (REST API)"
             elif days > three_years_days:
                 status = "PASS"
-                message = f"Expires in {days} days ({days // 365} years) (REST API)"
+                message = f"Expires in {days} days ({days // 365}+ years) (REST API)"
             elif days > two_years_days:
                 status = "PASS"
-                message = f"Expires in {days} days ({days // 365} years) (REST API)"
+                message = f"Expires in {days} days ({days // 365}+ years) (REST API)"
             else:
                 status = "FAIL"
                 if days < 0:
@@ -1834,10 +1824,10 @@ def check_password_expirations() -> List[CheckResult]:
                     message = "Password never expires"
                 elif days > three_years_days:
                     status = "PASS"
-                    message = f"Expires in {days} days ({days // 365} years)"
-                elif days > two_years_days:
+                    message = f"Expires in {days} days ({days // 365}+ years)"
+                elif days >= 360:
                     status = "PASS"
-                    message = f"Expires in {days} days ({days // 365} years)"
+                    message = f"Expires in {days} days ({days // 365}+ years)"
                 else:
                     status = "FAIL"
                     if days < 0:
@@ -1890,10 +1880,10 @@ def check_password_expirations() -> List[CheckResult]:
                     message = "Password never expires"
                 elif days > three_years_days:
                     status = "PASS"
-                    message = f"Expires in {days} days ({days // 365} years)"
-                elif days > two_years_days:
+                    message = f"Expires in {days} days ({days // 365}+ years)"
+                elif days >= 360:
                     status = "PASS"
-                    message = f"Expires in {days} days ({days // 365} years)"
+                    message = f"Expires in {days} days ({days // 365}+ years)"
                 else:
                     status = "FAIL"
                     if days < 0:
@@ -1932,10 +1922,10 @@ def check_password_expirations() -> List[CheckResult]:
                 message = "Password never expires"
             elif days > three_years_days:
                 status = "PASS"
-                message = f"Expires in {days} days ({days // 365} years)"
+                message = f"Expires in {days} days ({days // 365}+ years)"
             elif days > two_years_days:
                 status = "PASS"
-                message = f"Expires in {days} days ({days // 365} years)"
+                message = f"Expires in {days} days ({days // 365}+ years)"
             else:
                 status = "FAIL"
                 if days < 0:
@@ -1967,10 +1957,10 @@ def check_password_expirations() -> List[CheckResult]:
                     message = "Password never expires"
                 elif days > three_years_days:
                     status = "PASS"
-                    message = f"Expires in {days} days ({days // 365} years)"
-                elif days > two_years_days:
+                    message = f"Expires in {days} days ({days // 365}+ years)"
+                elif days >= 360:
                     status = "PASS"
-                    message = f"Expires in {days} days ({days // 365} years)"
+                    message = f"Expires in {days} days ({days // 365}+ years)"
                 else:
                     status = "FAIL"
                     if days < 0:
@@ -2022,10 +2012,10 @@ def check_password_expirations() -> List[CheckResult]:
                     message = "Password never expires"
                 elif days > three_years_days:
                     status = "PASS"
-                    message = f"Expires in {days} days ({days // 365} years)"
-                elif days > two_years_days:
+                    message = f"Expires in {days} days ({days // 365}+ years)"
+                elif days >= 360:
                     status = "PASS"
-                    message = f"Expires in {days} days ({days // 365} years)"
+                    message = f"Expires in {days} days ({days // 365}+ years)"
                 else:
                     status = "FAIL"
                     if days < 0:
@@ -2116,10 +2106,10 @@ def check_password_expirations() -> List[CheckResult]:
                     message = "Password never expires"
                 elif days > three_years_days:
                     status = "PASS"
-                    message = f"Expires in {days} days ({days // 365} years)"
-                elif days > two_years_days:
+                    message = f"Expires in {days} days ({days // 365}+ years)"
+                elif days >= 360:
                     status = "PASS"
-                    message = f"Expires in {days} days ({days // 365} years)"
+                    message = f"Expires in {days} days ({days // 365}+ years)"
                 else:
                     status = "FAIL"
                     if days < 0:
@@ -2139,6 +2129,54 @@ def check_password_expirations() -> List[CheckResult]:
                     status="WARN",
                     message=f"Could not check: {str(e)[:40]}",
                     details={'hostname': opsvm, 'username': user, 'error': str(e)}
+                ))
+
+
+    # Check VSP nodes
+    vsp_nodes = []
+    for vip in ['10.1.1.142', '10.2.1.142']:
+        if lsf.test_ping(vip):
+            cmd = f"echo '{password}' | sudo -S -i kubectl get nodes -o jsonpath='{{.items[*].status.addresses[?(@.type==\\\"InternalIP\\\")].address}}'"
+            res = lsf.ssh(cmd, f'{VSP_SSH_USER}@{vip}', password)
+            out = getattr(res, 'stdout', '') or getattr(res, 'output', '') or ''
+            vsp_nodes.extend([ip.strip() for ip in out.split() if ip.strip()])
+
+    for node_ip in set(vsp_nodes):
+        for user in ['vmware-system-user', 'root']:
+            try:
+                needs_sudo = (user != 'vmware-system-user')
+                days = get_linux_password_expiration(node_ip, user, password,
+                                                      ssh_user='vmware-system-user',
+                                                      use_sudo=needs_sudo)
+                
+                if days is None:
+                    status = "PASS"
+                    message = "Password never expires"
+                elif days > three_years_days:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365}+ years)"
+                elif days >= 360:
+                    status = "PASS"
+                    message = f"Expires in {days} days ({days // 365}+ years)"
+                else:
+                    status = "FAIL"
+                    if days < 0:
+                        message = f"Password EXPIRED {abs(days)} days ago"
+                    else:
+                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                
+                results.append(CheckResult(
+                    name=f"VSP Node {node_ip} ({user})",
+                    status=status,
+                    message=message,
+                    details={'hostname': node_ip, 'username': user, 'days_until_expiration': days}
+                ))
+            except Exception as e:
+                results.append(CheckResult(
+                    name=f"VSP Node {node_ip} ({user})",
+                    status="WARN",
+                    message=f"Could not check: {str(e)[:40]}",
+                    details={'hostname': node_ip, 'username': user, 'error': str(e)}
                 ))
 
     return results

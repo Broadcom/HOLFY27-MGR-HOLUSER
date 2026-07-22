@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 auto-health.py
-Version 1.1.0 - 2026-07-14
+Version 1.2.0 - 2026-07-21
 Author: Burke Azbill and HOL Core Team
 
 Comprehensive, read-only health check for VCF Automation (VCFA). VCFA runs as a
@@ -51,8 +51,8 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 
-VERSION = "1.0.0"
-DATE    = "2026-07-14"
+VERSION = "1.2.0"
+DATE    = "2026-07-21"
 
 CREDS_FILE = "/home/holuser/creds.txt"
 VCFA_USER  = "vmware-system-user"
@@ -161,6 +161,7 @@ def show_help():
         ("endpoint", "/automation HTTP endpoint probe (expect 200)"),
         ("certs",    "cert-manager Certificate resources"),
         ("argo",     "Argo Workflow stale system-shutdown check"),
+        ("edge",     "Known edge cases (runaway jobs, rm deadlock)"),
         ("etcd",     "etcd defrag slack % (informational only)"),
     ]:
         print(f"    {_GREEN}{name:<10}{_NC} {desc}")
@@ -200,13 +201,13 @@ def ssh_exec(host, password, cmd, timeout=60):
 
     VCFA_USER (vmware-system-user) is not root; on VCF 9.1 sudo requires a password
     (unlike VCF 9.0's NOPASSWD), so we always pipe the password to sudo -S. sudo -S -i
-    gives a root login shell, which is required for kubectl to be on PATH and for
-    KUBECONFIG to be set (confirmed live: KUBECONFIG=/etc/kubernetes/super-admin.conf).
+    gives a root login shell, which is required for kubectl to be on PATH. We prepend
+    a dynamic KUBECONFIG resolution to handle admin.conf or super-admin.conf.
     """
     cmd_b64 = base64.b64encode(cmd.encode()).decode()
     outer = (
         f"echo '{password}' | sudo -S -i "
-        f"bash -c \"$(echo {cmd_b64} | base64 -d)\" 2>&1"
+        f"bash -c \"export KUBECONFIG=\\$(test -f /etc/kubernetes/admin.conf && echo /etc/kubernetes/admin.conf || echo /etc/kubernetes/super-admin.conf); $(echo {cmd_b64} | base64 -d)\" 2>&1"
     )
     _SUDO_RE = re.compile(r"\[sudo\] password for [^:]+:\s*")
     _NOISE   = ("Welcome to Photon", "Warning: Permanently added",
@@ -653,6 +654,45 @@ def chk_argo(workflows_text, verbose):
     return results
 
 
+# ─── Section 9.5: Edge Cases ────────────────────────────────────────────────
+def chk_edge_cases(edge_out, pods_text, verbose):
+    """Detect known edge cases like support-bundle runaway and RM deadlock."""
+    results = []
+    
+    # 1. Support Bundle Runaway
+    jobs_data = edge_out.get("jobs", [])
+    if jobs_data is None:
+        results.append(row_fail("Support bundle check", "failed to fetch jobs JSON"))
+    else:
+        num_jobs = len(jobs_data)
+        if num_jobs > 3:
+            results.append(row_fail(f"Support bundle runaway: {num_jobs} jobs found", f"threshold is 3, runaway detected!"))
+        elif num_jobs > 0:
+            results.append(row_ok(f"Support bundle runaway: {num_jobs} jobs found (under threshold)"))
+        else:
+            results.append(row_ok("Support bundle runaway: 0 jobs found"))
+            
+    # 2. Resource Manager Deadlock
+    rm_status = edge_out.get("rm", "").strip()
+    rm_pod_line = ""
+    if pods_text:
+        for line in pods_text.splitlines():
+            if "resource-manager-server-" in line:
+                rm_pod_line = line
+                break
+                
+    if rm_status == "RM_DEADLOCK_SUSPECT" and "1/1" not in rm_pod_line:
+        results.append(row_fail("resource-manager deadlock", "pod is not ready and no listener on 7710/7777 (deadlock!)"))
+    elif rm_status == "RM_LISTENING":
+        results.append(row_ok("resource-manager deadlock: listening normally"))
+    elif rm_status == "RM_NOT_FOUND":
+        results.append(row_warn("resource-manager deadlock: process not found", "pod may be missing or restarting"))
+    else:
+        results.append(row_ok("resource-manager deadlock: clear"))
+        
+    return results
+
+
 # ─── Section 10: etcd (informational only — never defrags) ──────────────────
 def chk_etcd(etcd_json_out, verbose):
     """Report current etcd defrag slack % (dbSize vs dbSizeInUse). Informational only —
@@ -693,6 +733,7 @@ SECTION_MAP = {
     "endpoint": "HTTP ENDPOINT",
     "certs":    "TLS CERTIFICATES",
     "argo":     "ARGO WORKFLOWS",
+    "edge":     "KNOWN EDGE CASES",
     "etcd":     "ETCD (informational)",
 }
 
@@ -704,6 +745,7 @@ class _QuietArgumentParser(argparse.ArgumentParser):
 
 
 def main():
+    global VCFA_HOST
     if "--help" in sys.argv or "-h" in sys.argv:
         show_help()
 
@@ -720,6 +762,17 @@ def main():
         show_help()
 
     host     = args.host
+    if host == "10.1.1.73":
+        import socket
+        for cand in ["10.1.1.71", "10.1.1.72", "10.1.1.73", "10.1.1.74"]:
+            s = socket.socket()
+            s.settimeout(2)
+            if s.connect_ex((cand, 22)) == 0:
+                host = cand
+                VCFA_HOST = cand
+                break
+            s.close()
+
     password = get_password()
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     W  = 70
@@ -748,12 +801,13 @@ def main():
 
     needs_cp       = want in (None, "cp")
     needs_nodes    = want in (None, "nodes")
-    needs_pods     = want in (None, "pods")
+    needs_pods     = want in (None, "pods", "edge")
     needs_deploys  = want in (None, "core", "auth")
     needs_gateway  = want in (None, "gateway")
     needs_endpoint = want in (None, "endpoint")
     needs_certs    = want in (None, "certs")
     needs_argo     = want in (None, "argo")
+    needs_edge     = want in (None, "edge")
     needs_etcd     = want in (None, "etcd")
 
     ip_out = lease_out = watchdog_out = healthz_out = ""
@@ -787,6 +841,23 @@ def main():
     argo_out   = ssh_exec(host, password,
                           f"kubectl get workflows -n {VMSP_NAMESPACE} --no-headers 2>&1", timeout=30)[1] \
                  if needs_argo else ""
+                 
+    edge_out   = {}
+    if needs_edge:
+        edge_out["jobs"] = fetch_json(host, password, "kubectl get jobs -n vmsp-platform -l app.kubernetes.io/name=support-bundle-cluster-info-dump -o json 2>/dev/null", 30)
+        edge_out["rm"] = ssh_exec(host, password, """
+            rm_pid=$(ps -ef | grep "/bin/resource-manager " | grep -v grep | awk '{print $2}' | head -n1)
+            if [ -n "$rm_pid" ]; then
+                if nsenter -t "$rm_pid" -n netstat -tlpn 2>/dev/null | grep -qE ":7710|:7777"; then
+                    echo "RM_LISTENING"
+                else
+                    echo "RM_DEADLOCK_SUSPECT"
+                fi
+            else
+                echo "RM_NOT_FOUND"
+            fi
+        """, timeout=30)[1]
+
     etcd_out   = ssh_exec(host, password,
                           "etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt "
                           "--cert=/etc/kubernetes/pki/etcd/peer.crt "
@@ -831,6 +902,9 @@ def main():
 
     run("argo",     f"ARGO WORKFLOWS  ({VMSP_NAMESPACE})",
         chk_argo, argo_out, args.verbose)
+
+    run("edge",     "KNOWN EDGE CASES  (Support bundle runaway, RM deadlock)",
+        chk_edge_cases, edge_out, pods_text, args.verbose)
 
     run("etcd",     "ETCD  (informational — no action taken)",
         chk_etcd, etcd_out, args.verbose)
