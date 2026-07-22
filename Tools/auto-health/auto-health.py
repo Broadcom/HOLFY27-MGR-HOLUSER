@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 auto-health.py
-Version 1.3.0 - 2026-07-22
+Version 1.3.1 - 2026-07-22
 Author: Burke Azbill and HOL Core Team
 
 Comprehensive, read-only health check for VCF Automation (VCFA). VCFA runs as a
@@ -47,6 +47,13 @@ cascades into ~15 prelude Deployments stuck Pending/PodInitializing behind ebs-s
 signal is invisible to sections 3-5 above (pod is Running, deployment is "ready") -- only a
 targeted check for the init container + listener catches it.
 
+v1.3.1 (2026-07-22): fixed a false-positive support-bundle-runaway report. The check was
+computing num_jobs = len(jobs_data) where jobs_data is the whole kubectl List object (4
+top-level keys: apiVersion/items/kind/metadata) instead of len(jobs_data["items"]) -- so it
+ALWAYS printed "4 jobs found" / "runaway detected!" regardless of the actual job count,
+even when 0 Jobs matched. This had nothing to do with the cluster; it was a bug in this
+script's own counting logic.
+
 No changes are made to the cluster — this is a check-only tool.
 Remediation: bash vcfa-stabilizer.sh
 
@@ -66,7 +73,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 DATE    = "2026-07-22"
 
 CREDS_FILE = "/home/holuser/creds.txt"
@@ -696,7 +703,14 @@ def chk_edge_cases(edge_out, pods_text, verbose):
     if jobs_data is None:
         results.append(row_fail("Support bundle check", "failed to fetch jobs JSON"))
     else:
-        num_jobs = len(jobs_data)
+        # v1.3.1: jobs_data is the raw `kubectl -o json` List object
+        # ({apiVersion, items, kind, metadata}) -- len(jobs_data) counted the object's 4
+        # top-level KEYS, not the number of Jobs in .items, so this ALWAYS reported exactly
+        # "4 jobs found" (> threshold of 3) regardless of the real job count. Confirmed live
+        # 2026-07-22: 0 actual Jobs matched the label selector; permanent false positive on
+        # every run since this check was added.
+        items = jobs_data.get("items", []) if isinstance(jobs_data, dict) else (jobs_data or [])
+        num_jobs = len(items)
         if num_jobs > 3:
             results.append(row_fail(f"Support bundle runaway: {num_jobs} jobs found", f"threshold is 3, runaway detected!"))
         elif num_jobs > 0:
