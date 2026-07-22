@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VCFA Complete Stabilization Script v2.16
-# Version 2.16 - 2026-07-21
+# VCFA Complete Stabilization Script v2.17
+# Version 2.17 - 2026-07-22
 # Author - HOL Core Team
 #
 # Default-run philosophy (v2.6+): one run of the script with no flags should leave the VCFA in a
@@ -43,6 +43,18 @@
 #     unconditionally just churns rollouts. Set FORCE_KYVERNO_FIX=1 to bypass the heuristic.
 #
 # See VCFA_Stabilizer_Incident_Apr2026.md for the gateway/EnvoyProxy guidance and HTTP 503 recovery.
+#
+# v2.17 changelog (2026-07-22):
+#  * NEW: step 8/8 inside check_and_fix_support_bundle_runaway — diagnostic-only check for any
+#    Argo Workflow (any name, not just system-shutdown-*) still Running after 2+ hours in
+#    vmsp-platform. Ported from the standalone cleanup-and-suspend.sh remediation script
+#    (Jira VMSPENG-14614, root cause VMSPENG-11684); the rest of that script's logic (package
+#    version lookup + Job deletion + CronJob suspend + drift-detection guard) was already folded
+#    into this function back in v2.12 (Maher-July-Patch), just via a narrower per-CronJob
+#    driftDetection annotation instead of the original script's release-wide driftDetection
+#    mode=warn patch. This closes the one remaining gap: a generic stuck/hung Workflow of any
+#    name was previously invisible until it caused a downstream symptom. Steps renumbered 1..8.
+#  * DOC: added Jira ticket references (VMSPENG-14614 / VMSPENG-11684) to the function header.
 #
 # v2.16 changelog (2026-07-21):
 #  * NEW: terminal Job/Workflow pod cleanup inside check_and_fix_support_bundle_runaway (step 3/7).
@@ -2327,7 +2339,7 @@ verify_fixes() {
 # Function to generate verification script
 generate_verification_script() {
     log "Generating verification script..."
-    local out="${SCRIPT_DIR}/vcfa-verify-stability.sh"
+    local out="$HOME/vcfa-verify-stability.sh"
     cat > "$out" << 'VFEOF'
 #!/bin/bash
 
@@ -2401,7 +2413,8 @@ VFEOF
 # Detect and remediate the support-bundle-cluster-info-dump CronJob runaway bug (VCF 9.1,
 # fixed in 9.1.1). When the CronJob accumulates stale Jobs, Failed pods pile up in
 # vmsp-platform and drive CPU into the 30 GHz+ range, causing the VCFA UI to become slow
-# or completely unreachable (Maher-July-Patch, 2026-07-17).
+# or completely unreachable (Maher-July-Patch, 2026-07-17). Jira: VMSPENG-14614 (root cause:
+# VMSPENG-11684).
 #
 # Logic (all in one execute_remote call):
 #   1. Sweep: delete stale system-shutdown-* Argo Workflows (re-cordon nodes on every boot).
@@ -2414,6 +2427,9 @@ VFEOF
 #   6. AUTO-UNSUSPEND: if CronJob was suspended but no runaway detected, un-suspend now that the
 #      permanent hardening (concurrencyPolicy=Replace + driftDetection=disabled) is in place.
 #   7. Report: counts of Failed/Pending pods after cleanup.
+#   8. Report (v2.17): any Argo Workflow of ANY name still Running after 2+ hours in vmsp-platform.
+#      Diagnostic only (no auto-remediation, since a generic stuck workflow's cause is unknown) --
+#      warns the operator to investigate rather than silently leaving it running indefinitely.
 #
 # Called from main() BEFORE the idempotency early-exit so it runs on every startup.
 check_and_fix_support_bundle_runaway() {
@@ -2431,11 +2447,11 @@ set -u
 # "ACTION REQUIRED: graceful shutdown/restart" warning). Force a sane numeric default here.
 case "${THRESHOLD:-}" in ''|*[!0-9]*) THRESHOLD=3 ;; esac
 
-# --- 1/7: Delete stale system-shutdown-* Argo Workflows ---
+# --- 1/8: Delete stale system-shutdown-* Argo Workflows ---
 # Each Fleet LCM shutdown cycle leaves a system-shutdown-{id} Workflow in vmsp-platform.
 # On startup the Argo controller resumes them, which re-cordons the VSP node and scales
 # all prelude deployments to 0 (→ VCFA HTTP 500). Up to 30+ can accumulate.
-echo "=== 1/7: stale system-shutdown Argo Workflow sweep ==="
+echo "=== 1/8: stale system-shutdown Argo Workflow sweep ==="
 if $K api-resources --api-group=argoproj.io -o name 2>/dev/null | grep -q '^workflows\.'; then
     STALE_WF=$($K get workflow -n "$NS" --no-headers 2>/dev/null \
         | awk '/system-shutdown/ {print $1}' || true)
@@ -2452,7 +2468,7 @@ else
 fi
 
 echo
-echo "=== 2/7: uncordon any SchedulingDisabled nodes ==="
+echo "=== 2/8: uncordon any SchedulingDisabled nodes ==="
 CORDONED=$($K get nodes --no-headers 2>/dev/null \
     | awk '$2 ~ /SchedulingDisabled/ {print $1}' || true)
 if [[ -n "$CORDONED" ]]; then
@@ -2463,7 +2479,7 @@ else
 fi
 
 echo
-# --- 3/7: Terminal Job/Workflow pod cleanup (cluster-wide) ---
+# --- 3/8: Terminal Job/Workflow pod cleanup (cluster-wide) ---
 # A Fleet LCM system-shutdown + power-on (and the ensuing chaotic mass-restart) leaves terminal
 # pods — phase Failed ("Error") or Succeeded ("Completed") — owned by a completed Job or Argo
 # Workflow, e.g. configure-component-<id>-execute-script-<hash>. These linger after the owning
@@ -2472,7 +2488,7 @@ echo
 # pods are artifacts, so a live controller that still needs to run spawns a NEW pod — never reuses
 # these — making this idempotent and safe. Bare/standalone pods and Deployment/DaemonSet/StatefulSet
 # pods are deliberately excluded.
-echo "=== 3/7: terminal Job/Workflow pod cleanup (cluster-wide) ==="
+echo "=== 3/8: terminal Job/Workflow pod cleanup (cluster-wide) ==="
 TERM_PODS=$($K get pods -A -o json 2>/dev/null | jq -r '
     .items[]
     | select(.status.phase=="Failed" or .status.phase=="Succeeded")
@@ -2491,7 +2507,7 @@ else
 fi
 
 echo
-echo "=== 4/7: support-bundle-cluster-info-dump Job count ==="
+echo "=== 4/8: support-bundle-cluster-info-dump Job count ==="
 CRONJOB_NAME="support-bundle-cluster-info-dump"
 JOB_COUNT=$($K get jobs -n "$NS" -o name 2>/dev/null \
     | grep -c "/${CRONJOB_NAME}-" || true)
@@ -2516,7 +2532,7 @@ if [[ "$JOB_COUNT" -gt "$THRESHOLD" ]]; then
 fi
 
 echo
-echo "=== 5/7: permanent CronJob hardening (idempotent) ==="
+echo "=== 5/8: permanent CronJob hardening (idempotent) ==="
 # Set concurrencyPolicy=Replace so a new run supersedes a stuck one instead of queuing.
 # Label with helm.toolkit.fluxcd.io/driftDetection=disabled so Flux does not revert.
 if $K get cronjob "$CRONJOB_NAME" -n "$NS" >/dev/null 2>&1; then
@@ -2546,7 +2562,7 @@ else
 fi
 
 echo
-echo "=== 6/7: auto-unsuspend (only if no runaway and cronjob was suspended) ==="
+echo "=== 6/8: auto-unsuspend (only if no runaway and cronjob was suspended) ==="
 if [[ "$RUNAWAY" -eq 0 ]]; then
     if $K get cronjob "$CRONJOB_NAME" -n "$NS" >/dev/null 2>&1; then
         IS_SUSPENDED=$($K get cronjob "$CRONJOB_NAME" -n "$NS" \
@@ -2566,7 +2582,7 @@ else
 fi
 
 echo
-echo "=== 7/7: post-cleanup pod health report ==="
+echo "=== 7/8: post-cleanup pod health report ==="
 FAILED_PODS=$($K get pod -A --field-selector=status.phase=Failed \
     --no-headers 2>/dev/null | wc -l || echo "?")
 PENDING_PODS=$($K get pod -A --field-selector=status.phase=Pending \
@@ -2574,6 +2590,27 @@ PENDING_PODS=$($K get pod -A --field-selector=status.phase=Pending \
 echo "  Failed pods: ${FAILED_PODS}  |  Pending pods: ${PENDING_PODS}"
 [[ "$FAILED_PODS" != "0" && "$FAILED_PODS" != "?" ]] && \
     $K get pod -A --field-selector=status.phase=Failed --no-headers 2>/dev/null | head -10 || true
+
+echo
+# --- 8/8: long-running (2h+) Argo Workflow check, any name (v2.17) ---
+# Diagnostic only: a Workflow of any name (not just system-shutdown-*) stuck Running for 2+
+# hours usually means something is wedged (e.g. a hung support-bundle collection step) and
+# won't self-resolve. We don't know a safe generic remediation, so just surface it loudly.
+echo "=== 8/8: long-running (2h+) Argo Workflow check (any name) ==="
+if $K api-resources --api-group=argoproj.io -o name 2>/dev/null | grep -q '^workflows\.'; then
+    LONG_RUNNING=$($K get workflows.argoproj.io -n "$NS" -o json 2>/dev/null \
+        | jq -r '[.items[] | select(.status.phase=="Running") | select(((now - (.status.startedAt | fromdateiso8601)) > 7200))] | length' 2>/dev/null || echo 0)
+    case "${LONG_RUNNING:-}" in ''|*[!0-9]*) LONG_RUNNING=0 ;; esac
+    if [[ "$LONG_RUNNING" -gt 0 ]]; then
+        echo "  *** WARNING: ${LONG_RUNNING} Argo Workflow(s) in ${NS} have been Running for 2+ hours: ***"
+        $K get workflows.argoproj.io -n "$NS" --no-headers 2>/dev/null | head -10 || true
+        echo "  Investigate before assuming the cluster is healthy."
+    else
+        echo "  no workflows running 2+ hours (ok)"
+    fi
+else
+    echo "  Argo Workflow CRD not present — skipping"
+fi
 
 echo "=== done ==="
 SUPPORT_BUNDLE_BODY
@@ -2846,7 +2883,7 @@ SIG
     echo ""
     echo "Next steps:"
     echo "1. Monitor system stability for 15-30 minutes"
-    echo "2. Run ${SCRIPT_DIR}/vcfa-verify-stability.sh periodically"
+    echo "2. Run $HOME/vcfa-verify-stability.sh periodically"
     echo "3. Check for any remaining restart patterns"
     echo ""
     echo "If issues persist, check the logs of specific failing services:"
@@ -2859,7 +2896,6 @@ SIG
 case "${1:-}" in
     --help|-h)
         echo "VCFA Complete Stabilization Script v2.16"
-        echo "See: ${SCRIPT_DIR}/VCFA_Stabilizer_Incident_Apr2026.md"
         echo ""
         echo "Usage: $0 [options]"
         echo ""
