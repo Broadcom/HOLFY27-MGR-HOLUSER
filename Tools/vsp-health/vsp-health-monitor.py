@@ -278,7 +278,8 @@ DEFAULTS = {
     'checks': [
         'host_contention', 'vsp_size', 'kvip_manifest', 'cp_pod_crash', 'gateway',
         'node_flap', 'crashloop_pods', 'postgres', 'salt_stack', 'vodap',
-        'component_health', 'argo_cleanup', 'proxy_config', 'cert_renewal', 'vip',
+        'component_health', 'argo_cleanup', 'proxy_config', 'password_expiration',
+        'cert_renewal', 'vip',
     ],
     'crashloop_restart_threshold': 5,
     'crashloop_max_restarts_per_cycle': 15,
@@ -1975,6 +1976,110 @@ def check_cert_renewal(cp_ip, password, remediate, dry_run, threshold_days):
 
 
 #==============================================================================
+# CHECK: PASSWORD EXPIRATION
+#==============================================================================
+
+def check_password_expiration(cp_ip, password, remediate, dry_run):
+    """Ensure all nodes have password expiration > 1 year.
+    If drifted (<= 365d or never), forcefully reset to 999 days.
+    """
+    node_ips_script = (
+        '#!/bin/bash\n'
+        "kubectl get nodes -o jsonpath='{range .items[*]}"
+        "{.status.addresses[?(@.type==\"InternalIP\")].address}{\" \"}{end}'\n"
+    )
+    node_ips_res = run_remote_script(cp_ip, node_ips_script, password)
+    node_ips_out = (_clean_stdout(node_ips_res) if node_ips_res is not None else '').strip()
+    node_ips = [ip for ip in node_ips_out.split() if ip]
+    if not node_ips:
+        return 'WARN', ['password_expiration: could not list node IPs — skipping']
+
+    check_script = (
+        '#!/bin/bash\n'
+        'DRIFT=0\n'
+        'for user in root vmware-system-user; do\n'
+        '  exp=$(chage -l $user | grep "Password expires" | cut -d: -f2- | xargs)\n'
+        '  if [ "$exp" = "never" ]; then\n'
+        '    DRIFT=1\n'
+        '  else\n'
+        '    exp_sec=$(date -d "$exp" +%s 2>/dev/null)\n'
+        '    now_sec=$(date +%s 2>/dev/null)\n'
+        '    if [ -n "$exp_sec" ] && [ -n "$now_sec" ]; then\n'
+        '      diff_days=$(( (exp_sec - now_sec) / 86400 ))\n'
+        '      if [ $diff_days -le 365 ]; then\n'
+        '        DRIFT=1\n'
+        '      fi\n'
+        '    else\n'
+        '      DRIFT=1\n'
+        '    fi\n'
+        '  fi\n'
+        'done\n'
+        'if [ $DRIFT -eq 1 ]; then\n'
+        '  echo PASS_DRIFT\n'
+        'else\n'
+        '  echo PASS_OK\n'
+        'fi\n'
+    )
+
+    import concurrent.futures
+    drifted = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(node_ips)) as pool:
+        futures = {pool.submit(run_remote_script, ip, check_script, password): ip
+                   for ip in node_ips}
+        for future in concurrent.futures.as_completed(futures):
+            ip = futures[future]
+            try:
+                res = future.result()
+            except Exception:
+                res = None
+            out = _clean_stdout(res) if res is not None else ''
+            if 'PASS_OK' not in out:
+                drifted.append(ip)
+
+    if not drifted:
+        return 'PASS', [f'password_expiration: all {len(node_ips)} node(s) expire in > 1 year - OK']
+
+    msgs = [f'password_expiration: {len(drifted)}/{len(node_ips)} node(s) drifted '
+           f'(<= 365d or never): {", ".join(drifted)}']
+           
+    if dry_run:
+        msgs.append('password_expiration: [DRY-RUN] would forcefully remediate to 999 days')
+        return 'FAIL', msgs
+    if not remediate:
+        return 'FAIL', msgs
+
+    push_script = (
+        '#!/bin/bash\n'
+        'today=$(date +%Y-%m-%d)\n'
+        'for user in root vmware-system-user; do\n'
+        '  chage -d "$today" -M 999 "$user" >/dev/null 2>&1\n'
+        'done\n'
+        'echo REMEDIATED\n'
+    )
+
+    failed_push = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(drifted)) as pool:
+        futures = {pool.submit(run_remote_script, ip, push_script, password): ip
+                   for ip in drifted}
+        for future in concurrent.futures.as_completed(futures):
+            ip = futures[future]
+            try:
+                res = future.result()
+            except Exception:
+                res = None
+            out = _clean_stdout(res) if res is not None else ''
+            if 'REMEDIATED' not in out:
+                failed_push.append(ip)
+
+    if failed_push:
+        msgs.append(f'password_expiration: failed to push fix to: {", ".join(failed_push)}')
+        return 'FAIL', msgs
+    
+    msgs.append(f'password_expiration: successfully set to 999 days on {len(drifted)} node(s)')
+    return 'RECOVERED', msgs
+
+
+#==============================================================================
 # CHECK: VIP REACHABILITY
 #==============================================================================
 
@@ -2108,6 +2213,8 @@ def run_all(cfg, dry_run):
                 st, msgs = check_argo_cleanup(cp_ip, password, remediate, dry_run)
             elif check == 'proxy_config':
                 st, msgs = check_proxy_config(cp_ip, password, remediate, dry_run)
+            elif check == 'password_expiration':
+                st, msgs = check_password_expiration(cp_ip, password, remediate, dry_run)
             elif check == 'cert_renewal':
                 st, msgs = check_cert_renewal(cp_ip, password, remediate, dry_run,
                                               cfg['cert_renewal_threshold_days'])
@@ -2255,6 +2362,31 @@ def release_lock():
 # MAIN
 #==============================================================================
 
+
+def run_all_sites(cfg, dry_run):
+    overall_exit = 0
+    has_custom_ip = False
+    try:
+        if lsf.config.has_option('VSPMONITOR', 'vsp_control_plane_ip'):
+            has_custom_ip = True
+    except:
+        pass
+        
+    if has_custom_ip:
+        sites = [(cfg['vsp_control_plane_ip'], cfg['vsp_worker_fqdn'])]
+    else:
+        sites = [('10.1.1.142', 'vsp-01a.site-a.vcf.lab'), ('10.2.1.142', 'vsp-01b.site-b.vcf.lab')]
+        
+    for cp_ip, worker in sites:
+        if has_custom_ip or lsf.test_ping(cp_ip, count=1, timeout=1) or lsf.test_ping(worker, count=1, timeout=1):
+            cfg['vsp_control_plane_ip'] = cp_ip
+            cfg['vsp_worker_fqdn'] = worker
+            exit_code = run_all(cfg, dry_run)
+            if exit_code > overall_exit:
+                overall_exit = exit_code
+                
+    return overall_exit
+
 def main():
     parser = argparse.ArgumentParser(
         description='HOLFY27 VSP Cluster Health Monitor & Remediator',
@@ -2281,7 +2413,7 @@ def main():
         uninstall_timer()
         return
 
-    if not cfg['enabled']:
+    if not cfg['enabled'] and not args.once:
         log('VSP Health Monitor disabled via config.ini [VSPMONITOR] enabled=false — exiting')
         return
 
@@ -2294,7 +2426,7 @@ def main():
                 'skipping this pass (lock held by a live PID)')
             return
         try:
-            sys.exit(run_all(cfg, args.dry_run))
+            sys.exit(run_all_sites(cfg, args.dry_run))
         finally:
             release_lock()
 
@@ -2311,7 +2443,7 @@ def main():
             'stacking a second concurrent run')
         return
     try:
-        sys.exit(run_all(cfg, args.dry_run))
+        sys.exit(run_all_sites(cfg, args.dry_run))
     finally:
         release_lock()
 

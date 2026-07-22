@@ -263,7 +263,7 @@
 #    - Enable bash shell for root user
 #    - Configure SSH authorized_keys for passwordless access
 #    - Enable browser support and MOB (Managed Object Browser)
-#    - Set password policies (9999 days expiration)
+#    - Set password policies (999 days expiration)
 #    - Disable HA Admission Control
 #    - Configure DRS to PartiallyAutomated
 #    - Clear ARP cache
@@ -272,7 +272,7 @@
 #    - Enable SSH via API on NSX Managers (direct API call)
 #    - Enable SSH via NSX Manager transport node API on NSX Edges
 #    - Configure SSH authorized_keys for passwordless access
-#    - Set 9999-day password expiration for admin, root, audit users
+#    - Set 999-day password expiration for admin, root, audit users
 #    - Auto-recover SDDC Manager rotated root passwords
 #
 # 4. SDDC Manager Configuration:
@@ -399,11 +399,11 @@ LOCAL_VPXD_CONFIG = '/tmp/vpxd.cfg'
 # NSX users to configure
 NSX_USERS = ['admin', 'root', 'audit']
 
-# NSX password expiration (9999 days)
-NSX_PASSWORD_EXPIRY_DAYS = 9999
+# NSX password expiration (999 days)
+NSX_PASSWORD_EXPIRY_DAYS = 999
 
-# Password expiration setting for vCenter (9999 days ~ 27 years)
-PASSWORD_MAX_DAYS = 9999
+# Password expiration setting for vCenter (999)
+PASSWORD_MAX_DAYS = 999
 
 #==============================================================================
 # HELPER FUNCTIONS - FILE OPERATIONS
@@ -639,7 +639,7 @@ def configure_esxi_host(hostname: str, host_system, auth_keys_file: str,
     1. Enable SSH via vSphere API
     2. Copy authorized_keys for passwordless access
     3. Set session timeout to 0 (no timeout)
-    4. Set password expiration to non-expiring (9999 days)
+    4. Set password expiration to non-expiring (999 days)
     
     :param hostname: ESXi host FQDN
     :param host_system: vim.HostSystem object (or None for direct connection)
@@ -866,7 +866,7 @@ def configure_vcenter_password_policies(hostname: str, user: str, password: str,
     This replaces the PowerShell script configvsphere.ps1 with native Python
     implementation using the vSphere REST API. It configures:
     
-    1. Local account password expiration (9999 days)
+    1. Local account password expiration (999 days)
     2. SSO password policy (previous password count = 1)
     3. DRS automation level (PartiallyAutomated)
     4. HA Admission Control (disabled)
@@ -904,7 +904,7 @@ def configure_vcenter_password_policies(hostname: str, user: str, password: str,
         token = response.json()
         session.headers.update({'vmware-api-session-id': token})
         
-        # Configure local accounts password policy (9999 days)
+        # Configure local accounts password policy (999 days)
         lsf.write_output(f'{hostname}: Setting password expiration to {PASSWORD_MAX_DAYS} days')
         policy_url = f'https://{hostname}/api/appliance/local-accounts/global-policy'
         policy_data = {'max_days': PASSWORD_MAX_DAYS}
@@ -1961,7 +1961,7 @@ def configure_nsx_edge(hostname: str, auth_keys_file: str, password: str,
     1. Enables SSH via NSX Manager transport node API
     2. Copies authorized_keys for root user
     3. Configures SSH to start on boot (via NSX CLI over SSH)
-    4. Sets 9999-day password expiration for admin, root, audit users
+    4. Sets 999-day password expiration for admin, root, audit users
     
     :param hostname: NSX Edge hostname
     :param auth_keys_file: Path to authorized_keys file
@@ -2635,7 +2635,7 @@ def configure_operations_vms(auth_keys_file: str, password: str,
             if ssh_user == 'root':
                 # Direct root SSH
                 lsf.write_output(f'{opsvm}: Setting non-expiring password for root...')
-                result = lsf.ssh('chage -M -1 root', f'root@{opsvm}', password)
+                result = lsf.ssh('chage -M 999 root', f'root@{opsvm}', password)
                 if result.returncode == 0:
                     lsf.write_output(f'{opsvm}: SUCCESS - Non-expiring password set for root')
                 elif result.returncode == 255:
@@ -4556,7 +4556,7 @@ def configure_vcf_fleet_password_policy(dry_run: bool = False) -> bool:
     This function:
     1. Authenticates to VCF Operations Manager suite-api
     2. Checks if "MaxExpiration" policy already exists
-    3. If not, creates it with expiration = 9999 days from today
+    3. If not, creates it with expiration = 999 days from today
     4. Queries all policies to find inventory assigned to other policies
     5. Reassigns MANAGEMENT to MaxExpiration (auto-unassigns from old policy)
     6. Reassigns each INSTANCE to MaxExpiration using resourceId (auto-unassigns)
@@ -5025,7 +5025,7 @@ def configure_vsp_proxy(dry_run: bool = False) -> bool:
 
     discover_cmd = (
         f"echo '{password}' | sudo -S -i "
-        f"kubectl get nodes -o jsonpath='{{range .items[*]}}{{.status.addresses[?(@.type==\"InternalIP\")].address}}{{\" \"}}{{end}}'"
+        f"kubectl get nodes -o jsonpath='{{range .items[*]}}{{.status.addresses[?(@.type==\\\"InternalIP\\\")].address}}{{\" \"}}{{end}}'"
     )
     result = lsf.ssh(discover_cmd, f'{VSP_SSH_USER}@{vsp_cp_vip}', password)
     if result.returncode == 0:
@@ -5079,6 +5079,13 @@ HTTP_PROXY={PROXY_URL}
 HTTPS_PROXY={PROXY_URL}
 NO_PROXY={NO_PROXY}
 ENVEOF
+
+# Also fix /etc/profile.d/proxy.sh if it exists
+if [ -f /etc/profile.d/proxy.sh ]; then
+  sed -i "s|^export NO_PROXY=.*|export NO_PROXY=\"{NO_PROXY}\"|" /etc/profile.d/proxy.sh
+  sed -i "s|^export no_proxy=.*|export no_proxy=\"{NO_PROXY}\"|" /etc/profile.d/proxy.sh
+fi
+
 
 mkdir -p /etc/systemd/system/containerd.service.d
 cat > /etc/systemd/system/containerd.service.d/http-proxy.conf << 'CTDEOF'
@@ -5161,14 +5168,14 @@ VSP_TOPOLOGY_MIN_NUMCPU = 12
 VSP_TOPOLOGY_MIN_MEMORY_MIB = 24576
 
 
-def _vsp_kubectl(cmd: str, password: str) -> 'subprocess.CompletedProcess':
+def _vsp_kubectl(cmd: str, password: str, vsp_cp_vip: str = VSP_CP_VIP) -> 'subprocess.CompletedProcess':
     """Run a kubectl command on the VSP control plane VIP via sudo -S -i.
 
     Matches the pattern already used by configure_vsp_proxy()'s discover_cmd —
     a single remote shell invocation, no nested bash -c layers.
     """
     full_cmd = f"echo '{password}' | sudo -S -i kubectl {cmd}"
-    return lsf.ssh(full_cmd, f'{VSP_SSH_USER}@{VSP_CP_VIP}', password)
+    return lsf.ssh(full_cmd, f'{VSP_SSH_USER}@{vsp_cp_vip}', password)
 
 
 def _apply_vsp_json_patch(resource: str, name: str, namespace: str,
@@ -5216,33 +5223,54 @@ def _apply_vsp_json_patch(resource: str, name: str, namespace: str,
 
 
 
+
+def configure_vsp_passwords(dry_run: bool = False) -> bool:
+    """
+    Ensure vmware-system-user and root passwords never expire on VSP nodes (Site A and Site B).
+    """
+    lsf.write_output('VSP Password Expiration Configuration')
+    password = lsf.get_password()
+    success = True
+
+    for vsp_cp_vip in ['10.1.1.142', '10.2.1.142']:
+        if not lsf.test_ping(vsp_cp_vip):
+            lsf.write_output(f'{vsp_cp_vip}: VSP control plane VIP not reachable - skipping')
+            continue
+
+        lsf.write_output(f'Discovering VSP nodes for {vsp_cp_vip}...')
+        discover_cmd = f"echo '{password}' | sudo -S -i kubectl get nodes -o jsonpath='{{.items[*].status.addresses[?(@.type==\\\"InternalIP\\\")].address}}'"
+        result = lsf.ssh(discover_cmd, f'{VSP_SSH_USER}@{vsp_cp_vip}', password)
+        output = getattr(result, 'stdout', '') or getattr(result, 'output', '') or ''
+        
+        vsp_node_ips = [ip.strip() for ip in output.split() if ip.strip()]
+        if not vsp_node_ips:
+            lsf.write_output(f'WARNING: No VSP nodes found for {vsp_cp_vip}')
+            continue
+
+        lsf.write_output(f'Found {len(vsp_node_ips)} VSP nodes for {vsp_cp_vip}: {", ".join(vsp_node_ips)}')
+
+        for node_ip in vsp_node_ips:
+            if dry_run:
+                lsf.write_output(f'[dry-run] Would set password to never expire on {node_ip}')
+                continue
+
+            for account in [VSP_SSH_USER, 'root']:
+                lsf.write_output(f'{node_ip}: Setting non-expiring password for {account}...')
+                chage_cmd = f"echo '{password}' | sudo -S chage -M 999 {account}"
+                res = lsf.ssh(chage_cmd, f'{VSP_SSH_USER}@{node_ip}', password)
+                if res.returncode == 0:
+                    lsf.write_output(f'{node_ip}: SUCCESS - Non-expiring password set for {account}')
+                else:
+                    lsf.write_output(f'{node_ip}: WARNING - Failed to set password for {account}')
+                    success = False
+
+    return success
+
+
 def fix_vsp_controlplane_sizing(dry_run: bool = False) -> bool:
     """
     Ensure the VSP control-plane node gets >= 12 vCPU via the SUPPORTED,
     operator-honored lever: the vsp ComponentVersion `sizes` profile.
-
-    Root cause (see vcf-troubleshooting references/supervisor-k8s.md#56/#59):
-    the `vsp` Component ships at size=small, whose control-plane profile caps
-    CP at 4 vCPU (workers get "large" = 12 vCPU). A 4-vCPU CP running etcd +
-    kube-apiserver + Kyverno's fail-closed admission webhooks is the stressed
-    foundation that lets a transient Kyverno blip ignite a self-sustaining
-    leader-election storm (kube-scheduler / controller-manager / envoy-gateway /
-    Kyverno all losing leases and restarting) — surfacing to end users as
-    gateway/fleet-lcm flapping and "Service or view is not available".
-
-    IMPORTANT — why THIS lever and not the earlier approaches: editing
-    Cluster.spec.topology.controlPlane.variables.overrides or the
-    VSphereMachineTemplates is REVERTED by vmsp-operator within ~90s (it
-    continuously re-renders those from the vsp component package). Likewise
-    HelmRelease driftDetection=warn is reverted. The durable input the operator
-    actually honors is the ComponentVersion's own `sizes` array. This function
-    bumps the ACTIVE size profile's control-plane cpu to >= 12 while leaving its
-    `worker` size untouched — so the CP grows (and only the CP node rolls) while
-    the worker nodes are completely unaffected.
-
-    Idempotent (skips if the active profile's CP is already >= 12); non-fatal
-    (logs + returns True if VSP isn't present/reachable). vpodchecker.py's
-    VSP Node Resources check and vsp-health-monitor.py verify/re-assert it.
     """
     lsf.write_output('')
     lsf.write_output('=' * 60)
@@ -5250,98 +5278,96 @@ def fix_vsp_controlplane_sizing(dry_run: bool = False) -> bool:
     lsf.write_output('=' * 60)
 
     password = lsf.get_password()
+    overall_success = True
 
-    if not lsf.test_ping(VSP_CP_VIP):
-        lsf.write_output(f'{VSP_CP_VIP}: VSP control plane VIP not reachable - '
-                         f'skipping (this lab type may not use a VSP cluster)')
-        return True
+    for vsp_cp_vip in ['10.1.1.142', '10.2.1.142']:
+        if not lsf.test_ping(vsp_cp_vip):
+            lsf.write_output(f'{vsp_cp_vip}: VSP control plane VIP not reachable - '
+                             f'skipping (this lab type may not use a VSP cluster)')
+            continue
 
-    # ---- Discover the vsp Component: active size profile + ComponentVersion name ----
-    comp = _vsp_kubectl('get components.api.vmsp.vmware.com vsp -o json', password)
-    craw = (getattr(comp, 'stdout', '') or '')
-    cjs = craw.find('{')
-    if getattr(comp, 'returncode', 1) != 0 or cjs < 0:
-        lsf.write_output('vsp Component not found - skipping '
-                         '(this lab type may not use a VSP cluster)')
-        return True
-    try:
-        cdata = json.loads(craw[cjs:])
-        active_size = cdata.get('spec', {}).get('size', 'small')
-        cv_name = cdata.get('spec', {}).get('versionRef', {}).get('name', '')
-    except Exception as e:
-        lsf.write_output(f'WARNING: could not parse vsp Component: {e} - skipping')
-        return True
-    if not cv_name:
-        lsf.write_output('WARNING: vsp Component has no versionRef - skipping')
-        return True
-
-    lsf.write_output(f'vsp Component: active size profile="{active_size}", '
-                     f'ComponentVersion="{cv_name}"')
-
-    # ---- Read the ComponentVersion size profiles ----
-    cv = _vsp_kubectl(f'get componentversions.api.vmsp.vmware.com {cv_name} -o json', password)
-    cvraw = (getattr(cv, 'stdout', '') or '')
-    cvjs = cvraw.find('{')
-    if getattr(cv, 'returncode', 1) != 0 or cvjs < 0:
-        lsf.write_output(f'WARNING: could not read ComponentVersion {cv_name} - skipping')
-        return True
-    try:
-        cvdata = json.loads(cvraw[cvjs:])
-        sizes = cvdata.get('spec', {}).get('sizes', [])
-    except Exception as e:
-        lsf.write_output(f'WARNING: could not parse ComponentVersion sizes: {e} - skipping')
-        return True
-
-    prof = next((s for s in sizes if s.get('name') == active_size), None)
-    if prof is None:
-        lsf.write_output(f'WARNING: active size profile "{active_size}" not found in '
-                         f'ComponentVersion sizes - skipping')
-        return True
-
-    def _cpu_max(p):
+        # ---- Discover the vsp Component: active size profile + ComponentVersion name ----
+        comp = _vsp_kubectl('get components.api.vmsp.vmware.com vsp -o json', password, vsp_cp_vip)
+        craw = (getattr(comp, 'stdout', '') or '')
+        cjs = craw.find('{')
+        if getattr(comp, 'returncode', 1) != 0 or cjs < 0:
+            lsf.write_output(f'{vsp_cp_vip}: vsp Component not found - skipping '
+                             '(this lab type may not use a VSP cluster)')
+            continue
         try:
-            return float(str(p.get('resources', {}).get('cpu', {}).get('max', '0')))
-        except (ValueError, TypeError):
-            return 0.0
+            cdata = json.loads(craw[cjs:])
+            active_size = cdata.get('spec', {}).get('size', 'small')
+            cv_name = cdata.get('spec', {}).get('versionRef', {}).get('name', '')
+        except Exception as e:
+            lsf.write_output(f'{vsp_cp_vip}: WARNING: could not parse vsp Component: {e} - skipping')
+            overall_success = False
+            continue
+        if not cv_name:
+            lsf.write_output(f'{vsp_cp_vip}: WARNING: vsp Component has no versionRef - skipping')
+            overall_success = False
+            continue
 
-    cur_cpu_max = _cpu_max(prof)
-    cur_worker = prof.get('worker', {}).get('size', '?')
-    if cur_cpu_max >= VSP_TOPOLOGY_MIN_NUMCPU:
-        lsf.write_output(f'  "{active_size}" profile CP cpu.max={cur_cpu_max} '
-                         f'(>= {VSP_TOPOLOGY_MIN_NUMCPU}), worker="{cur_worker}" - OK')
-        lsf.write_output('VSP control-plane sizing check complete - no changes needed')
-        return True
+        lsf.write_output(f'{vsp_cp_vip}: vsp Component: active size profile="{active_size}", '
+                         f'ComponentVersion="{cv_name}"')
 
-    lsf.write_output(f'  "{active_size}" profile CP cpu.max={cur_cpu_max} is UNDERSIZED '
-                     f'(< {VSP_TOPOLOGY_MIN_NUMCPU}); worker="{cur_worker}" (leaving workers as-is). '
-                     f'Bumping CP cpu to max={VSP_TOPOLOGY_MIN_NUMCPU}/min=8.')
-    if dry_run:
-        lsf.write_output('  [DRY-RUN] Would patch ComponentVersion sizes '
-                         f'"{active_size}".resources.cpu -> max 12/min 8 (worker untouched)')
-        return True
+        # ---- Read the ComponentVersion size profiles ----
+        cv = _vsp_kubectl(f'get componentversions.api.vmsp.vmware.com {cv_name} -o json', password, vsp_cp_vip)
+        cvraw = (getattr(cv, 'stdout', '') or '')
+        cvjs = cvraw.find('{')
+        if getattr(cv, 'returncode', 1) != 0 or cvjs < 0:
+            lsf.write_output(f'{vsp_cp_vip}: WARNING: could not read ComponentVersion {cv_name} - skipping')
+            overall_success = False
+            continue
+        try:
+            cvdata = json.loads(cvraw[cvjs:])
+            sizes = cvdata.get('spec', {}).get('sizes', [])
+        except Exception as e:
+            lsf.write_output(f'{vsp_cp_vip}: WARNING: could not parse ComponentVersion sizes: {e} - skipping')
+            overall_success = False
+            continue
 
-    # Rebuild the full sizes array (merge patch replaces the whole list); only
-    # the active profile's CP cpu is changed — memory/storage/worker preserved.
-    new_sizes = []
-    for s in sizes:
-        s = json.loads(json.dumps(s))  # deep copy
-        if s.get('name') == active_size:
-            s.setdefault('resources', {}).setdefault('cpu', {})
-            s['resources']['cpu']['max'] = str(VSP_TOPOLOGY_MIN_NUMCPU)
-            s['resources']['cpu']['min'] = '8'
-        new_sizes.append(s)
+        prof = next((s for s in sizes if s.get('name') == active_size), None)
+        if prof is None:
+            lsf.write_output(f'{vsp_cp_vip}: WARNING: active size profile "{active_size}" not found in '
+                             f'ComponentVersion sizes - skipping')
+            overall_success = False
+            continue
 
-    if _apply_vsp_json_patch('componentversions.api.vmsp.vmware.com', cv_name, '',
-                             {'spec': {'sizes': new_sizes}}, password):
-        lsf.write_output(f'  Patched ComponentVersion "{active_size}" profile CP cpu -> '
-                         f'12 (worker size "{cur_worker}" unchanged). The operator re-renders '
-                         f'the CP node to 12 vCPU; only the CP rolls, workers are untouched.')
-    else:
-        lsf.write_output('  ERROR: failed to patch ComponentVersion sizes')
-        return False
+        cp_cpu = prof.get('controlPlane', {}).get('cpu', 0)
+        cp_mem = prof.get('controlPlane', {}).get('memory', '0Gi')
+        lsf.write_output(f'{vsp_cp_vip}: Current profile "{active_size}" controlPlane: cpu={cp_cpu}, memory={cp_mem}')
 
-    lsf.write_output('VSP control-plane sizing complete (durable via ComponentVersion profile)')
-    return True
+        if cp_cpu >= VSP_TOPOLOGY_MIN_NUMCPU:
+            lsf.write_output(f'{vsp_cp_vip}: VSP control plane already sized >= {VSP_TOPOLOGY_MIN_NUMCPU} vCPU - no action needed')
+            continue
+
+        lsf.write_output(f'{vsp_cp_vip}: VSP control plane undersized ({cp_cpu} vCPU). Patching ComponentVersion {cv_name}...')
+
+        if dry_run:
+            lsf.write_output(f'{vsp_cp_vip}: [dry-run] would patch ComponentVersion controlPlane.cpu')
+            continue
+
+        # ---- Patch the ComponentVersion sizes array ----
+        for p in sizes:
+            if p.get('name') == active_size:
+                if 'controlPlane' not in p:
+                    p['controlPlane'] = {}
+                p['controlPlane']['cpu'] = VSP_TOPOLOGY_MIN_NUMCPU
+
+        patch_payload = {'spec': {'sizes': sizes}}
+        patch_json = json.dumps(patch_payload)
+
+        patch_cmd = f"patch componentversions.api.vmsp.vmware.com {cv_name} --type=merge -p '{patch_json}'"
+        patch_res = _vsp_kubectl(patch_cmd, password, vsp_cp_vip)
+
+        if getattr(patch_res, 'returncode', 1) == 0:
+            lsf.write_output(f'{vsp_cp_vip}: SUCCESS: Patched ComponentVersion {cv_name} controlPlane.cpu to {VSP_TOPOLOGY_MIN_NUMCPU}')
+        else:
+            err = (getattr(patch_res, 'stderr', '') or getattr(patch_res, 'stdout', '') or '')
+            lsf.write_output(f'{vsp_cp_vip}: FAILED to patch ComponentVersion: {err}')
+            overall_success = False
+
+    return overall_success
 
 
 def configure_all_proxies(dry_run: bool = False,
@@ -5663,7 +5689,7 @@ def main():
 
     Orchestrates all HOLification steps in the correct order:
     0a. Vault root CA import to Firefox on console VM (with SKIP/RETRY/FAIL options)
-    0b. Vault CA trust distribution across VCF suite (vCenters, ESXi, NSX, SDDC Mgr, VCFA, Ops)
+    6b. Vault CA trust distribution across VCF suite (vCenters, ESXi, NSX, SDDC Mgr, VCFA, Ops)
     0c. vCenter CA certificates import to Firefox on console VM (with SKIP/RETRY/FAIL options)
     1.  ESXi host configuration
     2.  vCenter configuration
@@ -5780,14 +5806,6 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
         lsf.write_output('ERROR: Failed to configure Vault CA for Firefox')
         sys.exit(1)
     
-    # Step 0b: Distribute Vault CA trust across VCF suite
-    # Import the Vault root CA into vCenters, ESXi, NSX, SDDC Manager, VCFA, Ops VMs
-    vault_ca_pem = download_vault_ca_certificate() if not args.dry_run else None
-    if vault_ca_pem or args.dry_run:
-        distribute_vault_ca_trust(vault_ca_pem or '', password, args.dry_run)
-    else:
-        lsf.write_output('WARNING: Could not download Vault CA - skipping VCF trust distribution')
-    
     # Step 0c: Import vCenter CA certificates to Firefox on console VM
     # This reads vCenters from config.ini and imports their CA certificates
     if not configure_vcenter_ca_for_firefox(args.dry_run):
@@ -5862,6 +5880,14 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
     # Step 6: Configure Operations VMs (VCF and VVF both have ops VMs)
     configure_operations_vms(auth_keys_file, password, args.dry_run)
 
+    # Step 6b: Distribute Vault CA trust across VCF suite
+    # Import the Vault root CA into vCenters, ESXi, NSX, SDDC Manager, VCFA, Ops VMs
+    vault_ca_pem = download_vault_ca_certificate() if not args.dry_run else None
+    if vault_ca_pem or args.dry_run:
+        distribute_vault_ca_trust(vault_ca_pem or '', password, args.dry_run)
+    else:
+        lsf.write_output('WARNING: Could not download Vault CA - skipping VCF trust distribution')
+    
     # Step 7: Disable SDDC Manager auto-rotate policies [VCF only]
     # This prevents credential rotation failures when the lab template is deployed
     if is_vcf:
@@ -5883,6 +5909,9 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
     # See vcf-troubleshooting skill references/supervisor-k8s.md#56.
     if not args.skip_vsp_sizing:
         fix_vsp_controlplane_sizing(args.dry_run)
+
+    # Step 8c: Fix VSP password expiration
+    configure_vsp_passwords(args.dry_run)
 
     # (Kyverno failure-policy hardening was evaluated and removed: the
     # --forceFailurePolicyIgnore flag lives on a vmsp-operator-rendered deployment

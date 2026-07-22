@@ -178,7 +178,7 @@ def show_help():
     print(f"    {_GREEN}-h, --help{_NC}          Show this help message\n")
     print(f"{_BOLD}CP HOST RESOLUTION ORDER:{_NC}")
     print(f"    1. {_GREEN}--host{_NC} <IP>, if given")
-    print(f"    2. Hardcoded VIP  ({VSP_VIP})")
+    print(f"    2. Hardcoded VIPs (10.1.1.142, 10.2.1.142)")
     print(f"    3. Auto-discovery via {_GREEN}--worker{_NC}")
     print(f"    Each candidate is tried via SSH; the first reachable one wins.\n")
     print(f"{_BOLD}SECTION NAMES:{_NC}  (use with --section)")
@@ -263,7 +263,7 @@ def ssh_exec(host, password, cmd, timeout=60):
         return 1, str(exc)
 
 
-def resolve_cp_host(host_arg, worker_fqdn, password):
+def resolve_cp_host(host_arg, worker_fqdn, password, site_vip):
     """Pick the VSP control-plane host to use, trying candidates in order:
     1. host_arg (--host), if given
     2. the hardcoded VSP_VIP
@@ -275,8 +275,8 @@ def resolve_cp_host(host_arg, worker_fqdn, password):
     candidates = []
     if host_arg:
         candidates.append((host_arg, "--host"))
-    if VSP_VIP not in (c[0] for c in candidates):
-        candidates.append((VSP_VIP, "hardcoded VIP"))
+    if site_vip not in (c[0] for c in candidates):
+        candidates.append((site_vip, "hardcoded VIP"))
 
     for host, label in candidates:
         tried.append(host)
@@ -396,15 +396,15 @@ def _pod_ready(pod_json):
 
 
 # ─── Section 1: Control Plane ─────────────────────────────────────────────────
-def chk_control_plane(cp_host, password, crictl_out, kvip_out, verbose):
+def chk_control_plane(cp_host, password, crictl_out, kvip_out, verbose, site_vip):
     results = []
 
     # VIP reachability
-    vip_up = ping_host(VSP_VIP)
+    vip_up = ping_host(site_vip)
     results.append(
-        row_ok(f"VIP {VSP_VIP}: reachable")
+        row_ok(f"VIP {site_vip}: reachable")
         if vip_up else
-        row_fail(f"VIP {VSP_VIP}: reachable", "dropped — run kube-fix.py to restore")
+        row_fail(f"VIP {site_vip}: reachable", "dropped — run kube-fix.py to restore")
     )
 
     # kube-vip manifest setting
@@ -1036,6 +1036,57 @@ def chk_proxy(cp_host, password, verbose):
 
 
 # ─── Section 12: Kubeadm Certificates ─────────────────────────────────────────
+
+def chk_password_expiration(cp_host, password, verbose):
+    results = []
+    nodes_data = fetch_json(cp_host, password, "kubectl get nodes -o json 2>/dev/null", 30)
+    if not nodes_data or 'items' not in nodes_data:
+        return [row_warn("Could not fetch nodes to check password expiration")]
+        
+    now = datetime.now(timezone.utc)
+    failed = False
+
+    for node in nodes_data['items']:
+        node_ip = None
+        for addr in node.get('status', {}).get('addresses', []):
+            if addr.get('type') == 'InternalIP':
+                node_ip = addr.get('address')
+                break
+        if not node_ip:
+            continue
+            
+        for user in [VSP_USER, 'root']:
+            _, out = ssh_exec(node_ip, password, f"chage -l {user} | grep 'Password expires'", timeout=10)
+            if not out:
+                results.append(row_fail(f"{node_ip}: {user} could not read password expiration"))
+                failed = True
+                continue
+                
+            out = out.strip()
+            if 'never' in out.lower():
+                results.append(row_fail(f"{node_ip}: {user} password set to never expire"))
+                failed = True
+                continue
+                
+            try:
+                date_str = out.split(':', 1)[1].strip()
+                exp_dt = datetime.strptime(date_str, "%b %d, %Y").replace(tzinfo=timezone.utc)
+                days = (exp_dt - now).days
+                
+                if days <= 365:
+                    results.append(row_fail(f"{node_ip}: {user} password expires in {days} days ({date_str})"))
+                    failed = True
+                elif verbose:
+                    results.append(row_ok(f"{node_ip}: {user} password expires in {days} days ({date_str})"))
+            except Exception as e:
+                results.append(row_fail(f"{node_ip}: {user} could not parse expiration date ({out})"))
+                failed = True
+                
+    if not failed:
+        results.append(row_ok("All node passwords expire in > 1 year"))
+        
+    return results
+
 def chk_kubeadm_certs(cp_host, password, verbose):
     """kubeadm's own cert population (apiserver, etcd, front-proxy, etc.) is
     a separate cert population from cert-manager's Certificate CRDs (section
@@ -1090,7 +1141,136 @@ SECTION_MAP = {
     "vodap":    "VODAP HEALTH",
     "proxy":    "NODE PROXY CONFIG",
     "kubeadm":  "KUBEADM CERTIFICATES",
+    "password": "PASSWORD EXPIRATION",
 }
+
+
+
+def run_health_check(args, password, site_vip, site_worker, run_start, ts, W):
+        # Determine CP host: --host, then hardcoded VIP, then auto-discovery.
+        cp_host, tried = resolve_cp_host(args.host, site_worker, password, site_vip)
+        if not cp_host:
+            print(f"\n{_RED}ERROR:{_NC} Cannot SSH to any candidate host as {VSP_USER}.")
+            print(f"  Tried: {', '.join(tried)}")
+            print(f"  Specify a reachable CP node directly: python3 vsp-health.py --host <IP>")
+            return 2
+    
+        # ── Bulk data fetch ────────────────────────────────────────────────────────
+        want = args.section  # None = all sections
+        print(f"{_DIM}  Fetching cluster state (this may take ~15-20s)...{_NC}", flush=True)
+    
+        needs_crictl = want in (None, "cp")
+        needs_kvip   = want in (None, "cp")
+        needs_nodes  = want in (None, "nodes")
+        needs_deps   = want in (None, "vcf")
+        needs_sts    = want in (None, "vcf")
+        needs_certs  = want in (None, "certs")
+        needs_argo   = want in (None, "argo")
+        needs_comp   = want in (None, "vcf")
+    
+        crictl_out = ssh_exec(cp_host, password, "crictl ps 2>/dev/null", timeout=20)[1] \
+                     if needs_crictl else ""
+        kvip_out   = ssh_exec(cp_host, password,
+                               "grep -A1 vip_preserve /etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null")[1] \
+                     if needs_kvip else ""
+        nodes_data = fetch_json(cp_host, password, "kubectl get nodes -o json 2>/dev/null", 30) \
+                     if needs_nodes else None
+        deps_data  = fetch_json(cp_host, password, "kubectl get deployments -A -o json 2>/dev/null", 45) \
+                     if needs_deps else None
+        sts_data   = fetch_json(cp_host, password, "kubectl get statefulsets -A -o json 2>/dev/null", 45) \
+                     if needs_sts else None
+        certs_data = fetch_json(cp_host, password, "kubectl get certificates -A -o json 2>/dev/null", 30) \
+                     if needs_certs else None
+        comp_data  = fetch_json(cp_host, password,
+                                "kubectl get components.api.vmsp.vmware.com -o json 2>/dev/null", 30) \
+                     if needs_comp else None
+    
+        # ── Run sections ──────────────────────────────────────────────────────────
+        all_results: dict = {}
+    
+        def run(key, title, fn, *fn_args):
+            if want and want != key:
+                return
+            section(title)
+            section_start = datetime.now()
+            rows = fn(*fn_args)
+            section_elapsed = (datetime.now() - section_start).total_seconds()
+            for i, r in enumerate(rows):
+                all_results[f"{key}_{i}"] = r
+            print(f"  {_DIM}({section_elapsed:.1f}s){_NC}")
+    
+        run("cp",       "CONTROL PLANE",
+            chk_control_plane, cp_host, password, crictl_out, kvip_out, args.verbose, site_vip)
+    
+        run("nodes",    "KUBERNETES NODES",
+            chk_nodes, nodes_data, args.verbose)
+    
+        run("pods",     "POD HEALTH OVERVIEW  (all namespaces)",
+            chk_pod_overview, cp_host, password, args.verbose)
+    
+        run("vcf",      "VCF MANAGED COMPONENTS  (vcfcomponents)",
+            chk_vcf_components, deps_data, sts_data, comp_data, args.verbose)
+    
+        run("postgres", "POSTGRESQL INSTANCES",
+            chk_postgres, cp_host, password, args.verbose)
+    
+        run("redis",    "REDIS & SALT RAAS",
+            chk_redis_raas, cp_host, password, args.verbose)
+    
+        run("salt",     "SALT STACK",
+            chk_salt, cp_host, password, args.verbose)
+    
+        run("certs",    "TLS CERTIFICATES  (cert-manager)",
+            chk_certificates, certs_data, args.verbose)
+    
+        run("argo",     "ARGO WORKFLOWS  (vmsp-platform)",
+            chk_argo, cp_host, password, args.verbose)
+    
+        run("vodap",    "VODAP HEALTH  (ClickHouse cert + fluentd buffers)",
+            chk_vodap, cp_host, password, args.verbose)
+    
+        run("proxy",    "NODE PROXY CONFIG",
+            chk_proxy, cp_host, password, args.verbose)
+    
+        run("kubeadm",  "KUBEADM CERTIFICATES",
+            chk_kubeadm_certs, cp_host, password, args.verbose)
+    
+        run("password", "PASSWORD EXPIRATION",
+            chk_password_expiration, cp_host, password, args.verbose)
+    
+        # ── Summary ───────────────────────────────────────────────────────────────
+        total   = len(all_results)
+        failed  = sum(1 for v in all_results.values() if v is False)
+        color   = _GREEN if failed == 0 else _RED
+        elapsed = (datetime.now() - run_start).total_seconds()
+    
+        print(f"\n{_CYAN}{'─' * 64}{_NC}")
+        print(f"  {color}{_BOLD}RESULT: {total - failed}/{total} checks passed{_NC}"
+              f"  {_DIM}(total: {elapsed:.1f}s){_NC}")
+        if failed:
+            print(f"  {_RED}  {failed} check(s) require attention — see {_FAIL} rows above{_NC}")
+            print(f"  {_DIM}  Remediation: python3 salt-stabilize.py | python3 kube-fix.py | "
+                  f"python3 vodap-fix.py{_NC}")
+            print(f"  {_DIM}  Or wait up to 5 min for vsp-health-monitor.py's next cron cycle{_NC}")
+        else:
+            print(f"  {_GREEN}  VSP cluster is healthy{_NC}")
+        print(f"{_CYAN}{'─' * 64}{_NC}\n")
+    
+        if args.json:
+            summary = {
+                "timestamp": ts,
+                "cp_host": cp_host,
+                "section_filter": args.section,
+                "checks_passed": total - failed,
+                "checks_failed": failed,
+                "checks_total": total,
+                "healthy": failed == 0,
+                "elapsed_seconds": round(elapsed, 1),
+                "detail": {k: v for k, v in all_results.items()},
+            }
+            print(json.dumps(summary, indent=2))
+    
+        return (0 if failed == 0 else 1)
 
 
 def main():
@@ -1118,127 +1298,30 @@ def main():
     print(f"{_CYAN}║{_NC}{ts:^{W}}{_CYAN}║{_NC}")
     print(f"{_CYAN}╚{'═' * W}╝{_NC}")
 
-    # Determine CP host: --host, then hardcoded VIP, then auto-discovery.
-    cp_host, tried = resolve_cp_host(args.host, args.worker, password)
-    if not cp_host:
-        print(f"\n{_RED}ERROR:{_NC} Cannot SSH to any candidate host as {VSP_USER}.")
-        print(f"  Tried: {', '.join(tried)}")
-        print(f"  Specify a reachable CP node directly: python3 vsp-health.py --host <IP>")
-        sys.exit(2)
 
-    # ── Bulk data fetch ────────────────────────────────────────────────────────
-    want = args.section  # None = all sections
-    print(f"{_DIM}  Fetching cluster state (this may take ~15-20s)...{_NC}", flush=True)
-
-    needs_crictl = want in (None, "cp")
-    needs_kvip   = want in (None, "cp")
-    needs_nodes  = want in (None, "nodes")
-    needs_deps   = want in (None, "vcf")
-    needs_sts    = want in (None, "vcf")
-    needs_certs  = want in (None, "certs")
-    needs_argo   = want in (None, "argo")
-    needs_comp   = want in (None, "vcf")
-
-    crictl_out = ssh_exec(cp_host, password, "crictl ps 2>/dev/null", timeout=20)[1] \
-                 if needs_crictl else ""
-    kvip_out   = ssh_exec(cp_host, password,
-                           "grep -A1 vip_preserve /etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null")[1] \
-                 if needs_kvip else ""
-    nodes_data = fetch_json(cp_host, password, "kubectl get nodes -o json 2>/dev/null", 30) \
-                 if needs_nodes else None
-    deps_data  = fetch_json(cp_host, password, "kubectl get deployments -A -o json 2>/dev/null", 45) \
-                 if needs_deps else None
-    sts_data   = fetch_json(cp_host, password, "kubectl get statefulsets -A -o json 2>/dev/null", 45) \
-                 if needs_sts else None
-    certs_data = fetch_json(cp_host, password, "kubectl get certificates -A -o json 2>/dev/null", 30) \
-                 if needs_certs else None
-    comp_data  = fetch_json(cp_host, password,
-                            "kubectl get components.api.vmsp.vmware.com -o json 2>/dev/null", 30) \
-                 if needs_comp else None
-
-    # ── Run sections ──────────────────────────────────────────────────────────
-    all_results: dict = {}
-
-    def run(key, title, fn, *fn_args):
-        if want and want != key:
-            return
-        section(title)
-        section_start = datetime.now()
-        rows = fn(*fn_args)
-        section_elapsed = (datetime.now() - section_start).total_seconds()
-        for i, r in enumerate(rows):
-            all_results[f"{key}_{i}"] = r
-        print(f"  {_DIM}({section_elapsed:.1f}s){_NC}")
-
-    run("cp",       "CONTROL PLANE",
-        chk_control_plane, cp_host, password, crictl_out, kvip_out, args.verbose)
-
-    run("nodes",    "KUBERNETES NODES",
-        chk_nodes, nodes_data, args.verbose)
-
-    run("pods",     "POD HEALTH OVERVIEW  (all namespaces)",
-        chk_pod_overview, cp_host, password, args.verbose)
-
-    run("vcf",      "VCF MANAGED COMPONENTS  (vcfcomponents)",
-        chk_vcf_components, deps_data, sts_data, comp_data, args.verbose)
-
-    run("postgres", "POSTGRESQL INSTANCES",
-        chk_postgres, cp_host, password, args.verbose)
-
-    run("redis",    "REDIS & SALT RAAS",
-        chk_redis_raas, cp_host, password, args.verbose)
-
-    run("salt",     "SALT STACK",
-        chk_salt, cp_host, password, args.verbose)
-
-    run("certs",    "TLS CERTIFICATES  (cert-manager)",
-        chk_certificates, certs_data, args.verbose)
-
-    run("argo",     "ARGO WORKFLOWS  (vmsp-platform)",
-        chk_argo, cp_host, password, args.verbose)
-
-    run("vodap",    "VODAP HEALTH  (ClickHouse cert + fluentd buffers)",
-        chk_vodap, cp_host, password, args.verbose)
-
-    run("proxy",    "NODE PROXY CONFIG",
-        chk_proxy, cp_host, password, args.verbose)
-
-    run("kubeadm",  "KUBEADM CERTIFICATES",
-        chk_kubeadm_certs, cp_host, password, args.verbose)
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    total   = len(all_results)
-    failed  = sum(1 for v in all_results.values() if v is False)
-    color   = _GREEN if failed == 0 else _RED
-    elapsed = (datetime.now() - run_start).total_seconds()
-
-    print(f"\n{_CYAN}{'─' * 64}{_NC}")
-    print(f"  {color}{_BOLD}RESULT: {total - failed}/{total} checks passed{_NC}"
-          f"  {_DIM}(total: {elapsed:.1f}s){_NC}")
-    if failed:
-        print(f"  {_RED}  {failed} check(s) require attention — see {_FAIL} rows above{_NC}")
-        print(f"  {_DIM}  Remediation: python3 salt-stabilize.py | python3 kube-fix.py | "
-              f"python3 vodap-fix.py{_NC}")
-        print(f"  {_DIM}  Or wait up to 5 min for vsp-health-monitor.py's next cron cycle{_NC}")
+    if args.host:
+        sites = [(args.host, args.worker)]
     else:
-        print(f"  {_GREEN}  VSP cluster is healthy{_NC}")
-    print(f"{_CYAN}{'─' * 64}{_NC}\n")
+        sites = [('10.1.1.142', 'vsp-01a.site-a.vcf.lab'), ('10.2.1.142', 'vsp-01b.site-b.vcf.lab')]
 
-    if args.json:
-        summary = {
-            "timestamp": ts,
-            "cp_host": cp_host,
-            "section_filter": args.section,
-            "checks_passed": total - failed,
-            "checks_failed": failed,
-            "checks_total": total,
-            "healthy": failed == 0,
-            "elapsed_seconds": round(elapsed, 1),
-            "detail": {k: v for k, v in all_results.items()},
-        }
-        print(json.dumps(summary, indent=2))
+    overall_exit = 0
+    for site_vip, site_worker in sites:
+        if not args.host:
+            # Check if site exists
+            rc, _ = ssh_exec(site_vip, password, "echo PONG", timeout=2)
+            if rc != 0:
+                rc, _ = ssh_exec(site_worker, password, "echo PONG", timeout=2)
+                if rc != 0:
+                    continue
+        
+        exit_code = run_health_check(args, password, site_vip, site_worker, run_start, ts, W)
+        if exit_code > overall_exit:
+            overall_exit = exit_code
 
-    sys.exit(0 if failed == 0 else 1)
+    sys.exit(overall_exit)
+
+
+
 
 
 if __name__ == "__main__":
