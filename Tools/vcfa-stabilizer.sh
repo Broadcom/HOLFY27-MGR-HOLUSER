@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VCFA Complete Stabilization Script v2.14
-# Version 2.14 - 2026-07-21
+# VCFA Complete Stabilization Script v2.16
+# Version 2.16 - 2026-07-21
 # Author - HOL Core Team
 #
 # Default-run philosophy (v2.6+): one run of the script with no flags should leave the VCFA in a
@@ -33,6 +33,9 @@
 #   - vcfa-vmsp-kube-vip-keeper.sh drift watcher (NEW v2.9, see below)
 #   - support-bundle-cluster-info-dump runaway check + permanent hardening (NEW v2.12)
 #   - stale system-shutdown Argo workflow sweep + cordoned node uncordon (NEW v2.12)
+#   - vcfapostgres pgdata permission auto-remediation (NEW v2.15)
+#   - terminal Job/Workflow pod cleanup (Failed/Succeeded pods owned by a Job or Argo Workflow,
+#     cluster-wide) — clears configure-component-*-execute-script-* leftovers (NEW v2.16)
 # What's conditional (only applied when we detect actual trouble):
 #   - kyverno --forceFailurePolicyIgnore=true + webhook Fail->Ignore. Triggers when load1>30, OR
 #     kyverno pods not Ready, OR kube-controller-manager restarts>5. Reason: vmsp-operator owns
@@ -40,6 +43,47 @@
 #     unconditionally just churns rollouts. Set FORCE_KYVERNO_FIX=1 to bypass the heuristic.
 #
 # See VCFA_Stabilizer_Incident_Apr2026.md for the gateway/EnvoyProxy guidance and HTTP 503 recovery.
+#
+# v2.16 changelog (2026-07-21):
+#  * NEW: terminal Job/Workflow pod cleanup inside check_and_fix_support_bundle_runaway (step 3/7).
+#    Symptom: after a Fleet LCM system-shutdown + power-on, auto-health.py stays red on a pod like
+#    `configure-component-<id>-execute-script-<hash>: Error` even though the owning Component CR has
+#    reconciled back to Running. Root cause: that pod is a terminal (phase Failed / "Error") Argo
+#    Workflow step pod (the `-execute-script-` suffix is Argo naming, NOT a bare Job), orphaned by the
+#    chaotic mass-restart; auto-health counts Error/Failed in BAD_STATES so the pod alone keeps it red.
+#    Fix: delete cluster-wide any pod in phase Failed/Succeeded whose controller ownerRef is a Job OR
+#    an Argo Workflow (--grace-period=0). Terminal pods are artifacts; a live controller spawns a NEW
+#    pod, never reuses these — so this is idempotent and safe. The old report-only "6/6" step is now the
+#    final "7/7" summary; step labels renumbered 1..7.
+#  * NEW: `--fix-post-boot` flag — fast, targeted recovery for the manual-shutdown-then-power-on
+#    pattern WITHOUT the slow Phase 1.5 control-plane preflight. Runs: run-lock, prerequisites,
+#    check_and_fix_support_bundle_runaway (workflow sweep + uncordon + terminal-pod cleanup),
+#    fix_vcf_final_edge_cases (0-replica prelude scale-up + resource-manager gRPC bootstrap-deadlock
+#    fix), then status. Closes the gap where `--fix-support-bundle` swept the workflow but left prelude
+#    scaled to 0 (no scale-up afterward).
+#  * NEW: incident-signature snapshot added to the main() pre-flight report — informational only,
+#    mirrors auto-health.py's signals: count of system-shutdown workflows, list of 0-replica prelude
+#    Deployments/StatefulSets, and count of terminal Job/Workflow pods cluster-wide.
+#  * NEW: acquire_run_lock() concurrent-run guard (flock on /tmp/vcfa-stabilizer.lock, pgrep fallback).
+#    Prevents two runs racing on scale operations. Called from main() and every mutating standalone
+#    flag; read-only flags (--status/--preflight/--verify*/--help) skip it. Bypass with FORCE_RUN=1.
+#  * ENHANCEMENT: resource-manager-server self-dial deadlock unblocker in fix_vcf_final_edge_cases is
+#    now a BOUNDED RETRY LOOP instead of single-shot. RM crash-loops on a ~1-5 min cadence and has a
+#    secondary dependency on ebs-service (:4242, itself cold-starting), so one nsenter unblock rarely
+#    survives the next kubelet kill. It now re-discovers the freshly-restarted pod and re-applies the
+#    fake-listener unblock each attempt, breaking as soon as the pod reports Ready, capped by a total
+#    wall-clock budget (RM_UNBLOCK_WALL_SECONDS=240, RM_UNBLOCK_ATTEMPT_SECONDS=60) so a wedged pod
+#    can't hang the run. Also unblocks intent-server, whose readiness depends on RM's gRPC listener.
+#  * FIX: guard THRESHOLD in the support-bundle runaway body. When THRESHOLD reached the remote body
+#    empty/non-numeric, "[[ JOB_COUNT -gt '' ]]" evaluated as N>0 and fired a FALSE runaway on any
+#    cluster with >=1 support-bundle-cluster-info-dump Job — deleting the Job and suspending the
+#    CronJob with a spurious "ACTION REQUIRED: graceful shutdown/restart" warning. Now defaulted to 3
+#    inside the body via a numeric-validation case. (Surfaced by the new --fix-post-boot run.)
+#
+# v2.15 changelog (2026-07-21):
+#  * ENHANCEMENT: Added automated detection and fix for the vcfapostgres-0 pgdata permission bug inside `fix_vcf_final_edge_cases`.
+#    It now automatically checks the postgres logs for the "invalid permissions" error, applies the
+#    required chmod g-s / chmod 0700 via kubectl exec, and wipes crashed dependent pods so they reconnect.
 #
 # v2.14 changelog (2026-07-21):
 #  * NEW: `resource-manager-server` bootstrap deadlock detection and auto-remediation inside `fix_vcf_final_edge_cases`.
@@ -677,6 +721,43 @@ EOS
 }
 
 # Function to check prerequisites
+# v2.16: concurrent-run guard. Two overlapping runs can race on scale/uncordon operations (observed
+# during the July 2026 post-boot incident where a second remediation was scaling prelude back up while
+# a diagnosis was in flight). Take a non-blocking flock on a lockfile local to wherever this script
+# runs (the manager VM); the lock auto-releases when the process exits (FD 9 closes). Falls back to a
+# pgrep check if flock is unavailable. Bypass with FORCE_RUN=1. Read-only flags never call this.
+acquire_run_lock() {
+    if [[ "${FORCE_RUN:-0}" == "1" ]]; then
+        warning "FORCE_RUN=1 — skipping concurrent-run lock"
+        return 0
+    fi
+    local lockfile="${STABILIZER_LOCKFILE:-/tmp/vcfa-stabilizer.lock}"
+    if command -v flock &>/dev/null; then
+        # NB: brace-group the redirect. A bare `exec 9>file 2>/dev/null` (exec with no command)
+        # would apply BOTH redirections to the shell PERMANENTLY — silencing every later error()
+        # (which writes to stderr) for the rest of the run. The group scopes 2>/dev/null to the exec
+        # only, while `exec 9>file` still persists FD 9 for the process lifetime.
+        { exec 9>"$lockfile"; } 2>/dev/null || {
+            warning "Cannot open lockfile $lockfile — proceeding without run lock"
+            return 0
+        }
+        if ! flock -n 9; then
+            error "Another vcfa-stabilizer.sh run holds $lockfile. Wait for it to finish, or set FORCE_RUN=1 to override."
+            exit 1
+        fi
+        info "Acquired run lock ($lockfile)."
+    else
+        # Bracket trick keeps pgrep's own cmdline from matching the pattern; filter out our own PID.
+        local others
+        others=$(pgrep -f '[v]cfa-stabilizer\.sh' 2>/dev/null | grep -cvx "$$" || echo 0)
+        if [[ "${others:-0}" -gt 0 ]]; then
+            error "Another vcfa-stabilizer.sh process detected (pgrep). Wait for it to finish, or set FORCE_RUN=1 to override."
+            exit 1
+        fi
+        info "No other vcfa-stabilizer.sh process detected (flock unavailable; used pgrep)."
+    fi
+}
+
 check_prerequisites() {
     log "Checking prerequisites..."
     ssh_mux_init
@@ -1840,6 +1921,30 @@ fix_vcf_final_edge_cases() {
     local fix_body
     fix_body=$(cat <<'EDGE_CASES_BODY'
 
+echo "=== postgres pgdata permissions ==="
+for pg_info in "prelude vcfapostgres-0" "vcd-migrator vcd-migrator-postgres-0"; do
+    NS_PG=$(echo "$pg_info" | awk '{print $1}')
+    POD_PG=$(echo "$pg_info" | awk '{print $2}')
+    pg_status=$($K get pod $POD_PG -n $NS_PG --no-headers 2>/dev/null || true)
+    if echo "$pg_status" | grep -q "Running"; then
+        pg_logs=$($K logs $POD_PG -n $NS_PG -c postgres --tail 100 2>/dev/null || true)
+        if echo "$pg_logs" | grep -q "invalid permissions" && echo "$pg_logs" | grep -q "data directory"; then
+            echo "  $POD_PG pgdata has wrong permissions - fixing"
+            $K exec $POD_PG -n $NS_PG -c postgres -- bash -c 'chmod g-s /home/postgres/pgdata/pgroot/data && chmod 0700 /home/postgres/pgdata/pgroot/data' 2>/dev/null || true
+            # Delete pods in the namespace that crash-looped due to DB being down
+            crashed_pods=$($K get pods -n $NS_PG | grep "CrashLoopBackOff" | awk '{print $1}')
+            if [ ! -z "$crashed_pods" ]; then
+                echo "  Restarting dependent crashed pods in $NS_PG..."
+                echo "$crashed_pods" | xargs -r -I{} $K delete pod {} -n $NS_PG --grace-period=0 --force 2>/dev/null || true
+            fi
+        else
+            echo "  $POD_PG is healthy or not in permission failure state"
+        fi
+    else
+        echo "  $POD_PG is not Running"
+    fi
+done
+
 echo "=== RabbitMQ .erlang.cookie ==="
 rmq_status=$($K get pod rabbitmq-ha-0 -n $NS --no-headers 2>/dev/null || true)
 if echo "$rmq_status" | grep -qE "CrashLoopBackOff|Error"; then
@@ -1944,7 +2049,19 @@ kubeconfig = "/etc/kubernetes/admin.conf"
 if not os.path.exists(kubeconfig):
     kubeconfig = "/etc/kubernetes/super-admin.conf"
 
-# 1. Ensure publishNotReadyAddresses is true on resource-manager-grpc service
+# v2.16: BOUNDED RETRY LOOP. The self-dial gRPC bootstrap deadlock (resource-manager dials its own
+# resource-manager-grpc:443 Service before it binds its native listener) is remediated by an
+# nsenter-injected fake HTTP/2 listener that answers the self-dial with a SETTINGS frame. Previously
+# this fired ONCE against a single pod PID. But resource-manager crash-loops on a ~1-5 min cadence
+# (kubelet kills it when the :7777 startup probe keeps failing), and it has a SECONDARY dependency on
+# ebs-service (:4242) which is itself cold-starting — so a single unblock rarely survives the next
+# kill. We now re-discover the (freshly-restarted) pod and re-apply the unblock across several
+# attempts, breaking as soon as the pod reports Ready, capped by a total wall-clock budget so a
+# genuinely-wedged pod can't hang the whole stabilizer run.
+MAX_WALL_SECONDS = int(os.environ.get("RM_UNBLOCK_WALL_SECONDS", "240"))   # total budget across attempts
+PER_ATTEMPT_SECONDS = int(os.environ.get("RM_UNBLOCK_ATTEMPT_SECONDS", "60"))  # nsenter accept-loop budget per attempt
+
+# 1. Ensure publishNotReadyAddresses is true on resource-manager-grpc service (once)
 try:
     out = subprocess.check_output([
         "kubectl", f"--kubeconfig={kubeconfig}", "get", "svc",
@@ -1957,82 +2074,54 @@ try:
             "resource-manager-grpc", "-n", "prelude",
             "-p", '{"spec":{"publishNotReadyAddresses":true}}'
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-except Exception as ex:
-    pass
-
-# 2. Get active (non-deleting) resource-manager-server pod
-try:
-    pods_json = subprocess.check_output([
-        "kubectl", f"--kubeconfig={kubeconfig}", "get", "pods",
-        "-n", "prelude", "-l", "app=resource-manager-server", "-o", "json"
-    ], stderr=subprocess.DEVNULL).decode()
-    data = json.loads(pods_json)
-    items = data.get("items", [])
-    active_items = [i for i in items if "deletionTimestamp" not in i.get("metadata", {})]
-    
-    if not active_items:
-        print("  No active resource-manager-server pod found")
-        sys.exit(0)
-    
-    pod_item = active_items[0]
-    pod_name = pod_item["metadata"]["name"]
-    
-    # Check if pod container status is ready
-    c_statuses = pod_item.get("status", {}).get("containerStatuses", [])
-    if c_statuses and c_statuses[0].get("ready") is True:
-        print(f"  resource-manager-server pod {pod_name} is healthy (1/1 Running)")
-        sys.exit(0)
-        
-except Exception as ex:
-    print("  Error checking resource-manager pod status:", ex)
-    sys.exit(0)
-
-# 3. Find container PID for active pod via crictl or ps
-pid = None
-try:
-    cids = subprocess.check_output([
-        "crictl", "ps", "--label", f"io.kubernetes.pod.name={pod_name}", "--name", "resource-manager", "-q"
-    ], stderr=subprocess.DEVNULL).decode().strip().splitlines()
-    if cids:
-        info = subprocess.check_output(["crictl", "inspect", cids[0]], stderr=subprocess.DEVNULL).decode()
-        data = json.loads(info)
-        pid = str(data["info"]["pid"])
 except Exception:
     pass
 
-if not pid:
+def get_active_pod():
+    """Return (pod_name, ready_bool) for the non-terminating resource-manager-server pod, or (None, None)."""
     try:
-        ps_out = subprocess.check_output(["ps", "-ef"]).decode()
-        for line in ps_out.splitlines():
-            if "/bin/resource-manager " in line and "python" not in line:
-                pid = line.split()[1]
-                break
+        pods_json = subprocess.check_output([
+            "kubectl", f"--kubeconfig={kubeconfig}", "get", "pods",
+            "-n", "prelude", "-l", "app=resource-manager-server", "-o", "json"
+        ], stderr=subprocess.DEVNULL).decode()
+        items = json.loads(pods_json).get("items", [])
+        active = [i for i in items if "deletionTimestamp" not in i.get("metadata", {})]
+        if not active:
+            return (None, None)
+        pod_item = active[0]
+        name = pod_item["metadata"]["name"]
+        cs = pod_item.get("status", {}).get("containerStatuses", [])
+        ready = bool(cs and cs[0].get("ready") is True)
+        return (name, ready)
+    except Exception as ex:
+        print("  Error checking resource-manager pod status:", ex)
+        return (None, None)
+
+def get_pid(pod_name):
+    """Find the container PID via crictl, falling back to ps."""
+    try:
+        cids = subprocess.check_output([
+            "crictl", "ps", "--label", f"io.kubernetes.pod.name={pod_name}", "--name", "resource-manager", "-q"
+        ], stderr=subprocess.DEVNULL).decode().strip().splitlines()
+        if cids:
+            info = json.loads(subprocess.check_output(["crictl", "inspect", cids[0]], stderr=subprocess.DEVNULL).decode())
+            return str(info["info"]["pid"])
     except Exception:
         pass
+    try:
+        for line in subprocess.check_output(["ps", "-ef"]).decode().splitlines():
+            if "/bin/resource-manager " in line and "python" not in line:
+                return line.split()[1]
+    except Exception:
+        pass
+    return None
 
-if not pid:
-    print("  resource-manager container process PID not found")
-    sys.exit(0)
-
-# 4. Check if already listening on ports 7710/7777
-try:
-    ns_listeners = subprocess.check_output([
-        "nsenter", "-t", pid, "-n", "netstat", "-tlpn"
-    ], stderr=subprocess.DEVNULL).decode()
-    if ":7710" in ns_listeners or ":7777" in ns_listeners:
-        print("  resource-manager is already listening on ports 7710/7777")
-        sys.exit(0)
-except Exception:
-    pass
-
-# 5. Deadlock detected! Run unblocker inside container netns
-certfile = f"/proc/{pid}/root/etc/server-tls/tls.crt"
-keyfile = f"/proc/{pid}/root/etc/server-tls/tls.key"
-if not os.path.exists(certfile) or not os.path.exists(keyfile):
-    print("  TLS certificate/key not found in container proc mount")
-    sys.exit(0)
-
-print(f"  Unblocking resource-manager (PID {pid}) bootstrap gRPC deadlock...")
+def is_listening(pid):
+    try:
+        ns = subprocess.check_output(["nsenter", "-t", pid, "-n", "netstat", "-tlpn"], stderr=subprocess.DEVNULL).decode()
+        return (":7710" in ns) or (":7777" in ns)
+    except Exception:
+        return False
 
 unblock_template = '''import socket, ssl, time, threading, subprocess
 
@@ -2056,7 +2145,7 @@ bind_sock.bind(("0.0.0.0", 7710))
 bind_sock.listen(10)
 
 start_time = time.time()
-while time.time() - start_time < 60:
+while time.time() - start_time < {BUDGET}:
     try:
         ns_listeners = subprocess.check_output(["netstat", "-tlpn"], stderr=subprocess.DEVNULL).decode()
         if ":7777" in ns_listeners:
@@ -2079,20 +2168,71 @@ while time.time() - start_time < 60:
 
 bind_sock.close()
 '''
-unblock_code = unblock_template.replace("{CERT}", certfile).replace("{KEY}", keyfile)
 
-proc = subprocess.run(["nsenter", "-t", pid, "-n", "python3", "-c", unblock_code], capture_output=True, text=True)
-if proc.stdout:
-    print(proc.stdout.strip())
-if proc.stderr:
-    print(proc.stderr.strip())
+deadline = time.time() + MAX_WALL_SECONDS
+attempt = 0
+while time.time() < deadline:
+    attempt += 1
+    pod_name, ready = get_active_pod()
+    if pod_name is None:
+        print("  No active resource-manager-server pod found")
+        sys.exit(0)
+    if ready:
+        print(f"  resource-manager-server pod {pod_name} is Ready (1/1 Running)")
+        sys.exit(0)
+
+    pid = get_pid(pod_name)
+    if not pid:
+        print(f"  attempt {attempt}: container PID not found (pod restarting?) — retrying in 10s...")
+        time.sleep(10)
+        continue
+    if is_listening(pid):
+        print("  resource-manager is already listening on ports 7710/7777 (bootstrap succeeded)")
+        sys.exit(0)
+
+    certfile = f"/proc/{pid}/root/etc/server-tls/tls.crt"
+    keyfile = f"/proc/{pid}/root/etc/server-tls/tls.key"
+    if not os.path.exists(certfile) or not os.path.exists(keyfile):
+        print(f"  attempt {attempt}: TLS cert/key not yet present in container proc mount — retrying in 10s...")
+        time.sleep(10)
+        continue
+
+    budget = min(PER_ATTEMPT_SECONDS, max(5, int(deadline - time.time())))
+    print(f"  attempt {attempt}: unblocking resource-manager (PID {pid}) self-dial gRPC deadlock (budget {budget}s)...")
+    unblock_code = unblock_template.replace("{CERT}", certfile).replace("{KEY}", keyfile).replace("{BUDGET}", str(budget))
+    proc = subprocess.run(["nsenter", "-t", pid, "-n", "python3", "-c", unblock_code], capture_output=True, text=True)
+    if proc.stdout:
+        print(proc.stdout.strip())
+    if proc.stderr:
+        print(proc.stderr.strip())
+    # Give the app a few seconds to flip Ready (or crash) before re-evaluating.
+    time.sleep(5)
+
+# Final state after the retry budget elapsed.
+pod_name, ready = get_active_pod()
+if ready:
+    print(f"  resource-manager-server pod {pod_name} is Ready (1/1 Running)")
+else:
+    print(f"  resource-manager-server still not Ready after {attempt} unblock attempt(s) (~{MAX_WALL_SECONDS}s budget).")
+    print("  Likely still blocked on a secondary dependency (e.g. ebs-service:4242 cold-starting). Re-run once ebs-app is up.")
 PY_RM
 
 EDGE_CASES_BODY
 )
     local out
+    info "Executing edge-case checks on appliance (typically ~15-30s; up to ~${RM_UNBLOCK_WALL_SECONDS:-240}s if the resource-manager self-dial deadlock is being retried)..."
     out=$(execute_remote "${fix_prefix}${fix_body}" "VCFfinal Edge Cases Fixes" false)
-    
+
+    # v2.16: surface the resource-manager-server bootstrap-deadlock outcome (previously $out was
+    # captured silently and only scanned for NEEDS_DIR_CLI_RESET). Echo the RM section so the operator
+    # sees whether the self-dial unblock loop succeeded, is still retrying, or timed out.
+    local rm_lines
+    rm_lines=$(echo "$out" | grep -aiE 'resource-manager.*(deadlock|Ready|listening|unblock|still not Ready|native health server)|attempt [0-9]+: ' || true)
+    if [[ -n "$rm_lines" ]]; then
+        info "resource-manager-server bootstrap-deadlock check:"
+        echo "$rm_lines" | sed 's/^/    /'
+    fi
+
     if echo "$out" | grep -q "NEEDS_DIR_CLI_RESET:"; then
         local reset_line
         reset_line=$(echo "$out" | grep "NEEDS_DIR_CLI_RESET:")
@@ -2266,12 +2406,14 @@ VFEOF
 # Logic (all in one execute_remote call):
 #   1. Sweep: delete stale system-shutdown-* Argo Workflows (re-cordon nodes on every boot).
 #   2. Sweep: uncordon any nodes with SchedulingDisabled.
-#   3. RUNAWAY detection: count support-bundle Jobs. If > SUPPORT_BUNDLE_JOB_THRESHOLD (default 3):
+#   3. Sweep: delete terminal (Failed/Succeeded) pods owned by a Job or Argo Workflow, cluster-wide
+#      (e.g. configure-component-<id>-execute-script-<hash> left over from a shutdown+restart).
+#   4. RUNAWAY detection: count support-bundle Jobs. If > SUPPORT_BUNDLE_JOB_THRESHOLD (default 3):
 #      delete all matching Jobs (cascades to Failed pods), suspend the CronJob, warn operator.
-#   4. ALWAYS (idempotent hardening): set concurrencyPolicy=Replace + disable Flux drift detection.
-#   5. AUTO-UNSUSPEND: if CronJob was suspended but no runaway detected, un-suspend now that the
+#   5. ALWAYS (idempotent hardening): set concurrencyPolicy=Replace + disable Flux drift detection.
+#   6. AUTO-UNSUSPEND: if CronJob was suspended but no runaway detected, un-suspend now that the
 #      permanent hardening (concurrencyPolicy=Replace + driftDetection=disabled) is in place.
-#   6. Report: counts of Failed/Pending pods after cleanup.
+#   7. Report: counts of Failed/Pending pods after cleanup.
 #
 # Called from main() BEFORE the idempotency early-exit so it runs on every startup.
 check_and_fix_support_bundle_runaway() {
@@ -2284,11 +2426,16 @@ check_and_fix_support_bundle_runaway() {
     fix_body=$(cat <<'SUPPORT_BUNDLE_BODY'
 set -u
 
-# --- 1/6: Delete stale system-shutdown-* Argo Workflows ---
+# v2.16: guard THRESHOLD. If it arrives empty or non-numeric, "[[ 1 -gt '' ]]" evaluates as 1>0 and
+# fires a FALSE runaway that deletes the support-bundle Job and suspends the CronJob (with a bogus
+# "ACTION REQUIRED: graceful shutdown/restart" warning). Force a sane numeric default here.
+case "${THRESHOLD:-}" in ''|*[!0-9]*) THRESHOLD=3 ;; esac
+
+# --- 1/7: Delete stale system-shutdown-* Argo Workflows ---
 # Each Fleet LCM shutdown cycle leaves a system-shutdown-{id} Workflow in vmsp-platform.
 # On startup the Argo controller resumes them, which re-cordons the VSP node and scales
 # all prelude deployments to 0 (→ VCFA HTTP 500). Up to 30+ can accumulate.
-echo "=== 1/6: stale system-shutdown Argo Workflow sweep ==="
+echo "=== 1/7: stale system-shutdown Argo Workflow sweep ==="
 if $K api-resources --api-group=argoproj.io -o name 2>/dev/null | grep -q '^workflows\.'; then
     STALE_WF=$($K get workflow -n "$NS" --no-headers 2>/dev/null \
         | awk '/system-shutdown/ {print $1}' || true)
@@ -2305,7 +2452,7 @@ else
 fi
 
 echo
-echo "=== 2/6: uncordon any SchedulingDisabled nodes ==="
+echo "=== 2/7: uncordon any SchedulingDisabled nodes ==="
 CORDONED=$($K get nodes --no-headers 2>/dev/null \
     | awk '$2 ~ /SchedulingDisabled/ {print $1}' || true)
 if [[ -n "$CORDONED" ]]; then
@@ -2316,7 +2463,35 @@ else
 fi
 
 echo
-echo "=== 3/6: support-bundle-cluster-info-dump Job count ==="
+# --- 3/7: Terminal Job/Workflow pod cleanup (cluster-wide) ---
+# A Fleet LCM system-shutdown + power-on (and the ensuing chaotic mass-restart) leaves terminal
+# pods — phase Failed ("Error") or Succeeded ("Completed") — owned by a completed Job or Argo
+# Workflow, e.g. configure-component-<id>-execute-script-<hash>. These linger after the owning
+# Component CR reconciles back to Running and keep auto-health.py red (it counts Error/Failed in
+# BAD_STATES). Delete only pods that are terminal AND controlled by a Job or Workflow: terminal
+# pods are artifacts, so a live controller that still needs to run spawns a NEW pod — never reuses
+# these — making this idempotent and safe. Bare/standalone pods and Deployment/DaemonSet/StatefulSet
+# pods are deliberately excluded.
+echo "=== 3/7: terminal Job/Workflow pod cleanup (cluster-wide) ==="
+TERM_PODS=$($K get pods -A -o json 2>/dev/null | jq -r '
+    .items[]
+    | select(.status.phase=="Failed" or .status.phase=="Succeeded")
+    | select(any((.metadata.ownerReferences // [])[]; .controller==true and (.kind=="Job" or .kind=="Workflow")))
+    | .metadata.namespace + "/" + .metadata.name' 2>/dev/null | sort -u || true)
+if [[ -n "$TERM_PODS" ]]; then
+    TCOUNT=$(echo "$TERM_PODS" | wc -l)
+    echo "  found ${TCOUNT} terminal Job/Workflow pod(s) — deleting..."
+    echo "$TERM_PODS" | while IFS='/' read -r pns pname; do
+        [[ -n "$pns" && -n "$pname" ]] || continue
+        $K delete pod "$pname" -n "$pns" --grace-period=0 2>&1 | head -1 || true
+    done
+    echo "  deleted"
+else
+    echo "  no terminal Job/Workflow pods found (no-op)"
+fi
+
+echo
+echo "=== 4/7: support-bundle-cluster-info-dump Job count ==="
 CRONJOB_NAME="support-bundle-cluster-info-dump"
 JOB_COUNT=$($K get jobs -n "$NS" -o name 2>/dev/null \
     | grep -c "/${CRONJOB_NAME}-" || true)
@@ -2341,7 +2516,7 @@ if [[ "$JOB_COUNT" -gt "$THRESHOLD" ]]; then
 fi
 
 echo
-echo "=== 4/6: permanent CronJob hardening (idempotent) ==="
+echo "=== 5/7: permanent CronJob hardening (idempotent) ==="
 # Set concurrencyPolicy=Replace so a new run supersedes a stuck one instead of queuing.
 # Label with helm.toolkit.fluxcd.io/driftDetection=disabled so Flux does not revert.
 if $K get cronjob "$CRONJOB_NAME" -n "$NS" >/dev/null 2>&1; then
@@ -2371,7 +2546,7 @@ else
 fi
 
 echo
-echo "=== 5/6: auto-unsuspend (only if no runaway and cronjob was suspended) ==="
+echo "=== 6/7: auto-unsuspend (only if no runaway and cronjob was suspended) ==="
 if [[ "$RUNAWAY" -eq 0 ]]; then
     if $K get cronjob "$CRONJOB_NAME" -n "$NS" >/dev/null 2>&1; then
         IS_SUSPENDED=$($K get cronjob "$CRONJOB_NAME" -n "$NS" \
@@ -2391,7 +2566,7 @@ else
 fi
 
 echo
-echo "=== 6/6: post-cleanup pod health report ==="
+echo "=== 7/7: post-cleanup pod health report ==="
 FAILED_PODS=$($K get pod -A --field-selector=status.phase=Failed \
     --no-headers 2>/dev/null | wc -l || echo "?")
 PENDING_PODS=$($K get pod -A --field-selector=status.phase=Pending \
@@ -2530,7 +2705,7 @@ CERT_CHECK_BODY
 # Main execution function
 main() {
     echo "======================================================================"
-    echo "           VCFA Complete Stabilization Script v2.14"
+    echo "           VCFA Complete Stabilization Script v2.16"
     echo "======================================================================"
     echo "Comprehensive VCFA stability solution for nested environments"
     echo "All phases run on every invocation; each step is self-checking and reports"
@@ -2541,7 +2716,8 @@ main() {
     echo "API Server: $API_SERVER"
     echo "======================================================================"
     echo ""
-    
+
+    acquire_run_lock
     check_prerequisites
 
     # --- Unconditional pre-boot sweeps (always run, every invocation) ---
@@ -2588,6 +2764,23 @@ echo "  Marker 4 — vcfa-vip-watchdog.sh (Phase 1.5):      $m4"
     else
         info "  → one or more markers MISSING; phases will apply the outstanding fixes."
     fi
+
+    # v2.16: incident-signature snapshot (informational only; mirrors auto-health.py's signals so an
+    # operator sees the post-boot fingerprint at a glance before any phase runs).
+    echo ""
+    info "=== Pre-flight: incident-signature snapshot (v2.16) ==="
+    local _sig_cmd
+    _sig_cmd=$(cat <<SIG
+K="${KUBECTL_CMD}"
+WF=\$(\$K get workflow -n ${VMSP_NAMESPACE} --no-headers 2>/dev/null | awk '/system-shutdown/' | wc -l | tr -d ' ')
+echo "  system-shutdown Argo workflows in ${VMSP_NAMESPACE}: \${WF:-?} (expect 0)"
+ZR=\$(\$K get deploy,sts -n ${PRELUDE_NAMESPACE} -o json 2>/dev/null | jq -r '.items[] | select(.spec.replicas==0) | .kind+"/"+.metadata.name' 2>/dev/null)
+if [ -n "\$ZR" ]; then echo "  0-replica prelude workloads:"; echo "\$ZR" | sed 's/^/    /'; else echo "  0-replica prelude workloads: none (expect none)"; fi
+TP=\$(\$K get pods -A -o json 2>/dev/null | jq -r '[.items[] | select(.status.phase=="Failed" or .status.phase=="Succeeded") | select(any((.metadata.ownerReferences // [])[]; .controller==true and (.kind=="Job" or .kind=="Workflow")))] | length' 2>/dev/null)
+echo "  terminal Job/Workflow pods (cluster-wide): \${TP:-?} (expect 0)"
+SIG
+)
+    vcfa_ssh_nosudo "$_sig_cmd" 2>/dev/null || warning "incident-signature snapshot unavailable (continuing)"
 
     echo ""
     info "=== PHASE 1: Initial System Assessment ==="
@@ -2665,7 +2858,7 @@ echo "  Marker 4 — vcfa-vip-watchdog.sh (Phase 1.5):      $m4"
 # Handle script arguments
 case "${1:-}" in
     --help|-h)
-        echo "VCFA Complete Stabilization Script v2.14"
+        echo "VCFA Complete Stabilization Script v2.16"
         echo "See: ${SCRIPT_DIR}/VCFA_Stabilizer_Incident_Apr2026.md"
         echo ""
         echo "Usage: $0 [options]"
@@ -2677,7 +2870,9 @@ case "${1:-}" in
         echo "Always runs (every invocation, before phase pre-flight report):"
         echo "  - support-bundle-cluster-info-dump runaway sweep (v2.12, Maher-July-Patch)"
         echo "  - stale system-shutdown Argo Workflow deletion + cordoned node uncordon (v2.12)"
+        echo "  - terminal Job/Workflow pod cleanup, cluster-wide (v2.16)"
         echo "  - service-tls freshness check across 24 prelude deployments (v2.8)"
+        echo "  - concurrent-run guard (flock; bypass with FORCE_RUN=1) (v2.16)"
         echo ""
         echo "Pre-flight report: shows PRESENT/MISSING state of 4 durable markers before phases run."
         echo "  Marker 1: vcfa-eg-mem-keeper.sh (Phase 3.5)       Marker 3: vmsp-kube-vip-keeper.sh (Phase 1.5)"
@@ -2713,6 +2908,12 @@ case "${1:-}" in
         echo "                          hardening (concurrencyPolicy=Replace + driftDetection=disabled label),"
         echo "                          and auto-unsuspends the CronJob if no runaway is found."
         echo "                          Symptom: 30GHz+ CPU, VCFA UI slow/unresponsive. Fixed in VCF 9.1.1."
+        echo "  --fix-post-boot         v2.16: fast recovery after a manual VCF Ops shutdown + power-on."
+        echo "                          Sweeps stale system-shutdown Argo workflows, uncordons the node,"
+        echo "                          deletes terminal Job/Workflow pods, scales 0-replica prelude"
+        echo "                          Deployments/StatefulSets back to 1, and runs the resource-manager"
+        echo "                          gRPC bootstrap-deadlock fix — WITHOUT the slow Phase 1.5 preflight."
+        echo "                          Use when /automation is HTTP 500 and prelude is scaled to 0 after boot."
         echo "  --repair-envoyproxy     Strip v2.1 EnvoyProxy volumeMounts + restart envoy-gateway (needs jq on appliance)"
         echo "  --recover-gateway-503   Roll trust/cert-manager + prelude SDS backends + dataplane/operator gateways (HTTP 503 / SDS)"
         echo "  --fix-sds-sni           Fix envoy-gateway v1.5 + Envoy v1.34 SDS NACK by replacing"
@@ -2765,6 +2966,8 @@ case "${1:-}" in
         echo "  VCFA_USER, CREDS_FILE, VCFA_PASSWORD, API_SERVER"
         echo "  VMSP_NAMESPACE, PRELUDE_NAMESPACE, VMSP_POLICIES_NAMESPACE"
         echo "  PROMETHEUS_NAME, KYVERNO_ADMISSION_DEPLOY, PROVISIONING_DEPLOY"
+        echo "  FORCE_RUN=1                      Bypass the concurrent-run lock (v2.16)"
+        echo "  STABILIZER_LOCKFILE              Run-lock path (default /tmp/vcfa-stabilizer.lock)"
         echo "  STABILIZER_DEBUG=1               Show suppressed SSH/kubectl stderr"
         exit 0
         ;;
@@ -2797,11 +3000,13 @@ case "${1:-}" in
         exit 0
         ;;
     --cpu-tune|--lab-cpu-tune)
+        acquire_run_lock
         check_prerequisites
         cpu_tune_apply || exit 1
         exit 0
         ;;
     --rollback-cpu-tune|--cpu-tune-rollback)
+        acquire_run_lock
         check_prerequisites
         cpu_tune_rollback || exit 1
         exit 0
@@ -2817,12 +3022,41 @@ case "${1:-}" in
     --fix-support-bundle)
         # Maher-July-Patch: support-bundle CronJob runaway remediation + cluster sweep.
         # Symptom: 30GHz+ CPU, VCFA UI slow or not loading (VCF 9.1 bug, fixed in 9.1.1).
+        acquire_run_lock
         check_prerequisites
         check_and_fix_support_bundle_runaway
         get_system_status
         exit 0
         ;;
+    --fix-post-boot)
+        # v2.16: fast recovery after a manual VCF Ops shutdown + power-on. Skips the slow Phase 1.5
+        # control-plane preflight and runs exactly the steps that resolve the observed incident:
+        #   1. workflow sweep + uncordon + terminal Job/Workflow pod cleanup (support-bundle runaway fn)
+        #   2. 0-replica prelude scale-up + resource-manager gRPC bootstrap-deadlock fix (edge-cases fn)
+        # Symptom: /automation HTTP 500 and prelude Deployments/StatefulSets scaled to 0 after boot,
+        # because a resumed Fleet LCM system-shutdown Argo workflow re-ran its cordon+scale-to-0 DAG.
+        acquire_run_lock
+        check_prerequisites
+        check_and_fix_support_bundle_runaway
+        fix_vcf_final_edge_cases
+        get_system_status
+        info "Re-check /automation (5x) after post-boot recovery..."
+        c=0
+        for i in 1 2 3 4 5; do
+            sleep 12
+            r=$(vcfa_curl_automation_code)
+            info "  probe $i: HTTP $r"
+            [[ "$r" == "200" ]] && c=$((c + 1))
+        done
+        if [[ "$c" -ge 3 ]]; then
+            success "/automation returned 200 on at least 3 of 5 probes after post-boot recovery."
+        else
+            warning "/automation still not consistently 200 ($c/5). prelude services may still be cold-starting; allow 5-10 min and re-run --status, or run the full 'bash $0' for the control-plane preflight."
+        fi
+        exit 0
+        ;;
     --repair-envoyproxy)
+        acquire_run_lock
         check_prerequisites
         repair_envoyproxy_remove_stabilizer_mounts
         log "Restarting envoy-gateway operator to force reconcile..."
@@ -2834,6 +3068,7 @@ case "${1:-}" in
         exit 0
         ;;
     --fix-sds-sni)
+        acquire_run_lock
         check_prerequisites
         fix_envoy_gateway_sds_san_nack
         get_system_status
@@ -2853,6 +3088,7 @@ case "${1:-}" in
         exit 0
         ;;
     --fix-overload)
+        acquire_run_lock
         check_prerequisites
         fix_overload_recovery
         info "Sleeping 90s for control plane to settle (kube-vip restart, controllers reconnect)..."
@@ -2874,6 +3110,7 @@ case "${1:-}" in
         exit 0
         ;;
     --recover-gateway-503)
+        acquire_run_lock
         check_prerequisites
         verify_envoy_dataplane_services || true
         # v2.4: the SDS SAN-without-CA NACK is the most common 503 root cause; address it first so the
