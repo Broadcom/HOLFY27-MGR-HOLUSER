@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 # VCF.py - HOLFY27 Core VCF Startup Module
-# Version 3.9 - 2026-07-20
+# Version 3.10 - 2026-07-22
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation startup sequence
 #
+# v3.10 Changes:
+# - Fix: Added outer retry loop (up to 3 attempts with 30s delay) in
+#   _start_vm_on_hosts() when VM power-on attempts fail across all candidate
+#   hosts (e.g. due to ESXi host HTTP read timeouts or transient hostd lag).
+#   Prevents premature lab failure when a host task times out but succeeds
+#   shortly after on the host side.
 # v3.9 Changes:
 # - Fix: _start_vm_on_hosts crashed the whole VCF module with an uncaught
 #   vmodl.fault.ManagedObjectNotFound ("The object 'vim.VirtualMachine:N' has
@@ -128,7 +134,8 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
     if we try to power it on from the wrong host.
     
     Strategy:
-    1. Search ALL host connections for the VM by name (may return multiple)
+    1. Search ALL host connections for the VM by name (retries up to 8 times
+       if registration is delayed during boot).
     2. If the exact name is not found, fall back to a prefix/regex match.
        - If exactly one unique VM name is matched (e.g., auto-a -> auto-a-45zgb),
          continue with the single-VM flow below.
@@ -141,6 +148,9 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
     5. If a power-on fails with FileNotFound / Device-busy (VMX locked), skip
        that stale registration and try the next one - the lock means another
        host owns the VM.
+    6. If power-on fails across all candidate hosts, retry up to
+       POWER_ON_MAX_RETRIES times (3 attempts) with a delayed pause between
+       attempts before failing the lab.
     
     :param lsf: lsfunctions module
     :param vm_name: VM name to find and power on
@@ -166,186 +176,190 @@ def _start_vm_on_hosts(lsf, vm_name: str, fail_label: str = 'VM') -> str:
     # running. Retry before declaring not_found to avoid a premature lab failure.
     VM_FIND_MAX_RETRIES = 8
     VM_FIND_RETRY_DELAY = 30  # seconds between attempts (8 x 30s = up to ~4 min)
-    
-    vms = []
-    for find_attempt in range(1, VM_FIND_MAX_RETRIES + 1):
-        candidates = lsf.get_vm_by_name(vm_name)
-        if not candidates:
-            # Exact name match failed. Two cases handled here:
-            # 1. Single VM with random suffix (auto-a -> auto-a-45zgb): prefix
-            #    match finds one unique name; fall through to the normal power-on.
-            # 2. Wildcard pattern matching multiple distinct VMs (vcf_Avi-.*
-            #    matching vcf_Avi-se-gwsie, vcf_Avi-se-lzcam, ...): start each
-            #    distinct VM individually via recursive calls, then return.
-            # The prefix pattern uses vm_name followed by a dash or end-of-string
-            # to avoid false positives (auto-a should NOT match auto-ab).
-            prefix_pattern = f'^{vm_name}(-|$)'
-            prefix_matches = lsf.get_vm_match(prefix_pattern)
-            if prefix_matches:
-                unique_names = list(dict.fromkeys(m.name for m in prefix_matches))
-                if len(unique_names) > 1:
-                    # Multiple distinct VMs match the wildcard - start each one.
-                    lsf.write_output(f'{fail_label} wildcard "{vm_name}" matched '
-                                     f'{len(unique_names)} distinct VMs: {unique_names}')
-                    any_started = False
-                    all_failed_or_not_found = True
-                    for actual_name in unique_names:
-                        sub_result = _start_vm_on_hosts(lsf, actual_name, fail_label=fail_label)
-                        if sub_result == 'started':
-                            any_started = True
-                            all_failed_or_not_found = False
-                        elif sub_result == 'already_on':
-                            all_failed_or_not_found = False
-                    if all_failed_or_not_found:
-                        return 'failed'
-                    return 'started' if any_started else 'already_on'
-                # Single unique name - one VM with a random suffix.
-                actual_name = unique_names[0]
-                lsf.write_output(f'{fail_label} exact name "{vm_name}" not found, '
-                                 f'but prefix match found: "{actual_name}"')
-                candidates = prefix_matches
-        
-        if candidates:
-            vms = candidates
-            break
-        
-        if find_attempt < VM_FIND_MAX_RETRIES:
-            lsf.write_output(f'WARNING: {fail_label} VM "{vm_name}" not found on any host '
-                             f'(attempt {find_attempt}/{VM_FIND_MAX_RETRIES}), '
-                             f'retrying in {VM_FIND_RETRY_DELAY}s...')
-            time.sleep(VM_FIND_RETRY_DELAY)
-        else:
-            lsf.write_output(f'WARNING: {fail_label} VM not found on any host after '
-                             f'{VM_FIND_MAX_RETRIES} attempts: {vm_name}')
-            return 'not_found'
-    
-    # Log all registrations found. A registration can vanish between
-    # discovery (above) and here - e.g. ESXi cleans up a stale duplicate
-    # registration once it notices the VM is already running via another
-    # host's registration. That turns any vm.runtime.* property access into
-    # a vmodl.fault.ManagedObjectNotFound ("object has already been deleted").
-    # None of these property reads were previously guarded, so a vanished
-    # registration crashed the whole VCF module instead of just being
-    # skipped like the analogous FileNotFound/Device-busy case in Step 3.
-    live_vms = []
-    for vm in vms:
-        try:
-            h = vm.runtime.host.name if vm.runtime.host else 'unknown'
-            lsf.write_output(f'  {vm.name}: found on {h} (power={vm.runtime.powerState}, conn={vm.runtime.connectionState})')
-            live_vms.append(vm)
-        except Exception as e:
-            lsf.write_output(f'  {fail_label} "{vm_name}": a registration vanished during lookup '
-                             f'({e}) - stale duplicate, ignoring')
-    vms = live_vms
 
-    if not vms:
-        lsf.write_output(f'WARNING: {fail_label} "{vm_name}": all registrations vanished before power-on')
-        return 'not_found'
+    # Power-on retries - if a power-on task times out or fails across all candidate
+    # hosts (e.g. due to ESXi hostd/HTTP timeout), retry up to 3 times with a delay.
+    POWER_ON_MAX_RETRIES = 3
+    POWER_ON_RETRY_DELAY = 30  # seconds delay between power-on retry attempts
 
-    # Step 1: Check if ANY registration shows poweredOn
-    for vm in vms:
-        try:
-            if vm.runtime.powerState == 'poweredOn':
-                host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
-                lsf.write_output(f'{vm.name} already powered on (host: {host_name})')
-                return 'already_on'
-        except Exception:
-            continue
-
-    # Step 2: Sort candidates - prefer connected VMs first, then by host name
-    # for deterministic ordering. Fall back to unsorted if a registration
-    # vanishes mid-sort rather than letting the sort itself crash.
-    try:
-        candidates = sorted(vms, key=lambda v: (
-            0 if v.runtime.connectionState == 'connected' else 1,
-            v.runtime.host.name if v.runtime.host else 'zzz'
-        ))
-    except Exception:
-        candidates = vms
-
-    # Step 3: Try to power on each candidate until one succeeds
     last_error = None
-    for vm in candidates:
-        host_name = 'unknown'
-        try:
-            host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
 
-            # Wait briefly for VM to reach connected state
-            max_wait = 30
-            waited = 0
-            while vm.runtime.connectionState != 'connected' and waited < max_wait:
-                lsf.write_output(f'  {vm.name} on {host_name}: connection state {vm.runtime.connectionState}, waiting...')
-                time.sleep(5)
-                waited += 5
+    for power_on_attempt in range(1, POWER_ON_MAX_RETRIES + 1):
+        if power_on_attempt > 1:
+            lsf.write_output(f'  {fail_label} "{vm_name}": starting power-on retry '
+                             f'attempt {power_on_attempt}/{POWER_ON_MAX_RETRIES}...')
 
-            if vm.runtime.connectionState != 'connected':
-                lsf.write_output(f'  {vm.name} on {host_name}: not connected after {max_wait}s, skipping')
-                continue
-
-            lsf.write_output(f'Powering on {vm.name} (host: {host_name})...')
-
-            task = vm.PowerOnVM_Task()
-            try:
-                WaitForTask(task, maxWaitTime=TASK_WAIT_TIMEOUT_SECONDS)
-                lsf.write_output(f'Powered on {vm.name} (host: {host_name})')
-                return 'started'
-            except Exception as wait_err:
-                if 'exceeded timeout' not in str(wait_err):
-                    raise
-                # The task itself didn't error - we just stopped hearing about
-                # it. Poll the VM's actual power state directly instead of
-                # trusting the (possibly stalled) PropertyCollector.
-                lsf.write_output(f'  {vm.name} on {host_name}: task completion '
-                                 f'notification timed out after {TASK_WAIT_TIMEOUT_SECONDS}s, '
-                                 f'polling power state directly...')
-                for poll_attempt in range(1, POWERSTATE_POLL_RETRIES + 1):
-                    time.sleep(POWERSTATE_POLL_DELAY)
-                    if vm.runtime.powerState == 'poweredOn':
-                        lsf.write_output(f'Powered on {vm.name} (host: {host_name}) '
-                                         f'[confirmed via direct poll, attempt {poll_attempt}]')
-                        return 'started'
-                # Still not showing poweredOn after polling - treat as a real failure.
-                raise Exception(f'power state still {vm.runtime.powerState} after '
-                                f'{TASK_WAIT_TIMEOUT_SECONDS + POWERSTATE_POLL_RETRIES * POWERSTATE_POLL_DELAY}s') from wait_err
-        except Exception as e:
-            error_str = str(e)
-            last_error = error_str
-
-            # FileNotFound / Device busy / ManagedObjectNotFound ("already
-            # been deleted") all mean the same thing: this registration is
-            # stale and another host actually owns (or already started) the
-            # VM. Skip it and try the next candidate rather than failing.
-            is_stale = ('FileNotFound' in error_str or
-                        'Device or resource busy' in error_str or
-                        'Unable to load configuration file' in error_str or
-                        'ManagedObjectNotFound' in error_str or
-                        'already been deleted' in error_str)
-
-            try:
-                vm_label = vm.name
-            except Exception:
-                vm_label = vm_name
-            if is_stale:
-                lsf.write_output(f'  {vm_label} on {host_name}: stale registration, trying next host...')
-                continue
+        vms = []
+        for find_attempt in range(1, VM_FIND_MAX_RETRIES + 1):
+            candidates = lsf.get_vm_by_name(vm_name)
+            if not candidates:
+                # Exact name match failed. Two cases handled here:
+                # 1. Single VM with random suffix (auto-a -> auto-a-45zgb): prefix
+                #    match finds one unique name; fall through to the normal power-on.
+                # 2. Wildcard pattern matching multiple distinct VMs (vcf_Avi-.*
+                #    matching vcf_Avi-se-gwsie, vcf_Avi-se-lzcam, ...): start each
+                #    distinct VM individually via recursive calls, then return.
+                # The prefix pattern uses vm_name followed by a dash or end-of-string
+                # to avoid false positives (auto-a should NOT match auto-ab).
+                prefix_pattern = f'^{vm_name}(-|$)'
+                prefix_matches = lsf.get_vm_match(prefix_pattern)
+                if prefix_matches:
+                    unique_names = list(dict.fromkeys(m.name for m in prefix_matches))
+                    if len(unique_names) > 1:
+                        # Multiple distinct VMs match the wildcard - start each one.
+                        lsf.write_output(f'{fail_label} wildcard "{vm_name}" matched '
+                                         f'{len(unique_names)} distinct VMs: {unique_names}')
+                        any_started = False
+                        all_failed_or_not_found = True
+                        for actual_name in unique_names:
+                            sub_result = _start_vm_on_hosts(lsf, actual_name, fail_label=fail_label)
+                            if sub_result == 'started':
+                                any_started = True
+                                all_failed_or_not_found = False
+                            elif sub_result == 'already_on':
+                                all_failed_or_not_found = False
+                        if all_failed_or_not_found:
+                            return 'failed'
+                        return 'started' if any_started else 'already_on'
+                    # Single unique name - one VM with a random suffix.
+                    actual_name = unique_names[0]
+                    lsf.write_output(f'{fail_label} exact name "{vm_name}" not found, '
+                                     f'but prefix match found: "{actual_name}"')
+                    candidates = prefix_matches
+            
+            if candidates:
+                vms = candidates
+                break
+            
+            if find_attempt < VM_FIND_MAX_RETRIES:
+                lsf.write_output(f'WARNING: {fail_label} VM "{vm_name}" not found on any host '
+                                 f'(attempt {find_attempt}/{VM_FIND_MAX_RETRIES}), '
+                                 f'retrying in {VM_FIND_RETRY_DELAY}s...')
+                time.sleep(VM_FIND_RETRY_DELAY)
             else:
-                lsf.write_output(f'FAILED to power on {vm_label} on {host_name}: {e}')
-                # Non-lock error is a real failure - still try remaining candidates
+                lsf.write_output(f'WARNING: {fail_label} VM not found on any host after '
+                                 f'{VM_FIND_MAX_RETRIES} attempts: {vm_name}')
+                if power_on_attempt < POWER_ON_MAX_RETRIES:
+                    break
+                return 'not_found'
+
+        # Log all registrations found. Guard against vanished registrations.
+        live_vms = []
+        for vm in vms:
+            try:
+                h = vm.runtime.host.name if vm.runtime.host else 'unknown'
+                lsf.write_output(f'  {vm.name}: found on {h} (power={vm.runtime.powerState}, conn={vm.runtime.connectionState})')
+                live_vms.append(vm)
+            except Exception as e:
+                lsf.write_output(f'  {fail_label} "{vm_name}": a registration vanished during lookup '
+                                 f'({e}) - stale duplicate, ignoring')
+        vms = live_vms
+
+        if not vms:
+            lsf.write_output(f'WARNING: {fail_label} "{vm_name}": all registrations vanished before power-on')
+            if power_on_attempt < POWER_ON_MAX_RETRIES:
+                lsf.write_output(f'  Retrying in {POWER_ON_RETRY_DELAY}s (attempt {power_on_attempt}/{POWER_ON_MAX_RETRIES})...')
+                time.sleep(POWER_ON_RETRY_DELAY)
                 continue
-    
-    # If we exhausted all candidates with FileNotFound/busy errors, the VM is
-    # likely running on a host we lost the stale registration from (it was
-    # cleaned up). Re-check all registrations for poweredOn - the reload from
-    # the failed PowerOn may have refreshed state.
-    lsf.write_output(f'  {vm_name}: all power-on attempts failed, re-checking state...')
-    vms_recheck = lsf.get_vm_by_name(vm_name)
-    for vm in vms_recheck:
-        if vm.runtime.powerState == 'poweredOn':
-            host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
-            lsf.write_output(f'{vm_name} is now reporting poweredOn (host: {host_name})')
-            return 'already_on'
-    
-    lsf.write_output(f'FAILED: {fail_label} {vm_name} could not be powered on from any host')
+            return 'not_found'
+
+        # Step 1: Check if ANY registration shows poweredOn
+        for vm in vms:
+            try:
+                if vm.runtime.powerState == 'poweredOn':
+                    host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
+                    lsf.write_output(f'{vm.name} already powered on (host: {host_name})')
+                    return 'started' if power_on_attempt > 1 else 'already_on'
+            except Exception:
+                continue
+
+        # Step 2: Sort candidates - prefer connected VMs first, then by host name
+        try:
+            candidates = sorted(vms, key=lambda v: (
+                0 if v.runtime.connectionState == 'connected' else 1,
+                v.runtime.host.name if v.runtime.host else 'zzz'
+            ))
+        except Exception:
+            candidates = vms
+
+        # Step 3: Try to power on each candidate until one succeeds
+        for vm in candidates:
+            host_name = 'unknown'
+            try:
+                host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
+
+                # Wait briefly for VM to reach connected state
+                max_wait = 30
+                waited = 0
+                while vm.runtime.connectionState != 'connected' and waited < max_wait:
+                    lsf.write_output(f'  {vm.name} on {host_name}: connection state {vm.runtime.connectionState}, waiting...')
+                    time.sleep(5)
+                    waited += 5
+
+                if vm.runtime.connectionState != 'connected':
+                    lsf.write_output(f'  {vm.name} on {host_name}: not connected after {max_wait}s, skipping')
+                    continue
+
+                lsf.write_output(f'Powering on {vm.name} (host: {host_name})...')
+
+                task = vm.PowerOnVM_Task()
+                try:
+                    WaitForTask(task, maxWaitTime=TASK_WAIT_TIMEOUT_SECONDS)
+                    lsf.write_output(f'Powered on {vm.name} (host: {host_name})')
+                    return 'started'
+                except Exception as wait_err:
+                    if 'exceeded timeout' not in str(wait_err):
+                        raise
+                    lsf.write_output(f'  {vm.name} on {host_name}: task completion '
+                                     f'notification timed out after {TASK_WAIT_TIMEOUT_SECONDS}s, '
+                                     f'polling power state directly...')
+                    for poll_attempt in range(1, POWERSTATE_POLL_RETRIES + 1):
+                        time.sleep(POWERSTATE_POLL_DELAY)
+                        if vm.runtime.powerState == 'poweredOn':
+                            lsf.write_output(f'Powered on {vm.name} (host: {host_name}) '
+                                             f'[confirmed via direct poll, attempt {poll_attempt}]')
+                            return 'started'
+                    raise Exception(f'power state still {vm.runtime.powerState} after '
+                                    f'{TASK_WAIT_TIMEOUT_SECONDS + POWERSTATE_POLL_RETRIES * POWERSTATE_POLL_DELAY}s') from wait_err
+            except Exception as e:
+                error_str = str(e)
+                last_error = error_str
+
+                is_stale = ('FileNotFound' in error_str or
+                            'Device or resource busy' in error_str or
+                            'Unable to load configuration file' in error_str or
+                            'ManagedObjectNotFound' in error_str or
+                            'already been deleted' in error_str)
+
+                try:
+                    vm_label = vm.name
+                except Exception:
+                    vm_label = vm_name
+                if is_stale:
+                    lsf.write_output(f'  {vm_label} on {host_name}: stale registration, trying next host...')
+                    continue
+                else:
+                    lsf.write_output(f'FAILED to power on {vm_label} on {host_name}: {e}')
+                    continue
+
+        # Re-check all registrations for poweredOn (in case asynchronous power-on finished)
+        lsf.write_output(f'  {vm_name}: power-on attempt {power_on_attempt} finished across candidate hosts, re-checking state...')
+        vms_recheck = lsf.get_vm_by_name(vm_name)
+        for vm in vms_recheck:
+            try:
+                if vm.runtime.powerState == 'poweredOn':
+                    host_name = vm.runtime.host.name if vm.runtime.host else 'unknown'
+                    lsf.write_output(f'{vm_name} is now reporting poweredOn (host: {host_name})')
+                    return 'started' if power_on_attempt > 1 else 'already_on'
+            except Exception:
+                continue
+
+        if power_on_attempt < POWER_ON_MAX_RETRIES:
+            lsf.write_output(f'WARNING: {fail_label} "{vm_name}" power-on attempt {power_on_attempt}/{POWER_ON_MAX_RETRIES} '
+                             f'failed ({last_error or "unknown error"}), retrying in {POWER_ON_RETRY_DELAY}s...')
+            time.sleep(POWER_ON_RETRY_DELAY)
+
+    lsf.write_output(f'FAILED: {fail_label} {vm_name} could not be powered on from any host after {POWER_ON_MAX_RETRIES} attempts')
     if last_error:
         lsf.write_output(f'  Last error: {last_error[:200]}')
     return 'failed'

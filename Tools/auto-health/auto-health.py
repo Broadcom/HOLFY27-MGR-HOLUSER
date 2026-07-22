@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 auto-health.py
-Version 1.2.0 - 2026-07-21
+Version 1.3.0 - 2026-07-22
 Author: Burke Azbill and HOL Core Team
 
 Comprehensive, read-only health check for VCF Automation (VCFA). VCFA runs as a
@@ -34,6 +34,19 @@ Sections reported:
   9. ARGO WORKFLOWS      Stale system-shutdown-* workflows in vmsp-platform
  10. ETCD                Informational defrag slack % (no action ever taken)
 
+Section "edge" also checks (added v1.3.0, 2026-07-22): rabbitmq-ha-0's "copy-config" init
+container is present, and (if present) that the AMQPS(5671) listener is actually up. Root
+cause seen live: a prior vcfa-stabilizer.sh RabbitMQ cookie-permission fix used
+`kubectl patch --type=merge` on spec.template.spec.initContainers, which under JSON Merge
+Patch semantics REPLACES the whole array instead of merging by name -- silently deleting the
+init container that copies rabbitmq.conf/enabled_plugins/definitions.json into /etc/rabbitmq.
+RabbitMQ then starts with "Config file(s): (none)": no AMQPS listener, no plugins -- but
+`rabbitmq-diagnostics ping` (the liveness/startup probe) still passes, so kubectl reports the
+pod perfectly healthy while every AMQP client (ebs-app etc) gets "Connection refused", which
+cascades into ~15 prelude Deployments stuck Pending/PodInitializing behind ebs-service. This
+signal is invisible to sections 3-5 above (pod is Running, deployment is "ready") -- only a
+targeted check for the init container + listener catches it.
+
 No changes are made to the cluster — this is a check-only tool.
 Remediation: bash vcfa-stabilizer.sh
 
@@ -45,14 +58,16 @@ Exit codes:
 import argparse
 import base64
 import json
+import os
 import re
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
-VERSION = "1.2.0"
-DATE    = "2026-07-21"
+VERSION = "1.3.0"
+DATE    = "2026-07-22"
 
 CREDS_FILE = "/home/holuser/creds.txt"
 VCFA_USER  = "vmware-system-user"
@@ -203,11 +218,28 @@ def ssh_exec(host, password, cmd, timeout=60):
     (unlike VCF 9.0's NOPASSWD), so we always pipe the password to sudo -S. sudo -S -i
     gives a root login shell, which is required for kubectl to be on PATH. We prepend
     a dynamic KUBECONFIG resolution to handle admin.conf or super-admin.conf.
+
+    v1.3.0: the multi-line `cmd` is base64-decoded into a TEMP FILE first, then executed as
+    `bash <file>` under sudo -- NOT inlined as a `bash -c "<multiline string>"` literal.
+    Confirmed live (2026-07-22): `sudo -S -i bash -c "<multiline command substitution result>"`
+    silently mangles the reconstructed command on this Photon OS sudo build -- it collapses ALL
+    embedded newlines (turning a multi-line if/then/else/fi into one unparseable line, a syntax
+    error) AND expands `$var` references that were inside single-quotes in the original script
+    (e.g. an awk '{print $2}' had its $2 wiped to empty). This silently broke the pre-existing
+    resource-manager deadlock check (edge_out["rm"]): RM_LISTENING/RM_DEADLOCK_SUSPECT/
+    RM_NOT_FOUND never matched the mangled output, so chk_edge_cases() always fell through to
+    its "clear" default -- a false-healthy result that nobody had noticed. Single-line commands
+    (the vast majority of ssh_exec() callers) were never affected; only multi-line scripts with
+    conditionals were at risk. The temp file is written pre-sudo (plain user, /tmp is writable)
+    and removed after execution.
     """
     cmd_b64 = base64.b64encode(cmd.encode()).decode()
+    script_path = f"/tmp/.auto-health-{os.getpid()}-{int(time.time() * 1000) % 1000000}.sh"
     outer = (
+        f"echo {cmd_b64} | base64 -d > {script_path} && "
         f"echo '{password}' | sudo -S -i "
-        f"bash -c \"export KUBECONFIG=\\$(test -f /etc/kubernetes/admin.conf && echo /etc/kubernetes/admin.conf || echo /etc/kubernetes/super-admin.conf); $(echo {cmd_b64} | base64 -d)\" 2>&1"
+        f"bash -c \"export KUBECONFIG=\\$(test -f /etc/kubernetes/admin.conf && echo /etc/kubernetes/admin.conf || echo /etc/kubernetes/super-admin.conf); bash {script_path}\"; "
+        f"rm -f {script_path} 2>&1"
     )
     _SUDO_RE = re.compile(r"\[sudo\] password for [^:]+:\s*")
     _NOISE   = ("Welcome to Photon", "Warning: Permanently added",
@@ -658,7 +690,7 @@ def chk_argo(workflows_text, verbose):
 def chk_edge_cases(edge_out, pods_text, verbose):
     """Detect known edge cases like support-bundle runaway and RM deadlock."""
     results = []
-    
+
     # 1. Support Bundle Runaway
     jobs_data = edge_out.get("jobs", [])
     if jobs_data is None:
@@ -671,7 +703,7 @@ def chk_edge_cases(edge_out, pods_text, verbose):
             results.append(row_ok(f"Support bundle runaway: {num_jobs} jobs found (under threshold)"))
         else:
             results.append(row_ok("Support bundle runaway: 0 jobs found"))
-            
+
     # 2. Resource Manager Deadlock
     rm_status = edge_out.get("rm", "").strip()
     rm_pod_line = ""
@@ -680,7 +712,7 @@ def chk_edge_cases(edge_out, pods_text, verbose):
             if "resource-manager-server-" in line:
                 rm_pod_line = line
                 break
-                
+
     if rm_status == "RM_DEADLOCK_SUSPECT" and "1/1" not in rm_pod_line:
         results.append(row_fail("resource-manager deadlock", "pod is not ready and no listener on 7710/7777 (deadlock!)"))
     elif rm_status == "RM_LISTENING":
@@ -689,7 +721,43 @@ def chk_edge_cases(edge_out, pods_text, verbose):
         results.append(row_warn("resource-manager deadlock: process not found", "pod may be missing or restarting"))
     else:
         results.append(row_ok("resource-manager deadlock: clear"))
-        
+
+    # 3. RabbitMQ copy-config init container integrity + AMQPS(5671) listener (added v1.3.0).
+    # Root cause seen live: a `kubectl patch --type=merge` on spec.template.spec.initContainers
+    # (in an earlier vcfa-stabilizer.sh RabbitMQ cookie-permission fix) replaced the WHOLE
+    # initContainers array under JSON Merge Patch semantics, silently deleting the "copy-config"
+    # init container that populates /etc/rabbitmq from the rabbitmq-ha ConfigMap + db-credentials
+    # Secret. rabbitmq-ha-0 then starts with "Config file(s): (none)" -- no AMQPS(5671) listener,
+    # no management plugin -- but `rabbitmq-diagnostics ping` (the liveness/startup probe) still
+    # passes, so the pod shows Running/Ready to kubectl while every AMQP client gets "Connection
+    # refused". This cascades into ~15 prelude Deployments stuck Pending/PodInitializing behind
+    # ebs-service, invisible to the CORE/AUTH deployment-readiness sections above. Read-only:
+    # only reports; fix lives in vcfa-stabilizer.sh's fix_vcf_final_edge_cases.
+    rmq_status = edge_out.get("rmq", "").strip()
+    if rmq_status == "RMQ_OK":
+        results.append(row_ok("RabbitMQ copy-config + AMQPS(5671) listener: healthy"))
+    elif rmq_status == "RMQ_NO_COPY_CONFIG":
+        results.append(row_fail(
+            "RabbitMQ copy-config init container: present",
+            "MISSING from rabbitmq-ha StatefulSet -- pod reports Ready via rabbitmq-diagnostics "
+            "ping but has no real config (no AMQPS listener); AMQP clients (ebs-app etc) will see "
+            "Connection refused. Run vcfa-stabilizer.sh (fix_vcf_final_edge_cases restores it)."
+        ))
+    elif rmq_status == "RMQ_LISTENER_DOWN":
+        results.append(row_fail(
+            "RabbitMQ AMQPS(5671) listener: up",
+            "copy-config init container is present but port 5671 is not listening -- possible "
+            "TLS cert/config problem (rabbitmq-tls secret?); not the copy-config bug. Investigate "
+            "rabbitmq-ha-0 logs; not auto-fixed."
+        ))
+    elif rmq_status.startswith("RMQ_NOT_RUNNING"):
+        phase = rmq_status.split(":", 1)[1] if ":" in rmq_status else "?"
+        results.append(row_warn(f"RabbitMQ pod rabbitmq-ha-0: phase={phase}", "not yet Running — may still be starting"))
+    elif rmq_status == "RMQ_NOT_FOUND":
+        results.append(row_warn("RabbitMQ pod rabbitmq-ha-0: found", "not found — may not be deployed on this build"))
+    else:
+        results.append(row_warn("RabbitMQ copy-config / AMQPS listener check", "could not determine status"))
+
     return results
 
 
@@ -855,6 +923,32 @@ def main():
                 fi
             else
                 echo "RM_NOT_FOUND"
+            fi
+        """, timeout=30)[1]
+        # RabbitMQ copy-config init container integrity + AMQPS(5671) listener (v1.3.0). Read-only:
+        # checks the StatefulSet spec (jsonpath) and, only if the init container is present, runs
+        # `rabbitmqctl status` inside the pod to confirm the SSL listener is actually up. See the
+        # module docstring / chk_edge_cases() for the full root-cause writeup.
+        edge_out["rmq"] = ssh_exec(host, password, """
+            rmq_status_line=$(kubectl get pod rabbitmq-ha-0 -n prelude --no-headers 2>/dev/null)
+            if [ -z "$rmq_status_line" ]; then
+                echo "RMQ_NOT_FOUND"
+            else
+                rmq_phase=$(kubectl get pod rabbitmq-ha-0 -n prelude -o jsonpath='{.status.phase}' 2>/dev/null)
+                if [ "$rmq_phase" != "Running" ]; then
+                    echo "RMQ_NOT_RUNNING:$rmq_phase"
+                else
+                    has_copy_config=$(kubectl get statefulset rabbitmq-ha -n prelude -o jsonpath='{.spec.template.spec.initContainers[?(@.name=="copy-config")].name}' 2>/dev/null)
+                    if [ -z "$has_copy_config" ]; then
+                        echo "RMQ_NO_COPY_CONFIG"
+                    else
+                        if kubectl exec rabbitmq-ha-0 -n prelude -c rabbitmq-ha -- rabbitmqctl status 2>/dev/null | grep -q "port: 5671"; then
+                            echo "RMQ_OK"
+                        else
+                            echo "RMQ_LISTENER_DOWN"
+                        fi
+                    fi
+                fi
             fi
         """, timeout=30)[1]
 
