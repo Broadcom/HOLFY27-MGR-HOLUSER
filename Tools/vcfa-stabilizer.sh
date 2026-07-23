@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VCFA Complete Stabilization Script v2.18
-# Version 2.18 - 2026-07-22
+# VCFA Complete Stabilization Script v2.19
+# Version 2.19 - 2026-07-23
 # Author - HOL Core Team
 #
 # Default-run philosophy (v2.6+): one run of the script with no flags should leave the VCFA in a
@@ -27,6 +27,10 @@
 #   - kube-apiserver / kube-controller-manager / kube-scheduler probe timeouts
 #     (period=10 timeout=30 failureThreshold=8)
 #   - etcd defrag (only when slack >= 30%)
+#   - vcfa-btp-wellknown-to-carefs Kyverno ClusterPolicy: mutates BackendTLSPolicy
+#     wellKnownCACertificates:System -> caCertificateRefs:platform-trust at admission time, inside
+#     fix_envoy_gateway_sds_san_nack (NEW v2.19, see below -- unowned cluster-scoped resource,
+#     nothing reverts it, unlike the postRenderers approach that was tried and rejected)
 # What's a runtime backstop (re-applied every run, harmless if already correct):
 #   - eth0 VIP pinning for .69, .70, .72 (kube-vip will reclaim, this is just a fallback)
 #   - ccs-k3s service-tls cert freshness check (NEW v2.8)
@@ -45,6 +49,42 @@
 #     unconditionally just churns rollouts. Set FORCE_KYVERNO_FIX=1 to bypass the heuristic.
 #
 # See VCFA_Stabilizer_Incident_Apr2026.md for the gateway/EnvoyProxy guidance and HTTP 503 recovery.
+#
+# v2.19 changelog (2026-07-23):
+#  * FIX (root cause, confirmed live): fix_envoy_gateway_sds_san_nack()'s old step "2/5" only ever
+#    patched the *live* BackendTLSPolicy object from wellKnownCACertificates:System to
+#    caCertificateRefs. The vmsp-platform charts (ndc, support-bundle, vmsp-agent, vmsp-identity @
+#    9.1.1865) still RENDER wellKnownCACertificates:System, and those 4 HelmReleases are the only
+#    ones in vmsp-platform with driftDetection.mode:enabled. Flux's drift-detection dry-run merges
+#    chart-desired (wellKnownCACertificates) onto the live-patched object (caCertificateRefs),
+#    producing an object with BOTH mutually-exclusive fields set -> Gateway API v1.3.0 CEL rule on
+#    BackendTLSPolicy.spec.validation rejects it -> those 4 HelmReleases sit permanently
+#    Ready=False/StateError -> the vmsp-platform PackageDeployment is wedged "Progressing" forever
+#    -> VCF Automation Upgrade Prechecks fail/hang on the "Stage VCF Automation precheck binaries"
+#    step with [VCFMS-HEALTH-002] "platform-package-core: vmsp-platform: wrong resource state:
+#    InProgress - package deployment is in progress". The other ~30 BackendTLSPolicies (prelude ns)
+#    were patched identically but their HelmReleases have driftDetection off, so the same divergence
+#    was silently masked there -- this is why only the 4 vmsp-platform releases ever surfaced it.
+#  * INVESTIGATED AND REJECTED: patching HelmRelease.spec.postRenderers to make helm itself render
+#    caCertificateRefs. vmsp-operator re-asserts full ownership of the HelmRelease spec and strips a
+#    manually-patched postRenderers block within ~60s (confirmed live) -- consistent with the
+#    existing kyverno-HelmRelease revert behavior already noted above under "What's conditional".
+#    Fighting a sub-60s revert window with a keeper timer is unreliable and needlessly combative.
+#  * FIX: step "2/5" replaced with three sub-steps -- 2a installs (idempotently) a Kyverno
+#    ClusterPolicy (vcfa-btp-wellknown-to-carefs) that mutates any BackendTLSPolicy carrying
+#    wellKnownCACertificates:System into caCertificateRefs:platform-trust AT ADMISSION TIME, verified
+#    live to apply to both a real apply and a `--dry-run=server` apply (exactly what Flux's drift
+#    detection issues) -- so chart-desired and live state converge instead of diverging, and Flux
+#    drift detection passes. This ClusterPolicy is a plain unowned cluster-scoped object (no Helm
+#    release, no ownerReference, not part of the vmsp-kyverno-policies chart), so nothing prunes or
+#    reverts it on reconcile -- no keeper needed. 2b keeps the old direct per-object patch as a
+#    one-time bootstrap for objects that predate the ClusterPolicy (e.g. a lab already in the broken
+#    state before pulling this update). 2c is a read-only confirmation that no BackendTLSPolicy still
+#    carries both CA fields.
+#  * Applies automatically on every run (no flag, no gate) since this is folded into the existing
+#    Phase 3.5 call -- any lab pulling this updated script and rebooting (VCFfinal.py runs the
+#    stabilizer unconditionally) or re-running it manually will self-heal into the fixed state,
+#    including labs that were already stuck on this exact upgrade-precheck failure.
 #
 # v2.18 changelog (2026-07-22):
 #  * FIX (root cause, confirmed live on a broken pod): the "RabbitMQ .erlang.cookie" fix inside
@@ -1104,8 +1144,73 @@ for NS in \$NS_LIST; do
 done
 
 echo
-echo "=== 2/5: patch every BackendTLSPolicy with wellKnownCACertificates: System -> caCertificateRefs ==="
-# Pre-count before patching so we can decide whether step 5 (dataplane rollout) is needed.
+echo "=== 2a/5: ensure durable Kyverno mutate policy (rewrite wellKnownCACertificates -> caCertificateRefs at admission) ==="
+# v2.19: A bare kubectl patch of the *live* BackendTLSPolicy (the old step 2/5) only ever fixes the
+# object at that instant. The vmsp-platform charts (ndc, support-bundle, vmsp-agent, vmsp-identity)
+# still *render* wellKnownCACertificates: System, and those 4 HelmReleases are the only ones with
+# driftDetection.mode: enabled. Flux's drift-detection dry-run merges the chart-desired field onto
+# the live-patched field, producing an object with BOTH mutually-exclusive fields set, which the
+# Gateway API v1.3.0 CEL rule on BackendTLSPolicy.spec.validation rejects (Ready=False/StateError),
+# which wedges the vmsp-platform PackageDeployment in "Progressing" forever and blocks VCF Automation
+# upgrade prechecks ([VCFMS-HEALTH-002] platform-package-core: vmsp-platform InProgress).
+#
+# A HelmRelease.spec.postRenderers patch was tried instead of live-object patching, but
+# vmsp-operator re-asserts full ownership of the HelmRelease spec and strips it within ~60s —
+# confirmed on 2026-07-23, consistent with the vmsp-operator drift-detection.mode revert behavior
+# already documented for this cluster. Fighting that with a keeper is unreliable (the revert window
+# is sub-60s) and combative with the operator's own reconcile loop.
+#
+# Durable fix: a Kyverno ClusterPolicy that mutates any BackendTLSPolicy carrying
+# wellKnownCACertificates: System into caCertificateRefs: platform-trust *at admission time*.
+# Verified 2026-07-23 that this converts BOTH a real apply AND a server-side dry-run apply
+# (exactly what Flux's helm-controller drift detection issues) to the single-field valid form —
+# so chart-desired and live state converge instead of diverging, and Flux drift detection passes.
+# This ClusterPolicy is a plain unowned cluster-scoped resource (no Helm release, no ownerReference,
+# not part of the vmsp-kyverno-policies chart), so nothing prunes or reverts it on reconcile.
+KYVERNO_POLICY_NAME="vcfa-btp-wellknown-to-carefs"
+if \$K get crd clusterpolicies.kyverno.io >/dev/null 2>&1; then
+    cat <<KYVPOL | \$K apply -f - >/dev/null 2>&1 && echo "  ClusterPolicy/\${KYVERNO_POLICY_NAME} applied (idempotent)" || echo "  WARN: ClusterPolicy apply failed"
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: \${KYVERNO_POLICY_NAME}
+  labels:
+    app.kubernetes.io/managed-by: vcfa-stabilizer.sh
+spec:
+  background: true
+  rules:
+  - name: rewrite-wellknown-to-carefs
+    match:
+      any:
+      - resources:
+          kinds:
+          - gateway.networking.k8s.io/v1alpha3/BackendTLSPolicy
+    preconditions:
+      all:
+      - key: "{{ request.object.spec.validation.wellKnownCACertificates || '' }}"
+        operator: Equals
+        value: "System"
+    mutate:
+      patchesJson6902: |-
+        - op: remove
+          path: /spec/validation/wellKnownCACertificates
+        - op: add
+          path: /spec/validation/caCertificateRefs
+          value:
+          - group: ""
+            kind: ConfigMap
+            name: platform-trust
+KYVPOL
+else
+    echo "  WARN: Kyverno CRDs not found on this cluster — skipping admission-time fix, falling back to live-object patch only"
+fi
+
+echo
+echo "=== 2b/5: one-time bootstrap — patch any BackendTLSPolicy currently using wellKnownCACertificates: System ==="
+# Fixes objects that predate the ClusterPolicy above (e.g. first run after upgrading this script on
+# a lab that's already in the broken state) without waiting on Kyverno's periodic background scan.
+# Once 2a is in place, this is a no-op on every subsequent run because new/updated objects are
+# already corrected at admission time.
 _WKCA_LIST=\$(\$K get backendtlspolicy -A \
     -o jsonpath='{range .items[?(@.spec.validation.wellKnownCACertificates=="System")]}{.metadata.namespace} {.metadata.name}{"\\n"}{end}' \
     2>/dev/null | grep -v '^\$' || true)
@@ -1126,6 +1231,23 @@ if [[ -n "\$_WKCA_LIST" ]]; then
         2>/dev/null | head || true
 else
     echo "  all BackendTLSPolicies already use caCertificateRefs (no-op)"
+fi
+
+echo
+echo "=== 2c/5: confirm no BackendTLSPolicy carries BOTH CA fields (the actual invalid/upgrade-blocking state) ==="
+_BOTH_LIST=\$(\$K get backendtlspolicy -A -o json 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for i in d.get("items", []):
+    v = i.get("spec", {}).get("validation", {})
+    if v.get("wellKnownCACertificates") and v.get("caCertificateRefs"):
+        print(i["metadata"]["namespace"], i["metadata"]["name"])
+' 2>/dev/null || true)
+if [[ -n "\$_BOTH_LIST" ]]; then
+    echo "  WARN: still found policies with BOTH fields set (will block PackageDeployment/upgrade prechecks):"
+    echo "\$_BOTH_LIST"
+else
+    echo "  none — all BackendTLSPolicies have exactly one CA source (no-op)"
 fi
 
 echo
@@ -2855,7 +2977,7 @@ CERT_CHECK_BODY
 # Main execution function
 main() {
     echo "======================================================================"
-    echo "           VCFA Complete Stabilization Script v2.16"
+    echo "           VCFA Complete Stabilization Script v2.19"
     echo "======================================================================"
     echo "Comprehensive VCFA stability solution for nested environments"
     echo "All phases run on every invocation; each step is self-checking and reports"
@@ -3008,7 +3130,7 @@ SIG
 # Handle script arguments
 case "${1:-}" in
     --help|-h)
-        echo "VCFA Complete Stabilization Script v2.16"
+        echo "VCFA Complete Stabilization Script v2.19"
         echo ""
         echo "Usage: $0 [options]"
         echo ""
