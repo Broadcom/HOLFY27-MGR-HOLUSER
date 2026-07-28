@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 vsp_cert_renewer.py
-Version 2.11 - 2026-06-16
+Version 2.12 - 2026-07-25
 Author: Burke Azbill, Kevin Tebear, and HOL Core Team
 
 Proactive Kubernetes certificate check and renewal for VSP and VCFA clusters.
@@ -46,8 +46,8 @@ import time
 from datetime import datetime, timezone
 
 # ─── Version ──────────────────────────────────────────────────────────────────
-VERSION = "2.11"
-DATE    = "2026-06-16"
+VERSION = "2.12"
+DATE    = "2026-07-25"
 
 # ─── Global constants ─────────────────────────────────────────────────────────
 THRESHOLD_DAYS = 60            # renew if any cert expires within 60 days
@@ -144,8 +144,10 @@ def _ssh_exec(ip, password, cmd, timeout=60):
     """
     cmd_b64 = base64.b64encode(cmd.encode()).decode()
     # The outer command is a simple shell snippet: decode cmd_b64 and run as root
+    # Unset proxy env vars so local kubectl / kubeadm calls never hit Squid proxy
     outer = (
         f"echo '{password}' | sudo -S -i "
+        f"env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY "
         f"bash -c \"$(echo {cmd_b64} | base64 -d)\" 2>&1"
     )
     try:
@@ -292,6 +294,63 @@ def _probe_kubeconfig(node_ip, password):
         if rc == 0 and "EXISTS" in out:
             return path
     return None
+
+
+# ─── K8s API pre-flight check helper ─────────────────────────────────────────
+def _wait_for_k8s_api(cp_ip, password, kubeconfig, cluster_cfg, timeout_sec=300):
+    """Wait up to timeout_sec (default 300s/5m) for the K8s API server and CRDs to respond.
+
+    Periodically re-probes kubeconfig if not yet available, and checks basic API
+    responsiveness via 'kubectl get nodes'. For clusters with cert-manager (VSP),
+    also checks 'kubectl get certs -n vmsp-platform' to ensure CRDs are served.
+    Returns (ready: bool, active_kubeconfig: str).
+    """
+    start_time = time.time()
+    last_log_time = -1
+    poll_interval = 5
+
+    log_info(f"Pre-flight: checking K8s API availability (timeout: {timeout_sec}s)...")
+
+    while time.time() - start_time < timeout_sec:
+        elapsed = int(time.time() - start_time)
+
+        if not kubeconfig:
+            kubeconfig = _probe_kubeconfig(cp_ip, password)
+
+        kc_flag = f"--kubeconfig={kubeconfig}" if kubeconfig else ""
+
+        # Test basic API server responsiveness with node listing
+        rc, out = _ssh_exec(
+            cp_ip, password,
+            f"kubectl {kc_flag} get nodes --no-headers 2>&1",
+            timeout=10,
+        )
+
+        if rc == 0 and out.strip() and "Unable to connect" not in out and "Forbidden" not in out and "refused" not in out:
+            # If cluster includes certmanager phase (e.g. VSP), ensure cert-manager CRDs are readable
+            if "certmanager" in cluster_cfg.get("phases", []):
+                crd_rc, crd_out = _ssh_exec(
+                    cp_ip, password,
+                    f"kubectl {kc_flag} get certs -n vmsp-platform --no-headers 2>&1",
+                    timeout=10,
+                )
+                if crd_rc == 0 or "No resources found" in crd_out or "notFound" in crd_out.lower() or "ServerResources" in crd_out:
+                    log_info(f"Pre-flight: K8s API and CRDs ready after {elapsed}s")
+                    return True, kubeconfig
+            else:
+                log_info(f"Pre-flight: K8s API ready after {elapsed}s")
+                return True, kubeconfig
+
+        # Log status every 15 seconds
+        if elapsed - last_log_time >= 15 or last_log_time == -1:
+            log_info(f"Pre-flight: waiting for K8s API to become ready... ({elapsed}s elapsed)")
+            last_log_time = elapsed
+
+        time.sleep(poll_interval)
+
+    total_elapsed = int(time.time() - start_time)
+    log_warn(f"Pre-flight: K8s API did not become fully ready within {total_elapsed}s — proceeding best-effort")
+    return False, kubeconfig
 
 
 # ─── TCP port probe helper ────────────────────────────────────────────────────
@@ -2355,6 +2414,12 @@ def _check_cluster(cluster_name, cluster_cfg, args):
     except Exception as exc:
         log_error(f"kubeconfig probe raised: {exc}")
         kubeconfig = None
+
+    # ── Pre-flight K8s API availability check (up to 5 minutes) ──────────────
+    try:
+        _, kubeconfig = _wait_for_k8s_api(cp_ip, password, kubeconfig, cluster_cfg, timeout_sec=300)
+    except Exception as exc:
+        log_warn(f"Pre-flight API check raised exception: {exc} — proceeding best-effort")
 
     if kubeconfig:
         log_info(f"kubeconfig: {kubeconfig}")
