@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 vsp-health.py
-Version 2.5.0 - 2026-07-16
+Version 2.6.0 - 2026-07-28
 Author: Burke Azbill and HOL Core Team
 
 v2.5.0: CP host resolution now tries candidates in order — explicit --host,
@@ -69,7 +69,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 DATE    = "2026-07-16"
 
 CREDS_FILE = "/home/holuser/creds.txt"
@@ -192,6 +192,7 @@ def show_help():
         ("salt",     "Salt master/minion deep check + logs"),
         ("certs",    "cert-manager Certificate resources"),
         ("argo",     "Argo Workflow stale shutdown + power-off-marker check"),
+        ("kyverno",  "Kyverno UpdateRequests backlog and controller health"),
         ("vodap",    "ClickHouse served-cert-vs-secret + fluentd buffers"),
         ("proxy",    "VSP node proxy config drift"),
         ("kubeadm",  "kubeadm cert population expiry"),
@@ -658,6 +659,66 @@ def chk_postgres(cp_host, password, verbose):
         results.append(row_warn("pgdatabase-0 (salt-raas): found",
                                 "pod not found or unreadable"))
 
+    # Patroni leader endpoint validity across all postgres instances
+    pg_clusters = [
+        ("salt-raas", "pgdatabase"),
+        ("vcf-fleet-lcm", "vcf-fleet-lcm-db"),
+        ("vcf-sddc-lcm", "vcf-sddc-lcm-db"),
+        ("vidb-external", "vidb-postgres-instance"),
+    ]
+    stale_leaders = []
+    for pg_ns, pg_name in pg_clusters:
+        ep_data = fetch_json(cp_host, password,
+                             f"kubectl get endpoints {pg_name} -n {pg_ns} -o json 2>/dev/null",
+                             timeout=15)
+        if ep_data and ep_data.get("kind") == "Endpoints":
+            leader_pod = ep_data.get("metadata", {}).get("annotations", {}).get("leader", "")
+            if leader_pod:
+                pod_data = fetch_json(cp_host, password,
+                                      f"kubectl get pod {leader_pod} -n {pg_ns} -o json 2>/dev/null",
+                                      timeout=15)
+                leader_ok = False
+                if pod_data and pod_data.get("kind") == "Pod":
+                    phase = pod_data.get("status", {}).get("phase", "")
+                    c_statuses = pod_data.get("status", {}).get("containerStatuses", [])
+                    if phase == "Running" and any(cs.get("ready", False) for cs in c_statuses):
+                        leader_ok = True
+                if not leader_ok:
+                    stale_leaders.append(f"{pg_ns}/{pg_name} -> {leader_pod}")
+
+    if stale_leaders:
+        results.append(row_fail("Patroni leader endpoints: all pointing to active ready pods",
+                                f"stale leader annotation(s): {', '.join(stale_leaders)}"))
+    else:
+        results.append(row_ok("Patroni leader endpoints: all pointing to active ready pods"))
+
+    # PostgreSQL wal-g restore hangs (S3 missing .history)
+    unmocked_pods = []
+    for pg_ns, _ in pg_clusters:
+        pods_data = fetch_json(cp_host, password,
+                               f"kubectl get pods -n {pg_ns} -l application=spilo -o json 2>/dev/null",
+                               timeout=15)
+        if pods_data and pods_data.get("items"):
+            for pod in pods_data["items"]:
+                pod_name = pod.get("metadata", {}).get("name", "")
+                phase = pod.get("status", {}).get("phase", "")
+                if pod_name and phase == "Running":
+                    rc, out = ssh_exec(cp_host, password,
+                                       f"kubectl exec {pod_name} -n {pg_ns} -c postgres -- bash -c \"grep -q 'exit 0' /usr/local/bin/wal-g 2>/dev/null || grep -q 'exit 0' /usr/bin/wal-g 2>/dev/null\"",
+                                       timeout=10)
+                    if rc != 0:
+                        unmocked_pods.append(f"{pg_ns}/{pod_name}")
+
+    if unmocked_pods:
+        if verbose:
+            results.append(row_fail("PostgreSQL wal-g binary mocked (prevents S3 restore hang)",
+                                    f"{len(unmocked_pods)} unmocked pods: {', '.join(unmocked_pods)}"))
+        else:
+            results.append(row_fail("PostgreSQL wal-g binary mocked (prevents S3 restore hang)",
+                                    f"{len(unmocked_pods)} unmocked pods found"))
+    else:
+        results.append(row_ok("PostgreSQL wal-g binary mocked (prevents S3 restore hang)"))
+
     return results
 
 
@@ -871,6 +932,43 @@ def chk_argo(cp_host, password, verbose):
     return results
 
 
+# ─── Section 9.5: Kyverno Policies ──────────────────────────────────────────
+def chk_kyverno(cp_host, password, verbose):
+    results = []
+    
+    # Check backlog of UpdateRequests
+    _, out = ssh_exec(cp_host, password, 
+                      "kubectl get updaterequests.kyverno.io -n vmsp-policies --no-headers 2>/dev/null | wc -l",
+                      timeout=15)
+    out = out.strip()
+    if not out.isdigit():
+        results.append(row_warn("Kyverno UpdateRequests: could not count", ""))
+    else:
+        count = int(out)
+        if count > 50:
+            results.append(row_fail(f"Kyverno UpdateRequests backlog: {count} (> 50)",
+                                    "run 'kubectl delete updaterequests.kyverno.io --all -n vmsp-policies'"))
+        else:
+            results.append(row_ok(f"Kyverno UpdateRequests backlog: {count} (healthy)"))
+            
+    # Check kyverno-background-controller pod
+    pod_data = fetch_json(cp_host, password,
+                          "kubectl get pod -n vmsp-policies -l app.kubernetes.io/component=background-controller -o json 2>/dev/null",
+                          timeout=15)
+    if pod_data and pod_data.get('items'):
+        pod = pod_data['items'][0]
+        ready, total, restarts, _ = _pod_ready(pod)
+        phase = pod.get('status', {}).get('phase', '')
+        if ready == total and total > 0:
+            results.append(row_ok(f"kyverno-background-controller: {ready}/{total} containers Ready"))
+        else:
+            results.append(row_fail(f"kyverno-background-controller: {ready}/{total} containers Ready", 
+                                    f"phase: {phase}, restarts: {restarts}"))
+    else:
+        results.append(row_warn("kyverno-background-controller: pod not found", ""))
+        
+    return results
+
 # ─── Section 10: Vodap (ClickHouse cert + fluentd buffers) ──────────────────
 def chk_vodap(cp_host, password, verbose):
     """ClickHouse: compares the cert it's actually SERVING (live openssl
@@ -1037,9 +1135,10 @@ def chk_proxy(cp_host, password, verbose):
 
 # ─── Section 12: Kubeadm Certificates ─────────────────────────────────────────
 
-def chk_password_expiration(cp_host, password, verbose):
+def chk_password_expiration(nodes_data, cp_host, password, verbose):
     results = []
-    nodes_data = fetch_json(cp_host, password, "kubectl get nodes -o json 2>/dev/null", 30)
+    if not nodes_data or 'items' not in nodes_data:
+        nodes_data = fetch_json(cp_host, password, "kubectl get nodes -o json 2>/dev/null", 30)
     if not nodes_data or 'items' not in nodes_data:
         return [row_warn("Could not fetch nodes to check password expiration")]
         
@@ -1064,8 +1163,7 @@ def chk_password_expiration(cp_host, password, verbose):
                 
             out = out.strip()
             if 'never' in out.lower():
-                results.append(row_fail(f"{node_ip}: {user} password set to never expire"))
-                failed = True
+                results.append(row_ok(f"{node_ip}: {user} password set to never expire"))
                 continue
                 
             try:
@@ -1073,17 +1171,17 @@ def chk_password_expiration(cp_host, password, verbose):
                 exp_dt = datetime.strptime(date_str, "%b %d, %Y").replace(tzinfo=timezone.utc)
                 days = (exp_dt - now).days
                 
-                if days <= 365:
+                if days <= 60:
                     results.append(row_fail(f"{node_ip}: {user} password expires in {days} days ({date_str})"))
                     failed = True
-                elif verbose:
+                else:
                     results.append(row_ok(f"{node_ip}: {user} password expires in {days} days ({date_str})"))
             except Exception as e:
                 results.append(row_fail(f"{node_ip}: {user} could not parse expiration date ({out})"))
                 failed = True
                 
     if not failed:
-        results.append(row_ok("All node passwords expire in > 1 year"))
+        results.append(row_ok("All node passwords set to never expire or valid > 60 days"))
         
     return results
 
@@ -1138,6 +1236,7 @@ SECTION_MAP = {
     "salt":     "SALT STACK",
     "certs":    "TLS CERTIFICATES",
     "argo":     "ARGO WORKFLOWS",
+    "kyverno":  "KYVERNO POLICIES",
     "vodap":    "VODAP HEALTH",
     "proxy":    "NODE PROXY CONFIG",
     "kubeadm":  "KUBEADM CERTIFICATES",
@@ -1161,7 +1260,7 @@ def run_health_check(args, password, site_vip, site_worker, run_start, ts, W):
     
         needs_crictl = want in (None, "cp")
         needs_kvip   = want in (None, "cp")
-        needs_nodes  = want in (None, "nodes")
+        needs_nodes  = want in (None, "nodes", "password")
         needs_deps   = want in (None, "vcf")
         needs_sts    = want in (None, "vcf")
         needs_certs  = want in (None, "certs")
@@ -1225,6 +1324,9 @@ def run_health_check(args, password, site_vip, site_worker, run_start, ts, W):
     
         run("argo",     "ARGO WORKFLOWS  (vmsp-platform)",
             chk_argo, cp_host, password, args.verbose)
+
+        run("kyverno",  "KYVERNO POLICIES  (vmsp-policies)",
+            chk_kyverno, cp_host, password, args.verbose)
     
         run("vodap",    "VODAP HEALTH  (ClickHouse cert + fluentd buffers)",
             chk_vodap, cp_host, password, args.verbose)
@@ -1236,7 +1338,7 @@ def run_health_check(args, password, site_vip, site_worker, run_start, ts, W):
             chk_kubeadm_certs, cp_host, password, args.verbose)
     
         run("password", "PASSWORD EXPIRATION",
-            chk_password_expiration, cp_host, password, args.verbose)
+            chk_password_expiration, nodes_data, cp_host, password, args.verbose)
     
         # ── Summary ───────────────────────────────────────────────────────────────
         total   = len(all_results)
