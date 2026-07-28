@@ -3455,14 +3455,14 @@ echo "PROXY_CONFIGURED"
                     lsf.write_output(f'  {_chage_host}: Ensuring vmware-system-user and root passwords expire in 730 days...')
                     try:
                         _chage_cmd = (
-                            f"echo '{password}' | sudo -S chage -M -730 vmware-system-user 2>&1; "
-                            f"echo '{password}' | sudo -S chage -M -730 root 2>&1"
+                            f"echo '{password}' | sudo -S chage -M 730 vmware-system-user 2>&1; "
+                            f"echo '{password}' | sudo -S chage -M 730 root 2>&1"
                         )
                         _cr = lsf.ssh(_chage_cmd, f'vmware-system-user@{_chage_host}', password)
                         if _cr.returncode == 0:
                             lsf.write_output(f'  {_chage_host}: vmware-system-user and root password expiration set to 730 days')
                         else:
-                            lsf.write_output(f'  {_chage_host}: WARNING — chage -M -730 returned exit {_cr.returncode}')
+                            lsf.write_output(f'  {_chage_host}: WARNING — chage -M 730 returned exit {_cr.returncode}')
                     except Exception as _ce:
                         lsf.write_output(f'  {_chage_host}: WARNING — could not run chage: {_ce}')
 
