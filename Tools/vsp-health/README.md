@@ -25,15 +25,15 @@ equivalent resolution order.
 
 | Script | Version | Mode | Purpose |
 | ------ | ------- | ---- | ------- |
-| `vsp-health.py` | 2.5.0 | Read-only | Full cluster health sweep — diagnose before acting |
-| `vsp-health-monitor.py` | 2.3 | Automated (cron) | Detects + optionally remediates 15 recurring failure modes every 5 min |
+| `vsp-health.py` | 2.6.0 | Read-only | Full cluster health sweep — diagnose before acting |
+| `vsp-health-monitor.py` | 2.4 | Automated (cron) | Detects + optionally remediates 15 recurring failure modes every 5 min |
 | `kube-fix.py` | 1.1.0 | Remediation | Control-plane VIP drop + kube-controller-manager/kube-scheduler backoff |
 | `salt-stabilize.py` | 1.1.0 | Remediation | Salt RAAS / salt-master / salt-minion crash recovery |
 | `vodap-fix.py` | 1.1.0 | Remediation | ClickHouse TLS cert staleness + fluentd buffer disk full |
 
 ---
 
-## `vsp-health.py` — Comprehensive Health Check (v2.5.0)
+## `vsp-health.py` — Comprehensive Health Check (v2.6.0)
 
 Full read-only diagnostic sweep across all VSP components. Run this first to
 understand what's wrong before running any remediation script. Every check
@@ -48,7 +48,7 @@ in this script has a corresponding automated fix in `vsp-health-monitor.py`
 | `nodes` | Every node: Ready state, SchedulingDisabled |
 | `pods` | All pods in ALL namespaces — one line per namespace (`ready/total`), unhealthy pods listed inline with reason |
 | `vcf` | All VCF-managed workloads (`vcfcomponents`) — `spec.replicas` vs `readyReplicas`, detects scaled-to-0, plus `components.api.vmsp.vmware.com` operational-status |
-| `postgres` | All Zalando Spilo instances — container readiness, suspended CRD label, `numberOfInstances` vs. saved original-instances annotation |
+| `postgres` | All Zalando Spilo instances — container readiness, suspended CRD label, `numberOfInstances` vs. saved original-instances annotation, Patroni leader endpoint validity |
 | `redis` | Redis pod readiness + `redis-service` endpoint population |
 | `salt` | salt-master / salt-minion readiness + log tail for SSL / RAAS stop errors |
 | `certs` | cert-manager `Certificate` resources — Ready condition + days to expiry |

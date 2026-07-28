@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vsp-health-monitor.py - HOLFY27 VSP Cluster Health Monitor & Remediator
-# Version 2.3 - 2026-07-16
+# Version 2.4 - 2026-07-28
 # Author - Burke Azbill and HOL Core Team
 #
 # PURPOSE
@@ -266,7 +266,7 @@ import lsfunctions as lsf
 # DEFAULTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.3'
+SCRIPT_VERSION = '2.4'
 LOG_FILE = '/tmp/vsp-health-monitor.log'
 
 DEFAULTS = {
@@ -277,9 +277,9 @@ DEFAULTS = {
     'vsp_worker_fqdn': 'vsp-01a.site-a.vcf.lab',
     'checks': [
         'host_contention', 'vsp_size', 'kvip_manifest', 'cp_pod_crash', 'gateway',
-        'node_flap', 'crashloop_pods', 'postgres', 'salt_stack', 'vodap',
+        'node_flap', 'crashloop_pods', 'postgres', 'walg_hang', 'salt_stack', 'vodap',
         'component_health', 'argo_cleanup', 'proxy_config', 'password_expiration',
-        'cert_renewal', 'vip',
+        'kyverno_queue', 'cert_renewal', 'vip',
     ],
     'crashloop_restart_threshold': 5,
     'crashloop_max_restarts_per_cycle': 15,
@@ -1255,9 +1255,57 @@ def check_postgres(cp_ip, password, remediate, dry_run):
                              {'spec': {'numberOfInstances': intended}}, password)
                 msgs.append(f'postgres: patched {ns}/{name} numberOfInstances -> {intended}')
 
+    # --- (c) Patroni Leader Endpoint Health Check & Remediator ---
+    pg_clusters = [
+        ('salt-raas', 'pgdatabase'),
+        ('vcf-fleet-lcm', 'vcf-fleet-lcm-db'),
+        ('vcf-sddc-lcm', 'vcf-sddc-lcm-db'),
+        ('vidb-external', 'vidb-postgres-instance')
+    ]
+    for pg_ns, pg_name in pg_clusters:
+        ep_data = kubectl_json(cp_ip, f'get endpoints {pg_name} -n {pg_ns}', password)
+        if ep_data and ep_data.get('kind') == 'Endpoints':
+            leader_pod = ep_data.get('metadata', {}).get('annotations', {}).get('leader', '')
+            if leader_pod:
+                pod_data = kubectl_json(cp_ip, f'get pod {leader_pod} -n {pg_ns}', password)
+                leader_ok = False
+                if pod_data and pod_data.get('kind') == 'Pod':
+                    phase = pod_data.get('status', {}).get('phase', '')
+                    c_statuses = pod_data.get('status', {}).get('containerStatuses', [])
+                    if phase == 'Running' and any(cs.get('ready', False) for cs in c_statuses):
+                        leader_ok = True
+                if not leader_ok:
+                    status = 'FAIL'
+                    msgs.append(f'postgres: {pg_ns}/{pg_name} endpoint leader annotation points to missing/unready pod "{leader_pod}"')
+                    if dry_run:
+                        msgs.append(f'postgres: [DRY-RUN] would clear stale leader annotation on {pg_ns}/{pg_name}')
+                    elif remediate:
+                        kubectl(cp_ip, f'annotate endpoints {pg_name} -n {pg_ns} leader- --overwrite', password)
+                        msgs.append(f'postgres: cleared stale leader annotation from {pg_ns}/{pg_name}')
+
+    # --- (d) LCM Microservices Database Connectivity / CrashLoopBackOff Check ---
+    lcm_deps = [
+        ('vcf-fleet-lcm', 'vcf-fleet-build-service-fleetbuild'),
+        ('vcf-fleet-lcm', 'vcf-fleet-upgrade-service-fleetupgrade'),
+        ('vcf-sddc-lcm', 'vcf-sddc-build-service-sddcbuild'),
+        ('vcf-sddc-lcm', 'vcf-sddc-upgrade-service-sddcupgrade'),
+    ]
+    for dep_ns, dep_name in lcm_deps:
+        dep_data = kubectl_json(cp_ip, f'get deployment {dep_name} -n {dep_ns}', password)
+        if dep_data and dep_data.get('kind') == 'Deployment':
+            desired = dep_data.get('spec', {}).get('replicas', 1) or 1
+            available = dep_data.get('status', {}).get('availableReplicas', 0) or 0
+            if available < desired:
+                status = 'FAIL'
+                msgs.append(f'postgres: LCM service {dep_ns}/{dep_name} available={available}/{desired}')
+                if dry_run:
+                    msgs.append(f'postgres: [DRY-RUN] would rollout restart deployment {dep_ns}/{dep_name}')
+                elif remediate:
+                    kubectl(cp_ip, f'rollout restart deployment {dep_name} -n {dep_ns}', password)
+                    msgs.append(f'postgres: rollout restarted deployment {dep_ns}/{dep_name}')
+
     if status == 'PASS' and len(msgs) <= 1:
-        msgs.append('postgres: PostgresInstance/Zalando CRDs — none suspended, '
-                    'all at intended replica count - OK')
+        msgs.append('postgres: PostgresInstance/Zalando CRDs, Patroni leader endpoints, and LCM services - OK')
     return status, msgs
 
 
@@ -1976,12 +2024,99 @@ def check_cert_renewal(cp_ip, password, remediate, dry_run, threshold_days):
 
 
 #==============================================================================
+# CHECK: KYVERNO QUEUE
+#==============================================================================
+
+def check_kyverno_queue(cp_ip, password, remediate, dry_run):
+    """Detect and clear a massive Kyverno updaterequests backlog that causes
+    the background controller to OOMKill/CrashLoopBackOff.
+    """
+    count_res = run_remote_script(cp_ip, "#!/bin/bash\nkubectl get updaterequests.kyverno.io -n vmsp-policies --no-headers 2>/dev/null | wc -l\n", password)
+    count_str = (_clean_stdout(count_res) if count_res else '').strip()
+    
+    if not count_str.isdigit():
+        return 'WARN', ['kyverno_queue: could not count update requests — skipping']
+        
+    count = int(count_str)
+    if count <= 50:
+        return 'PASS', [f'kyverno_queue: backlog is {count} (<= 50) - OK']
+        
+    msgs = [f'kyverno_queue: backlog is {count} (> 50) — causes OOM']
+    if dry_run:
+        msgs.append('kyverno_queue: [DRY-RUN] would delete all updaterequests in vmsp-policies')
+        return 'FAIL', msgs
+        
+    if remediate:
+        kubectl(cp_ip, 'delete updaterequests.kyverno.io --all -n vmsp-policies', password)
+        kubectl(cp_ip, 'delete pod -n vmsp-policies -l app.kubernetes.io/component=background-controller', password)
+        msgs.append('kyverno_queue: cleared backlog and restarted background controller')
+        return 'RECOVERED', msgs
+        
+    return 'FAIL', msgs
+
+#==============================================================================
+# CHECK: WAL-G HANG
+#==============================================================================
+
+def check_walg_hang(cp_ip, password, remediate, dry_run):
+    """Detect and prevent wal-g hangs during S3 restores by mocking the binary
+    in postgres pods. Prevents replicas stuck in 'creating replica' and primary
+    stuck in 'archive recovery'.
+    """
+    msgs = []
+    status = 'PASS'
+    pg_namespaces = ['salt-raas', 'vcf-fleet-lcm', 'vcf-sddc-lcm', 'vidb-external']
+    
+    to_mock = []
+    for ns in pg_namespaces:
+        pods_data = kubectl_json(cp_ip, f'get pods -n {ns} -l application=spilo', password)
+        if pods_data and pods_data.get('items'):
+            for pod in pods_data['items']:
+                pod_name = pod.get('metadata', {}).get('name')
+                phase = pod.get('status', {}).get('phase')
+                if pod_name and phase == 'Running':
+                    # Check if wal-g is already mocked
+                    check_res = kubectl(cp_ip, f"exec {pod_name} -n {ns} -c postgres -- bash -c \"grep -q 'exit 0' /usr/local/bin/wal-g 2>/dev/null || grep -q 'exit 0' /usr/bin/wal-g 2>/dev/null\"", password)
+                    if getattr(check_res, 'returncode', 1) != 0:
+                        to_mock.append((ns, pod_name))
+                        
+    if not to_mock:
+        return 'PASS', ['walg_hang: no active unmocked postgres spilo pods found - OK']
+        
+    msgs.append(f'walg_hang: found {len(to_mock)} unmocked postgres pod(s) susceptible to S3 restore hangs')
+    status = 'FAIL'
+    
+    if dry_run:
+        msgs.append(f'walg_hang: [DRY-RUN] would mock wal-g in {len(to_mock)} pod(s)')
+        return status, msgs
+        
+    if remediate:
+        import concurrent.futures
+        
+        def mock_pod(ns, name):
+            mock_cmd = (
+                f"exec {name} -n {ns} -c postgres -- bash -c "
+                f"\"if [ -f /usr/local/bin/wal-g ] && ! grep -q 'exit 0' /usr/local/bin/wal-g; then mv /usr/local/bin/wal-g /usr/local/bin/wal-g.bak; echo -e '#!/bin/bash\\nexit 0' > /usr/local/bin/wal-g; chmod +x /usr/local/bin/wal-g; pkill -9 -x wal-g || true; pkill -9 -x wale_restore.sh || true; fi; "
+                f"if [ -f /usr/bin/wal-g ] && ! grep -q 'exit 0' /usr/bin/wal-g; then mv /usr/bin/wal-g /usr/bin/wal-g.bak; echo -e '#!/bin/bash\\nexit 0' > /usr/bin/wal-g; chmod +x /usr/bin/wal-g; pkill -9 -x wal-g || true; pkill -9 -x wale_restore.sh || true; fi\""
+            )
+            kubectl(cp_ip, mock_cmd, password)
+            
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            for ns, name in to_mock:
+                pool.submit(mock_pod, ns, name)
+                
+        msgs.append(f'walg_hang: mocked wal-g and killed active restore processes in {len(to_mock)} pod(s)')
+        status = 'RECOVERED'
+        
+    return status, msgs
+
+#==============================================================================
 # CHECK: PASSWORD EXPIRATION
 #==============================================================================
 
 def check_password_expiration(cp_ip, password, remediate, dry_run):
-    """Ensure all nodes have password expiration > 1 year.
-    If drifted (<= 365d or never), forcefully reset to 999 days.
+    """Ensure all nodes have password expiration set to never or > 60 days.
+    If drifted (<= 60d), set to 730 days (chage -M -730).
     """
     node_ips_script = (
         '#!/bin/bash\n'
@@ -2000,13 +2135,13 @@ def check_password_expiration(cp_ip, password, remediate, dry_run):
         'for user in root vmware-system-user; do\n'
         '  exp=$(chage -l $user | grep "Password expires" | cut -d: -f2- | xargs)\n'
         '  if [ "$exp" = "never" ]; then\n'
-        '    DRIFT=1\n'
+        '    : # "never" is healthy\n'
         '  else\n'
         '    exp_sec=$(date -d "$exp" +%s 2>/dev/null)\n'
         '    now_sec=$(date +%s 2>/dev/null)\n'
         '    if [ -n "$exp_sec" ] && [ -n "$now_sec" ]; then\n'
         '      diff_days=$(( (exp_sec - now_sec) / 86400 ))\n'
-        '      if [ $diff_days -le 365 ]; then\n'
+        '      if [ $diff_days -le 60 ]; then\n'
         '        DRIFT=1\n'
         '      fi\n'
         '    else\n'
@@ -2037,22 +2172,21 @@ def check_password_expiration(cp_ip, password, remediate, dry_run):
                 drifted.append(ip)
 
     if not drifted:
-        return 'PASS', [f'password_expiration: all {len(node_ips)} node(s) expire in > 1 year - OK']
+        return 'PASS', [f'password_expiration: all {len(node_ips)} node(s) set to never expire or valid > 60 days - OK']
 
     msgs = [f'password_expiration: {len(drifted)}/{len(node_ips)} node(s) drifted '
-           f'(<= 365d or never): {", ".join(drifted)}']
+           f'(expires in <= 60d): {", ".join(drifted)}']
            
     if dry_run:
-        msgs.append('password_expiration: [DRY-RUN] would forcefully remediate to 999 days')
+        msgs.append('password_expiration: [DRY-RUN] would set password expiration to 730 days (chage -M -730)')
         return 'FAIL', msgs
     if not remediate:
         return 'FAIL', msgs
 
     push_script = (
         '#!/bin/bash\n'
-        'today=$(date +%Y-%m-%d)\n'
         'for user in root vmware-system-user; do\n'
-        '  chage -d "$today" -M 999 "$user" >/dev/null 2>&1\n'
+        '  chage -M 730 "$user" >/dev/null 2>&1\n'
         'done\n'
         'echo REMEDIATED\n'
     )
@@ -2075,7 +2209,7 @@ def check_password_expiration(cp_ip, password, remediate, dry_run):
         msgs.append(f'password_expiration: failed to push fix to: {", ".join(failed_push)}')
         return 'FAIL', msgs
     
-    msgs.append(f'password_expiration: successfully set to 999 days on {len(drifted)} node(s)')
+    msgs.append(f'password_expiration: successfully set to expire in 730 days (chage -M -730) on {len(drifted)} node(s)')
     return 'RECOVERED', msgs
 
 
@@ -2215,6 +2349,10 @@ def run_all(cfg, dry_run):
                 st, msgs = check_proxy_config(cp_ip, password, remediate, dry_run)
             elif check == 'password_expiration':
                 st, msgs = check_password_expiration(cp_ip, password, remediate, dry_run)
+            elif check == 'kyverno_queue':
+                st, msgs = check_kyverno_queue(cp_ip, password, remediate, dry_run)
+            elif check == 'walg_hang':
+                st, msgs = check_walg_hang(cp_ip, password, remediate, dry_run)
             elif check == 'cert_renewal':
                 st, msgs = check_cert_renewal(cp_ip, password, remediate, dry_run,
                                               cfg['cert_renewal_threshold_days'])

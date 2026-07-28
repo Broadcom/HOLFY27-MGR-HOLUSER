@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.24 - 2026-07-13
+# Version 2.25 - 2026-07-25
 # Author - Burke Azbill and HOL Core Team
 #
 # Script Naming Convention:
@@ -10,6 +10,12 @@
 # Supports both VCF 9.1 and VVF 9.1 lab types (VVF-only steps are skipped).
 #
 # CHANGELOG:
+# v2.25 - 2026-07-25:
+#   - Enhanced password expiration logic (`chage`) for VCF Operations VMs (`opsvm`)
+#     and VSP nodes to include `-d $(date +%Y-%m-%d)` along with `-M 999`, preventing
+#     stale shadow file last-changed dates from producing 2026 expiration calculations
+#     in VCF Operations. Added `consoleuser` and `root` account handling for VCF Operations
+#     for networks (`opsnet-a` / `10.1.1.60`).
 # v2.24 - 2026-07-13:
 #   - Reworked Step 8b fix_vsp_controlplane_sizing() to use the SUPPORTED,
 #     operator-honored lever: it bumps the vsp ComponentVersion's ACTIVE size
@@ -2635,7 +2641,7 @@ def configure_operations_vms(auth_keys_file: str, password: str,
             if ssh_user == 'root':
                 # Direct root SSH
                 lsf.write_output(f'{opsvm}: Setting non-expiring password for root...')
-                result = lsf.ssh('chage -M 999 root', f'root@{opsvm}', password)
+                result = lsf.ssh('chage -d $(date +%Y-%m-%d) -M 999 root', f'root@{opsvm}', password)
                 if result.returncode == 0:
                     lsf.write_output(f'{opsvm}: SUCCESS - Non-expiring password set for root')
                 elif result.returncode == 255:
@@ -2668,9 +2674,9 @@ def configure_operations_vms(auth_keys_file: str, password: str,
                 # vmware-system-user SSH with sudo
                 user_auth_file = f'/home/{ssh_user}/.ssh/authorized_keys'
                 
-                for account in [ssh_user, 'root']:
+                for account in [ssh_user, 'root', 'consoleuser', 'support']:
                     lsf.write_output(f'{opsvm}: Setting non-expiring password for {account}...')
-                    chage_cmd = f"echo '{password}' | sudo -S chage -M -1 {account}"
+                    chage_cmd = f"echo '{password}' | sudo -S chage -d $(date +%Y-%m-%d) -M 999 {account}"
                     result = lsf.ssh(chage_cmd, f'{ssh_user}@{opsvm}', password)
                     if result.returncode == 0:
                         lsf.write_output(f'{opsvm}: SUCCESS - Non-expiring password set for {account}')
@@ -5256,7 +5262,7 @@ def configure_vsp_passwords(dry_run: bool = False) -> bool:
 
             for account in [VSP_SSH_USER, 'root']:
                 lsf.write_output(f'{node_ip}: Setting non-expiring password for {account}...')
-                chage_cmd = f"echo '{password}' | sudo -S chage -M 999 {account}"
+                chage_cmd = f"echo '{password}' | sudo -S chage -d $(date +%Y-%m-%d) -M 999 {account}"
                 res = lsf.ssh(chage_cmd, f'{VSP_SSH_USER}@{node_ip}', password)
                 if res.returncode == 0:
                     lsf.write_output(f'{node_ip}: SUCCESS - Non-expiring password set for {account}')

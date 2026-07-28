@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VCFA Complete Stabilization Script v2.19
-# Version 2.19 - 2026-07-23
+# VCFA Complete Stabilization Script v2.20
+# Version 2.20 - 2026-07-25
 # Author - HOL Core Team
 #
 # Default-run philosophy (v2.6+): one run of the script with no flags should leave the VCFA in a
@@ -49,6 +49,16 @@
 #     unconditionally just churns rollouts. Set FORCE_KYVERNO_FIX=1 to bypass the heuristic.
 #
 # See VCFA_Stabilizer_Incident_Apr2026.md for the gateway/EnvoyProxy guidance and HTTP 503 recovery.
+#
+# v2.20 changelog (2026-07-25):
+#  * ENHANCEMENT: Adopted control-plane static manifest enhancements from hol-remediate.sh into
+#    fix_overload_recovery():
+#    - Added kube-controller-manager and kube-scheduler leader election tuning flags
+#      (--leader-elect-lease-duration=60s --leader-elect-renew-deadline=40s --leader-elect-retry-period=6s)
+#      to prevent election loss under high CPU load.
+#    - Added etcd CPU request enforcement (resources.requests.cpu: 1000m) in /etc/kubernetes/manifests/etcd.yaml.
+#    - Added purge of stale .bak.* files from /etc/kubernetes/manifests/ to /root/manifest-bak/
+#      to prevent kubelet from reading duplicate static pod definitions.
 #
 # v2.19 changelog (2026-07-23):
 #  * FIX (root cause, confirmed live): fix_envoy_gateway_sds_san_nack()'s old step "2/5" only ever
@@ -1530,7 +1540,26 @@ WDSVC
 fi
 
 echo
-echo "=== 2/6: etcd defrag (only if slack >= ${ETCD_SLACK_PCT}%) ==="
+echo "=== 2/6: etcd CPU request enforcement & defrag (only if slack >= ${ETCD_SLACK_PCT}%) ==="
+ETCD_M=/etc/kubernetes/manifests/etcd.yaml
+if [[ -f "$ETCD_M" ]]; then
+    ETCD_CPU=$(grep -A1 'requests:' "$ETCD_M" 2>/dev/null | grep 'cpu:' | awk '{print $2}' || true)
+    if [[ "$ETCD_CPU" != "1000m" && "$ETCD_CPU" != "1" ]]; then
+        mkdir -p /root/manifest-bak
+        cp -a "$ETCD_M" "/root/manifest-bak/etcd.yaml.bak.$(date +%s)"
+        python3 - "$ETCD_M" <<'PY'
+import sys, re
+p = sys.argv[1]
+s = open(p).read()
+if 'requests:' in s and 'cpu:' in s:
+    s = re.sub(r'(requests:[\s\S]*?cpu:\s*)[\w\.]+', r'\g<1>1000m', s, count=1)
+    open(p, "w").write(s)
+    print("  etcd cpu request bumped to 1000m")
+PY
+    else
+        echo "  etcd cpu request already 1000m (no-op)"
+    fi
+fi
 ETCDCTL='etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/peer.crt --key=/etc/kubernetes/pki/etcd/peer.key --endpoints=https://127.0.0.1:2379'
 # Pull current slack% from etcdctl endpoint status JSON.
 # If the apiserver/etcd is unreachable, skip silently.
@@ -1557,6 +1586,11 @@ fi
 
 echo
 echo "=== 3/6: harden kube-vip lease/renew/retry/preserve (static pod manifest) ==="
+mkdir -p /root/manifest-bak
+if ls /etc/kubernetes/manifests/*.bak.* >/dev/null 2>&1; then
+    mv /etc/kubernetes/manifests/*.bak.* /root/manifest-bak/ 2>/dev/null || true
+    echo "  moved manifest backup files out of /etc/kubernetes/manifests/ to /root/manifest-bak/"
+fi
 M=/etc/kubernetes/manifests/kube-vip.yaml
 if [[ -f "$M" ]]; then
     # 3a. Remove unsupported CLI args that crash kube-vip v1.0.x.
@@ -1572,7 +1606,7 @@ bad=["--leaseDuration","--renewDeadline","--retryPeriod"]
 old=c.get("args",[])
 new=[a for a in old if not any(a.startswith(f) for f in bad)]
 if new!=old:
-    shutil.copy2(p,p+".bak."+str(int(time.time())))
+    shutil.copy2(p,"/root/manifest-bak/kube-vip.yaml.bak."+str(int(time.time())))
     c["args"]=new
     yaml.dump(m,open(p,"w"),default_flow_style=False)
     os.utime(p,None)
@@ -1594,7 +1628,7 @@ print("CHANGE" if any(getv(s,k)!=v for k,v in desired.items()) else "OK")
 PY
 )
     if [[ "$KV_NEEDS" == "CHANGE" ]]; then
-        cp -a "$M" "${M}.bak.$(date +%s)"
+        cp -a "$M" "/root/manifest-bak/kube-vip.yaml.bak.$(date +%s)"
         python3 - <<'PY'
 import re
 p="/etc/kubernetes/manifests/kube-vip.yaml"
@@ -1636,7 +1670,7 @@ else
 fi
 
 echo
-echo "=== 4/6: probe timeouts on kube-apiserver/kube-controller-manager/kube-scheduler ==="
+echo "=== 4/6: probe timeouts and leader-election tuning on kube-apiserver/kube-controller-manager/kube-scheduler ==="
 for kind in kube-apiserver kube-controller-manager kube-scheduler; do
     M=/etc/kubernetes/manifests/${kind}.yaml
     [[ -f "$M" ]] || { echo "  (${kind} manifest not found, skipping)"; continue; }
@@ -1664,7 +1698,8 @@ print("CHANGE" if needs else "OK")
 PY
 )
     if [[ "$PR_NEEDS" == "CHANGE" ]]; then
-        cp -a "$M" "${M}.bak.$(date +%s)"
+        mkdir -p /root/manifest-bak
+        cp -a "$M" "/root/manifest-bak/${kind}.yaml.bak.$(date +%s)"
         python3 - "$M" <<'PY'
 import re, sys
 p=sys.argv[1]
@@ -1683,7 +1718,42 @@ PY
     else
         echo "  ${kind} probes already at desired values (period=10 timeout=30 failureThreshold=8) -- no-op"
     fi
+
+    # Leader election lease tuning for KCM and Scheduler
+    if [[ "$kind" == "kube-controller-manager" || "$kind" == "kube-scheduler" ]]; then
+        python3 - "$M" "$kind" <<'PY'
+import sys, re
+p = sys.argv[1]
+kind = sys.argv[2]
+s = open(p).read()
+target = {
+    "--leader-elect-lease-duration": "60s",
+    "--leader-elect-renew-deadline": "40s",
+    "--leader-elect-retry-period": "6s"
+}
+if "--leader-elect=true" in s:
+    changed = False
+    for k, v in target.items():
+        if f"{k}=" not in s:
+            s = re.sub(r'(\s+-\s+--leader-elect=true)', r'\1\n    - ' + f'{k}={v}', s, count=1)
+            changed = True
+        else:
+            m = re.search(re.escape(k) + r'=([^\s]+)', s)
+            if m and m.group(1) != v:
+                s = re.sub(re.escape(k) + r'=[^\s]+', f"{k}={v}", s)
+                changed = True
+    if changed:
+        open(p, "w").write(s)
+        print(f"  {kind} leader election lease parameters tuned (duration=60s renew=40s retry=6s)")
+    else:
+        print(f"  {kind} leader election lease parameters already at target (no-op)")
+PY
+    fi
 done
+mkdir -p /root/manifest-bak
+if ls /etc/kubernetes/manifests/*.bak.* >/dev/null 2>&1; then
+    mv /etc/kubernetes/manifests/*.bak.* /root/manifest-bak/ 2>/dev/null || true
+fi
 
 echo
 echo "=== 5/6: kyverno failurePolicy (only if needed: trouble detected or STABILIZER_FORCE_KYVERNO_FIX=1) ==="
@@ -2977,7 +3047,7 @@ CERT_CHECK_BODY
 # Main execution function
 main() {
     echo "======================================================================"
-    echo "           VCFA Complete Stabilization Script v2.19"
+    echo "           VCFA Complete Stabilization Script v2.20"
     echo "======================================================================"
     echo "Comprehensive VCFA stability solution for nested environments"
     echo "All phases run on every invocation; each step is self-checking and reports"
@@ -3130,7 +3200,7 @@ SIG
 # Handle script arguments
 case "${1:-}" in
     --help|-h)
-        echo "VCFA Complete Stabilization Script v2.19"
+        echo "VCFA Complete Stabilization Script v2.20"
         echo ""
         echo "Usage: $0 [options]"
         echo ""

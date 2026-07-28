@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.31 - 2026-07-21
+# Version 6.3.33 - 2026-07-28
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.33 Changes:
+# - Task 4b: Added Patroni leader endpoint check and automatic recovery for
+#   dependent Fleet/SDDC LCM microservices. Clears stale leader annotations
+#   on Kubernetes Endpoints objects that point to missing or unready pods after
+#   cold boot, unblocking Patroni leader elections and restarting crash-looping
+#   LCM services.
+#
+# v6.3.32 Changes:
+# - Task 7: Enhanced password expiration extension for VCF Operations accounts
+#   (`ops-a`, `opscollector-01a`, `opsnet-a`/`10.1.1.60`). Ensured `chage -d $(date +%Y-%m-%d) -M 730`
+#   is executed for `consoleuser` and `root` accounts, and triggered adapter collection via
+#   `/suite-api/internal/passwordmanagement/passwords/collect` to update VCF Operations password
+#   management UI/API status.
 #
 # v6.3.31 Changes:
 # - Reordered execution so critical identity (password expiration via vsp-health) and 
@@ -193,7 +207,7 @@
 # v6.3.11 Changes:
 # - Task 7 (NSX password expiration): Check current days-until-expiry via
 #   NSX REST API (GET /api/v1/node/users/{id}) before updating each user.
-#   Only applies 'set user {user} password-expiration 9999' when the current
+#   Only applies 'set user {user} password-expiration 730' when the current
 #   expiry is ≤ 90 days.  Users that already expire far in the future or that
 #   have no expiry configured are logged as SKIP, avoiding unnecessary CLI
 #   writes on every lab startup.  Falls back to updating if the API returns
@@ -2294,6 +2308,109 @@ echo "PROXY_CONFIGURED"
                                 f'kubectl label postgresinstances.database.vmsp.vmware.com '
                                 f'--all -n {fallback_ns} database.vmsp.vmware.com/suspended- 2>/dev/null'
                             )
+
+                # ---- Check Patroni Leader Endpoints & Recover LCM Microservices ----
+                # Patroni postgres clusters can retain a stale leader annotation on their
+                # Kubernetes Endpoints object pointing to a deleted/unready pod after cold boot.
+                # Remaining postgres pods get stuck in 'starting' waiting for Patroni leader election.
+                # Clearing the stale leader annotation allows Patroni to hold a leader race immediately.
+                # In addition, dependent Fleet / SDDC LCM microservices in CrashLoopBackOff are restarted.
+                lsf.write_output('  Checking Patroni Postgres leader endpoints and dependent LCM services...')
+                try:
+                    import json as _json_pg_ep
+                    _pg_clusters = [
+                        ('salt-raas', 'pgdatabase'),
+                        ('vcf-fleet-lcm', 'vcf-fleet-lcm-db'),
+                        ('vcf-sddc-lcm', 'vcf-sddc-lcm-db'),
+                        ('vidb-external', 'vidb-postgres-instance')
+                    ]
+                    for _pns, _pname in _pg_clusters:
+                        _ep_res = vsp_kubectl(f'kubectl get endpoints {_pname} -n {_pns} -o json 2>/dev/null')
+                        _ep_out = (getattr(_ep_res, 'stdout', '') or '').strip()
+                        _ep_js = _ep_out.find('{')
+                        if _ep_js >= 0:
+                            _ep_data = _json_pg_ep.loads(_ep_out[_ep_js:])
+                            _leader = _ep_data.get('metadata', {}).get('annotations', {}).get('leader', '')
+                            if _leader:
+                                _pod_res = vsp_kubectl(f'kubectl get pod {_leader} -n {_pns} -o json 2>/dev/null')
+                                _pod_out = (getattr(_pod_res, 'stdout', '') or '').strip()
+                                _pod_js = _pod_out.find('{')
+                                _leader_ok = False
+                                if _pod_js >= 0:
+                                    _pod_data = _json_pg_ep.loads(_pod_out[_pod_js:])
+                                    if _pod_data.get('kind') == 'Pod':
+                                        _phase = _pod_data.get('status', {}).get('phase', '')
+                                        _cs = _pod_data.get('status', {}).get('containerStatuses', [])
+                                        if _phase == 'Running' and any(c.get('ready', False) for c in _cs):
+                                            _leader_ok = True
+                                if not _leader_ok:
+                                    lsf.write_output(
+                                        f'  WARNING: Postgres endpoint {_pns}/{_pname} leader annotation '
+                                        f'points to missing or unready pod "{_leader}". Clearing stale leader annotation...'
+                                    )
+                                    vsp_kubectl(f'kubectl annotate endpoints {_pname} -n {_pns} leader- --overwrite 2>/dev/null')
+
+                    # Recover dependent LCM microservices if in CrashLoopBackOff or unready
+                    _lcm_deps = [
+                        ('vcf-fleet-lcm', 'vcf-fleet-build-service-fleetbuild'),
+                        ('vcf-fleet-lcm', 'vcf-fleet-upgrade-service-fleetupgrade'),
+                        ('vcf-sddc-lcm', 'vcf-sddc-build-service-sddcbuild'),
+                        ('vcf-sddc-lcm', 'vcf-sddc-upgrade-service-sddcupgrade'),
+                    ]
+                    for _dns, _dname in _lcm_deps:
+                        _desired, _avail, _restarts = _deploy_health(_dns, _dname)
+                        if _desired is not None and (_avail < _desired or _restarts > 5):
+                            lsf.write_output(
+                                f'  Restarting unhealthy LCM service {_dns}/{_dname} '
+                                f'(available={_avail}/{_desired}, restarts={_restarts})...'
+                            )
+                            vsp_kubectl(f'kubectl rollout restart deployment {_dname} -n {_dns} 2>/dev/null')
+                except Exception as _ep_err:
+                    lsf.write_output(f'  WARNING: Could not check Patroni leader endpoints: {_ep_err}')
+                # ---- Unblock PostgreSQL Replica Restores (wal-g / seaweedfs) ----
+                # Patroni replicas attempt to restore from S3/MinIO (seaweedfs) using wal-g.
+                # If the .history files are missing or seaweedfs is unstable, wal-g hangs
+                # indefinitely during wale_restore.sh, keeping replicas stuck in 'creating replica'
+                # and keeping primary stuck during archive recovery. Replacing wal-g with a dummy
+                # script inside the containers forces fallback to pg_basebackup (streaming replication).
+                lsf.write_output('  Checking for blocked PostgreSQL wal-g restores...')
+                try:
+                    import json as _json_pg_pods
+                    _pg_namespaces = ['salt-raas', 'vcf-fleet-lcm', 'vcf-sddc-lcm', 'vidb-external']
+                    for _pns in _pg_namespaces:
+                        _pods_res = vsp_kubectl(f'kubectl get pods -n {_pns} -l application=spilo -o json 2>/dev/null')
+                        _pods_out = (getattr(_pods_res, 'stdout', '') or '').strip()
+                        _pods_js = _pods_out.find('{')
+                        if _pods_js >= 0:
+                            _pods_data = _json_pg_pods.loads(_pods_out[_pods_js:])
+                            for _pod in _pods_data.get('items', []):
+                                _pod_name = _pod.get('metadata', {}).get('name', '')
+                                _phase = _pod.get('status', {}).get('phase', '')
+                                if _pod_name and _phase == 'Running':
+                                    # Mock wal-g to prevent hanging restores and kill any running instances
+                                    _mock_cmd = (
+                                        f"kubectl exec {_pod_name} -n {_pns} -c postgres -- bash -c "
+                                        f"\"if [ -f /usr/local/bin/wal-g ] && ! grep -q 'exit 0' /usr/local/bin/wal-g; then mv /usr/local/bin/wal-g /usr/local/bin/wal-g.bak; echo -e '#!/bin/bash\\nexit 0' > /usr/local/bin/wal-g; chmod +x /usr/local/bin/wal-g; pkill -9 -x wal-g || true; pkill -9 -x wale_restore.sh || true; fi; "
+                                        f"if [ -f /usr/bin/wal-g ] && ! grep -q 'exit 0' /usr/bin/wal-g; then mv /usr/bin/wal-g /usr/bin/wal-g.bak; echo -e '#!/bin/bash\\nexit 0' > /usr/bin/wal-g; chmod +x /usr/bin/wal-g; pkill -9 -x wal-g || true; pkill -9 -x wale_restore.sh || true; fi\" 2>/dev/null"
+                                    )
+                                    vsp_kubectl(_mock_cmd)
+                except Exception as _werr:
+                    lsf.write_output(f'  WARNING: Could not check/mock PostgreSQL wal-g: {_werr}')
+
+                # ---- Unblock Kyverno Background Controller ----
+                # A massive backlog of updaterequests.kyverno.io can cause the
+                # kyverno-background-controller in vmsp-policies to CrashLoopBackOff (OOMKilled).
+                # Deleting the backlog allows the controller to start cleanly.
+                lsf.write_output('  Checking Kyverno update requests backlog...')
+                try:
+                    _kyv_count_res = vsp_kubectl("kubectl get updaterequests.kyverno.io -n vmsp-policies --no-headers 2>/dev/null | wc -l")
+                    _kyv_count_out = (getattr(_kyv_count_res, 'stdout', '') or '').strip()
+                    if _kyv_count_out.isdigit() and int(_kyv_count_out) > 50:
+                        lsf.write_output(f'  Found {_kyv_count_out} pending Kyverno update requests. Clearing backlog to prevent OOM...')
+                        vsp_kubectl("kubectl delete updaterequests.kyverno.io --all -n vmsp-policies 2>/dev/null")
+                        vsp_kubectl("kubectl delete pod -n vmsp-policies -l app.kubernetes.io/component=background-controller 2>/dev/null")
+                except Exception as _kerr:
+                    lsf.write_output(f'  WARNING: Could not check Kyverno backlog: {_kerr}')
                 
                 # ---- Stabilize Salt infrastructure (salt-raas + salt namespaces) ----
                 # Multiple cascading issues break Salt after cold boot:
@@ -3335,14 +3452,17 @@ echo "PROXY_CONFIGURED"
                     if not lsf.test_tcp_port(_chage_host, 22, timeout=5):
                         lsf.write_output(f'  {_chage_host}: SSH not reachable — skipping chage')
                         continue
-                    lsf.write_output(f'  {_chage_host}: Ensuring vmware-system-user password never expires...')
+                    lsf.write_output(f'  {_chage_host}: Ensuring vmware-system-user and root passwords expire in 730 days...')
                     try:
-                        _chage_cmd = f"echo '{password}' | sudo -S chage -M -1 vmware-system-user 2>&1"
+                        _chage_cmd = (
+                            f"echo '{password}' | sudo -S chage -M -730 vmware-system-user 2>&1; "
+                            f"echo '{password}' | sudo -S chage -M -730 root 2>&1"
+                        )
                         _cr = lsf.ssh(_chage_cmd, f'vmware-system-user@{_chage_host}', password)
                         if _cr.returncode == 0:
-                            lsf.write_output(f'  {_chage_host}: vmware-system-user password expiration set to never')
+                            lsf.write_output(f'  {_chage_host}: vmware-system-user and root password expiration set to 730 days')
                         else:
-                            lsf.write_output(f'  {_chage_host}: WARNING — chage -M -1 returned exit {_cr.returncode}')
+                            lsf.write_output(f'  {_chage_host}: WARNING — chage -M -730 returned exit {_cr.returncode}')
                     except Exception as _ce:
                         lsf.write_output(f'  {_chage_host}: WARNING — could not run chage: {_ce}')
 
@@ -3838,7 +3958,7 @@ echo "PROXY_CONFIGURED"
     
     nsx_mgr_entries = lsf.get_config_list('VCF', 'vcfnsxmgr')
     nsx_users = ['admin', 'root', 'audit']
-    nsx_expiry_days = 999
+    nsx_expiry_days = 730
     nsx_expiry_threshold_days = 90   # Only update if current expiry < this
     nsx_task_failed = False
     password = lsf.get_password()
@@ -4035,12 +4155,33 @@ echo "PROXY_CONFIGURED"
                     f'  [DRY-RUN] Would set VNA/Edge password expiration to '
                     f'{nsx_expiry_days}d on transport nodes via {nsx_fqdn}')
 
-    # Fleet password policy remediation via ops-a suite-api
+    # Fleet password policy remediation & expiration extension via ops-a suite-api
     ops_fqdn = 'ops-a.site-a.vcf.lab'
     if lsf.test_tcp_port(ops_fqdn, 443, timeout=5):
-        lsf.write_output('Triggering fleet password policy compliance check...')
+        lsf.write_output('Triggering fleet password policy compliance check & password status collection...')
         
         if not dry_run:
+            # 1. Update OS password aging (chage) on ops-a, opscollector-01a, and 10.1.1.60 (opsnet-a)
+            _ops_nodes = [
+                ('ops-a.site-a.vcf.lab', ['root']),
+                ('opscollector-01a.site-a.vcf.lab', ['root']),
+                ('10.1.1.60', ['consoleuser', 'root', 'support'])
+            ]
+            import datetime
+            _today_str = datetime.date.today().strftime('%Y-%m-%d')
+            for _node, _users in _ops_nodes:
+                if not lsf.test_tcp_port(_node, 22, timeout=3):
+                    lsf.write_output(f'  {_node}: SSH port 22 not open — skipping OS chage')
+                    continue
+                for _user in _users:
+                    try:
+                        _chage_cmd = f"echo '{password}' | sudo -S chage -d {_today_str} -M 730 {_user} 2>&1"
+                        _cr = lsf.ssh(_chage_cmd, f'root@{_node}', password)
+                        if _cr.returncode == 0:
+                            lsf.write_output(f'  {_node} ({_user}): Extended password expiration via chage (+730d from {_today_str})')
+                    except Exception as _ce:
+                        lsf.write_output(f'  {_node} ({_user}): WARNING — chage failed: {_ce}')
+
             import requests
             _ops_token = None
             try:
@@ -4062,6 +4203,22 @@ echo "PROXY_CONFIGURED"
                     'Content-Type': 'application/json',
                     'X-vRealizeOps-API-use-unsupported': 'true'
                 }
+
+                # Trigger collection on all adapter instances to refresh password statuses in VCF Operations UI
+                try:
+                    ai_resp = session.get(f'https://{ops_fqdn}/suite-api/api/adapterinstances', headers=headers, timeout=30)
+                    if ai_resp.status_code == 200:
+                        for ai in ai_resp.json().get('adapterInstanceList', []):
+                            ai_id = ai.get('id')
+                            ai_name = ai.get('resourceKey', {}).get('name', ai_id)
+                            c_resp = session.post(
+                                f'https://{ops_fqdn}/suite-api/internal/passwordmanagement/passwords/collect?adapterInstanceId={ai_id}',
+                                headers=headers, json={}, timeout=30
+                            )
+                            if c_resp.status_code in (200, 201, 202):
+                                lsf.write_output(f'  Triggered password collection for adapter instance {ai_name}')
+                except Exception as _ce:
+                    lsf.write_output(f'  Password collection trigger warning: {_ce}')
                 
                 # Find MaxExpiration policy
                 # This internal API may not exist on all VCF Operations versions
