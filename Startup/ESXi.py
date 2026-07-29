@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # ESXi.py - HOLFY27 Core ESXi Host Verification Module
-# Version 3.1 - 2026-07-14
+# Version 3.2 - 2026-07-29
 # Author - Burke Azbill and HOL Core Team
 # Verifies ESXi hosts are online and responsive
+# v3.2: Gate vsp* VM resource enforcement behind vsp-min-core-enforced = true config setting
 # v3.1: Enforce minimum resource requirements for vsp* VMs (12 CPU / 24 GB RAM)
 
 import os
@@ -260,19 +261,37 @@ def main(lsf=None, standalone=False, dry_run=False):
     ## powered-off VMs so the VM is never blocked from booting; powered-on VMs
     ## that are under-spec are logged but left untouched.  Hosts with no
     ## matching VMs are skipped silently.
+    ##
+    ## This enforcement is disabled by default (flag is False) and is ONLY
+    ## processed if vsp-min-core-enforced = true is present in config.ini.
     ##=========================================================================
 
-    VSP_MIN_CPU    = 12
-    VSP_MIN_MEM_MB = 24 * 1024  # 24 GB
+    vsp_min_core_enforced = False
+    if hasattr(lsf, 'config') and lsf.config:
+        for _sec in lsf.config.sections():
+            if lsf.config.has_option(_sec, 'vsp-min-core-enforced'):
+                try:
+                    if lsf.config.getboolean(_sec, 'vsp-min-core-enforced'):
+                        vsp_min_core_enforced = True
+                        break
+                except Exception:
+                    _val = str(lsf.config.get(_sec, 'vsp-min-core-enforced')).strip().lower()
+                    if _val in ('true', '1', 'yes', 'on'):
+                        vsp_min_core_enforced = True
+                        break
 
-    lsf.write_output('Checking vsp* VMs for minimum resource requirements '
-                     f'({VSP_MIN_CPU} CPUs / {VSP_MIN_MEM_MB} MB RAM)...')
-
-    if dry_run:
+    if not vsp_min_core_enforced:
+        lsf.write_output('vsp-min-core-enforced is not enabled in config.ini - skipping vsp* resource enforcement')
+    elif dry_run:
         lsf.write_output('Dry-run: skipping vsp* resource enforcement')
     elif not esx_hosts:
         lsf.write_output('No ESXi hosts configured - skipping vsp* resource check')
     else:
+        VSP_MIN_CPU    = 12
+        VSP_MIN_MEM_MB = 24 * 1024  # 24 GB
+
+        lsf.write_output('Checking vsp* VMs for minimum resource requirements '
+                         f'({VSP_MIN_CPU} CPUs / {VSP_MIN_MEM_MB} MB RAM)...')
         try:
             import re
             import ssl as _ssl_vsp
