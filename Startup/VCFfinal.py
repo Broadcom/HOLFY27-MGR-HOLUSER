@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.34 - 2026-08-03
+# Version 6.3.35 - 2026-08-03
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.35 Changes:
+# - Task 2e: Added an unconditional CSI controller vCenter-auth pre-flight,
+#   invoked right before "Scale up each component" (vsphere-csi-controller
+#   CrashLoopBackOff from a stale vCenter SSO password stalls FailedAttachVolume
+#   for every PVC-backed component scaled up next -- e.g. ops-logs log-store/
+#   log-processor hanging the scale-up wait for its full 20-minute timeout).
+#   Calls Tools/vsp-health/vsp-health-monitor.py --csi-preflight, which runs
+#   ONLY check_csi_controller() and deliberately bypasses [VSPMONITOR] enabled
+#   -- checking all 17 HOLFY27 lab config.ini files found only HOL-2740 has
+#   enabled=true, so the general (opt-in) VSP Health Monitor pass later in this
+#   module never runs on the other 16 and would never have caught this.
 #
 # v6.3.34 Changes:
 # - Task 6: Optimized opslogs rescue logic during VCF Component URL checks.
@@ -2854,6 +2866,33 @@ echo "PROXY_CONFIGURED"
                                 )
                     except (ValueError, Exception) as je:
                         lsf.write_output(f'  WARNING: Could not parse component JSON: {je}')
+
+                # ---- CSI controller vCenter-auth pre-flight ----
+                # Unconditional -- deliberately NOT gated by [VSPMONITOR] enabled like the
+                # general VSP Health Monitor pass later in this module. A stale vCenter SSO
+                # password on the CSI service account leaves vsphere-csi-controller
+                # CrashLoopBackOff, which stalls FailedAttachVolume for every PVC-backed pod
+                # we're about to scale up below (first observed: ops-logs log-store/
+                # log-processor hanging the scale-up wait for its full 20-minute timeout).
+                # Must run BEFORE the scale-up, not after -- see Tools/vsp-health/
+                # vsp-health-monitor.py's check_csi_controller() for the fix itself.
+                _csi_preflight_script = '/home/holuser/hol/Tools/vsp-health/vsp-health-monitor.py'
+                if os.path.isfile(_csi_preflight_script):
+                    try:
+                        _csi_result = subprocess.run(
+                            ['python3', '-u', _csi_preflight_script, '--csi-preflight'],
+                            capture_output=True, text=True, timeout=120)
+                        for _csi_line in (_csi_result.stdout or '').splitlines():
+                            if _csi_line.strip():
+                                lsf.write_output(f'  {_csi_line.strip()}')
+                        if _csi_result.returncode not in (0, 1):
+                            lsf.write_output(
+                                f'  WARNING: CSI pre-flight exited {_csi_result.returncode}: '
+                                f'{(_csi_result.stderr or "").strip()[:200]}')
+                    except Exception as _csi_exc:
+                        lsf.write_output(f'  WARNING: CSI pre-flight check failed (non-fatal): {_csi_exc}')
+                else:
+                    lsf.write_output(f'  CSI pre-flight script not found: {_csi_preflight_script} — skipping')
 
                 # ---- Scale up each component ----
                 lsf.write_output(f'  Processing {len(vcfcomponents)} component resources...')
