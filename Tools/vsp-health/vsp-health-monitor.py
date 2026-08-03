@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # vsp-health-monitor.py - HOLFY27 VSP Cluster Health Monitor & Remediator
-# Version 2.4 - 2026-07-28
+# Version 2.5 - 2026-08-03
 # Author - Burke Azbill and HOL Core Team
+#
+# v2.5: check_vsp_size now targets the BenS-validated 4 vCPU control-plane
+#       size (was a 12-vCPU floor, which conflicted with and would have
+#       reverted BenS's vsp-remediate.sh CP_TARGET=4 sizing).
 #
 # PURPOSE
 #   Detect and (optionally) remediate the recurring health failures that make
@@ -721,25 +725,28 @@ def check_host_contention(cp_ip, password, multiplier):
 
 
 #==============================================================================
-# CHECK: VSP CONTROL-PLANE SIZE (durable root-cause prevention — supervisor-k8s
-# #56/#59). Verifies + re-asserts the vsp ComponentVersion's active size profile
-# control-plane cpu >= 12 (the SUPPORTED, operator-honored lever). Workers are
-# left untouched. Re-patches only if it has been reverted, and the operator only
-# rolls the CP node when the value actually changes — so this is a cheap, safe
-# backstop, not a churn source.
+# CHECK: VSP CONTROL-PLANE SIZE (durable drift protection). Verifies + re-
+# asserts the vsp ComponentVersion's active size profile control-plane cpu at
+# the BenS-validated target (the SUPPORTED, operator-honored lever). A larger
+# CP was found to be the resource-stress trigger for the leader-election
+# storm, not the fix for it — do NOT raise this target back toward 12.
+# Workers are left untouched. Re-patches only if it has drifted from target,
+# and the operator only rolls the CP node when the value actually changes —
+# so this is a cheap, safe backstop, not a churn source.
 #==============================================================================
 
-VSP_MIN_CP_CPU = 12
+VSP_TARGET_CP_CPU = 4
 
 
 def check_vsp_size(cp_ip, password, remediate, dry_run):
-    """Ensure the vsp ComponentVersion's ACTIVE size profile gives the control
-    plane >= 12 vCPU. This is the durable, supported fix for the undersized-CP
-    root cause of the leader-election storm (see #56/#59): editing
-    Cluster.spec.topology or VSphereMachineTemplates is reverted by vmsp-operator
-    within ~90s, but the ComponentVersion `sizes` profile is the input the
-    operator honors. Bumps ONLY the active profile's control-plane cpu (leaves
-    its `worker` size untouched, so worker nodes are unaffected). Idempotent."""
+    """Ensure the vsp ComponentVersion's ACTIVE size profile keeps the control
+    plane at the BenS-validated 4 vCPU target (see vsp-remediate.sh
+    CP_TARGET=4). Editing Cluster.spec.topology or VSphereMachineTemplates is
+    reverted by vmsp-operator within ~90s, but the ComponentVersion `sizes`
+    profile is the input the operator honors. Corrects ONLY the active
+    profile's control-plane cpu if it has drifted away from target in either
+    direction (leaves its `worker` size untouched, so worker nodes are
+    unaffected). Idempotent."""
     comp = kubectl_json(cp_ip, 'get components.api.vmsp.vmware.com vsp', password)
     if not comp or 'spec' not in comp:
         return 'WARN', ['vsp_size: vsp Component not found (lab may not use VSP) — skipping']
@@ -762,14 +769,15 @@ def check_vsp_size(cp_ip, password, remediate, dry_run):
         cpu_max = 0.0
     worker = prof.get('worker', {}).get('size', '?')
 
-    if cpu_max >= VSP_MIN_CP_CPU:
+    if cpu_max == VSP_TARGET_CP_CPU:
         return 'PASS', [f'vsp_size: "{active}" profile CP cpu.max={cpu_max} '
-                        f'(>= {VSP_MIN_CP_CPU}), worker="{worker}" - OK']
+                        f'(== {VSP_TARGET_CP_CPU} target), worker="{worker}" - OK']
 
-    msgs = [f'vsp_size: "{active}" profile CP cpu.max={cpu_max} UNDERSIZED '
-            f'(< {VSP_MIN_CP_CPU}); worker="{worker}" (untouched)']
+    msgs = [f'vsp_size: "{active}" profile CP cpu.max={cpu_max} DRIFTED '
+            f'(target {VSP_TARGET_CP_CPU}); worker="{worker}" (untouched)']
     if dry_run:
-        msgs.append('vsp_size: [DRY-RUN] would bump the profile CP cpu to max 12/min 8')
+        msgs.append(f'vsp_size: [DRY-RUN] would correct the profile CP cpu to '
+                    f'max/min {VSP_TARGET_CP_CPU}')
         return 'FAIL', msgs
     if not remediate:
         return 'FAIL', msgs
@@ -779,14 +787,15 @@ def check_vsp_size(cp_ip, password, remediate, dry_run):
         s = json.loads(json.dumps(s))  # deep copy
         if s.get('name') == active:
             s.setdefault('resources', {}).setdefault('cpu', {})
-            s['resources']['cpu']['max'] = str(VSP_MIN_CP_CPU)
-            s['resources']['cpu']['min'] = '8'
+            s['resources']['cpu']['max'] = str(VSP_TARGET_CP_CPU)
+            s['resources']['cpu']['min'] = str(VSP_TARGET_CP_CPU)
         new_sizes.append(s)
     pres = kubectl_patch(cp_ip, 'componentversions.api.vmsp.vmware.com', cv_name, '',
                          {'spec': {'sizes': new_sizes}}, password, ptype='merge')
     if pres is not None and 'patched' in (_clean_stdout(pres) or '').lower():
-        msgs.append(f'vsp_size: bumped "{active}" profile CP cpu -> 12 (worker "{worker}" '
-                    f'unchanged); operator re-renders CP to 12 vCPU (only the CP rolls)')
+        msgs.append(f'vsp_size: corrected "{active}" profile CP cpu -> {VSP_TARGET_CP_CPU} '
+                    f'(worker "{worker}" unchanged); operator re-renders CP to '
+                    f'{VSP_TARGET_CP_CPU} vCPU (only the CP rolls)')
     else:
         msgs.append('vsp_size: WARNING — ComponentVersion patch did not confirm')
     return 'FAIL', msgs

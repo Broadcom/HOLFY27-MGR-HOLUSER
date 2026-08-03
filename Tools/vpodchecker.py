@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.8.6 - 2026-07-13
+# Version 2.8.7 - 2026-08-03
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.8.7 - 2026-08-03: check_vsp_node_resources() now checks control-plane
+#   nodes against the BenS-validated 4 vCPU / 10240 MiB target instead of the
+#   uniform 12 vCPU / 24GB floor it previously shared with worker nodes
+#   (control-plane and worker sizing targets are intentionally different).
 # v2.8.6 - 2026-07-13:
 #   - Added check_vsp_node_resources(): verifies every VSP cluster node
 #     (control plane AND workers) has >= 12 vCPU / >= 24GB memory, reading
@@ -601,11 +605,23 @@ def check_vm_configuration(vms: List, fix_issues: bool = True) -> List[CheckResu
 
 VSP_CP_VIP = '10.1.1.142'
 VSP_SSH_USER = 'vmware-system-user'
-VSP_MIN_NUMCPU = 12
+# BenS-validated control-plane target (vsp-remediate.sh CP_TARGET=4 / 10240
+# MiB) — do NOT raise this back toward the worker-tier numbers below; a
+# larger CP was found to be the resource-stress trigger for the
+# leader-election storm, not the fix for it.
+VSP_MIN_CP_NUMCPU = 4
+# ~10GB configured (10240 MiB) reports a bit lower via kubelet capacity due to
+# normal kernel/hypervisor reserve — threshold set with margin so a
+# correctly-sized CP never false-FAILs.
+VSP_MIN_CP_MEMORY_MIB = 9700
+
+# Worker sizing is unchanged from the ClusterClass default (vsp-remediate.sh
+# WORKER_TARGET_CPU=12, memory left at 24Gi) — not part of the BenS CP resize.
+VSP_MIN_WORKER_NUMCPU = 12
 # ~24GB configured (24576 MiB) reports a bit lower via kubelet capacity due to
 # normal kernel/hypervisor reserve (observed ~24025MiB on a 24576MiB VM) —
 # threshold set with margin so correctly-sized nodes never false-FAIL.
-VSP_MIN_MEMORY_MIB = 23000
+VSP_MIN_WORKER_MEMORY_MIB = 23000
 
 
 def _k8s_quantity_to_mib(qty: str) -> Optional[float]:
@@ -627,8 +643,9 @@ def _k8s_quantity_to_mib(qty: str) -> Optional[float]:
 
 def check_vsp_node_resources() -> List[CheckResult]:
     """
-    Verify every VSP cluster node (control plane AND workers) meets the
-    minimum sizing of >= 12 vCPU / >= 24GB memory.
+    Verify every VSP cluster node meets its role-appropriate sizing target:
+    control plane at the BenS-validated 4 vCPU / 10240 MiB, workers at
+    >= 12 vCPU / >= 24GB memory.
     """
     results: List[CheckResult] = []
 
@@ -695,11 +712,16 @@ def check_vsp_node_resources() -> List[CheckResult]:
                 cpu = 0
             mem_mib = _k8s_quantity_to_mib(mem_str) or 0
 
+            if is_control_plane:
+                min_cpu, min_mem = VSP_MIN_CP_NUMCPU, VSP_MIN_CP_MEMORY_MIB
+            else:
+                min_cpu, min_mem = VSP_MIN_WORKER_NUMCPU, VSP_MIN_WORKER_MEMORY_MIB
+
             issues = []
-            if cpu < VSP_MIN_NUMCPU:
-                issues.append(f'{cpu} vCPU (need >= {VSP_MIN_NUMCPU})')
-            if mem_mib < VSP_MIN_MEMORY_MIB:
-                issues.append(f'{mem_mib:.0f}MiB memory (need >= {VSP_MIN_MEMORY_MIB}MiB)')
+            if cpu < min_cpu:
+                issues.append(f'{cpu} vCPU (need >= {min_cpu})')
+            if mem_mib < min_mem:
+                issues.append(f'{mem_mib:.0f}MiB memory (need >= {min_mem}MiB)')
 
             if issues:
                 status = 'FAIL'

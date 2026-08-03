@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.25 - 2026-07-25
+# Version 2.26 - 2026-08-03
 # Author - Burke Azbill and HOL Core Team
+#
+# v2.26: fix_vsp_controlplane_sizing() now targets the BenS-validated 4 vCPU /
+#        10240 MiB control-plane size (was a 12-vCPU / 24576 MiB floor, which
+#        conflicted with BenS's vsp-remediate.sh CP_TARGET=4 sizing).
 #
 # Script Naming Convention:
 # This script is named according to the VCF version it was developed and
@@ -5170,8 +5174,11 @@ echo "PROXY_CONFIGURED"
 
 VSP_CP_VIP = '10.1.1.142'
 VSP_SSH_USER = 'vmware-system-user'
-VSP_TOPOLOGY_MIN_NUMCPU = 12
-VSP_TOPOLOGY_MIN_MEMORY_MIB = 24576
+# BenS-validated VSP control-plane target (vsp-remediate.sh CP_TARGET=4).
+# Do NOT raise this back toward 12 vCPU: a larger CP was found to be the
+# resource-stress trigger for the leader-election storm, not the fix for it.
+VSP_TOPOLOGY_TARGET_NUMCPU = 4
+VSP_TOPOLOGY_TARGET_MEMORY_MIB = 10240
 
 
 def _vsp_kubectl(cmd: str, password: str, vsp_cp_vip: str = VSP_CP_VIP) -> 'subprocess.CompletedProcess':
@@ -5275,8 +5282,9 @@ def configure_vsp_passwords(dry_run: bool = False) -> bool:
 
 def fix_vsp_controlplane_sizing(dry_run: bool = False) -> bool:
     """
-    Ensure the VSP control-plane node gets >= 12 vCPU via the SUPPORTED,
-    operator-honored lever: the vsp ComponentVersion `sizes` profile.
+    Ensure the VSP control-plane node is sized at the BenS-validated 4 vCPU
+    target via the SUPPORTED, operator-honored lever: the vsp ComponentVersion
+    `sizes` profile.
     """
     lsf.write_output('')
     lsf.write_output('=' * 60)
@@ -5343,11 +5351,11 @@ def fix_vsp_controlplane_sizing(dry_run: bool = False) -> bool:
         cp_mem = prof.get('controlPlane', {}).get('memory', '0Gi')
         lsf.write_output(f'{vsp_cp_vip}: Current profile "{active_size}" controlPlane: cpu={cp_cpu}, memory={cp_mem}')
 
-        if cp_cpu >= VSP_TOPOLOGY_MIN_NUMCPU:
-            lsf.write_output(f'{vsp_cp_vip}: VSP control plane already sized >= {VSP_TOPOLOGY_MIN_NUMCPU} vCPU - no action needed')
+        if cp_cpu == VSP_TOPOLOGY_TARGET_NUMCPU:
+            lsf.write_output(f'{vsp_cp_vip}: VSP control plane already sized at target ({VSP_TOPOLOGY_TARGET_NUMCPU} vCPU) - no action needed')
             continue
 
-        lsf.write_output(f'{vsp_cp_vip}: VSP control plane undersized ({cp_cpu} vCPU). Patching ComponentVersion {cv_name}...')
+        lsf.write_output(f'{vsp_cp_vip}: VSP control plane at {cp_cpu} vCPU, target is {VSP_TOPOLOGY_TARGET_NUMCPU}. Patching ComponentVersion {cv_name}...')
 
         if dry_run:
             lsf.write_output(f'{vsp_cp_vip}: [dry-run] would patch ComponentVersion controlPlane.cpu')
@@ -5358,7 +5366,7 @@ def fix_vsp_controlplane_sizing(dry_run: bool = False) -> bool:
             if p.get('name') == active_size:
                 if 'controlPlane' not in p:
                     p['controlPlane'] = {}
-                p['controlPlane']['cpu'] = VSP_TOPOLOGY_MIN_NUMCPU
+                p['controlPlane']['cpu'] = VSP_TOPOLOGY_TARGET_NUMCPU
 
         patch_payload = {'spec': {'sizes': sizes}}
         patch_json = json.dumps(patch_payload)
@@ -5367,7 +5375,7 @@ def fix_vsp_controlplane_sizing(dry_run: bool = False) -> bool:
         patch_res = _vsp_kubectl(patch_cmd, password, vsp_cp_vip)
 
         if getattr(patch_res, 'returncode', 1) == 0:
-            lsf.write_output(f'{vsp_cp_vip}: SUCCESS: Patched ComponentVersion {cv_name} controlPlane.cpu to {VSP_TOPOLOGY_MIN_NUMCPU}')
+            lsf.write_output(f'{vsp_cp_vip}: SUCCESS: Patched ComponentVersion {cv_name} controlPlane.cpu to {VSP_TOPOLOGY_TARGET_NUMCPU}')
         else:
             err = (getattr(patch_res, 'stderr', '') or getattr(patch_res, 'stdout', '') or '')
             lsf.write_output(f'{vsp_cp_vip}: FAILED to patch ComponentVersion: {err}')
