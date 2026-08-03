@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# vsp-stabilizer.sh   (v1.0.0 - 2026-07-25, HOL Core Team)
+# vsp-stabilizer.sh   (v1.1.0 - 2026-08-03, HOL Core Team)
 #
 # Dedicated stabilization script for the VSP Fleet Control-Plane Node (10.1.1.142).
 # Enforces durable remediation across two core areas:
@@ -12,8 +12,13 @@
 #       node-exporter).
 #   (B) Static-manifest lease & resource tuning --
 #       kube-controller-manager and kube-scheduler lease tuning (60s/40s/6s),
-#       etcd CPU request enforcement (1000m) + auto-compaction + defrag,
+#       etcd CPU request enforcement (2500m) + auto-compaction + defrag,
 #       and kube-vip static pod manifest hardening.
+#
+# v1.1.0: etcd CPU request raised from 1000m to 2500m to match BenS's later,
+#         empirically-validated value for the VSP CP's etcd (cgroup weight
+#         ~=98 vs ~=39) -- the drift-keeper timer was reverting BenS's
+#         manually-applied 2500m fix back to 1000m every 60s.
 #
 # Can be run locally on the VSP CP node or remotely from the Console VM via SSH.
 # =============================================================================
@@ -27,7 +32,7 @@ LOCKFILE="${STABILIZER_LOCKFILE:-/tmp/vsp-stabilizer.lock}"
 
 LEASE_DURATION="60s";  RENEW_DEADLINE="40s";  RETRY_PERIOD="6s"
 VIP_LEASE_DURATION="60"; VIP_RENEW_DEADLINE="40"; VIP_RETRY_PERIOD="6"
-ETCD_CPU_REQUEST="1000m"
+ETCD_CPU_REQUEST="2500m"
 
 log()     { echo "[INFO]  $(date +'%Y-%m-%d %H:%M:%S') $1"; }
 warning() { echo "[WARN]  $(date +'%Y-%m-%d %H:%M:%S') $1"; }

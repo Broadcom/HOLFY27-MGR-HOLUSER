@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.33 - 2026-07-28
+# Version 6.3.34 - 2026-08-03
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.34 Changes:
+# - Task 6: Optimized opslogs rescue logic during VCF Component URL checks.
+#   Annotates components.api.vmsp.vmware.com ops-logs to Running BEFORE
+#   scaling statefulset/log-processor and statefulset/log-store to replicas=1.
+#   Gated rescue to run ONLY ONCE on initial failure at attempt 5 (instead of
+#   repeatedly on attempts 5-29), preventing continuous pod lifecycle resets
+#   and allowing StatefulSet pods sufficient time to become Ready.
 #
 # v6.3.33 Changes:
 # - Task 4b: Added Patroni leader endpoint check and automatic recovery for
@@ -3906,6 +3914,7 @@ echo "PROXY_CONFIGURED"
                     lsf.write_output(f'  Expected text: {expected}')
                 
                 url_success = False
+                opslogs_rescued = False
                 for attempt in range(1, VCFC_URL_MAX_RETRIES + 1):
                     result = lsf.test_url(url, expected_text=expected, verify_ssl=False, timeout=30)
                     if result:
@@ -3919,14 +3928,16 @@ echo "PROXY_CONFIGURED"
                             vcfc_urls_failed += 1
                             lsf.labfail(f'VCF Component URL {url} not accessible after {VCFC_URL_MAX_RETRIES} minutes')
                         else:
-                            if attempt >= 5 and 'opslogs' in url.lower():
-                                lsf.write_output(f'  [WARNING] opslogs unreachable at attempt {attempt}. Re-scaling StatefulSets to 1 (VSP VIP 10.1.1.142)...')
+                            if attempt >= 5 and 'opslogs' in url.lower() and not opslogs_rescued:
+                                opslogs_rescued = True
+                                lsf.write_output(f'  [WARNING] opslogs unreachable at attempt {attempt}. Rescuing ops-logs component (VSP VIP 10.1.1.142)...')
                                 pwd = lsf.get_password()
+                                # Annotate Component CRD FIRST to prevent operator race-down
+                                lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl annotate components.api.vmsp.vmware.com ops-logs component.vmsp.vmware.com/operational-status=Running --overwrite 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
+                                # Scale StatefulSets SECOND
                                 scale_result = lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl scale statefulset/log-processor statefulset/log-store -n ops-logs --replicas=1 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
                                 scale_out = scale_result.stdout.strip() if hasattr(scale_result, 'stdout') and scale_result.stdout else '(no output / SSH failed)'
                                 lsf.write_output(f'  StatefulSet rescale result: {scale_out}')
-                                if 'scaled' in scale_out or 'unchanged' in scale_out:
-                                    lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl annotate components.api.vmsp.vmware.com ops-logs component.vmsp.vmware.com/operational-status=Running --overwrite 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
                             
                             lsf.write_output(f'  Sleeping and will try again... {attempt} / {VCFC_URL_MAX_RETRIES}')
                             lsf.labstartup_sleep(VCFC_URL_RETRY_DELAY)
