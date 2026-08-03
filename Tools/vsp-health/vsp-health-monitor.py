@@ -1,7 +1,52 @@
 #!/usr/bin/env python3
 # vsp-health-monitor.py - HOLFY27 VSP Cluster Health Monitor & Remediator
-# Version 2.5 - 2026-08-03
+# Version 2.9 - 2026-08-03
 # Author - Burke Azbill and HOL Core Team
+#
+# v2.9: v2.8's _shq()-only fix still broke live on DevPod with "/bin/sh: 1:
+#       Syntax error: EOF in backquote substitution" -- the real service-
+#       account password contains a backtick, and lsf.ssh() wraps its whole
+#       command in an OUTER pair of double quotes on the LOCAL shell (run_command
+#       uses shell=True) before anything reaches SSH, so a backtick still
+#       triggers local command substitution regardless of the inner single-quote
+#       escaping. Routed the dir-cli reset through a staged script file instead
+#       (same run_remote_script() pattern already used elsewhere in this file) --
+#       the password now only ever appears inside a file Python writes directly,
+#       never inside a string any shell parses.
+#
+# v2.8: Fixed check_csi_controller()'s dir-cli reset: the naive `--new
+#       '{target_password}'` wrapping broke silently (no output, no error
+#       surfaced) whenever the generated service-account password contained a
+#       literal single quote -- verified live on DevPod (HOL-2702): the account
+#       (svc-vcfsp-vc-ebyqro) also turned out to have password EXPIRED, not just
+#       mismatched, but even a manual dir-cli reset with a hand-typed password
+#       didn't fix login until the quoting was fixed, confirming the real stored
+#       secret password differs from any guessed value and must round-trip
+#       through the reset command intact. Added POSIX-safe _shq() escaping for
+#       both the target and admin passwords, and now surfaces stderr + gates the
+#       pod bounce on dir-cli actually printing "reset successfully" (previously
+#       bounced the pods unconditionally, masking a failed reset as done).
+#
+# v2.7: Added --csi-preflight, which runs ONLY check_csi_controller() and exits,
+#       bypassing [VSPMONITOR] enabled entirely. Checking all 17 HOLFY27 lab
+#       config.ini files showed only HOL-2740 has enabled=true -- on the other
+#       16 labs VCFfinal.py's own enabled-gate skips invoking this script
+#       altogether, so v2.6's csi_controller check (bundled behind the general,
+#       opt-in monitor) never ran. --csi-preflight gives VCFfinal.py a narrow,
+#       unconditional call for just this one safe-by-construction check, while
+#       the other 17 checks stay opt-in behind [VSPMONITOR].
+#
+# v2.6: Added csi_controller pre-flight check (vcf-troubleshooting: CSI service
+#       account password drift). vsphere-csi-controller/vsphere-csi-node in
+#       kube-system CrashLoopBackOff with "incorrect user name or password"
+#       against vc-mgmt-a leaves every PVC-backed pod cluster-wide stuck on
+#       FailedAttachVolume forever (first observed: ops-logs log-store/
+#       log-processor hanging labstartup.py's scale-up wait for the full
+#       20-minute timeout). Realigns vCenter SSO via dir-cli (same mechanism
+#       already used for VCFA's cluster in Tools/vcfa-stabilizer.sh, ported
+#       here for the VSP fleet cluster's separate svc-vcfsp-vc-* account) and
+#       bounces the CSI pods, run BEFORE crashloop_pods so the generic sweep
+#       never blindly restarts a CSI pod without fixing its credential first.
 #
 # v2.5: check_vsp_size now targets the BenS-validated 4 vCPU control-plane
 #       size (was a 12-vCPU floor, which conflicted with and would have
@@ -21,6 +66,9 @@
 #                  CrashLoopBackOff -> fleet-01a/vsp-01a/instance-01a VIPs down
 #     #6  / #11  - VCF component pods (fleet-lcm, vidb, depot, salt, ops-logs,
 #                  vodap) evicted / CrashLoopBackOff after cluster instability
+#     n/a        - vsphere-csi-controller/vsphere-csi-node CrashLoopBackOff from
+#                  a stale vCenter SSO password on the svc-vcfsp-vc-* account
+#                  (stalls every PVC attach cluster-wide; see csi_controller)
 #
 # WHERE IT RUNS
 #   On the MANAGER VM, NOT on a VSP node. VSP control-plane nodes are CAPI
@@ -270,7 +318,7 @@ import lsfunctions as lsf
 # DEFAULTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.4'
+SCRIPT_VERSION = '2.9'
 LOG_FILE = '/tmp/vsp-health-monitor.log'
 
 DEFAULTS = {
@@ -281,9 +329,9 @@ DEFAULTS = {
     'vsp_worker_fqdn': 'vsp-01a.site-a.vcf.lab',
     'checks': [
         'host_contention', 'vsp_size', 'kvip_manifest', 'cp_pod_crash', 'gateway',
-        'node_flap', 'crashloop_pods', 'postgres', 'walg_hang', 'salt_stack', 'vodap',
-        'component_health', 'argo_cleanup', 'proxy_config', 'password_expiration',
-        'kyverno_queue', 'cert_renewal', 'vip',
+        'csi_controller', 'node_flap', 'crashloop_pods', 'postgres', 'walg_hang',
+        'salt_stack', 'vodap', 'component_health', 'argo_cleanup', 'proxy_config',
+        'password_expiration', 'kyverno_queue', 'cert_renewal', 'vip',
     ],
     'crashloop_restart_threshold': 5,
     'crashloop_max_restarts_per_cycle': 15,
@@ -293,15 +341,18 @@ DEFAULTS = {
 }
 
 VSP_SSH_USER = 'vmware-system-user'
+VCENTER_MGMT_HOST = 'vc-mgmt-a.site-a.vcf.lab'
 
 # Control-plane static pods are handled by the node_flap check (or must not be
-# blindly bounced); the gateway check owns the gateway pods. Both are excluded
-# from the broad crashloop sweep to bound its blast radius.
+# blindly bounced); the gateway check owns the gateway pods; csi_controller owns
+# the CSI pods (a bad vCenter credential needs realigning, not just a restart).
+# All three are excluded from the broad crashloop sweep to bound its blast radius.
 CP_STATIC_POD_PREFIXES = (
     'etcd-', 'kube-apiserver-', 'kube-controller-manager-',
     'kube-scheduler-', 'kube-vip-',
 )
 GATEWAY_POD_SUBSTRINGS = ('envoy-gateway', 'vmsp-gateway', 'ops-logs-gateway')
+CSI_POD_SUBSTRINGS = ('vsphere-csi-controller', 'vsphere-csi-node')
 
 # Marker comment used to find/replace our own crontab line idempotently
 CRON_MARKER = '# vsp-health-monitor (HOLFY27 auto-installed)'
@@ -1038,6 +1089,160 @@ def check_gateway(cp_ip, password, remediate, dry_run, restart_threshold):
 
 
 #==============================================================================
+# CHECK: CSI CONTROLLER VCENTER AUTH (vcf-troubleshooting: CSI service account
+# password drift). The vSphere CSI driver's stored vCenter credential
+# (kube-system/vsphere-config-secret -> csi-vsphere.conf) stops matching the
+# svc-vcfsp-vc-* account's actual password in vCenter SSO (rotation drift).
+# vsphere-csi-controller then CrashLoopBackOffs on every restart with
+# "incorrect user name or password", and every PVC-backed pod cluster-wide
+# hangs forever on FailedAttachVolume waiting for a CSI driver that can never
+# come up (first observed: ops-logs log-store/log-processor stuck through
+# labstartup.py's full 20-minute scale-up wait). Blindly restarting the pod —
+# all the generic crashloop_pods check below would otherwise do, see
+# CSI_POD_SUBSTRINGS — never fixes it; the credential must be realigned first.
+#
+# Fix: read whichever password vsphere-cloud-secret already has for
+# VCENTER_MGMT_HOST (falls back to csi-vsphere.conf's own password if the
+# cloud secret is absent — this cluster may not run the in-tree cloud
+# provider), force vCenter SSO to match it via dir-cli (no local secret is
+# modified — vCenter is realigned to what Kubernetes already believes), then
+# bounce the CSI controller + node pods so they re-login with the now-matching
+# password. Same mechanism already used for VCFA's own cluster in
+# Tools/vcfa-stabilizer.sh, ported here for the VSP fleet cluster's separate
+# service account.
+#==============================================================================
+
+def check_csi_controller(cp_ip, password, remediate, dry_run):
+    """Detect vsphere-csi-controller CrashLoopBackOff caused by a stale
+    vCenter credential and realign vCenter's SSO password via dir-cli.
+    Returns (status, [messages])."""
+    import base64 as _b64
+    msgs = []
+
+    data = kubectl_json(cp_ip, 'get pods -n kube-system -l app=vsphere-csi-controller', password)
+    if not data or not data.get('items'):
+        return 'WARN', ['csi_controller: vsphere-csi-controller pod not found — skipping']
+
+    pod = data['items'][0]
+    pod_name = pod.get('metadata', {}).get('name', '')
+    ready, total, restarts, waiting, phase = _pod_health(pod)
+
+    if waiting not in ('CrashLoopBackOff', 'Error'):
+        return 'PASS', [f'csi_controller: {pod_name} OK ({ready}/{total} ready, restarts={restarts})']
+
+    log_result = kubectl(
+        cp_ip, f'logs -n kube-system {pod_name} -c vsphere-csi-controller --previous --tail=30', password)
+    logs = _clean_stdout(log_result) if log_result is not None else ''
+    if 'incorrect user name or password' not in logs:
+        return 'WARN', [f'csi_controller: {pod_name} {waiting} (restarts={restarts}) but logs do not show '
+                        f'the known vCenter-auth signature — leaving to the crashloop_pods sweep']
+
+    conf_secret = kubectl_json(cp_ip, 'get secret vsphere-config-secret -n kube-system', password)
+    if not conf_secret:
+        return 'FAIL', [f'csi_controller: {pod_name} failing vCenter login but vsphere-config-secret '
+                        f'not found in kube-system — cannot determine the service account']
+
+    conf_b64 = conf_secret.get('data', {}).get('csi-vsphere.conf', '')
+    conf_text = _b64.b64decode(conf_b64).decode('utf-8') if conf_b64 else ''
+    csi_account = None
+    csi_conf_password = None
+    for line in conf_text.splitlines():
+        line = line.strip()
+        if line.startswith('user') and '=' in line:
+            csi_account = line.split('=', 1)[1].strip().strip('"').split('@')[0]
+        elif line.startswith('password') and '=' in line:
+            csi_conf_password = line.split('=', 1)[1].strip().strip('"')
+
+    if not csi_account:
+        return 'FAIL', [f'csi_controller: {pod_name} failing vCenter login but could not parse the '
+                        f'service account name out of csi-vsphere.conf']
+
+    # Prefer vsphere-cloud-secret's copy of the password (the in-tree cloud provider's
+    # own credential) when present — mirrors Tools/vcfa-stabilizer.sh's fix for the same
+    # failure class on VCFA's cluster. Falls back to csi-vsphere.conf's own password.
+    cloud_secret = kubectl_json(cp_ip, 'get secret vsphere-cloud-secret -n kube-system', password)
+    target_password = csi_conf_password
+    if cloud_secret:
+        cloud_pw_b64 = cloud_secret.get('data', {}).get(f'{VCENTER_MGMT_HOST}.password', '')
+        if cloud_pw_b64:
+            target_password = _b64.b64decode(cloud_pw_b64).decode('utf-8')
+
+    if not target_password:
+        return 'FAIL', [f'csi_controller: {pod_name} failing vCenter login for {csi_account}@vsphere.local '
+                        f'but no password could be recovered from either secret']
+
+    msgs.append(f'csi_controller: {pod_name} {waiting} (restarts={restarts}) — vCenter login failing for '
+               f'{csi_account}@vsphere.local (stale/rotated SSO password)')
+
+    if dry_run:
+        msgs.append(f'csi_controller: [DRY-RUN] would dir-cli reset {csi_account}@vsphere.local on '
+                   f'{VCENTER_MGMT_HOST} and restart the CSI controller + node pods')
+        return 'FAIL', msgs
+    if not remediate:
+        return 'FAIL', msgs
+
+    def _shq(s):
+        # POSIX single-quote escaping: close the quote, insert a literal
+        # single quote via a double-quoted segment, reopen the quote. Needed
+        # because generated service-account passwords can contain any shell
+        # metacharacter, including a literal single quote.
+        return "'" + s.replace("'", "'\"'\"'") + "'"
+
+    # A generated service-account password can contain backticks/`$(...)`/etc.
+    # lsf.ssh() wraps its command in an OUTER pair of double quotes, and that
+    # wrapping happens on the LOCAL shell (run_command uses shell=True) before
+    # anything is sent over SSH — so a backtick inside the command, even
+    # correctly single-quoted for the REMOTE shell, still triggers local
+    # command substitution and breaks with "EOF in backquote substitution"
+    # (observed live on DevPod). Sidestep entirely by staging a script file
+    # (same run_remote_script() pattern used elsewhere in this file) — the
+    # password only ever appears inside a file Python writes directly, never
+    # inside a string a shell parses twice.
+    import tempfile as _tempfile
+    reset_script_text = (
+        '#!/bin/bash\n'
+        f"/usr/lib/vmware-vmafd/bin/dir-cli password reset --account {csi_account} "
+        f"--new {_shq(target_password)} --login administrator@vsphere.local --password {_shq(password)}\n"
+    )
+    local_script = None
+    reset_out = ''
+    reset_err = ''
+    try:
+        with _tempfile.NamedTemporaryFile('w', suffix='.sh', delete=False) as f:
+            f.write(reset_script_text)
+            local_script = f.name
+        remote_script = f'/tmp/vsp_mon_csi_reset_{int(time.time() * 1000)}.sh'
+        scp_r = lsf.scp(local_script, f'root@{VCENTER_MGMT_HOST}:{remote_script}', password)
+        if getattr(scp_r, 'returncode', 1) != 0:
+            return 'FAIL', msgs + [f'csi_controller: failed to stage dir-cli reset script on '
+                                   f'{VCENTER_MGMT_HOST} (scp rc={getattr(scp_r, "returncode", "?")})']
+        reset_result = lsf.ssh(f'bash {remote_script}', f'root@{VCENTER_MGMT_HOST}', password)
+        reset_out = _clean_stdout(reset_result) if reset_result is not None else ''
+        reset_err = (getattr(reset_result, 'stderr', '') or '') if reset_result is not None else ''
+        lsf.ssh(f'rm -f {remote_script}', f'root@{VCENTER_MGMT_HOST}', password)
+    finally:
+        if local_script:
+            try:
+                os.remove(local_script)
+            except OSError:
+                pass
+
+    reset_ok = 'reset successfully' in reset_out.lower()
+    msgs.append(f'csi_controller: dir-cli reset for {csi_account}@vsphere.local on {VCENTER_MGMT_HOST}: '
+               f'{(reset_out.strip() or reset_err.strip() or "(no output)")[:200]}')
+
+    if not reset_ok:
+        msgs.append('csi_controller: dir-cli reset did not confirm success — leaving CSI pods as-is '
+                   'rather than bouncing them against a possibly-unchanged credential')
+        return 'FAIL', msgs
+
+    kubectl(cp_ip, 'delete pod -n kube-system -l app=vsphere-csi-controller --grace-period=0 --force', password)
+    kubectl(cp_ip, 'delete pod -n kube-system -l app=vsphere-csi-node --grace-period=0 --force', password)
+    msgs.append('csi_controller: restarted CSI controller + node pods — verified next cycle')
+    return 'RECOVERED', msgs
+
+
+#==============================================================================
 # CHECK: NODE FLAP (vcf-troubleshooting #3 / #56)
 #==============================================================================
 
@@ -1147,6 +1352,8 @@ def check_crashloop_pods(cp_ip, password, remediate, dry_run,
         if any(name.startswith(p) for p in CP_STATIC_POD_PREFIXES):
             continue
         if any(sub in name for sub in GATEWAY_POD_SUBSTRINGS):
+            continue
+        if any(sub in name for sub in CSI_POD_SUBSTRINGS):
             continue
         ready, total, restarts, waiting, phase = _pod_health(pod)
         if waiting in ('CrashLoopBackOff', 'Error') and restarts >= threshold:
@@ -2336,6 +2543,8 @@ def run_all(cfg, dry_run):
             elif check == 'gateway':
                 st, msgs = check_gateway(cp_ip, password, remediate, dry_run,
                                           cfg['crashloop_restart_threshold'])
+            elif check == 'csi_controller':
+                st, msgs = check_csi_controller(cp_ip, password, remediate, dry_run)
             elif check == 'node_flap':
                 st, msgs = check_node_flap(cp_ip, password, remediate, dry_run)
             elif check == 'crashloop_pods':
@@ -2549,6 +2758,14 @@ def main():
     parser.add_argument('--ignore-ready', action='store_true',
                         help='Skip the lab-Ready gate (used by the VCFfinal '
                              'startup pass, which intentionally runs pre-Ready)')
+    parser.add_argument('--csi-preflight', action='store_true',
+                        help='Run ONLY the csi_controller check (realign vCenter SSO '
+                             'for a CrashLoopBackOff vsphere-csi-controller) and exit. '
+                             'Deliberately bypasses [VSPMONITOR] enabled -- a stuck CSI '
+                             'driver stalls every PVC attach cluster-wide, so this one '
+                             'check cannot wait for a lab to opt in to the general '
+                             'monitor. Used by VCFfinal.py as an unconditional pre-flight '
+                             'before scaling up PVC-backed components.')
     parser.add_argument('--version', action='version',
                         version=f'%(prog)s {SCRIPT_VERSION}')
     args = parser.parse_args()
@@ -2559,6 +2776,25 @@ def main():
     if args.uninstall_timer:
         uninstall_timer()
         return
+
+    if args.csi_preflight:
+        # Unconditional -- deliberately runs before the [VSPMONITOR] enabled gate
+        # below (see the flag's help text for why).
+        if not acquire_lock():
+            log('Another vsp-health-monitor.py instance is running — skipping CSI '
+                'pre-flight this pass (will be re-checked on the next invocation)')
+            return
+        try:
+            cp_ip = cfg['vsp_control_plane_ip']
+            password = lsf.get_password()
+            status, msgs = check_csi_controller(cp_ip, password, not args.dry_run, args.dry_run)
+            for m in msgs:
+                log(f'  {m}')
+                print(m)
+            log(f'  [csi_controller] {status}')
+        finally:
+            release_lock()
+        sys.exit(0 if status in ('PASS', 'RECOVERED', 'WARN') else 1)
 
     if not cfg['enabled'] and not args.once:
         log('VSP Health Monitor disabled via config.ini [VSPMONITOR] enabled=false — exiting')
