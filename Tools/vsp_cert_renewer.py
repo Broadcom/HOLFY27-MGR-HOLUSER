@@ -1219,16 +1219,18 @@ def _phase3_sync_trust_manager(cluster_cfg, cp_ip, password, kubeconfig, dry_run
     )
     log_info("  vmsp-gateway restart triggered — will finish coming up in background")
 
-    # Step 4: restart cert-manager so it reloads the new CA Issuer key.
+    # Step 4: restart cert-manager, cert-manager-cainjector, and cert-manager-webhook so they reload the new CA Issuer key.
     # cert-manager caches the CA Secret's key material in memory.  If Phase 3.1
     # (leaf cert re-issuance) runs while cert-manager still holds the OLD key,
     # ALL leaf certs are silently re-signed with the wrong CA key.
+    # cainjector must also be restarted to ensure updated CA bundles are injected into webhooks.
     # MUST be Ready before Phase 3.1 runs → we wait here.
-    log_action(f"Restarting {_CERTMANAGER_DEPLOY} deployment in {_TRUST_MANAGER_NS}")
+    log_action(f"Restarting cert-manager, cert-manager-cainjector, cert-manager-webhook in {_TRUST_MANAGER_NS}")
     _ssh_exec(
         cp_ip, password,
-        f"kubectl {kc_flag} rollout restart deployment {_CERTMANAGER_DEPLOY} "
-        f"-n {_TRUST_MANAGER_NS} 2>/dev/null",
+        f"kubectl {kc_flag} rollout restart deployment {_CERTMANAGER_DEPLOY} cert-manager-cainjector cert-manager-webhook "
+        f"-n {_TRUST_MANAGER_NS} 2>/dev/null || "
+        f"kubectl {kc_flag} rollout restart deployment {_CERTMANAGER_DEPLOY} -n {_TRUST_MANAGER_NS} 2>/dev/null",
         timeout=20,
     )
 
