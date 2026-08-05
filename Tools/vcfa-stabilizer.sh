@@ -1088,6 +1088,8 @@ recover_gateway_http_503() {
     sleep 15
     execute_remote "${K} get deployment cert-manager -n cert-manager &>/dev/null && ${K} rollout restart deployment/cert-manager -n cert-manager && ${K} rollout status deployment/cert-manager -n cert-manager --timeout=300s || true" \
         "Rollout restart cert-manager/cert-manager controller (if present)" true
+    execute_remote "${K} get deployment cert-manager-cainjector -n cert-manager &>/dev/null && ${K} rollout restart deployment/cert-manager-cainjector -n cert-manager && ${K} rollout status deployment/cert-manager-cainjector -n cert-manager --timeout=300s || true" \
+        "Rollout restart cert-manager/cert-manager-cainjector (if present)" true
     sleep 15
     # Prelude apps that commonly appear as upstream_host in Envoy for /automation and /provider (SDS client certs to them).
     execute_remote "for d in cloud-automation-ui-app tenant-manager-server tenant-manager-app tenant-manager; do ${K} get deployment \$d -n ${PRELUDE_NAMESPACE} &>/dev/null && { echo restart prelude/\$d; ${K} rollout restart deployment/\$d -n ${PRELUDE_NAMESPACE}; ${K} rollout status deployment/\$d -n ${PRELUDE_NAMESPACE} --timeout=300s || true; }; sleep 8; done" \

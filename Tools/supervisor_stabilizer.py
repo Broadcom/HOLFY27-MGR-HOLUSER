@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.14 - 2026-07-09
+Version 2.15 - 2026-08-05
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
+
+v2.15 Changes:
+- Phase C (storage-quota cert-manager certs): added webhook caBundle verification
+  and automatic reconciliation for ValidatingWebhookConfiguration resources
+  (such as validate-quota-on-create.k8s.io).
+  When storage-quota-root-ca-secret is deleted or regenerated, or if caBundle drift
+  occurs, the caBundle in matching ValidatingWebhookConfiguration resources is
+  patched to match the current root CA secret, and cert-manager-cainjector is restarted.
+  Prevents admission webhook "x509: certificate signed by unknown authority" errors
+  during pod / PVC creation.
 
 v2.14 Changes:
 - Added LAB_NO_PROXY_PARTS to the list of constants imported from lsfunctions.py.
@@ -2301,15 +2311,97 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60,
         log(f"      [{cid}] Restarting deployments to regenerate certificates...")
         restart_cmds = [
             f"{K} -n kube-system rollout restart deploy cns-storage-quota-extension || true",
-            f"{K} -n kube-system rollout restart deploy storage-quota-webhook || true"
+            f"{K} -n kube-system rollout restart deploy storage-quota-webhook || true",
+            f"{K} -n vmware-system-cert-manager rollout restart deploy cert-manager-cainjector || true"
         ]
         run_on_scp(
             vc["host"], vc["root_user"], password,
             scp_ip, scp_pass, restart_cmds,
-            description=f"      [{cid}] Restarting storage-quota deployments",
+            description=f"      [{cid}] Restarting storage-quota and cainjector deployments",
             timeout=120,
         )
         time.sleep(20)
+
+    # 1b. Verify and sync ValidatingWebhookConfiguration caBundle with storage-quota root CA
+    wh_script = f"""cat << 'EOF' > /tmp/.check_vwc_ca.py
+import json, subprocess, sys
+
+def run(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return ""
+
+K = "{K}"
+dry_run = "{'1' if dry_run else '0'}"
+
+ca_b64 = run(f"{{K}} -n vmware-system-cert-manager get secret storage-quota-root-ca-secret -o jsonpath='{{.data.tls\\\\.crt}}'")
+if not ca_b64:
+    print("NO_CA_SECRET")
+    sys.exit(0)
+
+ca_b64_clean = "".join(ca_b64.split())
+vwcs_raw = run(f"{{K}} get validatingwebhookconfiguration -o json")
+if not vwcs_raw:
+    print("NO_VWC")
+    sys.exit(0)
+
+try:
+    data = json.loads(vwcs_raw)
+    mismatched_names = []
+    for item in data.get("items", []):
+        name = item.get("metadata", {{}}).get("name", "")
+        webhooks = item.get("webhooks", [])
+        is_target = ("quota" in name.lower() or "cns" in name.lower())
+        if not is_target:
+            for wh in webhooks:
+                svc = wh.get("clientConfig", {{}}).get("service", {{}}).get("name", "").lower()
+                if "quota" in svc or "cns" in svc:
+                    is_target = True
+                    break
+        if not is_target:
+            continue
+        item_mismatched = False
+        for wh in webhooks:
+            cab = "".join(wh.get("clientConfig", {{}}).get("caBundle", "").split())
+            if cab != ca_b64_clean:
+                item_mismatched = True
+                break
+        if item_mismatched:
+            mismatched_names.append(name)
+            if dry_run != "1":
+                for wh in webhooks:
+                    wh.setdefault("clientConfig", {{}})["caBundle"] = ca_b64
+                with open("/tmp/.vwc_patch.json", "w") as f:
+                    json.dump(item, f)
+                run(f"{{K}} apply -f /tmp/.vwc_patch.json && rm -f /tmp/.vwc_patch.json")
+
+    if not mismatched_names:
+        print("SYNCED")
+    elif dry_run == "1":
+        print("MISMATCH:" + ",".join(mismatched_names))
+    else:
+        print("PATCHED:" + ",".join(mismatched_names))
+except Exception as e:
+    print(f"ERROR: {{e}}")
+EOF
+python3 /tmp/.check_vwc_ca.py
+rm -f /tmp/.check_vwc_ca.py
+"""
+    try:
+        wh_out = ssh_to_scp_direct(vc, password, scp_ip, scp_pass, wh_script, timeout=60).strip()
+        if wh_out.startswith("MISMATCH:"):
+            names_str = wh_out.split(":", 1)[1]
+            log(f"      [{cid}] CHECK  : ValidatingWebhookConfiguration/{names_str} — caBundle mismatch (0d remaining)")
+        elif wh_out.startswith("PATCHED:"):
+            names_str = wh_out.split(":", 1)[1]
+            log(f"      [{cid}] FIXED  : ValidatingWebhookConfiguration/{names_str} — patched caBundle to match storage-quota-root-ca-secret")
+        elif wh_out == "SYNCED":
+            log(f"      [{cid}] SKIP   : ValidatingWebhookConfiguration/storage-quota — caBundle matches root CA (1825d remaining)")
+        elif wh_out:
+            log(f"      [{cid}] ValidatingWebhookConfiguration check output: {wh_out}")
+    except Exception as exc:
+        log(f"      [{cid}] Could not verify/sync ValidatingWebhookConfiguration caBundle: {exc}", level="WARN")
 
     # 2. Regenerate supervisor-management-proxy certs (live mode only).
     #
