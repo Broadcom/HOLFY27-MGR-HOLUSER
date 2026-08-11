@@ -179,7 +179,7 @@ def main():
     delta = datetime.datetime.now() - lsf.start_time
     run_mins = "{0:.2f}".format(delta.seconds / 60)
     lsf.write_output(f'LabStartup Finished - runtime was {run_mins} minutes')
-    lsf.write_output(f'Cloudinfo: {lsf.get_cloudinfo().split('"')}')
+    lsf.write_output(f'Cloudinfo: {lsf.get_cloudinfo().split('"')[1]}')
     
     # Write ready time
     try:
