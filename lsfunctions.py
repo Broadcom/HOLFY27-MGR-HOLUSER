@@ -1,8 +1,15 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.22 - 2026-07-09
+# Version 3.24 - 2026-08-11
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
+# v3.24: Added get_cloudinfo() (reads /tmp/cloudinfo.txt written by labstartup.sh)
+#        so Startup/odyssey.py's VLP-deployment check actually resolves instead
+#        of always falling back to 'NOT REPORTED' via a nonexistent attribute.
+# v3.23: Added shared DRS VM/Host group and affinity-rule helpers
+#        (ensure_drs_vm_group, ensure_drs_host_group, ensure_drs_vmhost_rule)
+#        so the VCF Automation host-isolation placement policy is created by
+#        one code path shared between confighol-9.1.py and VCFfinal.py.
 
 import os
 import base64
@@ -1876,6 +1883,25 @@ def get_config_value(section: str, option: str, fallback: str = '') -> str:
     return value
 
 
+def get_cloudinfo() -> str:
+    """
+    Get the VLP cloud org name detected by labstartup.sh at boot.
+
+    labstartup.sh reads guestinfo.ovfenv via vmtoolsd and writes the result
+    to /tmp/cloudinfo.txt - either the VLP org name (prod/VLP deployment)
+    or the literal string 'NOT REPORTED' (dev environment, not VLP deployed).
+
+    :return: Cloud org name, or 'NOT REPORTED' if the file is missing/empty
+    """
+    cloudinfo_file = '/tmp/cloudinfo.txt'
+    if os.path.isfile(cloudinfo_file):
+        with open(cloudinfo_file, 'r') as f:
+            value = f.read().strip()
+            if value:
+                return value
+    return 'NOT REPORTED'
+
+
 #==============================================================================
 # PASSWORD FUNCTIONS
 #==============================================================================
@@ -2873,6 +2899,117 @@ def get_cluster(cluster_name):
             if cluster.name == cluster_name:
                 return cluster
     return None
+
+
+#==============================================================================
+# Shared DRS VM/Host Group and Affinity Rule helpers
+#
+# Extracted from the one-time confighol-9.1.py auto-platform-a isolation
+# logic so the same code path can be called both from that onboarding tool
+# and from the per-boot placement-policy step in Startup/VCFfinal.py -
+# keeping the DRS objects they create (and what Tools/vpodchecker.py expects
+# to find) permanently in sync instead of drifting independently.
+#==============================================================================
+
+def ensure_drs_vm_group(cluster, group_name, vms):
+    """
+    Create or update a DRS VM Group on a cluster.
+    :param cluster: vim.ClusterComputeResource
+    :param group_name: str name of the VmGroup
+    :param vms: list of vim.VirtualMachine objects that belong in the group
+    :return: True on success, False on failure
+    """
+    try:
+        existing_groups = {g.name: g for g in cluster.configurationEx.group}
+        group_spec = vim.cluster.GroupSpec()
+        group_spec.operation = 'edit' if group_name in existing_groups else 'add'
+        vm_group = vim.cluster.VmGroup()
+        vm_group.name = group_name
+        vm_group.vm = vms
+        group_spec.info = vm_group
+
+        spec = vim.cluster.ConfigSpecEx()
+        spec.groupSpec = [group_spec]
+        task = cluster.ReconfigureComputeResource_Task(spec, True)
+        WaitForTask(task)
+        return True
+    except Exception as e:
+        write_output(f'ERROR: could not create/update DRS VM group "{group_name}" on {cluster.name}: {e}')
+        return False
+
+
+def ensure_drs_host_group(cluster, group_name, hosts):
+    """
+    Create or update a DRS Host Group on a cluster.
+    :param cluster: vim.ClusterComputeResource
+    :param group_name: str name of the HostGroup
+    :param hosts: list of vim.HostSystem objects that belong in the group
+    :return: True on success, False on failure
+    """
+    try:
+        existing_groups = {g.name: g for g in cluster.configurationEx.group}
+        group_spec = vim.cluster.GroupSpec()
+        group_spec.operation = 'edit' if group_name in existing_groups else 'add'
+        host_group = vim.cluster.HostGroup()
+        host_group.name = group_name
+        host_group.host = hosts
+        group_spec.info = host_group
+
+        spec = vim.cluster.ConfigSpecEx()
+        spec.groupSpec = [group_spec]
+        task = cluster.ReconfigureComputeResource_Task(spec, True)
+        WaitForTask(task)
+        return True
+    except Exception as e:
+        write_output(f'ERROR: could not create/update DRS host group "{group_name}" on {cluster.name}: {e}')
+        return False
+
+
+def ensure_drs_vmhost_rule(cluster, rule_name, vm_group_name, host_group_name,
+                            affine=True, mandatory=True, enabled=True):
+    """
+    Create or update a VM-Host DRS affinity/anti-affinity rule. Groups
+    referenced by vm_group_name/host_group_name must already exist (create
+    them first via ensure_drs_vm_group/ensure_drs_host_group).
+    :param cluster: vim.ClusterComputeResource
+    :param rule_name: str name of the rule
+    :param vm_group_name: str name of an existing VmGroup
+    :param host_group_name: str name of an existing HostGroup
+    :param affine: True for a must/should-run-on rule, False for a
+                   must/should-not-run-on rule
+    :param mandatory: True for a mandatory (hard) rule, False for a
+                      preferential (soft) rule
+    :param enabled: whether the rule is enabled
+    :return: True on success, False on failure
+    """
+    try:
+        current_rules = {r.name: r for r in cluster.configurationEx.rule}
+        rule_spec = vim.cluster.RuleSpec()
+        rule_info = vim.cluster.VmHostRuleInfo()
+        rule_info.name = rule_name
+        rule_info.enabled = enabled
+        rule_info.mandatory = mandatory
+        rule_info.vmGroupName = vm_group_name
+        if affine:
+            rule_info.affineHostGroupName = host_group_name
+        else:
+            rule_info.antiAffineHostGroupName = host_group_name
+
+        if rule_name in current_rules:
+            rule_spec.operation = 'edit'
+            rule_info.key = current_rules[rule_name].key
+        else:
+            rule_spec.operation = 'add'
+        rule_spec.info = rule_info
+
+        spec = vim.cluster.ConfigSpecEx()
+        spec.rulesSpec = [rule_spec]
+        task = cluster.ReconfigureComputeResource_Task(spec, True)
+        WaitForTask(task)
+        return True
+    except Exception as e:
+        write_output(f'ERROR: could not create/update DRS rule "{rule_name}" on {cluster.name}: {e}')
+        return False
 
 
 def wait_for_vcenter(hostname, timeout=600, interval=10):
