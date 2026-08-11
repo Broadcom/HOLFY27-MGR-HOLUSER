@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # odyssey.py - HOLFY27 Core Odyssey Installation Module
-# Version 3.0 - January 2026
+# Version 3.1 - 2026-08-11
 # Author - Burke Azbill and HOL Core Team
 # VMware Odyssey client installation for VLP deployments
 
@@ -193,7 +193,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         pass
     
     # Check if Odyssey is enabled
-    odyssey_enabled = getattr(lsf, 'odyssey', False)
+    odyssey_enabled = lsf.config.getboolean('VPOD', 'odyssey', fallback=False)
     if not odyssey_enabled:
         lsf.write_output('Odyssey not enabled in config.ini - skipping')
         if dashboard and TaskStatus:
@@ -352,7 +352,7 @@ if __name__ == '__main__':
     if args.standalone:
         print(f'Running {MODULE_NAME} in standalone mode')
         print(f'Lab SKU: {lsf.lab_sku}')
-        print(f'Odyssey enabled: {getattr(lsf, "odyssey", False)}')
+        print(f'Odyssey enabled: {lsf.config.getboolean("VPOD", "odyssey", fallback=False)}')
         print(f'Dry run: {args.dry_run}')
         print()
     
