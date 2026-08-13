@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # ESXi.py - HOLFY27 Core ESXi Host Verification Module
-# Version 3.6 - 2026-08-13
+# Version 3.7 - 2026-08-13
 # Author - Burke Azbill and HOL Core Team
 # Verifies ESXi hosts are online and responsive
+# v3.7: Combine vCPU count reduction and CPU topology changes into a single ConfigSpec reconfig task for auto-platform-a* VMs to prevent InvalidArgument (numCoresPerSocket) faults.
 # v3.6: HOL-2701 specific - cap auto-platform-a* (VCF Automation) VM at 24 vCPUs.
 # v3.5: Roll back vsp-01.* CPU limit of 8; preserve existing CPU counts and update CPU topology to 8, 4, 2, or 1 cores per socket (whichever divides numCPU evenly).
 # v3.4: Added auto-platform-a* CPU topology (8 cores per socket) enforcement. Applied directly on ESXi
@@ -361,61 +362,53 @@ def main(lsf=None, standalone=False, dry_run=False):
                                     f'numCoresPerSocket={_cur_cores}, state={_power}'
                                 )
 
-                                # HOL-2701 specific: cap VCF Automation VM at 24 vCPUs
+                                # Determine target vCPU count
+                                _target_num_cpu = _cur_num_cpu
                                 if lsf.lab_sku == 'HOL-2701' and _cur_num_cpu and _cur_num_cpu > 24:
-                                    if _power == 'poweredOn':
-                                        lsf.write_output(
-                                            f'    {_vm.name}: WARNING - VM is powered on; '
-                                            f'vCPU count reduction skipped to avoid disruption'
-                                        )
-                                        _host_vcfa_skipped += 1
-                                    else:
-                                        _cpu_spec = vim.vm.ConfigSpec()
-                                        _cpu_spec.numCPUs = 24
-                                        lsf.write_output(
-                                            f'    {_vm.name}: reconfiguring vCPU count '
-                                            f'(numCPU: {_cur_num_cpu} -> 24) for HOL-2701'
-                                        )
-                                        try:
-                                            _cpu_task = _vm.ReconfigVM_Task(spec=_cpu_spec)
-                                            WaitForTask(_cpu_task)
-                                            lsf.write_output(f'    {_vm.name}: vCPU count reconfiguration complete')
-                                            _host_vcfa_updated += 1
-                                        except Exception as _cpu_reconfig_err:
-                                            lsf.write_output(
-                                                f'    {_vm.name}: vCPU count reconfiguration FAILED: {_cpu_reconfig_err}'
-                                            )
+                                    _target_num_cpu = 24
 
-                                if _cur_cores == TARGET_CORES_PER_SOCKET:
+                                # Determine target cores per socket in order: 8, 4, 2, 1
+                                _target_cores = 8
+                                if _target_num_cpu:
+                                    for _c in [8, 4, 2, 1]:
+                                        if _target_num_cpu >= _c and _target_num_cpu % _c == 0:
+                                            _target_cores = _c
+                                            break
+
+                                if _cur_num_cpu == _target_num_cpu and _cur_cores == _target_cores:
                                     lsf.write_output(
-                                        f'    {_vm.name}: CPU topology already set to {TARGET_CORES_PER_SOCKET} cores per socket - no changes needed'
+                                        f'    {_vm.name}: numCPU={_cur_num_cpu}, numCoresPerSocket={_cur_cores} - no changes needed'
                                     )
                                     continue
 
                                 if _power == 'poweredOn':
                                     lsf.write_output(
                                         f'    {_vm.name}: WARNING - VM is powered on; '
-                                        f'topology reconfiguration skipped to avoid disruption'
+                                        f'reconfiguration skipped to avoid disruption'
                                     )
                                     _host_vcfa_skipped += 1
                                     continue
 
-                                # Powered off — safe to reconfigure topology
+                                # Powered off — safe to reconfigure vCPU count and topology in a single spec
                                 _spec = vim.vm.ConfigSpec()
-                                _spec.numCoresPerSocket = TARGET_CORES_PER_SOCKET
+                                _reconfig_msg_parts = []
+                                if _cur_num_cpu != _target_num_cpu:
+                                    _spec.numCPUs = _target_num_cpu
+                                    _reconfig_msg_parts.append(f'numCPU: {_cur_num_cpu} -> {_target_num_cpu}')
+                                if _cur_cores != _target_cores:
+                                    _spec.numCoresPerSocket = _target_cores
+                                    _reconfig_msg_parts.append(f'numCoresPerSocket: {_cur_cores} -> {_target_cores}')
 
-                                lsf.write_output(
-                                    f'    {_vm.name}: reconfiguring CPU topology '
-                                    f'(numCoresPerSocket: {_cur_cores} -> {TARGET_CORES_PER_SOCKET})'
-                                )
+                                _reconfig_msg = ', '.join(_reconfig_msg_parts)
+                                lsf.write_output(f'    {_vm.name}: reconfiguring CPU ({_reconfig_msg})')
                                 try:
                                     _task = _vm.ReconfigVM_Task(spec=_spec)
                                     WaitForTask(_task)
-                                    lsf.write_output(f'    {_vm.name}: CPU topology reconfiguration complete')
+                                    lsf.write_output(f'    {_vm.name}: CPU reconfiguration complete')
                                     _host_vcfa_updated += 1
                                 except Exception as _reconfig_err:
                                     lsf.write_output(
-                                        f'    {_vm.name}: CPU topology reconfiguration FAILED: {_reconfig_err}'
+                                        f'    {_vm.name}: CPU reconfiguration FAILED: {_reconfig_err}'
                                     )
 
                         # --- Process vsp-01.* VMs ---
