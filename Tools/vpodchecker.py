@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.8.7 - 2026-08-03
+# Version 2.8.8 - 2026-08-06
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.8.8 - 2026-08-06: check_auto_platform_isolation() updated to match the
+#   new placement policy: the "sole VM on host" check now allows configured
+#   [VCF] vcfvCenter VMs on the dedicated host (they're pinned there too),
+#   the auto-platform-VMs group check requires those vCenter VMs to be
+#   members, and a new check verifies the VSP ([VCF] vspvms) mandatory
+#   anti-affinity rule against that same host.
 # v2.8.7 - 2026-08-03: check_vsp_node_resources() now checks control-plane
 #   nodes against the BenS-validated 4 vCPU / 10240 MiB target instead of the
 #   uniform 12 vCPU / 24GB floor it previously shared with worker nodes
@@ -2700,16 +2706,22 @@ def check_vcf_password_policies() -> List[CheckResult]:
 
 def check_auto_platform_isolation() -> List[CheckResult]:
     """
-    Verify that auto-platform-a-* is the sole VM on its host and that
-    mandatory DRS VM-Host rules enforce this isolation on cluster-mgmt-01a.
+    Verify the VCF Automation + vCenter placement policy holds on
+    cluster-mgmt-01a: auto-platform-a-* and all configured [VCF] vcfvCenter
+    VMs share one dedicated host, VSP ([VCF] vspvms) VMs are barred from
+    that host, and the underlying DRS groups/rules match what
+    Startup/VCFfinal.py's per-boot placement step and Tools/confighol-9.1.py
+    create (via the shared lsf.ensure_drs_* helpers).
 
     Checks:
     1. auto-platform-a-* VM exists and is powered on
-    2. No other powered-on VMs share the same ESXi host
-    3. A VM group containing auto-platform-a-* exists
+    2. Only auto-platform-a-*/configured-vCenter VMs share its host
+    3. A VM group containing auto-platform-a-* + configured vCenter VMs exists
     4. A host group for the dedicated host exists
     5. A mandatory must-run-on affinity rule links VM group to host group
     6. A mandatory must-NOT-run-on anti-affinity rule keeps other VMs away
+    7. (if vspvms configured) A mandatory anti-affinity rule keeps VSP VMs
+       off the dedicated host
     """
     results: List[CheckResult] = []
 
@@ -2779,23 +2791,36 @@ def check_auto_platform_isolation() -> List[CheckResult]:
                 message='auto-platform-a VM not found'))
             return results
 
-        # Check 1: sole VM on host
+        # Resolve configured vCenter VMs ([VCF] vcfvCenter) - these are
+        # expected to be co-located with auto-platform-a, not evacuated
+        vcenter_vm_names = set()
+        if lsf.config.has_section('VCF') and lsf.config.has_option('VCF', 'vcfvCenter'):
+            for entry in lsf.get_config_list('VCF', 'vcfvCenter'):
+                name_pattern = entry.split(':')[0].strip()
+                try:
+                    vcenter_vm_names.update(v.name for v in lsf.get_vm_match(name_pattern))
+                except Exception:
+                    pass
+
+        expected_host_vm_names = {auto_vm.name} | vcenter_vm_names
+
+        # Check 1: only auto-platform-a + configured vCenter VMs on host
         other_vms = [v.name for v in auto_host.vm
-                     if v.name != auto_vm.name
+                     if v.name not in expected_host_vm_names
                      and v.runtime.powerState == 'poweredOn']
 
         if other_vms:
             results.append(CheckResult(
-                name=f'DRS Isolation: {auto_vm.name} sole on host',
+                name=f'DRS Isolation: {auto_vm.name} dedicated host',
                 status='FAIL',
-                message=(f'{auto_vm.name} shares {auto_host.name} with '
-                         f'{len(other_vms)} other VM(s): {", ".join(other_vms)}')))
+                message=(f'{auto_host.name} has {len(other_vms)} unexpected '
+                         f'VM(s): {", ".join(other_vms)}')))
         else:
             results.append(CheckResult(
-                name=f'DRS Isolation: {auto_vm.name} sole on host',
+                name=f'DRS Isolation: {auto_vm.name} dedicated host',
                 status='PASS',
-                message=(f'{auto_vm.name} is the only powered-on VM on '
-                         f'{auto_host.name}')))
+                message=(f'{auto_host.name} contains only VCF Automation + '
+                         f'configured vCenter VM(s)')))
 
         # Index groups and rules
         groups = {g.name: g for g in cluster.configurationEx.group}
@@ -2805,22 +2830,30 @@ def check_auto_platform_isolation() -> List[CheckResult]:
         HOST_GROUP = 'auto-platform-Hosts'
         AFFINITY_RULE = 'auto-platform-must-run-on-host'
         ANTIAFFINITY_RULE = 'other-VMs-must-not-run-on-auto-platform-host'
+        VSP_VM_GROUP = 'vsp-VMs'
+        VSP_ANTIAFFINITY_RULE = 'vsp-VMs-must-not-run-on-auto-platform-host'
 
-        # Check 2: VM group
+        # Check 2: VM group (must contain auto-platform-a + all configured vCenters)
         if VM_GROUP in groups:
             g = groups[VM_GROUP]
-            vm_names = [v.name for v in (g.vm or [])]
+            vm_names = set(v.name for v in (g.vm or []))
             has_auto = any(n.startswith('auto-platform-a') for n in vm_names)
-            if has_auto:
+            missing_vcenters = vcenter_vm_names - vm_names
+            if has_auto and not missing_vcenters:
                 results.append(CheckResult(
                     name=f'DRS Group: {VM_GROUP}',
                     status='PASS',
-                    message=f'Contains {", ".join(vm_names)}'))
+                    message=f'Contains {", ".join(sorted(vm_names))}'))
             else:
+                problems = []
+                if not has_auto:
+                    problems.append('missing auto-platform-a VM')
+                if missing_vcenters:
+                    problems.append(f'missing vCenter VM(s): {", ".join(sorted(missing_vcenters))}')
                 results.append(CheckResult(
                     name=f'DRS Group: {VM_GROUP}',
                     status='FAIL',
-                    message=f'Group exists but missing auto-platform-a VM'))
+                    message=f'Group exists but {"; ".join(problems)}'))
         else:
             results.append(CheckResult(
                 name=f'DRS Group: {VM_GROUP}',
@@ -2885,6 +2918,41 @@ def check_auto_platform_isolation() -> List[CheckResult]:
                 name=f'DRS Rule: anti-affinity',
                 status='FAIL',
                 message='Anti-affinity rule does not exist'))
+
+        # Check 6: VSP anti-affinity rule (only if vspvms configured)
+        has_vspvms = False
+        if lsf.config.has_section('VCF') and lsf.config.has_option('VCF', 'vspvms'):
+            for line in lsf.config.get('VCF', 'vspvms').split('\n'):
+                if line.strip() and not line.strip().startswith('#'):
+                    has_vspvms = True
+                    break
+
+        if not has_vspvms:
+            results.append(CheckResult(
+                name='DRS Rule: VSP anti-affinity',
+                status='SKIPPED',
+                message='vspvms not defined in config.ini'))
+        elif VSP_ANTIAFFINITY_RULE in rules:
+            r = rules[VSP_ANTIAFFINITY_RULE]
+            ok = (r.enabled and r.mandatory
+                  and getattr(r, 'vmGroupName', '') == VSP_VM_GROUP
+                  and getattr(r, 'antiAffineHostGroupName', '') == HOST_GROUP)
+            if ok:
+                results.append(CheckResult(
+                    name='DRS Rule: VSP anti-affinity',
+                    status='PASS',
+                    message='Mandatory VSP anti-affinity rule active'))
+            else:
+                results.append(CheckResult(
+                    name='DRS Rule: VSP anti-affinity',
+                    status='FAIL',
+                    message=(f'Rule misconfigured (enabled={r.enabled}, '
+                             f'mandatory={r.mandatory})')))
+        else:
+            results.append(CheckResult(
+                name='DRS Rule: VSP anti-affinity',
+                status='FAIL',
+                message='VSP anti-affinity rule does not exist'))
 
     except Exception as e:
         results.append(CheckResult(

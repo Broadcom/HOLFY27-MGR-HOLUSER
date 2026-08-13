@@ -1,7 +1,24 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.12 - 2026-06-30
+# Version 3.14 - 2026-08-13
 # Changes:
+# - Added update_hol_repo(): runs `git stash && git pull` on ${holroot}
+#   (/home/holuser/hol) as the very first step of MAIN EXECUTION, before the
+#   console-mount wait and everything after it. gitpull.sh already does this
+#   once via holuser's boot-time cron job, but this is a direct-invocation
+#   safety net so labstartup.sh always sees the latest Tools/, Startup/,
+#   holodeck/*.ini, and console/ content immediately before labstartup.py
+#   runs, regardless of cron timing or a manual/ad-hoc invocation. Skipped
+#   when the testing flag is present, matching the existing git_pull()
+#   convention for the SKU-specific vpodgitdir repo.
+# - Added check_and_fix_console_black_screen(): best-effort preflight that reads
+#   /sys/class/graphics/fb0/blank on the console shortly after GDM is confirmed
+#   running, and restarts GDM if it reads blanked. Root-caused a fresh-boot race
+#   where GDM/Xorg/gnome-shell report healthy but the vmwgfx framebuffer stays
+#   powered down (black screen via VMware console, RDP, and NoMachine alike).
+#   Runs once, only on a genuine startup (not labcheck), right after the console
+#   NFS mount is detected. See vcf-troubleshooting skill Section 8 / HISTORY.md
+#   2026-08-13 for the full diagnosis.
 # - Firefox profile rebuild gate (FIREFOX_PROFILE_REBUILD_REQUIRED in script): deploy
 #   rebuild-firefox-profile.sh, compare to ~/.local/state/firefox_profile_rebuild.count on LMC,
 #   SSH-run rebuild when missing or stored count < required (bump constant to force again).
@@ -78,6 +95,37 @@ check_testing_mode() {
         return 0  # True - testing mode enabled
     fi
     return 1  # False - normal mode
+}
+
+update_hol_repo() {
+    # Ensure the core hol repo content on this Manager VM (Tools/, Startup/,
+    # holodeck/*.ini, console/, etc.) is fully up to date BEFORE any of the
+    # rest of labstartup.sh - or labstartup.py - reads from it.
+    #
+    # gitpull.sh already does this once, earlier, via holuser's boot-time
+    # cron job. This is a direct-invocation safety net so that labstartup.sh
+    # always pulls the latest content immediately before running, regardless
+    # of cron timing or a manual/ad-hoc labstartup.sh invocation.
+    if check_testing_mode; then
+        log_msg "TESTING MODE: Skipping hol repo git stash/pull to preserve local changes" "${logfile}"
+        return 0
+    fi
+
+    if [ ! -d "${holroot}/.git" ]; then
+        log_msg "No git repository found at ${holroot} - skipping hol repo update" "${logfile}"
+        return 0
+    fi
+
+    log_msg "Updating hol repo at ${holroot} (git stash && git pull)..." "${logfile}"
+    (
+        cd "${holroot}" || exit 1
+        git stash >> ${logfile} 2>&1
+        if timeout 60 env GIT_TERMINAL_PROMPT=0 git pull >> ${logfile} 2>&1; then
+            log_msg "hol repo updated successfully" "${logfile}"
+        else
+            log_msg "hol repo git pull failed or timed out - continuing with existing code" "${logfile}"
+        fi
+    )
 }
 
 is_hol_sku() {
@@ -408,7 +456,72 @@ clone_or_pull_labtype_overrides() {
             log_warn "${labtype} override clone failed - ${labtype} overrides not available" "${logfile}"
         fi
     fi
-    
+
+    return 0
+}
+
+# Best-effort preflight for a fresh-boot console black-screen race (2026-08-13 incident).
+# GDM/Xorg/gnome-shell all report healthy in the broken state - the only observed
+# kernel-level signal was /sys/class/graphics/fb0/blank reading non-zero (blanked)
+# while the console's vmwgfx framebuffer never got a live frame after boot. A GDM
+# restart forces a fresh mode-set and resolves it without a full VM reboot.
+#
+# This is a HEURISTIC based on a single confirmed incident - it may not catch every
+# occurrence of the underlying race. It intentionally runs only once, only during a
+# genuine startup (never labcheck), so it can never interrupt an actively-used
+# desktop session that is merely screen-locked/DPMS-blanked by the user.
+check_and_fix_console_black_screen() {
+    local console_host="root@console.site-a.vcf.lab"
+
+    if ! command -v sshpass >/dev/null 2>&1 || [ ! -f /home/holuser/creds.txt ]; then
+        log_msg "Console black-screen preflight: sshpass or creds.txt missing - skipping (non-fatal)." "${logfile}"
+        return 0
+    fi
+
+    # Give GDM a moment to reach its post-boot steady state before sampling
+    # fb0/blank, so we don't catch a transient mid-boot value.
+    local attempt gdm_ready
+    gdm_ready=false
+    for attempt in 1 2 3 4 5 6; do
+        if sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${console_host}" \
+            "systemctl is-active --quiet gdm && pgrep -x Xorg >/dev/null" >/dev/null 2>&1; then
+            gdm_ready=true
+            break
+        fi
+        sleep 5
+    done
+
+    if [ "$gdm_ready" != true ]; then
+        log_msg "Console black-screen preflight: GDM/Xorg not confirmed running after 30s - skipping (non-fatal)." "${logfile}"
+        return 0
+    fi
+
+    local fb_blank
+    fb_blank=$(sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${console_host}" \
+        "cat /sys/class/graphics/fb0/blank 2>/dev/null" 2>/dev/null | tr -d '[:space:]')
+
+    if [ -z "$fb_blank" ]; then
+        log_msg "Console black-screen preflight: could not read fb0/blank - skipping (non-fatal)." "${logfile}"
+        return 0
+    fi
+
+    if [ "$fb_blank" = "0" ]; then
+        log_msg "Console black-screen preflight: fb0/blank=0 (normal) - no action needed." "${logfile}"
+        return 0
+    fi
+
+    log_msg "Console black-screen preflight: fb0/blank=${fb_blank} (blanked) - restarting GDM to force a fresh mode-set..." "${logfile}"
+    if sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${console_host}" "systemctl restart gdm" >/dev/null 2>&1; then
+        sleep 8
+        # fb0/blank is a VT/kernel-level flag, not something the compositor resets
+        # on its own restarting GDM alone left it unchanged in testing. Force-clear
+        # it explicitly to match the exact sequence that was confirmed working live.
+        sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${console_host}" \
+            "echo 0 > /sys/class/graphics/fb0/blank" >/dev/null 2>&1
+        log_msg "Console black-screen preflight: GDM restarted and fb0/blank force-cleared. This is a best-effort remediation - it cannot be visually verified over SSH." "${logfile}"
+    else
+        log_msg "WARNING: Console black-screen preflight: GDM restart command failed (non-fatal, continuing startup)." "${logfile}"
+    fi
     return 0
 }
 
@@ -718,11 +831,20 @@ push_console_files_nfs() {
 # MAIN EXECUTION
 #==============================================================================
 
+log_msg "Starting labstartup.sh" "${logfile}"
+
+#==============================================================================
+# UPDATE HOL REPO
+#==============================================================================
+# Pull the latest hol repo content BEFORE anything else in this script (or
+# labstartup.py) reads from ${holroot} - Tools/, Startup/, holodeck/*.ini,
+# console/, etc. Runs ahead of the console-mount wait since it only touches
+# local Manager VM state and has no dependency on the LMC/NFS mount.
+update_hol_repo
+
 #==============================================================================
 # WAIT FOR CONSOLE MOUNT
 #==============================================================================
-
-log_msg "Starting labstartup.sh" "${logfile}"
 
 while true; do
     if [ -d ${lmcholroot} ]; then
@@ -741,6 +863,12 @@ if [ "$1" = "labcheck" ]; then
     runlabstartup labcheck
     exit 0
 else
+    # Console black-screen self-heal preflight (best-effort, non-fatal).
+    # Runs only here - on a genuine startup, once, right after the console NFS
+    # mount is confirmed - never on a labcheck cron cycle, so it can't interrupt
+    # an actively-used desktop that is merely screen-locked/DPMS-blanked.
+    check_and_fix_console_black_screen
+
     log_msg "Main Console mount is present. Clearing labstartup logs." "${logfile}"
     # Initialize the status dashboard to clear previous run info
     /usr/bin/python3 ${holroot}/Tools/status_dashboard.py --clear >> ${logfile} 2>&1

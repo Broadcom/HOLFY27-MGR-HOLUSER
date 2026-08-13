@@ -1,8 +1,33 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.26 - 2026-08-03
+# Version 2.29 - 2026-08-13
 # Author - Burke Azbill and HOL Core Team
 #
+# v2.29: Added Step 5b: disable_vcfa_fips_mode() — disables FIPS mode on the
+#        VCF Automation (VCFA) K8s appliance to fix high CPU utilization on
+#        AMD Zen4/Zen5 consumer CPUs (removes fips=1 from /boot/grub/grub.cfg,
+#        sets FIPS_MODE=disabled on the 5 affected prelude deployments).
+#        Runs after Step 5 (VCF Automation VM configuration), gated on
+#        [VCF only] and preceded by host discovery + SSH-reachability
+#        preflight checks so it safely no-ops on labs without VCF Automation.
+#        Extracted _discover_vcfa_hosts()/_get_primary_vcfa_host() helpers
+#        from distribute_vault_ca_trust() so both call sites share one VCFA
+#        host-discovery implementation. See
+#        williamlam.com/2026/08/quick-tip-reducing-high-cpu-utilization-in-vcf-automation-vcfa-on-amd-zen4-zen5-cpus.html
+# v2.28: configure_auto_platform_isolation() now also resolves [VCF]
+#        vcfvCenter VMs, includes them in the auto-platform-VMs group, and
+#        excludes them from the non-auto-platform-VMs anti-affinity group -
+#        matching Startup/VCFfinal.py Task 4's placement policy. Without
+#        this, re-running this one-time onboarding tool after VCFfinal.py
+#        had already pinned vCenters to the dedicated host would recreate
+#        the old anti-affinity rule and actively fight the new policy
+#        (found via live DevPod test).
+# v2.27: configure_auto_platform_isolation() now creates its DRS VM/Host
+#        groups and affinity/anti-affinity rules via the shared
+#        lsf.ensure_drs_vm_group/ensure_drs_host_group/ensure_drs_vmhost_rule
+#        helpers (lsfunctions.py) instead of inline ConfigSpecEx code, so
+#        this one-time onboarding path can never drift from the per-boot
+#        placement-policy step in Startup/VCFfinal.py Task 4.
 # v2.26: fix_vsp_controlplane_sizing() now targets the BenS-validated 4 vCPU /
 #        10240 MiB control-plane size (was a 12-vCPU / 24576 MiB floor, which
 #        conflicted with BenS's vsp-remediate.sh CP_TARGET=4 sizing).
@@ -388,7 +413,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.24'
+SCRIPT_VERSION = '2.29'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -411,6 +436,17 @@ NSX_USERS = ['admin', 'root', 'audit']
 
 # NSX password expiration (999 days)
 NSX_PASSWORD_EXPIRY_DAYS = 999
+
+# VCF Automation prelude deployments affected by FIPS crypto overhead on
+# AMD Zen4/Zen5 host CPUs. See:
+# williamlam.com/2026/08/quick-tip-reducing-high-cpu-utilization-in-vcf-automation-vcfa-on-amd-zen4-zen5-cpus.html
+FIPS_AFFECTED_DEPLOYMENTS = [
+    'approval-service-app',
+    'catalog-service-app',
+    'ebs-app',
+    'ccs-infra-eas-app',
+    'provisioning-service-app',
+]
 
 # Password expiration setting for vCenter (999)
 PASSWORD_MAX_DAYS = 999
@@ -1008,14 +1044,21 @@ def configure_vcenter_password_policies(hostname: str, user: str, password: str,
 def configure_auto_platform_isolation(hostname: str, user: str, password: str,
                                        dry_run: bool = False) -> bool:
     """
-    Ensure auto-platform-a-* VM runs alone on its host via DRS rules.
+    Ensure auto-platform-a-* and configured [VCF] vcfvCenter VMs share one
+    dedicated host via DRS rules.
 
     Creates VM/Host groups and a VM-Host affinity rule so that
-    auto-platform-a-* is pinned to a dedicated host, then vMotions any
-    other VMs off that host. A second anti-affinity rule prevents all
-    other cluster VMs from landing on the same host.
+    auto-platform-a-* and any configured vCenter VMs are pinned to a
+    dedicated host, then vMotions vCenters onto it and everything else off
+    of it. A second anti-affinity rule prevents all other cluster VMs from
+    landing on the same host.
 
     Only applies to vc-mgmt-a / cluster-mgmt-01a.
+
+    Uses the shared lsf.ensure_drs_vm_group / ensure_drs_host_group /
+    ensure_drs_vmhost_rule helpers so this one-time onboarding path and the
+    per-boot placement-policy step in Startup/VCFfinal.py always create the
+    same DRS objects (also checked by Tools/vpodchecker.py).
 
     :param hostname: vCenter hostname (only vc-mgmt-a is processed)
     :param user: vCenter SSO user
@@ -1077,116 +1120,74 @@ def configure_auto_platform_isolation(hostname: str, user: str, password: str,
         auto_host = auto_vm.runtime.host
         lsf.write_output(f'{hostname}: Found {auto_vm.name} on {auto_host.name}')
 
-        # -- Build existing group/rule index --
-        existing_groups = {g.name: g for g in cluster.configurationEx.group}
-        existing_rules = {r.name: r for r in cluster.configurationEx.rule}
-
         VM_GROUP = 'auto-platform-VMs'
         HOST_GROUP = 'auto-platform-Hosts'
         AFFINITY_RULE = 'auto-platform-must-run-on-host'
         ANTIAFFINITY_RULE = 'other-VMs-must-not-run-on-auto-platform-host'
         OTHER_VM_GROUP = 'non-auto-platform-VMs'
 
+        # Resolve configured vCenter VMs ([VCF] vcfvCenter) - these must be
+        # co-located with auto-platform-a, matching Startup/VCFfinal.py Task 4.
+        # Excluding them here too is required: if this one-time onboarding
+        # tool is ever re-run after VCFfinal.py has already pinned vCenters to
+        # auto_host, classifying them as "other" VMs here would recreate the
+        # old anti-affinity rule and actively fight the placement policy.
+        vcenter_vms = []
+        for entry in lsf.get_config_list('VCF', 'vcfvCenter'):
+            name_pattern = entry.split(':')[0].strip()
+            try:
+                vcenter_vms.extend(lsf.get_vm_match(name_pattern))
+            except Exception:
+                pass
+        pinned_names = {auto_vm.name} | {v.name for v in vcenter_vms}
+
         # Collect VMs that should NOT be on auto_host
         other_vms_on_host = [v for v in auto_host.vm
-                             if v.name != auto_vm.name
+                             if v.name not in pinned_names
                              and v.runtime.powerState == 'poweredOn']
 
-        # -- Step 1: Create / update groups --
-        group_specs = []
+        # Every other powered-on VM in the cluster (for the anti-affinity group)
+        all_other_vms = [v for h in cluster.host for v in h.vm
+                         if v.name not in pinned_names]
 
-        # VM group: auto-platform-a VM
-        vm_group_spec = vim.cluster.GroupSpec()
-        if VM_GROUP in existing_groups:
-            vm_group_spec.operation = 'edit'
-        else:
-            vm_group_spec.operation = 'add'
-        vm_group = vim.cluster.VmGroup()
-        vm_group.name = VM_GROUP
-        vm_group.vm = [auto_vm]
-        vm_group_spec.info = vm_group
-        group_specs.append(vm_group_spec)
-
-        # Host group: the single dedicated host
-        host_group_spec = vim.cluster.GroupSpec()
-        if HOST_GROUP in existing_groups:
-            host_group_spec.operation = 'edit'
-        else:
-            host_group_spec.operation = 'add'
-        host_group = vim.cluster.HostGroup()
-        host_group.name = HOST_GROUP
-        host_group.host = [auto_host]
-        host_group_spec.info = host_group
-        group_specs.append(host_group_spec)
-
-        # VM group: every other powered-on VM in the cluster
-        all_other_vms = []
-        for h in cluster.host:
-            for v in h.vm:
-                if not v.name.startswith('auto-platform-a'):
-                    all_other_vms.append(v)
-        other_vm_group_spec = vim.cluster.GroupSpec()
-        if OTHER_VM_GROUP in existing_groups:
-            other_vm_group_spec.operation = 'edit'
-        else:
-            other_vm_group_spec.operation = 'add'
-        other_vm_group = vim.cluster.VmGroup()
-        other_vm_group.name = OTHER_VM_GROUP
-        other_vm_group.vm = all_other_vms
-        other_vm_group_spec.info = other_vm_group
-        group_specs.append(other_vm_group_spec)
-
-        # Apply group changes
-        spec = vim.cluster.ConfigSpecEx()
-        spec.groupSpec = group_specs
-        task = cluster.ReconfigureComputeResource_Task(spec, True)
-        WaitForTask(task)
+        # -- Step 1: Create / update groups (shared helpers) --
+        if not lsf.ensure_drs_vm_group(cluster, VM_GROUP, [auto_vm] + vcenter_vms):
+            connect.Disconnect(si)
+            return False
+        if not lsf.ensure_drs_host_group(cluster, HOST_GROUP, [auto_host]):
+            connect.Disconnect(si)
+            return False
+        if not lsf.ensure_drs_vm_group(cluster, OTHER_VM_GROUP, all_other_vms):
+            connect.Disconnect(si)
+            return False
         lsf.write_output(f'{hostname}: SUCCESS - DRS groups created/updated')
 
-        # -- Step 2: Create / update rules --
-        # Re-read cluster config to get current rule keys after group changes
-        current_rules = {r.name: r for r in cluster.configurationEx.rule}
-        rule_specs = []
-
-        # Must-run-on rule: auto-platform-a -> dedicated host
-        affinity_spec = vim.cluster.RuleSpec()
-        affinity_rule = vim.cluster.VmHostRuleInfo()
-        affinity_rule.name = AFFINITY_RULE
-        affinity_rule.enabled = True
-        affinity_rule.mandatory = True
-        affinity_rule.vmGroupName = VM_GROUP
-        affinity_rule.affineHostGroupName = HOST_GROUP
-        if AFFINITY_RULE in current_rules:
-            affinity_spec.operation = 'edit'
-            affinity_rule.key = current_rules[AFFINITY_RULE].key
-        else:
-            affinity_spec.operation = 'add'
-        affinity_spec.info = affinity_rule
-        rule_specs.append(affinity_spec)
-
-        # Must-not-run-on rule: all other VMs cannot be on that host
-        anti_spec = vim.cluster.RuleSpec()
-        anti_rule = vim.cluster.VmHostRuleInfo()
-        anti_rule.name = ANTIAFFINITY_RULE
-        anti_rule.enabled = True
-        anti_rule.mandatory = True
-        anti_rule.vmGroupName = OTHER_VM_GROUP
-        anti_rule.antiAffineHostGroupName = HOST_GROUP
-        if ANTIAFFINITY_RULE in current_rules:
-            anti_spec.operation = 'edit'
-            anti_rule.key = current_rules[ANTIAFFINITY_RULE].key
-        else:
-            anti_spec.operation = 'add'
-        anti_spec.info = anti_rule
-        rule_specs.append(anti_spec)
-
-        spec2 = vim.cluster.ConfigSpecEx()
-        spec2.rulesSpec = rule_specs
-        task2 = cluster.ReconfigureComputeResource_Task(spec2, True)
-        WaitForTask(task2)
+        # -- Step 2: Create / update rules (shared helpers) --
+        if not lsf.ensure_drs_vmhost_rule(cluster, AFFINITY_RULE, VM_GROUP, HOST_GROUP,
+                                          affine=True, mandatory=True):
+            connect.Disconnect(si)
+            return False
+        if not lsf.ensure_drs_vmhost_rule(cluster, ANTIAFFINITY_RULE, OTHER_VM_GROUP, HOST_GROUP,
+                                          affine=False, mandatory=True):
+            connect.Disconnect(si)
+            return False
         lsf.write_output(f'{hostname}: SUCCESS - DRS rules created/updated')
 
-        # -- Step 3: Migrate other VMs off the dedicated host --
+        # -- Step 3: Migrate vCenter VMs onto the dedicated host (now that
+        # groups/rules above already reflect the final desired state) --
+        for vc_vm in vcenter_vms:
+            if vc_vm.runtime.host != auto_host:
+                lsf.write_output(f'{hostname}: Migrating vCenter VM {vc_vm.name} to {auto_host.name}...')
+                try:
+                    relocate_spec = vim.vm.RelocateSpec()
+                    relocate_spec.host = auto_host
+                    migrate_task = vc_vm.RelocateVM_Task(relocate_spec)
+                    WaitForTask(migrate_task)
+                    lsf.write_output(f'{hostname}: SUCCESS - {vc_vm.name} migrated to {auto_host.name}')
+                except Exception as mig_err:
+                    lsf.write_output(f'{hostname}: WARNING - Could not migrate {vc_vm.name}: {mig_err}')
+
+        # -- Step 4: Migrate other VMs off the dedicated host --
         if other_vms_on_host:
             # Pick a destination host (any other host in the cluster)
             dest_hosts = [h for h in cluster.host if h != auto_host]
@@ -1213,7 +1214,7 @@ def configure_auto_platform_isolation(hostname: str, user: str, password: str,
                     f'{hostname}: WARNING - No alternative host for migration')
         else:
             lsf.write_output(
-                f'{hostname}: {auto_vm.name} already sole VM on {auto_host.name}')
+                f'{hostname}: {auto_host.name} already dedicated to {auto_vm.name} + configured vCenter VM(s)')
 
         connect.Disconnect(si)
         lsf.write_output(f'{hostname}: auto-platform-a host isolation configured')
@@ -2214,7 +2215,148 @@ def configure_aria_automation(hostname: str, auth_keys_file: str, password: str,
         lsf.write_output(f'{hostname}: Would copy authorized_keys for {ssh_user}')
         lsf.write_output(f'{hostname}: Would copy authorized_keys for root via sudo')
         lsf.write_output(f'{hostname}: Would set non-expiring password for {ssh_user} and root')
-    
+
+    return success
+
+
+def _discover_vcfa_hosts() -> List[Tuple[str, str]]:
+    """
+    Discover VCF Automation appliance hostnames from config.ini.
+
+    Checks vravms/vraurls across the VCFFINAL, VCF, and RESOURCES sections
+    (vravms entries like "auto-platform-a.*" have the ".*" suffix stripped),
+    then falls back to the standard single-site defaults if nothing is
+    configured. Shared by distribute_vault_ca_trust() and
+    disable_vcfa_fips_mode() so both use one host-discovery implementation.
+
+    :return: list of (hostname, ssh_user) tuples
+    """
+    vcfa_hosts = []
+    for section in ['VCFFINAL', 'VCF', 'RESOURCES']:
+        if not lsf.config.has_section(section):
+            continue
+        if lsf.config.has_option(section, 'vravms'):
+            for entry in lsf.config.get(section, 'vravms').split('\n'):
+                if entry.strip() and not entry.strip().startswith('#'):
+                    hostname = entry.split(':')[0].strip()
+                    clean_host = hostname.replace('.*', '')
+                    if clean_host and clean_host not in [h for h, _ in vcfa_hosts]:
+                        vcfa_hosts.append((clean_host, 'vmware-system-user'))
+        if lsf.config.has_option(section, 'vraurls'):
+            for entry in lsf.config.get(section, 'vraurls').split('\n'):
+                if entry.strip() and not entry.strip().startswith('#'):
+                    url = entry.split(',')[0].strip()
+                    if '://' in url:
+                        hostname = url.split('://')[1].split('/')[0].split(':')[0]
+                        if hostname and hostname not in [h for h, _ in vcfa_hosts]:
+                            vcfa_hosts.append((hostname, 'vmware-system-user'))
+
+    if not vcfa_hosts:
+        vcfa_hosts = [
+            ('auto-a.site-a.vcf.lab', 'vmware-system-user'),
+            ('auto-platform-a.site-a.vcf.lab', 'vmware-system-user'),
+        ]
+    return vcfa_hosts
+
+
+def _get_primary_vcfa_host() -> Optional[str]:
+    """
+    Return the primary VCF Automation appliance hostname — the auto-a K8s
+    node that runs kubectl/prelude — as opposed to auto-platform-a or any
+    other discovered VCFA host.
+
+    :return: hostname, or None if no VCFA hosts are configured
+    """
+    vcfa_hosts = _discover_vcfa_hosts()
+    for h, _ in vcfa_hosts:
+        if h.startswith('auto-a.') or h == 'auto-a':
+            return h
+    return vcfa_hosts[0][0] if vcfa_hosts else None
+
+
+def disable_vcfa_fips_mode(password: str, dry_run: bool = False) -> bool:
+    """
+    Disable FIPS mode on the VCF Automation (VCFA) K8s appliance to fix high
+    CPU utilization observed on AMD Zen4/Zen5 consumer CPUs (e.g. Minisforum
+    MS-A2). Implements Steps 1-3 from:
+    williamlam.com/2026/08/quick-tip-reducing-high-cpu-utilization-in-vcf-automation-vcfa-on-amd-zen4-zen5-cpus.html
+
+      1. SSH as vmware-system-user, elevate to root via sudo
+      2. Remove the fips=1 kernel parameter from /boot/grub/grub.cfg
+      3. Disable FIPS_MODE on the 5 affected prelude deployments via kubectl
+
+    Runs after Step 5 (VCF Automation VM configuration) so any SSH/sudo
+    access set up there is already in place. Preflighted with host discovery
+    and an SSH-reachability check, so labs without VCF Automation (or with
+    it powered off) are skipped rather than failed. The reboot (article
+    Step 4) and verification (article Step 5) are left as a manual
+    follow-up — see HOLIFICATION.md — since this tool does not otherwise
+    reboot appliances.
+
+    Uses `sudo -S -i bash -c '...'` (not `sudo -S -i kubectl ...`) because
+    kubectl is only on root's PATH via the login shell on the VCFA node.
+
+    :param password: vmware-system-user password
+    :param dry_run: If True, preview only
+    :return: True if successful or skipped; False if any command failed
+    """
+    ssh_user = 'vmware-system-user'
+
+    hostname = _get_primary_vcfa_host()
+    if not hostname:
+        lsf.write_output('Step 5b: No VCF Automation host found in config - skipping FIPS disable')
+        return True
+
+    lsf.write_output('')
+    lsf.write_output('=' * 60)
+    lsf.write_output('VCF Automation FIPS Disable (AMD Zen4/Zen5 CPU fix)')
+    lsf.write_output('=' * 60)
+
+    if not lsf.test_tcp_port(hostname, 22, timeout=10):
+        lsf.write_output(f'{hostname}: SSH not reachable - skipping FIPS disable')
+        return True
+
+    if dry_run:
+        lsf.write_output(f'{hostname}: Would remove fips=1 from /boot/grub/grub.cfg')
+        lsf.write_output(f'{hostname}: Would set FIPS_MODE=disabled on {len(FIPS_AFFECTED_DEPLOYMENTS)} prelude deployments')
+        return True
+
+    success = True
+
+    # Step 2 (article): remove the fips=1 kernel parameter from grub.cfg.
+    # Idempotent: grep-gates the sed so reruns after the first fix are no-ops.
+    # Space before "fips=1" is backslash-escaped (not quoted) since this
+    # command is itself embedded in single quotes for bash -c below.
+    lsf.write_output(f'{hostname}: Removing fips=1 kernel parameter from grub.cfg...')
+    grub_inner = ('grep -q fips=1 /boot/grub/grub.cfg && '
+                  'sed -i s/\\ fips=1//g /boot/grub/grub.cfg && '
+                  'echo GRUB_CHANGED || echo GRUB_ALREADY_CLEAN')
+    grub_cmd = f"echo '{password}' | sudo -S -i bash -c '{grub_inner}'"
+    result = lsf.ssh(grub_cmd, f'{ssh_user}@{hostname}', password)
+    output = result.stdout or ''
+    if result.returncode == 0 and 'GRUB_CHANGED' in output:
+        lsf.write_output(f'{hostname}: SUCCESS - fips=1 removed from grub.cfg (reboot required to take effect)')
+    elif result.returncode == 0 and 'GRUB_ALREADY_CLEAN' in output:
+        lsf.write_output(f'{hostname}: fips=1 already absent from grub.cfg - no change needed')
+    else:
+        lsf.write_output(f'{hostname}: WARNING - Failed to update grub.cfg')
+        success = False
+
+    # Step 3 (article): disable FIPS_MODE on the affected prelude deployments
+    lsf.write_output(f'{hostname}: Disabling FIPS_MODE on prelude deployments...')
+    for deployment in FIPS_AFFECTED_DEPLOYMENTS:
+        kubectl_inner = f'kubectl set env deployment/{deployment} -n prelude FIPS_MODE=disabled'
+        kubectl_cmd = f"echo '{password}' | sudo -S -i bash -c '{kubectl_inner}'"
+        result = lsf.ssh(kubectl_cmd, f'{ssh_user}@{hostname}', password)
+        if result.returncode == 0:
+            lsf.write_output(f'{hostname}: SUCCESS - FIPS_MODE disabled on {deployment}')
+        else:
+            lsf.write_output(f'{hostname}: WARNING - Failed to set FIPS_MODE on {deployment}')
+            success = False
+
+    if success:
+        lsf.write_output(f'{hostname}: NOTE - Reboot the VCFA appliance to apply the grub.cfg change (not performed by this tool)')
+
     return success
 
 
@@ -3880,38 +4022,7 @@ def distribute_vault_ca_trust(ca_pem: str, password: str,
     # --- VCF Automation Appliances ---
     lsf.write_output('')
     lsf.write_output('--- VCF Automation Appliances ---')
-    vcfa_hosts = []
-    
-    # Dynamically find VCF Automation VMs from config.ini
-    if lsf and hasattr(lsf, 'config'):
-        for section in ['VCFFINAL', 'VCF', 'RESOURCES']:
-            if lsf.config.has_section(section):
-                # Check vravms
-                if lsf.config.has_option(section, 'vravms'):
-                    for entry in lsf.config.get(section, 'vravms').split('\n'):
-                        if entry.strip() and not entry.strip().startswith('#'):
-                            hostname = entry.split(':')[0].strip()
-                            if hostname and hostname.replace('.*', '') not in [h for h, _ in vcfa_hosts]:
-                                # If it's a regex like auto-platform-a.*, just use the base name
-                                clean_host = hostname.replace('.*', '')
-                                vcfa_hosts.append((clean_host, 'vmware-system-user'))
-                
-                # Check vraurls
-                if lsf.config.has_option(section, 'vraurls'):
-                    for entry in lsf.config.get(section, 'vraurls').split('\n'):
-                        if entry.strip() and not entry.strip().startswith('#'):
-                            url = entry.split(',')[0].strip()
-                            if '://' in url:
-                                hostname = url.split('://')[1].split('/')[0].split(':')[0]
-                                if hostname and hostname not in [h for h, _ in vcfa_hosts]:
-                                    vcfa_hosts.append((hostname, 'vmware-system-user'))
-                                    
-    # Fallback to defaults if none found
-    if not vcfa_hosts:
-        vcfa_hosts = [
-            ('auto-a.site-a.vcf.lab', 'vmware-system-user'),
-            ('auto-platform-a.site-a.vcf.lab', 'vmware-system-user'),
-        ]
+    vcfa_hosts = _discover_vcfa_hosts()
 
     for vcfa_host, vcfa_user in vcfa_hosts:
         if lsf.test_ping(vcfa_host):
@@ -3927,14 +4038,7 @@ def distribute_vault_ca_trust(ca_pem: str, password: str,
     # Only attempt for the primary auto-a host (the Provider endpoint).
     lsf.write_output('')
     lsf.write_output('--- VCF Automation Provider Trusted Certificates ---')
-    auto_a_host = None
-    for h, _ in vcfa_hosts:
-        if h.startswith('auto-a.') or h == 'auto-a':
-            auto_a_host = h
-            break
-    if auto_a_host is None and vcfa_hosts:
-        # Fall back to first discovered host that looks like a primary VCFA node
-        auto_a_host = vcfa_hosts[0][0]
+    auto_a_host = _get_primary_vcfa_host()
 
     if auto_a_host:
         if lsf.test_ping(auto_a_host):
@@ -5174,11 +5278,10 @@ echo "PROXY_CONFIGURED"
 
 VSP_CP_VIP = '10.1.1.142'
 VSP_SSH_USER = 'vmware-system-user'
-# BenS-validated VSP control-plane target (vsp-remediate.sh CP_TARGET=4).
 # Do NOT raise this back toward 12 vCPU: a larger CP was found to be the
 # resource-stress trigger for the leader-election storm, not the fix for it.
-VSP_TOPOLOGY_TARGET_NUMCPU = 4
-VSP_TOPOLOGY_TARGET_MEMORY_MIB = 10240
+VSP_TOPOLOGY_TARGET_NUMCPU = 6
+VSP_TOPOLOGY_TARGET_MEMORY_MIB = 12288
 
 
 def _vsp_kubectl(cmd: str, password: str, vsp_cp_vip: str = VSP_CP_VIP) -> 'subprocess.CompletedProcess':
@@ -5710,6 +5813,7 @@ def main():
     3.  NSX configuration (Managers and Edges)              [VCF only]
     4.  SDDC Manager configuration                          [VCF only]
     5.  VCF Automation VMs configuration                    [VCF only]
+    5b. Disable VCFA FIPS mode (AMD Zen4/Zen5 CPU fix)       [VCF only]
     6.  Operations VMs configuration
     7.  Disable SDDC Manager auto-rotate policies           [VCF only]
     8.  Configure VCF Operations Fleet Password Policy
@@ -5772,6 +5876,9 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
     parser.add_argument('--skip-vsp-sizing', action='store_true',
                         help='Skip Step 8b: VSP control-plane node sizing fix '
                              '(numCPUs/memoryMiB topology override)')
+    parser.add_argument('--skip-vcfa-fips', action='store_true',
+                        help='Skip Step 5b: VCFA FIPS mode disable '
+                             '(AMD Zen4/Zen5 CPU utilization fix)')
     parser.add_argument('--version', action='version',
                         version=f'%(prog)s {SCRIPT_VERSION}')
     
@@ -5890,6 +5997,15 @@ NOTE: NSX Edge SSH is enabled automatically via Guest Operations.
         configure_aria_automation_vms(auth_keys_file, password, args.dry_run)
     else:
         lsf.write_output('Step 5: VCF Automation configuration skipped (VVF lab — no VCF Automation)')
+
+    # Step 5b: Disable VCFA FIPS mode (AMD Zen4/Zen5 CPU utilization fix) [VCF only]
+    # Runs after Step 5 so any SSH/sudo access configured there is already in
+    # place. Internally preflighted (host discovery + SSH reachability), so
+    # it safely no-ops on labs without VCF Automation deployed/powered on.
+    if is_vcf and not args.skip_vcfa_fips:
+        disable_vcfa_fips_mode(password, args.dry_run)
+    elif not is_vcf:
+        lsf.write_output('Step 5b: VCFA FIPS disable skipped (VVF lab — no VCF Automation)')
 
     # Step 6: Configure Operations VMs (VCF and VVF both have ops VMs)
     configure_operations_vms(auth_keys_file, password, args.dry_run)

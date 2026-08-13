@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # ESXi.py - HOLFY27 Core ESXi Host Verification Module
-# Version 3.3 - 2026-08-03
+# Version 3.5 - 2026-08-13
 # Author - Burke Azbill and HOL Core Team
 # Verifies ESXi hosts are online and responsive
+# v3.5: Roll back vsp-01.* CPU limit of 8; preserve existing CPU counts and update CPU topology to 8, 4, 2, or 1 cores per socket (whichever divides numCPU evenly).
+# v3.4: Added auto-platform-a* CPU topology (8 cores per socket) enforcement. Applied directly on ESXi
+#       hosts before power-on.
 # v3.3: Removed vsp* VM minimum resource (12 CPU / 24 GB RAM) enforcement.
 #       VSP control-plane/worker sizing is now owned exclusively by the
 #       BenS vsp-remediate.sh toolkit (VSP CP target: 4 vCPU / 10240 MiB),
@@ -254,6 +257,237 @@ def main(lsf=None, standalone=False, dry_run=False):
     
     ##=========================================================================
     ## End Core Team code
+    ##=========================================================================
+
+    ##=========================================================================
+    ## CUSTOM - VCF Automation (auto-platform-a*) & VSP Platform (vsp-01.*)
+    ##          CPU topology enforcement
+    ##
+    ## 1. For each ESXi host, find any VM whose name starts with 'auto-platform-a'
+    ##    and ensure its CPU topology has 8 cores per socket (numCoresPerSocket = 8).
+    ##
+    ## 2. For each ESXi host, find any VM whose name starts with 'vsp-01'
+    ##    and update its CPU topology to 8, 4, 2, or 1 cores per socket (whichever
+    ##    first results in an equal number of cores across sockets for numCPU).
+    ##    CPU counts (numCPU) are left unchanged.
+    ##
+    ## Reconfiguration is only applied to powered-off VMs so running VMs
+    ## are never disrupted. Hosts with no matching VMs are logged/skipped.
+    ## Host connections are retried up to 5 times with 30s delays.
+    ##=========================================================================
+
+    if dry_run:
+        lsf.write_output('Dry-run: skipping auto-platform-a* and vsp-01.* CPU topology enforcement')
+    elif not esx_hosts:
+        lsf.write_output('No ESXi hosts configured - skipping auto-platform-a* and vsp-01.* CPU checks')
+    else:
+        TARGET_CORES_PER_SOCKET = 8
+        MAX_HOST_RETRIES = 5
+        HOST_RETRY_DELAY = 30
+
+        lsf.write_output('Checking ESXi host VMs for CPU topology (auto-platform-a* and vsp-01.*)...')
+        try:
+            import re
+            import ssl as _ssl_vcfa
+            from pyVmomi import vim
+            from pyVim import connect as _vcfa_connect
+            from pyVim.task import WaitForTask
+
+            _vcfa_password = lsf.get_password()
+            _vcfa_ctx = _ssl_vcfa._create_unverified_context()
+
+            hosts_checked       = 0
+            vcfa_vms_found      = 0
+            vcfa_vms_updated    = 0
+            vcfa_vms_skipped_on = 0
+
+            vsp_vms_found       = 0
+            vsp_vms_updated     = 0
+            vsp_vms_skipped_on  = 0
+
+            for _entry in esx_hosts:
+                _host = _entry.split(':')[0].strip() if ':' in _entry else _entry.strip()
+
+                for _attempt in range(MAX_HOST_RETRIES):
+                    try:
+                        _si = _vcfa_connect.SmartConnect(
+                            host=_host,
+                            user='root',
+                            pwd=_vcfa_password,
+                            sslContext=_vcfa_ctx
+                        )
+                        _content = _si.RetrieveContent()
+                        _container = _content.viewManager.CreateContainerView(
+                            _content.rootFolder, [vim.VirtualMachine], True
+                        )
+
+                        _all_vms = list(_container.view)
+                        _vcfa_vms = [
+                            vm for vm in _all_vms
+                            if re.match(r'^auto-platform-a', vm.name, re.IGNORECASE)
+                        ]
+                        _vsp_vms = [
+                            vm for vm in _all_vms
+                            if re.match(r'^vsp-01', vm.name, re.IGNORECASE)
+                        ]
+                        _container.Destroy()
+
+                        if not _vcfa_vms and not _vsp_vms:
+                            lsf.write_output(f'  {_host}: no auto-platform-a* or vsp-01.* VMs found')
+                            _vcfa_connect.Disconnect(_si)
+                            hosts_checked += 1
+                            break
+
+                        _host_vcfa_found = len(_vcfa_vms)
+                        _host_vcfa_updated = 0
+                        _host_vcfa_skipped = 0
+
+                        _host_vsp_found = len(_vsp_vms)
+                        _host_vsp_updated = 0
+                        _host_vsp_skipped = 0
+
+                        # --- Process auto-platform-a* VMs ---
+                        if _vcfa_vms:
+                            lsf.write_output(f'  {_host}: found {len(_vcfa_vms)} auto-platform-a* VM(s)')
+                            for _vm in _vcfa_vms:
+                                _hw = _vm.config.hardware if (_vm.config and _vm.config.hardware) else None
+                                _cur_cores = _hw.numCoresPerSocket if _hw else None
+                                _cur_num_cpu = _hw.numCPU if _hw else None
+                                _power = _vm.runtime.powerState
+
+                                lsf.write_output(
+                                    f'    {_vm.name}: numCPU={_cur_num_cpu}, '
+                                    f'numCoresPerSocket={_cur_cores}, state={_power}'
+                                )
+
+                                if _cur_cores == TARGET_CORES_PER_SOCKET:
+                                    lsf.write_output(
+                                        f'    {_vm.name}: CPU topology already set to {TARGET_CORES_PER_SOCKET} cores per socket - no changes needed'
+                                    )
+                                    continue
+
+                                if _power == 'poweredOn':
+                                    lsf.write_output(
+                                        f'    {_vm.name}: WARNING - VM is powered on; '
+                                        f'topology reconfiguration skipped to avoid disruption'
+                                    )
+                                    _host_vcfa_skipped += 1
+                                    continue
+
+                                # Powered off — safe to reconfigure topology
+                                _spec = vim.vm.ConfigSpec()
+                                _spec.numCoresPerSocket = TARGET_CORES_PER_SOCKET
+
+                                lsf.write_output(
+                                    f'    {_vm.name}: reconfiguring CPU topology '
+                                    f'(numCoresPerSocket: {_cur_cores} -> {TARGET_CORES_PER_SOCKET})'
+                                )
+                                try:
+                                    _task = _vm.ReconfigVM_Task(spec=_spec)
+                                    WaitForTask(_task)
+                                    lsf.write_output(f'    {_vm.name}: CPU topology reconfiguration complete')
+                                    _host_vcfa_updated += 1
+                                except Exception as _reconfig_err:
+                                    lsf.write_output(
+                                        f'    {_vm.name}: CPU topology reconfiguration FAILED: {_reconfig_err}'
+                                    )
+
+                        # --- Process vsp-01.* VMs ---
+                        if _vsp_vms:
+                            lsf.write_output(f'  {_host}: found {len(_vsp_vms)} vsp-01.* VM(s)')
+                            for _vm in _vsp_vms:
+                                _hw = _vm.config.hardware if (_vm.config and _vm.config.hardware) else None
+                                _cur_cores = _hw.numCoresPerSocket if _hw else None
+                                _cur_num_cpu = _hw.numCPU if _hw else None
+                                _power = _vm.runtime.powerState
+
+                                lsf.write_output(
+                                    f'    {_vm.name}: numCPU={_cur_num_cpu}, '
+                                    f'numCoresPerSocket={_cur_cores}, state={_power}'
+                                )
+
+                                # Determine target cores per socket in order: 8, 4, 2, 1
+                                _target_cores = 1
+                                if _cur_num_cpu:
+                                    for _c in [8, 4, 2, 1]:
+                                        if _cur_num_cpu >= _c and _cur_num_cpu % _c == 0:
+                                            _target_cores = _c
+                                            break
+
+                                if _cur_cores == _target_cores:
+                                    lsf.write_output(
+                                        f'    {_vm.name}: CPU topology already set to {_target_cores} cores per socket - no changes needed'
+                                    )
+                                    continue
+
+                                if _power == 'poweredOn':
+                                    lsf.write_output(
+                                        f'    {_vm.name}: WARNING - VM is powered on; '
+                                        f'CPU topology reconfiguration skipped to avoid disruption'
+                                    )
+                                    _host_vsp_skipped += 1
+                                    continue
+
+                                # Powered off — safe to reconfigure CPU topology
+                                _spec = vim.vm.ConfigSpec()
+                                _spec.numCoresPerSocket = _target_cores
+
+                                lsf.write_output(
+                                    f'    {_vm.name}: reconfiguring CPU topology '
+                                    f'(numCoresPerSocket: {_cur_cores} -> {_target_cores})'
+                                )
+                                try:
+                                    _task = _vm.ReconfigVM_Task(spec=_spec)
+                                    WaitForTask(_task)
+                                    lsf.write_output(f'    {_vm.name}: CPU topology reconfiguration complete')
+                                    _host_vsp_updated += 1
+                                except Exception as _reconfig_err:
+                                    lsf.write_output(
+                                        f'    {_vm.name}: CPU topology reconfiguration FAILED: {_reconfig_err}'
+                                    )
+
+                        _vcfa_connect.Disconnect(_si)
+
+                        hosts_checked += 1
+                        vcfa_vms_found += _host_vcfa_found
+                        vcfa_vms_updated += _host_vcfa_updated
+                        vcfa_vms_skipped_on += _host_vcfa_skipped
+
+                        vsp_vms_found += _host_vsp_found
+                        vsp_vms_updated += _host_vsp_updated
+                        vsp_vms_skipped_on += _host_vsp_skipped
+                        break
+
+                    except Exception as _host_err:
+                        if _attempt < MAX_HOST_RETRIES - 1:
+                            lsf.write_output(
+                                f'  WARNING: could not connect to {_host} for VM CPU check '
+                                f'(attempt {_attempt + 1}/{MAX_HOST_RETRIES}): {_host_err}. Retrying in {HOST_RETRY_DELAY}s...'
+                            )
+                            lsf.labstartup_sleep(HOST_RETRY_DELAY)
+                        else:
+                            lsf.write_output(
+                                f'  WARNING: could not connect to {_host} for VM CPU check after {MAX_HOST_RETRIES} attempts: {_host_err}'
+                            )
+
+            _summary_parts = [
+                f'{hosts_checked} host(s) checked',
+                f'{vcfa_vms_found} auto-platform-a* VM(s) found ({vcfa_vms_updated} updated)',
+                f'{vsp_vms_found} vsp-01.* VM(s) found ({vsp_vms_updated} updated)',
+            ]
+            if vcfa_vms_skipped_on or vsp_vms_skipped_on:
+                _summary_parts.append(
+                    f'{vcfa_vms_skipped_on + vsp_vms_skipped_on} skipped (powered on)'
+                )
+            lsf.write_output('ESXi VM CPU check complete: ' + ', '.join(_summary_parts))
+
+        except Exception as _global_err:
+            lsf.write_output(
+                f'WARNING: ESXi VM CPU check encountered an error: {_global_err}'
+            )
+
+    ##=========================================================================
+    ## End CUSTOM section
     ##=========================================================================
 
     lsf.write_output(f'{MODULE_NAME} completed')
