@@ -1,4 +1,5 @@
 .DS_Store
+.claude/
 .playwright-mcp
 __pycache__
 */__pycache__
