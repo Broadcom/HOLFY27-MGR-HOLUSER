@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # odyssey.py - HOLFY27 Core Odyssey Installation Module
-# Version 3.1 - 2026-08-11
+# Version 3.2 - 2026-08-13
 # Author - Burke Azbill and HOL Core Team
 # VMware Odyssey client installation for VLP deployments
 
@@ -147,17 +147,29 @@ def install_odyssey_lmc(lsf, mc, desktop, odyssey_dst):
         lmcuser, lsf.password
     )
     
+    # Remove any stale extraction from a previous run - appimage-extract
+    # will not overwrite an existing squashfs-root (it either errors or
+    # extracts into squashfs-root-<pid> instead), leaving AppRun missing
+    # from the expected path even though extraction "succeeded".
+    squashfs_root = '/home/holuser/desktop-hol/squashfs-root'
+    lsf.ssh(f'rm -rf {squashfs_root}', lmcuser, lsf.password)
+
     # Extract AppImage for Ubuntu 24.04+ (fuse2 not available)
     extract_script = '/lmchol/tmp/extract.sh'
     with open(extract_script, 'w') as script:
         script.write('#!/bin/sh\n')
         script.write(f'cd /home/holuser/desktop-hol\n')
         script.write(f'./{ODYSSEY_APP_LINUX} --appimage-extract\n')
-    
-    lsf.ssh('/bin/sh /tmp/extract.sh', lmcuser, lsf.password)
-    
+
+    extract_result = lsf.ssh('/bin/sh /tmp/extract.sh', lmcuser, lsf.password)
+    lsf.write_output(
+        f'Odyssey extract result: rc={getattr(extract_result, "returncode", "?")} '
+        f'stdout={getattr(extract_result, "stdout", "")!r} '
+        f'stderr={getattr(extract_result, "stderr", "")!r}'
+    )
+
     # Fix chrome-sandbox permissions
-    sandbox = '/home/holuser/desktop-hol/squashfs-root/chrome-sandbox'
+    sandbox = f'{squashfs_root}/chrome-sandbox'
     lsf.ssh(f'chown root:root {sandbox}', 'root@console', lsf.password)
     lsf.ssh(f'chmod 4755 {sandbox}', 'root@console', lsf.password)
 
