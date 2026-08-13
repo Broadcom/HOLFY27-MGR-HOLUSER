@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # odyssey.py - HOLFY27 Core Odyssey Installation Module
-# Version 3.2 - 2026-08-13
+# Version 3.3 - 2026-08-13
 # Author - Burke Azbill and HOL Core Team
 # VMware Odyssey client installation for VLP deployments
 
@@ -265,37 +265,58 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output(f'Cloud: {the_cloud}')
     
     #==========================================================================
-    # Clean Up Old Installation
+    # Clean Up, Download, Install and Validate Odyssey - retry the full
+    # cycle if the AppImage extraction didn't actually produce AppRun
+    # (see install_odyssey_lmc - a stale/failed extraction can leave
+    # squashfs-root without AppRun even though earlier steps succeeded)
     #==========================================================================
-    
+
+    max_attempts = 5
+    retry_delay_seconds = 15
+    apprun_path = f'{mc}/{odyssey_dst}/squashfs-root/AppRun'
+    extraction_verified = False
+
     if not dry_run:
-        cleanup_old_odyssey(lsf, mc, desktop, odyssey_dst)
-    
-    #==========================================================================
-    # Download and Install Odyssey
-    #==========================================================================
-    
-    if not dry_run:
-        lsf.write_output('Downloading Odyssey client...')
-        
-        proxies = getattr(lsf, 'proxies', {})
-        if not download_odyssey(lsf, proxies):
-            lsf.write_output('Failed to download Odyssey')
+        for attempt in range(1, max_attempts + 1):
+            lsf.write_output(f'Odyssey install attempt {attempt}/{max_attempts}')
+
+            cleanup_old_odyssey(lsf, mc, desktop, odyssey_dst)
+
+            lsf.write_output('Downloading Odyssey client...')
+            proxies = getattr(lsf, 'proxies', {})
+            if not download_odyssey(lsf, proxies):
+                lsf.write_output('Failed to download Odyssey')
+                if attempt < max_attempts:
+                    lsf.labstartup_sleep(retry_delay_seconds)
+                    continue
+                break
+
+            lsf.write_output('Installing Odyssey on console...')
+            install_odyssey_lmc(lsf, mc, desktop, odyssey_dst)
+
+            if os.path.isfile(apprun_path):
+                lsf.write_output(f'Verified {apprun_path} exists')
+                extraction_verified = True
+                break
+
+            lsf.write_output(f'{apprun_path} not found after attempt {attempt}/{max_attempts}')
+            if attempt < max_attempts:
+                lsf.labstartup_sleep(retry_delay_seconds)
+
+        if not extraction_verified:
+            lsf.write_output(f'Odyssey installation failed - {apprun_path} not found after {max_attempts} attempts')
             lsf.write_vpodprogress('ODYSSEY FAIL', 'ODYSSEY-FAIL', color='red')
             if dashboard and TaskStatus:
-                dashboard.update_task('odyssey', 'install', TaskStatus.FAILED, 'Download failed')
+                dashboard.update_task('odyssey', 'install', TaskStatus.FAILED, 'AppRun not found after retries')
                 dashboard.generate_html()
             return
-        
-        lsf.write_output('Installing Odyssey on console...')
-        install_odyssey_lmc(lsf, mc, desktop, odyssey_dst)
-    
+
     #==========================================================================
     # Verify Installation
     #==========================================================================
-    
+
     shortcut_path = f'{mc}/{desktop}/{ODYSSEY_SHORTCUT}'
-    
+
     if os.path.isfile(shortcut_path) or dry_run:
         lsf.write_output('Odyssey installation complete')
         lsf.write_vpodprogress('READY', 'ODYSSEY-READY', color='green')
