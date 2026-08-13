@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 vsp-health.py
-Version 2.8.0 - 2026-08-13
+Version 2.9.0 - 2026-08-13
 Author: Burke Azbill and HOL Core Team
+
+v2.9.0: Added Control Plane vs. Worker Node pod location breakdown (x CP / y Worker)
+to Pod Health Overview, plus node role and hostname details for unhealthy pods in verbose mode.
 
 v2.8.0: Fixed Control Plane auto-discovery fallback across active node IPs
 (10.1.1.141-150) when VIP is down/unreachable, dynamic VCF component
@@ -78,7 +81,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 DATE    = "2026-08-13"
 
 CREDS_FILE = "/home/holuser/creds.txt"
@@ -582,24 +585,40 @@ def chk_nodes(cp_host, password, nodes_data, verbose):
 
 
 # ─── Section 3: Pod Health Overview ──────────────────────────────────────────
-def chk_pod_overview(cp_host, password, verbose):
+def chk_pod_overview(cp_host, password, nodes_data, verbose):
     """One line per namespace via lightweight --no-headers text output.
 
     Using -o json for all pods returns megabytes of data that exceeds SSH
-    pipe buffers on large clusters.  Text output is ~100x smaller and just
-    as informative for a health summary.
+    pipe buffers on large clusters.  Text output with -o wide is ~100x smaller and
+    includes node placement for CP vs Worker node breakdown.
     """
+    if not nodes_data:
+        nodes_data = fetch_json(cp_host, password, "kubectl get nodes -o json 2>/dev/null", 30)
+
+    node_roles = {}
+    if nodes_data and isinstance(nodes_data, dict):
+        for item in nodes_data.get("items", []):
+            name = item.get("metadata", {}).get("name")
+            labels = item.get("metadata", {}).get("labels", {})
+            if "node-role.kubernetes.io/control-plane" in labels or "node-role.kubernetes.io/master" in labels:
+                node_roles[name] = "CP"
+            else:
+                node_roles[name] = "Worker"
+
     _, out = ssh_exec(cp_host, password,
-                      "kubectl get pods -A --no-headers 2>/dev/null", timeout=60)
+                      "kubectl get pods -A -o wide --no-headers 2>/dev/null", timeout=60)
     if not out or out.strip() == "":
         return [row_fail("kubectl get pods -A: success", "command returned no output")]
 
-    ns_summary = defaultdict(lambda: {"healthy": 0, "total": 0, "bad": []})
+    ns_summary = defaultdict(lambda: {"healthy": 0, "total": 0, "bad": [], "cp": 0, "worker": 0})
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) < 4:
+        if len(parts) < 8:
             continue
         ns, name, ready_str, status = parts[0], parts[1], parts[2], parts[3]
+        node = parts[-3]
+        role = node_roles.get(node, "Worker")
+
         try:
             cur, tot = (int(x) for x in ready_str.split("/"))
         except (ValueError, AttributeError):
@@ -612,12 +631,17 @@ def chk_pod_overview(cp_host, password, verbose):
             or (status == "Running" and cur == tot)
         )
         ns_summary[ns]["total"] += 1
+        if role == "CP":
+            ns_summary[ns]["cp"] += 1
+        else:
+            ns_summary[ns]["worker"] += 1
+
         if healthy:
             ns_summary[ns]["healthy"] += 1
         else:
             issue = (f"NotReady({cur}/{tot})" if status == "Running"
                      else status)
-            ns_summary[ns]["bad"].append((name, issue))
+            ns_summary[ns]["bad"].append((name, issue, role, node))
 
     if not ns_summary:
         return [row_fail("kubectl get pods -A: returned data", "no parseable pod lines")]
@@ -632,18 +656,20 @@ def chk_pod_overview(cp_host, password, verbose):
     for ns in sorted(ns_summary.keys(), key=ns_sort):
         d = ns_summary[ns]
         h, t = d["healthy"], d["total"]
+        cp_c, wrk_c = d["cp"], d["worker"]
         bad  = d["bad"]
-        count_str = f"{h}/{t} Running/Completed"
+        node_str = f"({cp_c} CP / {wrk_c} Worker)"
+        count_str = f"{h}/{t} Running/Completed {node_str}"
         if not bad:
             results.append(row_ok(f"{ns:<{W_NS}} {count_str}"))
         else:
-            inline = ", ".join(f"{nm}: {issue}" for nm, issue in bad[:2])
+            inline = ", ".join(f"{nm}: {issue}" for nm, issue, _, _ in bad[:2])
             if len(bad) > 2:
                 inline += f" (+{len(bad)-2} more)"
             results.append(row_fail(f"{ns:<{W_NS}} {count_str}", inline))
             if verbose:
-                for nm, issue in bad:
-                    row_verbose(f"  {ns}/{nm}: {issue}")
+                for nm, issue, role, node in bad:
+                    row_verbose(f"  {ns}/{nm}: {issue}  [{role}: {node}]")
     return results
 
 
@@ -1437,7 +1463,7 @@ def run_health_check(args, password, site_vip, site_worker, run_start, ts, W):
     
         needs_crictl = want in (None, "cp")
         needs_kvip   = want in (None, "cp")
-        needs_nodes  = want in (None, "nodes", "password")
+        needs_nodes  = want in (None, "nodes", "pods", "password")
         needs_deps   = want in (None, "vcf")
         needs_sts    = want in (None, "vcf")
         needs_certs  = want in (None, "certs")
@@ -1482,7 +1508,7 @@ def run_health_check(args, password, site_vip, site_worker, run_start, ts, W):
             chk_nodes, cp_host, password, nodes_data, args.verbose)
     
         run("pods",     "POD HEALTH OVERVIEW  (all namespaces)",
-            chk_pod_overview, cp_host, password, args.verbose)
+            chk_pod_overview, cp_host, password, nodes_data, args.verbose)
     
         run("vcf",      "VCF MANAGED COMPONENTS  (vcfcomponents)",
             chk_vcf_components, cp_host, password, deps_data, sts_data, comp_data, args.verbose)
