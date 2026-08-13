@@ -1,7 +1,15 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.12 - 2026-06-30
+# Version 3.13 - 2026-08-13
 # Changes:
+# - Added check_and_fix_console_black_screen(): best-effort preflight that reads
+#   /sys/class/graphics/fb0/blank on the console shortly after GDM is confirmed
+#   running, and restarts GDM if it reads blanked. Root-caused a fresh-boot race
+#   where GDM/Xorg/gnome-shell report healthy but the vmwgfx framebuffer stays
+#   powered down (black screen via VMware console, RDP, and NoMachine alike).
+#   Runs once, only on a genuine startup (not labcheck), right after the console
+#   NFS mount is detected. See vcf-troubleshooting skill Section 8 / HISTORY.md
+#   2026-08-13 for the full diagnosis.
 # - Firefox profile rebuild gate (FIREFOX_PROFILE_REBUILD_REQUIRED in script): deploy
 #   rebuild-firefox-profile.sh, compare to ~/.local/state/firefox_profile_rebuild.count on LMC,
 #   SSH-run rebuild when missing or stored count < required (bump constant to force again).
@@ -408,7 +416,72 @@ clone_or_pull_labtype_overrides() {
             log_warn "${labtype} override clone failed - ${labtype} overrides not available" "${logfile}"
         fi
     fi
-    
+
+    return 0
+}
+
+# Best-effort preflight for a fresh-boot console black-screen race (2026-08-13 incident).
+# GDM/Xorg/gnome-shell all report healthy in the broken state - the only observed
+# kernel-level signal was /sys/class/graphics/fb0/blank reading non-zero (blanked)
+# while the console's vmwgfx framebuffer never got a live frame after boot. A GDM
+# restart forces a fresh mode-set and resolves it without a full VM reboot.
+#
+# This is a HEURISTIC based on a single confirmed incident - it may not catch every
+# occurrence of the underlying race. It intentionally runs only once, only during a
+# genuine startup (never labcheck), so it can never interrupt an actively-used
+# desktop session that is merely screen-locked/DPMS-blanked by the user.
+check_and_fix_console_black_screen() {
+    local console_host="root@console.site-a.vcf.lab"
+
+    if ! command -v sshpass >/dev/null 2>&1 || [ ! -f /home/holuser/creds.txt ]; then
+        log_msg "Console black-screen preflight: sshpass or creds.txt missing - skipping (non-fatal)." "${logfile}"
+        return 0
+    fi
+
+    # Give GDM a moment to reach its post-boot steady state before sampling
+    # fb0/blank, so we don't catch a transient mid-boot value.
+    local attempt gdm_ready
+    gdm_ready=false
+    for attempt in 1 2 3 4 5 6; do
+        if sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${console_host}" \
+            "systemctl is-active --quiet gdm && pgrep -x Xorg >/dev/null" >/dev/null 2>&1; then
+            gdm_ready=true
+            break
+        fi
+        sleep 5
+    done
+
+    if [ "$gdm_ready" != true ]; then
+        log_msg "Console black-screen preflight: GDM/Xorg not confirmed running after 30s - skipping (non-fatal)." "${logfile}"
+        return 0
+    fi
+
+    local fb_blank
+    fb_blank=$(sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${console_host}" \
+        "cat /sys/class/graphics/fb0/blank 2>/dev/null" 2>/dev/null | tr -d '[:space:]')
+
+    if [ -z "$fb_blank" ]; then
+        log_msg "Console black-screen preflight: could not read fb0/blank - skipping (non-fatal)." "${logfile}"
+        return 0
+    fi
+
+    if [ "$fb_blank" = "0" ]; then
+        log_msg "Console black-screen preflight: fb0/blank=0 (normal) - no action needed." "${logfile}"
+        return 0
+    fi
+
+    log_msg "Console black-screen preflight: fb0/blank=${fb_blank} (blanked) - restarting GDM to force a fresh mode-set..." "${logfile}"
+    if sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${console_host}" "systemctl restart gdm" >/dev/null 2>&1; then
+        sleep 8
+        # fb0/blank is a VT/kernel-level flag, not something the compositor resets
+        # on its own restarting GDM alone left it unchanged in testing. Force-clear
+        # it explicitly to match the exact sequence that was confirmed working live.
+        sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${console_host}" \
+            "echo 0 > /sys/class/graphics/fb0/blank" >/dev/null 2>&1
+        log_msg "Console black-screen preflight: GDM restarted and fb0/blank force-cleared. This is a best-effort remediation - it cannot be visually verified over SSH." "${logfile}"
+    else
+        log_msg "WARNING: Console black-screen preflight: GDM restart command failed (non-fatal, continuing startup)." "${logfile}"
+    fi
     return 0
 }
 
@@ -741,6 +814,12 @@ if [ "$1" = "labcheck" ]; then
     runlabstartup labcheck
     exit 0
 else
+    # Console black-screen self-heal preflight (best-effort, non-fatal).
+    # Runs only here - on a genuine startup, once, right after the console NFS
+    # mount is confirmed - never on a labcheck cron cycle, so it can't interrupt
+    # an actively-used desktop that is merely screen-locked/DPMS-blanked.
+    check_and_fix_console_black_screen
+
     log_msg "Main Console mount is present. Clearing labstartup logs." "${logfile}"
     # Initialize the status dashboard to clear previous run info
     /usr/bin/python3 ${holroot}/Tools/status_dashboard.py --clear >> ${logfile} 2>&1
