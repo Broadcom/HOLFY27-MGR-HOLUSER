@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.38 - 2026-08-12
+# Version 6.3.39 - 2026-08-13
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
 #
+# v6.3.39 Changes:
+# - Task 2: After the VSP K8s cert check/renewal step, run
+#   Tools/vsp-health/vsp-scale-down.py --cp-machine-type cp.medium against
+#   vsp_vip to keep the VSP Control Plane node on the cp.medium machine
+#   type. Streamed the same way as the vsp_cert_renewer.py call immediately
+#   above it (subprocess.Popen, PYTHONUNBUFFERED, line-by-line write_output).
+#   Idempotent (the script no-ops if already at cp.medium) and non-fatal —
+#   a non-zero exit is logged as a WARNING and does not abort Task 2.
 # v6.3.38 Changes:
 # - Apply the auto-platform-a* CPU reservation/limit AFTER power-on and
 #   Tools-running confirmation (gated behind vcfa-cpu-alloc-enforced = true).
@@ -2280,6 +2288,60 @@ echo "PROXY_CONFIGURED"
                     if dashboard:
                         dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.SKIPPED,
                                               'vsp_cert_renewer.py not found')
+                        dashboard.generate_html()
+
+                # ---- VSP Control Plane machine type (cp.medium) ----
+                # vsp-scale-down.py checks the current PackageDeployment
+                # cluster.machineType first and no-ops if already at the
+                # target, so rerunning this on every boot is cheap once set.
+                # Non-fatal — a failure here does not abort the rest of Task 2.
+                _vsp_scale_script = '/home/holuser/hol/Tools/vsp-health/vsp-scale-down.py'
+                _vsp_scale_errors = []
+                if dashboard:
+                    dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.RUNNING)
+                    dashboard.generate_html()
+                if os.path.isfile(_vsp_scale_script):
+                    lsf.write_output('  Configuring VSP Control Plane machine type (cp.medium)...')
+                    _scale_env = os.environ.copy()
+                    _scale_env['PYTHONUNBUFFERED'] = '1'
+                    _scale_proc = subprocess.Popen(
+                        ['python3', '-u', _vsp_scale_script,
+                         '--host', vsp_vip,
+                         '--cp-machine-type', 'cp.medium',
+                         '--yes'],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        env=_scale_env,
+                    )
+                    for _scale_line in _scale_proc.stdout:
+                        _scale_line = _scale_line.rstrip('\n')
+                        if _scale_line.strip():
+                            lsf.write_output(f' {_scale_line.strip()}')
+                    _scale_proc.wait()
+                    if _scale_proc.returncode not in (0, None):
+                        lsf.write_output(
+                            f'  WARNING: VSP CP resize exited '
+                            f'{_scale_proc.returncode} — continuing'
+                        )
+                        _vsp_scale_errors.append(f'exited {_scale_proc.returncode}')
+                    if dashboard:
+                        if _vsp_scale_errors:
+                            dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.FAILED,
+                                                  f'Non-zero exit: {"; ".join(_vsp_scale_errors)}')
+                        else:
+                            dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.COMPLETE,
+                                                  'CP machine type set to cp.medium')
+                        dashboard.generate_html()
+                else:
+                    lsf.write_output(
+                        f'  VSP scale-down script not found: '
+                        f'{_vsp_scale_script} — skipping'
+                    )
+                    if dashboard:
+                        dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.SKIPPED,
+                                              'vsp-scale-down.py not found')
                         dashboard.generate_html()
 
                 # ---- Unsuspend postgres instances managed by Zalando operator ----
