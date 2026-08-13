@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """
 vsp-health.py
-Version 2.6.0 - 2026-07-28
+Version 2.8.0 - 2026-08-13
 Author: Burke Azbill and HOL Core Team
+
+v2.8.0: Fixed Control Plane auto-discovery fallback across active node IPs
+(10.1.1.141-150) when VIP is down/unreachable, dynamic VCF component
+discovery from config.ini/cluster, and Site A/B reachability loop.
+
+v2.7.0: Added Node Capacity vs. Resource Requests Allocation ASCII table to the
+nodes section to visualize CPU and Memory requests compared to allocatable capacity.
+
+v2.6.0: Added Patroni leader endpoint validity check to the postgres section.
 
 v2.5.0: CP host resolution now tries candidates in order — explicit --host,
 then the hardcoded VSP_VIP, then auto-discovery via --worker — stopping at
@@ -69,8 +78,8 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 
-VERSION = "2.6.0"
-DATE    = "2026-07-16"
+VERSION = "2.8.0"
+DATE    = "2026-08-13"
 
 CREDS_FILE = "/home/holuser/creds.txt"
 VSP_USER   = "vmware-system-user"
@@ -86,39 +95,6 @@ BAD_REASONS = frozenset([
     "RunContainerError", "InvalidImageName", "ContainerCannotRun",
     "StartError",
 ])
-
-# VCF-managed workloads — matches [VCFFINAL] vcfcomponents in config.ini
-# Format: (namespace, "kind/name")
-VCF_COMPONENTS = [
-    ("salt",               "deployment/salt-master"),
-    ("salt",               "deployment/salt-minion"),
-    ("salt-raas",          "deployment/redis"),
-    ("salt-raas",          "deployment/raas"),
-    ("telemetry",          "deployment/telemetry-acceptor"),
-    ("vcf-fleet-depot",    "deployment/depot-service"),
-    ("vcf-fleet-depot",    "deployment/distribution-service"),
-    ("vcf-fleet-lcm",      "deployment/vcf-fleet-build-service-fleetbuild"),
-    ("vcf-fleet-lcm",      "deployment/vcf-fleet-upgrade-service-fleetupgrade"),
-    ("vcf-sddc-lcm",       "deployment/vcf-sddc-build-service-sddcbuild"),
-    ("vcf-sddc-lcm",       "deployment/vcf-sddc-upgrade-service-sddcupgrade"),
-    ("vidb-external",      "deployment/vidb-service"),
-    ("ops-logs",           "statefulset/log-processor"),
-    ("ops-logs",           "statefulset/log-store"),
-    ("vodap",              "deployment/vcf-obs-collector-controller-service"),
-    ("vodap",              "deployment/vcf-obs-data-query-service"),
-    ("vodap",              "deployment/vcf-obs-esx-collector-service"),
-    ("vodap",              "deployment/vcf-obs-netops-collector-service"),
-    ("vodap",              "deployment/vcf-obs-vc-collector-service"),
-    ("vodap",              "statefulset/chi-vcf-obs-vcf-obs-0-0"),
-    ("vodap",              "statefulset/chk-vcf-obs-keeper-keeper-0-0"),
-    ("vodap",              "statefulset/chk-vcf-obs-keeper-keeper-0-1"),
-    ("vodap",              "statefulset/chk-vcf-obs-keeper-keeper-0-2"),
-    ("vmsp-metrics-store", "deployment/clickhouse-operator-altinity-clickhouse-operator"),
-    ("vmsp-metrics-store", "deployment/vsp-metrics-store-operator"),
-]
-
-# vodap deployments that depend on ClickHouse (section 10)
-CLICKHOUSE_CLIENTS = ["vcf-obs-data-query-service", "vcf-obs-netops-collector-service"]
 
 # Namespaces displayed first in the pod overview (priority order)
 _NS_PRIORITY = ["kube-system", "vmsp-platform", "cert-manager", "antrea", "istio-system"]
@@ -308,18 +284,34 @@ def resolve_cp_host(host_arg, worker_fqdn, password, site_vip):
 
 
 def discover_cp(worker_fqdn, password):
-    """SSH to worker node, read kubeconfig, return CP/VIP IP. Returns None on failure."""
+    """SSH to worker or CP node, read kubeconfig, return CP/VIP IP or reachable CP node IP. Returns None on failure."""
+    candidate_ips = []
     try:
-        worker_ip = socket.gethostbyname(worker_fqdn)
+        candidate_ips.append(socket.gethostbyname(worker_fqdn))
     except socket.gaierror as e:
         print(f"  {_WARN} DNS lookup for {worker_fqdn} failed: {e}")
-        return None
-    print(f"  {_DIM}Querying {worker_fqdn} ({worker_ip}) for CP IP...{_NC}")
-    _, out = ssh_exec(worker_ip, password,
-                      "grep server: /etc/kubernetes/node-agent.conf 2>/dev/null || "
-                      "grep server: /etc/kubernetes/admin.conf 2>/dev/null")
-    m = re.search(r'https?://([0-9.]+):', out)
-    return m.group(1) if m else None
+
+    # Fallback to checking standard VSP node IP range if worker_fqdn DNS is stale or unreachable
+    subnet_prefix = "10.1.1." if "site-a" in worker_fqdn else "10.2.1."
+    for last_octet in range(141, 151):
+        ip = f"{subnet_prefix}{last_octet}"
+        if ip not in candidate_ips:
+            candidate_ips.append(ip)
+
+    for ip in candidate_ips:
+        rc, out = ssh_exec(ip, password,
+                           "grep server: /etc/kubernetes/node-agent.conf 2>/dev/null || "
+                           "grep server: /etc/kubernetes/admin.conf 2>/dev/null", timeout=5)
+        if rc == 0 and out.strip():
+            m = re.search(r'https?://([0-9.]+):', out)
+            if m:
+                cp_ip = m.group(1)
+                rc_cp, _ = ssh_exec(cp_ip, password, "echo PONG", timeout=5)
+                if rc_cp == 0:
+                    return cp_ip
+                # If the VIP/CP IP in kubeconfig is down, return this node itself if it can act as CP target
+                return ip
+    return None
 
 
 def ping_host(ip, timeout=2):
@@ -441,7 +433,129 @@ def chk_control_plane(cp_host, password, crictl_out, kvip_out, verbose, site_vip
 
 
 # ─── Section 2: Kubernetes Nodes ─────────────────────────────────────────────
-def chk_nodes(nodes_data, verbose):
+def parse_cpu(val_str):
+    val_str = str(val_str).strip()
+    if val_str.endswith('m'):
+        return int(val_str[:-1])
+    try:
+        return int(float(val_str) * 1000)
+    except ValueError:
+        return 0
+
+
+def parse_mem_mib(val_str):
+    val_str = str(val_str).strip()
+    try:
+        if val_str.endswith('Ki'):
+            return float(val_str[:-2]) / 1024.0
+        elif val_str.endswith('Mi'):
+            return float(val_str[:-2])
+        elif val_str.endswith('Gi'):
+            return float(val_str[:-2]) * 1024.0
+        return float(val_str) / (1024.0 * 1024.0)
+    except ValueError:
+        return 0.0
+
+
+def print_node_capacity_table(describe_out):
+    """Parse `kubectl describe nodes` and print an ASCII Node Capacity vs Resource Requests Allocation table."""
+    if not describe_out or "Name:" not in describe_out:
+        return
+
+    node_blocks = re.split(r'\n(?=Name:\s+)', describe_out)
+    rows = []
+
+    for block in node_blocks:
+        name_m = re.search(r'Name:\s+(\S+)', block)
+        if not name_m:
+            continue
+        name = name_m.group(1)
+
+        roles_m = re.search(r'Roles:\s+([^\n]+)', block)
+        roles_raw = roles_m.group(1).strip() if roles_m else '<none>'
+        if 'control-plane' in roles_raw:
+            role = 'Control Plane'
+        else:
+            role = 'Worker'
+
+        taints_m = re.search(r'Taints:\s+([^\n]+)', block)
+        taints_raw = taints_m.group(1).strip() if taints_m else '<none>'
+        if taints_raw in ('<none>', 'none', ''):
+            taints = 'None'
+        else:
+            taints = taints_raw.replace('node-role.kubernetes.io/', '')
+
+        # Allocatable
+        alloc_idx = block.find('Allocatable:')
+        if alloc_idx != -1:
+            alloc_block = block[alloc_idx:alloc_idx+300]
+            alloc_cpu_m = re.search(r'cpu:\s+(\S+)', alloc_block)
+            alloc_mem_m = re.search(r'memory:\s+(\S+)', alloc_block)
+            cpu_alloc_m = parse_cpu(alloc_cpu_m.group(1)) if alloc_cpu_m else 0
+            mem_alloc_mib = parse_mem_mib(alloc_mem_m.group(1)) if alloc_mem_m else 0
+        else:
+            cpu_alloc_m = 0
+            mem_alloc_mib = 0
+
+        # Allocated resources
+        alloc_res_idx = block.find('Allocated resources:')
+        if alloc_res_idx != -1:
+            alloc_res_block = block[alloc_res_idx:alloc_res_idx+400]
+            cpu_m = re.search(r'cpu\s+(\S+)\s+\(([^)]+)\)', alloc_res_block)
+            mem_m = re.search(r'memory\s+(\S+)\s+\(([^)]+)\)', alloc_res_block)
+
+            cpu_req_str = f"{cpu_m.group(2)} ({cpu_m.group(1)})" if cpu_m else "N/A"
+            mem_req_str = f"{mem_m.group(2)} ({mem_m.group(1)})" if mem_m else "N/A"
+
+            cpu_req_m = parse_cpu(cpu_m.group(1)) if cpu_m else 0
+            mem_req_mib = parse_mem_mib(mem_m.group(1)) if mem_m else 0
+        else:
+            cpu_req_str = "N/A"
+            mem_req_str = "N/A"
+            cpu_req_m = 0
+            mem_req_mib = 0
+
+        if 'NoSchedule' in taints or role == 'Control Plane':
+            rem_str = 'N/A (Untolerated Taint)'
+        else:
+            rem_cpu = max(0, cpu_alloc_m - cpu_req_m)
+            rem_mem = max(0, int(mem_alloc_mib - mem_req_mib))
+            rem_str = f"~{rem_cpu}m CPU / ~{rem_mem:,} Mi Memory"
+
+        rows.append({
+            'node': name,
+            'role': role,
+            'taints': taints,
+            'cpu_req': cpu_req_str,
+            'mem_req': mem_req_str,
+            'remaining': rem_str
+        })
+
+    if not rows:
+        return
+
+    headers = ['Node', 'Role', 'Taints', 'CPU Requests', 'Memory Requests', 'Allocatable CPU / Memory Remaining']
+    col_keys = ['node', 'role', 'taints', 'cpu_req', 'mem_req', 'remaining']
+
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, k in enumerate(col_keys):
+            widths[i] = max(widths[i], len(r[k]))
+
+    sep = '+' + '+'.join('-' * (w + 2) for w in widths) + '+'
+    header_line = '| ' + ' | '.join(f"{headers[i]:<{widths[i]}}" for i in range(len(headers))) + ' |'
+
+    print(f"\n{_DIM}  Node Capacity vs. Resource Requests Allocation:{_NC}")
+    print(f"{_DIM}  {sep}{_NC}")
+    print(f"{_DIM}  {header_line}{_NC}")
+    print(f"{_DIM}  {sep}{_NC}")
+    for r in rows:
+        row_line = '| ' + ' | '.join(f"{r[col_keys[i]]:<{widths[i]}}" for i in range(len(col_keys))) + ' |'
+        print(f"{_DIM}  {row_line}{_NC}")
+    print(f"{_DIM}  {sep}{_NC}")
+
+
+def chk_nodes(cp_host, password, nodes_data, verbose):
     results = []
     if not nodes_data:
         return [row_fail("kubectl get nodes: success")]
@@ -459,6 +573,10 @@ def chk_nodes(nodes_data, verbose):
                                     "cordoned; stale Argo system-shutdown workflows?"))
         else:
             results.append(row_fail(f"Node {name}: Ready"))
+
+    if cp_host and password:
+        _, describe_out = ssh_exec(cp_host, password, "kubectl describe nodes 2>/dev/null", timeout=30)
+        print_node_capacity_table(describe_out)
 
     return results
 
@@ -530,12 +648,70 @@ def chk_pod_overview(cp_host, password, verbose):
 
 
 # ─── Section 4: VCF Managed Components ───────────────────────────────────────
-def chk_vcf_components(deps_data, sts_data, comp_data, verbose):
+def get_vcf_components(cp_host, password):
+    """
+    Load VCF components from /tmp/config.ini if available.
+    Otherwise, dynamically discover them from the cluster.
+    """
+    import configparser
+    import os
+    import json
+    
+    # 1. Try config.ini
+    if os.path.exists('/tmp/config.ini'):
+        config = configparser.ConfigParser()
+        config.read('/tmp/config.ini')
+        if config.has_option('VCFFINAL', 'vcfcomponents'):
+            raw = config.get('VCFFINAL', 'vcfcomponents').strip()
+            if raw:
+                entries = []
+                for line in raw.replace('\n', ',').split(','):
+                    line = line.strip()
+                    if not line or ':' not in line:
+                        continue
+                    ns, resource = line.split(':', 1)
+                    entries.append((ns.strip(), resource.strip()))
+                return entries
+
+    # 2. Dynamic discovery from cluster
+    entries = []
+    rc, out = ssh_exec(cp_host, password, "kubectl get components.api.vmsp.vmware.com -o json")
+    if rc == 0 and out.strip():
+        try:
+            idx = out.find('{')
+            if idx >= 0:
+                data = json.loads(out[idx:])
+                namespaces = [item.get('spec', {}).get('namespace', '') for item in data.get('items', [])]
+                namespaces = [ns for ns in namespaces if ns and ns != 'vmsp-platform']
+                
+                for ns in namespaces:
+                    r, o = ssh_exec(cp_host, password, f"kubectl get deploy,sts -n {ns} -l ops.vmsp.vmware.com/type --no-headers")
+                    if r == 0 and o.strip():
+                        for line in o.splitlines():
+                            parts = line.split()
+                            if len(parts) >= 1:
+                                res = parts[0]
+                                if res.startswith('deployment.apps/'):
+                                    res = res.replace('deployment.apps/', 'deployment/')
+                                elif res.startswith('statefulset.apps/'):
+                                    res = res.replace('statefulset.apps/', 'statefulset/')
+                                entries.append((ns, res))
+        except Exception:
+            pass
+            
+    return entries
+
+def chk_vcf_components(cp_host, password, deps_data, sts_data, comp_data, verbose):
     """Check all VCF-managed workloads — spec.replicas vs status.readyReplicas,
     plus the components.api.vmsp.vmware.com CRDs' operational-status
     annotation (vsp-health-monitor.py's component_health check fixes both of
     these; this section is detect-only)."""
     results = []
+    
+    vcf_components = get_vcf_components(cp_host, password)
+    if not vcf_components:
+        print(f"  {_DIM}No VCF components found in config.ini or cluster.{_NC}")
+        return True, 0
 
     # Build lookup: (namespace, kind, name) -> {spec, ready}
     wl = {}
@@ -551,7 +727,7 @@ def chk_vcf_components(deps_data, sts_data, comp_data, verbose):
 
     W = 62  # label column width
     prev_ns = None
-    for ns, resource in VCF_COMPONENTS:
+    for ns, resource in vcf_components:
         kind, name = resource.split("/", 1)
 
         if verbose and ns != prev_ns:
@@ -1047,11 +1223,12 @@ def chk_vodap(cp_host, password, verbose):
             results.append(row_ok(f"ClickHouse cert: serving matches secret "
                                   f"(notAfter={na.date() if na else '?'})"))
 
-        for dep in CLICKHOUSE_CLIENTS:
-            dep_data = fetch_json(cp_host, password,
-                                  f"kubectl get deployment {dep} -n vodap -o json 2>/dev/null",
-                                  timeout=20)
-            if dep_data:
+        deps_data = fetch_json(cp_host, password,
+                               "kubectl get deployments -n vodap -o json 2>/dev/null",
+                               timeout=20)
+        if deps_data and "items" in deps_data:
+            for dep_data in deps_data["items"]:
+                dep = dep_data.get("metadata", {}).get("name", "unknown")
                 ready = dep_data.get("status", {}).get("readyReplicas", 0) or 0
                 desired = dep_data.get("spec", {}).get("replicas", 1) or 1
                 if desired > 0 and ready < desired:
@@ -1302,13 +1479,13 @@ def run_health_check(args, password, site_vip, site_worker, run_start, ts, W):
             chk_control_plane, cp_host, password, crictl_out, kvip_out, args.verbose, site_vip)
     
         run("nodes",    "KUBERNETES NODES",
-            chk_nodes, nodes_data, args.verbose)
+            chk_nodes, cp_host, password, nodes_data, args.verbose)
     
         run("pods",     "POD HEALTH OVERVIEW  (all namespaces)",
             chk_pod_overview, cp_host, password, args.verbose)
     
         run("vcf",      "VCF MANAGED COMPONENTS  (vcfcomponents)",
-            chk_vcf_components, deps_data, sts_data, comp_data, args.verbose)
+            chk_vcf_components, cp_host, password, deps_data, sts_data, comp_data, args.verbose)
     
         run("postgres", "POSTGRESQL INSTANCES",
             chk_postgres, cp_host, password, args.verbose)
@@ -1404,18 +1581,13 @@ def main():
     if args.host:
         sites = [(args.host, args.worker)]
     else:
-        sites = [('10.1.1.142', 'vsp-01a.site-a.vcf.lab'), ('10.2.1.142', 'vsp-01b.site-b.vcf.lab')]
+        sites = [('10.1.1.142', 'vsp-01a.site-a.vcf.lab')]
+        # Add Site B only if reachable
+        if ping_host('10.2.1.142', timeout=1) or ssh_exec('10.2.1.142', password, "echo PONG", timeout=2)[0] == 0:
+            sites.append(('10.2.1.142', 'vsp-01b.site-b.vcf.lab'))
 
     overall_exit = 0
     for site_vip, site_worker in sites:
-        if not args.host:
-            # Check if site exists
-            rc, _ = ssh_exec(site_vip, password, "echo PONG", timeout=2)
-            if rc != 0:
-                rc, _ = ssh_exec(site_worker, password, "echo PONG", timeout=2)
-                if rc != 0:
-                    continue
-        
         exit_code = run_health_check(args, password, site_vip, site_worker, run_start, ts, W)
         if exit_code > overall_exit:
             overall_exit = exit_code
