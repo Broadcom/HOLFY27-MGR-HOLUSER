@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.39 - 2026-08-13
+# Version 6.3.40 - 2026-08-13
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.40 Changes:
+# - Task 4: Set CPU shares to "High" (vim.SharesInfo.Level.high) along with
+#   reservation and limit when applying CPU allocation settings for the VCF
+#   Automation VM after power-on.
 #
 # v6.3.39 Changes:
 # - Task 2: After the VSP K8s cert check/renewal step, run
@@ -3691,21 +3696,25 @@ echo "PROXY_CONFIGURED"
                                     cur_alloc = vm.config.cpuAllocation
                                     cur_res = cur_alloc.reservation if cur_alloc else None
                                     cur_limit = cur_alloc.limit if cur_alloc else None
-                                    if cur_res != VCFA_CPU_RESERVATION_MHZ or cur_limit != VCFA_CPU_LIMIT_MHZ:
-                                        lsf.write_output(f'  {vm.name}: applying CPU reservation/limit after power-on '
-                                                         f'(current reservation={cur_res} MHz, limit={cur_limit} MHz)...')
+                                    cur_shares_level = cur_alloc.shares.level if (cur_alloc and cur_alloc.shares) else None
+                                    if cur_res != VCFA_CPU_RESERVATION_MHZ or cur_limit != VCFA_CPU_LIMIT_MHZ or cur_shares_level != 'high':
+                                        lsf.write_output(f'  {vm.name}: applying CPU reservation/limit/shares after power-on '
+                                                         f'(current reservation={cur_res} MHz, limit={cur_limit} MHz, shares={cur_shares_level})...')
                                         try:
                                             reconfig_spec = vim.vm.ConfigSpec()
                                             cpu_alloc_spec = vim.ResourceAllocationInfo()
                                             cpu_alloc_spec.reservation = VCFA_CPU_RESERVATION_MHZ
                                             cpu_alloc_spec.limit = VCFA_CPU_LIMIT_MHZ
+                                            shares_info = vim.SharesInfo()
+                                            shares_info.level = vim.SharesInfo.Level.high
+                                            cpu_alloc_spec.shares = shares_info
                                             reconfig_spec.cpuAllocation = cpu_alloc_spec
                                             task = vm.ReconfigVM_Task(spec=reconfig_spec)
                                             WaitForTask(task)
-                                            lsf.write_output(f'  {vm.name}: CPU reservation/limit applied '
-                                                             f'(reservation={VCFA_CPU_RESERVATION_MHZ} MHz, limit={VCFA_CPU_LIMIT_MHZ} MHz)')
+                                            lsf.write_output(f'  {vm.name}: CPU reservation/limit/shares applied '
+                                                             f'(reservation={VCFA_CPU_RESERVATION_MHZ} MHz, limit={VCFA_CPU_LIMIT_MHZ} MHz, shares=high)')
                                         except Exception as reconfig_err:
-                                            lsf.write_output(f'  WARNING: Could not apply CPU reservation/limit on {vm.name}: {reconfig_err}')
+                                            lsf.write_output(f'  WARNING: Could not apply CPU reservation/limit/shares on {vm.name}: {reconfig_err}')
 
                         except Exception as e:
                             lsf.write_output(f'Warning: Error waiting for {vm.name}: {e}')
