@@ -1,7 +1,16 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.13 - 2026-08-13
+# Version 3.14 - 2026-08-13
 # Changes:
+# - Added update_hol_repo(): runs `git stash && git pull` on ${holroot}
+#   (/home/holuser/hol) as the very first step of MAIN EXECUTION, before the
+#   console-mount wait and everything after it. gitpull.sh already does this
+#   once via holuser's boot-time cron job, but this is a direct-invocation
+#   safety net so labstartup.sh always sees the latest Tools/, Startup/,
+#   holodeck/*.ini, and console/ content immediately before labstartup.py
+#   runs, regardless of cron timing or a manual/ad-hoc invocation. Skipped
+#   when the testing flag is present, matching the existing git_pull()
+#   convention for the SKU-specific vpodgitdir repo.
 # - Added check_and_fix_console_black_screen(): best-effort preflight that reads
 #   /sys/class/graphics/fb0/blank on the console shortly after GDM is confirmed
 #   running, and restarts GDM if it reads blanked. Root-caused a fresh-boot race
@@ -86,6 +95,37 @@ check_testing_mode() {
         return 0  # True - testing mode enabled
     fi
     return 1  # False - normal mode
+}
+
+update_hol_repo() {
+    # Ensure the core hol repo content on this Manager VM (Tools/, Startup/,
+    # holodeck/*.ini, console/, etc.) is fully up to date BEFORE any of the
+    # rest of labstartup.sh - or labstartup.py - reads from it.
+    #
+    # gitpull.sh already does this once, earlier, via holuser's boot-time
+    # cron job. This is a direct-invocation safety net so that labstartup.sh
+    # always pulls the latest content immediately before running, regardless
+    # of cron timing or a manual/ad-hoc labstartup.sh invocation.
+    if check_testing_mode; then
+        log_msg "TESTING MODE: Skipping hol repo git stash/pull to preserve local changes" "${logfile}"
+        return 0
+    fi
+
+    if [ ! -d "${holroot}/.git" ]; then
+        log_msg "No git repository found at ${holroot} - skipping hol repo update" "${logfile}"
+        return 0
+    fi
+
+    log_msg "Updating hol repo at ${holroot} (git stash && git pull)..." "${logfile}"
+    (
+        cd "${holroot}" || exit 1
+        git stash >> ${logfile} 2>&1
+        if timeout 60 env GIT_TERMINAL_PROMPT=0 git pull >> ${logfile} 2>&1; then
+            log_msg "hol repo updated successfully" "${logfile}"
+        else
+            log_msg "hol repo git pull failed or timed out - continuing with existing code" "${logfile}"
+        fi
+    )
 }
 
 is_hol_sku() {
@@ -791,11 +831,20 @@ push_console_files_nfs() {
 # MAIN EXECUTION
 #==============================================================================
 
+log_msg "Starting labstartup.sh" "${logfile}"
+
+#==============================================================================
+# UPDATE HOL REPO
+#==============================================================================
+# Pull the latest hol repo content BEFORE anything else in this script (or
+# labstartup.py) reads from ${holroot} - Tools/, Startup/, holodeck/*.ini,
+# console/, etc. Runs ahead of the console-mount wait since it only touches
+# local Manager VM state and has no dependency on the LMC/NFS mount.
+update_hol_repo
+
 #==============================================================================
 # WAIT FOR CONSOLE MOUNT
 #==============================================================================
-
-log_msg "Starting labstartup.sh" "${logfile}"
 
 while true; do
     if [ -d ${lmcholroot} ]; then
