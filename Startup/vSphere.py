@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
 # vSphere.py - HOLFY27 Core vSphere Startup Module
-# Version 3.2 - March 2026
+# Version 3.4 - 2026-08-06
 # Author - Burke Azbill and HOL Core Team
 # vSphere infrastructure startup sequence
 #
 # CHANGELOG:
+# v3.4 - 2026-08-06:
+#   - TASK 4: Fixed inverted DRS_CONSERVATIVE_VMOTION_RATE. Empirically
+#     confirmed via live DevPod test that vim.cluster.DrsConfigInfo.vmotionRate
+#     is inverted from the vSphere Client UI slider: API value 1 (what v3.3
+#     used, intending "leftmost/Conservative") actually rendered as slider
+#     position 5 ("Aggressive - More Frequent vMotions") in the UI. Changed
+#     to 5, which is the API value that renders as the leftmost/Conservative
+#     position.
+# v3.3 - 2026-08-06:
+#   - TASK 4: Clusters not flagged ":on" in [RESOURCES] Clusters (including
+#     the shipped ":off" default) now get Partially Automated DRS with the
+#     migration threshold slider set to its most conservative position,
+#     instead of being left completely unmanaged. ":on" is unchanged
+#     (Fully Automated) and always supersedes this new default. Keeps DRS
+#     from fighting the VM/host placement policy enforced in
+#     Startup/VCFfinal.py Task 4.
 # v3.2 - 2026-03-05:
 #   - TASK 5: Added retry logic for SuppressShellWarning when vCenter License
 #     Service is not yet available during cold boot (NotEnoughLicenses fault).
@@ -121,13 +137,13 @@ def main(lsf=None, standalone=False, dry_run=False):
             while (time.time() - start_wait) < VCENTER_WAIT_TIMEOUT:
                 # Check if vCenter port 443 is responding
                 if lsf.test_tcp_port(vc_hostname, 443, timeout=10):
-                    # Verify vCenter is responding via multiple endpoints
-                    # Some endpoints may respond before others during startup
+                    # Verify vCenter vpxd service is responding
+                    # Note: /ui/ HTTP 200 responds early via Envoy proxy while vpxd is still starting (503)
                     try:
                         session = requests.Session()
                         session.trust_env = False  # Ignore proxy environment vars
                         
-                        # Try the API endpoint first
+                        # Check REST API endpoint
                         api_url = f'https://{vc_hostname}/api'
                         api_response = None
                         try:
@@ -135,7 +151,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                         except requests.exceptions.RequestException as e:
                             lsf.write_output(f'  API endpoint check failed: {e}')
                         
-                        # Also try the UI endpoint as a fallback
+                        # Check UI endpoint
                         ui_url = f'https://{vc_hostname}/ui/'
                         ui_response = None
                         try:
@@ -143,21 +159,38 @@ def main(lsf=None, standalone=False, dry_run=False):
                         except requests.exceptions.RequestException as e:
                             lsf.write_output(f'  UI endpoint check failed: {e}')
                         
-                        # Consider vCenter available if either endpoint responds
-                        api_ok = api_response and api_response.status_code in [200, 401, 403]
+                        api_ok = api_response and api_response.status_code in [200, 401, 403, 405]
                         ui_ok = ui_response and ui_response.status_code == 200
-                        
+
+                        # Perform VIM API (pyVmomi) probe to confirm vpxd is ready
+                        parts = entry.split(':')
+                        vc_user = parts[2].strip() if len(parts) >= 3 else 'administrator@vsphere.local'
+                        vc_pwd = lsf.get_password()
+                        vim_ok = False
                         if api_ok or ui_ok:
+                            try:
+                                from pyVim import connect as _pyvim_conn
+                                try:
+                                    _probe_si = _pyvim_conn.SmartConnectNoSSL(host=vc_hostname, user=vc_user, pwd=vc_pwd, port=443)
+                                except AttributeError:
+                                    _probe_si = _pyvim_conn.SmartConnect(host=vc_hostname, user=vc_user, pwd=vc_pwd, port=443, disableSslCertValidation=True)
+                                if _probe_si:
+                                    vim_ok = True
+                                    _pyvim_conn.Disconnect(_probe_si)
+                            except Exception:
+                                vim_ok = False
+                        
+                        if vim_ok or api_ok:
                             vcenter_available = True
                             elapsed = int(time.time() - start_wait)
-                            which_endpoint = 'API' if api_ok else 'UI'
-                            lsf.write_output(f'vCenter {vc_hostname} is available after {elapsed} seconds (detected via {which_endpoint} endpoint)')
+                            det_type = 'VIM API (vpxd)' if vim_ok else 'REST API'
+                            lsf.write_output(f'vCenter {vc_hostname} is available after {elapsed} seconds (detected via {det_type})')
                             break
                         else:
-                            # Log what we got for debugging
+                            # Log detailed status during startup
                             api_status = api_response.status_code if api_response else 'no response'
                             ui_status = ui_response.status_code if ui_response else 'no response'
-                            lsf.write_output(f'  Endpoint status - API: {api_status}, UI: {ui_status}')
+                            lsf.write_output(f'  Endpoint status - API: {api_status} (vpxd starting), UI: {ui_status}')
                     except Exception as e:
                         lsf.write_output(f'  vCenter check error: {e}')
                 
@@ -249,24 +282,51 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('vsphere', 'drs', TaskStatus.RUNNING)
     
     #==========================================================================
-    # TASK 4: Enable DRS on Specified Clusters
+    # TASK 4: Configure DRS on Specified Clusters
+    #
+    # Clusters explicitly flagged ":on" in [RESOURCES] Clusters get Fully
+    # Automated DRS - this is an explicit per-lab operator override and
+    # always wins. Clusters flagged ":off" (or with no flag - the shipped
+    # config.ini default) get a new conservative default instead of being
+    # left completely unmanaged: Partially Automated with the migration
+    # threshold slider at its most conservative (leftmost) position. This
+    # keeps DRS from fighting the explicit VM/host placement policy enforced
+    # later in Startup/VCFfinal.py Task 4 (VCF Automation + vCenter
+    # co-location, VSP anti-affinity, 32-vCPU-per-host cap).
     #==========================================================================
-    
+
     # Use get_config_list to properly filter commented-out values
     clusters = lsf.get_config_list('RESOURCES', 'Clusters')
-    
-    drs_clusters = []
+
+    fully_automated_clusters = []
+    conservative_clusters = []
     for entry in clusters:
         if ':' in entry:
             parts = entry.split(':')
             cluster_name = parts[0].strip()
             drs_flag = parts[1].strip().lower() if len(parts) > 1 else 'off'
-            if drs_flag == 'on':
-                drs_clusters.append(cluster_name)
-    
+        else:
+            cluster_name = entry.strip()
+            drs_flag = 'off'
+        if not cluster_name:
+            continue
+        if drs_flag == 'on':
+            fully_automated_clusters.append(cluster_name)
+        else:
+            conservative_clusters.append(cluster_name)
+
+    drs_clusters = fully_automated_clusters + conservative_clusters
+    # vim.cluster.DrsConfigInfo.vmotionRate is INVERTED relative to the vSphere
+    # Client UI slider: API value 5 renders as the leftmost/"Conservative" (less
+    # frequent vMotions) position, and API value 1 renders as rightmost/
+    # "Aggressive". Confirmed empirically 2026-08-06: setting vmotionRate=1
+    # produced a live UI slider reading "Aggressive (More Frequent vMotions)"
+    # at position 5. Use 5 here to get the actual leftmost/Conservative UI position.
+    DRS_CONSERVATIVE_VMOTION_RATE = 5  # leftmost/most-conservative migration threshold (UI), inverted API value
+
     if drs_clusters and not dry_run:
         from pyVim.task import WaitForTask
-        for cluster_name in drs_clusters:
+        for cluster_name in fully_automated_clusters:
             cluster = lsf.get_cluster(cluster_name)
             if cluster:
                 if not cluster.configuration.drsConfig.enabled or cluster.configuration.drsConfig.defaultVmBehavior != vim.cluster.DrsConfigInfo.DrsBehavior.fullyAutomated:
@@ -277,7 +337,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                         drs_spec.enabled = True
                         drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.fullyAutomated
                         spec.drsConfig = drs_spec
-                        
+
                         task = cluster.ReconfigureComputeResource_Task(spec=spec, modify=True)
                         WaitForTask(task)
                         lsf.write_output(f'Successfully enabled fully automated DRS on {cluster.name}')
@@ -287,7 +347,33 @@ def main(lsf=None, standalone=False, dry_run=False):
                     lsf.write_output(f'DRS is already fully automated on {cluster.name}')
             else:
                 lsf.write_output(f'Could not find cluster {cluster_name} to configure DRS')
-        
+
+        for cluster_name in conservative_clusters:
+            cluster = lsf.get_cluster(cluster_name)
+            if cluster:
+                current = cluster.configuration.drsConfig
+                if (not current.enabled
+                        or current.defaultVmBehavior != vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
+                        or current.vmotionRate != DRS_CONSERVATIVE_VMOTION_RATE):
+                    lsf.write_output(f'Setting Partially Automated DRS (conservative migration threshold) on {cluster.name}...')
+                    try:
+                        spec = vim.cluster.ConfigSpecEx()
+                        drs_spec = vim.cluster.DrsConfigInfo()
+                        drs_spec.enabled = True
+                        drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
+                        drs_spec.vmotionRate = DRS_CONSERVATIVE_VMOTION_RATE
+                        spec.drsConfig = drs_spec
+
+                        task = cluster.ReconfigureComputeResource_Task(spec=spec, modify=True)
+                        WaitForTask(task)
+                        lsf.write_output(f'Successfully set Partially Automated/conservative DRS on {cluster.name}')
+                    except Exception as e:
+                        lsf.write_output(f'Failed to configure DRS on {cluster.name}: {str(e)}')
+                else:
+                    lsf.write_output(f'DRS is already Partially Automated/conservative on {cluster.name}')
+            else:
+                lsf.write_output(f'Could not find cluster {cluster_name} to configure DRS')
+
         lsf.write_output('DRS is configured on all required clusters')
     
     if dashboard:

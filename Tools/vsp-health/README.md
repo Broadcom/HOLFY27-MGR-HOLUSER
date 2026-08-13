@@ -30,6 +30,7 @@ equivalent resolution order.
 | `kube-fix.py` | 1.1.0 | Remediation | Control-plane VIP drop + kube-controller-manager/kube-scheduler backoff |
 | `salt-stabilize.py` | 1.1.0 | Remediation | Salt RAAS / salt-master / salt-minion crash recovery |
 | `vodap-fix.py` | 1.1.0 | Remediation | ClickHouse TLS cert staleness + fluentd buffer disk full |
+| `vsp-scale-down.py` | 1.3.0 | Sizing / scaling | Control-plane and worker machine-type resize + replica-count scaling via GitOps (`PackageDeployment`) |
 
 ---
 
@@ -123,7 +124,7 @@ cycle.
 | Check | What it fixes |
 | ----- | -------------- |
 | `host_contention` | Gate — runs first; if 1-min load > nproc×multiplier, downgrades every other check this cycle to detect-only (hypervisor CPU steal, not a config problem) |
-| `vsp_size` | Re-asserts the active ComponentVersion size profile's control-plane cpu >= 12 |
+| `vsp_size` | Re-asserts the active ComponentVersion size profile's control-plane cpu == 6 |
 | `kvip_manifest` | Patches `vip_preserve_on_leadership_loss=true` in the kube-vip static-pod manifest |
 | `cp_pod_crash` | `crictl rm -f` on a crashed kube-controller-manager/kube-scheduler static pod |
 | `gateway` | Restarts unhealthy envoy-gateway controller / vmsp-gateway / ops-logs-gateway pods |
@@ -331,6 +332,140 @@ python3 vodap-fix.py             # full diagnosis + remediation
 python3 vodap-fix.py --dry-run   # preview only (no changes made)
 python3 vodap-fix.py --verbose   # show raw kubectl output per step
 ```
+
+---
+
+## `vsp-scale-down.py` — VSP Control Plane and Worker Resize / Scale-Down (v1.3.0)
+
+End-to-end automation of the control plane and worker resize/scale walkthrough documented in
+`vsp-cluster-sizing.md`. Everything is auto-discovered (`KubernetesCluster`
+name, `MachineDeployment` name, current sizing) — the only required inputs
+are the Control Plane VIP, a password, and at least one target
+(`--machine-type`, `--cp-machine-type`, and/or `--worker-count`/`--min-replicas`/`--max-replicas`).
+
+The script now features automatic `cluster-autoscaler` management. By default (`--autoscaler auto`), it will detect if the autoscaler is disabled and temporarily enable it for the duration of the run to allow scaling to complete, then disable it again. You can also explicitly force it on or off with `--autoscaler enable` or `--autoscaler disable`.
+
+Unlike the other scripts in this folder, it doesn't diagnose or fix a broken
+component — it changes worker **size** and/or **count** through the
+GitOps object the platform actually owns:
+
+- **Step 2b / 3 — resize machine type:** patches
+  `PackageDeployment/vmsp-platform` → `spec.values.cluster.machineType` (for CP) and `spec.values.cluster.worker.machineType`
+  (and derived `size` for workers), then polls `MachineDeployment` status until every
+  worker has rolled to the new template (`desired == current == ready ==
+  updated`). This triggers a genuine CAPI **rolling replacement** — new
+  Machines are created and old ones deleted, not resized in place.
+- **Step 4 — scale replica count:** patches
+  `PackageDeployment.worker.{minReplicas,maxReplicas}`, waits for
+  Flux/`vmsp-operator` to propagate the bounds into
+  `KubernetesCluster.spec.workers[]`, then waits for the **cluster-autoscaler**
+  to drain/grow the `MachineDeployment` to match. If the autoscaler hits its
+  known `"size increase too large"` stuck loop while stepping down through
+  intermediate replica counts, the script detects it from the autoscaler's
+  own logs and (by default) patches `MachineDeployment.spec.replicas`
+  directly to unblock it — safe because that object is CAPI-owned, not
+  Flux-owned. It will **not** force a scale-down the autoscaler is correctly
+  refusing on capacity-eligibility grounds.
+
+### Safety features
+
+- `--dry-run` — discovers and prints the planned patch(es), applies nothing
+- Captures per-node CPU/memory (`kubectl top nodes`) before and after, and
+  flags any node at/above `--cpu-warn-pct` (default 80%) in the final
+  verification
+- `verify_final_state()` checks `KubernetesCluster` phase, final worker
+  count, and Pending-pod count after every run (even outside `--dry-run`)
+- `--no-auto-fix-autoscaler` disables the automatic `MachineDeployment`
+  patch if you'd rather intervene manually when the stuck-loop bug appears
+
+### Usage
+
+> WARNING: 3 worker nodes is insufficient to meet CPU Requests. 5 medium nodes uses less CPU and Memory than 4 of the default Large nodes
+
+```bash
+# Minimal -- prompts for host (default 10.1.1.142) and password only
+python3 vsp-scale-down.py --worker-count 5
+
+# Resize CP to cp.medium, workers to management.medium, and scale to 5 nodes, no prompts
+python3 vsp-scale-down.py --cp-machine-type cp.medium --machine-type management.medium --worker-count 5 --yes
+
+# Just change the worker count, leave machine types alone
+python3 vsp-scale-down.py --worker-count 5 --yes
+
+# Preview what would change without touching the cluster
+python3 vsp-scale-down.py --cp-machine-type cp.medium --machine-type management.medium --worker-count 5 --dry-run
+
+# Site-B, explicit password file, fully unattended
+python3 vsp-scale-down.py --host 10.2.1.142 --password-file /tmp/pw.txt \
+    --cp-machine-type cp.medium --machine-type management.medium --worker-count 5 --yes
+```
+
+#### 3 Worker vs 5 worker
+
+The following were taken from a live HOL-2704 lab that had been scaled down to 3 medium nodes, resulting in several pending pods unable to start due to insufficient CPU and Memory resources available to meet the CPU Requests and Memory Requests of the manifests. This is not reflecting actual utilization, just the configured Requests.
+
+```plain
+Node Capacity vs. Resource Requests Allocation:
+  +---------------+---------------+--------------------------+--------------+-----------------+------------------------------------+
+  | Node          | Role          | Taints                   | CPU Requests | Memory Requests | Allocatable CPU / Memory Remaining |
+  +---------------+---------------+--------------------------+--------------+-----------------+------------------------------------+
+  | vsp-01a-b8kpj | Control Plane | control-plane:NoSchedule | 99% (3915m)  | 34% (2720Mi)    | N/A (Untolerated Taint)            |
+  | vsp-01a-cr722 | Worker        | None                     | 93% (7420m)  | 92% (12270Mi)   | ~490m CPU / ~989 Mi Memory         |
+  | vsp-01a-djlnn | Worker        | None                     | 95% (7535m)  | 71% (9514Mi)    | ~375m CPU / ~3,745 Mi Memory       |
+  | vsp-01a-gllm8 | Worker        | None                     | 95% (7575m)  | 98% (13073Mi)   | ~335m CPU / ~186 Mi Memory         |
+  +---------------+---------------+--------------------------+--------------+-----------------+------------------------------------+
+```
+
+After scaling to 5 worker nodes
+
+Even after scaling out to 5 worker nodes, there were still 4 pods failing to secure resources for deployment:
+
+- logging-operator-filelogs-fluentbit-*
+- logging-operator-fluentbit-*
+- logging-operator-systemlogs-fluentbit-*
+- scheduled-etcd-backup-*
+
+These were failing because they need to run on the Control Plane node which was already at 99% demand.
+
+After updating the vsp-scale-down.py script to also resize the CP node to 6 vCPU, here's the resulting Demand:
+While the table below shows some high percentage CPU Requests, the actual Utilization across all nodes at the time was between 1-9% for EACH NODE! So, the Requests are actually much higher than required for lab based operation.
+
+```plain
+  Node Capacity vs. Resource Requests Allocation:
+  +---------------+---------------+--------------------------+--------------+-----------------+------------------------------------+
+  | Node          | Role          | Taints                   | CPU Requests | Memory Requests | Allocatable CPU / Memory Remaining |
+  +---------------+---------------+--------------------------+--------------+-----------------+------------------------------------+
+  | vsp-01a-cr722 | Worker        | None                     | 93% (7360m)  | 90% (12050Mi)   | ~550m CPU / ~1,209 Mi Memory       |
+  | vsp-01a-djlnn | Worker        | None                     | 95% (7535m)  | 71% (9514Mi)    | ~375m CPU / ~3,745 Mi Memory       |
+  | vsp-01a-gllm8 | Worker        | None                     | 95% (7575m)  | 98% (13073Mi)   | ~335m CPU / ~186 Mi Memory         |
+  | vsp-01a-h74c5 | Control Plane | control-plane:NoSchedule | 37% (2190m)  | 28% (2742Mi)    | N/A (Untolerated Taint)            |
+  | vsp-01a-nnbp7 | Worker        | None                     | 25% (2)      | 86% (11472Mi)   | ~5910m CPU / ~1,787 Mi Memory      |
+  | vsp-01a-nppr4 | Worker        | None                     | 23% (1875m)  | 23% (3080Mi)    | ~6035m CPU / ~10,179 Mi Memory     |
+  +---------------+---------------+--------------------------+--------------+-----------------+------------------------------------+
+```
+
+As we can see there, 5 nodes is giving plenty of headroom so we could probably get away with 4 nodes. The 6 vCPU CP Node appears much hapier as well.
+
+### How this differs from BenS's `vsp-remediate.sh`
+
+`BenS/toolkit/vsp-remediate-toolkit/vsp-remediate.sh` also resizes/scales
+VSP nodes (`--cp-resize`, `--worker-resize`, `--consolidate`), but through
+the opposite mechanism: it powers off the *existing* vCenter VM and calls
+`govc vm.change` on it in place, preserving node identity and local-PV data
+but leaving the live VM **drifted** from what the `VSphereMachineTemplate`
+declares. It's also the only one of the two that can resize the
+control-plane node, and it treats the cluster-autoscaler as unreliable in
+this environment (recommending it be pinned off for deterministic manual
+worker removal).
+
+`vsp-scale-down.py` instead patches the GitOps source
+(`PackageDeployment`) and lets CAPI do a proper rolling replacement, so the
+change is durable against future reconciliation — it covers both control plane
+and workers, but loses node identity/local `hostPath` data on
+replaced Machines, and works *with* the autoscaler rather than around it.
+
+Full side-by-side comparison, including which to use when:
+[`vsp-remediate-vs-scale-down-comparison.md`](./vsp-remediate-vs-scale-down-comparison.md).
 
 ---
 

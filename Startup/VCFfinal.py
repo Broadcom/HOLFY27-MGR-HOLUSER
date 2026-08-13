@@ -1,8 +1,40 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.35 - 2026-08-03
+# Version 6.3.38 - 2026-08-12
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.38 Changes:
+# - Apply the auto-platform-a* CPU reservation/limit AFTER power-on and
+#   Tools-running confirmation (gated behind vcfa-cpu-alloc-enforced = true).
+#   Moved from ESXi.py because the appliance power-on sequence resets
+#   pre-power-on cpuAllocation changes back to defaults. CPU reservation/limit
+#   is safe to hot-apply to a running VM, so this post-power-on set sticks.
+# - Task 4: Updated VM placement flow so all non-auto-platform-a* VMs (e.g. vsp-.*)
+#   are evacuated off the dedicated host FIRST, ensuring the host contains ONLY
+#   the auto-platform-a* VM before moving vCenter VMs onto it.
+#
+# v6.3.37 Changes (found via live DevPod test of v6.3.36):
+# - Task 4: Reordered the placement policy so ALL DRS groups/rules (VM_GROUP,
+#   HOST_GROUP, OTHER_VM_GROUP, VSP_VM_GROUP) are built/updated to their final
+#   state BEFORE any relocation is attempted. Previously, vCenter relocation
+#   was attempted first and failed with VmHostAffinityRuleViolation whenever a
+#   stale anti-affinity group (from a prior run, or from confighol-9.1.py)
+#   still classified the vCenter VM as "other" at the moment of the move.
+# - Added explicit WARNING logging when [VCF] vcfvCenter/vspvms are configured
+#   but resolve to 0 VMs, so a config/name mismatch is diagnosable in the log.
+#
+# v6.3.36 Changes:
+# - Task 4: Replaced the ad-hoc "evacuate the auto-platform-a host"
+#   evacuation (random.choice destination, no persistent DRS rule) with a
+#   full VM/host placement policy: VCF Automation (auto-platform-a*) and all
+#   configured [VCF] vcfvCenter VMs are pinned to one dedicated host via
+#   mandatory DRS VM/Host groups+rules (shared lsf.ensure_drs_* helpers,
+#   also used by Tools/confighol-9.1.py and checked by
+#   Tools/vpodchecker.py); [VCF] vspvms VMs get a mandatory anti-affinity
+#   rule against that same host; and a best-effort, isolation-safe pass
+#   keeps any host from exceeding 32 powered-on vCPUs (logs a warning and
+#   continues if unavoidable - never fails labstartup).
 #
 # v6.3.35 Changes:
 # - Task 2e: Added an unconditional CSI controller vCenter-auth pre-flight,
@@ -3287,57 +3319,253 @@ echo "PROXY_CONFIGURED"
                 else:
                     lsf.write_output(f'Resolved {len(resolved_vcfa_vms)} VCF Automation VMs')
                     
-                    # Isolate Automation VMs on dedicated host
+                    #------------------------------------------------------------
+                    # Enforce VM/Host placement policy:
+                    #   - VCF Automation (auto-platform-a*) + vCenters (vcfvCenter)
+                    #     are pinned together on one dedicated host via a
+                    #     mandatory DRS must-run-on rule
+                    #   - Every other VM in the cluster is barred from that
+                    #     host via a mandatory DRS must-not-run-on rule
+                    #   - VSP nodes (vspvms) additionally get their own
+                    #     must-not-run-on rule against that same host, so
+                    #     they can never land there even if evacuated
+                    #     elsewhere and relocated back later
+                    #   - No host may exceed MAX_VCPU_PER_HOST powered-on
+                    #     vCPUs; this is best-effort and never blocks
+                    #     labstartup - isolation rules above always win
+                    #
+                    # DRS groups/rules are created via the shared
+                    # lsf.ensure_drs_* helpers (lsfunctions.py) so this stays
+                    # in sync with Tools/confighol-9.1.py's one-time onboarding
+                    # version and with Tools/vpodchecker.py's health check.
+                    #------------------------------------------------------------
                     try:
                         from pyVmomi import vim
                         from pyVim.task import WaitForTask
-                        import random
-                        
-                        # Find the ESXi host for the first automation VM
+
+                        MAX_VCPU_PER_HOST = 32
+
+                        VM_GROUP              = 'auto-platform-VMs'
+                        HOST_GROUP            = 'auto-platform-Hosts'
+                        AFFINITY_RULE         = 'auto-platform-must-run-on-host'
+                        OTHER_VM_GROUP        = 'non-auto-platform-VMs'
+                        ANTIAFFINITY_RULE     = 'other-VMs-must-not-run-on-auto-platform-host'
+                        VSP_VM_GROUP          = 'vsp-VMs'
+                        VSP_ANTIAFFINITY_RULE = 'vsp-VMs-must-not-run-on-auto-platform-host'
+
+                        # Find the ESXi host for the first automation VM -
+                        # this host stays the dedicated host across boots
+                        # (deterministic - we never re-pick a new one)
                         auto_vm = resolved_vcfa_vms[0]
                         auto_host = auto_vm.runtime.host
-                        if auto_host:
-                            lsf.write_output(f'Automation VM {auto_vm.name} is on host {auto_host.name}')
-                            
-                            # Gather all Automation VMs to ensure we don't move them
+                        cluster = auto_host.parent if auto_host else None
+
+                        if not auto_host or not isinstance(cluster, vim.ClusterComputeResource):
+                            lsf.write_output('WARNING: Could not determine cluster for VCF Automation VM - skipping placement policy')
+                        else:
+                            lsf.write_output(f'VCF Automation VM {auto_vm.name} is on host {auto_host.name} (cluster {cluster.name})')
                             auto_vm_names = [v.name for v in resolved_vcfa_vms]
-                            
-                            # Find other VMs on this host
-                            vms_to_move = []
-                            for vm in auto_host.vm:
-                                if vm.name not in auto_vm_names and not vm.config.template and not vm.name.startswith('vCLS'):
-                                    vms_to_move.append(vm)
-                            
+
+                            # Resolve vCenter VMs ([VCF] vcfvCenter) - these
+                            # must be co-located with VCF Automation
+                            vcenter_name_entries = lsf.get_config_list('VCF', 'vcfvCenter')
+                            vcenter_vms = []
+                            for entry in vcenter_name_entries:
+                                name_pattern = entry.split(':')[0].strip()
+                                try:
+                                    vcenter_vms.extend(lsf.get_vm_match(name_pattern))
+                                except Exception as e:
+                                    lsf.write_output(f'  Warning: Error resolving vCenter VM pattern "{name_pattern}": {e}')
+                            if vcenter_name_entries and not vcenter_vms:
+                                lsf.write_output(f'WARNING: [VCF] vcfvCenter is configured ({vcenter_name_entries}) but resolved 0 VMs - '
+                                                 f'vCenters will NOT be pinned to {auto_host.name} this run. Check vcfvCenter patterns '
+                                                 f'against actual VM names and vCenter session connectivity.')
+
+                            # Resolve VSP VMs ([VCF] vspvms) - these must stay
+                            # off the VCFA/vCenter dedicated host
+                            vsp_name_entries = lsf.get_config_list('VCF', 'vspvms')
+                            vsp_vms = []
+                            for entry in vsp_name_entries:
+                                name_pattern = entry.split(':')[0].strip()
+                                try:
+                                    vsp_vms.extend(lsf.get_vm_match(name_pattern))
+                                except Exception as e:
+                                    lsf.write_output(f'  Warning: Error resolving VSP VM pattern "{name_pattern}": {e}')
+                            if vsp_name_entries and not vsp_vms:
+                                lsf.write_output(f'WARNING: [VCF] vspvms is configured ({vsp_name_entries}) but resolved 0 VMs - '
+                                                 f'VSP anti-affinity will NOT be enforced this run.')
+
+                            pinned_names = set(auto_vm_names) | {v.name for v in vcenter_vms}
+
+                            #--------------------------------------------------
+                            # Step 1: build/update ALL DRS groups and rules
+                            # FIRST, before any relocation is attempted. If a
+                            # relocation is attempted while a stale rule from
+                            # a prior run (or from confighol-9.1.py) still
+                            # reflects the OLD classification of a VM, vCenter
+                            # rejects the move with VmHostAffinityRuleViolation
+                            # even though the move is exactly what the NEW
+                            # rule wants - so every group/rule must reach its
+                            # final desired state before any VM is relocated.
+                            #--------------------------------------------------
+                            all_other_vms = [v for h in cluster.host for v in h.vm
+                                              if v.name not in pinned_names
+                                              and (v.config and not v.config.template)
+                                              and not v.name.startswith('vCLS')]
+
+                            lsf.ensure_drs_vm_group(cluster, VM_GROUP, list(resolved_vcfa_vms) + vcenter_vms)
+                            lsf.ensure_drs_host_group(cluster, HOST_GROUP, [auto_host])
+                            lsf.ensure_drs_vm_group(cluster, OTHER_VM_GROUP, all_other_vms)
+                            if vsp_vms:
+                                lsf.ensure_drs_vm_group(cluster, VSP_VM_GROUP, vsp_vms)
+                            else:
+                                lsf.write_output('No VSP VMs resolved from [VCF] vspvms - skipping VSP anti-affinity enforcement')
+
+                            lsf.ensure_drs_vmhost_rule(cluster, AFFINITY_RULE, VM_GROUP, HOST_GROUP,
+                                                       affine=True, mandatory=True)
+                            lsf.ensure_drs_vmhost_rule(cluster, ANTIAFFINITY_RULE, OTHER_VM_GROUP, HOST_GROUP,
+                                                       affine=False, mandatory=True)
+                            if vsp_vms:
+                                lsf.ensure_drs_vmhost_rule(cluster, VSP_ANTIAFFINITY_RULE, VSP_VM_GROUP, HOST_GROUP,
+                                                           affine=False, mandatory=True)
+
+                            #--------------------------------------------------
+                            # Step 2: evacuate all non-automation VMs (e.g.
+                            # vsp-.*) off auto_host FIRST, so the host ONLY has
+                            # auto-platform-a* VM(s) on it before moving
+                            # vCenter VMs onto it.
+                            #--------------------------------------------------
+                            vms_to_move = [v for v in auto_host.vm
+                                           if v.name not in auto_vm_names
+                                           and (v.config and not v.config.template)
+                                           and not v.name.startswith('vCLS')]
+                            alt_hosts = [h for h in cluster.host if h != auto_host
+                                         and h.runtime.connectionState == 'connected'
+                                         and not h.runtime.inMaintenanceMode]
                             if vms_to_move:
-                                lsf.write_output(f'Found {len(vms_to_move)} other VMs on {auto_host.name}. Evacuating them to dedicate automation host...')
-                                
-                                # Find alternate hosts in the same cluster
-                                cluster = auto_host.parent
-                                if isinstance(cluster, vim.ClusterComputeResource):
-                                    alt_hosts = [h for h in cluster.host if h != auto_host and h.runtime.connectionState == 'connected' and not h.runtime.inMaintenanceMode]
-                                    
-                                    if alt_hosts:
-                                        for move_vm in vms_to_move:
-                                            dest_host = random.choice(alt_hosts)
-                                            lsf.write_output(f'  Migrating {move_vm.name} to {dest_host.name}...')
+                                lsf.write_output(f'Found {len(vms_to_move)} non-automation VM(s) (e.g. VSP) on {auto_host.name}. '
+                                                 f'Evacuating so host ONLY has auto-platform-a* VM(s) before moving vCenter(s)...')
+                                if alt_hosts:
+                                    for idx, move_vm in enumerate(vms_to_move):
+                                        dest_host = alt_hosts[idx % len(alt_hosts)]
+                                        lsf.write_output(f'  Migrating {move_vm.name} to {dest_host.name}...')
+                                        try:
+                                            relocate_spec = vim.vm.RelocateSpec()
+                                            relocate_spec.host = dest_host
+                                            task = move_vm.RelocateVM_Task(relocate_spec)
+                                            WaitForTask(task)
+                                            lsf.write_output(f'    SUCCESS: Migrated {move_vm.name}')
+                                        except Exception as mig_err:
+                                            lsf.write_output(f'    WARNING: Could not migrate {move_vm.name}: {mig_err}')
+                                else:
+                                    lsf.write_output(f'WARNING: No alternate hosts found in cluster to evacuate VMs from {auto_host.name}')
+                            else:
+                                lsf.write_output(f'Host {auto_host.name} already has ONLY auto-platform-a* VM(s) on it.')
+
+                            #--------------------------------------------------
+                            # Step 3: now that auto_host contains ONLY the
+                            # auto-platform-a* VM(s), migrate vCenter VMs onto
+                            # it.
+                            #--------------------------------------------------
+                            for vc_vm in vcenter_vms:
+                                if vc_vm.runtime.host != auto_host:
+                                    lsf.write_output(f'Migrating vCenter VM {vc_vm.name} to dedicated host {auto_host.name}...')
+                                    try:
+                                        relocate_spec = vim.vm.RelocateSpec()
+                                        relocate_spec.host = auto_host
+                                        task = vc_vm.RelocateVM_Task(relocate_spec)
+                                        WaitForTask(task)
+                                        lsf.write_output(f'  SUCCESS: Migrated {vc_vm.name}')
+                                    except Exception as mig_err:
+                                        lsf.write_output(f'  WARNING: Could not migrate {vc_vm.name} to {auto_host.name}: {mig_err}')
+
+                            #--------------------------------------------------
+                            # Step 4: keep VSP off the dedicated host (and off
+                            # any host that currently runs a vCenter VM, in
+                            # case a vCenter migration above failed)
+                            #--------------------------------------------------
+                            vcenter_hosts = {vc_vm.runtime.host for vc_vm in vcenter_vms if vc_vm.runtime.host}
+                            restricted_hosts = {auto_host} | vcenter_hosts
+
+                            if vsp_vms:
+                                vsp_conflicts = [v for v in vsp_vms if v.runtime.host in restricted_hosts]
+                                if vsp_conflicts:
+                                    safe_hosts = [h for h in cluster.host if h not in restricted_hosts
+                                                  and h.runtime.connectionState == 'connected'
+                                                  and not h.runtime.inMaintenanceMode]
+                                    lsf.write_output(f'Found {len(vsp_conflicts)} VSP VM(s) on a restricted (VCFA/vCenter) host. Evacuating...')
+                                    if safe_hosts:
+                                        for idx, vsp_vm in enumerate(vsp_conflicts):
+                                            dest_host = safe_hosts[idx % len(safe_hosts)]
+                                            lsf.write_output(f'  Migrating VSP VM {vsp_vm.name} from {vsp_vm.runtime.host.name} to {dest_host.name}...')
                                             try:
                                                 relocate_spec = vim.vm.RelocateSpec()
                                                 relocate_spec.host = dest_host
-                                                task = move_vm.RelocateVM_Task(relocate_spec)
+                                                task = vsp_vm.RelocateVM_Task(relocate_spec)
                                                 WaitForTask(task)
-                                                lsf.write_output(f'    SUCCESS: Migrated {move_vm.name}')
+                                                lsf.write_output(f'    SUCCESS: Migrated {vsp_vm.name}')
                                             except Exception as mig_err:
-                                                lsf.write_output(f'    WARNING: Could not migrate {move_vm.name}: {mig_err}')
+                                                lsf.write_output(f'    WARNING: Could not migrate {vsp_vm.name}: {mig_err}')
                                     else:
-                                        lsf.write_output(f'WARNING: No alternate hosts found in cluster to evacuate VMs from {auto_host.name}')
-                                else:
-                                    lsf.write_output(f'WARNING: Host parent is not a cluster ({type(cluster)})')
-                            else:
-                                lsf.write_output(f'Host {auto_host.name} is already dedicated to Automation VMs.')
+                                        lsf.write_output('WARNING: No safe alternate host available to evacuate VSP VM(s) off restricted host(s)')
+
+                            #--------------------------------------------------
+                            # Step 5: 32-vCPU-per-host cap - best-effort only.
+                            # Isolation rules above always win: this step never
+                            # moves a pinned VCFA/vCenter/VSP VM, and never
+                            # moves anything onto a restricted host. If no
+                            # valid destination exists, log a warning and
+                            # continue - never fail labstartup.
+                            #--------------------------------------------------
+                            protected_names = pinned_names | {v.name for v in vsp_vms}
+                            for host in cluster.host:
+                                try:
+                                    powered_on_vms = [v for v in host.vm if v.runtime.powerState == 'poweredOn']
+                                    total_vcpu = sum(v.config.hardware.numCPU for v in powered_on_vms if v.config and v.config.hardware)
+                                    if total_vcpu <= MAX_VCPU_PER_HOST:
+                                        continue
+
+                                    lsf.write_output(f'Host {host.name} has {total_vcpu} powered-on vCPUs (cap is {MAX_VCPU_PER_HOST}). Attempting best-effort rebalance...')
+                                    movable = sorted(
+                                        (v for v in powered_on_vms
+                                         if v.name not in protected_names
+                                         and (v.config and not v.config.template)
+                                         and not v.name.startswith('vCLS')),
+                                        key=lambda v: (v.config.hardware.numCPU if v.config and v.config.hardware else 0)
+                                    )
+                                    for cand in movable:
+                                        if total_vcpu <= MAX_VCPU_PER_HOST:
+                                            break
+                                        cand_vcpu = cand.config.hardware.numCPU if cand.config and cand.config.hardware else 0
+                                        dest = None
+                                        for h2 in cluster.host:
+                                            if h2 == host or h2 in restricted_hosts:
+                                                continue
+                                            if h2.runtime.connectionState != 'connected' or h2.runtime.inMaintenanceMode:
+                                                continue
+                                            h2_vcpu = sum(v.config.hardware.numCPU for v in h2.vm if v.runtime.powerState == 'poweredOn' and v.config and v.config.hardware)
+                                            if h2_vcpu + cand_vcpu <= MAX_VCPU_PER_HOST:
+                                                dest = h2
+                                                break
+                                        if not dest:
+                                            continue
+                                        try:
+                                            relocate_spec = vim.vm.RelocateSpec()
+                                            relocate_spec.host = dest
+                                            task = cand.RelocateVM_Task(relocate_spec)
+                                            WaitForTask(task)
+                                            lsf.write_output(f'  SUCCESS: Migrated {cand.name} ({cand_vcpu} vCPU) from {host.name} to {dest.name} to relieve vCPU pressure')
+                                            total_vcpu -= cand_vcpu
+                                        except Exception as mig_err:
+                                            lsf.write_output(f'  WARNING: Could not migrate {cand.name}: {mig_err}')
+
+                                    if total_vcpu > MAX_VCPU_PER_HOST:
+                                        lsf.write_output(f'WARNING: Host {host.name} still has {total_vcpu} powered-on vCPUs (cap is {MAX_VCPU_PER_HOST}) after best-effort rebalance - continuing without failing labstartup')
+                                except Exception as cap_err:
+                                    lsf.write_output(f'WARNING: Error evaluating vCPU cap on host {host.name}: {cap_err}')
+
                     except Exception as ev_err:
-                        lsf.write_output(f'Warning: Error while trying to evacuate automation host: {ev_err}')
-                    
-                    # Removed: Do not use verify_nic_connected for automation VMs
+                        lsf.write_output(f'Warning: Error while enforcing VM placement policy: {ev_err}')
                     
                     # Start the VMs
                     try:
@@ -3377,10 +3605,49 @@ echo "PROXY_CONFIGURED"
                                 tools_attempt += 1
                             
                             # Removed: Do not use verify_nic_connected for automation VMs
-                        
+
+                            #----------------------------------------------------
+                            # Apply CPU reservation/limit AFTER power-on.
+                            # Gated behind vcfa-cpu-alloc-enforced = true in config.ini.
+                            # Pre-power-on configuration on ESXi is reset during
+                            # VM startup, so CPU reservation/limit is applied
+                            # here once the VM is confirmed powered on and
+                            # VMware Tools is running.
+                            #----------------------------------------------------
+                            if vm.name.lower().startswith('auto-platform-a'):
+                                vcfa_cpu_alloc_enforced = False
+                                for _sec in lsf.config.sections():
+                                    if lsf.config.has_option(_sec, 'vcfa-cpu-alloc-enforced'):
+                                        try:
+                                            vcfa_cpu_alloc_enforced = lsf.config.getboolean(_sec, 'vcfa-cpu-alloc-enforced')
+                                        except Exception:
+                                            vcfa_cpu_alloc_enforced = str(lsf.config.get(_sec, 'vcfa-cpu-alloc-enforced')).strip().lower() in ('true', '1', 'yes', 'on')
+                                        break
+                                if vcfa_cpu_alloc_enforced:
+                                    VCFA_CPU_RESERVATION_MHZ = 10000
+                                    VCFA_CPU_LIMIT_MHZ = 65000
+                                    cur_alloc = vm.config.cpuAllocation
+                                    cur_res = cur_alloc.reservation if cur_alloc else None
+                                    cur_limit = cur_alloc.limit if cur_alloc else None
+                                    if cur_res != VCFA_CPU_RESERVATION_MHZ or cur_limit != VCFA_CPU_LIMIT_MHZ:
+                                        lsf.write_output(f'  {vm.name}: applying CPU reservation/limit after power-on '
+                                                         f'(current reservation={cur_res} MHz, limit={cur_limit} MHz)...')
+                                        try:
+                                            reconfig_spec = vim.vm.ConfigSpec()
+                                            cpu_alloc_spec = vim.ResourceAllocationInfo()
+                                            cpu_alloc_spec.reservation = VCFA_CPU_RESERVATION_MHZ
+                                            cpu_alloc_spec.limit = VCFA_CPU_LIMIT_MHZ
+                                            reconfig_spec.cpuAllocation = cpu_alloc_spec
+                                            task = vm.ReconfigVM_Task(spec=reconfig_spec)
+                                            WaitForTask(task)
+                                            lsf.write_output(f'  {vm.name}: CPU reservation/limit applied '
+                                                             f'(reservation={VCFA_CPU_RESERVATION_MHZ} MHz, limit={VCFA_CPU_LIMIT_MHZ} MHz)')
+                                        except Exception as reconfig_err:
+                                            lsf.write_output(f'  WARNING: Could not apply CPU reservation/limit on {vm.name}: {reconfig_err}')
+
                         except Exception as e:
                             lsf.write_output(f'Warning: Error waiting for {vm.name}: {e}')
-                
+
                 lsf.write_output('VCF Automation VMs processing complete')
         else:
             lsf.write_output('No VCF Automation VMs configured')

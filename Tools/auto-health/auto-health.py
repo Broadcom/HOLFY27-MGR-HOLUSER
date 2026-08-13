@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 auto-health.py
-Version 1.3.1 - 2026-07-22
+Version 1.4.0 - 2026-08-11
 Author: Burke Azbill and HOL Core Team
+
+v1.4.0: Added Node Capacity vs. Resource Requests Allocation ASCII table to the
+nodes section to visualize CPU and Memory requests compared to allocatable capacity.
 
 Comprehensive, read-only health check for VCF Automation (VCFA). VCFA runs as a
 single-node Kubernetes cluster (the "auto-platform-a" appliance) hosting two
@@ -73,8 +76,8 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
-VERSION = "1.3.1"
-DATE    = "2026-07-22"
+VERSION = "1.4.0"
+DATE    = "2026-08-11"
 
 CREDS_FILE = "/home/holuser/creds.txt"
 VCFA_USER  = "vmware-system-user"
@@ -418,7 +421,129 @@ def chk_control_plane(ip_out, lease_out, watchdog_out, healthz_out, verbose):
 
 
 # ─── Section 2: Kubernetes Nodes ─────────────────────────────────────────────
-def chk_nodes(nodes_data, verbose):
+def parse_cpu(val_str):
+    val_str = str(val_str).strip()
+    if val_str.endswith('m'):
+        return int(val_str[:-1])
+    try:
+        return int(float(val_str) * 1000)
+    except ValueError:
+        return 0
+
+
+def parse_mem_mib(val_str):
+    val_str = str(val_str).strip()
+    try:
+        if val_str.endswith('Ki'):
+            return float(val_str[:-2]) / 1024.0
+        elif val_str.endswith('Mi'):
+            return float(val_str[:-2])
+        elif val_str.endswith('Gi'):
+            return float(val_str[:-2]) * 1024.0
+        return float(val_str) / (1024.0 * 1024.0)
+    except ValueError:
+        return 0.0
+
+
+def print_node_capacity_table(describe_out):
+    """Parse `kubectl describe nodes` and print an ASCII Node Capacity vs Resource Requests Allocation table."""
+    if not describe_out or "Name:" not in describe_out:
+        return
+
+    node_blocks = re.split(r'\n(?=Name:\s+)', describe_out)
+    rows = []
+
+    for block in node_blocks:
+        name_m = re.search(r'Name:\s+(\S+)', block)
+        if not name_m:
+            continue
+        name = name_m.group(1)
+
+        roles_m = re.search(r'Roles:\s+([^\n]+)', block)
+        roles_raw = roles_m.group(1).strip() if roles_m else '<none>'
+        if 'control-plane' in roles_raw:
+            role = 'Control Plane'
+        else:
+            role = 'Worker'
+
+        taints_m = re.search(r'Taints:\s+([^\n]+)', block)
+        taints_raw = taints_m.group(1).strip() if taints_m else '<none>'
+        if taints_raw in ('<none>', 'none', ''):
+            taints = 'None'
+        else:
+            taints = taints_raw.replace('node-role.kubernetes.io/', '')
+
+        # Allocatable
+        alloc_idx = block.find('Allocatable:')
+        if alloc_idx != -1:
+            alloc_block = block[alloc_idx:alloc_idx+300]
+            alloc_cpu_m = re.search(r'cpu:\s+(\S+)', alloc_block)
+            alloc_mem_m = re.search(r'memory:\s+(\S+)', alloc_block)
+            cpu_alloc_m = parse_cpu(alloc_cpu_m.group(1)) if alloc_cpu_m else 0
+            mem_alloc_mib = parse_mem_mib(alloc_mem_m.group(1)) if alloc_mem_m else 0
+        else:
+            cpu_alloc_m = 0
+            mem_alloc_mib = 0
+
+        # Allocated resources
+        alloc_res_idx = block.find('Allocated resources:')
+        if alloc_res_idx != -1:
+            alloc_res_block = block[alloc_res_idx:alloc_res_idx+400]
+            cpu_m = re.search(r'cpu\s+(\S+)\s+\(([^)]+)\)', alloc_res_block)
+            mem_m = re.search(r'memory\s+(\S+)\s+\(([^)]+)\)', alloc_res_block)
+
+            cpu_req_str = f"{cpu_m.group(2)} ({cpu_m.group(1)})" if cpu_m else "N/A"
+            mem_req_str = f"{mem_m.group(2)} ({mem_m.group(1)})" if mem_m else "N/A"
+
+            cpu_req_m = parse_cpu(cpu_m.group(1)) if cpu_m else 0
+            mem_req_mib = parse_mem_mib(mem_m.group(1)) if mem_m else 0
+        else:
+            cpu_req_str = "N/A"
+            mem_req_str = "N/A"
+            cpu_req_m = 0
+            mem_req_mib = 0
+
+        if 'NoSchedule' in taints or role == 'Control Plane':
+            rem_str = 'N/A (Untolerated Taint)'
+        else:
+            rem_cpu = max(0, cpu_alloc_m - cpu_req_m)
+            rem_mem = max(0, int(mem_alloc_mib - mem_req_mib))
+            rem_str = f"~{rem_cpu}m CPU / ~{rem_mem:,} Mi Memory"
+
+        rows.append({
+            'node': name,
+            'role': role,
+            'taints': taints,
+            'cpu_req': cpu_req_str,
+            'mem_req': mem_req_str,
+            'remaining': rem_str
+        })
+
+    if not rows:
+        return
+
+    headers = ['Node', 'Role', 'Taints', 'CPU Requests', 'Memory Requests', 'Allocatable CPU / Memory Remaining']
+    col_keys = ['node', 'role', 'taints', 'cpu_req', 'mem_req', 'remaining']
+
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, k in enumerate(col_keys):
+            widths[i] = max(widths[i], len(r[k]))
+
+    sep = '+' + '+'.join('-' * (w + 2) for w in widths) + '+'
+    header_line = '| ' + ' | '.join(f"{headers[i]:<{widths[i]}}" for i in range(len(headers))) + ' |'
+
+    print(f"\n{_DIM}  Node Capacity vs. Resource Requests Allocation:{_NC}")
+    print(f"{_DIM}  {sep}{_NC}")
+    print(f"{_DIM}  {header_line}{_NC}")
+    print(f"{_DIM}  {sep}{_NC}")
+    for r in rows:
+        row_line = '| ' + ' | '.join(f"{r[col_keys[i]]:<{widths[i]}}" for i in range(len(col_keys))) + ' |'
+        print(f"{_DIM}  {row_line}{_NC}")
+    print(f"{_DIM}  {sep}{_NC}")
+
+
+def chk_nodes(host, password, nodes_data, verbose):
     results = []
     if not nodes_data:
         return [row_fail("kubectl get nodes: success")]
@@ -436,6 +561,10 @@ def chk_nodes(nodes_data, verbose):
                                     "cordoned; stale Argo system-shutdown workflow? see --section argo"))
         else:
             results.append(row_fail(f"Node {name}: Ready"))
+
+    if host and password:
+        _, describe_out = ssh_exec(host, password, "kubectl describe nodes 2>/dev/null", timeout=30)
+        print_node_capacity_table(describe_out)
 
     return results
 
@@ -988,7 +1117,7 @@ def main():
         chk_control_plane, ip_out, lease_out, watchdog_out, healthz_out, args.verbose)
 
     run("nodes",    "KUBERNETES NODES",
-        chk_nodes, nodes_data, args.verbose)
+        chk_nodes, host, password, nodes_data, args.verbose)
 
     run("pods",     "POD HEALTH OVERVIEW  (all namespaces)",
         chk_pod_overview, pods_text, args.verbose)
