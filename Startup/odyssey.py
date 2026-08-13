@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # odyssey.py - HOLFY27 Core Odyssey Installation Module
-# Version 3.3 - 2026-08-13
+# Version 3.5 - 2026-08-13
 # Author - Burke Azbill and HOL Core Team
 # VMware Odyssey client installation for VLP deployments
 
@@ -9,6 +9,7 @@ import sys
 import argparse
 import logging
 import shutil
+import time
 
 # Add hol directory to path
 sys.path.insert(0, '/home/holuser/hol')
@@ -102,6 +103,29 @@ def download_odyssey(lsf, proxies):
     return False
 
 
+def kill_odyssey_processes(lsf, lmcuser):
+    """
+    Best-effort kill of any running Odyssey process on the console
+
+    A leftover odyssey-client-linux.AppImage or extracted AppRun process
+    (from a prior boot, a user launching it manually, or an earlier
+    partial extraction attempt) holds the AppImage file open, which
+    causes ETXTBSY ("Text file busy") when we try to overwrite or
+    re-exec it. pkill returns nonzero when nothing matches, so that's
+    not an error - just log the outcome either way.
+
+    :param lsf: lsfunctions module
+    :param lmcuser: SSH target for the console, e.g. 'holuser@console'
+    """
+    for pattern in (ODYSSEY_APP_LINUX, 'squashfs-root/AppRun'):
+        result = lsf.ssh(f'pkill -f {pattern}', lmcuser, lsf.password)
+        rc = getattr(result, 'returncode', None)
+        if rc == 0:
+            lsf.write_output(f'Killed running process(es) matching: {pattern}')
+        else:
+            lsf.write_output(f'No running process matched: {pattern} (rc={rc})')
+
+
 def install_odyssey_lmc(lsf, mc, desktop, odyssey_dst):
     """
     Install Odyssey on Linux Main Console
@@ -112,12 +136,22 @@ def install_odyssey_lmc(lsf, mc, desktop, odyssey_dst):
     :param odyssey_dst: Odyssey destination directory
     """
     lmcuser = 'holuser@console'
-    
+
+    # Kill any running Odyssey process before touching the AppImage file -
+    # a still-running instance holds it open and causes ETXTBSY below.
+    kill_odyssey_processes(lsf, lmcuser)
+
     # Copy application
     src = f'/tmp/{ODYSSEY_APP_LINUX}'
     dst = f'{mc}/{odyssey_dst}/{ODYSSEY_APP_LINUX}'
     os.system(f'cp {src} {dst}')
-    
+
+    # Give the console's NFS server a moment to fully release the write
+    # before we exec this same file below - copying over /lmchol and
+    # immediately running it can hit ETXTBSY ("Text file busy") due to
+    # NFS close-to-open consistency lag.
+    time.sleep(5)
+
     # Copy launcher script
     launcher_src = f'{lsf.holroot}/Tools/{ODYSSEY_LAUNCHER}'
     launcher_dst = f'{mc}/{odyssey_dst}/{ODYSSEY_LAUNCHER}'
@@ -147,26 +181,47 @@ def install_odyssey_lmc(lsf, mc, desktop, odyssey_dst):
         lmcuser, lsf.password
     )
     
-    # Remove any stale extraction from a previous run - appimage-extract
-    # will not overwrite an existing squashfs-root (it either errors or
-    # extracts into squashfs-root-<pid> instead), leaving AppRun missing
-    # from the expected path even though extraction "succeeded".
-    squashfs_root = '/home/holuser/desktop-hol/squashfs-root'
-    lsf.ssh(f'rm -rf {squashfs_root}', lmcuser, lsf.password)
-
     # Extract AppImage for Ubuntu 24.04+ (fuse2 not available)
+    squashfs_root = '/home/holuser/desktop-hol/squashfs-root'
     extract_script = '/lmchol/tmp/extract.sh'
     with open(extract_script, 'w') as script:
         script.write('#!/bin/sh\n')
         script.write(f'cd /home/holuser/desktop-hol\n')
         script.write(f'./{ODYSSEY_APP_LINUX} --appimage-extract\n')
 
-    extract_result = lsf.ssh('/bin/sh /tmp/extract.sh', lmcuser, lsf.password)
-    lsf.write_output(
-        f'Odyssey extract result: rc={getattr(extract_result, "returncode", "?")} '
-        f'stdout={getattr(extract_result, "stdout", "")!r} '
-        f'stderr={getattr(extract_result, "stderr", "")!r}'
-    )
+    # Retry just the extraction a few times on ETXTBSY (rc=126) - that's
+    # a transient NFS write/exec race, not a real failure, so it's much
+    # cheaper to retry here than to fall back to the full outer
+    # cleanup/download/install cycle in main().
+    max_extract_attempts = 3
+    extract_retry_delay = 3
+    extract_result = None
+    for extract_attempt in range(1, max_extract_attempts + 1):
+        # A running AppRun from a prior attempt holds squashfs-root busy
+        # too (both for the rm -rf below and for re-exec of the AppImage).
+        kill_odyssey_processes(lsf, lmcuser)
+
+        # Remove any stale extraction from a previous run - appimage-extract
+        # will not overwrite an existing squashfs-root (it either errors or
+        # extracts into squashfs-root-<pid> instead), leaving AppRun missing
+        # from the expected path even though extraction "succeeded".
+        lsf.ssh(f'rm -rf {squashfs_root}', lmcuser, lsf.password)
+
+        extract_result = lsf.ssh('/bin/sh /tmp/extract.sh', lmcuser, lsf.password)
+        rc = getattr(extract_result, 'returncode', None)
+        lsf.write_output(
+            f'Odyssey extract attempt {extract_attempt}/{max_extract_attempts}: rc={rc} '
+            f'stdout={getattr(extract_result, "stdout", "")!r} '
+            f'stderr={getattr(extract_result, "stderr", "")!r}'
+        )
+
+        if rc == 0:
+            break
+        if rc == 126 and extract_attempt < max_extract_attempts:
+            lsf.write_output('Text file busy (ETXTBSY) - retrying extraction after brief pause')
+            time.sleep(extract_retry_delay)
+            continue
+        break
 
     # Fix chrome-sandbox permissions
     sandbox = f'{squashfs_root}/chrome-sandbox'
