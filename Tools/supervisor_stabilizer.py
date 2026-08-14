@@ -1,8 +1,24 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.15 - 2026-08-05
+Version 2.16 - 2026-08-14
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
+
+v2.16: --dry-run is now actually read-only in Phase 2/A. The hypercrypt/kubelet
+       wait loop and the Kubernetes-API wait loop had NO dry-run guard, so a
+       --dry-run invocation would `systemctl restart hypercrypt` and
+       `systemctl start kubelet` on the Supervisor control plane, and could block
+       for the full max_wait (1800s) polling a condition it was not permitted to
+       fix. That also tripped vpodchecker.py's 300s subprocess timeout, since
+       vpodchecker calls this script with --dry-run for its cert audit.
+       Both loops now probe once under --dry-run, log what they WOULD do, and
+       fall through to the read-only Phase C / Phase 3 checks (whose parseable
+       CHECK:/SKIP: output is the reason vpodchecker runs this at all) instead of
+       returning False. Non-dry-run behaviour is unchanged.
+       Also added SCRIPT_VERSION / SCRIPT_DATE and a --version flag: this file
+       previously had no machine-readable version at all, so log consumers could
+       not tell which revision produced a line.
+       See Tools/vsp-analysis-report-opus.md F4.
 
 Unified cert-rotation and control-plane remediation for VCF / vSphere Supervisor environments.
 
@@ -410,6 +426,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import configparser
+
+# ---------------------------------------------------------------------------
+# Script identity. Keep in sync with the Version line in the module docstring.
+# Added in v2.16 -- this file previously had no machine-readable version, so
+# neither --version nor a log consumer could tell which revision emitted a line.
+# ---------------------------------------------------------------------------
+
+SCRIPT_VERSION = "2.16"
+SCRIPT_DATE    = "2026-08-14"
 
 # ---------------------------------------------------------------------------
 # Defaults - matched to the lab in supervisor-cert-fix/README.md but every
@@ -2065,7 +2090,9 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60,
     max_wait = 1800
     start_time = time.time()
     services_ok = False
-    
+    hc_status = ""
+    kl_status = ""
+
     while time.time() - start_time < max_wait:
         elapsed = int(time.time() - start_time)
         
@@ -2095,29 +2122,49 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60,
         if hc_status == "activating":
             log(f"      [{cid}] hypercrypt is still initializing (encryption keys being delivered)...")
         elif hc_status == "failed":
-            log(f"      [{cid}] hypercrypt has failed - attempting restart...", level="WARN")
-            cmd_restart_hc = (
-                f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_rhc && chmod 600 /tmp/.scppwd_rhc && "
-                f"sshpass -f /tmp/.scppwd_rhc ssh {SSH_OPTS} root@{scp_ip} 'systemctl restart hypercrypt'; "
-                f"rm -f /tmp/.scppwd_rhc"
-            )
-            ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_restart_hc)
-            
+            if dry_run:
+                log(f"      [{cid}] [dry-run] hypercrypt has failed - would restart it", level="WARN")
+            else:
+                log(f"      [{cid}] hypercrypt has failed - attempting restart...", level="WARN")
+                cmd_restart_hc = (
+                    f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_rhc && chmod 600 /tmp/.scppwd_rhc && "
+                    f"sshpass -f /tmp/.scppwd_rhc ssh {SSH_OPTS} root@{scp_ip} 'systemctl restart hypercrypt'; "
+                    f"rm -f /tmp/.scppwd_rhc"
+                )
+                ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_restart_hc)
+
         if kl_status != "active" and hc_status == "active":
-            log(f"      [{cid}] hypercrypt is active but kubelet is not - attempting to start kubelet...")
-            cmd_start_kl = (
-                f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_skl && chmod 600 /tmp/.scppwd_skl && "
-                f"sshpass -f /tmp/.scppwd_skl ssh {SSH_OPTS} root@{scp_ip} 'systemctl start kubelet'; "
-                f"rm -f /tmp/.scppwd_skl"
-            )
-            ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_start_kl)
-            
+            if dry_run:
+                log(f"      [{cid}] [dry-run] kubelet is not active - would start it")
+            else:
+                log(f"      [{cid}] hypercrypt is active but kubelet is not - attempting to start kubelet...")
+                cmd_start_kl = (
+                    f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_skl && chmod 600 /tmp/.scppwd_skl && "
+                    f"sshpass -f /tmp/.scppwd_skl ssh {SSH_OPTS} root@{scp_ip} 'systemctl start kubelet'; "
+                    f"rm -f /tmp/.scppwd_skl"
+                )
+                ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_start_kl)
+
+        # A dry run must never block on a service it is not allowed to fix. Probe
+        # once, report, and fall through to the read-only checks below. Previously
+        # this loop had no dry-run guard at all: --dry-run restarted hypercrypt,
+        # started kubelet, and could block for the full 1800s -- which also tripped
+        # vpodchecker.py's 300s subprocess timeout.
+        if dry_run:
+            break
+
         time.sleep(30)
-        
+
     if not services_ok:
-        log(f"      [{cid}] SCP services did not become active within timeout.", level="ERROR")
-        return False
-        
+        if dry_run:
+            log(f"      [{cid}] [dry-run] SCP services not both active "
+                f"(hypercrypt={hc_status or 'unknown'}, kubelet={kl_status or 'unknown'}) - "
+                f"continuing with read-only checks", level="WARN")
+        else:
+            log(f"      [{cid}] SCP services did not become active within timeout.", level="ERROR")
+            return False
+
+
     log(f"      [{cid}] Waiting for Kubernetes API to become available...")
     k8s_ok = False
     while time.time() - start_time < max_wait:
@@ -2135,11 +2182,21 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60,
             break
             
         log(f"      [{cid}] K8s API not yet available - waiting... ({elapsed}s / {max_wait}s)")
+
+        # Same reasoning as Phase A: a dry run probes once and reports rather than
+        # blocking for up to 1800s on a condition it is not permitted to remediate.
+        if dry_run:
+            break
+
         time.sleep(30)
-        
+
     if not k8s_ok:
-        log(f"      [{cid}] Kubernetes API did not become available within timeout.", level="ERROR")
-        return False
+        if dry_run:
+            log(f"      [{cid}] [dry-run] Kubernetes API not available yet - "
+                f"continuing with read-only checks", level="WARN")
+        else:
+            log(f"      [{cid}] Kubernetes API did not become available within timeout.", level="ERROR")
+            return False
 
     # --- Phase B: Proxy Configuration ---
     if clear_proxy:
@@ -3174,6 +3231,11 @@ def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--version", action="version",
+        version=f"supervisor_stabilizer.py {SCRIPT_VERSION} ({SCRIPT_DATE})",
+        help="Print the script version and exit.",
     )
     p.add_argument(
         "--password", required=False,
