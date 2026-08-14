@@ -42,6 +42,18 @@ Exit codes:
   1  One or more fixes failed or timed out
   2  Cannot connect to VSP cluster
 """
+##############################################################################
+# DEPRECATED -- superseded by Tools/vcf-lab-tuner.py
+#
+# Equivalent: python3 Tools/vcf-lab-tuner.py --cluster vsp --mode remediate --section vodap
+#
+# ClickHouse served-vs-stored cert comparison and fluentd buffer purging are
+# in the vodap section.
+#
+# This script still works and is UNCHANGED. Nothing here was removed.
+# New work belongs in vcf-lab-tuner.py. See Tools/vcf-lab-tuner.md and
+# Tools/vsp-analysis-report-opus.md for the consolidation rationale.
+##############################################################################
 import argparse
 import base64
 import json

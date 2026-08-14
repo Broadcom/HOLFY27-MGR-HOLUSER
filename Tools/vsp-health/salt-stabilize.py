@@ -38,6 +38,20 @@ Exit codes:
   1  One or more steps failed
   2  Cannot connect to VSP cluster
 """
+##############################################################################
+# DEPRECATED -- superseded by Tools/vcf-lab-tuner.py
+#
+# Equivalent: python3 Tools/vcf-lab-tuner.py --cluster vsp --mode remediate --section postgres
+#
+# pgdata permission repair is in the postgres section, which sweeps EVERY
+# spilo namespace rather than only salt-raas/pgdatabase-0 -- the hardcoding
+# here is why vidb-external sat broken for 43 days. Note the Salt rollout
+# restart in this script is UNCONDITIONAL; the replacement gates it.
+#
+# This script still works and is UNCHANGED. Nothing here was removed.
+# New work belongs in vcf-lab-tuner.py. See Tools/vcf-lab-tuner.md and
+# Tools/vsp-analysis-report-opus.md for the consolidation rationale.
+##############################################################################
 import argparse
 import base64
 import json
