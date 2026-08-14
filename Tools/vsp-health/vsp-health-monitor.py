@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 # vsp-health-monitor.py - HOLFY27 VSP Cluster Health Monitor & Remediator
-# Version 2.12 - 2026-08-13
+# Version 2.13 - 2026-08-14
 # Author - Burke Azbill and HOL Core Team
+#
+# v2.13: Fixed two spec.replicas=0 false positives. Both check_postgres()'s LCM
+#        deployment loop and check_vodap()'s ClickHouse client loop computed
+#        `desired = spec.replicas or 1`, coercing a deployment legitimately
+#        scaled to 0 into desired=1. In check_postgres() that reported
+#        available=0/1 and rollout-restarted the LCM service; in check_vodap()
+#        it also DEFEATED the existing `desired > 0` guard, so any scaled-to-0
+#        optional collector made the check restart the ClickHouse StatefulSet.
+#        Now uses `spec_rep if spec_rep is not None else 1` plus a `desired > 0`
+#        guard on both -- the same fix already carried by vsp-health.py v2.9.1
+#        and vodap-fix.py v1.1.1 (this file was the last of the three).
+#        Also corrected SCRIPT_VERSION, which had been left at '2.10' while the
+#        header said 2.12, so --version and the run banner under-reported by two
+#        revisions.
 #
 # v2.12: Fixed the v2.11 vsphere-cpi DaemonSet patch -- kubectl_patch()
 #       defaults to ptype='merge', which (unlike strategic merge) does not
@@ -367,7 +381,7 @@ import lsfunctions as lsf
 # DEFAULTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.10'
+SCRIPT_VERSION = '2.13'   # keep in sync with the Version line in the header above
 LOG_FILE = '/tmp/vsp-health-monitor.log'
 
 DEFAULTS = {
@@ -1558,9 +1572,13 @@ def check_postgres(cp_ip, password, remediate, dry_run):
     for dep_ns, dep_name in lcm_deps:
         dep_data = kubectl_json(cp_ip, f'get deployment {dep_name} -n {dep_ns}', password)
         if dep_data and dep_data.get('kind') == 'Deployment':
-            desired = dep_data.get('spec', {}).get('replicas', 1) or 1
+            # Do NOT use `.get('replicas', 1) or 1`: a deployment legitimately scaled
+            # to 0 gets coerced to desired=1, reported as 0/1 not-ready, and rollout
+            # restarted for nothing. Same fix as vsp-health.py v2.9.1 / vodap-fix.py v1.1.1.
+            spec_rep = dep_data.get('spec', {}).get('replicas')
+            desired = spec_rep if spec_rep is not None else 1
             available = dep_data.get('status', {}).get('availableReplicas', 0) or 0
-            if available < desired:
+            if desired > 0 and available < desired:
                 status = 'FAIL'
                 msgs.append(f'postgres: LCM service {dep_ns}/{dep_name} available={available}/{desired}')
                 if dry_run:
@@ -1749,7 +1767,11 @@ def check_vodap(cp_ip, password, remediate, dry_run):
             dep_data = kubectl_json(cp_ip, f'get deployment {dep} -n vodap', password)
             if dep_data:
                 ready = dep_data.get('status', {}).get('readyReplicas', 0) or 0
-                desired = dep_data.get('spec', {}).get('replicas', 1) or 1
+                # `.get('replicas', 1) or 1` coerced a legitimate 0 to 1, which DEFEATED
+                # the `desired > 0` guard below: every scaled-to-0 optional collector
+                # looked like 0/1 not-ready and restarted the ClickHouse StatefulSet.
+                spec_rep = dep_data.get('spec', {}).get('replicas')
+                desired = spec_rep if spec_rep is not None else 1
                 if desired > 0 and ready < desired:
                     failing_clients.append(dep)
 
