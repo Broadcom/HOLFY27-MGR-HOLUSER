@@ -1,7 +1,39 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.29 - 2026-08-13
+# Version 2.30 - 2026-08-14
 # Author - Burke Azbill and HOL Core Team
+#
+# v2.30: Three fixes in the VSP proxy + sizing steps, all found by source/live audit
+#        (see Tools/vsp-analysis-report-opus.md F1/F3):
+#        1. Step 9 Target 3 (Supervisor API proxy) had NEVER applied. v2.18 replaced
+#           the local NO_PROXY_PARTS list with lsf.build_lab_no_proxy() but left two
+#           references to the old name; the one in the PATCH body sits inside a
+#           try/except Exception, so every real run raised NameError, logged it as a
+#           warning, and moved on. Added NO_PROXY_PARTS = lsf.LAB_NO_PROXY_PARTS
+#           (a list -- the shape the namespace-management API and
+#           lsfunctions.set_supervisor_api_proxy() both use).
+#        2. configure_vsp_proxy() wrote the containerd/kubelet systemd drop-ins and
+#           ran only `systemctl daemon-reload`. Environment= changes take effect on
+#           service RESTART, so the new proxy env stayed inert until the next reboot.
+#           Now checksums each drop-in before/after and restarts only the service
+#           whose file actually changed (no needless control-plane blip on re-runs).
+#        3. fix_vsp_controlplane_sizing() is now VERIFY-ONLY. It read and wrote
+#           spec.sizes[].controlPlane.{cpu,memory}, which is not a field in this CRD
+#           (verified against the live schema: sizes[] declares only
+#           name/resources/worker). .get('controlPlane', {}).get('cpu', 0) therefore
+#           always returned 0, the `0 == 6` guard never matched, and EVERY run
+#           patched the ComponentVersion with an undeclared field -- accepted only
+#           because the schema sets x-kubernetes-preserve-unknown-fields: true -- and
+#           then logged SUCCESS. It is not repointed at resources.cpu on purpose:
+#           that field is a resource envelope (live "small" profile declares cpu
+#           max=4 while the CP node runs 6 vCPU via machineType=cp.medium) and
+#           vsp-health-monitor.py re-asserts it to "4" every cycle, so writing it
+#           here would create a 5-minute flip-flop. CP sizing has exactly one owner:
+#           PackageDeployment.spec.values.cluster.machineType, maintained every boot
+#           by VCFfinal.py -> Tools/vsp-health/vsp-scale-down.py. The step now logs
+#           the observed envelope + effective machineType and names that owner.
+#           VSP_TOPOLOGY_TARGET_NUMCPU / _MEMORY_MIB removed (the latter was defined
+#           and never read, so memory was never enforced even before this change).
 #
 # v2.29: Added Step 5b: disable_vcfa_fips_mode() — disables FIPS mode on the
 #        VCF Automation (VCFA) K8s appliance to fix high CPU utilization on
@@ -413,7 +445,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.29'
+SCRIPT_VERSION = '2.30'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -5024,6 +5056,14 @@ def configure_vsp_proxy(dry_run: bool = False) -> bool:
 
     PROXY_URL = lsf.LAB_PROXY_URL
     NO_PROXY = lsf.build_lab_no_proxy()
+    # The namespace-management API expects no_proxy_config as a LIST of entries,
+    # not the comma-joined string NO_PROXY holds. v2.18 dropped the local
+    # NO_PROXY_PARTS list in favour of lsf.build_lab_no_proxy() but left two
+    # references to the old name behind (dry-run log + the PATCH body), so every
+    # real run raised NameError inside the try/except below and Target 3
+    # (Supervisor API proxy) silently never applied. Matches the shape used by
+    # lsfunctions.set_supervisor_api_proxy().
+    NO_PROXY_PARTS = lsf.LAB_NO_PROXY_PARTS
     VSP_SSH_USER = 'vmware-system-user'
 
     lsf.write_output('')
@@ -5201,8 +5241,18 @@ if [ -f /etc/profile.d/proxy.sh ]; then
 fi
 
 
+CTD_DROPIN=/etc/systemd/system/containerd.service.d/http-proxy.conf
+KUBE_DROPIN=/etc/systemd/system/kubelet.service.d/http-proxy.conf
+
+# Capture pre-write checksums so we only restart a service whose drop-in actually
+# changed. systemd Environment= changes take effect ONLY on service restart, so a
+# bare daemon-reload left the new proxy env inert until the next reboot; but
+# restarting unconditionally would blip containerd/kubelet on every re-run.
+CTD_OLD=$(md5sum "$CTD_DROPIN" 2>/dev/null | cut -d' ' -f1)
+KUBE_OLD=$(md5sum "$KUBE_DROPIN" 2>/dev/null | cut -d' ' -f1)
+
 mkdir -p /etc/systemd/system/containerd.service.d
-cat > /etc/systemd/system/containerd.service.d/http-proxy.conf << 'CTDEOF'
+cat > "$CTD_DROPIN" << 'CTDEOF'
 [Service]
 Environment="HTTP_PROXY={PROXY_URL}"
 Environment="HTTPS_PROXY={PROXY_URL}"
@@ -5210,14 +5260,30 @@ Environment="NO_PROXY={NO_PROXY}"
 CTDEOF
 
 mkdir -p /etc/systemd/system/kubelet.service.d
-cat > /etc/systemd/system/kubelet.service.d/http-proxy.conf << 'KUBEOF'
+cat > "$KUBE_DROPIN" << 'KUBEOF'
 [Service]
 Environment="HTTP_PROXY={PROXY_URL}"
 Environment="HTTPS_PROXY={PROXY_URL}"
 Environment="NO_PROXY={NO_PROXY}"
 KUBEOF
 
+CTD_NEW=$(md5sum "$CTD_DROPIN" 2>/dev/null | cut -d' ' -f1)
+KUBE_NEW=$(md5sum "$KUBE_DROPIN" 2>/dev/null | cut -d' ' -f1)
+
 systemctl daemon-reload
+
+if [ "$CTD_OLD" != "$CTD_NEW" ]; then
+  systemctl restart containerd && echo "CONTAINERD_RESTARTED"
+else
+  echo "CONTAINERD_UNCHANGED"
+fi
+
+if [ "$KUBE_OLD" != "$KUBE_NEW" ]; then
+  systemctl restart kubelet && echo "KUBELET_RESTARTED"
+else
+  echo "KUBELET_UNCHANGED"
+fi
+
 echo "PROXY_CONFIGURED"
 '''
 
@@ -5278,10 +5344,10 @@ echo "PROXY_CONFIGURED"
 
 VSP_CP_VIP = '10.1.1.142'
 VSP_SSH_USER = 'vmware-system-user'
-# Do NOT raise this back toward 12 vCPU: a larger CP was found to be the
-# resource-stress trigger for the leader-election storm, not the fix for it.
-VSP_TOPOLOGY_TARGET_NUMCPU = 6
-VSP_TOPOLOGY_TARGET_MEMORY_MIB = 12288
+# CP sizing is NOT set here -- see fix_vsp_controlplane_sizing()'s docstring.
+# The effective lever is PackageDeployment.spec.values.cluster.machineType,
+# owned by Tools/vsp-health/vsp-scale-down.py (invoked every boot by VCFfinal.py).
+VSP_TOPOLOGY_TARGET_MACHINE_TYPE = 'cp.medium'   # 6 vCPU / 12 GiB
 
 
 def _vsp_kubectl(cmd: str, password: str, vsp_cp_vip: str = VSP_CP_VIP) -> 'subprocess.CompletedProcess':
@@ -5385,13 +5451,33 @@ def configure_vsp_passwords(dry_run: bool = False) -> bool:
 
 def fix_vsp_controlplane_sizing(dry_run: bool = False) -> bool:
     """
-    Ensure the VSP control-plane node is sized at the BenS-validated 4 vCPU
-    target via the SUPPORTED, operator-honored lever: the vsp ComponentVersion
-    `sizes` profile.
+    Report VSP control-plane sizing. VERIFY-ONLY as of v2.30 - this function no
+    longer patches anything.
+
+    Why: CP VM size is determined by
+    PackageDeployment.spec.values.cluster.machineType (cp.small=4/10,
+    cp.medium=6/12, cp.large=8/14), which VCFfinal.py maintains every boot via
+    Tools/vsp-health/vsp-scale-down.py. It is NOT determined by the vsp
+    ComponentVersion size profile:
+
+      * The CRD's spec.sizes[] items declare only name/resources/worker -
+        verified against the live CRD schema, which has no `controlPlane`
+        property. The item does carry x-kubernetes-preserve-unknown-fields:true,
+        so the API server ACCEPTED the old controlPlane.cpu patch and stored it
+        as a field no controller reads - a silent no-op that never errored.
+      * resources.cpu.{max,min} is a resource ENVELOPE, not the VM size. Live
+        proof: profile "small" declares cpu.max="4" while the CP node runs
+        6 vCPU / 12 GiB, matching machineType=cp.medium exactly.
+      * vsp-health-monitor.py re-asserts resources.cpu max/min = "4" on every
+        cycle, so patching that field from here would create a 5-minute
+        flip-flop rather than a fix.
+
+    Kept as a step (still gated by --skip-vsp-sizing) so the log records the
+    observed envelope and the effective machineType, and names the owning tool.
     """
     lsf.write_output('')
     lsf.write_output('=' * 60)
-    lsf.write_output('VSP Control-Plane Node Sizing (ComponentVersion size profile)')
+    lsf.write_output('VSP Control-Plane Node Sizing (verify-only)')
     lsf.write_output('=' * 60)
 
     password = lsf.get_password()
@@ -5450,39 +5536,43 @@ def fix_vsp_controlplane_sizing(dry_run: bool = False) -> bool:
             overall_success = False
             continue
 
-        cp_cpu = prof.get('controlPlane', {}).get('cpu', 0)
-        cp_mem = prof.get('controlPlane', {}).get('memory', '0Gi')
-        lsf.write_output(f'{vsp_cp_vip}: Current profile "{active_size}" controlPlane: cpu={cp_cpu}, memory={cp_mem}')
+        # ---- Report the REAL fields (see the note above this function) ----
+        # The CRD's sizes[] items declare only name/resources/worker. The previous
+        # implementation read and wrote prof['controlPlane'], which does not exist:
+        # .get('controlPlane', {}).get('cpu', 0) therefore always returned 0, the
+        # `0 == 6` guard never matched, and EVERY run patched the CR with an
+        # undeclared field (accepted only because the schema sets
+        # x-kubernetes-preserve-unknown-fields: true) and then logged SUCCESS.
+        res = prof.get('resources', {})
+        env_cpu = res.get('cpu', {})
+        env_mem = res.get('memory', {})
+        lsf.write_output(
+            f'{vsp_cp_vip}: Profile "{active_size}" resource envelope: '
+            f'cpu max={env_cpu.get("max", "?")}/min={env_cpu.get("min", "?")}, '
+            f'memory max={env_mem.get("max", "?")}/min={env_mem.get("min", "?")}')
 
-        if cp_cpu == VSP_TOPOLOGY_TARGET_NUMCPU:
-            lsf.write_output(f'{vsp_cp_vip}: VSP control plane already sized at target ({VSP_TOPOLOGY_TARGET_NUMCPU} vCPU) - no action needed')
-            continue
-
-        lsf.write_output(f'{vsp_cp_vip}: VSP control plane at {cp_cpu} vCPU, target is {VSP_TOPOLOGY_TARGET_NUMCPU}. Patching ComponentVersion {cv_name}...')
-
-        if dry_run:
-            lsf.write_output(f'{vsp_cp_vip}: [dry-run] would patch ComponentVersion controlPlane.cpu')
-            continue
-
-        # ---- Patch the ComponentVersion sizes array ----
-        for p in sizes:
-            if p.get('name') == active_size:
-                if 'controlPlane' not in p:
-                    p['controlPlane'] = {}
-                p['controlPlane']['cpu'] = VSP_TOPOLOGY_TARGET_NUMCPU
-
-        patch_payload = {'spec': {'sizes': sizes}}
-        patch_json = json.dumps(patch_payload)
-
-        patch_cmd = f"patch componentversions.api.vmsp.vmware.com {cv_name} --type=merge -p '{patch_json}'"
-        patch_res = _vsp_kubectl(patch_cmd, password, vsp_cp_vip)
-
-        if getattr(patch_res, 'returncode', 1) == 0:
-            lsf.write_output(f'{vsp_cp_vip}: SUCCESS: Patched ComponentVersion {cv_name} controlPlane.cpu to {VSP_TOPOLOGY_TARGET_NUMCPU}')
+        # Report the lever that actually determines CP VM size, so the log tells the
+        # truth about who owns this. PackageDeployment.spec.values.cluster.machineType
+        # is maintained every boot by VCFfinal.py -> Tools/vsp-health/vsp-scale-down.py.
+        mt_res = _vsp_kubectl(
+            'get packagedeployment vmsp-platform -n vmsp-platform '
+            '-o jsonpath={.spec.values.cluster.machineType}', password, vsp_cp_vip)
+        machine_type = (getattr(mt_res, 'stdout', '') or '').strip().splitlines()
+        machine_type = machine_type[-1].strip() if machine_type else ''
+        if machine_type:
+            lsf.write_output(f'{vsp_cp_vip}: Effective CP machineType={machine_type} '
+                             f'(owned by vsp-scale-down.py via VCFfinal.py)')
         else:
-            err = (getattr(patch_res, 'stderr', '') or getattr(patch_res, 'stdout', '') or '')
-            lsf.write_output(f'{vsp_cp_vip}: FAILED to patch ComponentVersion: {err}')
-            overall_success = False
+            lsf.write_output(f'{vsp_cp_vip}: Could not read PackageDeployment machineType '
+                             f'(non-fatal; sizing is owned by vsp-scale-down.py)')
+
+        # Deliberately NO patch here. Writing resources.cpu would fight
+        # vsp-health-monitor.py, which re-asserts cpu max/min = "4" every cycle
+        # (VSP_TARGET_CP_CPU); writing controlPlane.* is a no-op the operator
+        # ignores. CP sizing has exactly one owner: machineType.
+        lsf.write_output(f'{vsp_cp_vip}: Verify-only - no ComponentVersion patch applied. '
+                         f'To change CP size use: python3 Tools/vsp-health/vsp-scale-down.py '
+                         f'--cp-machine-type <cp.small|cp.medium|cp.large>')
 
     return overall_success
 
