@@ -1,7 +1,56 @@
 #!/usr/bin/env python3
 # vsp-health-monitor.py - HOLFY27 VSP Cluster Health Monitor & Remediator
-# Version 2.9 - 2026-08-03
+# Version 2.12 - 2026-08-13
 # Author - Burke Azbill and HOL Core Team
+#
+# v2.12: Fixed the v2.11 vsphere-cpi DaemonSet patch -- kubectl_patch()
+#       defaults to ptype='merge', which (unlike strategic merge) does not
+#       know how to merge a containers[] array element by its `name` key;
+#       it replaced the entire container object with just {name, args},
+#       dropping required fields like `image` and causing the API server to
+#       reject the patch ("...image: Required value"). Passed
+#       ptype='strategic' explicitly for this call. Confirmed live on DevPod.
+#
+# v2.11: CORRECTED check_leaderelect_tuning() -- v2.10 patched spec.values on
+#       the vsphere-cpi/kyverno HelmReleases on the assumption that Flux's
+#       10-minute driftDetection was the only enforcement loop to beat.
+#       Verified live on DevPod that this is wrong: vmsp-operator's
+#       PackageDeployment controller owns and re-templates these specific
+#       HelmReleases from its own internal per-package definition and
+#       reverts any spec.values edit in under 1 second (empirically timed --
+#       gone by the very next status check); the PackageDeployment CR has no
+#       exposed per-package values-override field, so there is no viable
+#       HelmRelease-layer fix at all. Replaced with direct patches to the
+#       live vsphere-cpi DaemonSet args and the
+#       kyverno-cleanup-validating-webhook-cfg failurePolicy (one layer
+#       further downstream, where Flux's helm-controller -- not
+#       vmsp-operator -- is the reverting force, on its slower ~10-minute
+#       reconcile). vsphere-cpi's DaemonSet uses updateStrategyType=OnDelete,
+#       so the pod is force-deleted after each patch. Also added a WARNING
+#       message when Tools/vsp-stabilizer.sh's vsp-fleet-depot-keeper.timer
+#       isn't active, since this check alone (running once per monitor
+#       cycle) only protects until the next ~10-minute Flux reconcile --
+#       continuous protection needs that 60s drift-keeper timer.
+#
+# v2.10: Added check_leaderelect_tuning() ('leaderelect_tuning' check) to
+#       detect and (if remediate) patch the vsphere-cpi and kyverno
+#       HelmReleases (ns vmsp-platform) when they're missing leader-election
+#       resilience tuning. Both controllers are single-replica and exit on
+#       leader-election-lease loss; transient etcd apply-latency on this
+#       lab's single-node VSP control plane (no quorum to absorb spikes) is
+#       enough to trip the default 10s renew-deadline, causing repeated
+#       CrashLoopBackOff (confirmed live on DevPod, 2026-08-13, via etcd
+#       "apply request took too long" + apiserver post-timeout logs). Both
+#       HelmReleases have Flux driftDetection enabled, so patching the live
+#       Deployment/DaemonSet would just get reverted -- this check instead
+#       patches spec.values via kubectl_patch(), which Flux then enforces
+#       durably. vsphere-cpi gets standard cloud-controller-manager
+#       leader-elect flags (60s/40s/6s); kyverno's controller-runtime
+#       controllers don't expose leader-election timing as a flag (confirmed
+#       against the vendored kyverno@3.5.2-4 chart/binary), so kyverno
+#       instead gets features.forceFailurePolicyIgnore=true so a transient
+#       cleanup-controller crash no longer fails other reconciles (e.g.
+#       vmsp-platform PackageDeployment) via its fail-closed webhook.
 #
 # v2.9: v2.8's _shq()-only fix still broke live on DevPod with "/bin/sh: 1:
 #       Syntax error: EOF in backquote substitution" -- the real service-
@@ -318,7 +367,7 @@ import lsfunctions as lsf
 # DEFAULTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.9'
+SCRIPT_VERSION = '2.10'
 LOG_FILE = '/tmp/vsp-health-monitor.log'
 
 DEFAULTS = {
@@ -331,7 +380,7 @@ DEFAULTS = {
         'host_contention', 'vsp_size', 'kvip_manifest', 'cp_pod_crash', 'gateway',
         'csi_controller', 'node_flap', 'crashloop_pods', 'postgres', 'walg_hang',
         'salt_stack', 'vodap', 'component_health', 'argo_cleanup', 'proxy_config',
-        'password_expiration', 'kyverno_queue', 'cert_renewal', 'vip',
+        'password_expiration', 'kyverno_queue', 'leaderelect_tuning', 'cert_renewal', 'vip',
     ],
     'crashloop_restart_threshold': 5,
     'crashloop_max_restarts_per_cycle': 15,
@@ -2271,6 +2320,114 @@ def check_kyverno_queue(cp_ip, password, remediate, dry_run):
     return 'FAIL', msgs
 
 #==============================================================================
+# CHECK: LEADER-ELECTION TUNING (vsphere-cpi DaemonSet / kyverno webhook)
+#==============================================================================
+
+def check_leaderelect_tuning(cp_ip, password, remediate, dry_run):
+    """Detect and (if remediate) patch the live vsphere-cpi DaemonSet and
+    kyverno-cleanup-validating-webhook-cfg when missing leader-election
+    resilience tuning.
+
+    vsphere-cpi (cloud-controller-manager) and kyverno's background/cleanup-
+    controllers are single-replica, leader-election-based controllers that
+    exit whenever they fail to renew their Lease within the default 10s
+    renew-deadline. Transient etcd apply-latency on this lab's single-node
+    VSP control plane (no quorum to absorb spikes) is enough to trip that
+    deadline, causing repeated CrashLoopBackOff (confirmed live on DevPod,
+    2026-08-13, via etcd "apply request took too long" + apiserver
+    post-timeout logs).
+
+    CORRECTED: an earlier version of this check patched spec.values on the
+    vsphere-cpi/kyverno HelmReleases, on the assumption that Flux's 10-minute
+    driftDetection was the only enforcement loop to beat. Verified live that
+    this is wrong: vmsp-operator's PackageDeployment controller owns and
+    re-templates these specific HelmReleases from its own internal
+    per-package definition and reverts any spec.values edit in under 1
+    second -- there is no exposed override field at the HelmRelease/
+    PackageDeployment layer at all. This check instead patches the LIVE
+    objects directly (one layer further downstream, where Flux's
+    helm-controller -- not vmsp-operator -- is the reverting force, on its
+    slower ~10-minute reconcile):
+      - vsphere-cpi: standard cloud-controller-manager leader-elect args
+        (60s/40s/6s) appended directly to the DaemonSet's container args.
+        Its DaemonSet uses updateStrategyType=OnDelete, so the pod is
+        force-deleted after patching so kubelet picks up the new args.
+      - kyverno: controller-runtime-based controllers do not expose
+        leader-election timing as a flag at all (confirmed against the
+        vendored kyverno@3.5.2-4 chart/binary), so the only lever is
+        patching kyverno-cleanup-validating-webhook-cfg's failurePolicy to
+        Ignore directly, so a transient cleanup-controller crash no longer
+        fails other reconciles (e.g. vmsp-platform PackageDeployment) via
+        its fail-closed webhook.
+
+    NOTE: since this check only runs once per monitor cycle (not on a tight
+    timer), it only protects until the next Flux reconcile reverts the live
+    object again (~10 min window). CONTINUOUS protection requires
+    Tools/vsp-stabilizer.sh's 60s drift-keeper timer, which folds these same
+    two patches into its existing loop -- this check additionally warns if
+    that timer isn't active.
+    """
+    msgs = []
+    any_needs_fix = False
+    any_remediated = False
+
+    cpi_args = kubectl(cp_ip, 'get daemonset vsphere-cpi -n kube-system '
+                              "-o jsonpath='{.spec.template.spec.containers[0].args}'", password)
+    cpi_args_str = _clean_stdout(cpi_args) if cpi_args and cpi_args.returncode == 0 else ''
+    if not cpi_args_str:
+        msgs.append('leaderelect_tuning: vsphere-cpi DaemonSet not found — skipping')
+    elif '--leader-elect-renew-deadline=' in cpi_args_str:
+        msgs.append('leaderelect_tuning: vsphere-cpi DaemonSet already tuned - OK')
+    else:
+        any_needs_fix = True
+        msgs.append('leaderelect_tuning: vsphere-cpi DaemonSet missing leader-election lease tuning')
+        if dry_run:
+            msgs.append('leaderelect_tuning: [DRY-RUN] would patch vsphere-cpi DaemonSet args (60s/40s/6s)')
+        elif remediate:
+            new_args = (cpi_args_str[:-1] + ',"--leader-elect-lease-duration=60s"'
+                        ',"--leader-elect-renew-deadline=40s"'
+                        ',"--leader-elect-retry-period=6s"]')
+            patch = {'spec': {'template': {'spec': {'containers': [
+                {'name': 'vsphere-cpi', 'args': json.loads(new_args)}
+            ]}}}}
+            kubectl_patch(cp_ip, 'daemonset', 'vsphere-cpi', 'kube-system', patch, password, ptype='strategic')
+            kubectl(cp_ip, 'delete pod -n kube-system -l app=vsphere-cpi --grace-period=0 --force', password)
+            msgs.append('leaderelect_tuning: patched vsphere-cpi DaemonSet args (60s/40s/6s) and restarted pod')
+            any_remediated = True
+
+    kyv_fp = kubectl(cp_ip, 'get validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg '
+                             "-o jsonpath='{.webhooks[0].failurePolicy}'", password)
+    kyv_fp_str = _clean_stdout(kyv_fp) if kyv_fp and kyv_fp.returncode == 0 else ''
+    if not kyv_fp_str:
+        msgs.append('leaderelect_tuning: kyverno-cleanup-validating-webhook-cfg not found — skipping')
+    elif kyv_fp_str == 'Ignore':
+        msgs.append('leaderelect_tuning: kyverno-cleanup-validating-webhook-cfg already tuned - OK')
+    else:
+        any_needs_fix = True
+        msgs.append('leaderelect_tuning: kyverno-cleanup-validating-webhook-cfg missing failurePolicy=Ignore')
+        if dry_run:
+            msgs.append('leaderelect_tuning: [DRY-RUN] would patch kyverno-cleanup-validating-webhook-cfg (failurePolicy=Ignore)')
+        elif remediate:
+            patch = [{'op': 'replace', 'path': '/webhooks/0/failurePolicy', 'value': 'Ignore'}]
+            kubectl_patch(cp_ip, 'validatingwebhookconfiguration',
+                          'kyverno-cleanup-validating-webhook-cfg', None, patch, password, ptype='json')
+            msgs.append('leaderelect_tuning: patched kyverno-cleanup-validating-webhook-cfg (failurePolicy=Ignore)')
+            any_remediated = True
+
+    keeper = ssh_run(cp_ip, 'systemctl is-active vsp-fleet-depot-keeper.timer 2>/dev/null', password)
+    keeper_active = _clean_stdout(keeper).strip() == 'active' if keeper else False
+    if not keeper_active:
+        msgs.append('leaderelect_tuning: WARNING - vsp-fleet-depot-keeper.timer not active; '
+                     'this fix will only last until the next Flux reconcile (~10 min) without it '
+                     '-- run Tools/vsp-stabilizer.sh for continuous protection')
+
+    if not any_needs_fix:
+        return 'PASS', msgs
+    if any_remediated:
+        return 'RECOVERED', msgs
+    return 'FAIL', msgs
+
+#==============================================================================
 # CHECK: WAL-G HANG
 #==============================================================================
 
@@ -2569,6 +2726,8 @@ def run_all(cfg, dry_run):
                 st, msgs = check_password_expiration(cp_ip, password, remediate, dry_run)
             elif check == 'kyverno_queue':
                 st, msgs = check_kyverno_queue(cp_ip, password, remediate, dry_run)
+            elif check == 'leaderelect_tuning':
+                st, msgs = check_leaderelect_tuning(cp_ip, password, remediate, dry_run)
             elif check == 'walg_hang':
                 st, msgs = check_walg_hang(cp_ip, password, remediate, dry_run)
             elif check == 'cert_renewal':

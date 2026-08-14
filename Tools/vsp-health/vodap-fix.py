@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 vodap-fix.py
-Version 1.1.0 - 2026-07-16
+Version 1.1.1 - 2026-08-14
 Author: Burke Azbill and HOL Core Team
+
+v1.1.1: Fixed spec.replicas evaluation so spec.replicas = 0 is not converted to 1 via `or 1`.
 
 v1.1.0: CP host resolution now tries candidates in order — explicit --host,
 then the hardcoded VSP_VIP, then auto-discovery via --worker — stopping at
@@ -387,8 +389,9 @@ def fix_clickhouse(cp_host, password, dry_run, verbose):
                               f'-o json 2>/dev/null',
                               timeout=20)
         if dep_data:
-            ready   = dep_data.get('status', {}).get('readyReplicas', 0) or 0
-            desired = dep_data.get('spec', {}).get('replicas', 1) or 1
+            ready    = dep_data.get('status', {}).get('readyReplicas', 0) or 0
+            spec_rep = dep_data.get('spec', {}).get('replicas')
+            desired  = spec_rep if spec_rep is not None else 1
             if desired > 0 and ready < desired:
                 failing_clients.append(dep)
 

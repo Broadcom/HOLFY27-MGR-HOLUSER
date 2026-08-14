@@ -1,19 +1,69 @@
 #!/usr/bin/env bash
 # =============================================================================
-# vsp-stabilizer.sh   (v1.1.0 - 2026-08-03, HOL Core Team)
+# vsp-stabilizer.sh   (v1.3.1 - 2026-08-13, HOL Core Team)
 #
 # Dedicated stabilization script for the VSP Fleet Control-Plane Node (10.1.1.142).
-# Enforces durable remediation across two core areas:
+# Enforces durable remediation across three core areas:
 #
 #   (A) Drift-keeper systemd timer ('vsp-fleet-depot-keeper.timer') --
 #       Probe-timeout and memory patches on Helm/reconciler-managed objects
 #       that revert on reconciles (depot-service, fleetbuild, envoy-gateway,
 #       vidb-service, sddcbuild, sddcupgrade, prometheus, kube-state-metrics,
-#       node-exporter).
+#       node-exporter, vsphere-cpi, kyverno-cleanup-validating-webhook-cfg).
 #   (B) Static-manifest lease & resource tuning --
 #       kube-controller-manager and kube-scheduler lease tuning (60s/40s/6s),
 #       etcd CPU request enforcement (2500m) + auto-compaction + defrag,
 #       and kube-vip static pod manifest hardening.
+#   (C) Live-object tuning (vsphere-cpi / kyverno) --
+#       vsphere-cpi and kyverno's background/cleanup-controllers are
+#       single-replica, leader-election-based controllers that exit whenever
+#       they fail to renew their Lease within the default 10s renew-deadline;
+#       transient etcd apply-latency on this lab's single-node VSP control
+#       plane (no quorum to absorb spikes) is enough to trip that deadline,
+#       causing repeated CrashLoopBackOff. vsphere-cpi's DaemonSet gets the
+#       same leader-elect lease/renew/retry args as (B) (60s/40s/6s);
+#       kyverno's controller-runtime controllers do not expose
+#       leader-election timing as a flag at all, so the only lever there is
+#       patching kyverno-cleanup-validating-webhook-cfg's failurePolicy to
+#       Ignore, so a transient cleanup-controller crash no longer fails
+#       other reconciles (e.g. vmsp-platform PackageDeployment) via its
+#       fail-closed webhook. Folded into the SAME 60s drift-keeper timer as
+#       (A) -- see v1.3.0 note below for why a HelmRelease-level fix (the
+#       original v1.2.0 approach) does not work here.
+#
+# v1.3.1: Fixed the v1.3.0 vsphere-cpi DaemonSet patch -- it used
+#         `kubectl patch --type=merge`, which (unlike the default strategic
+#         merge) does not know how to merge a containers[] array element by
+#         its `name` key; it replaced the entire container object with just
+#         {name, args}, dropping required fields like `image` and causing
+#         the API server to reject the patch ("...image: Required value").
+#         Changed to `--type=strategic` in all three call sites (apply,
+#         revert, and the 60s drift-keeper loop). Confirmed live on DevPod.
+#
+# v1.3.0: CORRECTED section (C) -- v1.2.0 patched spec.values on the
+#         vsphere-cpi/kyverno HelmReleases on the assumption that Flux's
+#         10-minute driftDetection was the only enforcement loop to beat.
+#         Verified live on DevPod that this is wrong: vmsp-operator's
+#         PackageDeployment controller owns and re-templates these specific
+#         HelmReleases from its own internal per-package definition and
+#         reverts any spec.values edit in under 1 second (empirically
+#         timed -- gone by the very next status check). The PackageDeployment
+#         CR has no exposed per-package values-override field, so there is
+#         no viable HelmRelease-layer fix at all. Replaced with direct
+#         patches to the live DaemonSet/ValidatingWebhookConfiguration
+#         objects (one layer further downstream, where Flux's
+#         helm-controller -- not vmsp-operator -- is the reverting force, on
+#         its slower ~10-minute reconcile), folded into the existing 60s
+#         drift-keeper timer for continuous reassertion, matching this
+#         script's own established pattern in section (A) for exactly this
+#         class of problem. vsphere-cpi's DaemonSet uses
+#         updateStrategyType=OnDelete, so the pod is force-deleted after
+#         each patch so kubelet picks up the new args.
+#
+# v1.2.0: Added section (C) -- vsphere-cpi/kyverno HelmRelease leader-election
+#         and fail-policy tuning, folded into the existing status/apply-lease/
+#         revert-lease actions. Diagnosed live on DevPod, 2026-08-13.
+#         SUPERSEDED by v1.3.0 above -- did not actually persist.
 #
 # v1.1.0: etcd CPU request raised from 1000m to 2500m to match BenS's later,
 #         empirically-validated value for the VSP CP's etcd (cgroup weight
@@ -128,6 +178,7 @@ LEASE_DURATION="${LEASE_DURATION}"
 RENEW_DEADLINE="${RENEW_DEADLINE}"
 RETRY_PERIOD="${RETRY_PERIOD}"
 ETCD_CPU_REQUEST="${ETCD_CPU_REQUEST}"
+export KUBECONFIG=/etc/kubernetes/admin.conf
 
 mkdir -p /root/manifest-bak
 if ls /etc/kubernetes/manifests/*.bak.* >/dev/null 2>&1; then
@@ -194,6 +245,110 @@ status_leader_elect() {
   fi
 }
 
+# ---- Section (C): live-object tuning (vsphere-cpi / kyverno) ----
+# CORRECTED 2026-08-13: an earlier version of this section patched
+# spec.values on the vsphere-cpi/kyverno HelmReleases, on the theory that
+# Flux's 10-minute driftDetection was the only enforcement loop to beat.
+# Verified live on DevPod that this is wrong: vmsp-operator's PackageDeployment
+# controller owns and re-templates these specific HelmReleases from its own
+# internal per-package definition and reverts any spec.values edit in under
+# 1 second (confirmed empirically -- a patch was gone by the very next
+# status check). There is no exposed override field on the PackageDeployment
+# CR for per-package Helm values, so a HelmRelease-level fix is not viable
+# here at all. The functions below instead patch the LIVE DaemonSet/
+# ValidatingWebhookConfiguration objects directly, which are one layer
+# further downstream -- Flux's helm-controller still owns rendering the
+# HelmRelease into these objects, on its ~10-minute reconcile, so a direct
+# edit here has a much bigger survival window than the HelmRelease layer
+# did. This is the SAME pattern already proven out by the drift-keeper
+# timer above for depot-service/envoy-gateway/etc: apply_status()/apply()
+# below only cover a one-off check/apply for --status/--apply-lease/
+# --revert-lease; CONTINUOUS protection comes from these same patches also
+# being asserted every 60s by vsp-fleet-depot-keeper.sh (see below).
+# vsphere-cpi's DaemonSet uses updateStrategyType=OnDelete, so a template
+# patch alone does not roll out -- the existing pod must be deleted after
+# patching for kubelet to pick up the new args.
+
+helmrelease_cpi_status() {
+  local cur
+  cur="\$(kubectl -n kube-system get daemonset vsphere-cpi -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || true)"
+  if echo "\$cur" | grep -q -- '--leader-elect-renew-deadline='; then
+    echo "  vsphere-cpi DaemonSet: PATCHED, at target"
+  else
+    echo "  vsphere-cpi DaemonSet: NOT patched (args=\${cur:-unset})"
+  fi
+}
+
+helmrelease_cpi_apply() {
+  local cur new
+  cur="\$(kubectl -n kube-system get daemonset vsphere-cpi -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || true)"
+  if [ -z "\$cur" ]; then
+    echo "  vsphere-cpi DaemonSet: not found -- skipping"
+    return
+  fi
+  if echo "\$cur" | grep -q -- '--leader-elect-renew-deadline='; then
+    echo "  vsphere-cpi DaemonSet: already at target -- no-op"
+    return
+  fi
+  new="\${cur%]},\"--leader-elect-lease-duration=\${LEASE_DURATION}\",\"--leader-elect-renew-deadline=\${RENEW_DEADLINE}\",\"--leader-elect-retry-period=\${RETRY_PERIOD}\"]"
+  kubectl -n kube-system patch daemonset vsphere-cpi --type=strategic -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"vsphere-cpi\",\"args\":\$new}]}}}}" \
+    >/dev/null 2>&1 && kubectl -n kube-system delete pod -l app=vsphere-cpi --grace-period=0 --force >/dev/null 2>&1 \
+    && echo "  vsphere-cpi DaemonSet: patched leader-election lease settings (\${LEASE_DURATION}/\${RENEW_DEADLINE}/\${RETRY_PERIOD}) and restarted pod" \
+    || echo "  vsphere-cpi DaemonSet: patch FAILED"
+}
+
+helmrelease_cpi_revert() {
+  local cur new
+  cur="\$(kubectl -n kube-system get daemonset vsphere-cpi -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || true)"
+  if ! echo "\$cur" | grep -q -- '--leader-elect-renew-deadline='; then
+    echo "  vsphere-cpi DaemonSet: nothing to revert (not patched)"
+    return
+  fi
+  new="\$(echo "\$cur" | sed -E 's/,"--leader-elect-[a-z-]+=[^"]*"//g')"
+  kubectl -n kube-system patch daemonset vsphere-cpi --type=strategic -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"vsphere-cpi\",\"args\":\$new}]}}}}" \
+    >/dev/null 2>&1 && kubectl -n kube-system delete pod -l app=vsphere-cpi --grace-period=0 --force >/dev/null 2>&1 \
+    && echo "  vsphere-cpi DaemonSet: reverted to base args and restarted pod" \
+    || echo "  vsphere-cpi DaemonSet: revert FAILED"
+}
+
+helmrelease_kyverno_status() {
+  local cur
+  cur="\$(kubectl get validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg -o jsonpath='{.webhooks[0].failurePolicy}' 2>/dev/null || true)"
+  if [ "\$cur" = "Ignore" ]; then
+    echo "  kyverno-cleanup-validating-webhook-cfg: PATCHED, failurePolicy=Ignore"
+  else
+    echo "  kyverno-cleanup-validating-webhook-cfg: NOT patched (failurePolicy=\${cur:-unset})"
+  fi
+}
+
+helmrelease_kyverno_apply() {
+  local cur
+  cur="\$(kubectl get validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg -o jsonpath='{.webhooks[0].failurePolicy}' 2>/dev/null || true)"
+  if [ -z "\$cur" ]; then
+    echo "  kyverno-cleanup-validating-webhook-cfg: not found -- skipping"
+    return
+  fi
+  if [ "\$cur" = "Ignore" ]; then
+    echo "  kyverno-cleanup-validating-webhook-cfg: already at target -- no-op"
+    return
+  fi
+  kubectl patch validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg --type=json -p '[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Ignore"}]' \
+    >/dev/null 2>&1 && echo "  kyverno-cleanup-validating-webhook-cfg: patched failurePolicy=Ignore (was \$cur)" \
+    || echo "  kyverno-cleanup-validating-webhook-cfg: patch FAILED"
+}
+
+helmrelease_kyverno_revert() {
+  local cur
+  cur="\$(kubectl get validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg -o jsonpath='{.webhooks[0].failurePolicy}' 2>/dev/null || true)"
+  if [ "\$cur" != "Ignore" ]; then
+    echo "  kyverno-cleanup-validating-webhook-cfg: nothing to revert (not patched)"
+    return
+  fi
+  kubectl patch validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg --type=json -p '[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Fail"}]' \
+    >/dev/null 2>&1 && echo "  kyverno-cleanup-validating-webhook-cfg: reverted failurePolicy=Fail" \
+    || echo "  kyverno-cleanup-validating-webhook-cfg: revert FAILED"
+}
+
 etcd_cpu_status() {
   local file="\$MDIR/etcd.yaml"
   [ -f "\$file" ] || { echo "  etcd: manifest not found"; return; }
@@ -254,6 +409,10 @@ case "\$FAMB_ACTION" in
     etcd_cpu_status
     echo ""
     kube_vip_status
+    echo ""
+    echo "vsphere-cpi / kyverno (HelmRelease-managed):"
+    helmrelease_cpi_status
+    helmrelease_kyverno_status
     ;;
   apply-lease)
     echo "kube-controller-manager / kube-scheduler:"
@@ -262,6 +421,10 @@ case "\$FAMB_ACTION" in
     echo ""
     echo "etcd:"
     etcd_cpu_apply
+    echo ""
+    echo "vsphere-cpi / kyverno (HelmRelease-managed):"
+    helmrelease_cpi_apply
+    helmrelease_kyverno_apply
     ;;
   revert-lease)
     echo "kube-controller-manager / kube-scheduler:"
@@ -270,6 +433,10 @@ case "\$FAMB_ACTION" in
     echo ""
     echo "etcd:"
     revert_etcd
+    echo ""
+    echo "vsphere-cpi / kyverno (HelmRelease-managed):"
+    helmrelease_cpi_revert
+    helmrelease_kyverno_revert
     ;;
   etcd-compaction)
     etcd_compaction_apply
@@ -520,6 +687,23 @@ PROMMEM=$($KB -n vmsp-platform get statefulset prometheus-kube-prometheus-stack-
 if [ "$PROMMEM" != "4Gi" ]; then
   $KB -n vmsp-platform patch statefulset prometheus-kube-prometheus-stack-prometheus --type=strategic --patch-file /usr/local/etc/vsp-prometheus-patch.yaml >/dev/null 2>&1 \
     && logger -t vsp-fleet-depot-keeper "drift corrected: prometheus memory -> 4Gi (was '${PROMMEM:-unset}')"
+fi
+# vsphere-cpi/kyverno: see Section (C) comment above patch_leader_elect() -- these
+# revert in under 1s at the HelmRelease layer (vmsp-operator owns/re-templates
+# them), so continuous reassertion of the LIVE objects on this same 60s timer
+# is the only mechanism that actually holds. vsphere-cpi is a DaemonSet with
+# updateStrategyType=OnDelete, so the pod must be deleted after patching.
+CPIARGS=$($KB -n kube-system get daemonset vsphere-cpi -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo "")
+if [ -n "$CPIARGS" ] && ! echo "$CPIARGS" | grep -q -- '--leader-elect-renew-deadline='; then
+  CPINEW="${CPIARGS%]},\"--leader-elect-lease-duration=60s\",\"--leader-elect-renew-deadline=40s\",\"--leader-elect-retry-period=6s\"]"
+  $KB -n kube-system patch daemonset vsphere-cpi --type=strategic -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"vsphere-cpi\",\"args\":$CPINEW}]}}}}" >/dev/null 2>&1 \
+    && $KB -n kube-system delete pod -l app=vsphere-cpi --grace-period=0 --force >/dev/null 2>&1 \
+    && logger -t vsp-fleet-depot-keeper "drift corrected: vsphere-cpi DaemonSet leader-election args re-applied (was missing) and pod restarted"
+fi
+KYVFP=$($KB get validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg -o jsonpath='{.webhooks[0].failurePolicy}' 2>/dev/null || echo "")
+if [ -n "$KYVFP" ] && [ "$KYVFP" != "Ignore" ]; then
+  $KB patch validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg --type=json -p '[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Ignore"}]' >/dev/null 2>&1 \
+    && logger -t vsp-fleet-depot-keeper "drift corrected: kyverno-cleanup-validating-webhook-cfg failurePolicy -> Ignore (was '${KYVFP:-unset}')"
 fi
 KEEPER
 
