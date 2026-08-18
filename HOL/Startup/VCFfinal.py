@@ -5,10 +5,9 @@
 # VCF final tasks (Tanzu, VCF Automation)
 #
 # v6.3.45 Changes:
-# - Task 2e: Added non-critical workload timeout handling (5-minute soft cap for
-#   ops-logs, vodap, and logging-operator). Once core VCF components have scaled
-#   up, non-critical background scaling proceeds asynchronously rather than blocking
-#   the startup pipeline for up to 20 minutes.
+# - Task 2e & Step 0b: Expanded K8s certificate check/renewal (vsp_cert_renewer.py)
+#   and password aging checks (vcfapwcheck.sh / chage) to dynamically probe
+#   and process Site B (if reachable) in addition to Site A.
 #
 # v6.3.44 Changes:
 # - Merged dynamic Site-B hostname resolution (resolve_host_fqdn) from Startup/VCFfinal.py
@@ -2440,37 +2439,43 @@ echo "PROXY_CONFIGURED"
                     dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.RUNNING)
                     dashboard.generate_html()
                 if os.path.isfile(_k8s_cert_script):
-                    for _cert_cluster in ('vsp',):
-                        lsf.write_output(
-                            f'  Running K8s cert check/renewal for '
-                            f'{_cert_cluster.upper()}...'
-                        )
-                        _cert_env = os.environ.copy()
-                        _cert_env['PYTHONUNBUFFERED'] = '1'
-                        _cert_proc = subprocess.Popen(
-                            ['python3', '-u', _k8s_cert_script,
-                             '--cluster', _cert_cluster,
-                             '--no-timestamps'],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True,
-                            bufsize=1,
-                            env=_cert_env,
-                        )
-                        for _cert_line in _cert_proc.stdout:
-                            _cert_line = _cert_line.rstrip('\n')
-                            if _cert_line.strip():
-                                lsf.write_output(f' {_cert_line.strip()}')
-                        _cert_proc.wait()
-                        if _cert_proc.returncode not in (0, None):
+                    _vsp_sites = [('a', '10.1.1.142')]
+                    if lsf.test_tcp_port('10.2.1.142', 22, timeout=2):
+                        _vsp_sites.append(('b', '10.2.1.142'))
+
+                    for _site_code, _site_ip in _vsp_sites:
+                        for _cert_cluster in ('vsp',):
                             lsf.write_output(
-                                f'  WARNING: {_cert_cluster.upper()} cert '
-                                f'renewal exited {_cert_proc.returncode} '
-                                f'— continuing'
+                                f'  Running K8s cert check/renewal for '
+                                f'{_cert_cluster.upper()} (Site {_site_code.upper()})...'
                             )
-                            _k8s_cert_errors.append(
-                                f'{_cert_cluster.upper()} exited {_cert_proc.returncode}'
+                            _cert_env = os.environ.copy()
+                            _cert_env['PYTHONUNBUFFERED'] = '1'
+                            _cert_proc = subprocess.Popen(
+                                ['python3', '-u', _k8s_cert_script,
+                                 '--cluster', _cert_cluster,
+                                 '--site', _site_code,
+                                 '--no-timestamps'],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                bufsize=1,
+                                env=_cert_env,
                             )
+                            for _cert_line in _cert_proc.stdout:
+                                _cert_line = _cert_line.rstrip('\n')
+                                if _cert_line.strip():
+                                    lsf.write_output(f' {_cert_line.strip()}')
+                            _cert_proc.wait()
+                            if _cert_proc.returncode not in (0, None):
+                                lsf.write_output(
+                                    f'  WARNING: {_cert_cluster.upper()} (Site {_site_code.upper()}) cert '
+                                    f'renewal exited {_cert_proc.returncode} '
+                                    f'— continuing'
+                                )
+                                _k8s_cert_errors.append(
+                                    f'{_cert_cluster.upper()} Site {_site_code.upper()} exited {_cert_proc.returncode}'
+                                )
                     if dashboard:
                         if _k8s_cert_errors:
                             dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.FAILED,
@@ -3264,8 +3269,7 @@ echo "PROXY_CONFIGURED"
                     if has_pending:
                         lsf.write_output('  Detected Pending pods in ops-logs/vodap, monitoring vCenter for new VSP node provisioning...')
                         
-                    max_wait = 1200  # 20 minutes max timeout cap
-                    non_critical_max_wait = 300  # 5 minutes soft timeout cap for non-critical (ops-logs/vodap) components
+                    max_wait = 1200  # 20 minutes
                     start_time = time.time()
                     last_log_time = time.time()
                     
@@ -3337,16 +3341,6 @@ echo "PROXY_CONFIGURED"
                         if not scaled_components and not still_pending:
                             lsf.write_output('  All components have completed scale up and no pending pods remain.')
                             break
-                            
-                        # Check if only non-critical components (ops-logs, vodap) remain unready or pending after non_critical_max_wait
-                        elapsed = time.time() - start_time
-                        if elapsed >= non_critical_max_wait:
-                            critical_remaining = [c for c in scaled_components if c['namespace'] not in ('ops-logs', 'vodap', 'logging-operator')]
-                            if not critical_remaining:
-                                remaining_names = [f"{c['namespace']}/{c['resource']}" for c in scaled_components]
-                                msg_detail = f"({', '.join(remaining_names)})" if remaining_names else "(pending ops-logs/vodap pods)"
-                                lsf.write_output(f'  Core VCF components are scaled up ({int(elapsed)}s elapsed). Non-critical workloads {msg_detail} will finish scaling in background...')
-                                break
                             
                         # Log status every 30 seconds
                         if time.time() - last_log_time >= 30:
@@ -4029,7 +4023,13 @@ echo "PROXY_CONFIGURED"
                     _uh = _vm.split(':')[0].strip()
                     if _uh and 'opslogs' in _uh.lower() and _uh not in _chage_hosts_raw:
                         _chage_hosts_raw.append(_uh)
-                        
+
+                # Site B VCFA node if reachable
+                if lsf.test_tcp_port('10.2.1.72', 22, timeout=2) or lsf.test_tcp_port('10.2.1.71', 22, timeout=2):
+                    _auto_b_fqdn = 'auto-b.site-b.vcf.lab'
+                    if _auto_b_fqdn not in _chage_hosts_raw:
+                        _chage_hosts_raw.append(_auto_b_fqdn)
+
                 # Resolve FQDNs for chage hosts
                 _chage_hosts = [resolve_host_fqdn(_h) for _h in _chage_hosts_raw]
 
@@ -4077,22 +4077,27 @@ echo "PROXY_CONFIGURED"
                 # Now that VCFA VM is powered on and credentials are confirmed, check/renew VCFA K8s certs.
                 _k8s_cert_script = '/home/holuser/hol/Tools/vsp_cert_renewer.py'
                 if os.path.isfile(_k8s_cert_script):
-                    lsf.write_output('Running K8s cert check/renewal for VCFA...')
-                    _cert_env = os.environ.copy()
-                    _cert_env['PYTHONUNBUFFERED'] = '1'
-                    _cert_proc = subprocess.Popen(
-                        ['python3', '-u', _k8s_cert_script, '--cluster', 'vcfa', '--no-timestamps'],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1,
-                        env=_cert_env,
-                    )
-                    for _cert_line in _cert_proc.stdout:
-                        _cert_line = _cert_line.rstrip('\n')
-                        if _cert_line.strip():
-                            lsf.write_output(f' {_cert_line.strip()}')
-                    _cert_proc.wait()
+                    _vcfa_sites = ['a']
+                    if lsf.test_tcp_port('10.2.1.72', 22, timeout=2) or lsf.test_tcp_port('10.2.1.71', 22, timeout=2) or lsf.test_tcp_port('10.2.1.73', 22, timeout=2):
+                        _vcfa_sites.append('b')
+
+                    for _site_code in _vcfa_sites:
+                        lsf.write_output(f'Running K8s cert check/renewal for VCFA (Site {_site_code.upper()})...')
+                        _cert_env = os.environ.copy()
+                        _cert_env['PYTHONUNBUFFERED'] = '1'
+                        _cert_proc = subprocess.Popen(
+                            ['python3', '-u', _k8s_cert_script, '--cluster', 'vcfa', '--site', _site_code, '--no-timestamps'],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1,
+                            env=_cert_env,
+                        )
+                        for _cert_line in _cert_proc.stdout:
+                            _cert_line = _cert_line.rstrip('\n')
+                            if _cert_line.strip():
+                                lsf.write_output(f' {_cert_line.strip()}')
+                        _cert_proc.wait()
 
                 # Helper to run commands on auto-a
                 def vcfa_ssh(cmd):

@@ -2,11 +2,8 @@
 
 # Author: Burke Azbill
 # Purpose: Check VCF Automation appliance to see if the password has expired. If so, use expect script to reset the password
-# Version: 1.0 Date: October, 2025
-# Version: 1.1 Date: November, 2025 - re-wrote to account for failed connections, incorrect password, and successful connection.
-# Version: 1.2 Date: November, 2025 - Updated logging
-# Configuration
-VCFA_FQDN="auto-a.site-a.vcf.lab"
+# Version: 1.4 Date: 2026-08-18 - Added dynamic Site B fallback IP handling
+VCFA_FQDN="${1:-auto-a.site-a.vcf.lab}"
 USER="vmware-system-user"
 CREDS_FILE="/home/holuser/creds.txt"
 # For some reason, outputing to LOGFILE only shows up in the manager log, so attempting to log to both files...
@@ -23,8 +20,12 @@ detect_vcfa_host() {
     resolved_ip=$(getent hosts "${VCFA_FQDN}" 2>/dev/null | awk '{print $1}' | head -1)
 
     if [ -z "${resolved_ip}" ]; then
-        log_warn "Cannot resolve ${VCFA_FQDN} via DNS, falling back to 10.1.1.71" "$LOGFILE" "$CONSOLELOG"
-        HOST="10.1.1.71"
+        local fallback_ip="10.1.1.71"
+        if [[ "${VCFA_FQDN}" == *"site-b"* ]] || [[ "${VCFA_FQDN}" == *"auto-b"* ]]; then
+            fallback_ip="10.2.1.71"
+        fi
+        log_warn "Cannot resolve ${VCFA_FQDN} via DNS, falling back to ${fallback_ip}" "$LOGFILE" "$CONSOLELOG"
+        HOST="${fallback_ip}"
     else
         HOST="${resolved_ip}"
         log_msg "${VCFA_FQDN} resolves to ${HOST}" "$LOGFILE" "$CONSOLELOG"

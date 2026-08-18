@@ -16,6 +16,7 @@
 # If Firefox is currently running (.parentlock detected), the script skips the
 # import and logs a warning rather than corrupting the live database.
 #
+# Version 1.1 - 2026-08-18: Standardized BLUE color code (\033[0;34m) for universal console/VCD terminal compatibility.
 # Version 1.0 - 2026-06-30
 # Author - Burke Azbill and HOL Core Team
 #
@@ -32,7 +33,7 @@
 set -euo pipefail
 
 TOOL_NAME="import-firefox-bookmarks.sh"
-VERSION="1.0"
+VERSION="1.1"
 VERSION_STR="Version ${VERSION}"
 
 # ---------------------------------------------------------------------------
@@ -42,7 +43,7 @@ if [[ -t 1 ]]; then
     RED='\033[0;31m'
     GREEN='\033[0;32m'
     YELLOW='\033[1;33m'
-    BLUE='\033[38;2;0;176;255m'
+    BLUE='\033[0;34m'
     CYAN='\033[0;36m'
     BOLD='\033[1m'
     NC='\033[0m'

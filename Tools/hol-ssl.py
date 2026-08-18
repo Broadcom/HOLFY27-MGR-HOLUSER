@@ -2,6 +2,7 @@
 #
 # hol-ssl.py - Issue SSL certificates for HOL vPods via HashiCorp Vault PKI
 #
+# version 2.4  2026-08-18 (Standardized ANSI blue color _BLUE to \033[0;34m for universal terminal compatibility)
 # version 2.3  2026-05-01
 # Connects to a Vault PKI secrets engine to issue certificates. Vault connection
 # details, PKI role, key parameters, and output directory are read from
@@ -31,13 +32,13 @@ from cryptography.hazmat.primitives.serialization import pkcs12, BestAvailableEn
 from cryptography.x509.oid import NameOID
 import jks
 
-VERSION = '2.2'
+VERSION = '2.4'
 log = logging.getLogger('hol-ssl')
 
 # ANSI colors (disabled when stdout is not a terminal)
 if sys.stdout.isatty():
     _CYAN    = '\033[0;36m'
-    _BLUE    = '\033[38;2;0;176;255m'
+    _BLUE    = '\033[0;34m'
     _GREEN   = '\033[0;32m'
     _YELLOW  = '\033[1;33m'
     _BOLD    = '\033[1m'
