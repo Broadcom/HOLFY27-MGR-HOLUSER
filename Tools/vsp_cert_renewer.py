@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
 vsp_cert_renewer.py
-Version 2.12 - 2026-07-25
+Version 2.13 - 2026-08-17
 Author: Burke Azbill, Kevin Tebear, and HOL Core Team
 
 Proactive Kubernetes certificate check and renewal for VSP and VCFA clusters.
+
+Changelog:
+v2.13 (2026-08-17) - Added dynamic Site-B support via --site argument.
+                     Replaced static CLUSTERS dict with get_cluster_configs().
 
 Runs at every lab startup (called by VCFfinal.py Task 2e before component
 scale-up). Non-fatal — exceptions are caught per-phase so a failure in one
@@ -46,8 +50,8 @@ import time
 from datetime import datetime, timezone
 
 # ─── Version ──────────────────────────────────────────────────────────────────
-VERSION = "2.12"
-DATE    = "2026-07-25"
+VERSION = "2.13"
+DATE    = "2026-08-17"
 
 # ─── Global constants ─────────────────────────────────────────────────────────
 THRESHOLD_DAYS = 60            # renew if any cert expires within 60 days
@@ -93,6 +97,31 @@ CLUSTERS = {
         "phases":         ["kubeadm", "kubelet"],
     },
 }
+
+def get_cluster_configs(args):
+    site_suffix = "a.site-a"
+    subnet_prefix = "10.1.1"
+    
+    if hasattr(args, "site") and args.site:
+        site = args.site.lower()
+        site_suffix = f"{site}.site-{site}"
+        if site == "b":
+            subnet_prefix = "10.2.1"
+            
+    return {
+        "vsp": {
+            "label":          "VSP",
+            "worker_fqdn":    f"vsp-01{site_suffix}.vcf.lab",
+            "phases":         ["kubeadm", "kubelet", "extendca", "certmanager", "antrea", "casync"],
+            "fix_kcm_duration": True,
+        },
+        "vcfa": {
+            "label":          "VCFA",
+            "fqdn":           f"auto-{site_suffix}.vcf.lab",
+            "candidate_ips":  [f"{subnet_prefix}.71", f"{subnet_prefix}.72", f"{subnet_prefix}.73", f"{subnet_prefix}.74"],
+            "phases":         ["kubeadm", "kubelet"],
+        },
+    }
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 _LOG_LABEL      = ""
@@ -2615,6 +2644,11 @@ def main():
     parser.add_argument("--skip-casync",      action="store_true",
                         help="Skip Phase 5 (containerd CA trust sync)")
     parser.add_argument(
+        "--site",
+        choices=["a", "b"],
+        help="Which site to target (a or b)",
+    )
+    parser.add_argument(
         "--no-timestamps",
         action="store_true",
         help="Suppress the [timestamp] prefix on log lines (used when called "
@@ -2635,14 +2669,15 @@ def main():
     log_sep()
 
     target = args.cluster
+    configs = get_cluster_configs(args)
 
     if target == "all":
-        for cname, ccfg in CLUSTERS.items():
+        for cname, ccfg in configs.items():
             _check_cluster(cname, ccfg, args)
-    elif target in CLUSTERS:
-        _check_cluster(target, CLUSTERS[target], args)
+    elif target in configs:
+        _check_cluster(target, configs[target], args)
     else:
-        log_error(f"Unknown cluster '{target}' — valid choices: {list(CLUSTERS.keys())}")
+        log_error(f"Unknown cluster '{target}' — valid choices: {list(configs.keys())}")
         sys.exit(1)
 
     log_info("All requested clusters processed.")

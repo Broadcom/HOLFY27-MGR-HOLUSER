@@ -8,17 +8,18 @@
 # By default does NOT restore: extensions/, storage/ (IndexedDB), caches, sessionstore.
 #   Use --keep-extensions / --keep-storage to include them (higher risk of re-importing corruption).
 #
+# Version 1.2 - 2026-08-18: Standardized BLUE color code (\033[0;34m) for universal console/VCD terminal compatibility.
 # Version 1.1 - 2026-04-27: --rebuild-count N writes ~/.local/state/firefox_profile_rebuild.count (labstartup gate).
 set -euo pipefail
 
-VERSION="1.1"
+VERSION="1.2"
 TOOL_NAME="rebuild-firefox-profile.sh"
 VERSION_STR="Version ${VERSION}"
 
 if [[ -t 1 ]]; then
   GREEN='\033[0;32m'
   YELLOW='\033[1;33m'
-  BLUE='\033[38;2;0;176;255m'
+  BLUE='\033[0;34m'
   CYAN='\033[0;36m'
   BOLD='\033[1m'
   RED='\033[0;31m'

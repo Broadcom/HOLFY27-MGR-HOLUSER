@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
 vsp-health.py
-Version 2.9.0 - 2026-08-13
+Version 2.9.2 - 2026-08-18
 Author: Burke Azbill and HOL Core Team
+
+v2.9.2: Standardized ANSI blue color (_BLUE) to standard 16-color ANSI (\033[0;34m) for universal terminal compatibility.
+
+v2.9.1: Fixed bug in chk_vodap where spec.replicas = 0 (e.g. optional collector profile
+deployments) was evaluated as `0 or 1` (desired=1), causing false 0/1 ready
+ClickHouse-dependent client not ready failures for scaled-to-0 deployments.
 
 v2.9.0: Added Control Plane vs. Worker Node pod location breakdown (x CP / y Worker)
 to Pod Health Overview, plus node role and hostname details for unhealthy pods in verbose mode.
@@ -81,8 +87,8 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 
-VERSION = "2.9.0"
-DATE    = "2026-08-13"
+VERSION = "2.9.2"
+DATE    = "2026-08-18"
 
 CREDS_FILE = "/home/holuser/creds.txt"
 VSP_USER   = "vmware-system-user"
@@ -105,7 +111,7 @@ _NS_PRIORITY = ["kube-system", "vmsp-platform", "cert-manager", "antrea", "istio
 # ─── Colors ──────────────────────────────────────────────────────────────────
 if sys.stdout.isatty():
     _CYAN, _BLUE, _GREEN, _RED, _YELLOW, _BOLD, _DIM, _NC = (
-        '\033[0;36m', '\033[38;2;0;176;255m', '\033[0;32m',
+        '\033[0;36m', '\033[0;34m', '\033[0;32m',
         '\033[0;31m', '\033[1;33m', '\033[1m', '\033[2m', '\033[0m'
     )
 else:
@@ -1256,7 +1262,8 @@ def chk_vodap(cp_host, password, verbose):
             for dep_data in deps_data["items"]:
                 dep = dep_data.get("metadata", {}).get("name", "unknown")
                 ready = dep_data.get("status", {}).get("readyReplicas", 0) or 0
-                desired = dep_data.get("spec", {}).get("replicas", 1) or 1
+                spec_rep = dep_data.get("spec", {}).get("replicas")
+                desired = spec_rep if spec_rep is not None else 1
                 if desired > 0 and ready < desired:
                     results.append(row_fail(f"{dep} (vodap): {ready}/{desired} ready",
                                             "ClickHouse-dependent client not ready"))

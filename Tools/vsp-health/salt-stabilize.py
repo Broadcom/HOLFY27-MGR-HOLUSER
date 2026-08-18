@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 salt-stabilize.py
-Version 1.1.0 - 2026-07-16
+Version 1.1.1 - 2026-08-18
 Author: Burke Azbill and HOL Core Team
+
+v1.1.1: Standardized ANSI blue color (_BLUE) to standard 16-color ANSI (\033[0;34m) for universal terminal compatibility.
 
 v1.1.0: CP host resolution now tries candidates in order — explicit --host,
 then the hardcoded VSP_VIP, then auto-discovery via --worker — stopping at
@@ -38,6 +40,20 @@ Exit codes:
   1  One or more steps failed
   2  Cannot connect to VSP cluster
 """
+##############################################################################
+# DEPRECATED -- superseded by Tools/vcf-lab-tuner.py
+#
+# Equivalent: python3 Tools/vcf-lab-tuner.py --cluster vsp --mode remediate --section postgres
+#
+# pgdata permission repair is in the postgres section, which sweeps EVERY
+# spilo namespace rather than only salt-raas/pgdatabase-0 -- the hardcoding
+# here is why vidb-external sat broken for 43 days. Note the Salt rollout
+# restart in this script is UNCONDITIONAL; the replacement gates it.
+#
+# This script still works and is UNCHANGED. Nothing here was removed.
+# New work belongs in vcf-lab-tuner.py. See Tools/vcf-lab-tuner.md and
+# Tools/vsp-analysis-report-opus.md for the consolidation rationale.
+##############################################################################
 import argparse
 import base64
 import json
@@ -48,8 +64,8 @@ import sys
 import time
 from datetime import datetime
 
-VERSION = "1.1.0"
-DATE    = "2026-07-16"
+VERSION = "1.1.1"
+DATE    = "2026-08-18"
 
 CREDS_FILE = "/home/holuser/creds.txt"
 VSP_USER   = "vmware-system-user"
@@ -67,7 +83,7 @@ SALT_STEPS = [
 # ─── Colors ──────────────────────────────────────────────────────────────────
 if sys.stdout.isatty():
     _CYAN, _BLUE, _GREEN, _RED, _YELLOW, _BOLD, _DIM, _NC = (
-        '\033[0;36m', '\033[38;2;0;176;255m', '\033[0;32m',
+        '\033[0;36m', '\033[0;34m', '\033[0;32m',
         '\033[0;31m', '\033[1;33m', '\033[1m', '\033[2m', '\033[0m'
     )
 else:

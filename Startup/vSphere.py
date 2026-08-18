@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 # vSphere.py - HOLFY27 Core vSphere Startup Module
-# Version 3.4 - 2026-08-06
+# Version 3.5 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
 # vSphere infrastructure startup sequence
 #
 # CHANGELOG:
+# v3.5 - 2026-08-18:
+#   - TASK 5: Added pre-flight QueryOptions check before calling UpdateOptions for
+#     UserVars.SuppressShellWarning on ESXi hosts. Skips call if already set to 1,
+#     preventing NotEnoughLicenses faults and 50-second retry delays during early
+#     vCenter License Service startup.
 # v3.4 - 2026-08-06:
 #   - TASK 4: Fixed inverted DRS_CONSERVATIVE_VMOTION_RATE. Empirically
 #     confirmed via live DevPod test that vim.cluster.DrsConfigInfo.vmotionRate
@@ -399,6 +404,25 @@ def main(lsf=None, standalone=False, dry_run=False):
         esxhosts = lsf.get_all_hosts()
         for host in esxhosts:
             option_manager = host.configManager.advancedOption
+            
+            # Pre-flight check: query option first to avoid unnecessary UpdateOptions calls
+            # that trigger NotEnoughLicenses retries when License Service is initializing.
+            already_suppressed = False
+            try:
+                cur_opts = option_manager.QueryOptions(name='UserVars.SuppressShellWarning')
+                if cur_opts:
+                    for opt in cur_opts:
+                        if opt.key == 'UserVars.SuppressShellWarning' and str(opt.value) == '1':
+                            already_suppressed = True
+                            break
+            except Exception:
+                pass
+
+            if already_suppressed:
+                lsf.write_output(f'Shell warning already suppressed on {host.name}')
+                shell_warning_count += 1
+                continue
+
             option = vim.option.OptionValue(
                 key='UserVars.SuppressShellWarning',
                 value=1
