@@ -123,17 +123,14 @@ def main(lsf=None, standalone=False, dry_run=False):
         import time
         import requests
         import urllib3
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         
-        # Wait for each vCenter to become available before attempting connection
-        for entry in vcenters:
-            # get_config_list already filters comments, but double-check
+        # Wait for each vCenter to become available in parallel before attempting connection
+        def _wait_for_vcenter_single(entry):
             if not entry:
-                continue
-            
-            # Extract hostname from entry (format: hostname:type:user)
+                return True
             vc_hostname = entry.split(':')[0].strip()
-            
             lsf.write_output(f'Waiting for vCenter {vc_hostname} to become available (max {VCENTER_WAIT_TIMEOUT // 60} minutes)...')
             
             start_wait = time.time()
@@ -143,7 +140,6 @@ def main(lsf=None, standalone=False, dry_run=False):
                 # Check if vCenter port 443 is responding
                 if lsf.test_tcp_port(vc_hostname, 443, timeout=10):
                     # Verify vCenter vpxd service is responding
-                    # Note: /ui/ HTTP 200 responds early via Envoy proxy while vpxd is still starting (503)
                     try:
                         session = requests.Session()
                         session.trust_env = False  # Ignore proxy environment vars
@@ -154,7 +150,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                         try:
                             api_response = session.get(api_url, verify=False, timeout=10, proxies=None)
                         except requests.exceptions.RequestException as e:
-                            lsf.write_output(f'  API endpoint check failed: {e}')
+                            lsf.write_output(f'  API endpoint check failed ({vc_hostname}): {e}')
                         
                         # Check UI endpoint
                         ui_url = f'https://{vc_hostname}/ui/'
@@ -162,7 +158,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                         try:
                             ui_response = session.get(ui_url, verify=False, timeout=10, proxies=None)
                         except requests.exceptions.RequestException as e:
-                            lsf.write_output(f'  UI endpoint check failed: {e}')
+                            lsf.write_output(f'  UI endpoint check failed ({vc_hostname}): {e}')
                         
                         api_ok = api_response and api_response.status_code in [200, 401, 403, 405]
                         ui_ok = ui_response and ui_response.status_code == 200
@@ -190,14 +186,13 @@ def main(lsf=None, standalone=False, dry_run=False):
                             elapsed = int(time.time() - start_wait)
                             det_type = 'VIM API (vpxd)' if vim_ok else 'REST API'
                             lsf.write_output(f'vCenter {vc_hostname} is available after {elapsed} seconds (detected via {det_type})')
-                            break
+                            return True
                         else:
-                            # Log detailed status during startup
                             api_status = api_response.status_code if api_response else 'no response'
                             ui_status = ui_response.status_code if ui_response else 'no response'
-                            lsf.write_output(f'  Endpoint status - API: {api_status} (vpxd starting), UI: {ui_status}')
+                            lsf.write_output(f'  Endpoint status ({vc_hostname}) - API: {api_status} (vpxd starting), UI: {ui_status}')
                     except Exception as e:
-                        lsf.write_output(f'  vCenter check error: {e}')
+                        lsf.write_output(f'  vCenter {vc_hostname} check error: {e}')
                 
                 elapsed = int(time.time() - start_wait)
                 remaining = VCENTER_WAIT_TIMEOUT - elapsed
@@ -206,6 +201,12 @@ def main(lsf=None, standalone=False, dry_run=False):
             
             if not vcenter_available:
                 lsf.labfail(f'vCenter {vc_hostname} did not become available within {VCENTER_WAIT_TIMEOUT // 60} minutes')
+            return False
+
+        with ThreadPoolExecutor(max_workers=max(1, len([v for v in vcenters if v]))) as executor:
+            futures = [executor.submit(_wait_for_vcenter_single, entry) for entry in vcenters if entry]
+            for future in as_completed(futures):
+                future.result()
         
         # Now connect to all vCenters
         lsf.connect_vcenters(vcenters)
@@ -469,15 +470,21 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_vpodprogress('Checking vCenter', 'GOOD-3')
         lsf.write_output('Checking vCenter readiness...')
         
-        vc_urls = []
-        for entry in vcenters:
-            vc = entry.split(':')[0]
-            vc_urls.append(f'https://{vc}/ui/')
-        
-        for url in vc_urls:
+        def _check_ui_ready(url):
             while not lsf.test_url(url, expected_text='loading-container', timeout=5):
                 lsf.write_output(f'Waiting for vCenter UI: {url}')
                 lsf.labstartup_sleep(lsf.sleep_seconds)
+
+        vc_urls = []
+        for entry in vcenters:
+            if entry and not entry.strip().startswith('#'):
+                vc = entry.split(':')[0].strip()
+                vc_urls.append(f'https://{vc}/ui/')
+        
+        with ThreadPoolExecutor(max_workers=max(1, len(vc_urls))) as executor:
+            futures = [executor.submit(_check_ui_ready, url) for url in vc_urls]
+            for future in as_completed(futures):
+                future.result()
     
     if dashboard:
         vc_ready_count = len([v for v in vcenters if v and not v.strip().startswith('#')])
