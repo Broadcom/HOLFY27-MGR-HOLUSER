@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # services.py - HOLFY27 Core Services Management Module
-# Version 3.0 - January 2026
+# Version 3.1 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
 # Manages Linux services and TCP port verification
+#
+# v3.1 Changes (2026-08-18):
+# - TASK 2: Parallelized TCP port testing across configured TCPServices endpoints
+#   using ThreadPoolExecutor, eliminating sequential wait loops.
 
 import os
 import sys
@@ -146,36 +150,42 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_vpodprogress('Testing TCP Ports', 'GOOD-6')
         lsf.write_output('Testing TCP ports')
         
-        for entry in tcp_services:
-            if dry_run:
+        if dry_run:
+            for entry in tcp_services:
                 lsf.write_output(f'Would test TCP port: {entry}')
-                continue
-            
-            # Parse host:port format
-            parts = entry.split(':')
-            if len(parts) < 2:
-                lsf.write_output(f'Invalid TCP entry: {entry}')
-                continue
-            
-            host = parts[0].strip()
-            port = int(parts[1].strip())
-            
-            # Try up to max_retries times before giving up
-            max_retries = 20
-            port_responding = False
-            for attempt in range(max_retries):
-                if lsf.test_tcp_port(host, port):
-                    port_responding = True
-                    break
-                lsf.write_output(f'Waiting for {host}:{port}... (attempt {attempt+1}/{max_retries})')
-                lsf.labstartup_sleep(lsf.sleep_seconds)
-            
-            if port_responding:
-                lsf.write_output(f'TCP port {host}:{port} is responding')
-                tcp_succeeded.append(f'{host}:{port}')
-            else:
-                lsf.write_output(f'TCP port {host}:{port} failed after {max_retries} attempts')
-                tcp_failed.append(f'{host}:{port}')
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import time as _svc_time
+
+            def _test_tcp_service_entry(entry):
+                parts = entry.split(':')
+                if len(parts) < 2:
+                    return entry, False, f'Invalid TCP entry: {entry}'
+                
+                host = parts[0].strip()
+                try:
+                    port = int(parts[1].strip())
+                except ValueError:
+                    return entry, False, f'Invalid port in TCP entry: {entry}'
+                
+                max_retries = 20
+                for attempt in range(max_retries):
+                    if lsf.test_tcp_port(host, port, timeout=5):
+                        return f'{host}:{port}', True, f'TCP port {host}:{port} is responding'
+                    if attempt < max_retries - 1:
+                        _svc_time.sleep(lsf.sleep_seconds)
+                return f'{host}:{port}', False, f'TCP port {host}:{port} failed after {max_retries} attempts'
+
+            max_workers = min(10, max(1, len(tcp_services)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_test_tcp_service_entry, entry): entry for entry in tcp_services}
+                for future in as_completed(futures):
+                    target_str, success, msg = future.result()
+                    lsf.write_output(msg)
+                    if success:
+                        tcp_succeeded.append(target_str)
+                    else:
+                        tcp_failed.append(target_str)
         
         lsf.write_output(f'Finished testing TCP ports: {len(tcp_succeeded)} succeeded, {len(tcp_failed)} failed')
     

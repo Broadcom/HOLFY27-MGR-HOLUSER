@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # VCF.py - HOLFY27 Core VCF Startup Module
-# Version 3.10 - 2026-07-22
+# Version 3.11 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
 # VMware Cloud Foundation startup sequence
+#
+# v3.11 Changes (2026-08-18):
+# - Replaced hardcoded 300s (5-minute) fixed sleep for NSX Edges with dynamic
+#   network probing (ping, TCP 22/443), proceeding immediately once edges respond.
+# - Replaced hardcoded 30s fixed sleeps for NSX Manager and Post-Edge VMs with
+#   dynamic network probes.
 #
 # v3.10 Changes:
 # - Fix: Added outer retry loop (up to 3 attempts with 30s delay) in
@@ -659,8 +665,21 @@ def main(lsf=None, standalone=False, dry_run=False):
                         nsx_mgr_failed += 1
                 
                 if mgr_need_wait:
-                    lsf.write_output('Waiting 30 seconds for NSX Manager(s) to start...')
-                    lsf.labstartup_sleep(30)
+                    lsf.write_output('Waiting for NSX Manager(s) to respond (max 30s)...')
+                    mgr_start_time = time.time()
+                    max_mgr_wait = 30
+                    poll_interval = 5
+                    while (time.time() - mgr_start_time) < max_mgr_wait:
+                        all_ready = True
+                        for entry in vcfnsxmgr:
+                            mgr_name = entry.split(':')[0].strip()
+                            if not (lsf.test_ping(mgr_name) or lsf.test_tcp_port(mgr_name, 443, timeout=3) or lsf.test_tcp_port(mgr_name, 22, timeout=3)):
+                                all_ready = False
+                                break
+                        if all_ready:
+                            lsf.write_output(f'All NSX Manager(s) responding after {int(time.time() - mgr_start_time)}s')
+                            break
+                        lsf.labstartup_sleep(poll_interval)
                 else:
                     lsf.write_output('All NSX Manager VMs already powered on, skipping wait')
             else:
@@ -735,8 +754,21 @@ def main(lsf=None, standalone=False, dry_run=False):
                         return  # labfail calls sys.exit, but just in case
                 
                 if edges_need_wait:
-                    lsf.write_output('Waiting 5 minutes for NSX Edges to start...')
-                    lsf.labstartup_sleep(300)
+                    lsf.write_output('Waiting for NSX Edges to respond to network probes (max 5 minutes)...')
+                    edge_start_time = time.time()
+                    max_edge_wait = 300
+                    poll_interval = 10
+                    while (time.time() - edge_start_time) < max_edge_wait:
+                        all_ready = True
+                        for entry in vcfnsxedges:
+                            edge_name = entry.split(':')[0].strip()
+                            if not (lsf.test_ping(edge_name) or lsf.test_tcp_port(edge_name, 22, timeout=3) or lsf.test_tcp_port(edge_name, 443, timeout=3)):
+                                all_ready = False
+                                break
+                        if all_ready:
+                            lsf.write_output(f'All NSX Edges responding after {int(time.time() - edge_start_time)}s')
+                            break
+                        lsf.labstartup_sleep(poll_interval)
                 else:
                     lsf.write_output('All NSX Edge VMs already powered on, skipping wait')
             else:
@@ -788,10 +820,21 @@ def main(lsf=None, standalone=False, dry_run=False):
                         lsf.write_output(f'WARNING: Post-edge VM {vm_name} - {result} (non-fatal, continuing)')
                 
                 if postedge_need_wait:
-                    # Short wait - these VMs will continue booting in parallel
-                    # with subsequent startup tasks
-                    lsf.write_output('Post-edge VMs started, continuing with startup...')
-                    lsf.labstartup_sleep(30)
+                    lsf.write_output('Waiting for post-edge VMs to respond (max 30s)...')
+                    postedge_start_time = time.time()
+                    max_postedge_wait = 30
+                    poll_interval = 5
+                    while (time.time() - postedge_start_time) < max_postedge_wait:
+                        all_ready = True
+                        for entry in vcfpostedgevms:
+                            vm_name = entry.split(':')[0].strip()
+                            if not (lsf.test_ping(vm_name) or lsf.test_tcp_port(vm_name, 22, timeout=3) or lsf.test_tcp_port(vm_name, 443, timeout=3)):
+                                all_ready = False
+                                break
+                        if all_ready:
+                            lsf.write_output(f'All post-edge VMs responding after {int(time.time() - postedge_start_time)}s')
+                            break
+                        lsf.labstartup_sleep(poll_interval)
                 else:
                     lsf.write_output('All post-edge VMs already powered on')
             else:

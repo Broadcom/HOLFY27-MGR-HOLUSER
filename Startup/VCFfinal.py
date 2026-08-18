@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.44 - 2026-08-18
+# Version 6.3.45 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.45 Changes:
+# - Task 2e: Added non-critical workload timeout handling (5-minute soft cap for
+#   ops-logs, vodap, and logging-operator). Once core VCF components have scaled
+#   up, non-critical background scaling proceeds asynchronously rather than blocking
+#   the startup pipeline for up to 20 minutes.
 #
 # v6.3.44 Changes:
 # - Merged dynamic Site-B hostname resolution (resolve_host_fqdn) from Startup/VCFfinal.py
@@ -3258,7 +3264,8 @@ echo "PROXY_CONFIGURED"
                     if has_pending:
                         lsf.write_output('  Detected Pending pods in ops-logs/vodap, monitoring vCenter for new VSP node provisioning...')
                         
-                    max_wait = 1200  # 20 minutes
+                    max_wait = 1200  # 20 minutes max timeout cap
+                    non_critical_max_wait = 300  # 5 minutes soft timeout cap for non-critical (ops-logs/vodap) components
                     start_time = time.time()
                     last_log_time = time.time()
                     
@@ -3330,6 +3337,16 @@ echo "PROXY_CONFIGURED"
                         if not scaled_components and not still_pending:
                             lsf.write_output('  All components have completed scale up and no pending pods remain.')
                             break
+                            
+                        # Check if only non-critical components (ops-logs, vodap) remain unready or pending after non_critical_max_wait
+                        elapsed = time.time() - start_time
+                        if elapsed >= non_critical_max_wait:
+                            critical_remaining = [c for c in scaled_components if c['namespace'] not in ('ops-logs', 'vodap', 'logging-operator')]
+                            if not critical_remaining:
+                                remaining_names = [f"{c['namespace']}/{c['resource']}" for c in scaled_components]
+                                msg_detail = f"({', '.join(remaining_names)})" if remaining_names else "(pending ops-logs/vodap pods)"
+                                lsf.write_output(f'  Core VCF components are scaled up ({int(elapsed)}s elapsed). Non-critical workloads {msg_detail} will finish scaling in background...')
+                                break
                             
                         # Log status every 30 seconds
                         if time.time() - last_log_time >= 30:

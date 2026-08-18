@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # VVF.py - HOLFY27 Core VVF Startup Module
-# Version 4.2 - 2026-07-22
+# Version 4.3 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
 # VMware Validated Foundation startup sequence
+#
+# v4.3 Changes (2026-08-18):
+# - Replaced hardcoded 30s fixed sleep for License VMs (Post-Edge) with dynamic
+#   network probing (ping, TCP 22/443).
 #
 # v4.2 Changes (2026-07-22):
 # - Fix: Added outer retry loop (up to 3 attempts with 30s delay) in
@@ -521,8 +525,21 @@ def main(lsf=None, standalone=False, dry_run=False):
                         f'WARNING: License VM {vm_name} - {result} (non-fatal, continuing)')
 
             if postedge_need_wait:
-                lsf.write_output('License VMs started, waiting 30s before vCenter...')
-                lsf.labstartup_sleep(30)
+                lsf.write_output('Waiting for license VMs to respond (max 30s)...')
+                postedge_start_time = time.time()
+                max_postedge_wait = 30
+                poll_interval = 5
+                while (time.time() - postedge_start_time) < max_postedge_wait:
+                    all_ready = True
+                    for entry in vvfpostedgevms:
+                        vm_name = entry.split(':')[0].strip()
+                        if not (lsf.test_ping(vm_name) or lsf.test_tcp_port(vm_name, 22, timeout=3) or lsf.test_tcp_port(vm_name, 443, timeout=3)):
+                            all_ready = False
+                            break
+                    if all_ready:
+                        lsf.write_output(f'All license VMs responding after {int(time.time() - postedge_start_time)}s')
+                        break
+                    lsf.labstartup_sleep(poll_interval)
             else:
                 lsf.write_output('All license VMs already powered on')
         else:
