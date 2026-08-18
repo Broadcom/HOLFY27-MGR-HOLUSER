@@ -2,11 +2,8 @@
 
 # Author: Burke Azbill
 # Purpose: Check VCF Automation appliance to see if the password has expired. If so, use expect script to reset the password
-# Version: 1.0 Date: October, 2025
-# Version: 1.1 Date: November, 2025 - re-wrote to account for failed connections, incorrect password, and successful connection.
-# Version: 1.2 Date: November, 2025 - Updated logging
-# Configuration
-VCFA_FQDN="auto-a.site-a.vcf.lab"
+# Version: 1.3 Date: August, 2026 - Updated to accept target host parameter Configuration
+VCFA_FQDN="${1:-auto-a.site-a.vcf.lab}"
 USER="vmware-system-user"
 CREDS_FILE="/home/holuser/creds.txt"
 # For some reason, outputing to LOGFILE only shows up in the manager log, so attempting to log to both files...

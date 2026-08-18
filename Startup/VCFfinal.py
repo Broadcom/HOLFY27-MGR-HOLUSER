@@ -1,8 +1,65 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.40 - 2026-08-13
+# Version 6.3.44 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.44 Changes:
+# - Merged dynamic Site-B hostname resolution (resolve_host_fqdn) from Startup/VCFfinal.py
+#   with Task 2e vsphere-cpi/kyverno leader-election resilience pre-flight from HOL/Startup/VCFfinal.py.
+#
+# v6.3.43 Changes:
+# - Task 2e: Fixed the v6.3.42 vsphere-cpi DaemonSet patch -- it used
+#   `kubectl patch --type merge`, which (unlike the default strategic merge)
+#   does not know how to merge a containers[] array element by its `name`
+#   key; it replaced the entire container object with just {name, args},
+#   dropping required fields like `image` and causing the API server to
+#   reject the patch ("spec.template.spec.containers[0].image: Required
+#   value"). Changed to `--type strategic`, confirmed live on DevPod.
+#
+# v6.3.42 Changes:
+# - Task 2e: CORRECTED the v6.3.41 vsphere-cpi/kyverno pre-flight -- it
+#   patched spec.values on the vsphere-cpi/kyverno HelmReleases on the
+#   assumption that Flux's 10-minute driftDetection was the only enforcement
+#   loop to beat. Verified live on DevPod that this is wrong: vmsp-operator's
+#   PackageDeployment controller owns and re-templates these specific
+#   HelmReleases from its own internal per-package definition and reverts
+#   any spec.values edit in under 1 second (empirically timed -- gone by the
+#   very next status check); the PackageDeployment CR has no exposed
+#   per-package values-override field, so there is no viable HelmRelease-
+#   layer fix at all. Replaced with direct patches to the live
+#   DaemonSet/ValidatingWebhookConfiguration objects (one layer further
+#   downstream, where Flux's helm-controller -- not vmsp-operator -- is the
+#   reverting force, on its slower ~10-minute reconcile). vsphere-cpi's
+#   DaemonSet uses updateStrategyType=OnDelete, so the pod is force-deleted
+#   after each patch. Also noted this pre-flight only covers the boot-time
+#   window -- continuous protection requires vsp-stabilizer.sh's 60s
+#   drift-keeper timer, which folds the same two live-object patches into
+#   its existing loop.
+#
+# v6.3.41 Changes:
+# - Task 2e: Added pre-flight check/remediation for vsphere-cpi and kyverno
+#   background-controller/cleanup-controller CrashLoopBackOff caused by
+#   transient etcd "apply request took too long" spikes tripping their
+#   Kubernetes leader-election renew-deadline on this lab's single-node VSP
+#   control plane (no etcd quorum to absorb latency). Both are Flux
+#   HelmRelease-managed with driftDetection enabled (10m reconcile), so a
+#   direct kubectl edit of the live Deployment/DaemonSet gets silently
+#   reverted -- the durable fix patches each HelmRelease's spec.values
+#   instead, which Flux then enforces going forward: vsphere-cpi gets
+#   standard cloud-controller-manager leader-elect flags (60s/40s/6s,
+#   matching the lease tuning vsp-stabilizer.sh already applies to
+#   kube-controller-manager/kube-scheduler) via
+#   daemonset.cmdline.additionalParams; kyverno's controller-runtime-based
+#   controllers do not expose leader-election timing as a flag (confirmed
+#   against the vendored kyverno@3.5.2-4 chart and the distroless controller
+#   binaries), so kyverno instead gets features.forceFailurePolicyIgnore=true
+#   so a transient kyverno-cleanup-controller crash no longer fails other
+#   reconciles (e.g. vmsp-platform PackageDeployment) via its fail-closed
+#   admission webhook. Diagnosed live on DevPod, 2026-08-13.
+# - Updated password processing to dynamically discover and include Site-B hosts 
+#   from config.ini without hardcoding hostnames (resolve_host_fqdn helper, NSX, 
+#   OS chage, Fleet API, VCFA, Fleet-LCM).
 #
 # v6.3.40 Changes:
 # - Task 4: Set CPU shares to "High" (vim.SharesInfo.Level.high) along with
@@ -509,6 +566,44 @@ WCP_SCRIPT_TIMEOUT = 1860  # 31 minutes (slightly more than max poll to allow sc
 #==============================================================================
 # HELPER FUNCTIONS
 #==============================================================================
+
+def resolve_host_fqdn(host):
+    """
+    Resolve short hostnames to site-aware FQDNs for dual-site processing.
+    - If host is an IP address or already contains '.': return host.
+    - If host matches Site-B conventions (e.g. ends with 'b'): default to {host}.site-b.vcf.lab.
+    - If host matches Site-A conventions (e.g. ends with 'a'): default to {host}.site-a.vcf.lab.
+    - Verify DNS resolution via socket.gethostbyname against .site-a.vcf.lab, .site-b.vcf.lab, .vcf.lab, returning the first resolving FQDN.
+    """
+    import socket
+    import re
+    
+    if not host or '.' in host:
+        return host
+        
+    # Default suffix based on naming convention
+    default_suffix = '.site-a.vcf.lab'
+    if re.search(r'-b$', host) or re.search(r'0[1-9]b$', host):
+        default_suffix = '.site-b.vcf.lab'
+    elif re.search(r'-a$', host) or re.search(r'0[1-9]a$', host):
+        default_suffix = '.site-a.vcf.lab'
+        
+    # Try resolving with different suffixes
+    suffixes_to_try = [default_suffix]
+    for s in ['.site-a.vcf.lab', '.site-b.vcf.lab', '.vcf.lab']:
+        if s not in suffixes_to_try:
+            suffixes_to_try.append(s)
+    
+    for suffix in suffixes_to_try:
+        fqdn = f"{host}{suffix}"
+        try:
+            socket.gethostbyname(fqdn)
+            return fqdn
+        except socket.gaierror:
+            continue
+            
+    # If none resolve, return the best guess
+    return f"{host}{default_suffix}"
 
 def verify_nic_connected(lsf, vm_obj, simple=False):
     """
@@ -2040,6 +2135,99 @@ def main(lsf=None, standalone=False, dry_run=False):
                 except Exception as _nf_exc:
                     lsf.write_output(
                         f'  WARNING: node-flapping pre-flight check failed (non-fatal): {_nf_exc}')
+
+                # ---- Pre-flight: vsphere-cpi / kyverno leader-election resilience tuning ----
+                # vsphere-cpi (cloud-controller-manager) and kyverno's background-controller /
+                # cleanup-controller are single-replica, leader-election-based controllers that
+                # exit whenever they fail to renew their Kubernetes Lease within the default
+                # 10s renew-deadline. On this lab's single-node VSP control plane (no etcd
+                # quorum to absorb latency), transient etcd "apply request took too long"
+                # spikes are enough to trip that deadline, causing repeated CrashLoopBackOff
+                # (confirmed via etcd/apiserver logs on DevPod, 2026-08-13).
+                # CORRECTED: an earlier version of this pre-flight patched spec.values on the
+                # vsphere-cpi/kyverno HelmReleases, on the assumption that Flux's 10-minute
+                # driftDetection was the only enforcement loop to beat. Verified live that this
+                # is wrong: vmsp-operator's PackageDeployment controller owns and re-templates
+                # these specific HelmReleases from its own internal per-package definition and
+                # reverts any spec.values edit in under 1 second -- there is no exposed
+                # override field for this at the HelmRelease/PackageDeployment layer at all.
+                # This pre-flight instead patches the LIVE DaemonSet/
+                # ValidatingWebhookConfiguration objects directly (one layer further
+                # downstream, where Flux's helm-controller -- not vmsp-operator -- is the
+                # reverting force, on its slower ~10-minute reconcile). vsphere-cpi's
+                # DaemonSet uses updateStrategyType=OnDelete, so the pod is force-deleted
+                # after patching so kubelet picks up the new args. kyverno's
+                # controller-runtime-based controllers do not expose leader-election timing as
+                # a flag at all (verified against the vendored kyverno@3.5.2-4 chart and the
+                # distroless controller binaries), so the only lever there is patching
+                # kyverno-cleanup-validating-webhook-cfg's failurePolicy to Ignore, so a
+                # transient cleanup-controller crash no longer fails other reconciles (e.g.
+                # the vmsp-platform PackageDeployment) via its fail-closed admission webhook.
+                # NOTE: since this pre-flight only runs once per boot, it only protects until
+                # the next Flux reconcile reverts the live object again (~10 min window) --
+                # CONTINUOUS protection requires Tools/vsp-stabilizer.sh's 60s drift-keeper
+                # timer (section C), which folds these same two patches into its existing
+                # loop. This pre-flight covers the boot-time window; recommend also running
+                # vsp-stabilizer.sh for ongoing coverage.
+                lsf.write_output('  Pre-flight: checking vsphere-cpi/kyverno leader-election tuning...')
+                try:
+                    _let_cpi_args = (getattr(vsp_kubectl(
+                        "kubectl get daemonset vsphere-cpi -n kube-system "
+                        "-o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null"
+                    ), 'stdout', '') or '').strip()
+                    if '--leader-elect-renew-deadline=' in _let_cpi_args:
+                        lsf.write_output(
+                            '  Pre-flight: vsphere-cpi DaemonSet already tuned — no action needed')
+                    elif not _let_cpi_args:
+                        lsf.write_output(
+                            '  Pre-flight: vsphere-cpi DaemonSet not found — skipping')
+                    else:
+                        lsf.write_output(
+                            '  Pre-flight: patching vsphere-cpi DaemonSet with leader-election '
+                            'lease tuning (60s/40s/6s) to survive transient etcd latency...')
+                        _let_cpi_new = (
+                            _let_cpi_args[:-1] + ',"--leader-elect-lease-duration=60s"'
+                            ',"--leader-elect-renew-deadline=40s"'
+                            ',"--leader-elect-retry-period=6s"]'
+                        )
+                        vsp_kubectl(
+                            "kubectl patch daemonset vsphere-cpi -n kube-system --type strategic -p "
+                            f"'{{\"spec\":{{\"template\":{{\"spec\":{{\"containers\":"
+                            f"[{{\"name\":\"vsphere-cpi\",\"args\":{_let_cpi_new}}}]}}}}}}}}' "
+                            "&& kubectl delete pod -n kube-system -l app=vsphere-cpi "
+                            "--grace-period=0 --force"
+                        )
+                        lsf.write_output(
+                            '  Pre-flight: vsphere-cpi DaemonSet patched and pod restarted')
+
+                    _let_kyv_fp = (getattr(vsp_kubectl(
+                        "kubectl get validatingwebhookconfiguration "
+                        "kyverno-cleanup-validating-webhook-cfg "
+                        "-o jsonpath='{.webhooks[0].failurePolicy}' 2>/dev/null"
+                    ), 'stdout', '') or '').strip()
+                    if _let_kyv_fp == 'Ignore':
+                        lsf.write_output(
+                            '  Pre-flight: kyverno-cleanup-validating-webhook-cfg already tuned '
+                            '— no action needed')
+                    elif not _let_kyv_fp:
+                        lsf.write_output(
+                            '  Pre-flight: kyverno-cleanup-validating-webhook-cfg not found — skipping')
+                    else:
+                        lsf.write_output(
+                            '  Pre-flight: patching kyverno-cleanup-validating-webhook-cfg '
+                            '(failurePolicy=Ignore) so it fails open during a controller crash-loop...')
+                        vsp_kubectl(
+                            "kubectl patch validatingwebhookconfiguration "
+                            "kyverno-cleanup-validating-webhook-cfg --type json -p "
+                            "'[{\"op\":\"replace\",\"path\":\"/webhooks/0/failurePolicy\","
+                            "\"value\":\"Ignore\"}]'"
+                        )
+                        lsf.write_output(
+                            '  Pre-flight: kyverno-cleanup-validating-webhook-cfg patched')
+                except Exception as _let_exc:
+                    lsf.write_output(
+                        '  WARNING: vsphere-cpi/kyverno leader-election tuning pre-flight '
+                        f'failed (non-fatal): {_let_exc}')
 
                 # ---- Apply PROXY and NO_PROXY to VSP cluster nodes (HOL only) ----
                 # Inject proxy configuration to avoid ImagePullBackOff for opsnet/opslogs.
@@ -3793,6 +3981,41 @@ echo "PROXY_CONFIGURED"
                 lsf.write_output('WARNING: VCF Automation K8s node not reachable via SSH')
                 vcfa_k8s_remediation_ok = False
             else:
+                _chage_hosts_raw = []
+                if vcfa_k8s_ip and vcfa_k8s_ip not in _chage_hosts_raw:
+                    _chage_hosts_raw.append(vcfa_k8s_ip)
+                
+                # VCF Automation hosts from vraurls
+                for _us in lsf.get_config_list('VCFFINAL', 'vraurls'):
+                    _uh = _us.split(',')[0].strip()
+                    if '://' in _uh:
+                        _uh = _uh.split('://')[1].split('/')[0].split(':')[0]
+                    if _uh and _uh.startswith('auto-') and _uh not in _chage_hosts_raw:
+                        _chage_hosts_raw.append(_uh)
+                        
+                # Automation hosts from vcfautomationvms
+                for _vm in lsf.get_config_list('VCF', 'vcfautomationvms'):
+                    _uh = _vm.split(':')[0].strip()
+                    if _uh and _uh not in _chage_hosts_raw:
+                        _chage_hosts_raw.append(_uh)
+
+                # opslogs hosts from vcfcomponenturls
+                for _us in lsf.get_config_list('VCFFINAL', 'vcfcomponenturls'):
+                    _uh = _us.split(',')[0].strip()
+                    if '://' in _uh:
+                        _uh = _uh.split('://')[1].split('/')[0].split(':')[0]
+                    if _uh and 'opslogs' in _uh.lower() and _uh not in _chage_hosts_raw:
+                        _chage_hosts_raw.append(_uh)
+                        
+                # opslogs hosts from vcfopsvms
+                for _vm in lsf.get_config_list('VCF', 'vcfopsvms'):
+                    _uh = _vm.split(':')[0].strip()
+                    if _uh and 'opslogs' in _uh.lower() and _uh not in _chage_hosts_raw:
+                        _chage_hosts_raw.append(_uh)
+                        
+                # Resolve FQDNs for chage hosts
+                _chage_hosts = [resolve_host_fqdn(_h) for _h in _chage_hosts_raw]
+
                 # ---- Step 0a: Ensure vmware-system-user password is valid and never expires ----
                 # MUST run before any vcfa_ssh / kubectl commands are attempted so that
                 # expired passwords are reset via expect (vcfapwcheck.sh / vcfapass.sh)
@@ -3800,27 +4023,9 @@ echo "PROXY_CONFIGURED"
                 lsf.write_output('Fixing expired automation password if necessary...')
                 vcfapwcheck_script = '/home/holuser/hol/Tools/vcfapwcheck.sh'
                 if os.path.isfile(vcfapwcheck_script):
-                    lsf.run_command(vcfapwcheck_script)
-
-                _chage_hosts = []
-                if vcfa_k8s_ip and vcfa_k8s_ip not in _chage_hosts:
-                    _chage_hosts.append(vcfa_k8s_ip)
-                # VCF Automation hosts from vraurls (auto-a, auto-platform-a, etc.)
-                _vraurls_raw = lsf.get_config_list('VCFFINAL', 'vraurls')
-                for _us in _vraurls_raw:
-                    _uh = _us.split(',')[0].strip()
-                    if '://' in _uh:
-                        _uh = _uh.split('://')[1].split('/')[0].split(':')[0]
-                    if _uh and _uh.startswith('auto-') and _uh not in _chage_hosts:
-                        _chage_hosts.append(_uh)
-                # opslogs hosts from vcfcomponenturls
-                _comp_urls_raw = lsf.get_config_list('VCFFINAL', 'vcfcomponenturls')
-                for _us in _comp_urls_raw:
-                    _uh = _us.split(',')[0].strip()
-                    if '://' in _uh:
-                        _uh = _uh.split('://')[1].split('/')[0].split(':')[0]
-                    if _uh and 'opslogs' in _uh.lower() and _uh not in _chage_hosts:
-                        _chage_hosts.append(_uh)
+                    for _chage_host in _chage_hosts:
+                        if _chage_host.startswith('auto-'):
+                            lsf.run_command(f"{vcfapwcheck_script} {_chage_host}")
 
                 # Discover VSP nodes for Site A and Site B
                 for _vip in ['10.1.1.142', '10.2.1.142']:
@@ -4397,7 +4602,7 @@ echo "PROXY_CONFIGURED"
 
         for entry in nsx_mgr_entries:
             nsx_host = entry.split(':')[0].strip()
-            nsx_fqdn = f'{nsx_host}.site-a.vcf.lab' if '.' not in nsx_host else nsx_host
+            nsx_fqdn = resolve_host_fqdn(nsx_host)
             lsf.write_output(f'  -> {nsx_fqdn}')
 
             if not dry_run:
@@ -4453,8 +4658,7 @@ echo "PROXY_CONFIGURED"
 
             for entry in nsx_mgr_entries:
                 nsx_host = entry.split(':')[0].strip()
-                nsx_fqdn = (f'{nsx_host}.site-a.vcf.lab'
-                            if '.' not in nsx_host else nsx_host)
+                nsx_fqdn = resolve_host_fqdn(nsx_host)
                 lsf.write_output(f'  -> {nsx_fqdn}')
 
                 try:
@@ -4537,40 +4741,84 @@ echo "PROXY_CONFIGURED"
         else:
             for entry in nsx_mgr_entries:
                 nsx_host = entry.split(':')[0].strip()
-                nsx_fqdn = (f'{nsx_host}.site-a.vcf.lab'
-                            if '.' not in nsx_host else nsx_host)
+                nsx_fqdn = resolve_host_fqdn(nsx_host)
                 lsf.write_output(
                     f'  [DRY-RUN] Would set VNA/Edge password expiration to '
                     f'{nsx_expiry_days}d on transport nodes via {nsx_fqdn}')
 
     # Fleet password policy remediation & expiration extension via ops-a suite-api
-    ops_fqdn = 'ops-a.site-a.vcf.lab'
-    if lsf.test_tcp_port(ops_fqdn, 443, timeout=5):
-        lsf.write_output('Triggering fleet password policy compliance check & password status collection...')
-        
-        if not dry_run:
-            # 1. Update OS password aging (chage) on ops-a, opscollector-01a, and 10.1.1.60 (opsnet-a)
-            _ops_nodes = [
-                ('ops-a.site-a.vcf.lab', ['root']),
-                ('opscollector-01a.site-a.vcf.lab', ['root']),
-                ('10.1.1.60', ['consoleuser', 'root', 'support'])
-            ]
-            import datetime
-            _today_str = datetime.date.today().strftime('%Y-%m-%d')
-            for _node, _users in _ops_nodes:
-                if not lsf.test_tcp_port(_node, 22, timeout=3):
-                    lsf.write_output(f'  {_node}: SSH port 22 not open — skipping OS chage')
-                    continue
-                for _user in _users:
-                    try:
-                        _chage_cmd = f"echo '{password}' | sudo -S chage -d {_today_str} -M 730 {_user} 2>&1"
-                        _cr = lsf.ssh(_chage_cmd, f'root@{_node}', password)
-                        if _cr.returncode == 0:
-                            lsf.write_output(f'  {_node} ({_user}): Extended password expiration via chage (+730d from {_today_str})')
-                    except Exception as _ce:
-                        lsf.write_output(f'  {_node} ({_user}): WARNING — chage failed: {_ce}')
+    _ops_nodes_raw = []
+    
+    # Gather from [VCF] vcfopsvms
+    for _vm in lsf.get_config_list('VCF', 'vcfopsvms'):
+        _h = _vm.split(':')[0].strip()
+        if _h and _h not in _ops_nodes_raw:
+            _ops_nodes_raw.append(_h)
+            
+    # Gather from [SHUTDOWN] ops lists
+    for _key in ['vcf_ops_vms', 'vcf_ops_collector_vms', 'vcf_ops_networks_vms', 'vcf_ops_logs_vms']:
+        for _vm in lsf.get_config_list('SHUTDOWN', _key):
+            _h = _vm.split(':')[0].strip()
+            if _h and _h not in _ops_nodes_raw:
+                _ops_nodes_raw.append(_h)
+                
+    # Gather from [VCFFINAL] vcfcomponenturls
+    for _u in lsf.get_config_list('VCFFINAL', 'vcfcomponenturls'):
+        _h = _u.split(',')[0].strip()
+        if '://' in _h:
+            _h = _h.split('://')[1].split('/')[0].split(':')[0]
+        if _h and 'ops' in _h.lower() and _h not in _ops_nodes_raw:
+            _ops_nodes_raw.append(_h)
 
-            import requests
+    # Gather from [RESOURCES] VMs
+    for _vm in lsf.get_config_list('RESOURCES', 'VMs'):
+        _h = _vm.split(':')[0].strip()
+        if _h and 'ops' in _h.lower() and _h not in _ops_nodes_raw:
+            _ops_nodes_raw.append(_h)
+
+    # Fallbacks
+    for _f in ['ops-a', 'opscollector-01a', 'opsnet-a', '10.1.1.60', 'ops-b', 'opscollector-01b', 'opsnet-b', '10.2.1.60']:
+        if _f not in _ops_nodes_raw:
+            _ops_nodes_raw.append(_f)
+
+    _ops_nodes = []
+    for _node in _ops_nodes_raw:
+        _fqdn = resolve_host_fqdn(_node)
+        if 'opsnet' in _fqdn.lower() or _fqdn in ['10.1.1.60', '10.2.1.60']:
+            _ops_nodes.append((_fqdn, ['consoleuser', 'root', 'support']))
+        elif 'opslogs' in _fqdn.lower():
+            _ops_nodes.append((_fqdn, ['vmware-system-user']))
+        else:
+            _ops_nodes.append((_fqdn, ['root']))
+
+    _ops_managers = set(n[0] for n in _ops_nodes if n[0].startswith('ops-'))
+    if not _ops_managers:
+        _ops_managers.add(resolve_host_fqdn('ops-a'))
+
+    lsf.write_output('Triggering fleet password policy compliance check & password status collection...')
+    
+    if not dry_run:
+        import datetime
+        _today_str = datetime.date.today().strftime('%Y-%m-%d')
+        for _node, _users in _ops_nodes:
+            if not lsf.test_tcp_port(_node, 22, timeout=3):
+                lsf.write_output(f'  {_node}: SSH port 22 not open — skipping OS chage')
+                continue
+            for _user in _users:
+                try:
+                    _chage_cmd = f"echo '{password}' | sudo -S chage -d {_today_str} -M 730 {_user} 2>&1"
+                    _cr = lsf.ssh(_chage_cmd, f'{_user}@{_node}', password)
+                    if _cr.returncode == 0:
+                        lsf.write_output(f'  {_node} ({_user}): Extended password expiration via chage (+730d from {_today_str})')
+                except Exception as _ce:
+                    lsf.write_output(f'  {_node} ({_user}): WARNING — chage failed: {_ce}')
+
+        import requests
+        for ops_fqdn in _ops_managers:
+            if not lsf.test_tcp_port(ops_fqdn, 443, timeout=5):
+                lsf.write_output(f'  {ops_fqdn} not reachable - skipping fleet policy check')
+                continue
+                
             _ops_token = None
             try:
                 session = requests.Session()
@@ -4658,13 +4906,11 @@ echo "PROXY_CONFIGURED"
                                      'Accept': 'application/json'},
                             timeout=10,
                         )
-                        lsf.write_output('  OpsToken released')
+                        lsf.write_output(f'  {ops_fqdn}: OpsToken released')
                     except Exception:
                         pass
-        else:
-            lsf.write_output('  Would trigger fleet policy compliance check/remediation')
     else:
-        lsf.write_output(f'{ops_fqdn} not reachable - skipping fleet policy check')
+        lsf.write_output('  Would trigger fleet policy compliance check/remediation')
     
     if dashboard:
         if nsx_mgr_entries:
@@ -4952,12 +5198,37 @@ echo "PROXY_CONFIGURED"
                 import socket as _sock
                 import re as _re
 
-                _fleet_fqdn = 'fleet-01a.site-a.vcf.lab'
-                _fleet_url = f'https://{_fleet_fqdn}'
+                _fleet_hosts_raw = []
+                for _u in lsf.get_config_list('VCFFINAL', 'vcfcomponenturls'):
+                    _h = _u.split(',')[0].strip()
+                    if '://' in _h:
+                        _h = _h.split('://')[1].split('/')[0].split(':')[0]
+                    if _h and 'fleet' in _h.lower() and _h not in _fleet_hosts_raw:
+                        _fleet_hosts_raw.append(_h)
+                
+                if not _fleet_hosts_raw:
+                    _fleet_hosts_raw = ['fleet-01a']
+                
                 _vsp_user = 'vmware-system-user'
 
-                # --- Step 1: Discover VSP control plane IP and read IAM client credentials ---
-                _vsp_worker_ip = _sock.gethostbyname('vsp-01a.site-a.vcf.lab')
+                for _fleet_host in _fleet_hosts_raw:
+                    _fleet_fqdn = resolve_host_fqdn(_fleet_host)
+                    _fleet_url = f'https://{_fleet_fqdn}'
+                    
+                    # Assume VSP worker name matches Fleet site suffix
+                    _vsp_host = 'vsp-01a'
+                    if 'b' in _fleet_host[-2:].lower():
+                        _vsp_host = 'vsp-01b'
+                    _vsp_fqdn = resolve_host_fqdn(_vsp_host)
+                    
+                    lsf.write_output(f'  Processing Fleet-LCM on {_fleet_fqdn} (via {_vsp_fqdn})')
+
+                    # --- Step 1: Discover VSP control plane IP and read IAM client credentials ---
+                    try:
+                        _vsp_worker_ip = _sock.gethostbyname(_vsp_fqdn)
+                    except _sock.gaierror:
+                        lsf.write_output(f'    Could not resolve {_vsp_fqdn} - skipping')
+                        continue
                 _node_conf = lsf.ssh(
                     f"echo '{password}' | sudo -S grep server: /etc/kubernetes/node-agent.conf",
                     f'{_vsp_user}@{_vsp_worker_ip}'
@@ -5071,7 +5342,12 @@ echo "PROXY_CONFIGURED"
                     # that loads ComponentPublicNameCache from the now-populated release data.
                     lsf.write_output('  Restarting fleet-build-service to reload name cache...')
                     _fbs_restarted = False
-                    for _vsp_ip in [f'10.1.1.{i}' for i in range(128, 155)]:
+                    
+                    _subnet = '10.1.1'
+                    if 'b' in _fleet_host[-2:].lower():
+                        _subnet = '10.2.1'
+                        
+                    for _vsp_ip in [f'{_subnet}.{i}' for i in range(128, 155)]:
                         try:
                             _cid_res = subprocess.run(
                                 f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
