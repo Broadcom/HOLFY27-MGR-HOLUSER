@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.8.8 - 2026-08-06
+# Version 2.8.9 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.8.9 - 2026-08-18: check_k8s_certs() updated to probe for Site B VSP CP node
+#   (10.2.1.142) and execute vsp_cert_renewer.py --site for both Site A and Site B.
 # v2.8.8 - 2026-08-06: check_auto_platform_isolation() updated to match the
 #   new placement policy: the "sole VM on host" check now allows configured
 #   [VCF] vcfvCenter VMs on the dedicated host (they're pinned there too),
@@ -3046,80 +3048,86 @@ def check_k8s_certificates() -> List[CheckResult]:
                 name='VCFA Kubernetes',
                 status='SKIPPED',
                 message='vravms not defined in config.ini'))
-        cmd_a = [
-            'python3', '-u', renewer,
-            '--dry-run',
-            '--cluster', renewer_cluster,
-            '--no-timestamps',
-        ]
-        try:
-            proc_a = subprocess.run(
-                cmd_a,
-                capture_output=True, text=True, timeout=300,
-            )
-            for line in (proc_a.stdout + proc_a.stderr).splitlines():
-                # Extract label from [LABEL] prefix inside the message
-                lm = _re_vcr_label.search(line)
-                label = lm.group(1) if lm else 'VSP'
-                env = _label_to_env(label)
 
-                # CHECK line — cert is expiring / was renewed
-                cm = _re_vcr_check.search(line)
-                if cm:
-                    cert_name = cm.group(1).strip()
-                    expires   = cm.group(2).strip()
-                    residual  = int(cm.group(3))
-                    if residual <= 0:
-                        status, msg = 'FAIL', f'EXPIRED (expires: {expires})'
-                    elif residual <= 60:
-                        status, msg = 'WARN', (
-                            f'Expires in {residual}d (expires: {expires})')
-                    else:
-                        status, msg = 'PASS', (
-                            f'Valid — {residual}d remaining (expires: {expires})')
-                    results.append(CheckResult(
-                        name=f'{env}: {cert_name}',
-                        status=status, message=msg,
-                        details={'label': label, 'residual_days': residual,
-                                 'expires': expires}))
-                    continue
+        sites = ['a']
+        if lsf and hasattr(lsf, 'test_tcp_port') and lsf.test_tcp_port('10.2.1.142', 22, timeout=2):
+            sites.append('b')
 
-                # SKIP line — cert is valid, no renewal needed
-                if _re_vcr_skip.search(line) and _re_vcr_label.search(line):
-                    # Extract a short name from the line when possible
-                    # e.g. "[VSP] SKIP   : apiserver valid for >60d (RESIDUAL 1825d)"
-                    after_skip = re.sub(
-                        r'^.*?SKIP\s*:\s*', '', line, flags=re.IGNORECASE).strip()
-                    # Pull out residual days if present
-                    rm = re.search(r'RESIDUAL\s+(\d+)d', after_skip, re.IGNORECASE)
-                    rd = int(rm.group(1)) if rm else None
-                    msg = (f'Valid — {rd}d remaining' if rd else 'Valid') + \
-                          (f' ({after_skip[:80]})' if after_skip else '')
-                    results.append(CheckResult(
-                        name=f'{env}: {after_skip[:60]}',
-                        status='PASS', message=msg,
-                        details={'label': label}))
-                    continue
+        for site in sites:
+            cmd_a = [
+                'python3', '-u', renewer,
+                '--dry-run',
+                '--cluster', renewer_cluster,
+                '--site', site,
+                '--no-timestamps',
+            ]
+            try:
+                proc_a = subprocess.run(
+                    cmd_a,
+                    capture_output=True, text=True, timeout=300,
+                )
+                for line in (proc_a.stdout + proc_a.stderr).splitlines():
+                    # Extract label from [LABEL] prefix inside the message
+                    lm = _re_vcr_label.search(line)
+                    label = lm.group(1) if lm else 'VSP'
+                    env = _label_to_env(label)
+                    if len(sites) > 1:
+                        env = f"{env} (Site {site.upper()})"
 
-                # ERROR line
-                if _re_vcr_error.search(line) and _re_vcr_label.search(line):
-                    after_err = re.sub(
-                        r'^.*?ERROR\s*:\s*', '', line, flags=re.IGNORECASE).strip()
-                    results.append(CheckResult(
-                        name=f'{env}: ERROR',
-                        status='FAIL', message=after_err[:120],
-                        details={'label': label}))
+                    # CHECK line — cert is expiring / was renewed
+                    cm = _re_vcr_check.search(line)
+                    if cm:
+                        cert_name = cm.group(1).strip()
+                        expires   = cm.group(2).strip()
+                        residual  = int(cm.group(3))
+                        if residual <= 0:
+                            status, msg = 'FAIL', f'EXPIRED (expires: {expires})'
+                        elif residual <= 60:
+                            status, msg = 'WARN', (
+                                f'Expires in {residual}d (expires: {expires})')
+                        else:
+                            status, msg = 'PASS', (
+                                f'Valid — {residual}d remaining (expires: {expires})')
+                        results.append(CheckResult(
+                            name=f'{env}: {cert_name}',
+                            status=status, message=msg,
+                            details={'label': label, 'residual_days': residual,
+                                     'expires': expires, 'site': site}))
+                        continue
 
-        except subprocess.TimeoutExpired:
-            results.append(CheckResult(
-                name='K8s Cert Check (VSP/VCFA)',
-                status='WARN',
-                message='vsp_cert_renewer.py timed out after 300s'))
-        except Exception as exc:
-            results.append(CheckResult(
-                name='K8s Cert Check (VSP/VCFA)',
-                status='WARN',
-                message=f'Could not run vsp_cert_renewer.py: {exc}'))
+                    # SKIP line — cert is valid, no renewal needed
+                    if _re_vcr_skip.search(line) and _re_vcr_label.search(line):
+                        after_skip = re.sub(
+                            r'^.*?SKIP\s*:\s*', '', line, flags=re.IGNORECASE).strip()
+                        rm = re.search(r'RESIDUAL\s+(\d+)d', after_skip, re.IGNORECASE)
+                        rd = int(rm.group(1)) if rm else None
+                        msg = (f'Valid — {rd}d remaining' if rd else 'Valid') + \
+                              (f' ({after_skip[:80]})' if after_skip else '')
+                        results.append(CheckResult(
+                            name=f'{env}: {after_skip[:60]}',
+                            status='PASS', message=msg,
+                            details={'label': label, 'site': site}))
+                        continue
+
+                    # ERROR line
+                    if _re_vcr_error.search(line) and _re_vcr_label.search(line):
+                        after_err = re.sub(
+                            r'^.*?ERROR\s*:\s*', '', line, flags=re.IGNORECASE).strip()
+                        results.append(CheckResult(
+                            name=f'{env}: ERROR',
+                            status='FAIL', message=after_err[:120],
+                            details={'label': label, 'site': site}))
+
+            except subprocess.TimeoutExpired:
+                results.append(CheckResult(
+                    name=f'K8s Cert Check (VSP/VCFA Site {site.upper()})',
+                    status='WARN',
+                    message='vsp_cert_renewer.py timed out after 300s'))
+            except Exception as exc:
+                results.append(CheckResult(
+                    name=f'K8s Cert Check (VSP/VCFA Site {site.upper()})',
+                    status='WARN',
+                    message=f'Could not run vsp_cert_renewer.py: {exc}'))
     else:
         results.append(CheckResult(
             name='K8s Cert Check (VSP/VCFA)',

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # vsp-health-monitor.py - HOLFY27 VSP Cluster Health Monitor & Remediator
-# Version 2.13 - 2026-08-14
+# Version 2.14 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
+#
+# v2.14: Updated check_cert_renewal() to probe for Site B VSP CP VIP (10.2.1.142)
+#        and run vsp_cert_renewer.py for both Site A and Site B.
 #
 # v2.13: Fixed two spec.replicas=0 false positives. Both check_postgres()'s LCM
 #        deployment loop and check_vodap()'s ClickHouse client loop computed
@@ -2266,48 +2269,50 @@ def check_cert_renewal(cp_ip, password, remediate, dry_run, threshold_days):
         return 'PASS', [f'cert_renewal: already checked this boot session '
                         f'(at {checked_at}) - OK']
 
-    args = ['python3', '-u', CERT_RENEWER_SCRIPT, '--cluster', 'vsp',
-           '--threshold-days', str(threshold_days), '--no-timestamps']
-    if dry_run or not remediate:
-        args.append('--dry-run')
+    sites = ['a']
+    if lsf.test_tcp_port('10.2.1.142', 22, timeout=2):
+        sites.append('b')
 
-    try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=180)
-    except subprocess.TimeoutExpired:
-        return 'WARN', ['cert_renewal: vsp_cert_renewer.py timed out after 180s']
-    except Exception as e:
-        return 'WARN', [f'cert_renewal: failed to invoke vsp_cert_renewer.py: {e}']
+    all_error_lines = []
+    all_renewed_lines = []
+    all_returncodes = []
+    combined_outputs = []
 
-    out = (proc.stdout or '') + (proc.stderr or '')
-    # vsp_cert_renewer.py's own log format tags each line with a level
-    # (CHECK/ACTION/RENEWED/SKIP/WARN/ERROR/INFO — see its _log()). Section
-    # headers like "Phase 1: kubeadm ... renewal" and "Renewal target: ..."
-    # contain the word "renew" on EVERY run regardless of outcome, so a plain
-    # substring match on "renew" false-positives every single cycle — match
-    # the RENEWED/ERROR tags themselves instead.
-    error_lines = [ln for ln in out.splitlines() if 'ERROR  :' in ln]
-    renewed_lines = [ln for ln in out.splitlines() if 'RENEWED:' in ln]
+    for site in sites:
+        args = ['python3', '-u', CERT_RENEWER_SCRIPT, '--cluster', 'vsp', '--site', site,
+               '--threshold-days', str(threshold_days), '--no-timestamps']
+        if dry_run or not remediate:
+            args.append('--dry-run')
 
-    if error_lines:
-        # Don't mark as checked — a discovery/connectivity hiccup should
-        # retry on the next cycle rather than wait for the next reboot.
-        return 'WARN', [f'cert_renewal: {len(error_lines)} error(s) reported — '
-                        f'{error_lines[-1].strip()}']
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=180)
+            out = (proc.stdout or '') + (proc.stderr or '')
+            combined_outputs.append(out)
+            all_returncodes.append(proc.returncode)
+            all_error_lines.extend([ln for ln in out.splitlines() if 'ERROR  :' in ln])
+            all_renewed_lines.extend([ln for ln in out.splitlines() if 'RENEWED:' in ln])
+        except subprocess.TimeoutExpired:
+            return 'WARN', [f'cert_renewal: vsp_cert_renewer.py (Site {site.upper()}) timed out after 180s']
+        except Exception as e:
+            return 'WARN', [f'cert_renewal: failed to invoke vsp_cert_renewer.py (Site {site.upper()}): {e}']
 
-    # Clean completion (PASS or a genuine RENEWED action) — don't re-check
-    # again until the next reboot. dry_run never persists state, matching
-    # every other check's convention.
+    if all_error_lines:
+        return 'WARN', [f'cert_renewal: {len(all_error_lines)} error(s) reported — '
+                        f'{all_error_lines[-1].strip()}']
+
     if not dry_run:
         _mark_cert_renewal_checked()
 
-    if renewed_lines:
-        return 'FAIL', [f'cert_renewal: {len(renewed_lines)} cert(s) renewed — '
-                        f'{renewed_lines[-1].strip()}']
-    if proc.returncode == 0:
-        return 'PASS', [f'cert_renewal: all VSP certs healthy (threshold '
+    if all_renewed_lines:
+        return 'FAIL', [f'cert_renewal: {len(all_renewed_lines)} cert(s) renewed — '
+                        f'{all_renewed_lines[-1].strip()}']
+    if all(rc == 0 for rc in all_returncodes):
+        return 'PASS', [f'cert_renewal: all VSP certs healthy on {len(sites)} site(s) (threshold '
                         f'{threshold_days}d), no renewal needed - OK']
-    tail = out.strip().splitlines()[-1] if out.strip() else '(no output)'
-    return 'WARN', [f'cert_renewal: vsp_cert_renewer.py exited {proc.returncode} — {tail}']
+    
+    last_out = combined_outputs[-1] if combined_outputs else ''
+    tail = last_out.strip().splitlines()[-1] if last_out.strip() else '(no output)'
+    return 'WARN', [f'cert_renewal: vsp_cert_renewer.py exited with non-zero code — {tail}']
 
 
 #==============================================================================

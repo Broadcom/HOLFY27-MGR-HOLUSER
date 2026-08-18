@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.30 - 2026-08-14
+# Version 2.31 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
+#
+# v2.31: Updated Step 10 (configure_k8s_certs) to probe for Site B VSP CP node
+#        (10.2.1.142) and execute vsp_cert_renewer.py for both Site A and Site B.
 #
 # v2.30: Three fixes in the VSP proxy + sizing steps, all found by source/live audit
 #        (see Tools/vsp-analysis-report-opus.md F1/F3):
@@ -5742,33 +5745,39 @@ def configure_k8s_certs(dry_run: bool = False,
         lsf.write_output(f'WARNING: vsp_cert_renewer.py not found at {script} — skipping')
         return True
 
-    cmd = [
-        'python3', '-u', script,
-        '--cluster', 'all',
-        '--threshold-days', str(threshold_days),
-        '--no-timestamps',
-    ]
-    if dry_run:
-        cmd.append('--dry-run')
+    sites = ['a']
+    if lsf.test_tcp_port('10.2.1.142', 22, timeout=2) or lsf.test_ping('10.2.1.142'):
+        sites.append('b')
 
-    lsf.write_output(f'  Running: {" ".join(cmd)}')
-    try:
-        env = os.environ.copy()
-        env['PYTHONUNBUFFERED'] = '1'
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, env=env,
-        )
-        for line in proc.stdout:
-            lsf.write_output(f' {line.rstrip()}')
-        proc.wait()
-        if proc.returncode != 0:
-            lsf.write_output(
-                f'WARNING: vsp_cert_renewer.py exited {proc.returncode} — '
-                f'review output above; continuing HOLification'
+    for site in sites:
+        cmd = [
+            'python3', '-u', script,
+            '--cluster', 'all',
+            '--site', site,
+            '--threshold-days', str(threshold_days),
+            '--no-timestamps',
+        ]
+        if dry_run:
+            cmd.append('--dry-run')
+
+        lsf.write_output(f'  Running for Site {site.upper()}: {" ".join(cmd)}')
+        try:
+            env = os.environ.copy()
+            env['PYTHONUNBUFFERED'] = '1'
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=env,
             )
-    except Exception as exc:
-        lsf.write_output(f'WARNING: Error running vsp_cert_renewer.py: {exc}')
+            for line in proc.stdout:
+                lsf.write_output(f' {line.rstrip()}')
+            proc.wait()
+            if proc.returncode != 0:
+                lsf.write_output(
+                    f'WARNING: vsp_cert_renewer.py for Site {site.upper()} exited {proc.returncode} — '
+                    f'review output above; continuing HOLification'
+                )
+        except Exception as exc:
+            lsf.write_output(f'WARNING: Error running vsp_cert_renewer.py for Site {site.upper()}: {exc}')
 
     return True
 
