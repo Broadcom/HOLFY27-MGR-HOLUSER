@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 # vSphere.py - HOLFY27 Core vSphere Startup Module
-# Version 3.5 - 2026-08-18
+# Version 3.6 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
 # vSphere infrastructure startup sequence
 #
 # CHANGELOG:
+# v3.6 - 2026-08-18:
+#   - TASK 4: Added conditional DRS and HA enforcement when dsm.* VMs are active
+#     in config.ini. Automatically sets Fully Automated DRS and enables vSphere HA
+#     on Site A Workload (cluster-wld01-01a) and Site B clusters, while maintaining
+#     standard Partial DRS on Site A Management cluster (cluster-mgmt-01a).
 # v3.5 - 2026-08-18:
 #   - TASK 5: Added pre-flight QueryOptions check before calling UpdateOptions for
 #     UserVars.SuppressShellWarning on ESXi hosts. Skips call if already set to 1,
@@ -57,6 +62,25 @@ logging.basicConfig(
 
 MODULE_NAME = 'vSphere'
 MODULE_DESCRIPTION = 'vSphere infrastructure startup'
+
+#==============================================================================
+# CLUSTER CLASSIFICATION HELPERS
+#==============================================================================
+
+def is_site_a_mgmt_cluster(name):
+    """Return True if cluster is Site A Management cluster (e.g. cluster-mgmt-01a)."""
+    c = name.lower().strip()
+    return c in ('cluster-mgmt-01a', 'cluster-mgmt-a') or (c.startswith('cluster-mgmt') and (c.endswith('a') or 'site-a' in c))
+
+def is_site_a_wld_cluster(name):
+    """Return True if cluster is Site A Workload cluster (e.g. cluster-wld01-01a)."""
+    c = name.lower().strip()
+    return 'wld' in c and (c.endswith('a') or 'site-a' in c)
+
+def is_site_b_cluster(name):
+    """Return True if cluster is a Site B cluster (ends in 'b', or contains 'regionb'/'site-b')."""
+    c = name.lower().strip()
+    return c.endswith('b') or 'regionb' in c or 'site-b' in c
 
 #==============================================================================
 # MAIN FUNCTION
@@ -299,7 +323,17 @@ def main(lsf=None, standalone=False, dry_run=False):
     # keeps DRS from fighting the explicit VM/host placement policy enforced
     # later in Startup/VCFfinal.py Task 4 (VCF Automation + vCenter
     # co-location, VSP anti-affinity, 32-vCPU-per-host cap).
+    #
+    # CONDITIONAL ENFORCEMENT FOR dsm.* VMs:
+    # When active dsm.* VMs exist in [RESOURCES] VMs, automatically force
+    # Fully Automated DRS AND vSphere HA (admission control disabled) on Site A
+    # Workload (cluster-wld01-01a) and Site B clusters, while maintaining standard
+    # Partially Automated DRS on Site A Management cluster (cluster-mgmt-01a).
     #==========================================================================
+
+    # Check if active (uncommented) dsm.* VMs exist in [RESOURCES] VMs
+    vm_entries = lsf.get_config_list('RESOURCES', 'VMs')
+    has_dsm_vms = any(entry.split(':')[0].strip().lower().startswith('dsm') for entry in vm_entries)
 
     # Use get_config_list to properly filter commented-out values
     clusters = lsf.get_config_list('RESOURCES', 'Clusters')
@@ -330,7 +364,98 @@ def main(lsf=None, standalone=False, dry_run=False):
     # at position 5. Use 5 here to get the actual leftmost/Conservative UI position.
     DRS_CONSERVATIVE_VMOTION_RATE = 5  # leftmost/most-conservative migration threshold (UI), inverted API value
 
-    if drs_clusters and not dry_run:
+    if has_dsm_vms:
+        lsf.write_output('dsm.* VMs detected in config.ini — applying conditional DRS and vSphere HA enforcement')
+        target_clusters = {}
+        if not dry_run and hasattr(lsf, 'sis') and lsf.sis:
+            for si in lsf.sis:
+                try:
+                    container = si.content.viewManager.CreateContainerView(si.content.rootFolder, [vim.ClusterComputeResource], True)
+                    for c in container.view:
+                        target_clusters[c.name] = c
+                    container.Destroy()
+                except Exception:
+                    pass
+
+        # Ensure any explicitly configured cluster names are included
+        for c_name in drs_clusters:
+            if c_name not in target_clusters:
+                target_clusters[c_name] = lsf.get_cluster(c_name) if not dry_run else None
+
+        if dry_run:
+            for c_name in target_clusters.keys():
+                if is_site_a_wld_cluster(c_name) or is_site_b_cluster(c_name):
+                    lsf.write_output(f'Would configure Fully Automated DRS and enable vSphere HA on {c_name} (dsm.* VMs active)')
+                elif is_site_a_mgmt_cluster(c_name):
+                    lsf.write_output(f'Would configure Partially Automated DRS on Site A Mgmt cluster {c_name} (skipping HA, dsm.* VMs active)')
+                else:
+                    lsf.write_output(f'Would configure standard DRS settings on cluster {c_name}')
+        else:
+            from pyVim.task import WaitForTask
+            for c_name, cluster in target_clusters.items():
+                if not cluster:
+                    lsf.write_output(f'Could not find cluster {c_name} to configure DRS/HA')
+                    continue
+
+                if is_site_a_wld_cluster(c_name) or is_site_b_cluster(c_name):
+                    # Force Fully Automated DRS AND vSphere HA (admissionControlEnabled = False)
+                    drs_current = getattr(cluster.configuration, 'drsConfig', None)
+                    das_current = getattr(cluster.configuration, 'dasConfig', None)
+
+                    drs_need_update = not drs_current or not drs_current.enabled or drs_current.defaultVmBehavior != vim.cluster.DrsConfigInfo.DrsBehavior.fullyAutomated
+                    das_need_update = not das_current or not das_current.enabled or das_current.admissionControlEnabled
+
+                    if drs_need_update or das_need_update:
+                        lsf.write_output(f'Configuring Fully Automated DRS and vSphere HA on {cluster.name}...')
+                        try:
+                            spec = vim.cluster.ConfigSpecEx()
+                            drs_spec = vim.cluster.DrsConfigInfo()
+                            drs_spec.enabled = True
+                            drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.fullyAutomated
+                            spec.drsConfig = drs_spec
+
+                            das_spec = vim.cluster.DasConfigInfo()
+                            das_spec.enabled = True
+                            das_spec.admissionControlEnabled = False
+                            spec.dasConfig = das_spec
+
+                            task = cluster.ReconfigureComputeResource_Task(spec=spec, modify=True)
+                            WaitForTask(task)
+                            lsf.write_output(f'Successfully configured Fully Automated DRS and vSphere HA on {cluster.name}')
+                        except Exception as e:
+                            lsf.write_output(f'Failed to configure DRS/HA on {cluster.name}: {str(e)}')
+                    else:
+                        lsf.write_output(f'DRS (Fully Automated) and vSphere HA are already configured on {cluster.name}')
+
+                elif is_site_a_mgmt_cluster(c_name):
+                    # EXCLUDED from dsm HA - apply standard Partially Automated DRS
+                    drs_current = getattr(cluster.configuration, 'drsConfig', None)
+                    if (not drs_current
+                            or not drs_current.enabled
+                            or drs_current.defaultVmBehavior != vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
+                            or drs_current.vmotionRate != DRS_CONSERVATIVE_VMOTION_RATE):
+                        lsf.write_output(f'Setting Partially Automated DRS (conservative threshold) on Site A Mgmt cluster {cluster.name}...')
+                        try:
+                            spec = vim.cluster.ConfigSpecEx()
+                            drs_spec = vim.cluster.DrsConfigInfo()
+                            drs_spec.enabled = True
+                            drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
+                            drs_spec.vmotionRate = DRS_CONSERVATIVE_VMOTION_RATE
+                            spec.drsConfig = drs_spec
+
+                            task = cluster.ReconfigureComputeResource_Task(spec=spec, modify=True)
+                            WaitForTask(task)
+                            lsf.write_output(f'Successfully set Partially Automated DRS on Site A Mgmt cluster {cluster.name}')
+                        except Exception as e:
+                            lsf.write_output(f'Failed to configure DRS on {cluster.name}: {str(e)}')
+                    else:
+                        lsf.write_output(f'DRS is already Partially Automated/conservative on Site A Mgmt cluster {cluster.name}')
+                else:
+                    lsf.write_output(f'Maintaining standard DRS settings on cluster {cluster.name}')
+
+        lsf.write_output('DRS and HA configuration complete for dsm.* environment')
+
+    elif drs_clusters and not dry_run:
         from pyVim.task import WaitForTask
         for cluster_name in fully_automated_clusters:
             cluster = lsf.get_cluster(cluster_name)
