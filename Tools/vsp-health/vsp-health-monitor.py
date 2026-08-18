@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # vsp-health-monitor.py - HOLFY27 VSP Cluster Health Monitor & Remediator
-# Version 2.14 - 2026-08-18
+# Version 2.15 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
+#
+# v2.15: Standardized ANSI blue color (_BLUE) to standard 16-color ANSI (\033[0;34m) for universal terminal compatibility.
 #
 # v2.14: Updated check_cert_renewal() to probe for Site B VSP CP VIP (10.2.1.142)
 #        and run vsp_cert_renewer.py for both Site A and Site B.
@@ -384,7 +386,7 @@ import lsfunctions as lsf
 # DEFAULTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.13'   # keep in sync with the Version line in the header above
+SCRIPT_VERSION = '2.15'   # keep in sync with the Version line in the header above
 LOG_FILE = '/tmp/vsp-health-monitor.log'
 
 DEFAULTS = {
@@ -432,7 +434,7 @@ LAB_STATUS_FILES = ('/lmchol/hol/startup_status.txt', '/wmchol/hol/startup_statu
 # across both tools) ──────────────────────────────────────────────────────────
 if sys.stdout.isatty():
     _CYAN, _BLUE, _GREEN, _RED, _YELLOW, _BOLD, _DIM, _NC = (
-        '\033[0;36m', '\033[38;2;0;176;255m', '\033[0;32m',
+        '\033[0;36m', '\033[0;34m', '\033[0;32m',
         '\033[0;31m', '\033[1;33m', '\033[1m', '\033[2m', '\033[0m'
     )
 else:
