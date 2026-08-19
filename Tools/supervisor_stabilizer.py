@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.16 - 2026-08-14
+Version 2.17 - 2026-08-19
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
+
+v2.17: Added standard 16-color ANSI terminal colorization (_CYAN, _BLUE, _GREEN,
+       _RED, _YELLOW, _BOLD, _DIM, _NC) for interactive execution (gated on
+       sys.stdout.isatty()) to align output styling with vsp-health.py.
+       Upgraded Phase C to dynamically discover and cryptographically verify
+       all cert-manager certificates across all 41 Supervisor namespaces.
 
 v2.16: --dry-run is now actually read-only in Phase 2/A. The hypercrypt/kubelet
        wait loop and the Kubernetes-API wait loop had NO dry-run guard, so a
@@ -433,8 +439,8 @@ import configparser
 # neither --version nor a log consumer could tell which revision emitted a line.
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2.16"
-SCRIPT_DATE    = "2026-08-14"
+SCRIPT_VERSION = "2.17"
+SCRIPT_DATE    = "2026-08-19"
 
 # ---------------------------------------------------------------------------
 # Defaults - matched to the lab in supervisor-cert-fix/README.md but every
@@ -566,15 +572,60 @@ STUCK_POD_FILTER = (
 )
 
 
+# ─── Colors ──────────────────────────────────────────────────────────────────
+if sys.stdout.isatty():
+    _CYAN, _BLUE, _GREEN, _RED, _YELLOW, _BOLD, _DIM, _NC = (
+        '\033[0;36m', '\033[0;34m', '\033[0;32m',
+        '\033[0;31m', '\033[1;33m', '\033[1m', '\033[2m', '\033[0m'
+    )
+else:
+    _CYAN = _BLUE = _GREEN = _RED = _YELLOW = _BOLD = _DIM = _NC = ''
+
+_OK   = f"{_GREEN}✓{_NC}"
+_FAIL = f"{_RED}✗{_NC}"
+
+
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
 
+def colorize_line(line):
+    if not sys.stdout.isatty():
+        return line
+    if line.startswith("--- ") and line.endswith(" ---"):
+        return f"{_CYAN}{_BOLD}{line}{_NC}"
+    if line.strip().startswith(">>> "):
+        return f"{_BLUE}{_BOLD}{line}{_NC}"
+    if "CHECK  :" in line:
+        line = line.replace("CHECK  :", f"{_YELLOW}{_BOLD}CHECK  :{_NC}")
+    if "SKIP   :" in line:
+        line = line.replace("SKIP   :", f"{_GREEN}SKIP   :{_NC}")
+    if "FIXED  :" in line:
+        line = line.replace("FIXED  :", f"{_GREEN}{_BOLD}FIXED  :{_NC}")
+    if "INVALID" in line:
+        line = line.replace("INVALID", f"{_RED}{_BOLD}INVALID{_NC}")
+    if "EXPIRES" in line:
+        line = line.replace("EXPIRES", f"{_YELLOW}EXPIRES{_NC}")
+    if "MISSING SECRET" in line:
+        line = line.replace("MISSING SECRET", f"{_RED}{_BOLD}MISSING SECRET{_NC}")
+    if "FAILED" in line:
+        line = line.replace("FAILED", f"{_RED}{_BOLD}FAILED{_NC}")
+    if "VERIFIED" in line:
+        line = line.replace("VERIFIED", f"{_GREEN}{_BOLD}VERIFIED{_NC}")
+    if "STARTED" in line:
+        line = line.replace("STARTED", f"{_GREEN}STARTED{_NC}")
+    if "PASSED" in line or "SUCCESS" in line:
+        line = line.replace("PASSED", f"{_GREEN}{_BOLD}PASSED{_NC}").replace("SUCCESS", f"{_GREEN}{_BOLD}SUCCESS{_NC}")
+    return line
+
+
 def log(msg, level="INFO"):
-    # Timestamp is handled by the VCFfinal.py script that runs this script
-    #ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    #print(f"[{ts}] {level}: {msg}", flush=True)
-    #print(f"{level}: {msg}", flush=True)
+    if level == "ERROR":
+        msg = f"{_RED}{_BOLD}{msg}{_NC}" if sys.stdout.isatty() else msg
+    elif level == "WARN":
+        msg = f"{_YELLOW}{msg}{_NC}" if sys.stdout.isatty() else msg
+    else:
+        msg = colorize_line(msg)
     print(f"{msg}", flush=True)
 
 
@@ -584,9 +635,9 @@ def fail(msg, code=1):
 
 
 def banner(title):
-    log("=" * 70)
-    log(title)
-    log("=" * 70)
+    log(f"{_CYAN}{'=' * 70}{_NC}")
+    log(f"{_CYAN}{_BOLD}{title}{_NC}")
+    log(f"{_CYAN}{'=' * 70}{_NC}")
 
 
 # ---------------------------------------------------------------------------
@@ -2295,89 +2346,182 @@ def _stabilize_one_supervisor(vc, password, cluster, dry_run, threshold_days=60,
     _SCP_CERT_THRESHOLD_DAYS = threshold_days
     _SCP_CERT_THRESHOLD_SEC  = _SCP_CERT_THRESHOLD_DAYS * 86400
 
-    # 1. Check (and optionally renew) storage-quota cert-manager certs.
-    # The check loop runs in BOTH dry_run and live modes so vpodchecker can
-    # call with --dry-run and receive real SKIP/CHECK lines.  Renewal actions
-    # (Secret delete, deployment restart) are guarded with 'if not dry_run'.
-    certs_to_check = [
-        ("vmware-system-cert-manager", "storage-quota-root-ca-secret"),
-        ("kube-system", "storage-quota-webhook-server-internal-cert"),
-        ("kube-system", "cns-storage-quota-extension-cert")
-    ]
+    # 1. Dynamically discover and verify all cert-manager certs across all namespaces.
+    log(f"      [{cid}] Dynamically inspecting all SCP cert-manager cert(s) across all namespaces "
+        f"(threshold: {_SCP_CERT_THRESHOLD_DAYS}d)...")
 
-    log(f"      [{cid}] Checking {len(certs_to_check)} SCP cert-manager cert(s) "
-        f"(threshold: {_SCP_CERT_THRESHOLD_DAYS}d)")
+    dyn_cert_script = f"""cat << 'EOF' > /tmp/.dyn_cert_check.py
+import json, subprocess, sys, re, tempfile, os, time
 
-    certs_need_renewal = False
-    for ns, secret in certs_to_check:
-        cmd_cert = (
-            f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_cert && chmod 600 /tmp/.scppwd_cert && "
-            f"sshpass -f /tmp/.scppwd_cert ssh {SSH_OPTS} root@{scp_ip} "
-            f"'{K} -n {ns} get secret {secret} -o jsonpath=\"{{.data.tls\\\\.crt}}\" 2>/dev/null | base64 -d 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null'; "
-            f"rm -f /tmp/.scppwd_cert"
-        )
-        end_date_out = ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_cert).strip()
+K = "{K}"
+dry_run = "{'1' if dry_run else '0'}" == "1"
+threshold_days = {_SCP_CERT_THRESHOLD_DAYS}
+threshold_sec = threshold_days * 86400
+now = time.time()
 
-        if not end_date_out:
-            log(f"      [{cid}] {ns}/{secret}: Not found or could not parse "
-                f"(will be created automatically)")
-            continue
+def run(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return ""
 
-        m = re.search(r"notAfter=(.+)", end_date_out)
-        if m:
-            expiry_str = m.group(1)
-            try:
-                # Parse openssl date format, e.g., "May  7 14:54:44 2026 GMT"
-                expiry_epoch = time.mktime(
-                    time.strptime(expiry_str, "%b %d %H:%M:%S %Y %Z"))
-                now_epoch = time.time()
-                remaining = expiry_epoch - now_epoch
-                days_remaining = int(remaining / 86400)
-                if remaining <= _SCP_CERT_THRESHOLD_SEC:
-                    log(f"      [{cid}] CHECK  : {ns}/{secret} — "
-                        f"EXPIRES in {days_remaining}d (expires: {expiry_str})")
-                    certs_need_renewal = True
-                    if not dry_run:
-                        # Best-effort: patch Certificate spec.duration to 5 years
-                        # before deleting the Secret so cert-manager reissues with
-                        # a longer TTL.  Silently ignored if the Certificate resource
-                        # doesn't exist or the VMware operator restricts duration.
-                        cmd_patch = (
-                            f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_patch && chmod 600 /tmp/.scppwd_patch && "
-                            f"sshpass -f /tmp/.scppwd_patch ssh {SSH_OPTS} root@{scp_ip} "
-                            f"'{K} -n {ns} patch certificate {secret} --type=merge "
-                            f"-p {{\\\"spec\\\":{{\\\"duration\\\":\\\"43830h0m0s\\\"}}}} 2>/dev/null || true'; "
-                            f"rm -f /tmp/.scppwd_patch"
-                        )
-                        ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_patch)
-                        cmd_del = (
-                            f"echo {base64.b64encode(scp_pass.encode()).decode()} | base64 -d > /tmp/.scppwd_del && chmod 600 /tmp/.scppwd_del && "
-                            f"sshpass -f /tmp/.scppwd_del ssh {SSH_OPTS} root@{scp_ip} "
-                            f"'{K} -n {ns} delete secret {secret} --ignore-not-found=true'; "
-                            f"rm -f /tmp/.scppwd_del"
-                        )
-                        ssh_to_vcenter(vc["host"], vc["root_user"], password, cmd_del)
-                else:
-                    log(f"      [{cid}] SKIP   : {ns}/{secret} — "
-                        f"valid for {days_remaining}d (expires: {expiry_str})")
-            except ValueError:
-                log(f"      [{cid}] Could not parse expiry date: {expiry_str}",
-                    level="WARN")
+# Discover Issuers and ClusterIssuers
+cissuers = json.loads(run(K + " get clusterissuers -o json") or "{{}}").get("items", [])
+issuers = json.loads(run(K + " get issuers -A -o json") or "{{}}").get("items", [])
 
-    if certs_need_renewal and not dry_run:
-        log(f"      [{cid}] Restarting deployments to regenerate certificates...")
-        restart_cmds = [
-            f"{K} -n kube-system rollout restart deploy cns-storage-quota-extension || true",
-            f"{K} -n kube-system rollout restart deploy storage-quota-webhook || true",
-            f"{K} -n vmware-system-cert-manager rollout restart deploy cert-manager-cainjector || true"
-        ]
-        run_on_scp(
-            vc["host"], vc["root_user"], password,
-            scp_ip, scp_pass, restart_cmds,
-            description=f"      [{cid}] Restarting storage-quota and cainjector deployments",
-            timeout=120,
-        )
-        time.sleep(20)
+def get_sec_data(sec_ns, sec_name):
+    raw = run(f"{{K}} -n {{sec_ns}} get secret {{sec_name}} -o json")
+    if not raw:
+        return {{}}
+    try:
+        return json.loads(raw).get("data", {{}})
+    except Exception:
+        return {{}}
+
+def get_ca_pem(ikind, iname, ins):
+    sec_name = None
+    sec_ns = None
+    if ikind == "ClusterIssuer":
+        for ci in cissuers:
+            if ci["metadata"]["name"] == iname:
+                sec_name = ci["spec"].get("ca", {{}}).get("secretName")
+                sec_ns = "vmware-system-cert-manager"
+                break
+    elif ikind == "Issuer":
+        for iss in issuers:
+            if iss["metadata"]["namespace"] == ins and iss["metadata"]["name"] == iname:
+                sec_name = iss["spec"].get("ca", {{}}).get("secretName")
+                sec_ns = ins
+                break
+    if not sec_name:
+        return None, None, None
+    
+    sec_data = get_sec_data(sec_ns, sec_name)
+    ca_b64 = sec_data.get("tls.crt", "") or sec_data.get("ca.crt", "")
+    if not ca_b64 and ikind == "ClusterIssuer":
+        for fallback_ns in ["kube-system", "default"]:
+            sec_data = get_sec_data(fallback_ns, sec_name)
+            ca_b64 = sec_data.get("tls.crt", "") or sec_data.get("ca.crt", "")
+            if ca_b64:
+                sec_ns = fallback_ns
+                break
+    return sec_ns, sec_name, ca_b64
+
+# Query all Certificate resources across all namespaces
+certs = json.loads(run(K + " get certificates -A -o json") or "{{}}").get("items", [])
+
+renewed_secrets = []  # tuples of (ns, sec_name, cert_name)
+log_lines = []
+
+for c in certs:
+    ns = c["metadata"]["namespace"]
+    name = c["metadata"]["name"]
+    sec = c["spec"].get("secretName")
+    is_ca = c["spec"].get("isCA", False)
+    iref = c["spec"].get("issuerRef", {{}})
+    ikind = iref.get("kind", "Issuer")
+    iname = iref.get("name")
+    
+    leaf_data = get_sec_data(ns, sec)
+    leaf_b64 = leaf_data.get("tls.crt", "")
+    if not leaf_b64:
+        log_lines.append(f"CHECK  : {{ns}}/{{sec}} — MISSING SECRET (0d remaining)")
+        if not is_ca:
+            renewed_secrets.append((ns, sec, name))
+        continue
+    
+    end_date_raw = run(f"echo '{{leaf_b64}}' | base64 -d | openssl x509 -noout -enddate")
+    m = re.search(r"notAfter=(.+)", end_date_raw)
+    exp_str = m.group(1) if m else "UNKNOWN"
+    exp_epoch = 0
+    try:
+        exp_epoch = time.mktime(time.strptime(exp_str, "%b %d %H:%M:%S %Y %Z"))
+    except Exception:
+        pass
+    
+    days_rem = int((exp_epoch - now) / 86400) if exp_epoch else 0
+    is_expiring = (exp_epoch - now) <= threshold_sec
+    
+    ca_ns, ca_sec, ca_b64 = get_ca_pem(ikind, iname, ns)
+    ca_invalid = False
+    if ca_b64 and not is_ca:
+        with tempfile.NamedTemporaryFile("w", delete=False) as f_ca, tempfile.NamedTemporaryFile("w", delete=False) as f_leaf:
+            f_ca_name = f_ca.name
+            f_leaf_name = f_leaf.name
+        run(f"echo '{{ca_b64}}' | base64 -d > {{f_ca_name}}")
+        run(f"echo '{{leaf_b64}}' | base64 -d > {{f_leaf_name}}")
+        v_out = run(f"openssl verify -CAfile {{f_ca_name}} {{f_leaf_name}}")
+        os.unlink(f_ca_name)
+        os.unlink(f_leaf_name)
+        if ": OK" not in v_out:
+            ca_invalid = True
+    
+    if ca_invalid:
+        log_lines.append(f"CHECK  : {{ns}}/{{sec}} — INVALID (signed by non-current CA) (0d remaining)")
+        if not is_ca:
+            renewed_secrets.append((ns, sec, name))
+    elif is_expiring:
+        log_lines.append(f"CHECK  : {{ns}}/{{sec}} — EXPIRES in {{days_rem}}d (expires: {{exp_str}})")
+        if not is_ca:
+            renewed_secrets.append((ns, sec, name))
+    else:
+        log_lines.append(f"SKIP   : {{ns}}/{{sec}} — valid for {{days_rem}}d (expires: {{exp_str}})")
+
+for line in log_lines:
+    print(line)
+
+if not dry_run and renewed_secrets:
+    for ns, sec, cname in renewed_secrets:
+        patch_json = json.dumps({{"spec": {{"duration": "43830h0m0s"}}}})
+        run(f"{{K}} -n {{ns}} patch certificate {{cname}} --type=merge -p '{{patch_json}}'")
+        run(f"{{K}} -n {{ns}} delete secret {{sec}} --ignore-not-found=true")
+    
+    all_workloads = json.loads(run(K + " get deploy,ds,sts -A -o json") or "{{}}").get("items", [])
+    sec_names_renewed = {{s[1] for s in renewed_secrets}}
+    
+    restart_workloads = set()
+    for w in all_workloads:
+        w_kind = w.get("kind")
+        w_ns = w["metadata"]["namespace"]
+        w_name = w["metadata"]["name"]
+        pod_spec = w.get("spec", {{}}).get("template", {{}}).get("spec", {{}})
+        vols = pod_spec.get("volumes", [])
+        
+        mounted_secs = set()
+        for v in vols:
+            if "secret" in v:
+                mounted_secs.add(v["secret"].get("secretName"))
+            if "projected" in v:
+                for src in v["projected"].get("sources", []):
+                    if "secret" in src:
+                        mounted_secs.add(src["secret"].get("name"))
+        
+        if mounted_secs.intersection(sec_names_renewed):
+            restart_workloads.add((w_ns, w_kind, w_name))
+    
+    restart_workloads.add(("vmware-system-cert-manager", "Deployment", "cert-manager-cainjector"))
+    
+    restarted_summary = []
+    for w_ns, w_kind, w_name in sorted(restart_workloads):
+        run(f"{{K}} -n {{w_ns}} rollout restart {{w_kind.lower()}}/{{w_name}}")
+        restarted_summary.append(f"{{w_ns}}/{{w_kind.lower()}}/{{w_name}}")
+    
+    workloads_str = ", ".join(restarted_summary)
+    for ns, sec, cname in renewed_secrets:
+        print(f"FIXED  : {{ns}}/{{sec}} — secret deleted; triggered rollout restart for {{workloads_str}}")
+
+EOF
+python3 /tmp/.dyn_cert_check.py
+rm -f /tmp/.dyn_cert_check.py
+"""
+    try:
+        dyn_out = ssh_to_scp_direct(vc, password, scp_ip, scp_pass, dyn_cert_script, timeout=120).strip()
+        if dyn_out:
+            for line in dyn_out.splitlines():
+                if line.strip():
+                    log(f"      [{cid}] {line.strip()}")
+    except Exception as exc:
+        log(f"      [{cid}] Could not execute dynamic cert check: {exc}", level="WARN")
 
     # 1b. Verify and sync ValidatingWebhookConfiguration caBundle with storage-quota root CA
     wh_script = f"""cat << 'EOF' > /tmp/.check_vwc_ca.py
@@ -2392,12 +2536,18 @@ def run(cmd):
 K = "{K}"
 dry_run = "{'1' if dry_run else '0'}"
 
-ca_b64 = run(f"{{K}} -n vmware-system-cert-manager get secret storage-quota-root-ca-secret -o jsonpath='{{.data.tls\\\\.crt}}'")
+ca_sec_raw = run(f"{{K}} -n vmware-system-cert-manager get secret storage-quota-root-ca-secret -o json")
+ca_b64 = json.loads(ca_sec_raw or "{{}}").get("data", {{}}).get("tls.crt", "")
 if not ca_b64:
     print("NO_CA_SECRET")
     sys.exit(0)
 
 ca_b64_clean = "".join(ca_b64.split())
+
+serving_sec_raw = run(f"{{K}} -n kube-system get secret storage-quota-webhook-server-internal-cert -o json")
+ca_b64_serving = json.loads(serving_sec_raw or "{{}}").get("data", {{}}).get("tls.crt", "")
+ca_b64_serving_clean = "".join(ca_b64_serving.split())
+
 vwcs_raw = run(f"{{K}} get validatingwebhookconfiguration -o json")
 if not vwcs_raw:
     print("NO_VWC")
@@ -2419,9 +2569,13 @@ try:
         if not is_target:
             continue
         item_mismatched = False
+        has_cainjector = "inject-ca-from" in str(item.get("metadata", {{}}).get("annotations", {{}}))
         for wh in webhooks:
             cab = "".join(wh.get("clientConfig", {{}}).get("caBundle", "").split())
-            if cab != ca_b64_clean:
+            if not cab:
+                item_mismatched = True
+                break
+            if not has_cainjector and cab != ca_b64_clean and cab != ca_b64_serving_clean:
                 item_mismatched = True
                 break
         if item_mismatched:
