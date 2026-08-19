@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # VVFfinal.py - HOLFY27 Core VVF Final Tasks Module
-# Version 1.4 - 2026-06-24
+# Version 1.5 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
 # VVF final startup tasks: VSP platform VMs, Fleet component health, URL checks
 #
 # Runs after VVF.py and vSphere.py complete. Skips immediately if no [VVFFINAL]
 # section is present in config.ini (safe for VCF labs).
+#
+# v1.5 Changes:
+# - Task 3: Updated vsp_cert_renewer.py invocation to loop over Site A and Site B
+#   clusters using --site parameter.
 #
 # v1.4 Changes:
 # - Task 1b enhanced with full manual recovery (KB 440862 steps 2-5):
@@ -719,37 +723,54 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.update_task('vvffinal', 'k8s_certs', TaskStatus.SKIPPED, 'Dry run mode')
             dashboard.generate_html()
     else:
-        lsf.write_output(f'  Running cert renewer for all VSP clusters (--cluster vsp)...')
-        try:
-            cmd = [
-                sys.executable, cert_renewer,
-                '--cluster', 'vsp',
-                '--no-timestamps'
-            ]
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
-            for line in proc.stdout:
-                lsf.write_output(f' {line.rstrip()}')
-            proc.wait(timeout=300)
-            if proc.returncode == 0:
-                k8s_cert_ok += 1
-                lsf.write_output(f'  Cert check complete for all VSP clusters')
-            else:
+        sites_to_renew = []
+        if vspcontrolplaneips:
+            for ip in vspcontrolplaneips:
+                if ip.startswith('10.2.1') or 'site-b' in ip:
+                    if ('b', ip) not in sites_to_renew:
+                        sites_to_renew.append(('b', ip))
+                else:
+                    if ('a', ip) not in sites_to_renew:
+                        sites_to_renew.append(('a', ip))
+        else:
+            sites_to_renew = [('a', '10.1.1.142')]
+            if lsf.test_tcp_port('10.2.1.142', 22, timeout=2):
+                sites_to_renew.append(('b', '10.2.1.142'))
+
+        lsf.write_output(f'  Running cert renewer for {len(sites_to_renew)} VSP cluster(s)...')
+        for site_code, site_ip in sites_to_renew:
+            lsf.write_output(f'  Checking K8s certs for VSP Site {site_code.upper()} ({site_ip})...')
+            try:
+                cmd = [
+                    sys.executable, cert_renewer,
+                    '--cluster', 'vsp',
+                    '--site', site_code,
+                    '--no-timestamps'
+                ]
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+                for line in proc.stdout:
+                    lsf.write_output(f' {line.rstrip()}')
+                proc.wait(timeout=300)
+                if proc.returncode == 0:
+                    k8s_cert_ok += 1
+                    lsf.write_output(f'  Cert check complete for VSP Site {site_code.upper()}')
+                else:
+                    k8s_cert_failed += 1
+                    lsf.write_output(
+                        f'  Cert check for Site {site_code.upper()} returned code {proc.returncode} (non-fatal)')
+            except subprocess.TimeoutExpired:
+                proc.kill()
                 k8s_cert_failed += 1
-                lsf.write_output(
-                    f'  Cert check returned code {proc.returncode} (non-fatal)')
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            k8s_cert_failed += 1
-            lsf.write_output(f'  Cert renewer timed out (non-fatal)')
-        except Exception as e:
-            k8s_cert_failed += 1
-            lsf.write_output(f'  Cert renewer error: {e} (non-fatal)')
+                lsf.write_output(f'  Cert renewer for Site {site_code.upper()} timed out (non-fatal)')
+            except Exception as e:
+                k8s_cert_failed += 1
+                lsf.write_output(f'  Cert renewer for Site {site_code.upper()} error: {e} (non-fatal)')
 
         if dashboard:
             total = len(vspcontrolplaneips) if vspcontrolplaneips else 0
