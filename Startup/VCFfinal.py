@@ -538,6 +538,7 @@ import ssl
 import time
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Add hol directory to path
 sys.path.insert(0, '/home/holuser/hol')
@@ -3187,6 +3188,14 @@ echo "PROXY_CONFIGURED"
                 else:
                     lsf.write_output(f'  CSI pre-flight script not found: {_csi_preflight_script} — skipping')
 
+                # ---- Proactive pre-scaling for ops-logs ----
+                try:
+                    lsf.write_output('  Proactively ensuring ops-logs CRD operational-status=Running and statefulsets scaled...')
+                    vsp_kubectl('kubectl annotate components.api.vmsp.vmware.com ops-logs component.vmsp.vmware.com/operational-status=Running --overwrite 2>/dev/null')
+                    vsp_kubectl('kubectl scale statefulset/log-processor statefulset/log-store -n ops-logs --replicas=1 2>&1')
+                except Exception as _ops_exc:
+                    lsf.write_output(f'  WARNING: Proactive ops-logs pre-scaling error (non-fatal): {_ops_exc}')
+
                 # ---- Scale up each component ----
                 lsf.write_output(f'  Processing {len(vcfcomponents)} component resources...')
                 
@@ -4055,10 +4064,10 @@ echo "PROXY_CONFIGURED"
                             if _ip and _ip not in _chage_hosts:
                                 _chage_hosts.append(_ip)
 
-                for _chage_host in _chage_hosts:
+                def _process_single_chage(_chage_host):
                     if not lsf.test_tcp_port(_chage_host, 22, timeout=5):
                         lsf.write_output(f'  {_chage_host}: SSH not reachable — skipping chage')
-                        continue
+                        return
                     lsf.write_output(f'  {_chage_host}: Ensuring vmware-system-user and root passwords expire in 730 days...')
                     try:
                         _chage_cmd = (
@@ -4072,6 +4081,12 @@ echo "PROXY_CONFIGURED"
                             lsf.write_output(f'  {_chage_host}: WARNING — chage -M 730 returned exit {_cr.returncode}')
                     except Exception as _ce:
                         lsf.write_output(f'  {_chage_host}: WARNING — could not run chage: {_ce}')
+
+                if _chage_hosts:
+                    with ThreadPoolExecutor(max_workers=max(1, len(_chage_hosts))) as _chage_exec:
+                        _chage_futures = [_chage_exec.submit(_process_single_chage, host) for host in _chage_hosts]
+                        for _f in as_completed(_chage_futures):
+                            _f.result()
 
                 # ---- Step 0b: Check and renew K8s certificates for VCFA ----
                 # Now that VCFA VM is powered on and credentials are confirmed, check/renew VCFA K8s certs.
@@ -4527,7 +4542,7 @@ echo "PROXY_CONFIGURED"
                             vcfc_urls_failed += 1
                             lsf.labfail(f'VCF Component URL {url} not accessible after {VCFC_URL_MAX_RETRIES} minutes')
                         else:
-                            if attempt >= 5 and 'opslogs' in url.lower() and not opslogs_rescued:
+                            if 'opslogs' in url.lower() and not opslogs_rescued:
                                 opslogs_rescued = True
                                 lsf.write_output(f'  [WARNING] opslogs unreachable at attempt {attempt}. Rescuing ops-logs component (VSP VIP 10.1.1.142)...')
                                 pwd = lsf.get_password()
@@ -4538,8 +4553,9 @@ echo "PROXY_CONFIGURED"
                                 scale_out = scale_result.stdout.strip() if hasattr(scale_result, 'stdout') and scale_result.stdout else '(no output / SSH failed)'
                                 lsf.write_output(f'  StatefulSet rescale result: {scale_out}')
                             
-                            lsf.write_output(f'  Sleeping and will try again... {attempt} / {VCFC_URL_MAX_RETRIES}')
-                            lsf.labstartup_sleep(VCFC_URL_RETRY_DELAY)
+                            retry_delay = 15 if 'opslogs' in url.lower() else VCFC_URL_RETRY_DELAY
+                            lsf.write_output(f'  Sleeping and will try again... {attempt} / {VCFC_URL_MAX_RETRIES} ({retry_delay}s delay)')
+                            lsf.labstartup_sleep(retry_delay)
         
         lsf.write_output(f'VCF Component URL check complete: {vcfc_urls_passed}/{vcfc_urls_checked} passed')
     else:
@@ -4617,15 +4633,16 @@ echo "PROXY_CONFIGURED"
         )
         lsf.write_vpodprogress('NSX Password Config', 'GOOD-8')
 
-        for entry in nsx_mgr_entries:
+        def _process_nsx_mgr_node(entry):
+            nonlocal nsx_task_failed
             nsx_host = entry.split(':')[0].strip()
             nsx_fqdn = resolve_host_fqdn(nsx_host)
             lsf.write_output(f'  -> {nsx_fqdn}')
 
             if not dry_run:
                 if not lsf.test_tcp_port(nsx_fqdn, 22, timeout=5):
-                    lsf.write_output(f'     [!] SSH not reachable — skipping')
-                    continue
+                    lsf.write_output(f'     [!] {nsx_fqdn}: SSH not reachable — skipping')
+                    return
 
                 for user in nsx_users:
                     uid_str = str(_nsx_user_id.get(user, '?'))
@@ -4637,7 +4654,7 @@ echo "PROXY_CONFIGURED"
                         current_display = 'no-expiry'
                     elif current > nsx_expiry_threshold_days:
                         lsf.write_output(
-                            f'     [~] {user} (id={uid_str}): {current}d — '
+                            f'     [~] {nsx_fqdn} {user} (id={uid_str}): {current}d — '
                             f'skip (> {nsx_expiry_threshold_days}d threshold)')
                         continue
                     else:
@@ -4649,17 +4666,22 @@ echo "PROXY_CONFIGURED"
                     )
                     if result.returncode == 0:
                         lsf.write_output(
-                            f'     [+] {user} (id={uid_str}): '
+                            f'     [+] {nsx_fqdn} {user} (id={uid_str}): '
                             f'{current_display} -> {nsx_expiry_days}d  [OK]')
                     else:
                         lsf.write_output(
-                            f'     [-] {user} (id={uid_str}): FAILED '
+                            f'     [-] {nsx_fqdn} {user} (id={uid_str}): FAILED '
                             f'(exit {result.returncode})')
                         nsx_task_failed = True
             else:
                 lsf.write_output(
-                    f'     [DRY-RUN] Would check/set user expiry '
+                    f'     [DRY-RUN] {nsx_fqdn}: Would check/set user expiry '
                     f'(threshold: {nsx_expiry_threshold_days}d -> {nsx_expiry_days}d)')
+
+        with ThreadPoolExecutor(max_workers=max(1, len(nsx_mgr_entries))) as nsx_exec:
+            nsx_futures = [nsx_exec.submit(_process_nsx_mgr_node, entry) for entry in nsx_mgr_entries]
+            for _f in as_completed(nsx_futures):
+                _f.result()
 
     # ---- NSX VNA/Edge transport-node password expiration ----------------
     # Transport-nodes proxy API — no SSH to edge/VNA nodes required.
