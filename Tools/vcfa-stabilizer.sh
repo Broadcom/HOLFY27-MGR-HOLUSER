@@ -1660,12 +1660,12 @@ def setv(text, name, val):
 for k,v in desired.items(): s=setv(s,k,v)
 open(p,"w").write(s)
 PY
-        echo "  kube-vip manifest updated: renew=40s retry=6s preserve=true"
+        echo "  kube-vip manifest updated: leaseduration=60s renew=40s retry=6s preserve=true"
         # Touch the manifest to force kubelet to re-read (env-var changes alone don't trigger restart).
         touch "$M" 2>/dev/null || true
         echo "  manifest touched; kubelet will recreate kube-vip pod within ~30s"
     else
-        echo "  kube-vip manifest already at desired values (renew=40 retry=6 preserve=true) -- no-op"
+        echo "  kube-vip manifest already at desired values (leaseduration=60 renew=40 retry=6 preserve=true) -- no-op"
     fi
     # Emergency-only: detect the true death-spiral signature (leaseDurationSeconds<10, originally
     # observed as =1 during the Apr 2026 control-plane overload incident) and patch it away. This
