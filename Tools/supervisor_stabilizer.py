@@ -595,7 +595,7 @@ def colorize_line(line):
     if line.startswith("--- ") and line.endswith(" ---"):
         return f"{_CYAN}{_BOLD}{line}{_NC}"
     if line.strip().startswith(">>> "):
-        return f"{_BLUE}{_BOLD}{line}{_NC}"
+        return f"{_CYAN}{_BOLD}{line}{_NC}"
     if "CHECK  :" in line:
         line = line.replace("CHECK  :", f"{_YELLOW}{_BOLD}CHECK  :{_NC}")
     if "SKIP   :" in line:
