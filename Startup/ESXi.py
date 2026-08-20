@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # ESXi.py - HOLFY27 Core ESXi Host Verification Module
-# Version 3.7 - 2026-08-13
+# Version 3.8 - 2026-08-18
 # Author - Burke Azbill and HOL Core Team
 # Verifies ESXi hosts are online and responsive
+# v3.8: Disable Transparent Page Sharing (Mem.ShareScanGHz=0) and Enable Large Page Support (Mem.AllocGuestLargePage=1) on each ESXi host.
 # v3.7: Combine vCPU count reduction and CPU topology changes into a single ConfigSpec reconfig task for auto-platform-a* VMs to prevent InvalidArgument (numCoresPerSocket) faults.
 # v3.6: HOL-2701 specific - cap auto-platform-a* (VCF Automation) VM at 24 vCPUs.
 # v3.5: Roll back vsp-01.* CPU limit of 8; preserve existing CPU counts and update CPU topology to 8, 4, 2, or 1 cores per socket (whichever divides numCPU evenly).
@@ -262,13 +263,15 @@ def main(lsf=None, standalone=False, dry_run=False):
     ##=========================================================================
 
     ##=========================================================================
-    ## CUSTOM - VCF Automation (auto-platform-a*) & VSP Platform (vsp-01.*)
-    ##          CPU topology enforcement
+    ## CUSTOM - ESXi Advanced System Settings & VM CPU Topology Enforcement
     ##
-    ## 1. For each ESXi host, find any VM whose name starts with 'auto-platform-a'
+    ## 1. Disable Transparent Page Sharing (Mem.ShareScanGHz=0) and Enable Large Page Support
+    ##    (Mem.AllocGuestLargePage=1) on each ESXi host before VMs are started.
+    ##
+    ## 2. For each ESXi host, find any VM whose name starts with 'auto-platform-a'
     ##    and ensure its CPU topology has 8 cores per socket (numCoresPerSocket = 8).
     ##
-    ## 2. For each ESXi host, find any VM whose name starts with 'vsp-01'
+    ## 3. For each ESXi host, find any VM whose name starts with 'vsp-01'
     ##    and update its CPU topology to 8, 4, 2, or 1 cores per socket (whichever
     ##    first results in an equal number of cores across sockets for numCPU).
     ##    CPU counts (numCPU) are left unchanged.
@@ -279,15 +282,15 @@ def main(lsf=None, standalone=False, dry_run=False):
     ##=========================================================================
 
     if dry_run:
-        lsf.write_output('Dry-run: skipping auto-platform-a* and vsp-01.* CPU topology enforcement')
+        lsf.write_output('Dry-run: skipping ESXi advanced settings and VM CPU topology enforcement')
     elif not esx_hosts:
-        lsf.write_output('No ESXi hosts configured - skipping auto-platform-a* and vsp-01.* CPU checks')
+        lsf.write_output('No ESXi hosts configured - skipping ESXi host configuration checks')
     else:
         TARGET_CORES_PER_SOCKET = 8
         MAX_HOST_RETRIES = 5
         HOST_RETRY_DELAY = 30
 
-        lsf.write_output('Checking ESXi host VMs for CPU topology (auto-platform-a* and vsp-01.*)...')
+        lsf.write_output('Checking ESXi host advanced settings and VM CPU topology...')
         try:
             import re
             import ssl as _ssl_vcfa
@@ -298,14 +301,16 @@ def main(lsf=None, standalone=False, dry_run=False):
             _vcfa_password = lsf.get_password()
             _vcfa_ctx = _ssl_vcfa._create_unverified_context()
 
-            hosts_checked       = 0
-            vcfa_vms_found      = 0
-            vcfa_vms_updated    = 0
-            vcfa_vms_skipped_on = 0
+            hosts_checked          = 0
+            adv_settings_updated   = 0
 
-            vsp_vms_found       = 0
-            vsp_vms_updated     = 0
-            vsp_vms_skipped_on  = 0
+            vcfa_vms_found         = 0
+            vcfa_vms_updated       = 0
+            vcfa_vms_skipped_on    = 0
+
+            vsp_vms_found          = 0
+            vsp_vms_updated        = 0
+            vsp_vms_skipped_on     = 0
 
             for _entry in esx_hosts:
                 _host = _entry.split(':')[0].strip() if ':' in _entry else _entry.strip()
@@ -319,6 +324,52 @@ def main(lsf=None, standalone=False, dry_run=False):
                             sslContext=_vcfa_ctx
                         )
                         _content = _si.RetrieveContent()
+
+                        # --- Process Advanced System Settings on ESXi host ---
+                        lsf.write_output(f'  {_host}: checking advanced system settings...')
+                        _adv_settings = {
+                            'Mem.ShareScanGHz': 0,
+                            'Mem.AllocGuestLargePage': 1,
+                        }
+                        try:
+                            _host_view = _content.viewManager.CreateContainerView(
+                                _content.rootFolder, [vim.HostSystem], True
+                            )
+                            _host_obj = _host_view.view[0] if _host_view.view else None
+                            _host_view.Destroy()
+
+                            if _host_obj and _host_obj.configManager and _host_obj.configManager.advancedOption:
+                                _option_mgr = _host_obj.configManager.advancedOption
+                                for _setting_key, _target_val in _adv_settings.items():
+                                    try:
+                                        _opts = _option_mgr.QueryOptions(name=_setting_key)
+                                        _cur_val = _opts[0].value if _opts else None
+                                        if _cur_val is not None and str(_cur_val) == str(_target_val):
+                                            lsf.write_output(
+                                                f'    {_host}: {_setting_key}={_cur_val} - no change needed'
+                                            )
+                                        else:
+                                            lsf.write_output(
+                                                f'    {_host}: reconfiguring {_setting_key} '
+                                                f'({_cur_val} -> {_target_val})'
+                                            )
+                                            _opt_val = vim.option.OptionValue(key=_setting_key, value=_target_val)
+                                            _option_mgr.UpdateOptions(changedValue=[_opt_val])
+                                            lsf.write_output(
+                                                f'    {_host}: {_setting_key} updated to {_target_val}'
+                                            )
+                                            adv_settings_updated += 1
+                                    except Exception as _setting_err:
+                                        lsf.write_output(
+                                            f'    {_host}: FAILED to reconfigure {_setting_key}: {_setting_err}'
+                                        )
+                            else:
+                                lsf.write_output(f'    {_host}: HostSystem configManager.advancedOption not available')
+                        except Exception as _adv_err:
+                            lsf.write_output(
+                                f'    {_host}: FAILED to process advanced system settings: {_adv_err}'
+                            )
+
                         _container = _content.viewManager.CreateContainerView(
                             _content.rootFolder, [vim.VirtualMachine], True
                         )
@@ -480,17 +531,18 @@ def main(lsf=None, standalone=False, dry_run=False):
                     except Exception as _host_err:
                         if _attempt < MAX_HOST_RETRIES - 1:
                             lsf.write_output(
-                                f'  WARNING: could not connect to {_host} for VM CPU check '
+                                f'  WARNING: could not connect to {_host} for ESXi host check '
                                 f'(attempt {_attempt + 1}/{MAX_HOST_RETRIES}): {_host_err}. Retrying in {HOST_RETRY_DELAY}s...'
                             )
                             lsf.labstartup_sleep(HOST_RETRY_DELAY)
                         else:
                             lsf.write_output(
-                                f'  WARNING: could not connect to {_host} for VM CPU check after {MAX_HOST_RETRIES} attempts: {_host_err}'
+                                f'  WARNING: could not connect to {_host} for ESXi host check after {MAX_HOST_RETRIES} attempts: {_host_err}'
                             )
 
             _summary_parts = [
                 f'{hosts_checked} host(s) checked',
+                f'{adv_settings_updated} advanced setting(s) updated',
                 f'{vcfa_vms_found} auto-platform-a* VM(s) found ({vcfa_vms_updated} updated)',
                 f'{vsp_vms_found} vsp-01.* VM(s) found ({vsp_vms_updated} updated)',
             ]
@@ -498,11 +550,11 @@ def main(lsf=None, standalone=False, dry_run=False):
                 _summary_parts.append(
                     f'{vcfa_vms_skipped_on + vsp_vms_skipped_on} skipped (powered on)'
                 )
-            lsf.write_output('ESXi VM CPU check complete: ' + ', '.join(_summary_parts))
+            lsf.write_output('ESXi host configuration check complete: ' + ', '.join(_summary_parts))
 
         except Exception as _global_err:
             lsf.write_output(
-                f'WARNING: ESXi VM CPU check encountered an error: {_global_err}'
+                f'WARNING: ESXi host configuration check encountered an error: {_global_err}'
             )
 
     ##=========================================================================

@@ -1,7 +1,12 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.14 - 2026-08-13
+# Version 3.15 - 2026-08-19
 # Changes:
+# - Fix check_and_fix_console_black_screen(): replaced legacy /sys/class/graphics/fb0/blank
+#   heuristic (which always reads 4/blanked on Linux DRM/KMS vmwgfx drivers, falsely triggering
+#   unconditional GDM restarts on healthy systems) with a multi-signal GUI health verification:
+#   confirms GDM service, Xorg/compositor process, connected & enabled DRM connector with DPMS On,
+#   active seat0 user session, and responsive X11 Window Manager. Only restarts GDM if a fault is detected.
 # - Added update_hol_repo(): runs `git stash && git pull` on ${holroot}
 #   (/home/holuser/hol) as the very first step of MAIN EXECUTION, before the
 #   console-mount wait and everything after it. gitpull.sh already does this
@@ -460,68 +465,115 @@ clone_or_pull_labtype_overrides() {
     return 0
 }
 
-# Best-effort preflight for a fresh-boot console black-screen race (2026-08-13 incident).
-# GDM/Xorg/gnome-shell all report healthy in the broken state - the only observed
-# kernel-level signal was /sys/class/graphics/fb0/blank reading non-zero (blanked)
-# while the console's vmwgfx framebuffer never got a live frame after boot. A GDM
-# restart forces a fresh mode-set and resolves it without a full VM reboot.
+# Preflight check and remediation for console GUI / black-screen state (v3.15).
+# Verifies that GDM is active, display server (Xorg/Wayland) is running, DRM connector
+# is connected/enabled with DPMS On, seat0 user session is active, and X11 window manager
+# is responding. ONLY restarts GDM if a genuine display/session fault is detected.
 #
-# This is a HEURISTIC based on a single confirmed incident - it may not catch every
-# occurrence of the underlying race. It intentionally runs only once, only during a
-# genuine startup (never labcheck), so it can never interrupt an actively-used
-# desktop session that is merely screen-locked/DPMS-blanked by the user.
+# Runs once, only during a genuine startup (not labcheck), right after the console
+# NFS mount is detected.
 check_and_fix_console_black_screen() {
     local console_host="root@console.site-a.vcf.lab"
+    local creds_file="/home/holuser/creds.txt"
 
-    if ! command -v sshpass >/dev/null 2>&1 || [ ! -f /home/holuser/creds.txt ]; then
-        log_msg "Console black-screen preflight: sshpass or creds.txt missing - skipping (non-fatal)." "${logfile}"
+    if ! command -v sshpass >/dev/null 2>&1 || [ ! -f "${creds_file}" ]; then
+        log_msg "Console display preflight: sshpass or creds.txt missing - skipping (non-fatal)." "${logfile}"
         return 0
     fi
 
-    # Give GDM a moment to reach its post-boot steady state before sampling
-    # fb0/blank, so we don't catch a transient mid-boot value.
-    local attempt gdm_ready
-    gdm_ready=false
+    local ssh_cmd="sshpass -f ${creds_file} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 ${console_host}"
+
+    log_msg "Console display preflight: checking console GUI health..." "${logfile}"
+
+    # Multi-signal GUI verification script executed remotely on the console VM
+    local remote_check_script='
+check_gui_health() {
+    # 1. GDM display manager service status
+    if ! systemctl is-active --quiet gdm && ! systemctl is-active --quiet gdm3; then
+        echo "GDM service is not active"
+        return 1
+    fi
+
+    # 2. Display server process (Xorg or Wayland/gnome-shell)
+    if ! pgrep -x Xorg >/dev/null && ! pgrep -x gnome-shell >/dev/null && ! pgrep -x Xwayland >/dev/null; then
+        echo "No display server process (Xorg/gnome-shell) running"
+        return 1
+    fi
+
+    # 3. DRM connector check (must have at least one connected & enabled display with DPMS active)
+    local has_active_drm=0
+    for conn in /sys/class/drm/card*-*; do
+        [ -d "$conn" ] || continue
+        local status enabled dpms
+        status=$(cat "$conn/status" 2>/dev/null || true)
+        enabled=$(cat "$conn/enabled" 2>/dev/null || true)
+        dpms=$(cat "$conn/dpms" 2>/dev/null || true)
+        if [ "$status" = "connected" ] && [ "$enabled" = "enabled" ] && [ "$dpms" != "Off" ] && [ "$dpms" != "Suspend" ]; then
+            has_active_drm=1
+            break
+        fi
+    done
+    if [ "$has_active_drm" -ne 1 ]; then
+        echo "No connected and enabled DRM display output found with DPMS On"
+        return 1
+    fi
+
+    # 4. User session on seat0 (desktop session)
+    if ! loginctl list-sessions --no-legend 2>/dev/null | grep -E "seat0.*active" >/dev/null; then
+        echo "No active graphical session found on seat0"
+        return 1
+    fi
+
+    # 5. X11 Window Manager / Compositor responsiveness on DISPLAY=:0
+    local xauth
+    xauth=$(tr "\0" "\n" < /proc/$(pgrep -x Xorg 2>/dev/null | head -1)/cmdline 2>/dev/null | grep -A1 "^-auth$" | tail -1)
+    if [ -z "$xauth" ] || [ ! -f "$xauth" ]; then
+        xauth=$(ls -1 /run/user/*/gdm/Xauthority /home/holuser/.Xauthority 2>/dev/null | head -1)
+    fi
+
+    if [ -n "$xauth" ] && [ -f "$xauth" ]; then
+        if ! DISPLAY=:0 XAUTHORITY="$xauth" xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q "window id #"; then
+            echo "Window manager is not responding on DISPLAY=:0"
+            return 1
+        fi
+    fi
+
+    echo "OK"
+    return 0
+}
+check_gui_health
+'
+
+    local attempt check_result is_healthy=false
     for attempt in 1 2 3 4 5 6; do
-        if sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${console_host}" \
-            "systemctl is-active --quiet gdm && pgrep -x Xorg >/dev/null" >/dev/null 2>&1; then
-            gdm_ready=true
+        check_result=$(${ssh_cmd} "${remote_check_script}" 2>/dev/null | tr -d '\r' | tail -1)
+        if [ "$check_result" = "OK" ]; then
+            is_healthy=true
             break
         fi
         sleep 5
     done
 
-    if [ "$gdm_ready" != true ]; then
-        log_msg "Console black-screen preflight: GDM/Xorg not confirmed running after 30s - skipping (non-fatal)." "${logfile}"
+    if [ "$is_healthy" = true ]; then
+        log_msg "Console display preflight: console GUI is healthy and active - no action needed." "${logfile}"
         return 0
     fi
 
-    local fb_blank
-    fb_blank=$(sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${console_host}" \
-        "cat /sys/class/graphics/fb0/blank 2>/dev/null" 2>/dev/null | tr -d '[:space:]')
-
-    if [ -z "$fb_blank" ]; then
-        log_msg "Console black-screen preflight: could not read fb0/blank - skipping (non-fatal)." "${logfile}"
-        return 0
-    fi
-
-    if [ "$fb_blank" = "0" ]; then
-        log_msg "Console black-screen preflight: fb0/blank=0 (normal) - no action needed." "${logfile}"
-        return 0
-    fi
-
-    log_msg "Console black-screen preflight: fb0/blank=${fb_blank} (blanked) - restarting GDM to force a fresh mode-set..." "${logfile}"
-    if sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${console_host}" "systemctl restart gdm" >/dev/null 2>&1; then
-        sleep 8
-        # fb0/blank is a VT/kernel-level flag, not something the compositor resets
-        # on its own restarting GDM alone left it unchanged in testing. Force-clear
-        # it explicitly to match the exact sequence that was confirmed working live.
-        sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${console_host}" \
-            "echo 0 > /sys/class/graphics/fb0/blank" >/dev/null 2>&1
-        log_msg "Console black-screen preflight: GDM restarted and fb0/blank force-cleared. This is a best-effort remediation - it cannot be visually verified over SSH." "${logfile}"
+    log_msg "Console display preflight: problem detected (${check_result:-unresponsive}) - restarting GDM..." "${logfile}"
+    if ${ssh_cmd} "systemctl restart gdm || systemctl restart gdm3" >/dev/null 2>&1; then
+        log_msg "Console display preflight: GDM restart issued; waiting for recovery..." "${logfile}"
+        sleep 10
+        local post_check
+        post_check=$(${ssh_cmd} "${remote_check_script}" 2>/dev/null | tr -d '\r' | tail -1)
+        if [ "$post_check" = "OK" ]; then
+            log_msg "Console display preflight: GDM restarted successfully; console GUI confirmed healthy." "${logfile}"
+        else
+            log_msg "Console display preflight: GDM restarted; status: ${post_check:-unconfirmed} (non-fatal, continuing startup)." "${logfile}"
+        fi
     else
-        log_msg "WARNING: Console black-screen preflight: GDM restart command failed (non-fatal, continuing startup)." "${logfile}"
+        log_msg "WARNING: Console display preflight: GDM restart command failed (non-fatal, continuing startup)." "${logfile}"
     fi
+
     return 0
 }
 
