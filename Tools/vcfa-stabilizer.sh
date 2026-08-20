@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VCFA Complete Stabilization Script v2.24
-# Version 2.24 - 2026-08-20
+# VCFA Complete Stabilization Script v2.25
+# Version 2.25 - 2026-08-20
 # Author - HOL Core Team
 #
 # Default-run philosophy (v2.6+): one run of the script with no flags should leave the VCFA in a
@@ -43,6 +43,17 @@
 #     unconditionally just churns rollouts. Set FORCE_KYVERNO_FIX=1 to bypass the heuristic.
 #
 # See VCFA_Stabilizer_Incident_Apr2026.md for the gateway/EnvoyProxy guidance and HTTP 503 recovery.
+#
+# v2.25 changelog (2026-08-20):
+#  * FIX (SSH transport & auto-discovery): Fixed unexpanded double-quoted "${VCFA_SSH_OPTS}" in
+#    check_prerequisites which caused ssh command-line option parsing failure on direct password auth.
+#  * ENHANCEMENT (Resilient multi-mode discovery): Added comprehensive multi-target connection auto-discovery:
+#    - Host reachability probe: automatically tests candidate VCFA hostnames/IPs (10.1.1.71, 10.1.1.73,
+#      vcfa-01a.site-a.vcf.lab, vcfa.site-a.vcf.lab) if the configured host is unresponsive on port 22.
+#    - Multi-user authentication fallback: automatically tries vmware-system-user, root, and holuser.
+#    - Key discovery: tests explicit key, then iterates standard local keys (~/.ssh/id_rsa, id_ed25519, id_ecdsa).
+#    - Dynamic in-memory creds fallback: generates secure temporary creds file if CREDS_FILE is missing but
+#      VCFA_PASSWORD is set in environment.
 #
 # v2.24 changelog (2026-08-20):
 #  * DOCS / TRACEABILITY: Appended official Broadcom Knowledge Base (KB) article numbers to all
@@ -906,12 +917,36 @@ check_prerequisites() {
 
     local auth_success=0
 
+    # 0. Host connectivity & reachability auto-discovery
+    # If the default/configured VCFA_HOST is not reachable on port 22, check candidate IPs/names
+    local host_reachable=0
+    if timeout 3 bash -c "</dev/tcp/${VCFA_HOST}/22" 2>/dev/null; then
+        host_reachable=1
+    fi
+
+    if [[ "$host_reachable" -eq 0 && -z "${STABILIZER_JUMP_HOST:-}" ]]; then
+        warning "Configured VCFA_HOST (${VCFA_HOST}) not reachable on port 22; probing candidate hosts..."
+        local candidates=("10.1.1.71" "10.1.1.73" "vcfa-01a.site-a.vcf.lab" "vcfa.site-a.vcf.lab")
+        for cand in "${candidates[@]}"; do
+            [[ "$cand" == "$VCFA_HOST" ]] && continue
+            if timeout 2 bash -c "</dev/tcp/${cand}/22" 2>/dev/null; then
+                info "Discovered active VCFA appliance at ${cand} - switching target host."
+                VCFA_HOST="$cand"
+                API_SERVER="https://${VCFA_HOST}:6443"
+                KUBECTL_CMD="kubectl --kubeconfig=/etc/kubernetes/admin.conf --server=${API_SERVER}"
+                host_reachable=1
+                break
+            fi
+        done
+    fi
+
     # 1. If STABILIZER_VCFA_IDENTITY_FILE is specified, try key-based authentication first
     if [[ -n "${STABILIZER_VCFA_IDENTITY_FILE:-}" && -f "${STABILIZER_VCFA_IDENTITY_FILE}" ]]; then
         if [[ -n "${STABILIZER_JUMP_HOST:-}" ]]; then
             if ssh "${STABILIZER_SSH_MUX_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$STABILIZER_JUMP_HOST" \
                 "ssh -i $(printf '%q' "$STABILIZER_VCFA_IDENTITY_FILE") -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no ${VCFA_USER}@${VCFA_HOST} echo ok" &>/dev/null; then
                 auth_success=1
+                info "Authenticated via jump host using specified key (${STABILIZER_VCFA_IDENTITY_FILE})."
             else
                 warning "SSH key authentication ($STABILIZER_VCFA_IDENTITY_FILE) failed via jump host; falling back to password auth..."
                 STABILIZER_VCFA_IDENTITY_FILE=""
@@ -919,6 +954,7 @@ check_prerequisites() {
         else
             if ssh "${STABILIZER_SSH_MUX_OPTS[@]}" -i "$STABILIZER_VCFA_IDENTITY_FILE" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no "${VCFA_USER}@${VCFA_HOST}" "echo ok" &>/dev/null; then
                 auth_success=1
+                info "Authenticated using specified key (${STABILIZER_VCFA_IDENTITY_FILE})."
             else
                 warning "SSH key authentication ($STABILIZER_VCFA_IDENTITY_FILE) failed; falling back to password auth..."
                 STABILIZER_VCFA_IDENTITY_FILE=""
@@ -949,22 +985,52 @@ check_prerequisites() {
                 error "sshpass is required for password auth (or set STABILIZER_VCFA_IDENTITY_FILE). Install: sudo apt-get install sshpass"
                 exit 1
             fi
+            if [[ ! -f "$CREDS_FILE" && -n "${VCFA_PASSWORD:-}" ]]; then
+                # Fallback: create temporary credentials file if VCFA_PASSWORD is set in environment
+                CREDS_FILE="/tmp/.vcfa_creds_$$"
+                echo "$VCFA_PASSWORD" > "$CREDS_FILE"
+                chmod 600 "$CREDS_FILE"
+            fi
             if [[ ! -f "$CREDS_FILE" ]]; then
                 error "Credentials file $CREDS_FILE not found"
                 exit 1
             fi
-            if sshpass -f "$CREDS_FILE" ssh "${STABILIZER_SSH_MUX_OPTS[@]}" "${VCFA_SSH_OPTS}" -o ConnectTimeout=10 "${VCFA_USER}@${VCFA_HOST}" "echo ok" &>/dev/null; then
+            if sshpass -f "$CREDS_FILE" ssh "${STABILIZER_SSH_MUX_OPTS[@]}" ${VCFA_SSH_OPTS} -o ConnectTimeout=10 "${VCFA_USER}@${VCFA_HOST}" "echo ok" &>/dev/null; then
                 auth_success=1
             fi
         fi
     fi
 
-    # 3. If password auth also failed, check if an unconfigured local id_rsa works as recovery
-    if [[ "$auth_success" -eq 0 && -z "${STABILIZER_VCFA_IDENTITY_FILE:-}" && -f "/home/holuser/.ssh/id_rsa" ]]; then
-        if ssh "${STABILIZER_SSH_MUX_OPTS[@]}" -i "/home/holuser/.ssh/id_rsa" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no "${VCFA_USER}@${VCFA_HOST}" "echo ok" &>/dev/null; then
-            auth_success=1
-            STABILIZER_VCFA_IDENTITY_FILE="/home/holuser/.ssh/id_rsa"
-        fi
+    # 3. If primary user password auth failed, try alternate usernames (root, holuser, vmware-system-user)
+    if [[ "$auth_success" -eq 0 && -f "$CREDS_FILE" && -z "${STABILIZER_JUMP_HOST:-}" ]]; then
+        local user_candidates=("vmware-system-user" "root" "holuser")
+        for u in "${user_candidates[@]}"; do
+            [[ "$u" == "$VCFA_USER" ]] && continue
+            if sshpass -f "$CREDS_FILE" ssh "${STABILIZER_SSH_MUX_OPTS[@]}" ${VCFA_SSH_OPTS} -o ConnectTimeout=8 "${u}@${VCFA_HOST}" "echo ok" &>/dev/null; then
+                auth_success=1
+                info "Authenticated successfully with alternate user: ${u}"
+                VCFA_USER="$u"
+                break
+            fi
+        done
+    fi
+
+    # 4. If password auth also failed, scan for existing local SSH keys (~/.ssh/id_rsa, ~/.ssh/id_ed25519, ~/.ssh/id_ecdsa)
+    if [[ "$auth_success" -eq 0 && -z "${STABILIZER_VCFA_IDENTITY_FILE:-}" ]]; then
+        local key_candidates=("/home/holuser/.ssh/id_rsa" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_ecdsa")
+        local user_list=("$VCFA_USER" "vmware-system-user" "root")
+        for k in "${key_candidates[@]}"; do
+            [[ -f "$k" ]] || continue
+            for u in "${user_list[@]}"; do
+                if ssh "${STABILIZER_SSH_MUX_OPTS[@]}" -i "$k" -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no "${u}@${VCFA_HOST}" "echo ok" &>/dev/null; then
+                    auth_success=1
+                    STABILIZER_VCFA_IDENTITY_FILE="$k"
+                    VCFA_USER="$u"
+                    info "Authenticated successfully using auto-discovered SSH key (${k}) as user ${u}."
+                    break 2
+                fi
+            done
+        done
     fi
 
     if [[ "$auth_success" -eq 0 ]]; then
@@ -3293,7 +3359,7 @@ SIG
 # Handle script arguments
 case "${1:-}" in
     --help|-h)
-        echo "VCFA Complete Stabilization Script v2.24"
+        echo "VCFA Complete Stabilization Script v2.25"
         echo ""
         echo "Usage: $0 [options]"
         echo ""
