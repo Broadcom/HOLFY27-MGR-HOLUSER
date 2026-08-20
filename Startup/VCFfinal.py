@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.45 - 2026-08-18
+# Version 6.3.46 - 2026-08-20
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.46 Changes:
+# - Task 6: Fixed misleading "not accessible after 30 minutes" failure message when checking
+#   opslogs URL with 15s retry interval. Added dynamic retry calculation and accurate elapsed time reporting.
+# - Task 6: Enhanced opslogs URL verification with progressive diagnostic snapshots (every 60s)
+#   and targeted auto-healing (bouncing log-processor when OpenSearch is ready to resolve connection backoff).
+# - Task 2e: Added early proactive ops-logs pre-warming immediately after control plane connectivity
+#   is established, maximizing background OpenSearch/log-processor initialization time while parallel
+#   checks (certificates, proxy, Salt) run.
 #
 # v6.3.45 Changes:
 # - Task 2e: Added non-critical workload timeout handling (5-minute soft cap for
@@ -1754,6 +1763,17 @@ def main(lsf=None, standalone=False, dry_run=False):
                     else:
                         ssh_cmd = f"sudo -i bash -c \\\"\\$(echo {cmd_b64} | base64 -d)\\\""
                     return lsf.ssh(ssh_cmd, f'{vsp_user}@{vsp_control_plane_ip}')
+
+                # ---- Early proactive pre-warming for ops-logs ----
+                # Start ops-logs early so OpenSearch and Log Processor can begin background initialization
+                # while subsequent pre-flights, cert checks, and other component setups run.
+                if any('ops-logs' in c.lower() for c in vcfcomponents):
+                    try:
+                        lsf.write_output('  Early pre-warming ops-logs CRD and StatefulSets...')
+                        vsp_kubectl('kubectl annotate components.api.vmsp.vmware.com ops-logs component.vmsp.vmware.com/operational-status=Running --overwrite 2>/dev/null')
+                        vsp_kubectl('kubectl scale statefulset/log-processor statefulset/log-store -n ops-logs --replicas=1 2>&1')
+                    except Exception as _ops_init_exc:
+                        lsf.write_output(f'  WARNING: Early ops-logs pre-warming error (non-fatal): {_ops_init_exc}')
 
                 # ---- Shared pre-flight health helpers ----
                 # Used to gate scale/rollout-restart/patch actions so they only run when the
@@ -4529,32 +4549,70 @@ echo "PROXY_CONFIGURED"
                 
                 url_success = False
                 opslogs_rescued = False
-                for attempt in range(1, VCFC_URL_MAX_RETRIES + 1):
+
+                # Configuration: Allocate appropriate timeout budget for URL verification
+                # For opslogs (15s poll), allow up to 100 attempts (25 mins) to detect readiness fast
+                is_opslogs = 'opslogs' in url.lower()
+                retry_delay = 15 if is_opslogs else VCFC_URL_RETRY_DELAY
+                max_wait_seconds = 1500 if is_opslogs else (VCFC_URL_MAX_RETRIES * VCFC_URL_RETRY_DELAY)
+                max_attempts = max(VCFC_URL_MAX_RETRIES, int(max_wait_seconds / retry_delay))
+
+                start_url_time = time.time()
+
+                for attempt in range(1, max_attempts + 1):
                     result = lsf.test_url(url, expected_text=expected, verify_ssl=False, timeout=30)
                     if result:
-                        lsf.write_output(f'  [SUCCESS] {url} (attempt {attempt})')
+                        elapsed = int(time.time() - start_url_time)
+                        lsf.write_output(f'  [SUCCESS] {url} (attempt {attempt}, {elapsed}s elapsed)')
                         url_success = True
                         vcfc_urls_passed += 1
                         break
                     else:
-                        if attempt == VCFC_URL_MAX_RETRIES:
-                            lsf.write_output(f'  [FAILED] {url} after {VCFC_URL_MAX_RETRIES} attempts')
+                        elapsed = int(time.time() - start_url_time)
+                        elapsed_mins = round(elapsed / 60, 1)
+
+                        if attempt == max_attempts:
+                            lsf.write_output(f'  [FAILED] {url} after {max_attempts} attempts ({elapsed_mins} minutes)')
                             vcfc_urls_failed += 1
-                            lsf.labfail(f'VCF Component URL {url} not accessible after {VCFC_URL_MAX_RETRIES} minutes')
+                            lsf.labfail(f'VCF Component URL {url} not accessible after {max_attempts} attempts ({elapsed_mins} minutes)')
                         else:
-                            if 'opslogs' in url.lower() and not opslogs_rescued:
-                                opslogs_rescued = True
-                                lsf.write_output(f'  [WARNING] opslogs unreachable at attempt {attempt}. Rescuing ops-logs component (VSP VIP 10.1.1.142)...')
+                            # Opslogs intelligent diagnostics and progressive remediation
+                            if is_opslogs:
                                 pwd = lsf.get_password()
-                                # Annotate Component CRD FIRST to prevent operator race-down
-                                lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl annotate components.api.vmsp.vmware.com ops-logs component.vmsp.vmware.com/operational-status=Running --overwrite 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
-                                # Scale StatefulSets SECOND
-                                scale_result = lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl scale statefulset/log-processor statefulset/log-store -n ops-logs --replicas=1 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
-                                scale_out = scale_result.stdout.strip() if hasattr(scale_result, 'stdout') and scale_result.stdout else '(no output / SSH failed)'
-                                lsf.write_output(f'  StatefulSet rescale result: {scale_out}')
-                            
-                            retry_delay = 15 if 'opslogs' in url.lower() else VCFC_URL_RETRY_DELAY
-                            lsf.write_output(f'  Sleeping and will try again... {attempt} / {VCFC_URL_MAX_RETRIES} ({retry_delay}s delay)')
+
+                                # 1. Immediate rescue on initial failure (Attempt 1)
+                                if not opslogs_rescued:
+                                    opslogs_rescued = True
+                                    lsf.write_output(f'  [WARNING] opslogs unreachable at attempt {attempt}. Ensuring CRD operational status and scaling StatefulSets (VSP VIP 10.1.1.142)...')
+                                    lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl annotate components.api.vmsp.vmware.com ops-logs component.vmsp.vmware.com/operational-status=Running --overwrite 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
+                                    scale_res = lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl scale statefulset/log-processor statefulset/log-store -n ops-logs --replicas=1 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
+                                    scale_out = scale_res.stdout.strip() if hasattr(scale_res, 'stdout') and scale_res.stdout else '(no output / SSH failed)'
+                                    lsf.write_output(f'  StatefulSet rescale result: {scale_out}')
+
+                                # 2. Periodic pod diagnostic snapshot every 4 attempts (~60 seconds)
+                                elif attempt % 4 == 0:
+                                    diag_res = lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl get pods -n ops-logs -o wide 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
+                                    if hasattr(diag_res, 'stdout') and diag_res.stdout:
+                                        pod_lines = [l.strip() for l in diag_res.stdout.splitlines() if 'log-' in l]
+                                        if pod_lines:
+                                            lsf.write_output(f'  [DIAGNOSTIC {attempt}/{max_attempts}] ops-logs pods: {" | ".join(pod_lines)}')
+
+                                # 3. Targeted Healing at Attempt 16 (~4 mins), 32 (~8 mins), 48 (~12 mins), 64 (~16 mins)
+                                # If log-store is 1/1 Running but log-processor is stuck with 500 error, bounce log-processor pod
+                                if attempt in (16, 32, 48, 64):
+                                    heal_cmd = (
+                                        "STORE_READY=$(kubectl get pod log-store-0 -n ops-logs -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null); "
+                                        "PROC_READY=$(kubectl get pod log-processor-0 -n ops-logs -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null); "
+                                        "if [ \"$STORE_READY\" = \"true\" ] && [ \"$PROC_READY\" != \"true\" ]; then "
+                                        "  echo 'OpenSearch is Ready; restarting log-processor pod to force fresh connection'; "
+                                        "  kubectl delete pod log-processor-0 -n ops-logs --grace-period=0 --force 2>&1; "
+                                        "fi"
+                                    )
+                                    heal_res = lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c '{heal_cmd}'", 'vmware-system-user@10.1.1.142', pwd)
+                                    if hasattr(heal_res, 'stdout') and heal_res.stdout.strip():
+                                        lsf.write_output(f'  [HEALING] {heal_res.stdout.strip()}')
+
+                            lsf.write_output(f'  Sleeping and will try again... {attempt} / {max_attempts} ({retry_delay}s delay, {elapsed}s elapsed)')
                             lsf.labstartup_sleep(retry_delay)
         
         lsf.write_output(f'VCF Component URL check complete: {vcfc_urls_passed}/{vcfc_urls_checked} passed')
