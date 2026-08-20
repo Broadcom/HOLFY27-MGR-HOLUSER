@@ -220,6 +220,8 @@ def _build_policies(
                 "browser.tabs.crashReporting.sendReport": False,
                 "browser.crashReports.unsubmittedCheck.enabled": False,
                 "browser.crashReports.unsubmittedCheck.autoSubmit2": False,
+                # Prevent site specific zoom differences
+                "browser.display.zoom.site-specific": False,
                 # Autofill — preserve form and credential autofill behaviour.
                 "browser.formfill.enable": True,
                 "browser.formfill.autoFill": True,
