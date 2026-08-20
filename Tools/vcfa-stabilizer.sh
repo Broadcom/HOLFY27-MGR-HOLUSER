@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VCFA Complete Stabilization Script v2.23
-# Version 2.23 - 2026-08-19
+# VCFA Complete Stabilization Script v2.24
+# Version 2.24 - 2026-08-20
 # Author - HOL Core Team
 #
 # Default-run philosophy (v2.6+): one run of the script with no flags should leave the VCFA in a
@@ -43,6 +43,18 @@
 #     unconditionally just churns rollouts. Set FORCE_KYVERNO_FIX=1 to bypass the heuristic.
 #
 # See VCFA_Stabilizer_Incident_Apr2026.md for the gateway/EnvoyProxy guidance and HTTP 503 recovery.
+#
+# v2.24 changelog (2026-08-20):
+#  * DOCS / TRACEABILITY: Appended official Broadcom Knowledge Base (KB) article numbers to all
+#    Phase banner lines in script output:
+#    - Phase 1:   KB 326114 / KB 326113 (Health validation & pod/log descriptions)
+#    - Phase 1.5: KB 327477 / KB 380701 / KB 326110 (etcd defrag/space exhaustion, CP systemd & disk pressure)
+#    - Phase 2:   KB 322724 / KB 426075 (Health probe timeouts & startupProbe loops)
+#    - Phase 3:   KB 440167 / KB 392417 / KB 372624 / KB 417831 / KB 435491 (ccs-k3s SAN cert bloat,
+#                 RabbitMQ cookie/copy-config, Postgres permissions, Provisioning OOM, CSI controller leases)
+#    - Phase 3.5: KB 439264 / KB 424402 (Envoy Gateway SDS SAN NACK HTTP 503 & platform-trust sync)
+#    - Phase 4-6: KB 326114 (Stabilization wait, 5x endpoint verification suite, continuous health monitoring)
+#
 #
 # v2.23 changelog (2026-08-19):
 #  * ENHANCEMENT (SSH multiplexing): Extended OpenSSH ControlMaster connection sharing to direct
@@ -941,7 +953,7 @@ check_prerequisites() {
                 error "Credentials file $CREDS_FILE not found"
                 exit 1
             fi
-            if sshpass -f "$CREDS_FILE" ssh "${STABILIZER_SSH_MUX_OPTS[@]}" ${VCFA_SSH_OPTS} -o ConnectTimeout=10 "${VCFA_USER}@${VCFA_HOST}" "echo ok" &>/dev/null; then
+            if sshpass -f "$CREDS_FILE" ssh "${STABILIZER_SSH_MUX_OPTS[@]}" "${VCFA_SSH_OPTS}" -o ConnectTimeout=10 "${VCFA_USER}@${VCFA_HOST}" "echo ok" &>/dev/null; then
                 auth_success=1
             fi
         fi
@@ -3102,7 +3114,7 @@ CERT_CHECK_BODY
 # Main execution function
 main() {
     echo "======================================================================"
-    echo "           VCFA Complete Stabilization Script v2.23"
+    echo "           VCFA Complete Stabilization Script v2.24"
     echo "======================================================================"
     echo "Comprehensive VCFA stability solution for nested environments"
     echo "All phases run on every invocation; each step is self-checking and reports"
@@ -3199,11 +3211,11 @@ SIG
     vcfa_ssh_nosudo "$_sig_cmd" 2>/dev/null || warning "incident-signature snapshot unavailable (continuing)"
 
     echo ""
-    info "=== PHASE 1: Initial System Assessment ==="
+    info "=== PHASE 1: Initial System Assessment [Broadcom KB 326114 / KB 326113] ==="
     get_system_status
 
     echo ""
-    info "=== PHASE 1.5: Control-plane preflight (v2.6 prophylaxis) ==="
+    info "=== PHASE 1.5: Control-plane preflight (v2.6 prophylaxis) [Broadcom KB 327477 / KB 380701 / KB 326110] ==="
     # Each sub-step compares current state to desired and prints "(no-op)" when already correct.
     # Covers: VIP pinning, etcd defrag, kube-vip manifest hardening, kube-apiserver/kcm/scheduler
     # probe tuning, kyverno failurePolicy, vmsp-platform kube-vip DaemonSet, drift watchers.
@@ -3232,16 +3244,16 @@ SIG
     fi
     
     echo ""
-    info "=== PHASE 2: Authentication Services Stabilization ==="
+    info "=== PHASE 2: Authentication Services Stabilization [Broadcom KB 322724 / KB 426075] ==="
     fix_authentication_services
     
     echo ""
-    info "=== PHASE 3: VCFA Core Components Stabilization ==="
+    info "=== PHASE 3: VCFA Core Components Stabilization [Broadcom KB 440167 / KB 392417 / KB 372624 / KB 417831 / KB 435491] ==="
     fix_vcfa_core_components
     fix_vcf_final_edge_cases
     
     echo ""
-    info "=== PHASE 3.5: SDS NACK auto-fix (v2.4) ==="
+    info "=== PHASE 3.5: SDS NACK auto-fix (v2.4) [Broadcom KB 439264 / KB 424402] ==="
     # Idempotent: if every BackendTLSPolicy already uses caCertificateRefs and operator already has 4Gi,
     # the helper is a no-op. Otherwise it applies the durable fix discovered during the Apr 2026 incident.
     if [[ "${STABILIZER_SKIP_SDS_FIX:-0}" == "1" ]]; then
@@ -3251,15 +3263,15 @@ SIG
     fi
     
     echo ""
-    info "=== PHASE 4: Waiting for Stabilization ==="
+    info "=== PHASE 4: Waiting for Stabilization [Broadcom KB 326114] ==="
     wait_for_stabilization
     
     echo ""
-    info "=== PHASE 5: Verification ==="
+    info "=== PHASE 5: Verification [Broadcom KB 326114] ==="
     verify_fixes
     
     echo ""
-    info "=== PHASE 6: Setup Monitoring ==="
+    info "=== PHASE 6: Setup Monitoring [Broadcom KB 326114] ==="
     generate_verification_script
     
     echo ""
@@ -3281,7 +3293,7 @@ SIG
 # Handle script arguments
 case "${1:-}" in
     --help|-h)
-        echo "VCFA Complete Stabilization Script v2.23"
+        echo "VCFA Complete Stabilization Script v2.24"
         echo ""
         echo "Usage: $0 [options]"
         echo ""
