@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.16 - 2026-07-02
+# Version 3.17 - 2026-08-21
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
 
@@ -594,12 +594,12 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.generate_html()
 
     #==========================================================================
-    # TASK 11: Ensure Technitium DNS Local Endpoint 10.1.1.1:53
+    # TASK 11: Ensure Technitium DNS Local Endpoints (10.1.1.1:53, 10.2.1.1:53)
     #==========================================================================
 
-    REQUIRED_DNS_ENDPOINT = '10.1.1.1:53'
+    REQUIRED_DNS_ENDPOINTS = ['10.1.1.1:53', '10.2.1.1:53']
     lsf.write_output(
-        f'Checking Technitium DNS local endpoints for {REQUIRED_DNS_ENDPOINT}...'
+        f'Checking Technitium DNS local endpoints for {", ".join(REQUIRED_DNS_ENDPOINTS)}...'
     )
 
     try:
@@ -659,33 +659,37 @@ def main(lsf=None, standalone=False, dry_run=False):
 
         # Fetch current settings and check the local endpoints list
         _settings = _tdns_post('settings/get', {'token': _tok})
-        _current = _settings.get('response', {}).get('dnsServerLocalEndPoints', [])
+        _current = _settings.get('response', {}).get('dnsServerLocalEndPoints') or []
+        if not isinstance(_current, list):
+            _current = [_current]
 
-        if REQUIRED_DNS_ENDPOINT in _current:
+        _missing = [ep for ep in REQUIRED_DNS_ENDPOINTS if ep not in _current]
+
+        if not _missing:
             lsf.write_output(
-                f'{REQUIRED_DNS_ENDPOINT} already present in DNS local endpoints: {_current}'
+                f'All required DNS endpoints ({", ".join(REQUIRED_DNS_ENDPOINTS)}) already present in DNS local endpoints: {_current}'
             )
         else:
             lsf.write_output(
-                f'{REQUIRED_DNS_ENDPOINT} not found in DNS local endpoints {_current}; adding...'
+                f'Required DNS endpoint(s) {_missing} not found in DNS local endpoints {_current}; adding...'
             )
             if not dry_run:
-                _new_endpoints = _current + [REQUIRED_DNS_ENDPOINT]
+                _new_endpoints = list(_current) + _missing
                 _resp = _tdns_post(
                     'settings/set',
                     {'token': _tok, 'dnsServerLocalEndPoints': _new_endpoints},
                 )
                 if _resp.get('status') == 'ok':
                     lsf.write_output(
-                        f'Successfully added {REQUIRED_DNS_ENDPOINT} to DNS local endpoints'
+                        f'Successfully added {_missing} to DNS local endpoints'
                     )
                 else:
                     lsf.write_output(
-                        f'WARNING: Failed to add {REQUIRED_DNS_ENDPOINT} to DNS local endpoints: {_resp}'
+                        f'WARNING: Failed to add {_missing} to DNS local endpoints: {_resp}'
                     )
             else:
                 lsf.write_output(
-                    f'[dry-run] Would add {REQUIRED_DNS_ENDPOINT} to DNS local endpoints'
+                    f'[dry-run] Would add {_missing} to DNS local endpoints'
                 )
 
     except Exception as _e:
