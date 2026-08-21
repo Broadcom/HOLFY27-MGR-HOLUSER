@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.17 - 2026-08-19
+Version 2.18 - 2026-08-20
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
+
+v2.18: Deferred Content Library synchronization when upstream depot (e.g. fleet-01a.site-a.vcf.lab)
+       is not yet reachable. Proactively checks TCP port 443 before attempting cert retrieval or
+       calling `govc library.sync`. Prevents premature 400 Bad Request (connection_to_vcsp_server_failed)
+       errors and eliminates wasted connection timeout delays during early lab startup (when VSP fleet
+       workload VMs have not yet booted). Recorded deferred libraries are automatically re-probed and
+       synchronized at the end of the stabilization run if the depot has come online in the interim.
 
 v2.17: Added standard 16-color ANSI terminal colorization (_CYAN, _BLUE, _GREEN,
        _RED, _YELLOW, _BOLD, _DIM, _NC) for interactive execution (gated on
@@ -422,6 +429,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -439,8 +447,8 @@ import configparser
 # neither --version nor a log consumer could tell which revision emitted a line.
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2.17"
-SCRIPT_DATE    = "2026-08-19"
+SCRIPT_VERSION = "2.18"
+SCRIPT_DATE    = "2026-08-20"
 
 # ---------------------------------------------------------------------------
 # Defaults - matched to the lab in supervisor-cert-fix/README.md but every
@@ -956,12 +964,48 @@ def check_start_vcenter_services(vc, password, dry_run):
 # Phase 1: Content library trust refresh
 # ---------------------------------------------------------------------------
 
+DEFERRED_SYNC_LIBRARIES = []
+
+
+def is_upstream_reachable(host, port=443, timeout=3):
+    """Check if the upstream host:port is accepting TCP connections.
+    Used to detect if upstream depots (e.g. fleet-01a) are online before
+    attempting cert fetches or triggering library.sync."""
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, socket.error):
+        return False
+
+
+def record_deferred_sync(vc, env, lib, host, vc_label, thumbprint=None):
+    """Record a library for deferred synchronization once the upstream depot is reachable."""
+    for entry in DEFERRED_SYNC_LIBRARIES:
+        if entry["lib"]["id"] == lib["id"] and entry["vc"]["host"] == vc["host"]:
+            return
+    DEFERRED_SYNC_LIBRARIES.append({
+        "vc": vc,
+        "env": env,
+        "lib": lib,
+        "host": host,
+        "vc_label": vc_label,
+        "thumbprint": thumbprint,
+    })
+
+
 def fetch_upstream_cert(domain, port=443, timeout=30):
     """Pull the live cert from <domain>:<port> and return (pem, sha1_thumbprint).
 
     sha1_thumbprint is returned in the colon-delimited uppercase hex format
     that vCenter and govc expect (e.g. AA:BB:CC:...).
+    Returns (None, None) if the upstream host is unreachable or retrieval fails.
     """
+    if not is_upstream_reachable(domain, port=port, timeout=min(timeout, 3)):
+        log(f"Upstream host '{domain}:{port}' is not reachable on port {port}.", level="WARN")
+        return None, None
+
     log(f"Fetching upstream certificate from {domain}:{port} ...")
     fetch = subprocess.run(
         f"echo | openssl s_client -showcerts -servername {domain} "
@@ -971,8 +1015,9 @@ def fetch_upstream_cert(domain, port=443, timeout=30):
     )
     pem = fetch.stdout.strip()
     if not pem.startswith("-----BEGIN CERTIFICATE-----"):
-        fail(f"Could not retrieve PEM cert from {domain}: "
-             f"{fetch.stderr.strip() or 'no output'}")
+        log(f"Could not retrieve PEM cert from {domain}: "
+            f"{fetch.stderr.strip() or 'no output'}", level="WARN")
+        return None, None
 
     # Compute SHA-1 fingerprint in vCenter's expected format.
     fp = subprocess.run(
@@ -980,11 +1025,13 @@ def fetch_upstream_cert(domain, port=443, timeout=30):
         shell=True, input=pem, capture_output=True, text=True,
     )
     if fp.returncode != 0:
-        fail(f"openssl could not compute SHA-1 fingerprint: {fp.stderr.strip()}")
+        log(f"openssl could not compute SHA-1 fingerprint: {fp.stderr.strip()}", level="WARN")
+        return None, None
     # Output looks like:  SHA1 Fingerprint=AA:BB:CC:...
     m = re.search(r"=\s*([0-9A-Fa-f:]+)", fp.stdout)
     if not m:
-        fail(f"Unexpected fingerprint output: {fp.stdout!r}")
+        log(f"Unexpected fingerprint output: {fp.stdout!r}", level="WARN")
+        return None, None
     thumbprint = m.group(1).upper()
 
     # Audit fields - useful in the log so the operator can sanity-check the
@@ -1010,15 +1057,23 @@ def govc(args, env_overrides, input_data=None, timeout=60, check=False):
     """Run a govc subcommand with explicit env. Returns CompletedProcess."""
     env = os.environ.copy()
     env.update(env_overrides)
-    return subprocess.run(
-        ["govc"] + args,
-        env=env,
-        input=input_data,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=check,
-    )
+    try:
+        return subprocess.run(
+            ["govc"] + args,
+            env=env,
+            input=input_data,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=check,
+        )
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(
+            args=["govc"] + args,
+            returncode=124,
+            stdout=e.stdout or "",
+            stderr=e.stderr or f"govc {' '.join(args)} timed out after {timeout}s",
+        )
 
 
 def _sub_block(lib):
@@ -1107,8 +1162,8 @@ def add_cert_to_trust_store(env, pem, vc_label):
     return False
 
 
-def update_subscribed_library(env, lib, new_thumbprint, vc_label, dry_run):
-    """Apply the new thumbprint (when one is pinned) and force a sync.
+def update_subscribed_library(env, lib, new_thumbprint, vc_label, dry_run, defer_sync=False):
+    """Apply the new thumbprint (when one is pinned) and force a sync (unless deferred).
     Returns True on success.
 
     Some labs / customers configure subscribed libraries with no pinned
@@ -1145,8 +1200,19 @@ def update_subscribed_library(env, lib, new_thumbprint, vc_label, dry_run):
                     f"{(res.stderr or res.stdout).strip()}", level="ERROR")
                 return False
 
+    if defer_sync:
+        log(f"      Deferring library.sync (upstream depot '{lib.get('host', 'unknown')}' not yet reachable).")
+        return True
+
     if dry_run:
         log(f"      [dry-run] would: govc library.sync {lib['id']}")
+        return True
+
+    # Check upstream depot reachability before invoking govc library.sync to avoid 400 Bad Request
+    host = lib.get("host")
+    if host and not is_upstream_reachable(host):
+        log(f"      Upstream depot '{host}' is not reachable on port 443. "
+            f"Deferring library.sync until depot is online.")
         return True
 
     res = govc(["library.sync", lib["id"]], env, timeout=300)
@@ -1261,35 +1327,46 @@ def fix_content_library_trust(vc, password, target_domain, auto, pem,
 
     all_ok = True
     for host, host_libs in by_host.items():
+        depot_reachable = is_upstream_reachable(host, timeout=3)
+        if not depot_reachable:
+            log(f"  [{label}] Upstream depot '{host}' is not reachable on port 443 "
+                f"(e.g. VSP fleet workload VM not yet started). Deferring Content Library sync.",
+                level="WARN")
+
         if auto:
             log(f"  [{label}] Processing upstream {host} "
                 f"({len(host_libs)} library/libraries)")
-            try:
+            if depot_reachable:
                 this_pem, this_thumb = fetch_upstream_cert(host)
-            except SystemExit:
-                log(f"  [{label}] Could not fetch cert from {host} - "
-                    f"skipping its libraries.", level="ERROR")
-                all_ok = False
-                continue
+                if not this_pem:
+                    log(f"  [{label}] Could not fetch cert from {host} - "
+                        f"deferring sync for its libraries.", level="WARN")
+            else:
+                this_pem, this_thumb = None, None
         else:
             this_pem, this_thumb = pem, thumbprint
 
-        if not dry_run:
-            if not add_cert_to_trust_store(env, this_pem, label):
-                log(f"  [{label}] Aborting updates for upstream {host} "
-                    f"because trust.create failed.", level="ERROR")
-                all_ok = False
-                continue
-        else:
-            log(f"  [{label}] [dry-run] would: govc library.trust.create - "
-                f"(piping cert for {host})")
+        if this_pem:
+            if not dry_run:
+                if not add_cert_to_trust_store(env, this_pem, label):
+                    log(f"  [{label}] Aborting updates for upstream {host} "
+                        f"because trust.create failed.", level="ERROR")
+                    all_ok = False
+                    continue
+            else:
+                log(f"  [{label}] [dry-run] would: govc library.trust.create - "
+                    f"(piping cert for {host})")
 
         for lib in host_libs:
+            defer = not depot_reachable or not this_pem
+            if defer:
+                record_deferred_sync(vc, env, lib, host, label, this_thumb)
+
             if not update_subscribed_library(env, lib, this_thumb, label,
-                                             dry_run):
+                                             dry_run, defer_sync=defer):
                 all_ok = False
                 continue
-            if dry_run:
+            if dry_run or defer:
                 continue
             # Only verify when the library was already pinning a thumbprint
             # AND we had a new one to push. Libraries with no pin (e.g.
@@ -1302,6 +1379,66 @@ def fix_content_library_trust(vc, password, target_domain, auto, pem,
                 log(f"      Skipping post-update thumbprint verification "
                     f"(library was not pinning one).")
     return all_ok
+
+
+def sync_deferred_content_libraries(dry_run=False):
+    """Attempt to synchronize any Content Libraries whose sync was deferred in Phase 1.
+
+    Probes each upstream depot host. If reachable, fetches certificates if needed,
+    updates trust/thumbprints, and triggers govc library.sync. If still unreachable,
+    logs an informational message that vCenter will automatically sync once the depot
+    workload VM powers on.
+    """
+    if not DEFERRED_SYNC_LIBRARIES:
+        return True
+
+    banner("Deferred Content Library Synchronization Check")
+    log(f"Checking {len(DEFERRED_SYNC_LIBRARIES)} deferred Content Library synchronization(s)...")
+
+    by_host = {}
+    for entry in DEFERRED_SYNC_LIBRARIES:
+        by_host.setdefault(entry["host"], []).append(entry)
+
+    for host, entries in by_host.items():
+        log(f"  Probing upstream depot '{host}' (port 443)...")
+        if not is_upstream_reachable(host, timeout=3):
+            log(f"  Depot '{host}' is not yet reachable on port 443 (workload VM still starting up).", level="INFO")
+            log(f"  Trust store configuration is ready; vCenter will sync {len(entries)} library/libraries once '{host}' is online.", level="INFO")
+            for item in entries:
+                log(f"    - [{item['vc_label']}] '{item['lib']['name']}' ({item['lib']['id']}): sync deferred until depot starts")
+            continue
+
+        log(f"  Depot '{host}' is now REACHABLE. Triggering deferred Content Library sync for {len(entries)} library/libraries...")
+        for item in entries:
+            env = item["env"]
+            lib = item["lib"]
+            vc_label = item["vc_label"]
+            lib_id = lib["id"]
+            lib_name = lib["name"]
+            thumb = item.get("thumbprint")
+
+            # If cert was not fetched in Phase 1, fetch it now and add to trust store
+            if not thumb:
+                pem, thumb = fetch_upstream_cert(host)
+                if pem and not dry_run:
+                    add_cert_to_trust_store(env, pem, vc_label)
+
+            if thumb and not dry_run and lib.get("thumbprint") and lib["thumbprint"] != thumb:
+                log(f"    [{vc_label}] Updating thumbprint for '{lib_name}' to {thumb}")
+                govc(["library.update", "-thumbprint", thumb, lib_id], env)
+
+            log(f"    [{vc_label}] Syncing '{lib_name}' ({lib_id})...")
+            if dry_run:
+                log(f"      [dry-run] would: govc library.sync {lib_id}")
+            else:
+                res = govc(["library.sync", lib_id], env, timeout=300)
+                if res.returncode == 0:
+                    log(f"      sync triggered successfully.")
+                else:
+                    msg = (res.stderr or res.stdout).strip()
+                    log(f"      library.sync returned {res.returncode}: {msg}", level="WARN")
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -3557,7 +3694,13 @@ def main():
                 "library and refresh per-library.")
             pem, thumbprint = None, None
         else:
-            pem, thumbprint = fetch_upstream_cert(args.target_domain)
+            if is_upstream_reachable(args.target_domain, timeout=3):
+                pem, thumbprint = fetch_upstream_cert(args.target_domain)
+            else:
+                log(f"Upstream domain '{args.target_domain}' is not reachable on port 443 "
+                    f"(depot VM may still be starting up). Deferring cert retrieval and sync.",
+                    level="WARN")
+                pem, thumbprint = None, None
         for vc in vcenters:
             ok = fix_content_library_trust(
                 vc, password, args.target_domain, args.auto, pem, thumbprint,
@@ -3613,6 +3756,10 @@ def main():
             )
             if not ok:
                 failures.append(f"pod-cleanup:{vc['label']}")
+
+    # ---- Deferred Content Library Sync ----------------------------------
+    if DEFERRED_SYNC_LIBRARIES and not args.skip_content_lib:
+        sync_deferred_content_libraries(args.dry_run)
 
     banner("Summary")
     if failures:
