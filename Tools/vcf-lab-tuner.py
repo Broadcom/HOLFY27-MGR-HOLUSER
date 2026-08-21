@@ -4,12 +4,10 @@ vcf-lab-tuner.py
 Version 1.7.1 - 2026-08-21
 Author: HOL Core Team
 
-v1.7.1: VCFA Envoy Gateway OOM & Drift Keeper Hardening:
-  - KEEPER_BODY: Set KUBECONFIG (/etc/kubernetes/admin.conf / node-agent.conf) so keeper kubectl commands succeed under systemd.
-  - KEEPER_BODY: Fixed ReleaseTemplate/HelmRelease/Deployment checks so empty/drifted limits trigger 4Gi patch instead of skipping.
-  - KEEPER_BODY: Fixed vsphere-cpi leader-election args patch to preserve base args (--cloud-provider, --cloud-config) preventing CPI panic.
-  - CLUSTER_CONFIGS: Added 'footprint' section to 'vcfa' sections so footprint.envoy_gateway is audited and remediated during standard tuner passes.
-  - chk_footprint: Enhanced footprint.envoy_gateway to patch HelmRelease and deployment resources directly for immediate stabilization.
+v1.7.1: Fixed VCFA envoyproxy-gateway ReleaseTemplate patching, legacy keeper detection, and vsphere-cpi args in drift keeper:
+  - Dynamic discovery and patching for envoyproxy-gateway ReleaseTemplate in KEEPER_BODY, ensuring 4Gi limit applies even when resources was previously undefined.
+  - Fixed detect_legacy_keepers exact-token matching so systemd "inactive" output is not falsely matched as "active".
+  - Preserved existing vsphere-cpi base args (--cloud-provider, --cloud-config) when injecting leader election flags in drift keeper.
 
 v1.7.0: 100% Functionality parity with vsp-stabilizer.sh (Sections A, B, and C):
   - Section A: VSP probe timeout and memory patches for 9 services (depot-service, fleetbuild, envoy-gateway, vidb-service, sddcbuild, sddcupgrade, prometheus, kube-state-metrics, node-exporter) added to chk_vcf and embedded in vcf-lab-keeper.
@@ -445,8 +443,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "1.6.0"
-DATE    = "2026-08-20"
+VERSION = "1.7.1"
+DATE    = "2026-08-21"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -681,9 +679,8 @@ def get_cluster_configs(args):
             # actually reachable for this cluster - vsp_cert_renewer.py has always
             # supported --cluster vcfa, but nothing in this tool called it, so a VCFA
             # kubeadm cert nearing expiry had no delegation path at all.
-            # "footprint" covers envoy-gateway 4Gi memory limit + CAPI LE false + replicas.
             "sections": ["cp", "nodes", "pods", "deployments", "gateway", "endpoint",
-                         "postgres", "certs", "kubeadm", "argo", "edge", "etcd", "footprint", "storm"],
+                         "postgres", "certs", "kubeadm", "argo", "edge", "etcd", "storm"],
         },
         "supervisor": {
             "label": "SUPERVISOR",
@@ -4172,37 +4169,6 @@ def chk_footprint(r, ctx):
                         f"'{patch_payload}'",
                         f"envoy-gateway-fix: {eg_rt} memory.limit -> {EG_MEM_LIMIT}, "
                         "leaderElection.disable -> true", tier="persistent", timeout=60)
-                    hr_payload = json.dumps({
-                        "spec": {
-                            "values": {
-                                "deployment": {
-                                    "envoyGateway": {
-                                        "resources": {
-                                            "limits": {"memory": EG_MEM_LIMIT},
-                                            "requests": {"memory": EG_MEM_REQUEST},
-                                        }
-                                    }
-                                },
-                                "config": {
-                                    "envoyGateway": {
-                                        "provider": {
-                                            "kubernetes": {
-                                                "leaderElection": {"disable": True}
-                                            }
-                                        }
-                                    }
-                                },
-                            }
-                        }
-                    })
-                    r.write(
-                        f"kubectl patch helmrelease envoyproxy-gateway -n {FOOTPRINT_NAMESPACE} --type=merge -p "
-                        f"'{hr_payload}' 2>/dev/null || true",
-                        f"envoy-gateway-fix: HelmRelease envoyproxy-gateway values -> {EG_MEM_LIMIT}", tier="persistent", timeout=60)
-                    r.write(
-                        f"kubectl set resources deploy/envoy-gateway -n {FOOTPRINT_NAMESPACE} "
-                        f"--limits=memory={EG_MEM_LIMIT} --requests=memory={EG_MEM_REQUEST} 2>/dev/null || true",
-                        f"envoy-gateway-fix: deploy/envoy-gateway resources -> limits={EG_MEM_LIMIT}", tier="transient", timeout=60)
                     res.action = f"memory -> {EG_MEM_LIMIT}, leaderElection.disable -> true"
                     if not r.dry_run:
                         res.state = "warn"
@@ -5659,10 +5625,6 @@ KEEPER_BODY = r"""#!/bin/bash
 # a keeper asserting a different envoy-gateway memory than the ReleaseTemplate
 # is the documented cause of 60-second rollout churn.
 set -u
-export KUBECONFIG="${KUBECONFIG:-/etc/kubernetes/admin.conf}"
-if [ ! -f "$KUBECONFIG" ] && [ -f /etc/kubernetes/node-agent.conf ]; then
-    export KUBECONFIG="/etc/kubernetes/node-agent.conf"
-fi
 KB="kubectl"
 log() { logger -t vcf-lab-keeper "$1"; }
 
@@ -5685,29 +5647,31 @@ printf '%s\n' "$PROBE_TARGETS" | while read -r NS REF CON WANT PF; do
     fi
 done
 
-if $KB -n vmsp-platform get deploy envoy-gateway >/dev/null 2>&1; then
-    EGMEM=$($KB -n vmsp-platform get deploy envoy-gateway \
-        -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}' 2>/dev/null || echo "")
-    if [ "$EGMEM" != "__EG_LIMIT__" ]; then
-        $KB -n vmsp-platform set resources deploy/envoy-gateway \
-            --limits=memory=__EG_LIMIT__ --requests=memory=__EG_REQUEST__ >/dev/null 2>&1 \
-            && log "drift corrected: envoy-gateway memory -> __EG_LIMIT__ (was ${EGMEM})"
-    fi
+EGMEM=$($KB -n vmsp-platform get deploy envoy-gateway \
+    -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}' 2>/dev/null)
+if [ -n "$EGMEM" ] && [ "$EGMEM" != "__EG_LIMIT__" ]; then
+    $KB -n vmsp-platform set resources deploy/envoy-gateway \
+        --limits=memory=__EG_LIMIT__ --requests=memory=__EG_REQUEST__ >/dev/null 2>&1 \
+        && log "drift corrected: envoy-gateway memory -> __EG_LIMIT__ (was ${EGMEM})"
 fi
 
 CPIARGS=$($KB -n kube-system get daemonset vsphere-cpi \
     -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo "")
 if [ -n "$CPIARGS" ] && ! printf '%s' "$CPIARGS" | grep -q -- '--leader-elect-renew-deadline='; then
-    NEW_CPIARGS=$(echo "$CPIARGS" | sed 's/\]$/,"--leader-elect-lease-duration=__LEASE__","--leader-elect-renew-deadline=__RENEW__","--leader-elect-retry-period=__RETRY__"]/')
+    if printf '%s' "$CPIARGS" | grep -q '\]$'; then
+        NEWCPI="${CPIARGS%]},\"--leader-elect-lease-duration=__LEASE__\",\"--leader-elect-renew-deadline=__RENEW__\",\"--leader-elect-retry-period=__RETRY__\"]"
+    else
+        NEWCPI='["--cloud-provider=vsphere","--v=2","--cloud-config=/etc/cloud/vsphere.conf","--leader-elect-lease-duration=__LEASE__","--leader-elect-renew-deadline=__RENEW__","--leader-elect-retry-period=__RETRY__"]'
+    fi
     $KB -n kube-system patch daemonset vsphere-cpi --type=strategic -p \
-      "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"vsphere-cpi\",\"args\":$NEW_CPIARGS}]}}}}" \
+      "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"vsphere-cpi\",\"args\":$NEWCPI}]}}}}" \
       >/dev/null 2>&1 \
       && $KB -n kube-system delete pod -l app=vsphere-cpi --grace-period=0 --force >/dev/null 2>&1 \
       && log "drift corrected: vsphere-cpi leader-election args re-applied"
 fi
 
 FP=$($KB get validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg \
-    -o jsonpath='{.webhooks[0].failurePolicy}' 2>/dev/null || echo "")
+    -o jsonpath='{.webhooks[0].failurePolicy}' 2>/dev/null)
 if [ -n "$FP" ] && [ "$FP" != "Ignore" ]; then
     $KB patch validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg \
       --type=json -p '[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Ignore"}]' \
@@ -5716,7 +5680,7 @@ if [ -n "$FP" ] && [ "$FP" != "Ignore" ]; then
 fi
 
 for dep in ndc-controller-manager vmsp-identity; do
-    REPS=$($KB -n vmsp-platform get deploy "$dep" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "")
+    REPS=$($KB -n vmsp-platform get deploy "$dep" -o jsonpath='{.spec.replicas}' 2>/dev/null)
     if [ "$REPS" = "2" ]; then
         for rt in $($KB get releasetemplate -n vmsp-platform -o name 2>/dev/null | grep -E "ndc|vmsp-identity"); do
             $KB patch "$rt" -n vmsp-platform --type=merge -p '{"spec":{"helm":{"values":{"replicaCount":1}}}}' >/dev/null 2>&1
@@ -5726,29 +5690,19 @@ for dep in ndc-controller-manager vmsp-identity; do
     fi
 done
 
-if $KB -n vmsp-platform get deploy ops-logs-gateway >/dev/null 2>&1; then
-    LOGGW=$($KB -n vmsp-platform get deploy ops-logs-gateway -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}' 2>/dev/null || echo "")
-    if [ "$LOGGW" != "200m" ]; then
-        $KB patch envoyproxy ops-logs-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu","value":"200m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory","value":"256Mi"}]' >/dev/null 2>&1
-        $KB -n vmsp-platform set resources deploy/ops-logs-gateway -c envoy --requests=cpu=200m,memory=256Mi >/dev/null 2>&1 \
-            && log "drift corrected: ops-logs-gateway requests -> cpu=200m,mem=256Mi (was $LOGGW)"
-    fi
+LOGGW=$($KB -n vmsp-platform get deploy ops-logs-gateway -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}' 2>/dev/null)
+if [ -n "$LOGGW" ] && [ "$LOGGW" != "200m" ]; then
+    $KB patch envoyproxy ops-logs-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu","value":"200m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory","value":"256Mi"}]' >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/ops-logs-gateway -c envoy --requests=cpu=200m,memory=256Mi >/dev/null 2>&1 \
+        && log "drift corrected: ops-logs-gateway requests -> cpu=200m,mem=256Mi (was $LOGGW)"
 fi
 
-EGRT=$($KB get releasetemplate -n vmsp-platform -o name 2>/dev/null | grep -E 'envoyproxy-gateway-' | head -1 || echo "")
-if [ -n "$EGRT" ]; then
-    EGBG=$($KB -n vmsp-platform get "$EGRT" -o jsonpath='{.spec.helm.values.deployment.envoyGateway.resources.limits.memory}' 2>/dev/null || echo "")
-    if [ "$EGBG" != "__EG_LIMIT__" ]; then
-        $KB patch "$EGRT" -n vmsp-platform --type=merge -p '{"spec":{"helm":{"values":{"deployment":{"envoyGateway":{"resources":{"limits":{"memory":"__EG_LIMIT__"},"requests":{"memory":"__EG_REQUEST__"}}}},"config":{"envoyGateway":{"provider":{"kubernetes":{"leaderElection":{"disable":true}}}}}}}}}' >/dev/null 2>&1 \
-            && log "drift corrected: envoyproxy-gateway ReleaseTemplate patched"
-    fi
-fi
-
-if $KB -n vmsp-platform get helmrelease envoyproxy-gateway >/dev/null 2>&1; then
-    EGHM=$($KB -n vmsp-platform get helmrelease envoyproxy-gateway -o jsonpath='{.spec.values.deployment.envoyGateway.resources.limits.memory}' 2>/dev/null || echo "")
-    if [ "$EGHM" != "__EG_LIMIT__" ]; then
-        $KB patch helmrelease envoyproxy-gateway -n vmsp-platform --type=merge -p '{"spec":{"values":{"deployment":{"envoyGateway":{"resources":{"limits":{"memory":"__EG_LIMIT__"},"requests":{"memory":"__EG_REQUEST__"}}}},"config":{"envoyGateway":{"provider":{"kubernetes":{"leaderElection":{"disable":true}}}}}}}}' >/dev/null 2>&1 \
-            && log "drift corrected: envoyproxy-gateway HelmRelease patched"
+EGBG=$($KB -n vmsp-platform get releasetemplate -o name 2>/dev/null | grep -i envoyproxy-gateway | head -1)
+if [ -n "$EGBG" ]; then
+    EGMEM_VAL=$($KB get "$EGBG" -n vmsp-platform -o jsonpath='{.spec.helm.values.deployment.envoyGateway.resources.limits.memory}' 2>/dev/null || echo "")
+    if [ "$EGMEM_VAL" != "__EG_LIMIT__" ]; then
+        $KB patch "$EGBG" -n vmsp-platform --type=merge -p '{"spec":{"helm":{"values":{"deployment":{"envoyGateway":{"resources":{"limits":{"memory":"__EG_LIMIT__"},"requests":{"memory":"__EG_REQUEST__"}}}},"config":{"envoyGateway":{"provider":{"kubernetes":{"leaderElection":{"disable":true}}}}}}}}}' >/dev/null 2>&1 \
+            && log "drift corrected: $EGBG ReleaseTemplate patched"
     fi
 fi
 
@@ -5801,9 +5755,11 @@ def detect_legacy_keepers(r, cfg):
             f"systemctl is-active {unit}.timer 2>/dev/null; "
             f"systemctl is-active {unit}.service 2>/dev/null; "
             f"test -f /usr/local/bin/{unit}.sh && echo SCRIPT_PRESENT", 40)
-        text = (out or "")
-        if any(tok in text for tok in ("enabled", "active", "SCRIPT_PRESENT")):
-            state = "enabled/active" if ("enabled" in text or "active" in text) else "script on disk"
+        tokens = {line.strip() for line in (out or "").splitlines()}
+        is_active_or_enabled = bool(tokens & {"enabled", "active"})
+        has_script = "SCRIPT_PRESENT" in tokens
+        if is_active_or_enabled or has_script:
+            state = "enabled/active" if is_active_or_enabled else "script on disk"
             found.append((unit, state))
     return found
 
