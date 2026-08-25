@@ -1,7 +1,12 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.15 - 2026-08-19
+# Version 3.17 - 2026-08-25
 # Changes:
+# - Remove any legacy vsp-health-monitor crontab entry if present
+# - Added check_and_fix_console_taskbar(): preflight check and self-heal for the
+#   Main Console bottom taskbar (Ubuntu Dock). Detects missing/disabled GNOME extensions,
+#   unconfigured dash-to-dock positioning or autohide states, and remediates them to ensure
+#   the taskbar is fixed across the bottom. Runs immediately after black screen detection.
 # - Fix check_and_fix_console_black_screen(): replaced legacy /sys/class/graphics/fb0/blank
 #   heuristic (which always reads 4/blanked on Linux DRM/KMS vmwgfx drivers, falsely triggering
 #   unconditional GDM restarts on healthy systems) with a multi-signal GUI health verification:
@@ -577,6 +582,179 @@ check_gui_health
     return 0
 }
 
+# Preflight check and remediation for console GUI taskbar / bottom dock (v3.16).
+# Verifies that GNOME user extensions are globally enabled, ubuntu-dock extension
+# is enabled and active in the user session, and dash-to-dock is configured as a
+# fixed bottom panel (dock-position='BOTTOM', dock-fixed=true, autohide=false,
+# extend-height=true). ONLY remediates if the taskbar is missing or misconfigured.
+#
+# Runs once, only during a genuine startup (not labcheck), right after the console
+# black-screen preflight is completed.
+check_and_fix_console_taskbar() {
+    local console_host="root@console.site-a.vcf.lab"
+    local creds_file="/home/holuser/creds.txt"
+
+    if ! command -v sshpass >/dev/null 2>&1 || [ ! -f "${creds_file}" ]; then
+        log_msg "Console taskbar preflight: sshpass or creds.txt missing - skipping (non-fatal)." "${logfile}"
+        return 0
+    fi
+
+    local ssh_cmd="sshpass -f ${creds_file} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 ${console_host}"
+
+    log_msg "Console taskbar preflight: checking console bottom taskbar health..." "${logfile}"
+
+    local remote_check_script='
+check_taskbar_health() {
+    local HUID
+    HUID=$(id -u holuser 2>/dev/null || echo 1000)
+    local BUS="unix:path=/run/user/${HUID}/bus"
+
+    if [ ! -S "/run/user/${HUID}/bus" ]; then
+        echo "NO_BUS"
+        return 1
+    fi
+
+    # 1. Global user extensions toggle
+    local dis_ext
+    dis_ext=$(su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings get org.gnome.shell disable-user-extensions 2>/dev/null" | tr -d "[:space:]")
+    if [ "$dis_ext" = "true" ]; then
+        echo "EXTENSIONS_DISABLED"
+        return 1
+    fi
+
+    # 2. Enabled & disabled extensions lists
+    local en_ext
+    en_ext=$(su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings get org.gnome.shell enabled-extensions 2>/dev/null")
+    if ! echo "$en_ext" | grep -q "ubuntu-dock@ubuntu.com"; then
+        echo "DOCK_NOT_IN_ENABLED_EXTENSIONS"
+        return 1
+    fi
+
+    local dis_list
+    dis_list=$(su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings get org.gnome.shell disabled-extensions 2>/dev/null")
+    if echo "$dis_list" | grep -q "ubuntu-dock@ubuntu.com"; then
+        echo "DOCK_IN_DISABLED_EXTENSIONS"
+        return 1
+    fi
+
+    # 3. Live extension state (must be ACTIVE or ENABLED)
+    local ext_state
+    ext_state=$(su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gnome-extensions info ubuntu-dock@ubuntu.com 2>/dev/null" | grep -i "State:" | awk "{print \$2}")
+    if [ "$ext_state" != "ACTIVE" ] && [ "$ext_state" != "ENABLED" ]; then
+        echo "DOCK_NOT_ACTIVE"
+        return 1
+    fi
+
+    # 4. Dock position and panel configuration
+    local pos fixed autohide ext_height
+    pos=$(su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings get org.gnome.shell.extensions.dash-to-dock dock-position 2>/dev/null" | tr -d "[:space:]'\''")
+    fixed=$(su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings get org.gnome.shell.extensions.dash-to-dock dock-fixed 2>/dev/null" | tr -d "[:space:]")
+    autohide=$(su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings get org.gnome.shell.extensions.dash-to-dock autohide 2>/dev/null" | tr -d "[:space:]")
+    ext_height=$(su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings get org.gnome.shell.extensions.dash-to-dock extend-height 2>/dev/null" | tr -d "[:space:]")
+
+    if [ "$pos" != "BOTTOM" ] || [ "$fixed" != "true" ] || [ "$autohide" != "false" ] || [ "$ext_height" != "true" ]; then
+        echo "DOCK_CONFIG_MISMATCH"
+        return 1
+    fi
+
+    echo "OK"
+    return 0
+}
+check_taskbar_health
+'
+
+    local remote_fix_script='
+fix_taskbar() {
+    local HUID
+    HUID=$(id -u holuser 2>/dev/null || echo 1000)
+    local BUS="unix:path=/run/user/${HUID}/bus"
+
+    if [ ! -S "/run/user/${HUID}/bus" ]; then
+        return 1
+    fi
+
+    # Enable extensions globally
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings set org.gnome.shell disable-user-extensions false"
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings set org.gnome.shell disabled-extensions \"[]\""
+
+    # Enable individual extensions
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gnome-extensions enable ubuntu-dock@ubuntu.com 2>/dev/null || true"
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gnome-extensions enable ding@rastersoft.com 2>/dev/null || true"
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gnome-extensions enable ubuntu-appindicators@ubuntu.com 2>/dev/null || true"
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gnome-extensions enable tiling-assistant@ubuntu.com 2>/dev/null || true"
+
+    # Configure bottom panel dock
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings set org.gnome.shell.extensions.dash-to-dock dock-position \"BOTTOM\""
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings set org.gnome.shell.extensions.dash-to-dock dock-fixed true"
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings set org.gnome.shell.extensions.dash-to-dock autohide false"
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings set org.gnome.shell.extensions.dash-to-dock extend-height true"
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings set org.gnome.shell.extensions.dash-to-dock intellihide false"
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 26"
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings set org.gnome.shell.extensions.dash-to-dock show-trash true"
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings set org.gnome.shell.extensions.dash-to-dock show-show-apps-button true"
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings set org.gnome.shell.extensions.dash-to-dock show-running true"
+    su - holuser -c "DBUS_SESSION_BUS_ADDRESS=${BUS} gsettings set org.gnome.shell.extensions.dash-to-dock show-favorites true"
+
+    return 0
+}
+fix_taskbar
+'
+
+    local attempt check_result is_healthy=false
+    for attempt in 1 2 3; do
+        check_result=$(${ssh_cmd} "${remote_check_script}" 2>/dev/null | tr -d '\r' | tail -1)
+        if [ "$check_result" = "OK" ]; then
+            is_healthy=true
+            break
+        fi
+        # Only sleep and retry if user session bus is not yet available
+        if [ "$check_result" = "NO_BUS" ]; then
+            sleep 2
+        else
+            break
+        fi
+    done
+
+    if [ "$is_healthy" = true ]; then
+        log_msg "Console taskbar preflight: console taskbar is healthy and active - no action needed." "${logfile}"
+        return 0
+    fi
+
+    log_msg "Console taskbar preflight: problem detected (${check_result:-missing}) - configuring and enabling bottom taskbar..." "${logfile}"
+    ${ssh_cmd} "${remote_fix_script}" >/dev/null 2>&1
+    sleep 2
+
+    # Re-verify after applying gsettings
+    local post_check
+    post_check=$(${ssh_cmd} "${remote_check_script}" 2>/dev/null | tr -d '\r' | tail -1)
+    if [ "$post_check" = "OK" ]; then
+        log_msg "Console taskbar preflight: taskbar settings applied; console taskbar confirmed healthy." "${logfile}"
+        return 0
+    fi
+
+    # If extensions were started in a disabled/unloaded state by GNOME Shell, restart GDM to reload the session
+    log_msg "Console taskbar preflight: taskbar status after settings update: ${post_check:-unconfirmed} - restarting GDM to reload session..." "${logfile}"
+    if ${ssh_cmd} "systemctl restart gdm || systemctl restart gdm3" >/dev/null 2>&1; then
+        sleep 10
+        # Re-apply settings post-restart just in case and verify
+        ${ssh_cmd} "${remote_fix_script}" >/dev/null 2>&1
+        sleep 2
+        for attempt in 1 2 3 4 5; do
+            post_check=$(${ssh_cmd} "${remote_check_script}" 2>/dev/null | tr -d '\r' | tail -1)
+            if [ "$post_check" = "OK" ]; then
+                log_msg "Console taskbar preflight: GDM restarted successfully; console taskbar confirmed healthy." "${logfile}"
+                return 0
+            fi
+            sleep 3
+        done
+        log_msg "Console taskbar preflight: GDM restarted; final taskbar status: ${post_check:-unconfirmed} (non-fatal, continuing startup)." "${logfile}"
+    else
+        log_msg "WARNING: Console taskbar preflight: GDM restart command failed (non-fatal, continuing startup)." "${logfile}"
+    fi
+
+    return 0
+}
+
 push_router_files_nfs() {
     # Push router files via NFS instead of SCP
     # Note: vpodgitdir must be set before calling this function
@@ -920,6 +1098,11 @@ else
     # mount is confirmed - never on a labcheck cron cycle, so it can't interrupt
     # an actively-used desktop that is merely screen-locked/DPMS-blanked.
     check_and_fix_console_black_screen
+
+    # Console taskbar self-heal preflight (best-effort, non-fatal).
+    # Checks for missing or misconfigured bottom taskbar (Ubuntu Dock / dash-to-dock)
+    # and restores it only if missing/disabled.
+    check_and_fix_console_taskbar
 
     log_msg "Main Console mount is present. Clearing labstartup logs." "${logfile}"
     # Initialize the status dashboard to clear previous run info
@@ -1363,6 +1546,12 @@ date > ${holorouterdir}/gitdone
 #==============================================================================
 # RUN LABSTARTUP
 #==============================================================================
+
+# Remove any legacy vsp-health-monitor crontab entry if present
+if crontab -l 2>/dev/null | grep -q 'vsp-health-monitor'; then
+    log_msg "Removing vsp-health-monitor from crontab..." "${logfile}"
+    crontab -l 2>/dev/null | grep -v 'vsp-health-monitor' | crontab -
+fi
 
 if [ -f ${configini} ]; then
     if cp /tmp/config.ini /lmchol/tmp/config.ini 2>&1; then

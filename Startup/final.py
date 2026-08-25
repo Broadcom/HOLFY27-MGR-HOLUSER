@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # final.py - HOLFY27 Core Final Lab Checks
-# Version 3.4 - 2026-05-14
+# Version 3.5 - 2026-08-25
 # Author - Burke Azbill and HOL Core Team
 # Final lab startup checks and cleanup
 
@@ -8,6 +8,7 @@ import os
 import sys
 import argparse
 import logging
+import subprocess
 import urllib3
 
 # Suppress SSL warnings
@@ -33,6 +34,56 @@ MODULE_DESCRIPTION = 'Final lab startup checks and cleanup'
 #==============================================================================
 # MAIN FUNCTION
 #==============================================================================
+
+def run_update_script(lsf, cmd, start_msg, finish_msg, timeout=1800, dry_run=False):
+    """
+    Run an update script while streaming output in real time to lsf.write_output.
+    Fails startup via lsf.labfail() if the script returns a non-zero exit code or times out.
+    """
+    cmd_str = cmd if isinstance(cmd, str) else ' '.join(cmd)
+    if dry_run:
+        lsf.write_output(f'[DRY-RUN] Would run: {start_msg}')
+        return True
+
+    lsf.write_output(start_msg)
+    try:
+        env = dict(os.environ)
+        env['PYTHONUNBUFFERED'] = '1'
+        proc = subprocess.Popen(
+            cmd,
+            shell=isinstance(cmd, str),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env
+        )
+        for line in proc.stdout:
+            line = line.rstrip('\n')
+            if line.strip():
+                lsf.write_output(f'  {line}')
+
+        proc.wait(timeout=timeout)
+        if proc.returncode != 0:
+            msg = f'{start_msg} failed (exit code {proc.returncode}) - check labstartup.log for details'
+            lsf.write_output(f'ERROR: {msg}')
+            lsf.labfail(msg)
+            return False
+
+        lsf.write_output(finish_msg)
+        return True
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        msg = f'{start_msg} timed out after {timeout} seconds'
+        lsf.write_output(f'ERROR: {msg}')
+        lsf.labfail(msg)
+        return False
+    except Exception as e:
+        msg = f'Error running {start_msg}: {e}'
+        lsf.write_output(f'ERROR: {msg}')
+        lsf.labfail(msg)
+        return False
+
 
 def main(lsf=None, standalone=False, dry_run=False):
     """
@@ -64,12 +115,12 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard = None
     
     #==========================================================================
-    # TASK 1: Check for lab-specific final script
+    # TASK 1: Run Lab Updates & Custom Final Scripts
     #==========================================================================
     
-    lsf.write_output('Checking for lab-specific final script...')
+    lsf.write_output('Checking for lab-specific updates and custom scripts...')
     
-    # Check for final script in vPod repo
+    # 1a. Check for final script in vPod repo
     repo_final = os.path.join(lsf.vpod_repo, 'final_custom.py')
     if os.path.exists(repo_final):
         lsf.write_output(f'Running custom final script: {repo_final}')
@@ -85,6 +136,83 @@ def main(lsf=None, standalone=False, dry_run=False):
             except Exception as e:
                 lsf.write_output(f'Error running custom final script: {e}')
     
+    # 1b. Run the lab-update.sh script from the vpodrepo folder if it exists:
+    lab_update_script = f"{lsf.vpod_repo}/lab-update.sh"
+    if os.path.isfile(lab_update_script):
+        if not dry_run:
+            lsf.run_command(f"chmod +x {lab_update_script}")
+        run_update_script(
+            lsf,
+            f"/bin/bash {lab_update_script}",
+            start_msg=f"Running lab-update.sh from {lab_update_script}",
+            finish_msg="Finished Lab updates",
+            timeout=1800,
+            dry_run=dry_run
+        )
+    
+    # 1c. Run the lab-update.py script from the vpodrepo folder if it exists:
+    lab_update_python_script = f"{lsf.vpod_repo}/lab-update.py"
+    if os.path.isfile(lab_update_python_script):
+        if not dry_run:
+            lsf.run_command(f"chmod +x {lab_update_python_script}")
+        run_update_script(
+            lsf,
+            f"/usr/bin/python3 {lab_update_python_script}",
+            start_msg=f"Running lab-update.py from {lab_update_python_script}",
+            finish_msg="Finished Lab updates",
+            timeout=1800,
+            dry_run=dry_run
+        )
+
+    # 1d. Run labtype-specific lab-update.sh if present.
+    # Search order: external team repo (/home/holuser/{lsf.labtype}/) first,
+    # then in-repo (/home/holuser/hol/{lsf.labtype}/). First found wins.
+    labtype_update_sh = None
+    for candidate in [
+        f"{lsf.home}/{lsf.labtype}/lab-update.sh",
+        f"{lsf.holroot}/{lsf.labtype}/lab-update.sh",
+    ]:
+        if os.path.isfile(candidate):
+            labtype_update_sh = candidate
+            break
+    if labtype_update_sh:
+        if not dry_run:
+            lsf.run_command(f"chmod +x {labtype_update_sh}")
+        run_update_script(
+            lsf,
+            f"/bin/bash {labtype_update_sh}",
+            start_msg=f"Running labtype ({lsf.labtype}) lab-update.sh from {labtype_update_sh}",
+            finish_msg=f"Finished labtype ({lsf.labtype}) lab updates (sh)",
+            timeout=1800,
+            dry_run=dry_run
+        )
+
+    # 1e. Run labtype-specific lab-update.py if present.
+    # Search order: external team repo first, then in-repo. First found wins.
+    labtype_update_py = None
+    for candidate in [
+        f"{lsf.home}/{lsf.labtype}/lab-update.py",
+        f"{lsf.holroot}/{lsf.labtype}/lab-update.py",
+    ]:
+        if os.path.isfile(candidate):
+            labtype_update_py = candidate
+            break
+    if labtype_update_py:
+        if not dry_run:
+            lsf.run_command(f"chmod +x {labtype_update_py}")
+        run_update_script(
+            lsf,
+            f"/usr/bin/python3 {labtype_update_py}",
+            start_msg=f"Running labtype ({lsf.labtype}) lab-update.py from {labtype_update_py}",
+            finish_msg=f"Finished labtype ({lsf.labtype}) lab updates (py)",
+            timeout=1800,
+            dry_run=dry_run
+        )
+
+    if dashboard:
+        dashboard.update_task('final', 'custom', TaskStatus.COMPLETE)
+        dashboard.generate_html()
+
     #==========================================================================
     # TASK 2: Final Verification (Pings and URLs)
     #==========================================================================
@@ -138,41 +266,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                              lsf.write_output(f'  Expected: {expected_text}')
 
     #==========================================================================
-    # TASK 3: Lab Ready Recording
-    #==========================================================================
-    
-    if not dry_run:
-        lsf.write_output('Recording ready time...')
-        try:
-            # Calculate total runtime
-            import datetime
-            now = datetime.datetime.now()
-            runtime = now - lsf.start_time
-            minutes = runtime.total_seconds() / 60
-            
-            lsf.write_output(f'Lab ready after {minutes:.2f} minutes')
-            
-            # Write ready time to file
-            with open(lsf.ready_time_file, 'w') as f:
-                f.write(f'{minutes:.2f}\n')
-                
-        except Exception as e:
-            lsf.write_output(f'Error recording ready time: {e}')
-    
-    #==========================================================================
-    # TASK 4: Signal Router
-    #==========================================================================
-    
-    lsf.write_output('Signaling router that lab is ready...')
-    if not dry_run:
-        lsf.signal_router('ready')
-    
-    if dashboard:
-        dashboard.update_task('final', 'custom', TaskStatus.COMPLETE)
-        dashboard.generate_html()
-    
-    #==========================================================================
-    # TASK 5: LabCheck Schedule
+    # TASK 3: LabCheck Schedule
     #==========================================================================
     
     if dashboard:
@@ -202,7 +296,7 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.generate_html()
     
     #==========================================================================
-    # TASK 6: holuser Lock
+    # TASK 4: holuser Lock
     #==========================================================================
     
     if dashboard:
@@ -221,7 +315,6 @@ def main(lsf=None, standalone=False, dry_run=False):
             if not dry_run:
                 # Lock the holuser account
                 try:
-                    import subprocess
                     subprocess.run(['passwd', '-l', 'holuser'], capture_output=True)
                     lsf.write_output('holuser account locked')
                 except Exception as e:
@@ -239,17 +332,9 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.generate_html()
     
     #==========================================================================
-    # TASK 7: Lab Ready
-    #==========================================================================
-    
-    if dashboard:
-        dashboard.update_task('final', 'ready', TaskStatus.RUNNING)
-        dashboard.generate_html()
-    
-    #==========================================================================
-    # TASK 8: Clear All vCenter Alarms
-    # Runs as the very last step so alarms triggered during startup
-    # (e.g., VM CPU usage spikes from NSX Manager boot) are cleared.
+    # TASK 5: Clear All vCenter Alarms
+    # Runs after all startup tasks, lab updates, and verification have finished
+    # so alarms triggered during startup or lab updates are cleared.
     #==========================================================================
     
     if not dry_run:
@@ -273,71 +358,36 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_output(f'Cleared alarms on {cleared} vCenter session(s)')
         except Exception as e:
             lsf.write_output(f'Could not clear vCenter alarms: {e}')
-    
 
     #==========================================================================
-    # TASK 9: Run Lab Update script
+    # TASK 6: Lab Ready Recording & Signal Router
     #==========================================================================
     
-    # Run the lab-update.sh script from the vpodrepo folder if it exists:
-    lab_update_script = f"{lsf.vpod_repo}/lab-update.sh"
-    if os.path.isfile(lab_update_script):
-        lsf.write_output(f"Running lab-update.sh from {lab_update_script}")
-        lsf.run_command(f"chmod +x {lab_update_script}")
-        lsf.run_command(f"/bin/bash {lab_update_script}")
-        lsf.write_output("Finished Lab updates")
+    if dashboard:
+        dashboard.update_task('final', 'ready', TaskStatus.RUNNING)
+        dashboard.generate_html()
+
+    if not dry_run:
+        lsf.write_output('Recording ready time...')
+        try:
+            # Calculate total runtime
+            import datetime
+            now = datetime.datetime.now()
+            runtime = now - lsf.start_time
+            minutes = runtime.total_seconds() / 60
+            
+            lsf.write_output(f'Lab ready after {minutes:.2f} minutes')
+            
+            # Write ready time to file
+            with open(lsf.ready_time_file, 'w') as f:
+                f.write(f'{minutes:.2f}\n')
+                
+        except Exception as e:
+            lsf.write_output(f'Error recording ready time: {e}')
     
-    # Run the lab-update.py script from the vpodrepo folder if it exists:
-    lab_update_python_script = f"{lsf.vpod_repo}/lab-update.py"
-    if os.path.isfile(lab_update_python_script):
-        lsf.write_output(f"Running lab-update.py from {lab_update_python_script}")
-        lsf.run_command(f"chmod +x {lab_update_python_script}")
-        # Allow up to 30 minutes. For example:
-        #   kubectl rollout wait  ~10 min
-        #   cert install + nginx  ~3 min
-        #   post-install monitor  ~9 min (3 cycles × 3 min)
-        #   overhead              ~8 min
-        result = lsf.run_command(f"/usr/bin/python3 {lab_update_python_script}", timeout=1800)
-        if result.returncode != 0:
-            lsf.labfail("lab-update.py failed - check labstartup.log for details")
-        lsf.write_output("Finished Lab updates")
-
-    # Run labtype-specific lab-update.sh if present.
-    # Search order: external team repo (/home/holuser/{labtype}/) first,
-    # then in-repo (/home/holuser/hol/{labtype}/). First found wins.
-    labtype_update_sh = None
-    for candidate in [
-        f"{lsf.home}/{lsf.labtype}/lab-update.sh",
-        f"{lsf.holroot}/{lsf.labtype}/lab-update.sh",
-    ]:
-        if os.path.isfile(candidate):
-            labtype_update_sh = candidate
-            break
-    if labtype_update_sh:
-        lsf.write_output(f"Running labtype ({lsf.labtype}) lab-update.sh from {labtype_update_sh}")
-        lsf.run_command(f"chmod +x {labtype_update_sh}")
-        lsf.run_command(f"/bin/bash {labtype_update_sh}")
-        lsf.write_output(f"Finished labtype ({lsf.labtype}) lab updates (sh)")
-
-    # Run labtype-specific lab-update.py if present.
-    # Search order: external team repo first, then in-repo. First found wins.
-    labtype_update_py = None
-    for candidate in [
-        f"{lsf.home}/{lsf.labtype}/lab-update.py",
-        f"{lsf.holroot}/{lsf.labtype}/lab-update.py",
-    ]:
-        if os.path.isfile(candidate):
-            labtype_update_py = candidate
-            break
-    if labtype_update_py:
-        lsf.write_output(f"Running labtype ({lsf.labtype}) lab-update.py from {labtype_update_py}")
-        lsf.run_command(f"chmod +x {labtype_update_py}")
-        result = lsf.run_command(f"/usr/bin/python3 {labtype_update_py}", timeout=1800)
-        if result.returncode != 0:
-            lsf.labfail(f"labtype ({lsf.labtype}) lab-update.py failed - check labstartup.log for details")
-        lsf.write_output(f"Finished labtype ({lsf.labtype}) lab updates (py)")
-
-
+        lsf.write_output('Signaling router that lab is ready...')
+        lsf.signal_router('ready')
+    
     ##=========================================================================
     ## End Core Team code
     ##=========================================================================
@@ -359,11 +409,11 @@ def main(lsf=None, standalone=False, dry_run=False):
         dashboard.update_task('final', 'ready', TaskStatus.COMPLETE, 'Lab startup completed successfully')
         dashboard.generate_html()
     
-    # Update desktop background if needed
+    # Update desktop status if needed
     if not dry_run:
         try:
-            lsf.update_desktop_config('Ready')
-        except:
+            lsf.update_desktop_status('Ready', color='green')
+        except Exception:
             pass
 
 

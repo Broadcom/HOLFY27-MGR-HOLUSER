@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.46 - 2026-08-20
+# Version 6.3.48 - 2026-08-24
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.48 Changes:
+# - Task 2: Gate VSP CP machine type resize (cp.medium) behind [VCFFINAL]
+#   set_vsp_cp_to_medium in /tmp/config.ini. Only executes when explicitly
+#   enabled (commented out / disabled by default).
+#
+# v6.3.47 Changes:
+# - vcf-lab-tuner.py called instead of legacy scripts
+# - Task 7: Strict config.ini enforcement for Ops password extension; removed unconfigured
+#   hardcoded fallback nodes (ops-b, opscollector-01b, opsnet-b, 10.1.1.60, 10.2.1.60).
+# - Task 6: Converted opslogs URL check into an asynchronous background probe with 30s polling,
+#   120s throttled pod diagnostics, targeted auto-healing, and a 20-minute fail-safe timeout (lsf.labfail).
 #
 # v6.3.46 Changes:
 # - Task 6: Fixed misleading "not accessible after 30 minutes" failure message when checking
@@ -547,6 +559,7 @@ import ssl
 import time
 import json
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Add hol directory to path
@@ -558,6 +571,16 @@ logging.basicConfig(
     format='[%(asctime)s] %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+
+# Opslogs background probe tracking state
+opslogs_probe_state = {
+    'thread': None,
+    'success': False,
+    'done': False,
+    'failed': False,
+    'error': None,
+    'start_time': 0,
+}
 
 #==============================================================================
 # MODULE CONFIGURATION
@@ -582,6 +605,86 @@ WCP_SCRIPT_TIMEOUT = 1860  # 31 minutes (slightly more than max poll to allow sc
 #==============================================================================
 # HELPER FUNCTIONS
 #==============================================================================
+
+def _run_opslogs_background_probe(url, expected, lsf, dashboard=None, dry_run=False):
+    """
+    Asynchronous background probe for opslogs URL with 30s polling,
+    120s pod diagnostics, targeted log-processor pod bounce, and 20-minute hard timeout.
+    """
+    global opslogs_probe_state
+
+    if dry_run:
+        lsf.write_output(f'  [DRY-RUN] Would probe opslogs URL in background: {url}')
+        opslogs_probe_state['done'] = True
+        opslogs_probe_state['success'] = True
+        return
+
+    retry_delay = 30  # 30s polling interval
+    max_wait_seconds = 1200  # 20 minutes hard timeout cap
+    max_attempts = int(max_wait_seconds / retry_delay)  # 40 attempts
+
+    start_url_time = time.time()
+    opslogs_probe_state['start_time'] = start_url_time
+    opslogs_rescued = False
+
+    lsf.write_output(f'  [BACKGROUND PROBE START] Monitoring {url} (30s delay, max {max_attempts} attempts / 20 mins)...')
+
+    for attempt in range(1, max_attempts + 1):
+        result = lsf.test_url(url, expected_text=expected, verify_ssl=False, timeout=30)
+        if result:
+            elapsed = int(time.time() - start_url_time)
+            lsf.write_output(f'  [SUCCESS] {url} (attempt {attempt}, {elapsed}s elapsed, background probe)')
+            opslogs_probe_state['success'] = True
+            opslogs_probe_state['done'] = True
+            return
+        else:
+            elapsed = int(time.time() - start_url_time)
+            elapsed_mins = round(elapsed / 60, 1)
+
+            if attempt == max_attempts:
+                fail_msg = f'VCF Component URL {url} not accessible after {max_attempts} attempts ({elapsed_mins} minutes in background probe)'
+                lsf.write_output(f'  [FAILED] {fail_msg}')
+                opslogs_probe_state['failed'] = True
+                opslogs_probe_state['error'] = fail_msg
+                opslogs_probe_state['done'] = True
+                return
+            else:
+                pwd = lsf.get_password()
+
+                # 1. Immediate rescue on initial failure (Attempt 1)
+                if not opslogs_rescued:
+                    opslogs_rescued = True
+                    lsf.write_output(f'  [WARNING] opslogs unreachable at attempt {attempt}. Ensuring CRD operational status and scaling StatefulSets (VSP VIP 10.1.1.142)...')
+                    lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl annotate components.api.vmsp.vmware.com ops-logs component.vmsp.vmware.com/operational-status=Running --overwrite 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
+                    scale_res = lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl scale statefulset/log-processor statefulset/log-store -n ops-logs --replicas=1 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
+                    scale_out = scale_res.stdout.strip() if hasattr(scale_res, 'stdout') and scale_res.stdout else '(no output / SSH failed)'
+                    lsf.write_output(f'  StatefulSet rescale result: {scale_out}')
+
+                # 2. Periodic pod diagnostic snapshot every 4 attempts (at 30s delay = every 120 seconds / 2 mins)
+                elif attempt % 4 == 0:
+                    diag_res = lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl get pods -n ops-logs -o wide 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
+                    if hasattr(diag_res, 'stdout') and diag_res.stdout:
+                        pod_lines = [l.strip() for l in diag_res.stdout.splitlines() if 'log-' in l]
+                        if pod_lines:
+                            lsf.write_output(f'  [DIAGNOSTIC {attempt}/{max_attempts}] ops-logs pods: {" | ".join(pod_lines)}')
+
+                # 3. Targeted Healing at Attempts 8 (~4 min), 16 (~8 min), 24 (~12 min), 32 (~16 min)
+                if attempt in (8, 16, 24, 32):
+                    heal_cmd = (
+                        "STORE_READY=$(kubectl get pod log-store-0 -n ops-logs -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null); "
+                        "PROC_READY=$(kubectl get pod log-processor-0 -n ops-logs -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null); "
+                        "if [ \"$STORE_READY\" = \"true\" ] && [ \"$PROC_READY\" != \"true\" ]; then "
+                        "  echo 'OpenSearch is Ready; restarting log-processor pod to force fresh connection'; "
+                        "  kubectl delete pod log-processor-0 -n ops-logs --grace-period=0 --force 2>&1; "
+                        "fi"
+                    )
+                    heal_res = lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c '{heal_cmd}'", 'vmware-system-user@10.1.1.142', pwd)
+                    if hasattr(heal_res, 'stdout') and heal_res.stdout.strip():
+                        lsf.write_output(f'  [HEALING] {heal_res.stdout.strip()}')
+
+                lsf.write_output(f'  [BACKGROUND PROBE] Sleeping and will try again... {attempt} / {max_attempts} ({retry_delay}s delay, {elapsed}s elapsed)')
+                time.sleep(retry_delay)
+
 
 def resolve_host_fqdn(host):
     """
@@ -1211,48 +1314,33 @@ def main(lsf=None, standalone=False, dry_run=False):
             dashboard.generate_html()
         
         #----------------------------------------------------------------------
-        # TASK 2c: POST-VERIFY - Run supervisor_stabilizer.py for certificates/webhooks
-        # This script has its own internal polling (30s intervals, 30m max).
-        # It waits for SCP to become fully accessible before running fixes.
-        # (the script that checks and starts the vapi-endpoint, trustmanagement, 
-        # and wcp services) into Python natively within VCFfinal.py.
+        # TASK 2c: POST-VERIFY - Run vcf-lab-tuner.py for Supervisor stabilization
+        # Unified lab tuner handles Supervisor auto-discovery, certificates,
+        # webhooks, and proxy configuration via two-hop SSH.
         #----------------------------------------------------------------------
         lsf.write_output('='*60)
         lsf.write_output('Supervisor Stabilization (post-verify)')
         lsf.write_output('='*60)
         lsf.write_vpodprogress('Supervisor Stabilization', 'GOOD-3')
         
-        supervisor_stabilizer_script = '/home/holuser/hol/Tools/supervisor_stabilizer.py'
+        vcf_lab_tuner_script = '/home/holuser/hol/Tools/vcf-lab-tuner.py'
         wcp_certs_ok = True
         
-        if os.path.isfile(supervisor_stabilizer_script):
+        if os.path.isfile(vcf_lab_tuner_script):
             # Use the vCenters where we actually found Supervisors
             if not wcp_active_vcenters:
-                lsf.write_output('  No active Supervisor clusters found on any vCenter. Skipping stabilization script.')
+                lsf.write_output('  No active Supervisor clusters found on any vCenter. Skipping stabilization.')
                 wcp_certs_ok = True
             else:
-                lsf.write_output(f'Running: python3 {supervisor_stabilizer_script} --auto')
-                lsf.write_output(f'  (script will auto-discover and stabilize all active Supervisors)')
+                lsf.write_output(f'Running: python3 {vcf_lab_tuner_script} --cluster supervisor --mode remediate')
+                lsf.write_output(f'  (vcf-lab-tuner will auto-discover and stabilize all active Supervisors)')
                 
                 try:
-                    # Stream output line-by-line so the log shows progress in
-                    # real time rather than buffering the entire ~5-minute run
-                    # and dumping it all at once after the script exits.
-                    # -u forces Python unbuffered I/O; PYTHONUNBUFFERED=1 is a
-                    # belt-and-suspenders complement for any C-level buffering.
                     env = os.environ.copy()
                     env['PYTHONUNBUFFERED'] = '1'
-                    _stabilizer_cmd = ['python3', '-u', supervisor_stabilizer_script, '--auto']
-                    if not _proxy_required:
-                        # Non-HOL labtype: skip Phase 0 (vCenter PROXY/NO_PROXY)
-                        # and Phase 2 (SCP PROXY/NO_PROXY); cert phases still run.
-                        _stabilizer_cmd += ['--skip-vcenter-proxy', '--skip-proxy']
-                        lsf.write_output(
-                            '  Labtype does not require proxy — '
-                            'skipping vCenter and SCP proxy phases'
-                        )
+                    _tuner_cmd = ['python3', '-u', vcf_lab_tuner_script, '--cluster', 'supervisor', '--mode', 'remediate']
                     proc = subprocess.Popen(
-                        _stabilizer_cmd,
+                        _tuner_cmd,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         text=True,
@@ -1263,7 +1351,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                     for line in proc.stdout:
                         if time.time() - start_time > WCP_SCRIPT_TIMEOUT:
                             proc.kill()
-                            lsf.write_output('  WARNING: Supervisor stabilization script timed out')
+                            lsf.write_output('  WARNING: Supervisor lab tuner script timed out')
                             break
                         line_stripped = line.rstrip('\n')
                         if line_stripped.strip():
@@ -1274,7 +1362,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                     if exit_code == 0:
                         lsf.write_output(f'Supervisor stabilization completed successfully')
                     else:
-                        lsf.write_output(f'WARNING: Supervisor stabilization script exited with code {exit_code}')
+                        lsf.write_output(f'WARNING: Supervisor lab tuner script exited with code {exit_code}')
                         wcp_certs_ok = False
 
                     # ---- Target 3: Supervisor API cluster_proxy_config (SET or CLEAR) ----
@@ -1297,11 +1385,11 @@ def main(lsf=None, standalone=False, dry_run=False):
                         lsf.write_output(f'  WARNING: Supervisor API proxy step skipped: {_t3_err}')
 
                 except Exception as wcp_err:
-                    lsf.write_output(f'WARNING: Error running Supervisor stabilization script: {wcp_err}')
+                    lsf.write_output(f'WARNING: Error running Supervisor lab tuner script: {wcp_err}')
                     lsf.write_output('  Continuing with startup - WCP may need manual attention')
                     wcp_certs_ok = False
         else:
-            lsf.write_output(f'Supervisor stabilization script not found: {supervisor_stabilizer_script}')
+            lsf.write_output(f'Supervisor lab tuner script not found: {vcf_lab_tuner_script}')
             lsf.write_output('  Skipping stabilization - manual intervention may be needed')
         
         #----------------------------------------------------------------------
@@ -2451,117 +2539,101 @@ echo "PROXY_CONFIGURED"
                     else:
                         lsf.clear_esxi_proxy(_vc_entry['host'], _vc_entry['sso_user'], password)
 
-                # ---- Kubernetes certificate check/renewal (VSP + VCFA) ----
-                # Runs before component scale-up so the API server is healthy
-                # for everything that follows.  Non-fatal per cluster — a
-                # failure in one cluster does not abort the other or the boot.
-                _k8s_cert_script = '/home/holuser/hol/Tools/vsp_cert_renewer.py'
-                _k8s_cert_errors = []
-                if dashboard:
-                    dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.RUNNING)
-                    dashboard.generate_html()
-                if os.path.isfile(_k8s_cert_script):
-                    for _cert_cluster in ('vsp',):
-                        lsf.write_output(
-                            f'  Running K8s cert check/renewal for '
-                            f'{_cert_cluster.upper()}...'
-                        )
-                        _cert_env = os.environ.copy()
-                        _cert_env['PYTHONUNBUFFERED'] = '1'
-                        _cert_proc = subprocess.Popen(
-                            ['python3', '-u', _k8s_cert_script,
-                             '--cluster', _cert_cluster,
-                             '--no-timestamps'],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True,
-                            bufsize=1,
-                            env=_cert_env,
-                        )
-                        for _cert_line in _cert_proc.stdout:
-                            _cert_line = _cert_line.rstrip('\n')
-                            if _cert_line.strip():
-                                lsf.write_output(f' {_cert_line.strip()}')
-                        _cert_proc.wait()
-                        if _cert_proc.returncode not in (0, None):
-                            lsf.write_output(
-                                f'  WARNING: {_cert_cluster.upper()} cert '
-                                f'renewal exited {_cert_proc.returncode} '
-                                f'— continuing'
-                            )
-                            _k8s_cert_errors.append(
-                                f'{_cert_cluster.upper()} exited {_cert_proc.returncode}'
-                            )
+                # ---- K8s Cert Renewal, CP Sizing, and VSP Pre-flight/Tuning via vcf-lab-tuner.py ----
+                _vlt_script = '/home/holuser/hol/Tools/vcf-lab-tuner.py'
+                if os.path.isfile(_vlt_script):
+                    lsf.write_output('  Running VSP stabilization pass via vcf-lab-tuner.py...')
                     if dashboard:
-                        if _k8s_cert_errors:
-                            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.FAILED,
-                                                  f'Non-zero exit: {"; ".join(_k8s_cert_errors)}')
-                        else:
-                            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.COMPLETE,
-                                                  'VSP + VCFA cert check/renewal complete')
+                        dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.RUNNING)
                         dashboard.generate_html()
-                else:
-                    lsf.write_output(
-                        f'  K8s cert renewal script not found: '
-                        f'{_k8s_cert_script} — skipping'
-                    )
-                    if dashboard:
-                        dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.SKIPPED,
-                                              'vsp_cert_renewer.py not found')
-                        dashboard.generate_html()
+                    try:
+                        _vlt_cmd = [
+                            'python3', '-u', _vlt_script,
+                            '--cluster', 'vsp',
+                            '--mode', 'remediate',
+                            '--install-keeper',
+                            '--purge-legacy-keepers'
+                        ]
+                        if dry_run:
+                            _vlt_cmd.append('--dry-run')
+                        _vlt_env = os.environ.copy()
+                        _vlt_env['PYTHONUNBUFFERED'] = '1'
+                        _vlt_proc = subprocess.Popen(
+                            _vlt_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, env=_vlt_env
+                        )
+                        for _vlt_line in _vlt_proc.stdout:
+                            _vlt_line = _vlt_line.rstrip('\n')
+                            if _vlt_line.strip():
+                                lsf.write_output(f'  {_vlt_line.strip()}')
+                        _vlt_proc.wait()
 
-                # ---- VSP Control Plane machine type (cp.medium) ----
-                # vsp-scale-down.py checks the current PackageDeployment
-                # cluster.machineType first and no-ops if already at the
-                # target, so rerunning this on every boot is cheap once set.
-                # Non-fatal — a failure here does not abort the rest of Task 2.
-                _vsp_scale_script = '/home/holuser/hol/Tools/vsp-health/vsp-scale-down.py'
-                _vsp_scale_errors = []
-                if dashboard:
-                    dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.RUNNING)
-                    dashboard.generate_html()
-                if os.path.isfile(_vsp_scale_script):
-                    lsf.write_output('  Configuring VSP Control Plane machine type (cp.medium)...')
-                    _scale_env = os.environ.copy()
-                    _scale_env['PYTHONUNBUFFERED'] = '1'
-                    _scale_proc = subprocess.Popen(
-                        ['python3', '-u', _vsp_scale_script,
-                         '--host', vsp_vip,
-                         '--cp-machine-type', 'cp.medium',
-                         '--yes'],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1,
-                        env=_scale_env,
-                    )
-                    for _scale_line in _scale_proc.stdout:
-                        _scale_line = _scale_line.rstrip('\n')
-                        if _scale_line.strip():
-                            lsf.write_output(f' {_scale_line.strip()}')
-                    _scale_proc.wait()
-                    if _scale_proc.returncode not in (0, None):
-                        lsf.write_output(
-                            f'  WARNING: VSP CP resize exited '
-                            f'{_scale_proc.returncode} — continuing'
-                        )
-                        _vsp_scale_errors.append(f'exited {_scale_proc.returncode}')
-                    if dashboard:
-                        if _vsp_scale_errors:
-                            dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.FAILED,
-                                                  f'Non-zero exit: {"; ".join(_vsp_scale_errors)}')
+                        if _vlt_proc.returncode in (0, None):
+                            if dashboard:
+                                dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.COMPLETE, 'K8s cert check complete')
+                                dashboard.generate_html()
                         else:
-                            dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.COMPLETE,
-                                                  'CP machine type set to cp.medium')
-                        dashboard.generate_html()
+                            lsf.write_output(f'  WARNING: vcf-lab-tuner.py exited {_vlt_proc.returncode} — continuing')
+                            if dashboard:
+                                dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.FAILED, f'Exited {_vlt_proc.returncode}')
+                                dashboard.generate_html()
+
+                        # Sizing pass specifically for CP machine type tuning (gated by config.ini [VCFFINAL] set_vsp_cp_to_medium)
+                        _resize_vsp_cp = False
+                        if lsf.config.has_section('VCFFINAL') and lsf.config.has_option('VCFFINAL', 'set_vsp_cp_to_medium'):
+                            _set_vsp_cp_raw = lsf.config.get('VCFFINAL', 'set_vsp_cp_to_medium', fallback='disabled').strip().lower()
+                            if _set_vsp_cp_raw in ('enabled', 'true', '1', 'yes', 'on'):
+                                _resize_vsp_cp = True
+
+                        if _resize_vsp_cp:
+                            lsf.write_output('  Resizing VSP Control Plane to cp.medium via vcf-lab-tuner.py...')
+                            if dashboard:
+                                dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.RUNNING)
+                                dashboard.generate_html()
+                            _vlt_size_cmd = [
+                                'python3', '-u', _vlt_script,
+                                '--cluster', 'vsp',
+                                '--mode', 'remediate',
+                                '--section', 'sizing',
+                                '--cp-machine-type', 'cp.medium'
+                            ]
+                            if dry_run:
+                                _vlt_size_cmd.append('--dry-run')
+                            _vlt_size_proc = subprocess.Popen(
+                                _vlt_size_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1, env=_vlt_env
+                            )
+                            for _vlt_line in _vlt_size_proc.stdout:
+                                _vlt_line = _vlt_line.rstrip('\n')
+                                if _vlt_line.strip():
+                                    lsf.write_output(f'  {_vlt_line.strip()}')
+                            _vlt_size_proc.wait()
+
+                            if _vlt_size_proc.returncode in (0, None):
+                                if dashboard:
+                                    dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.COMPLETE, 'CP machine type set to cp.medium')
+                                    dashboard.generate_html()
+                            else:
+                                lsf.write_output(f'  WARNING: vcf-lab-tuner.py sizing exited {_vlt_size_proc.returncode} — continuing')
+                                if dashboard:
+                                    dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.FAILED, f'Exited {_vlt_size_proc.returncode}')
+                                    dashboard.generate_html()
+                        else:
+                            lsf.write_output('  VSP CP resize to cp.medium not enabled in [VCFFINAL] set_vsp_cp_to_medium — skipping')
+                            if dashboard:
+                                dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.SKIPPED, 'Disabled in config.ini')
+                                dashboard.generate_html()
+                    except Exception as _vlt_exc:
+                        lsf.write_output(f'  WARNING: vcf-lab-tuner.py execution failed: {_vlt_exc}')
+                        if dashboard:
+                            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.FAILED, f'Failed: {_vlt_exc}')
+                            dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.FAILED, f'Failed: {_vlt_exc}')
+                            dashboard.generate_html()
                 else:
-                    lsf.write_output(
-                        f'  VSP scale-down script not found: '
-                        f'{_vsp_scale_script} — skipping'
-                    )
+                    lsf.write_output(f'  vcf-lab-tuner.py not found: {_vlt_script} — skipping')
                     if dashboard:
-                        dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.SKIPPED,
-                                              'vsp-scale-down.py not found')
+                        dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.SKIPPED, 'vcf-lab-tuner.py not found')
+                        dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.SKIPPED, 'vcf-lab-tuner.py not found')
                         dashboard.generate_html()
 
                 # ---- Unsuspend postgres instances managed by Zalando operator ----
@@ -3749,6 +3821,10 @@ echo "PROXY_CONFIGURED"
                                 if alt_hosts:
                                     for idx, move_vm in enumerate(vms_to_move):
                                         dest_host = alt_hosts[idx % len(alt_hosts)]
+                                        # if the move_vm.name starts with vc- then skip the migration
+                                        if move_vm.name.startswith('vc-'):
+                                            lsf.write_output(f'  Skipping migration of {move_vm.name} to {dest_host.name} because vCenters are pinned to same host as auto')
+                                            continue
                                         lsf.write_output(f'  Migrating {move_vm.name} to {dest_host.name}...')
                                         try:
                                             relocate_spec = vim.vm.RelocateSpec()
@@ -3975,26 +4051,14 @@ echo "PROXY_CONFIGURED"
         dashboard.generate_html()
     
     #==========================================================================
-    # TASK 4b: VCF Automation K8s Health Check & Remediation
-    # Consolidated from the former watchvcfa.sh script and original health
-    # check. After the VCF Automation VM is started, the internal K8s
-    # cluster may have issues that prevent services from coming up:
-    #   1. kube-vip crash loop: VIP released when istio-ingressgateway
-    #      fails to start (ImagePullBackOff during Antrea CNI init).
-    #   2. Containerd Ready,SchedulingDisabled: node cordoned by stale state.
-    #   3. CAPI/CAPV webhook failure: CNI socket issue prevents pod sandboxes.
-    #   4. kube-scheduler stuck at 0/1 Running.
-    #   5. Stale seaweedfs-master-0 pod blocking other pods.
-    #   6. Stuck volume attachments with deletionTimestamp.
-    #   7. vCenter vAPI endpoint stopped (CSI controller dependency).
-    #   8. CSI controller CrashLoopBackOff (leases, password, CRD errors).
-    #   9. RabbitMQ .erlang.cookie permissions (fsGroup breaks Erlang).
-    #  10. provisioning-service Spring Boot deadlock.
-    #  11. Prelude deployments/statefulsets at 0 replicas after cold boot.
-    #  12. Prelude pods stuck in ContainerCreating after volume/CSI fixes.
+    # TASK 4b: VCF Automation K8s Health Check & Remediation via vcf-lab-tuner.py
+    # Unified lab tuner handles VCFA control plane, VIPs, certificates,
+    # deployments, gateway dataplane, etcd, postgres, rabbitmq, and keepers.
     #==========================================================================
     
     vcfa_k8s_remediation_ok = True
+    vcfa_k8s_ip = '10.1.1.72'
+    vcfa_user = 'vmware-system-user'
     
     if vcfa_vms_configured and not dry_run:
         lsf.write_output('='*60)
@@ -4007,16 +4071,10 @@ echo "PROXY_CONFIGURED"
             dashboard.generate_html()
         
         try:
-            import json as _json_k8s
-            
             password = lsf.get_password()
-            vcfa_k8s_ip = '10.1.1.71'  # VCF 9.0 default
-            vcfa_vip = '10.1.1.70'
-            vcfa_user = 'vmware-system-user'
-            vcenter_host = 'vc-mgmt-a.site-a.vcf.lab'
             
             # Auto-detect K8s API IP from known VCF Automation IPs
-            for candidate_ip in ['10.1.1.71', '10.1.1.72', '10.1.1.73', '10.1.1.74']:
+            for candidate_ip in ['10.1.1.72', '10.1.1.71', '10.1.1.73', '10.1.1.74']:
                 if lsf.test_tcp_port(candidate_ip, 22, timeout=5):
                     vcfa_k8s_ip = candidate_ip
                     break
@@ -4063,7 +4121,7 @@ echo "PROXY_CONFIGURED"
                 _chage_hosts = [resolve_host_fqdn(_h) for _h in _chage_hosts_raw]
 
                 # ---- Step 0a: Ensure vmware-system-user password is valid and never expires ----
-                # MUST run before any vcfa_ssh / kubectl commands are attempted so that
+                # MUST run before any SSH / kubectl commands are attempted so that
                 # expired passwords are reset via expect (vcfapwcheck.sh / vcfapass.sh)
                 # and maxdays set to -1 (chage) BEFORE SSH session calls.
                 lsf.write_output('Fixing expired automation password if necessary...')
@@ -4108,291 +4166,47 @@ echo "PROXY_CONFIGURED"
                         for _f in as_completed(_chage_futures):
                             _f.result()
 
-                # ---- Step 0b: Check and renew K8s certificates for VCFA ----
-                # Now that VCFA VM is powered on and credentials are confirmed, check/renew VCFA K8s certs.
-                _k8s_cert_script = '/home/holuser/hol/Tools/vsp_cert_renewer.py'
-                if os.path.isfile(_k8s_cert_script):
-                    lsf.write_output('Running K8s cert check/renewal for VCFA...')
-                    _cert_env = os.environ.copy()
-                    _cert_env['PYTHONUNBUFFERED'] = '1'
-                    _cert_proc = subprocess.Popen(
-                        ['python3', '-u', _k8s_cert_script, '--cluster', 'vcfa', '--no-timestamps'],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1,
-                        env=_cert_env,
-                    )
-                    for _cert_line in _cert_proc.stdout:
-                        _cert_line = _cert_line.rstrip('\n')
-                        if _cert_line.strip():
-                            lsf.write_output(f' {_cert_line.strip()}')
-                    _cert_proc.wait()
+                # ---- Run vcf-lab-tuner.py for complete VCFA stabilization & cert check ----
+                _vlt_script = '/home/holuser/hol/Tools/vcf-lab-tuner.py'
+                if os.path.isfile(_vlt_script):
+                    lsf.write_output('Running VCFA stabilization pass via vcf-lab-tuner.py...')
+                    try:
+                        _vcfa_cmd = [
+                            'python3', '-u', _vlt_script,
+                            '--cluster', 'vcfa',
+                            '--mode', 'remediate',
+                            '--install-keeper',
+                            '--purge-legacy-keepers'
+                        ]
+                        if dry_run:
+                            _vcfa_cmd.append('--dry-run')
+                        _vcfa_env = os.environ.copy()
+                        _vcfa_env['PYTHONUNBUFFERED'] = '1'
+                        _vcfa_proc = subprocess.Popen(
+                            _vcfa_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, env=_vcfa_env
+                        )
+                        for _vcfa_line in _vcfa_proc.stdout:
+                            _vcfa_line = _vcfa_line.rstrip('\n')
+                            if _vcfa_line.strip():
+                                lsf.write_output(f'  {_vcfa_line.strip()}')
+                        _vcfa_proc.wait(timeout=1800)
 
-                # Helper to run commands on auto-a
-                def vcfa_ssh(cmd):
-                    return lsf.ssh(
-                        f"echo '{password}' | sudo -S -i bash -c '{cmd}'",
-                        f'{vcfa_user}@{vcfa_k8s_ip}'
-                    )
-                
-                def _get_stdout(result):
-                    """Extract stdout string from ssh result, or empty string."""
-                    if hasattr(result, 'stdout') and result.stdout:
-                        return result.stdout
-                    return ''
-                
-                # ---- Step 1: Check/fix kube-vip VIP ----
-                # VIP verification and restoration is handled by vcfa-stabilizer.sh
-                # which runs as part of the overall stabilization process.
-                vip_present = True
-                
-                if not vip_present:
-                    lsf.write_output('Cannot proceed without VIP - skipping K8s checks')
+                        if _vcfa_proc.returncode in (0, None):
+                            vcfa_k8s_remediation_ok = True
+                        else:
+                            lsf.write_output(f'  WARNING: vcf-lab-tuner.py exited {_vcfa_proc.returncode} — continuing')
+                            vcfa_k8s_remediation_ok = False
+                    except subprocess.TimeoutExpired:
+                        _vcfa_proc.kill()
+                        lsf.write_output('  WARNING: VCFA lab tuner script timed out')
+                        vcfa_k8s_remediation_ok = False
+                    except Exception as _vcfa_exc:
+                        lsf.write_output(f'  WARNING: vcf-lab-tuner.py execution failed: {_vcfa_exc}')
+                        vcfa_k8s_remediation_ok = False
                 else:
-                    # ---- Step 2: Verify kubectl works ----
-                    lsf.write_output('Verifying kubectl access...')
-                    kctl_prefix = 'if [ -f /etc/kubernetes/admin.conf ]; then export KUBECONFIG=/etc/kubernetes/admin.conf; elif [ -f /etc/kubernetes/super-admin.conf ]; then export KUBECONFIG=/etc/kubernetes/super-admin.conf; fi;'
-                    node_check = vcfa_ssh(f'{kctl_prefix} kubectl get nodes --no-headers 2>&1')
-                    kubectl_ok = False
-                    node_stdout = _get_stdout(node_check)
-                    if 'Ready' in node_stdout:
-                        kubectl_ok = True
-                        lsf.write_output('  kubectl access verified')
-                    else:
-                        lsf.write_output('  kubectl not responding, waiting 30s and retrying...')
-                        time.sleep(30)
-                        node_check2 = vcfa_ssh(f'{kctl_prefix} kubectl get nodes --no-headers 2>&1')
-                        if 'Ready' in _get_stdout(node_check2):
-                            kubectl_ok = True
-                            lsf.write_output('  kubectl access verified on retry')
-                        else:
-                            lsf.write_output('  kubectl still failing - restarting containerd and kubelet')
-                            vcfa_ssh('systemctl restart containerd && sleep 3 && systemctl restart kubelet')
-                            time.sleep(30)
-                            vcfa_ssh(f'ip addr show eth0 | grep {vcfa_vip} || ip addr add {vcfa_vip}/32 dev eth0')
-                            time.sleep(15)
-                            node_check3 = vcfa_ssh(f'{kctl_prefix} kubectl get nodes --no-headers 2>&1')
-                            if 'Ready' in _get_stdout(node_check3):
-                                kubectl_ok = True
-                                lsf.write_output('  kubectl access restored after service restart')
-                            else:
-                                lsf.write_output('  WARNING: kubectl still not working')
-                                vcfa_k8s_remediation_ok = False
-                    
-                    if kubectl_ok:
-                        # Track whether volume attachments or CSI were fixed
-                        # (used later to recover stuck prelude pods)
-                        stuck_va_fixed = False
-                        csi_fixed = False
-                        
-                        # ---- Step 3: Containerd Ready,SchedulingDisabled fix ----
-                        # Node uncordoning is handled by vcfa-stabilizer.sh
-                        
-                        # ---- Step 4: CAPI/CAPV controller health ----
-                        lsf.write_output('Checking CAPI/CAPV controller health...')
-                        
-                        def _check_capi_capv_ready():
-                            capv_out = _get_stdout(vcfa_ssh(
-                                f'{kctl_prefix} kubectl get deployment capv-controller-manager '
-                                f'-n vmsp-platform -o jsonpath="{{.status.readyReplicas}}" 2>/dev/null'
-                            )).strip()
-                            capi_out = _get_stdout(vcfa_ssh(
-                                f'{kctl_prefix} kubectl get deployment capi-controller-manager '
-                                f'-n vmsp-platform -o jsonpath="{{.status.readyReplicas}}" 2>/dev/null'
-                            )).strip()
-                            capv_val = capv_out.split('\n')[-1].strip() if capv_out else ''
-                            capi_val = capi_out.split('\n')[-1].strip() if capi_out else ''
-                            return (capv_val and capv_val != '0'), (capi_val and capi_val != '0')
-                        
-                        capv_ok, capi_ok = _check_capi_capv_ready()
-                        if capv_ok and capi_ok:
-                            lsf.write_output('  CAPI/CAPV controllers are ready')
-                        else:
-                            # Controllers may just be starting — check for actual pod failures
-                            # before restarting services
-                            lsf.write_output('  CAPI/CAPV controllers not ready yet, checking pod status...')
-                            capv_pod_out = _get_stdout(vcfa_ssh(
-                                f'{kctl_prefix} kubectl get pods -n vmsp-platform --no-headers 2>/dev/null '
-                                f'| grep -E "capv-controller|capi-controller"'
-                            ))
-                            pods_crashing = any(
-                                state in capv_pod_out
-                                for state in ['CrashLoopBackOff', 'Error', 'ImagePullBackOff', 'CreateContainerError']
-                            )
-                            if pods_crashing:
-                                lsf.write_output('  CAPI/CAPV pods in failure state - restarting containerd and kubelet')
-                                vcfa_ssh('systemctl restart containerd kubelet')
-                                time.sleep(30)
-                                lsf.write_output('  Waiting for CAPI/CAPV conollers to recover...')
-                                vcfa_ssh(
-                                    f'{kctl_prefix} kubectl rollout status deployment '
-                                    f'capv-controller-manager -n vmsp-platform --timeout=60s 2>/dev/null'
-                                )
-                            else:
-                                # Pods exist but aren't ready yet — give them time to converge
-                                lsf.write_output('  CAPI/CAPV pods are starting, waiting up to 60s for readiness...')
-                                for _wait in range(4):
-                                    time.sleep(15)
-                                    capv_ok, capi_ok = _check_capi_capv_ready()
-                                    if capv_ok and capi_ok:
-                                        lsf.write_output('  CAPI/CAPV controllers became ready')
-                                        break
-                                else:
-                                    lsf.write_output('  CAPI/CAPV controllers still not ready after 60s (will continue)')
-                        
-                        # ---- Step 5: kube-scheduler check/fix ----
-                        lsf.write_output('Checking kube-scheduler...')
-                        for attempt in range(3):
-                            sched_out = _get_stdout(vcfa_ssh(
-                                f'{kctl_prefix} kubectl get pods -n kube-system --no-headers 2>/dev/null '
-                                f'| grep kube-scheduler'
-                            ))
-                            if '0/1' not in sched_out:
-                                if attempt == 0:
-                                    lsf.write_output('  kube-scheduler is running')
-                                else:
-                                    lsf.write_output('  kube-scheduler recovered')
-                                break
-                            if attempt == 0:
-                                # First detection: wait 30s for natural recovery before intervening
-                                lsf.write_output('  kube-scheduler is 0/1, waiting 30s for recovery...')
-                                time.sleep(30)
-                            else:
-                                lsf.write_output(f'  kube-scheduler still 0/1 (attempt {attempt+1}/3) - restarting containerd')
-                                vcfa_ssh('systemctl restart containerd')
-                                time.sleep(30)
-                        
-                        # ---- Step 5b: Stuck support-bundle-cluster-info-dump jobs ----
-                        # Handled by vcfa-stabilizer.sh
-                        
-                        # ---- Step 6: Stale seaweedfs-master-0 pod ----
-                        # Handled by vcfa-stabilizer.sh
-                        
-                        # ---- Step 7: ImagePullBackOff pods ----
-                        lsf.write_output('Checking for ImagePullBackOff pods...')
-                        ipb_check = vcfa_ssh(
-                            f'{kctl_prefix} kubectl get pods -A --no-headers 2>/dev/null '
-                            f'| grep ImagePullBackOff'
-                        )
-                        ipb_out = _get_stdout(ipb_check)
-                        if 'ImagePullBackOff' in ipb_out:
-                            for line in ipb_out.strip().split('\n'):
-                                if not line.strip():
-                                    continue
-                                cols = line.split()
-                                if len(cols) >= 2:
-                                    ipb_ns, ipb_pod = cols[0], cols[1]
-                                    lsf.write_output(f'  Deleting ImagePullBackOff pod: {ipb_ns}/{ipb_pod}')
-                                    vcfa_ssh(
-                                        f'{kctl_prefix} kubectl delete pod {ipb_pod} -n {ipb_ns} '
-                                        f'--force --grace-period=0 2>/dev/null'
-                                    )
-                            time.sleep(10)
-                        else:
-                            lsf.write_output('  No ImagePullBackOff pods found')
-                        
-                        # ---- Step 8: Unknown pods ----
-                        lsf.write_output('Checking for Unknown pods...')
-                        unknown_check = vcfa_ssh(
-                            f'{kctl_prefix} kubectl get pods -A --no-headers 2>/dev/null '
-                            f'| grep Unknown'
-                        )
-                        unk_out = _get_stdout(unknown_check)
-                        if 'Unknown' in unk_out:
-                            unk_count = len([l for l in unk_out.strip().split('\n') if l.strip()])
-                            lsf.write_output(f'  Found {unk_count} pods in Unknown state, force deleting...')
-                            for line in unk_out.strip().split('\n'):
-                                if not line.strip():
-                                    continue
-                                cols = line.split()
-                                if len(cols) >= 2:
-                                    unk_ns, unk_pod = cols[0], cols[1]
-                                    lsf.write_output(f'  Deleting Unknown pod: {unk_ns}/{unk_pod}')
-                                    vcfa_ssh(
-                                        f'{kctl_prefix} kubectl delete pod {unk_pod} -n {unk_ns} '
-                                        f'--force --grace-period=0 2>/dev/null'
-                                    )
-                        else:
-                            lsf.write_output('  No Unknown pods found')
-                        
-                        # ---- Step 9: Stuck volume attachments ----
-                        lsf.write_output('Checking for stuck volume attachments...')
-                        for attempt in range(3):
-                            va_out = _get_stdout(vcfa_ssh(
-                                f'{kctl_prefix} kubectl get volumeattachments -o json 2>/dev/null'
-                            ))
-                            va_json_start = va_out.find('{')
-                            if va_json_start < 0:
-                                break
-                            try:
-                                va_data = _json_k8s.loads(va_out[va_json_start:])
-                                stuck_vas = [
-                                    item['metadata']['name']
-                                    for item in va_data.get('items', [])
-                                    if item.get('metadata', {}).get('deletionTimestamp')
-                                ]
-                            except Exception:
-                                lsf.write_output('  Could not parse volume attachment JSON')
-                                break
-                            
-                            if not stuck_vas:
-                                if attempt == 0:
-                                    lsf.write_output('  No stuck volume attachments found')
-                                break
-                            
-                            lsf.write_output(f'  Found {len(stuck_vas)} stuck volume attachment(s), removing finalizers...')
-                            for va_name in stuck_vas:
-                                lsf.write_output(f'  Removing finalizer from: {va_name}')
-                                vcfa_ssh(
-                                    f'{kctl_prefix} kubectl patch volumeattachment {va_name} '
-                                    f'-p \'{{"metadata":{{"finalizers":null}}}}\' --type=merge 2>/dev/null'
-                                )
-                            stuck_va_fixed = True
-                            time.sleep(5)
-                        
-                        # ---- Step 10: vCenter vAPI endpoint service ----
-                        # Handled by vcfa-stabilizer.sh
-                        
-                        # ---- Step 11: CSI controller health ----
-                        # Handled by vcfa-stabilizer.sh
-                        
-                        # ---- Step 12: RabbitMQ .erlang.cookie permissions ----
-                        # Handled by vcfa-stabilizer.sh
-                        
-                        # ---- Step 13: provisioning-service deadlock fix ----
-                        # Handled by vcfa-stabilizer.sh
-                        
-                        # ---- Step 14: Scale up zero-replica prelude deployments ----
-                        # Handled by vcfa-stabilizer.sh
-                        
-                        # ---- Step 14b: Post-scale node re-check ----
-                        # Handled by vcfa-stabilizer.sh
-                        
-                        # ---- Step 15: Recover prelude pods stuck after volume/CSI fixes ----
-                        if stuck_va_fixed or csi_fixed:
-                            lsf.write_output('Volume attachments or CSI controller were fixed, checking prelude pods...')
-                            time.sleep(10)
-                            
-                            stuck_pods_out = _get_stdout(vcfa_ssh(
-                                f'{kctl_prefix} kubectl get pods -n prelude --no-headers 2>/dev/null '
-                                f'| grep -E "ContainerCreating|Init:"'
-                            ))
-                            if stuck_pods_out.strip():
-                                stuck_pod_names = [
-                                    line.split()[0] for line in stuck_pods_out.strip().split('\n')
-                                    if line.strip() and len(line.split()) >= 1
-                                ]
-                                lsf.write_output(f'  Found {len(stuck_pod_names)} stuck prelude pods, deleting for fresh mount...')
-                                for sp_name in stuck_pod_names:
-                                    lsf.write_output(f'  Deleting stuck pod: {sp_name}')
-                                    vcfa_ssh(
-                                        f'{kctl_prefix} kubectl delete pod {sp_name} -n prelude 2>/dev/null'
-                                    )
-                                lsf.write_output('  Waiting 60s for pods to recreate with fresh volume mounts...')
-                                time.sleep(60)
-                            else:
-                                lsf.write_output('  No stuck prelude pods found, services should recover normally')
+                    lsf.write_output(f'  vcf-lab-tuner.py not found: {_vlt_script} — skipping')
+                    vcfa_k8s_remediation_ok = False
                 
                 lsf.write_output('VCF Automation K8s health check complete')
                 
@@ -4428,27 +4242,6 @@ echo "PROXY_CONFIGURED"
         lsf.write_output('Checking VCF Automation Checks...')
         lsf.write_vpodprogress('VCF Automation Checks', 'GOOD-8')
         
-
-        # If the lab_sku = HOL-2701, then run vcfa-stabilizer.sh
-        #if lsf.lab_sku == 'HOL-2701':
-        lsf.write_output('Running vcfa-stabilizer.sh...')
-        try:
-            proc = subprocess.Popen(
-                ['/bin/bash', '/home/holuser/hol/Tools/vcfa-stabilizer.sh'],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
-            for line in proc.stdout:
-                lsf.write_output(f'  {line.rstrip()}')
-            proc.wait(timeout=1800)
-        except subprocess.TimeoutExpired:
-            lsf.write_output('  [STDERR] Timeout executing vcfa-stabilizer.sh')
-            proc.kill()
-        except Exception as e:
-            lsf.write_output(f'  [STDERR] Error executing vcfa-stabilizer.sh: {e}')
-
         # vraurls already retrieved above
         
         for url_spec in vraurls:
@@ -4483,12 +4276,12 @@ echo "PROXY_CONFIGURED"
                             lsf.labfail(f'VCF Automation URL {url} not accessible after {VCFA_URL_MAX_RETRIES} minutes - should be reached in under 8 minutes')
                         else:
                             # Every 3 attempts re-check node scheduling — catches vmsp-operator
-                            # re-cordons that slip through Step 14b (e.g. very slow startup).
+                            # re-cordons that slip through (e.g. very slow startup).
                             if attempt % 3 == 0:
                                 try:
-                                    _url_nd = _get_stdout(vcfa_ssh(
-                                        f'{kctl_prefix} kubectl get nodes --no-headers 2>/dev/null'
-                                    ))
+                                    pwd = lsf.get_password()
+                                    _nd_res = lsf.ssh(f"echo '{pwd}' | sudo -S -i kubectl get nodes --no-headers 2>/dev/null", f'{vcfa_user}@{vcfa_k8s_ip}', pwd)
+                                    _url_nd = getattr(_nd_res, 'stdout', '') or getattr(_nd_res, 'output', '') or ''
                                     for _url_nd_line in _url_nd.split('\n'):
                                         if 'SchedulingDisabled' in _url_nd_line and _url_nd_line.strip():
                                             _url_nd_name = _url_nd_line.split()[0]
@@ -4496,10 +4289,11 @@ echo "PROXY_CONFIGURED"
                                                 f'  [NODE MONITOR] {_url_nd_name} is re-cordoned '
                                                 f'(attempt {attempt}) — uncordoning...'
                                             )
-                                            vcfa_ssh(
-                                                f'{kctl_prefix} kubectl uncordon {_url_nd_name} 2>/dev/null'
+                                            lsf.ssh(
+                                                f"echo '{pwd}' | sudo -S -i kubectl uncordon {_url_nd_name} 2>/dev/null",
+                                                f'{vcfa_user}@{vcfa_k8s_ip}', pwd
                                             )
-                                except (NameError, Exception):
+                                except Exception:
                                     pass
                             lsf.write_output(f'  Sleeping and will try again... {attempt} / {VCFA_URL_MAX_RETRIES}')
                             lsf.labstartup_sleep(VCFA_URL_RETRY_DELAY)
@@ -4541,81 +4335,59 @@ echo "PROXY_CONFIGURED"
                 url = url_spec.strip()
                 expected = None
             
-            if url and not dry_run:
-                vcfc_urls_checked += 1
-                lsf.write_output(f'Testing VCF Component URL: {url}')
-                if expected:
-                    lsf.write_output(f'  Expected text: {expected}')
-                
-                url_success = False
-                opslogs_rescued = False
-
-                # Configuration: Allocate appropriate timeout budget for URL verification
-                # For opslogs (15s poll), allow up to 100 attempts (25 mins) to detect readiness fast
+            if url:
                 is_opslogs = 'opslogs' in url.lower()
-                retry_delay = 15 if is_opslogs else VCFC_URL_RETRY_DELAY
-                max_wait_seconds = 1500 if is_opslogs else (VCFC_URL_MAX_RETRIES * VCFC_URL_RETRY_DELAY)
-                max_attempts = max(VCFC_URL_MAX_RETRIES, int(max_wait_seconds / retry_delay))
+                if is_opslogs:
+                    lsf.write_output(f'Spawning background probe for VCF Component URL: {url}')
+                    if expected:
+                        lsf.write_output(f'  Expected text: {expected}')
+                    opslogs_probe_state['start_time'] = time.time()
+                    t = threading.Thread(
+                        target=_run_opslogs_background_probe,
+                        args=(url, expected, lsf, dashboard, dry_run),
+                        daemon=True
+                    )
+                    opslogs_probe_state['thread'] = t
+                    t.start()
+                elif not dry_run:
+                    vcfc_urls_checked += 1
+                    lsf.write_output(f'Testing VCF Component URL: {url}')
+                    if expected:
+                        lsf.write_output(f'  Expected text: {expected}')
+                    
+                    url_success = False
+                    start_url_time = time.time()
+                    max_attempts = VCFC_URL_MAX_RETRIES
+                    retry_delay = VCFC_URL_RETRY_DELAY
 
-                start_url_time = time.time()
-
-                for attempt in range(1, max_attempts + 1):
-                    result = lsf.test_url(url, expected_text=expected, verify_ssl=False, timeout=30)
-                    if result:
-                        elapsed = int(time.time() - start_url_time)
-                        lsf.write_output(f'  [SUCCESS] {url} (attempt {attempt}, {elapsed}s elapsed)')
-                        url_success = True
-                        vcfc_urls_passed += 1
-                        break
-                    else:
-                        elapsed = int(time.time() - start_url_time)
-                        elapsed_mins = round(elapsed / 60, 1)
-
-                        if attempt == max_attempts:
-                            lsf.write_output(f'  [FAILED] {url} after {max_attempts} attempts ({elapsed_mins} minutes)')
-                            vcfc_urls_failed += 1
-                            lsf.labfail(f'VCF Component URL {url} not accessible after {max_attempts} attempts ({elapsed_mins} minutes)')
+                    for attempt in range(1, max_attempts + 1):
+                        result = lsf.test_url(url, expected_text=expected, verify_ssl=False, timeout=30)
+                        if result:
+                            elapsed = int(time.time() - start_url_time)
+                            lsf.write_output(f'  [SUCCESS] {url} (attempt {attempt}, {elapsed}s elapsed)')
+                            url_success = True
+                            vcfc_urls_passed += 1
+                            break
                         else:
-                            # Opslogs intelligent diagnostics and progressive remediation
-                            if is_opslogs:
-                                pwd = lsf.get_password()
+                            elapsed = int(time.time() - start_url_time)
+                            elapsed_mins = round(elapsed / 60, 1)
 
-                                # 1. Immediate rescue on initial failure (Attempt 1)
-                                if not opslogs_rescued:
-                                    opslogs_rescued = True
-                                    lsf.write_output(f'  [WARNING] opslogs unreachable at attempt {attempt}. Ensuring CRD operational status and scaling StatefulSets (VSP VIP 10.1.1.142)...')
-                                    lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl annotate components.api.vmsp.vmware.com ops-logs component.vmsp.vmware.com/operational-status=Running --overwrite 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
-                                    scale_res = lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl scale statefulset/log-processor statefulset/log-store -n ops-logs --replicas=1 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
-                                    scale_out = scale_res.stdout.strip() if hasattr(scale_res, 'stdout') and scale_res.stdout else '(no output / SSH failed)'
-                                    lsf.write_output(f'  StatefulSet rescale result: {scale_out}')
-
-                                # 2. Periodic pod diagnostic snapshot every 4 attempts (~60 seconds)
-                                elif attempt % 4 == 0:
-                                    diag_res = lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c 'kubectl get pods -n ops-logs -o wide 2>&1'", 'vmware-system-user@10.1.1.142', pwd)
-                                    if hasattr(diag_res, 'stdout') and diag_res.stdout:
-                                        pod_lines = [l.strip() for l in diag_res.stdout.splitlines() if 'log-' in l]
-                                        if pod_lines:
-                                            lsf.write_output(f'  [DIAGNOSTIC {attempt}/{max_attempts}] ops-logs pods: {" | ".join(pod_lines)}')
-
-                                # 3. Targeted Healing at Attempt 16 (~4 mins), 32 (~8 mins), 48 (~12 mins), 64 (~16 mins)
-                                # If log-store is 1/1 Running but log-processor is stuck with 500 error, bounce log-processor pod
-                                if attempt in (16, 32, 48, 64):
-                                    heal_cmd = (
-                                        "STORE_READY=$(kubectl get pod log-store-0 -n ops-logs -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null); "
-                                        "PROC_READY=$(kubectl get pod log-processor-0 -n ops-logs -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null); "
-                                        "if [ \"$STORE_READY\" = \"true\" ] && [ \"$PROC_READY\" != \"true\" ]; then "
-                                        "  echo 'OpenSearch is Ready; restarting log-processor pod to force fresh connection'; "
-                                        "  kubectl delete pod log-processor-0 -n ops-logs --grace-period=0 --force 2>&1; "
-                                        "fi"
-                                    )
-                                    heal_res = lsf.ssh(f"echo '{pwd}' | sudo -S -i bash -c '{heal_cmd}'", 'vmware-system-user@10.1.1.142', pwd)
-                                    if hasattr(heal_res, 'stdout') and heal_res.stdout.strip():
-                                        lsf.write_output(f'  [HEALING] {heal_res.stdout.strip()}')
-
-                            lsf.write_output(f'  Sleeping and will try again... {attempt} / {max_attempts} ({retry_delay}s delay, {elapsed}s elapsed)')
-                            lsf.labstartup_sleep(retry_delay)
+                            if attempt == max_attempts:
+                                lsf.write_output(f'  [FAILED] {url} after {max_attempts} attempts ({elapsed_mins} minutes)')
+                                vcfc_urls_failed += 1
+                                lsf.labfail(f'VCF Component URL {url} not accessible after {max_attempts} attempts ({elapsed_mins} minutes)')
+                            else:
+                                lsf.write_output(f'  Sleeping and will try again... {attempt} / {max_attempts} ({retry_delay}s delay, {elapsed}s elapsed)')
+                                lsf.labstartup_sleep(retry_delay)
+                elif dry_run:
+                    vcfc_urls_checked += 1
+                    lsf.write_output(f'  [DRY-RUN] Would test VCF Component URL: {url}')
+                    vcfc_urls_passed += 1
         
-        lsf.write_output(f'VCF Component URL check complete: {vcfc_urls_passed}/{vcfc_urls_checked} passed')
+        status_msg = f'VCF Component URL check complete: {vcfc_urls_passed}/{vcfc_urls_checked} passed'
+        if opslogs_probe_state.get('thread'):
+            status_msg += ' (opslogs probing in background)'
+        lsf.write_output(status_msg)
     else:
         lsf.write_output('No VCF Component URLs configured')
     
@@ -4624,8 +4396,10 @@ echo "PROXY_CONFIGURED"
             dashboard.update_task('vcffinal', 'vcf_component_urls', TaskStatus.FAILED,
                                   f'{vcfc_urls_failed}/{vcfc_urls_checked} URLs failed')
         else:
-            dashboard.update_task('vcffinal', 'vcf_component_urls', TaskStatus.COMPLETE,
-                                  f'{vcfc_urls_passed} URLs verified' if vcfc_urls_checked > 0 else '')
+            dash_msg = f'{vcfc_urls_passed} URLs verified' if vcfc_urls_checked > 0 else ''
+            if opslogs_probe_state.get('thread'):
+                dash_msg += ' (opslogs probing in background)' if dash_msg else 'opslogs probing in background'
+            dashboard.update_task('vcffinal', 'vcf_component_urls', TaskStatus.COMPLETE, dash_msg)
         dashboard.generate_html()
     
     #==========================================================================
@@ -4844,12 +4618,18 @@ echo "PROXY_CONFIGURED"
                     f'{nsx_expiry_days}d on transport nodes via {nsx_fqdn}')
 
     # Fleet password policy remediation & expiration extension via ops-a suite-api
+    # Only process active Ops entries declared in /tmp/config.ini
     _ops_nodes_raw = []
     
-    # Gather from [VCF] vcfopsvms
+    # Gather from [VCF] vcfopsvms and vcfvms
     for _vm in lsf.get_config_list('VCF', 'vcfopsvms'):
         _h = _vm.split(':')[0].strip()
         if _h and _h not in _ops_nodes_raw:
+            _ops_nodes_raw.append(_h)
+
+    for _vm in lsf.get_config_list('VCF', 'vcfvms'):
+        _h = _vm.split(':')[0].strip()
+        if _h and 'ops' in _h.lower() and '*' not in _h and _h not in _ops_nodes_raw:
             _ops_nodes_raw.append(_h)
             
     # Gather from [SHUTDOWN] ops lists
@@ -4867,16 +4647,18 @@ echo "PROXY_CONFIGURED"
         if _h and 'ops' in _h.lower() and _h not in _ops_nodes_raw:
             _ops_nodes_raw.append(_h)
 
-    # Gather from [RESOURCES] VMs
+    # Gather from [RESOURCES] VMs and URLS
     for _vm in lsf.get_config_list('RESOURCES', 'VMs'):
         _h = _vm.split(':')[0].strip()
         if _h and 'ops' in _h.lower() and _h not in _ops_nodes_raw:
             _ops_nodes_raw.append(_h)
 
-    # Fallbacks
-    for _f in ['ops-a', 'opscollector-01a', 'opsnet-a', '10.1.1.60', 'ops-b', 'opscollector-01b', 'opsnet-b', '10.2.1.60']:
-        if _f not in _ops_nodes_raw:
-            _ops_nodes_raw.append(_f)
+    for _u in lsf.get_config_list('RESOURCES', 'URLS'):
+        _h = _u.split(',')[0].strip()
+        if '://' in _h:
+            _h = _h.split('://')[1].split('/')[0].split(':')[0]
+        if _h and 'ops' in _h.lower() and _h not in _ops_nodes_raw:
+            _ops_nodes_raw.append(_h)
 
     _ops_nodes = []
     for _node in _ops_nodes_raw:
@@ -4888,11 +4670,12 @@ echo "PROXY_CONFIGURED"
         else:
             _ops_nodes.append((_fqdn, ['root']))
 
-    _ops_managers = set(n[0] for n in _ops_nodes if n[0].startswith('ops-'))
-    if not _ops_managers:
-        _ops_managers.add(resolve_host_fqdn('ops-a'))
+    _ops_managers = set(n[0] for n in _ops_nodes if n[0].startswith('ops-') and not 'opsnet' in n[0] and not 'opslogs' in n[0])
 
-    lsf.write_output('Triggering fleet password policy compliance check & password status collection...')
+    if _ops_nodes:
+        lsf.write_output(f'Triggering fleet password policy compliance check for {len(_ops_nodes)} active node(s)...')
+    else:
+        lsf.write_output('No active Ops nodes configured in config.ini — skipping fleet password policy checks')
     
     if not dry_run:
         import datetime
@@ -5510,16 +5293,8 @@ echo "PROXY_CONFIGURED"
             except Exception as e:
                 lsf.write_output(f'WARNING: Failed to fix fleet-lcm component friendly names: {e}')
 
-    # ---- VSP Cluster Health Monitor: startup pass + install recurring timer ----
-    # Runs Tools/vsp-health/vsp-health-monitor.py --install-timer, which (a) installs/enables
-    # the manager-side cron job that re-checks and self-heals the VSP cluster
-    # every [VSPMONITOR] interval_seconds (default 300s), AND (b) runs one
-    # check/remediate pass immediately so the lab comes up clean. Covers the
-    # recurring failure modes seen this cycle: envoy/vmsp-gateway CrashLoopBackOff
-    # (fleet-01a/vsp-01a/instance-01a VIPs down), CP node flapping, and
-    # cluster-wide CrashLoopBackOff pods. See vcf-troubleshooting #3/#56/#57.
-    # Config-gated: [VSPMONITOR] enabled=false skips the entire block here before
-    # the script is even invoked. Non-fatal — a monitor failure never fails lab startup.
+    # ---- VSP Cluster Health Monitor: startup report pass ----
+    # Runs vcf-lab-tuner.py --cluster vsp --mode report
     _vspmon_enabled = False
     if lsf.config.has_section('VSPMONITOR') and lsf.config.has_option('VSPMONITOR', 'enabled'):
         _raw = lsf.config.get('VSPMONITOR', 'enabled').strip().lower()
@@ -5527,17 +5302,13 @@ echo "PROXY_CONFIGURED"
     if not _vspmon_enabled:
         lsf.write_output('VSP health monitor not enabled in [VSPMONITOR] — skipping')
     else:
-        vsp_monitor_script = '/home/holuser/hol/Tools/vsp-health/vsp-health-monitor.py'
-        if os.path.isfile(vsp_monitor_script):
+        vlt_script = '/home/holuser/hol/Tools/vcf-lab-tuner.py'
+        if os.path.isfile(vlt_script):
             lsf.write_output('=' * 60)
-            lsf.write_output('VSP Cluster Health Monitor (startup pass + timer install)')
+            lsf.write_output('VSP Cluster Health Monitor (report pass via vcf-lab-tuner.py)')
             lsf.write_output('=' * 60)
             try:
-                _vspm_cmd = ['python3', '-u', vsp_monitor_script]
-                if dry_run:
-                    _vspm_cmd.append('--dry-run')
-                else:
-                    _vspm_cmd.append('--install-timer')
+                _vspm_cmd = ['python3', '-u', vlt_script, '--cluster', 'vsp', '--mode', 'report']
                 _vspm_env = os.environ.copy()
                 _vspm_env['PYTHONUNBUFFERED'] = '1'
                 _vspm_proc = subprocess.Popen(
@@ -5548,16 +5319,33 @@ echo "PROXY_CONFIGURED"
                 for _vspm_line in _vspm_proc.stdout:
                     if time.time() - _vspm_start > 1800:  # 30 min safety cap
                         _vspm_proc.kill()
-                        lsf.write_output('  WARNING: VSP health monitor timed out')
+                        lsf.write_output('  WARNING: VSP health report timed out')
                         break
                     _vspm_line = _vspm_line.rstrip('\n')
                     if _vspm_line.strip():
                         lsf.write_output(f'  {_vspm_line.strip()}')
                 _vspm_proc.wait()
             except Exception as _vspm_exc:
-                lsf.write_output(f'  WARNING: VSP health monitor step failed (non-fatal): {_vspm_exc}')
+                lsf.write_output(f'  WARNING: VSP health report step failed (non-fatal): {_vspm_exc}')
         else:
-            lsf.write_output(f'VSP health monitor not found: {vsp_monitor_script} — skipping')
+            lsf.write_output(f'VSP health tuner not found: {vlt_script} — skipping')
+
+    # ---- Opslogs Background Probe Synchronization Gate ----
+    if opslogs_probe_state.get('thread') is not None and opslogs_probe_state['thread'].is_alive():
+        lsf.write_output('Waiting for opslogs background probe to complete before finishing VCFfinal...')
+        while opslogs_probe_state['thread'].is_alive():
+            elapsed = time.time() - opslogs_probe_state['start_time']
+            if elapsed > 1200:  # 20 minutes timeout cap
+                fail_msg = 'VCF Component URL opslogs not accessible after 20 minutes of probing (timeout exceeded)'
+                lsf.write_output(f'  [FAILED] {fail_msg}')
+                lsf.labfail(fail_msg)
+            time.sleep(5)
+
+    if opslogs_probe_state.get('failed'):
+        fail_msg = opslogs_probe_state.get('error') or 'VCF Component URL opslogs probe failed after 20 minutes'
+        lsf.labfail(fail_msg)
+    elif opslogs_probe_state.get('success'):
+        lsf.write_output('opslogs background probe completed successfully.')
 
     lsf.write_output(f'{MODULE_NAME} completed')
     return not module_failed
