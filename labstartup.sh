@@ -1,7 +1,8 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.16 - 2026-08-25
+# Version 3.17 - 2026-08-25
 # Changes:
+# - Remove any legacy vsp-health-monitor crontab entry if present
 # - Added check_and_fix_console_taskbar(): preflight check and self-heal for the
 #   Main Console bottom taskbar (Ubuntu Dock). Detects missing/disabled GNOME extensions,
 #   unconfigured dash-to-dock positioning or autohide states, and remediates them to ensure
@@ -1545,6 +1546,12 @@ date > ${holorouterdir}/gitdone
 #==============================================================================
 # RUN LABSTARTUP
 #==============================================================================
+
+# Remove any legacy vsp-health-monitor crontab entry if present
+if crontab -l 2>/dev/null | grep -q 'vsp-health-monitor'; then
+    log_msg "Removing vsp-health-monitor from crontab..." "${logfile}"
+    crontab -l 2>/dev/null | grep -v 'vsp-health-monitor' | crontab -
+fi
 
 if [ -f ${configini} ]; then
     if cp /tmp/config.ini /lmchol/tmp/config.ini 2>&1; then
