@@ -2,19 +2,20 @@
 
 ## Broadcom Knowledge Base (KB) Alignment & Comparative Analysis Report
 
-**Target Script**: `Tools/vcfa-stabilizer.sh` (v2.24)  
-**Environment**: VMware Cloud Foundation (VCF) Automation 9.x on Nested Holodeck vPods  
-**Date**: August 20, 2026
+**Target Script**: `Tools/vcfa-stabilizer.sh` (v2.26) / `Tools/vcf-lab-tuner.py` (v1.8.0)  
+**Environment**: VMware Cloud Foundation (VCF) Automation 9.x / Supervisor / VSP on Nested Holodeck vPods  
+**Date**: August 24, 2026  
 **Reviewer**: Cursor IDE using model: Gemini 3.7 Flash High
 
 ---
 
 ## 1. Executive Summary
 
-A comprehensive technical comparison was conducted between the remediation logic implemented in `Tools/vcfa-stabilizer.sh` and official Broadcom Knowledge Base (KB) articles.
+A comprehensive technical comparison was conducted between the remediation logic implemented in `Tools/vcfa-stabilizer.sh`, the legacy stabilization scripts (`supervisor_stabilizer.py`, `vsp-stabilizer.sh`), and the unified `Tools/vcf-lab-tuner.py` against official Broadcom Knowledge Base (KB) articles.
 
 - **Direct Implementations (Exact Matches)**: The script directly incorporates official Broadcom KB remediation sequences for **`etcd` defragmentation / alarm clearing (KB 327477)**, **health probe timeout dilation (KB 322724)**, **`ccs-k3s` certificate bloat / secret clearing (KB 440167)**, **PostgreSQL `0700` permission enforcement (KB 372624)**, and **CSI lease lock clearing (KB 435491)**.
-- **Architectural Enhancements (Permanent Root-Cause vs. Reactive Workaround)**: For **Envoy Gateway SDS 503 errors (KB 439264 / KB 424402)**, Broadcom KB 439264 provides a reactive restart script (`envoy_gateway_sds_fix.sh`). `vcfa-stabilizer.sh` goes significantly beyond this by fixing the underlying Gateway API `BackendTLSPolicy` configuration schema, deploying an admission mutation policy (Kyverno), and adding systemd memory drift watchers to prevent recurring failures.
+- **Architectural Enhancements (Permanent Root-Cause vs. Reactive Workaround)**: For **Envoy Gateway SDS 503 errors (KB 439264 / KB 424402)**, Broadcom KB 439264 provides a reactive restart script (`envoy_gateway_sds_fix.sh`). `vcfa-stabilizer.sh` and `vcf-lab-tuner.py` go significantly beyond this by fixing the underlying Gateway API `BackendTLSPolicy` configuration schema, deploying an admission mutation policy (Kyverno), and adding systemd memory drift watchers to prevent recurring failures.
+- **Proactive Pod Health & Multi-Cluster Stabilization**: Implements comprehensive stale, failed, and hanging pod cleanup across Supervisor, VSP, and VCFA clusters aligning with **KB 326114, KB 326113, KB 435491, and KB 326110**. Eliminates vSphere-specific failure reason blindspots (`AgentUnreachable`, `ProviderFailed`, `PodVMAnnotationsMissing`, `Evicted`) through reason-agnostic phase field selectors, purges one-shot Job/CronJob/Workflow terminal pods, force-deletes wedged `Terminating` pods, and provides multi-vCenter auto-discovery with two-pass deployment readiness verification.
 - **Proactive Lab Hardening (Nested Virtualization Accommodations)**: To prevent control-plane death-spirals caused by nested storage/CPU latency spikes, the script extends standard KB practices with leader-election lease tolerance, kernel-level VIP pinning, and automated support-bundle runaway sweeps.
 
 ---
@@ -28,6 +29,7 @@ A comprehensive technical comparison was conducted between the remediation logic
 | **Phase 2** | **Authentication Services Stabilization** | [KB 322724](https://knowledge.broadcom.com/external/article?articleNumber=322724)<br>[KB 426075](https://knowledge.broadcom.com/external/article/426075/vmware-aria-automation-services-fail-to.html) | KB 322724 recommends increasing probe timeouts (`timeoutSeconds: 10`, `failureThreshold`, `periodSeconds`) to prevent premature container kills during slow initialization. Script applies these exact timeout patches across the 5 core authentication deployments. | **Exact Match (Automated)** |
 | **Phase 3** | **VCFA Core Components & Edge Cases** | [KB 440167](https://knowledge.broadcom.com/external/article/440167/the-aria-automation-ui-becomes-inaccessi.html)<br>[KB 392417](https://knowledge.broadcom.com/external/article/392417/resolving-rabbitmq-cluster-join-failure.html)<br>[KB 372624](https://knowledge.broadcom.com/external/article/372624/vmware-aria-automation-postgres-service.html)<br>[KB 417831](https://knowledge.broadcom.com/external/article/417831/aria-automation-provisioning-pod-constan.html)<br>[KB 435491](https://knowledge.broadcom.com/external/article/435491/csicontroller-pod-stuck-in-terminatingco.html) | • `ccs-k3s`: Script clears bloated `k3s-serving` secrets exceeding 64KB (KB 440167).<br>• `RabbitMQ`: Enforces `0400` permissions on `.erlang.cookie` (KB 392417) and protects `copy-config` init container.<br>• `PostgreSQL`: Enforces `0700` `pgdata` permissions (KB 372624).<br>• `vsphere-csi`: Deletes stale leader election leases in `kube-system` (KB 435491).<br>• `provisioning-service`: Disables Prometheus exemplars to prevent JVM deadlocks. | **Exact Match + Edge-Case Hardening** |
 | **Phase 3.5** | **Envoy Gateway SDS NACK Auto-Fix** | [KB 439264](https://knowledge.broadcom.com/external/article/439264/api-requests-fail-with-sds-errors.html)<br>[KB 424402](https://knowledge.broadcom.com/external/article/424402/ssl-is-out-of-sync-in-vcf-automation-and.html) | KB 439264 provides a reactive restart script (`envoy_gateway_sds_fix.sh`) when HTTP 503 SDS errors occur. Script fixes the root-cause incompatibility (Envoy v1.34 SAN-without-CA NACK) by mapping `BackendTLSPolicy` to `caCertificateRefs: platform-trust`, deploying Kyverno mutation policies, and increasing operator memory to 4Gi. | **Major Architectural Enhancement** |
+| **Pod Cleanup** | **Terminal, Failed, Stale & Hanging Pod Sweeping** | [KB 326114](https://knowledge.broadcom.com/external/article?articleNumber=326114)<br>[KB 326113](https://knowledge.broadcom.com/external/article?articleNumber=326113)<br>[KB 435491](https://knowledge.broadcom.com/external/article/435491/csicontroller-pod-stuck-in-terminatingco.html)<br>[KB 326110](https://knowledge.broadcom.com/external/article/326110/troubleshooting-kubernetes-disk-pressure.html) | KB articles describe diagnosing pods stuck in `Error`, `Failed`, `Terminating`, or `Evicted` states. `vcf-lab-tuner.py` (v1.8.0) unifies pod sweeps across Supervisor, VSP, and VCFA: reason-agnostic phase field-selectors (`status.phase=Failed/Succeeded`), Job/CronJob/Workflow artifact deletion, wedged `Terminating` pod force-clearing, and multi-vCenter Supervisor workload pre-flight scale-up. | **Comprehensive Unified Remediation** |
 | **Phase 4** | **Waiting for Stabilization** | [KB 326114](https://knowledge.broadcom.com/external/article?articleNumber=326114) | KB outlines cluster convergence validation. Script implements an active 5-second polling loop monitoring pod crash-loops and container restart statuses until the cluster reaches steady state. | **Aligned (Automated)** |
 | **Phase 5** | **Verification Suite** | [KB 326114](https://knowledge.broadcom.com/external/article?articleNumber=326114) | KB outlines endpoint verification. Script executes an automated 5-step verification testing Kubernetes control plane, `/automation` gateway response (HTTP 200), and core service readiness. | **Aligned (Automated)** |
 | **Phase 6** | **Continuous Monitoring Setup** | [KB 326114](https://knowledge.broadcom.com/external/article?articleNumber=326114) | KB provides manual troubleshooting commands. Script generates standalone persistent scripts (`/usr/local/bin/check-vcfa-health.sh`, `vcfa-verify-stability.sh`) for ongoing verification. | **Aligned (Automated)** |
@@ -91,6 +93,32 @@ A comprehensive technical comparison was conducted between the remediation logic
 
 ---
 
+### Terminal, Failed, and Hung Pod Cleanup Procedures (KB 326114, KB 326113, KB 435491, KB 326110)
+
+1. **Root Cause Analysis & Remediation Architecture**:
+   - In nested lab environments subjected to host reboots, snapshot reverts, or vCenter restarts, pods frequently become wedged in abnormal states across all three Kubernetes control planes (Supervisor, VSP, and VCFA).
+   - Standard Kubernetes pod garbage collection fails to clean up:
+     1. **vSphere-Specific Supervisor Failures**: Pods in `status.phase=Failed` with custom reasons such as `AgentUnreachable`, `ProviderFailed`, `PodVMAnnotationsMissing`, `NodeLost`, or `Evicted`.
+     2. **Terminal One-Shot Jobs / Workflows**: Completed or errored Job/CronJob/Argo Workflow pods (`configure-component-*-execute-script-*`, `support-bundle-*`, `platform-trust-*`, `scheduled-etcd-*`, `service-account-rotation-*`, `vcenter-path-sync-*`, `wal-s3-*`, `descheduler-*`) that linger at `restartCount=0` and remain uncollected.
+     3. **Wedged `Terminating` Pods**: Pods with non-empty `metadata.deletionTimestamp` where underlying volume unmounts or finalizers hung due to transient ESXi/CSI disconnects.
+     4. **Crashed Microservices**: Pods in `CrashLoopBackOff` or `Error` in core application namespaces (`prelude`, `vidb-external`, `vcf-sddc-lcm`, `salt-raas`, `vmsp-platform`).
+
+2. **Unified Remediation Implementation in `vcf-lab-tuner.py` (v1.8.0)**:
+   - **Supervisor Workload Recovery & Two-Pass Sweep**:
+     - *Pre-Flight Scale-Up*: Automatically scales up essential Supervisor services (`svc-cci-ns*`, `argocd`, `svc-harbor*`) to ensure controllers are active.
+     - *Reason-Agnostic Phase Deletion*: Executes `--field-selector status.phase=Failed` and `--field-selector status.phase=Succeeded` batch deletions across all namespaces, eliminating all reason string enumeration gaps.
+     - *Stuck Container Filter*: Scans the `STATUS` column for non-terminal failure modes (`CrashLoopBackOff`, `ImagePullBackOff`, `CreateContainerConfigError`, `RunContainerError`, `OOMKilled`) and force-deletes them.
+     - *Two-Pass Readiness Polling*: Waits up to 60s for deployment replicas to reach `ready == desired`, followed by a second sweep pass to catch newly-appeared strays during spherelet reconnects.
+   - **VSP & VCFA Workload Sweeping**:
+     - Automatically purges terminal Job and Workflow pods cluster-wide without requiring artificial restart count thresholds.
+     - Force-deletes hanging `Terminating` pods using `--force --grace-period=0`.
+     - Recreates crash-looping workloads (`CrashLoopBackOff` / `Error`) with `restarts >= 5` or when in failed states.
+   - **Real-Time Streaming & `labstartup.log` Parity**:
+     - Real-time logging output (`[SUPERVISOR] <namespace>: deleted X stale pod(s) — ...`, `[VSP] <namespace>: deleted X terminal pod(s)`, `[VCFA] <namespace>: deleted X terminal pod(s)`) is streamed through Python `sys.stdout` unbuffered, guaranteeing complete visibility in `labstartup.log` when invoked by `VCFfinal.py`.
+
+---
+
 ## 4. Conclusion
 
-`Tools/vcfa-stabilizer.sh` fully aligns with official Broadcom Knowledge Base articles for all standard remediation tasks while providing automated, idempotent execution. Where differences exist (particularly in **Phase 1.5 Control-Plane Preflight** and **Phase 3.5 SDS NACK Auto-Fix**), the script implements permanent root-cause fixes and nested virtualization tolerance enhancements that surpass the manual or temporary restart workarounds in the published KBs.
+`Tools/vcfa-stabilizer.sh` (v2.26) and `Tools/vcf-lab-tuner.py` (v1.8.0) fully align with official Broadcom Knowledge Base articles for all standard remediation tasks while providing automated, idempotent execution. Where differences exist (particularly in **Phase 1.5 Control-Plane Preflight**, **Phase 3.5 SDS NACK Auto-Fix**, and **Unified Pod Cleanup**), the scripts implement permanent root-cause fixes, admission mutations, and nested virtualization tolerance enhancements that surpass the manual or temporary restart workarounds in the published KBs.
+
