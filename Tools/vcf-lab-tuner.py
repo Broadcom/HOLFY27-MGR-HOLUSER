@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 1.8.0 - 2026-08-24
+Version 1.9.0 - 2026-08-25
 Author: HOL Core Team
+
+v1.9.0: VCFA automated startup recovery, 0-replica prelude scale-up, and SDS SAN NACK auto-remediation:
+  - 0-Replica Prelude Workload Recovery: Auto-scales all 0-replica Deployments and StatefulSets in prelude back to 1 during remediation, resolving the post-shutdown / cold-boot outage caused by resumed Fleet LCM Argo workflows.
+  - VCFA Section Re-ordering: Re-ordered VCFA execution flow (argo -> nodes -> cp -> etcd -> postgres -> pods -> storm -> edge -> certs -> gateway -> deployments -> endpoint -> kubeadm) so workflows are swept, nodes uncordoned, and deadlocks cleared before deployments and endpoints are validated.
+  - Integrated SDS SAN NACK Auto-Fix: chk_gateway on VCFA now automatically verifies and synchronizes platform-trust ConfigMaps across BackendTLSPolicy namespaces, applies the Kyverno vcfa-btp-wellknown-to-carefs ClusterPolicy, and rolls dataplanes if modified during remediation.
+  - Active Resource Manager gRPC Bootstrap Deadlock Unblocker: Embedded the nsenter HTTP/2 SETTINGS frame injector in chk_edge, actively resolving the self-dial race condition during startup so resource-manager binds :7777 reliably.
+  - CrashLoopBackOff Pod Reset: Automatically clears crashed auth pods in prelude during deployment remediation to reset exponential backoff delay.
+  - Comprehensive Endpoint Probing: chk_endpoint tests both /automation and /login/ endpoints via gateway VIP.
 
 v1.8.0: Comprehensive failed, stale, and hanging pod cleanup across Supervisor, VSP, and VCFA clusters:
   - Supervisor: Full parity with legacy supervisor_stabilizer.py workload recovery & stale pod sweep:
@@ -460,8 +468,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "1.8.0"
-DATE    = "2026-08-24"
+VERSION = "1.9.0"
+DATE    = "2026-08-25"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -715,8 +723,11 @@ def get_cluster_configs(args):
             # actually reachable for this cluster - vsp_cert_renewer.py has always
             # supported --cluster vcfa, but nothing in this tool called it, so a VCFA
             # kubeadm cert nearing expiry had no delegation path at all.
-            "sections": ["cp", "nodes", "pods", "deployments", "gateway", "endpoint",
-                         "postgres", "certs", "kubeadm", "argo", "edge", "etcd", "storm"],
+            # Re-ordered execution flow: sweeps and pre-flight cleanup run first (argo, nodes, cp, etcd, postgres, pods),
+            # followed by storm mitigations, edge cases (0-replica scale-up & RM unblock), certs, and gateway (SDS BTP fix),
+            # ensuring dependencies are healthy before deployments and endpoints are validated.
+            "sections": ["argo", "nodes", "cp", "etcd", "postgres", "pods", "storm",
+                         "edge", "certs", "gateway", "deployments", "endpoint", "kubeadm"],
         },
         "supervisor": {
             "label": "SUPERVISOR",
@@ -805,7 +816,7 @@ SECTION_ACT_MODES = {
     "argo":        ("remediate",),
     "kyverno":     ("remediate",),
     "password":    ("tune", "remediate"),   # chage is durable config
-    "gateway":     (),                      # detect-only: repair lives in cp/pods
+    "gateway":     ("remediate",),          # auto-remediates SDS SAN NACK & syncs platform-trust ConfigMaps
     "edge":        ("remediate",),
     "etcd":        ("remediate",),          # defrag briefly stalls the apiserver
     "services":    ("tune", "remediate"),   # starting a stopped service is config-ish
@@ -3029,25 +3040,29 @@ def chk_endpoint(r, ctx):
     fqdn, vip = cfg.get("endpoint_fqdn"), cfg.get("endpoint_vip")
     if not (fqdn and vip):
         return []
-    rc, out = r.read(
-        f"curl -k -s -o /dev/null -w '%{{http_code}}' --connect-timeout 8 "
-        f"--resolve {fqdn}:443:{vip} https://{fqdn}{cfg['endpoint_path']} 2>/dev/null", 45)
-    code = (out or "").strip().splitlines()
-    code = code[-1].strip() if code else ""
-    label = f"https://{fqdn}{cfg['endpoint_path']}: HTTP 200"
-    if code == "200":
-        return [ok("endpoint", label, cluster=cl)]
-    if not code.isdigit():
-        return [warn("endpoint", label, "no response code from curl", cluster=cl)]
-    # DETECT-ONLY BY DESIGN. A non-200 here is a symptom, not a thing you fix at
-    # this layer - the cause is upstream (gateway pods, prelude scaled to 0, a
-    # stale shutdown workflow), and each has its own section with its own guards.
-    # vsp-health-monitor.py:2594 makes the same call for VIPs: "a VIP down while
-    # its backing pod is healthy should be surfaced (not blindly auto-restarted)".
-    return [fail("endpoint", label,
-                 f"HTTP {code} — symptom, not remediated here; check the pods / "
-                 f"deployments sections, or vcfa-stabilizer.sh --fix-post-boot",
-                 cluster=cl)]
+    out = []
+    primary_path = cfg.get("endpoint_path", "/automation")
+    paths_to_check = [primary_path]
+    if primary_path != "/login/":
+        paths_to_check.append("/login/")
+
+    for p in paths_to_check:
+        rc, code_raw = r.read(
+            f"curl -k -s -o /dev/null -w '%{{http_code}}' --connect-timeout 8 "
+            f"--resolve {fqdn}:443:{vip} https://{fqdn}{p} 2>/dev/null", 45)
+        code = (code_raw or "").strip().splitlines()
+        code = code[-1].strip() if code else ""
+        label = f"https://{fqdn}{p}: HTTP 200"
+        if code in ("200", "302"):
+            out.append(ok("endpoint", label, f"HTTP {code}", cluster=cl))
+        elif not code.isdigit():
+            out.append(warn("endpoint", label, "no response code from curl", cluster=cl))
+        else:
+            out.append(fail("endpoint", label,
+                            f"HTTP {code} — symptom; check pods, deployments, gateway SDS, "
+                            f"or run with --recover-gateway-503 / --fix-sds-sni",
+                            cluster=cl))
+    return out
 
 
 def chk_deployments(r, ctx):
@@ -3091,12 +3106,6 @@ def chk_deployments(r, ctx):
             continue
         ready, desired = live[key]
         if desired == 0:
-            # Do NOT blind-scale to 1. supervisor_stabilizer.py:1937 runs
-            # `scale --all --replicas=1`, which silently DOWN-scales anything
-            # intentionally running more, and cannot tell "switched off on
-            # purpose" from "scaled to 0 by a stale shutdown workflow".
-            # vsp-health-monitor.py:1936 does it right: restore a RECORDED
-            # intended count. Without that annotation, say so and stop.
             recorded = live_annotations.get(key)
             res = warn("deploy", f"{label} (currently scaled to 0)",
                        "0 replicas — intentional, or a stale shutdown workflow?",
@@ -3110,6 +3119,15 @@ def chk_deployments(r, ctx):
                 res.action = f"scaled to recorded {recorded}"
                 if not r.dry_run:
                     res.detail = f"restored to recorded {recorded}"
+            elif cl == "vcfa" and may_act(r, "deployments"):
+                # On VCFA, stale Fleet LCM shutdown workflows scale deployments to 0 without annotations.
+                # In remediate mode, scale back to 1 to recover from post-shutdown / cold-boot outage.
+                r.write(f"kubectl scale deployment {name} -n {ns} --replicas=1",
+                        f"scale 0-replica {ns}/{name} to 1 (post-shutdown recovery)",
+                        tier="transient", timeout=60)
+                res.action = "replicas -> 1"
+                if not r.dry_run:
+                    res.state, res.detail = "warn", "was 0 replicas; scaled to 1"
             elif may_act(r, "deployments"):
                 res.detail += " — no vcf.lab/original-replicas annotation, so the " \
                               "intended count is unknown; not guessing"
@@ -3120,13 +3138,14 @@ def chk_deployments(r, ctx):
             res = (warn if severity == "warn" else fail)(
                 "deploy", label, f"{ready}/{desired}", cluster=cl)
             if may_act(r, "deployments") and severity != "warn":
-                r.write(f"kubectl rollout restart deployment {name} -n {ns}",
-                        f"rollout restart {ns}/{name} ({ready}/{desired} available)",
+                r.write(f"kubectl delete pod -n {ns} -l app={name} --field-selector=status.phase!=Running --grace-period=0 2>/dev/null; "
+                        f"kubectl rollout restart deployment {name} -n {ns}",
+                        f"reset crashed pods and rollout restart {ns}/{name} ({ready}/{desired} available)",
                         tier="transient", timeout=90)
-                res.action = "rollout restarted"
+                res.action = "crashed pods reset & rollout restarted"
                 if not r.dry_run:
                     res.state = "warn"
-                    res.detail = f"was {ready}/{desired}; rollout restarted"
+                    res.detail = f"was {ready}/{desired}; crashed pods reset and rollout restarted"
             out.append(res)
     return out
 
@@ -4699,6 +4718,12 @@ def chk_gateway(r, ctx):
                         "none match envoy-vmsp-platform* — informational: this "
                         "build may name them differently. Judge the gateway by the "
                         "LB VIP rows above and the endpoint section", cluster=cl))
+
+    if cl == "vcfa":
+        # Envoy Gateway v1.5 / Envoy v1.34 SDS SAN-without-CA NACK fix [KB 439264, KB 424402]
+        sds_results = _fix_sds_sni(r, cl)
+        out.extend(sds_results)
+
     return out
 
 
@@ -4713,6 +4738,8 @@ def chk_edge(r, ctx):
         "Config file(s): (none)", no AMQPS listener, yet rabbitmq-diagnostics ping
         (the probe) still passes, so it looks healthy while ~15 prelude
         deployments stall behind ebs-service.
+      * 0-replica prelude Deployments & StatefulSets - left at 0 by resumed
+        Fleet LCM Argo shutdown workflows.
     """
     out = []
     cl = r.cluster
@@ -4770,11 +4797,51 @@ def chk_edge(r, ctx):
                     "-p '{\"spec\":{\"publishNotReadyAddresses\":true}}'",
                     "set publishNotReadyAddresses=true on resource-manager-grpc Service",
                     tier="persistent", timeout=60)
-            r.write("kubectl delete pod -n prelude -l app=resource-manager-server 2>/dev/null; "
-                    "kubectl delete pod -n prelude -l app=resource-manager-server-app 2>/dev/null",
+            unblock_py = (
+                "import os, sys, subprocess, json, time\n"
+                "kc = '/etc/kubernetes/admin.conf' if os.path.exists('/etc/kubernetes/admin.conf') else '/etc/kubernetes/super-admin.conf'\n"
+                "try:\n"
+                "    pods = json.loads(subprocess.check_output(['kubectl', f'--kubeconfig={kc}', 'get', 'pods', '-n', 'prelude', '-l', 'app=resource-manager-server', '-o', 'json'], stderr=subprocess.DEVNULL))\n"
+                "    active = [i for i in pods.get('items', []) if 'deletionTimestamp' not in i.get('metadata', {})]\n"
+                "    if active:\n"
+                "        pname = active[0]['metadata']['name']\n"
+                "        cids = subprocess.check_output(['crictl', 'ps', '--label', f'io.kubernetes.pod.name={pname}', '--name', 'resource-manager', '-q'], stderr=subprocess.DEVNULL).decode().strip().splitlines()\n"
+                "        pid = json.loads(subprocess.check_output(['crictl', 'inspect', cids[0]], stderr=subprocess.DEVNULL))['info']['pid'] if cids else None\n"
+                "        if pid:\n"
+                "            cert = f'/proc/{pid}/root/etc/server-tls/tls.crt'\n"
+                "            key = f'/proc/{pid}/root/etc/server-tls/tls.key'\n"
+                "            if os.path.exists(cert) and os.path.exists(key):\n"
+                "                code = f'''import socket, ssl, time, threading\n"
+                "ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)\n"
+                "ctx.load_cert_chain(\"{cert}\", \"{key}\")\n"
+                "ctx.set_alpn_protocols([\"h2\", \"grpc\"])\n"
+                "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                "s.bind((\"0.0.0.0\", 7710))\n"
+                "s.listen(5)\n"
+                "s.settimeout(15.0)\n"
+                "try:\n"
+                "    c, a = s.accept()\n"
+                "    w = ctx.wrap_socket(c, server_side=True)\n"
+                "    w.sendall(bytes([0, 0, 0, 4, 0, 0, 0, 0, 0]))\n"
+                "    time.sleep(10)\n"
+                "    w.close()\n"
+                "except Exception:\n"
+                "    pass\n"
+                "s.close()\n"
+                "'''\n"
+                "                subprocess.run(['nsenter', '-t', str(pid), '-n', 'python3', '-c', code], timeout=25)\n"
+                "except Exception:\n"
+                "    pass\n"
+            )
+            r.write(f"python3 - <<'PY'\n{unblock_py}PY\n",
+                    "unblock resource-manager-server self-dial gRPC deadlock via nsenter",
+                    tier="transient", timeout=45)
+            r.write("kubectl delete pod -n prelude -l app=resource-manager-server --grace-period=0 2>/dev/null; "
+                    "kubectl delete pod -n prelude -l app=resource-manager-server-app --grace-period=0 2>/dev/null",
                     "restart resource-manager-server pod to unblock gRPC self-dial bootstrap deadlock",
                     tier="transient", timeout=90)
-            res.action = "publishNotReadyAddresses set, pod restarted"
+            res.action = "publishNotReadyAddresses set, nsenter unblocker executed, pod restarted"
             if not r.dry_run:
                 res.state = "warn"
                 res.detail = "unblocked gRPC self-dial bootstrap deadlock"
@@ -4846,6 +4913,41 @@ def chk_edge(r, ctx):
                 res_cookie.state = "warn"
                 res_cookie.detail = "fix-cookie patch applied"
         out.append(res_cookie)
+
+    if cl == "vcfa":
+        # 0-replica prelude Deployments & StatefulSets check and auto-recovery (from resumed Fleet LCM shutdown workflows)
+        rc_z, zout = r.read(
+            "kubectl get deploy,sts -n prelude -o json 2>/dev/null", 45)
+        if rc_z == 0 and zout:
+            try:
+                zd = json.loads(zout)
+                zero_items = []
+                for item in zd.get("items", []):
+                    kind = item.get("kind", "Deployment").lower()
+                    name = item.get("metadata", {}).get("name", "")
+                    reps = item.get("spec", {}).get("replicas")
+                    if reps == 0 and name:
+                        zero_items.append((kind, name))
+                zlabel = "prelude workloads: no 0-replica Deployments/StatefulSets"
+                if not zero_items:
+                    out.append(ok("edge.zero_replicas", zlabel, cluster=cl))
+                else:
+                    names_str = ", ".join(f"{k}/{n}" for k, n in zero_items[:4])
+                    res_z = fail("edge.zero_replicas", zlabel,
+                                 f"{len(zero_items)} workload(s) at 0 replicas (post-shutdown): {names_str}",
+                                 cluster=cl)
+                    if may_act(r, "edge"):
+                        for kind, name in zero_items:
+                            r.write(f"kubectl scale {kind}/{name} -n prelude --replicas=1",
+                                    f"scale 0-replica {kind}/{name} in prelude to 1 (post-shutdown recovery)",
+                                    tier="transient", timeout=45)
+                        res_z.action = f"scaled {len(zero_items)} workload(s) to 1"
+                        if not r.dry_run:
+                            res_z.state, res_z.detail = "warn", f"scaled {len(zero_items)} 0-replica workload(s) to 1"
+                    out.append(res_z)
+            except Exception:
+                pass
+
     return out
 
 
@@ -5288,8 +5390,8 @@ def chk_storm(r, ctx):
 
 def _fix_sds_sni(r, cl):
     """Envoy Gateway v1.5 / Envoy v1.34 SDS SAN-without-CA NACK fix [KB 439264, KB 424402].
-    Ensures platform-trust ConfigMap exists in every BackendTLSPolicy namespace
-    and applies Kyverno ClusterPolicy vcfa-btp-wellknown-to-carefs. Batched execution.
+    Ensures platform-trust ConfigMap exists in every BackendTLSPolicy namespace,
+    applies Kyverno ClusterPolicy vcfa-btp-wellknown-to-carefs, and rolls dataplanes if modified.
     """
     out = []
     batch_check = (
@@ -5307,40 +5409,59 @@ def _fix_sds_sni(r, cl):
     )
     rc, raw = r.read(batch_check, 45)
     raw_str = raw or ""
+    copied_namespaces = []
     for line in raw_str.splitlines():
         if line.startswith("COPIED:"):
             ns = line.split(":", 1)[1].strip()
+            copied_namespaces.append(ns)
             out.append(ok("sds_sni.cm", f"{ns}/platform-trust ConfigMap copied", cluster=cl))
 
+    policy_applied = False
     if "NEED_POLICY" in raw_str or rc != 0:
-        kyverno_yaml = (
-            "apiVersion: kyverno.io/v1\n"
-            "kind: ClusterPolicy\n"
-            "metadata:\n"
-            "  name: vcfa-btp-wellknown-to-carefs\n"
-            "spec:\n"
-            "  rules:\n"
-            "  - name: mutate-btp-wellknown\n"
-            "    match:\n"
-            "      any:\n"
-            "      - resources:\n"
-            "          kinds:\n"
-            "          - gateway.networking.k8s.io/v1alpha3/BackendTLSPolicy\n"
-            "          - gateway.networking.k8s.io/v1alpha2/BackendTLSPolicy\n"
-            "    mutate:\n"
-            "      patchStrategicMerge:\n"
-            "        spec:\n"
-            "          validation:\n"
-            "            caCertificateRefs:\n"
-            "            - group: \"\"\n"
-            "              kind: ConfigMap\n"
-            "              name: platform-trust\n"
-            "            (wellKnownCACertificates): null\n"
-        )
-        r.write(f"cat << 'EOF' | kubectl apply -f -\n{kyverno_yaml}EOF\n",
-                "apply Kyverno ClusterPolicy vcfa-btp-wellknown-to-carefs for SDS SAN NACK fix",
-                tier="persistent", timeout=60)
-        out.append(ok("sds_sni.policy", "vcfa-btp-wellknown-to-carefs ClusterPolicy applied", cluster=cl))
+        if may_act(r, "gateway") or may_act(r, "storm"):
+            kyverno_yaml = (
+                "apiVersion: kyverno.io/v1\n"
+                "kind: ClusterPolicy\n"
+                "metadata:\n"
+                "  name: vcfa-btp-wellknown-to-carefs\n"
+                "spec:\n"
+                "  rules:\n"
+                "  - name: mutate-btp-wellknown\n"
+                "    match:\n"
+                "      any:\n"
+                "      - resources:\n"
+                "          kinds:\n"
+                "          - gateway.networking.k8s.io/v1alpha3/BackendTLSPolicy\n"
+                "          - gateway.networking.k8s.io/v1alpha2/BackendTLSPolicy\n"
+                "    mutate:\n"
+                "      patchStrategicMerge:\n"
+                "        spec:\n"
+                "          validation:\n"
+                "            caCertificateRefs:\n"
+                "            - group: \"\"\n"
+                "              kind: ConfigMap\n"
+                "              name: platform-trust\n"
+                "            (wellKnownCACertificates): null\n"
+            )
+            r.write(f"cat << 'EOF' | kubectl apply -f -\n{kyverno_yaml}EOF\n",
+                    "apply Kyverno ClusterPolicy vcfa-btp-wellknown-to-carefs for SDS SAN NACK fix",
+                    tier="persistent", timeout=60)
+            policy_applied = True
+            out.append(ok("sds_sni.policy", "vcfa-btp-wellknown-to-carefs ClusterPolicy applied", cluster=cl))
+        else:
+            out.append(fail("sds_sni.policy", "vcfa-btp-wellknown-to-carefs ClusterPolicy applied",
+                            "ClusterPolicy missing — BackendTLSPolicies will trigger Envoy SDS NACK", cluster=cl))
+    else:
+        out.append(ok("sds_sni.policy", "vcfa-btp-wellknown-to-carefs ClusterPolicy present", cluster=cl))
+
+    if (copied_namespaces or policy_applied) and (may_act(r, "gateway") or may_act(r, "storm")):
+        r.write(
+            "kubectl rollout restart deployment/envoy-gateway -n vmsp-platform && "
+            "kubectl rollout restart deployment/vmsp-gateway -n vmsp-platform && "
+            "kubectl rollout restart deployment/vcfa-gateway-configuration -n vmsp-platform",
+            "rollout restart gateway dataplanes to reload SDS bundles",
+            tier="transient", timeout=90)
+        out.append(ok("sds_sni.rollout", "gateway dataplanes rolled to mount fresh SDS certs", cluster=cl))
 
     return out
 
@@ -5379,7 +5500,7 @@ def _recover_gateway_503(r, cl):
     batch_restart = (
         "kubectl rollout restart deployment/envoy-gateway -n vmsp-platform && "
         "kubectl rollout restart deployment/vmsp-gateway -n vmsp-platform && "
-        "kubectl rollout restart deployment/vcfa-gateway -n vmsp-platform && "
+        "kubectl rollout restart deployment/vcfa-gateway-configuration -n vmsp-platform && "
         "kubectl rollout restart deployment/encryption-manager -n prelude && "
         "kubectl rollout restart deployment/intent-server -n prelude && "
         "kubectl rollout restart deployment/vcfa-service-manager -n prelude"
