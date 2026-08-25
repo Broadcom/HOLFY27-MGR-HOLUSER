@@ -1,14 +1,14 @@
 # vcf-lab-tuner.py — Design & Reference
 
-**Version 2.8 — 2026-08-20**
+**Version 2.9 — 2026-08-24**
 **Author:** Burke Azbill and HOL Core Team
-**Status:** `vcf-lab-tuner.py` **v1.7.0**. All three clusters ported (VSP, VCFA,
-Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh` **and** `vcfa-stabilizer.sh`, enabling
-legacy `vsp-stabilizer.sh` and `vcfa-stabilizer.sh` to be safely retired. **Coverage audited against all legacy tools**,
+**Status:** `vcf-lab-tuner.py` **v1.8.0**. Comprehensive failed, stale, and hanging pod cleanup across Supervisor, VSP, and VCFA clusters. All three clusters ported (VSP, VCFA,
+Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh`, `vcfa-stabilizer.sh`, and `supervisor_stabilizer.py`, enabling
+legacy `vsp-stabilizer.sh`, `vcfa-stabilizer.sh`, and `supervisor_stabilizer.py` to be safely retired. **Coverage audited against all legacy tools**,
 including 14/14 `vsp-health.py` sections, 11/11 `auto-health.py` sections, and full
-remediation parity across `vsp-stabilizer.sh`, `vcfa-stabilizer.sh`, and `remediate-lab.sh`.
+remediation parity across `vsp-stabilizer.sh`, `vcfa-stabilizer.sh`, `supervisor_stabilizer.py`, and `remediate-lab.sh`.
 Remediation implemented for every section, keeper management working, deprecation
-banners applied, **23-assertion offline unit test suite passing**. Validated live on
+banners applied, **offline unit test suite passing**. Validated live on
 DevPod.
 
 ---
@@ -1311,7 +1311,26 @@ cross-script locking.
 
 ## 15. Changelog
 
-**2.7 — 2026-08-20** — `vcf-lab-tuner.md` v2.7 / `vcf-lab-tuner.py` **v1.5.0**.
+**2.9 — 2026-08-24** — `vcf-lab-tuner.md` v2.9 / `vcf-lab-tuner.py` **v1.8.0**.
+
+### Comprehensive Failed, Stale, and Hanging Pod Cleanup Across Supervisor, VSP, and VCFA Clusters
+
+Resolved pod sweep gaps where stale/failed one-shot Job pods, wedged `Terminating` pods, and vSphere-specific Supervisor failure reasons (`AgentUnreachable`, `ProviderFailed`, `PodVMAnnotationsMissing`, `Evicted`) were skipped by default damped checks.
+
+#### Key Enhancements & Technical Details
+- **Supervisor Workload Pre-Flight Scale-Up & Reason-Agnostic Phase Sweeps**:
+  - Automatically discovers and scales up CCI (`svc-cci-ns*`), ArgoCD (`argocd`), and Harbor (`svc-harbor*`) deployments/statefulsets.
+  - Queries `--field-selector status.phase=Failed` and `--field-selector status.phase=Succeeded` to delete terminal pods across all namespaces regardless of failure reason string.
+  - Filters and cleans stuck container states (`CrashLoopBackOff`, `ImagePullBackOff`, `CreateContainerConfigError`, `RunContainerError`, `OOMKilled`).
+  - Implements two-pass deployment readiness polling with secondary stray pod sweep.
+- **VSP & VCFA Terminal Job/Workflow & Wedged Pod Sweeping**:
+  - Sweeps terminal completed/failed pods owned by Jobs, CronJobs, and Argo Workflows (`support-bundle-*`, `platform-trust-*`, `scheduled-etcd-*`, `service-account-rotation-*`, `vcenter-path-sync-*`, `wal-s3-*`, `descheduler-*`, `configure-component-*`, `system-shutdown-*`, etc.) without artificial restart count gating.
+  - Force-deletes hanging pods wedged in `Terminating` status (`metadata.deletionTimestamp` set).
+  - Recreates crash-looping workloads (`CrashLoopBackOff` / `Error` with `restarts >= 5` or when in failed state).
+- **Multi-Supervisor & Multi-vCenter Iteration**:
+  - Fully supports auto-discovery and sequential stabilization of all Supervisor control planes across all configured vCenters via `decryptK8Pwd.py` and VPX DB fallback.
+- **Real-Time Streaming Output Parity**:
+  - Emits real-time progress (`[SUPERVISOR] <ns>: deleted X stale pod(s) — ...`, `[VSP] <ns>: deleted X terminal pod(s)`, `[VCFA] <ns>: deleted X terminal pod(s)`) streamed directly into `labstartup.log` when called by `VCFfinal.py`.
 
 ### OpenSSH ControlMaster Multiplexing, Remote Batching, ASCII 16-Color Display, and Broadcom KB Traceability
 
