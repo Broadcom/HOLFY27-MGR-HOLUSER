@@ -1,8 +1,8 @@
 # vcf-lab-tuner.py — Design & Reference
 
-**Version 2.9 — 2026-08-24**
+**Version 3.0 — 2026-08-25**
 **Author:** Burke Azbill and HOL Core Team
-**Status:** `vcf-lab-tuner.py` **v1.8.0**. Comprehensive failed, stale, and hanging pod cleanup across Supervisor, VSP, and VCFA clusters. All three clusters ported (VSP, VCFA,
+**Status:** `vcf-lab-tuner.py` **v1.9.0**. VCFA automated startup recovery, 0-replica prelude scale-up, and SDS SAN NACK auto-remediation. All three clusters ported (VSP, VCFA,
 Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh`, `vcfa-stabilizer.sh`, and `supervisor_stabilizer.py`, enabling
 legacy `vsp-stabilizer.sh`, `vcfa-stabilizer.sh`, and `supervisor_stabilizer.py` to be safely retired. **Coverage audited against all legacy tools**,
 including 14/14 `vsp-health.py` sections, 11/11 `auto-health.py` sections, and full
@@ -1310,6 +1310,29 @@ cross-script locking.
 
 
 ## 15. Changelog
+
+**3.0 — 2026-08-25** — `vcf-lab-tuner.md` v3.0 / `vcf-lab-tuner.py` **v1.9.0**.
+
+### VCFA Automated Startup Recovery, 0-Replica Prelude Scale-Up, and SDS SAN NACK Auto-Remediation
+
+Resolved VCFA cold-boot / post-shutdown stabilization failures where `vcf-lab-tuner.py --cluster vcfa --mode remediate` encountered HTTP 500 on user-facing endpoints.
+
+#### Key Enhancements & Technical Details
+- **0-Replica Prelude Workload Recovery**:
+  - Automatically discovers and scales up any 0-replica Deployments and StatefulSets in the `prelude` namespace to 1 during remediation (`chk_edge` and `chk_deployments`).
+  - Corrects the condition where resumed Fleet LCM `system-shutdown-*` Argo workflows leave critical microservices scaled down to 0 without annotations.
+- **VCFA Section Re-ordering**:
+  - Re-ordered VCFA execution sequence (`argo -> nodes -> cp -> etcd -> postgres -> pods -> storm -> edge -> certs -> gateway -> deployments -> endpoint -> kubeadm`).
+  - Ensures stale shutdown workflows are deleted, nodes uncordoned, databases healthy, probe tolerances relaxed (10s), and deadlocks cleared BEFORE evaluating deployment readiness and testing gateway endpoints.
+- **Integrated SDS SAN-Without-CA NACK Auto-Fix**:
+  - `chk_gateway` on VCFA automatically checks for missing `platform-trust` ConfigMaps across BackendTLSPolicy namespaces and verifies the `vcfa-btp-wellknown-to-carefs` Kyverno ClusterPolicy.
+  - In `remediate` mode, copies missing ConfigMaps, applies the mutation policy, and triggers atomic rollout restarts of the gateway dataplanes (`envoy-gateway`, `vmsp-gateway`, `vcfa-gateway-configuration`).
+- **Active Resource Manager gRPC Deadlock Unblocker**:
+  - Embedded the `nsenter` HTTP/2 SETTINGS frame injector in `chk_edge`, actively accepting the client dial and returning the HTTP/2 preface so `resource-manager-server` completes its bootstrap sequence and binds to `:7777`.
+- **CrashLoopBackOff Auth Pod Reset**:
+  - Automatically resets crashed auth pods in `prelude` with `--grace-period=0` during deployment remediation to eliminate exponential backoff delay.
+- **Comprehensive Endpoint Probing**:
+  - `chk_endpoint` validates both `/automation` and `/login/` via gateway VIP resolution.
 
 **2.9 — 2026-08-24** — `vcf-lab-tuner.md` v2.9 / `vcf-lab-tuner.py` **v1.8.0**.
 
