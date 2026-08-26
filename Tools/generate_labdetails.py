@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-generate_labdetails.py - Automatic Lab Documentation Generator
-Version 1.0 - February 2026
+generate_labdetails.py - Automatic Lab Documentation & Glassmorphism Topology Generator
+Version 2.0 - August 2026
 Author - HOL Core Team
 
-Generates a comprehensive LABDETAILS.md file with Mermaid diagrams
-by querying live vCenter, NSX, and SDDC Manager environments.
+License:
+  Portions of diagram styling, color tokens, and layout principles derived from
+  fireworks-tech-graph (https://github.com/yizhiyanhua-ai/fireworks-tech-graph)
+  MIT License © 2025 fireworks-tech-graph contributors.
+
+Generates a comprehensive LABDETAILS.md file with standalone Style 5 Glassmorphism SVG diagrams
+and Mermaid diagrams by querying live vCenter, NSX, and SDDC Manager environments.
 
 Usage:
     python3 Tools/generate_labdetails.py
@@ -20,9 +25,10 @@ import socket
 import argparse
 import datetime
 import subprocess
+from xml.sax.saxutils import escape
 from configparser import ConfigParser
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -216,6 +222,632 @@ def safe_api_call(func, *args, **kwargs) -> Optional[Any]:
     except Exception as e:
         print(f"  API call failed: {e}")
         return None
+
+def xml_escape(val: Any) -> str:
+    """Safely escape text content for XML/SVG rendering"""
+    if val is None:
+        return ""
+    return escape(str(val))
+
+#==============================================================================
+# STYLE 5 GLASSMORPHISM SVG ENGINE
+# Portions derived from fireworks-tech-graph (MIT License © 2025)
+#==============================================================================
+
+@dataclass
+class GlassCard:
+    """Represents a Glassmorphic node card"""
+    id: str
+    x: float
+    y: float
+    width: float
+    height: float
+    title: str
+    subtitle: str = ""
+    icon: str = ""
+    status_badge: str = ""
+    badge_color: str = "#3fb950"
+    details: List[str] = field(default_factory=list)
+    accent_color: str = "#58a6ff"
+
+@dataclass
+class FlowEdge:
+    """Represents a glowing connection edge between nodes"""
+    start: Tuple[float, float]
+    end: Tuple[float, float]
+    label: str = ""
+    color: str = "#58a6ff"
+    stroke_width: float = 2.0
+    dashed: bool = False
+    marker_end: bool = True
+    waypoints: List[Tuple[float, float]] = field(default_factory=list)
+
+class GlassmorphismCanvas:
+    """
+    Pure-Python Standalone Style 5 Glassmorphism SVG Builder Engine.
+    Encodes frosted glass cards, ambient radial glows, translucent containers,
+    and glowing semantic data flow paths.
+    """
+    COLOR_BLUE = "#58a6ff"
+    COLOR_PURPLE = "#bc8cff"
+    COLOR_GREEN = "#3fb950"
+    COLOR_ORANGE = "#f78166"
+    COLOR_AMBER = "#d29922"
+    COLOR_CYAN = "#38bdf8"
+    COLOR_MUTED = "#8b949e"
+    
+    def __init__(self, width: int = 1000, height: int = 700, title: str = "", subtitle: str = ""):
+        self.width = width
+        self.height = height
+        self.title = title
+        self.subtitle = subtitle
+        self.lines: List[str] = []
+        self.containers: List[Dict[str, Any]] = []
+        self.cards: List[GlassCard] = []
+        self.edges: List[FlowEdge] = []
+        self.legends: List[Tuple[str, str]] = []
+        
+    def _render_defs(self):
+        """Render SVG defs, styles, gradients, filters, and markers"""
+        self.lines.append('  <defs>')
+        self.lines.append('    <style>')
+        self.lines.append('      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&amp;display=swap");')
+        self.lines.append('      text { font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }')
+        self.lines.append('      .hero-title { font-size: 20px; font-weight: 700; fill: url(#title-grad); }')
+        self.lines.append('      .hero-subtitle { font-size: 12px; fill: #8b949e; }')
+        self.lines.append('      .card-title { font-size: 13px; font-weight: 600; fill: #f0f6fc; }')
+        self.lines.append('      .card-subtitle { font-size: 11px; fill: #8b949e; }')
+        self.lines.append('      .card-detail { font-size: 10.5px; fill: #c9d1d9; }')
+        self.lines.append('      .container-title { font-size: 12px; font-weight: 600; fill: #e6edf3; }')
+        self.lines.append('      .edge-label { font-size: 10px; font-weight: 600; fill: #f0f6fc; }')
+        self.lines.append('      .badge-text { font-size: 9.5px; font-weight: 600; fill: #0d1117; }')
+        self.lines.append('    </style>')
+        
+        # Background gradient
+        self.lines.append('    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">')
+        self.lines.append('      <stop offset="0%" stop-color="#0d1117"/>')
+        self.lines.append('      <stop offset="50%" stop-color="#161b22"/>')
+        self.lines.append('      <stop offset="100%" stop-color="#0d1117"/>')
+        self.lines.append('    </linearGradient>')
+        
+        # Hero title text gradient
+        self.lines.append('    <linearGradient id="title-grad" x1="0%" y1="0%" x2="100%" y2="0%">')
+        self.lines.append('      <stop offset="0%" stop-color="#58a6ff"/>')
+        self.lines.append('      <stop offset="100%" stop-color="#bc8cff"/>')
+        self.lines.append('    </linearGradient>')
+        
+        # Radial ambient glows
+        self.lines.append('    <radialGradient id="glow-blue" cx="30%" cy="30%" r="50%">')
+        self.lines.append('      <stop offset="0%" stop-color="rgba(88,166,255,0.15)"/>')
+        self.lines.append('      <stop offset="100%" stop-color="rgba(88,166,255,0)"/>')
+        self.lines.append('    </radialGradient>')
+        self.lines.append('    <radialGradient id="glow-purple" cx="75%" cy="65%" r="45%">')
+        self.lines.append('      <stop offset="0%" stop-color="rgba(188,140,255,0.12)"/>')
+        self.lines.append('      <stop offset="100%" stop-color="rgba(188,140,255,0)"/>')
+        self.lines.append('    </radialGradient>')
+        self.lines.append('    <radialGradient id="glow-green" cx="20%" cy="80%" r="40%">')
+        self.lines.append('      <stop offset="0%" stop-color="rgba(63,185,80,0.10)"/>')
+        self.lines.append('      <stop offset="100%" stop-color="rgba(63,185,80,0)"/>')
+        self.lines.append('    </radialGradient>')
+        self.lines.append('    <radialGradient id="glow-orange" cx="80%" cy="20%" r="40%">')
+        self.lines.append('      <stop offset="0%" stop-color="rgba(247,129,102,0.10)"/>')
+        self.lines.append('      <stop offset="100%" stop-color="rgba(247,129,102,0)"/>')
+        self.lines.append('    </radialGradient>')
+        
+        # Filters
+        self.lines.append('    <filter id="glass-shadow" x="-10%" y="-10%" width="120%" height="130%">')
+        self.lines.append('      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#000000" flood-opacity="0.35"/>')
+        self.lines.append('    </filter>')
+        
+        # Arrow markers for each color scheme
+        markers = [
+            ("arrow-blue", "#58a6ff"),
+            ("arrow-purple", "#bc8cff"),
+            ("arrow-green", "#3fb950"),
+            ("arrow-orange", "#f78166"),
+            ("arrow-amber", "#d29922"),
+            ("arrow-cyan", "#38bdf8"),
+            ("arrow-muted", "#8b949e"),
+        ]
+        for mid, col in markers:
+            self.lines.append(f'    <marker id="{mid}" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">')
+            self.lines.append(f'      <polygon points="0 0, 8 3, 0 6" fill="{col}"/>')
+            self.lines.append('    </marker>')
+            
+        self.lines.append('  </defs>')
+
+    def add_container(self, x: float, y: float, width: float, height: float, title: str, 
+                      subtitle: str = "", icon: str = "📦", border_color: str = "rgba(255,255,255,0.12)", 
+                      fill: str = "rgba(255,255,255,0.02)", dashed: bool = False, accent_color: str = None):
+        """Add a translucent grouping container rectangle"""
+        self.containers.append({
+            "x": x, "y": y, "width": width, "height": height,
+            "title": title, "subtitle": subtitle, "icon": icon,
+            "border_color": border_color, "fill": fill, "dashed": dashed,
+            "accent_color": accent_color or self.COLOR_BLUE
+        })
+        
+    def add_card(self, card: GlassCard):
+        """Add a Glass Card node"""
+        self.cards.append(card)
+        
+    def add_edge(self, edge: FlowEdge):
+        """Add a glowing flow edge"""
+        self.edges.append(edge)
+        
+    def add_legend(self, items: List[Tuple[str, str]]):
+        """Add legend items: list of (label, color_hex)"""
+        self.legends = items
+
+    def render(self) -> str:
+        """Assemble and return complete valid SVG string"""
+        self.lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {self.width} {self.height}" width="{self.width}" height="{self.height}">',
+        ]
+        
+        self._render_defs()
+        
+        # Layer 1: Background Rect & Glows
+        self.lines.append(f'  <rect width="{self.width}" height="{self.height}" fill="url(#bg-grad)"/>')
+        self.lines.append(f'  <rect width="{self.width}" height="{self.height}" fill="url(#glow-blue)"/>')
+        self.lines.append(f'  <rect width="{self.width}" height="{self.height}" fill="url(#glow-purple)"/>')
+        self.lines.append(f'  <rect width="{self.width}" height="{self.height}" fill="url(#glow-green)"/>')
+        self.lines.append(f'  <rect width="{self.width}" height="{self.height}" fill="url(#glow-orange)"/>')
+        
+        # Layer 2: Title Block
+        if self.title:
+            self.lines.append('  <g transform="translate(40, 36)">')
+            self.lines.append(f'    <text class="hero-title" x="0" y="0">{xml_escape(self.title)}</text>')
+            if self.subtitle:
+                self.lines.append(f'    <text class="hero-subtitle" x="0" y="18">{xml_escape(self.subtitle)}</text>')
+            self.lines.append('  </g>')
+            
+        # Layer 3: Containers
+        for c in self.containers:
+            dash_attr = ' stroke-dasharray="6,4"' if c["dashed"] else ''
+            self.lines.append(f'  <g id="container-{xml_escape(c["title"]).replace(" ", "_")}">')
+            self.lines.append(f'    <rect x="{c["x"]}" y="{c["y"]}" width="{c["width"]}" height="{c["height"]}" rx="14" ry="14" fill="{c["fill"]}" stroke="{c["border_color"]}" stroke-width="1.2"{dash_attr}/>')
+            
+            # Header pill badge
+            pill_w = max(120, len(c["title"]) * 7.5 + 40)
+            self.lines.append(f'    <rect x="{c["x"] + 12}" y="{c["y"] - 12}" width="{pill_w}" height="24" rx="12" fill="#161b22" stroke="{c["border_color"]}" stroke-width="1"/>')
+            icon_str = f'{xml_escape(c["icon"])} ' if c["icon"] else ''
+            self.lines.append(f'    <text class="container-title" x="{c["x"] + 24}" y="{c["y"] + 4}">{icon_str}{xml_escape(c["title"])}</text>')
+            if c["subtitle"]:
+                self.lines.append(f'    <text class="card-subtitle" x="{c["x"] + c["width"] - 16}" y="{c["y"] + 16}" text-anchor="end">{xml_escape(c["subtitle"])}</text>')
+            self.lines.append('  </g>')
+
+        # Layer 4: Edges & Glowing Lines (drawn before cards so labels/card bodies cleanly overlay)
+        for e in self.edges:
+            dash = ' stroke-dasharray="6,3"' if e.dashed else ''
+            
+            # Select marker
+            marker_str = ''
+            if e.marker_end:
+                if e.color == self.COLOR_PURPLE:
+                    marker_str = ' marker-end="url(#arrow-purple)"'
+                elif e.color == self.COLOR_GREEN:
+                    marker_str = ' marker-end="url(#arrow-green)"'
+                elif e.color == self.COLOR_ORANGE:
+                    marker_str = ' marker-end="url(#arrow-orange)"'
+                elif e.color == self.COLOR_AMBER:
+                    marker_str = ' marker-end="url(#arrow-amber)"'
+                elif e.color == self.COLOR_CYAN:
+                    marker_str = ' marker-end="url(#arrow-cyan)"'
+                elif e.color == self.COLOR_MUTED:
+                    marker_str = ' marker-end="url(#arrow-muted)"'
+                else:
+                    marker_str = ' marker-end="url(#arrow-blue)"'
+            
+            # Path data building
+            pts = [e.start] + e.waypoints + [e.end]
+            path_d = f"M {pts[0][0]:.1f},{pts[0][1]:.1f}"
+            for p in pts[1:]:
+                path_d += f" L {p[0]:.1f},{p[1]:.1f}"
+                
+            self.lines.append('  <g>')
+            # Outer glow casing
+            self.lines.append(f'    <path d="{path_d}" fill="none" stroke="{e.color}" stroke-width="{e.stroke_width + 2}" stroke-opacity="0.25"/>')
+            # Main path
+            self.lines.append(f'    <path d="{path_d}" fill="none" stroke="{e.color}" stroke-width="{e.stroke_width}" stroke-opacity="0.9"{dash}{marker_str}/>')
+            
+            # Label badge mid-path
+            if e.label:
+                # Find midpoint
+                if len(pts) == 2:
+                    mx = (pts[0][0] + pts[1][0]) / 2.0
+                    my = (pts[0][1] + pts[1][1]) / 2.0
+                else:
+                    mid_idx = len(pts) // 2
+                    mx, my = pts[mid_idx]
+                
+                lbl_text = xml_escape(e.label)
+                lbl_w = max(60.0, len(lbl_text) * 6.5 + 16.0)
+                self.lines.append(f'    <rect x="{mx - lbl_w/2:.1f}" y="{my - 10:.1f}" width="{lbl_w:.1f}" height="20" rx="6" fill="#0d1117" fill-opacity="0.92" stroke="{e.color}" stroke-width="0.8"/>')
+                self.lines.append(f'    <text class="edge-label" x="{mx:.1f}" y="{my + 4:.1f}" text-anchor="middle">{lbl_text}</text>')
+            self.lines.append('  </g>')
+
+        # Layer 5: Glass Cards
+        for card in self.cards:
+            self.lines.append(f'  <g id="card-{xml_escape(card.id)}" filter="url(#glass-shadow)">')
+            # Outer subtle glow border
+            self.lines.append(f'    <rect x="{card.x}" y="{card.y}" width="{card.width}" height="{card.height}" rx="12" ry="12" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.15)" stroke-width="1.2"/>')
+            # Top highlight line
+            self.lines.append(f'    <line x1="{card.x + 12}" y1="{card.y + 1}" x2="{card.x + card.width - 12}" y2="{card.y + 1}" stroke="rgba(255,255,255,0.30)" stroke-width="1"/>')
+            
+            # Left accent pill/bar
+            if card.accent_color:
+                self.lines.append(f'    <rect x="{card.x + 1}" y="{card.y + 12}" width="3.5" height="{max(12.0, card.height - 24)}" rx="1.7" fill="{card.accent_color}"/>')
+            
+            # Icon & Title
+            curr_y = card.y + 22
+            icon_prefix = f'{xml_escape(card.icon)} ' if card.icon else ''
+            self.lines.append(f'    <text class="card-title" x="{card.x + 14}" y="{curr_y}">{icon_prefix}{xml_escape(card.title)}</text>')
+            
+            # Status badge (top-right of card)
+            if card.status_badge:
+                badge_w = max(40.0, len(card.status_badge) * 6.0 + 12.0)
+                bx = card.x + card.width - badge_w - 10
+                by = card.y + 10
+                self.lines.append(f'    <rect x="{bx}" y="{by}" width="{badge_w}" height="18" rx="9" fill="{card.badge_color}"/>')
+                self.lines.append(f'    <text class="badge-text" x="{bx + badge_w/2}" y="{by + 12.5}" text-anchor="middle">{xml_escape(card.status_badge)}</text>')
+
+            if card.subtitle:
+                curr_y += 16
+                self.lines.append(f'    <text class="card-subtitle" x="{card.x + 14}" y="{curr_y}">{xml_escape(card.subtitle)}</text>')
+                
+            # Details lines
+            if card.details:
+                curr_y += 14
+                for d in card.details:
+                    curr_y += 14
+                    if curr_y < card.y + card.height - 6:
+                        self.lines.append(f'    <text class="card-detail" x="{card.x + 14}" y="{curr_y}">• {xml_escape(d)}</text>')
+            self.lines.append('  </g>')
+
+        # Layer 6: Legend (if defined)
+        if self.legends:
+            leg_x = self.width - 200
+            leg_y = 24
+            leg_w = 170
+            leg_h = len(self.legends) * 20 + 20
+            self.lines.append('  <g id="legend">')
+            self.lines.append(f'    <rect x="{leg_x}" y="{leg_y}" width="{leg_h if leg_w < 170 else leg_w}" height="{leg_h}" rx="8" fill="#161b22" stroke="rgba(255,255,255,0.15)" stroke-width="1"/>')
+            self.lines.append(f'    <text class="container-title" x="{leg_x + 12}" y="{leg_y + 16}">Legend / Planes</text>')
+            iy = leg_y + 34
+            for label, col in self.legends:
+                self.lines.append(f'    <circle cx="{leg_x + 18}" cy="{iy - 4}" r="4.5" fill="{col}"/>')
+                self.lines.append(f'    <text class="card-detail" x="{leg_x + 30}" y="{iy}">{xml_escape(label)}</text>')
+                iy += 18
+            self.lines.append('  </g>')
+
+        self.lines.append('</svg>')
+        return '\n'.join(self.lines)
+
+class LabDiagramBuilder:
+    """
+    Constructs 6 specialized Style 5 Glassmorphism SVG diagrams
+    illustrating connectivity and data flow throughout the VCF lab environment.
+    """
+    def __init__(self, env: LabEnvironment):
+        self.env = env
+
+    def build_high_level_architecture(self) -> GlassmorphismCanvas:
+        """1. High-Level Lab Architecture & Ingress/Egress Connectivity"""
+        c = GlassmorphismCanvas(
+            width=1050, height=700,
+            title="High-Level Lab Architecture & Connectivity",
+            subtitle=f"SKU: {self.env.lab_sku or 'VCF-91'} | Type: {self.env.lab_type or 'DISCOVERY'} | Domain: {self.env.dns_domain or 'site-a.vcf.lab'}"
+        )
+        c.add_legend([
+            ("Core / Ingress", GlassmorphismCanvas.COLOR_BLUE),
+            ("Control Plane", GlassmorphismCanvas.COLOR_PURPLE),
+            ("Workload Plane", GlassmorphismCanvas.COLOR_AMBER),
+            ("Gateway / External", GlassmorphismCanvas.COLOR_MUTED),
+        ])
+        
+        # Containers
+        c.add_container(40, 80, 230, 580, "External Network", subtitle="192.168.0.0/24", icon="🌐")
+        c.add_container(300, 80, 230, 580, "Core Infrastructure", subtitle="10.1.10.128/25", icon="🛠️", accent_color=GlassmorphismCanvas.COLOR_BLUE)
+        c.add_container(560, 80, 450, 580, "VMware Cloud Foundation", subtitle="SDDC & Workload Fabric", icon="☁️", accent_color=GlassmorphismCanvas.COLOR_PURPLE)
+        
+        c.add_container(580, 115, 410, 260, "Management Domain: mgmt-a", subtitle="10.1.1.0/24", icon="🏛️", border_color="rgba(188,140,255,0.25)")
+        c.add_container(580, 390, 410, 250, "Workload Domain: wld01-a", subtitle="10.1.1.0/24", icon="⚡", border_color="rgba(210,153,34,0.25)")
+        
+        # Nodes - External
+        c.add_card(GlassCard("ext-gateway", 65, 130, 180, 100, "External Gateway", "192.168.0.1", "🌐", "UP", GlassmorphismCanvas.COLOR_GREEN, ["Internet Access", "Proxy Uplink"], GlassmorphismCanvas.COLOR_MUTED))
+        c.add_card(GlassCard("ext-dns", 65, 270, 180, 90, "External DNS", "10.1.10.129", "🔍", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Technitium DNS", "Upstream Resolver"], GlassmorphismCanvas.COLOR_MUTED))
+        
+        # Nodes - Core
+        r_ip = self.env.router_ip or "10.1.10.129"
+        con_ip = self.env.console_ip or "10.1.10.130"
+        mgr_ip = self.env.manager_ip or "10.1.10.131"
+        c.add_card(GlassCard("holorouter", 325, 130, 180, 115, "holorouter", r_ip, "🛡️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["DNS / DHCP / NTP", "Squid Proxy (:3128)", "NAT & Firewall"], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("console", 325, 275, 180, 100, "console", con_ip, "🖥️", "READY", GlassmorphismCanvas.COLOR_GREEN, ["Ubuntu Desktop", "Firefox Browser", "SSH / VNC Client"], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("manager", 325, 405, 180, 100, "manager", mgr_ip, "🚀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Lab Startup Engine", "Python Automation", "NFS /tmp Export"], GlassmorphismCanvas.COLOR_BLUE))
+        
+        # Nodes - VCF Mgmt
+        c.add_card(GlassCard("sddc", 600, 155, 175, 95, "SDDC Manager", "sddcmanager-a", "🎛️", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, ["VCF Lifecycle API", "vsphere.local SSO"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("vc-mgmt", 795, 155, 175, 95, "vCenter Mgmt", "vc-mgmt-a", "🏢", "RUNNING", GlassmorphismCanvas.COLOR_GREEN, ["VAMI :5480", "cluster-mgmt-01a"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("nsx-mgmt", 600, 265, 175, 90, "NSX Manager", "nsx-mgmt-01a", "🔀", "READY", GlassmorphismCanvas.COLOR_GREEN, ["Network Virtualization", "Tier-0 / Tier-1"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("mgmt-hosts", 795, 265, 175, 90, "Mgmt ESXi Cluster", "4 Hosts (esx-01..04)", "🖥️", "4/4 UP", GlassmorphismCanvas.COLOR_GREEN, ["10.1.1.101 - 104", "vSAN Datastore"], GlassmorphismCanvas.COLOR_PURPLE))
+        
+        # Nodes - VCF Wld
+        c.add_card(GlassCard("vc-wld", 600, 430, 175, 90, "vCenter Wld", "vc-wld01-a", "🏬", "RUNNING", GlassmorphismCanvas.COLOR_GREEN, ["wld.sso Domain", "cluster-wld01-01a"], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("nsx-wld", 795, 430, 175, 90, "NSX Wld", "nsx-wld01-01a", "🔀", "READY", GlassmorphismCanvas.COLOR_GREEN, ["GENEVE Overlay", "Edge Clusters"], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("wld-hosts", 600, 535, 370, 80, "Workload ESXi Cluster", "3 Hosts (esx-05a .. esx-07a)", "🖥️", "3/3 UP", GlassmorphismCanvas.COLOR_GREEN, ["10.1.1.105 - 107", "vSAN Capacity Fabric"], GlassmorphismCanvas.COLOR_AMBER))
+        
+        # Edges
+        c.add_edge(FlowEdge((245, 180), (325, 180), "NAT / Proxy", GlassmorphismCanvas.COLOR_MUTED))
+        c.add_edge(FlowEdge((415, 245), (415, 275), "Local LAN", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((415, 375), (415, 405), "Control", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((505, 455), (600, 200), "VCF APIs", GlassmorphismCanvas.COLOR_PURPLE, waypoints=[(540, 455), (540, 200)]))
+        c.add_edge(FlowEdge((775, 200), (795, 200), "vSphere API", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((685, 250), (685, 265), "Management", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((685, 200), (600, 475), "Wld Provision", GlassmorphismCanvas.COLOR_AMBER, waypoints=[(530, 200), (530, 475)]))
+        
+        return c
+
+    def build_network_dataflow(self) -> GlassmorphismCanvas:
+        """2. Multi-Plane Network & Data Flow Topology"""
+        c = GlassmorphismCanvas(
+            width=1080, height=750,
+            title="Multi-Plane Network & Data Flow Topology",
+            subtitle="Isolation & Traffic Flow across 5 Physical/Virtual Planes"
+        )
+        c.add_legend([
+            ("Plane 1: Core/Admin", GlassmorphismCanvas.COLOR_BLUE),
+            ("Plane 2: Mgmt Control", GlassmorphismCanvas.COLOR_PURPLE),
+            ("Plane 3: vSAN Fabric", GlassmorphismCanvas.COLOR_GREEN),
+            ("Plane 4: vMotion Fabric", GlassmorphismCanvas.COLOR_CYAN),
+            ("Plane 5: NSX GENEVE TEP", GlassmorphismCanvas.COLOR_ORANGE),
+        ])
+        
+        # Containers for Planes
+        c.add_container(40, 80, 990, 110, "Plane 1: Core & Services Subnet", subtitle="10.1.10.128/25", icon="⚡", border_color="rgba(88,166,255,0.3)")
+        c.add_container(40, 215, 990, 115, "Plane 2: VCF Management Subnet", subtitle="10.1.1.0/24", icon="🏛️", border_color="rgba(188,140,255,0.3)")
+        c.add_container(40, 350, 485, 115, "Plane 3: vSAN Storage Subnet", subtitle="10.1.2.0/24", icon="💾", border_color="rgba(63,185,80,0.3)")
+        c.add_container(545, 350, 485, 115, "Plane 4: vMotion Live Migration", subtitle="10.1.3.0/24", icon="🔄", border_color="rgba(56,189,248,0.3)")
+        c.add_container(40, 485, 990, 240, "Plane 5: NSX GENEVE Overlay TEP Subnet", subtitle="10.1.5.128/25", icon="🔀", border_color="rgba(247,129,102,0.3)")
+        
+        # Nodes Plane 1
+        r_ip = self.env.router_ip or "10.1.10.129"
+        m_ip = self.env.manager_ip or "10.1.10.131"
+        c.add_card(GlassCard("p1-router", 70, 115, 200, 65, "holorouter", r_ip, "🛡️", "GW .129", GlassmorphismCanvas.COLOR_GREEN, ["DNS/DHCP Server"], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("p1-console", 430, 115, 200, 65, "console", "10.1.10.130", "🖥️", "IP .130", GlassmorphismCanvas.COLOR_GREEN, ["Management UI"], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("p1-manager", 790, 115, 200, 65, "manager", m_ip, "🚀", "IP .131", GlassmorphismCanvas.COLOR_GREEN, ["Automation Engine"], GlassmorphismCanvas.COLOR_BLUE))
+        
+        # Nodes Plane 2
+        c.add_card(GlassCard("p2-sddc", 70, 250, 210, 65, "SDDC Manager", "10.1.1.x", "🎛️", "VIP .17", GlassmorphismCanvas.COLOR_GREEN, ["LCM Control"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("p2-vcmgmt", 310, 250, 210, 65, "vc-mgmt-a", "10.1.1.16", "🏢", "IP .16", GlassmorphismCanvas.COLOR_GREEN, ["vCenter Mgmt"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("p2-vcwld", 550, 250, 210, 65, "vc-wld01-a", "10.1.1.26", "🏬", "IP .26", GlassmorphismCanvas.COLOR_GREEN, ["vCenter Wld"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("p2-nsx", 790, 250, 200, 65, "NSX Managers", "10.1.1.x", "🔀", "VIP .11", GlassmorphismCanvas.COLOR_GREEN, ["Control Cluster"], GlassmorphismCanvas.COLOR_PURPLE))
+        
+        # Nodes Plane 3 & 4
+        c.add_card(GlassCard("p3-vsan", 70, 385, 425, 65, "vSAN Cluster Storage Fabric", "10.1.2.101 - 10.1.2.107", "💾", "NVMe/SSD", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk1 | Dedicated vSAN Network"], GlassmorphismCanvas.COLOR_GREEN))
+        c.add_card(GlassCard("p4-vmotion", 575, 385, 425, 65, "vMotion Migration Fabric", "10.1.3.101 - 10.1.3.107", "🔄", "10 GbE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk2 | Live VM Storage/State"], GlassmorphismCanvas.COLOR_CYAN))
+        
+        # Nodes Plane 5
+        c.add_card(GlassCard("p5-tn-mgmt", 70, 525, 425, 80, "Mgmt ESXi Transport Nodes", "10.1.5.131 - 10.1.5.134", "🖥️", "4 Nodes", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk50 | GENEVE Tunnel Endpoints"], GlassmorphismCanvas.COLOR_ORANGE))
+        c.add_card(GlassCard("p5-tn-wld", 575, 525, 425, 80, "Wld ESXi Transport Nodes", "10.1.5.135 - 10.1.5.137", "🖥️", "3 Nodes", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk50 | GENEVE Tunnel Endpoints"], GlassmorphismCanvas.COLOR_ORANGE))
+        c.add_card(GlassCard("p5-edges", 250, 630, 550, 75, "NSX Edge Node Cluster", "10.1.5.141 - 10.1.5.144 (TEP IPs)", "🛡️", "Active/Standby", GlassmorphismCanvas.COLOR_GREEN, ["Tier-0/Tier-1 Uplinks & BGP Routing"], GlassmorphismCanvas.COLOR_ORANGE))
+        
+        # Flow Edges connecting planes
+        c.add_edge(FlowEdge((270, 147), (430, 147), "DHCP/DNS", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((630, 147), (790, 147), "SSH/API", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((175, 180), (175, 250), "Routing", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((280, 282), (310, 282), "SDDC API", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((520, 282), (550, 282), "Federation", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((760, 282), (790, 282), "Plugin", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((280, 450), (280, 525), "vSAN Sync", GlassmorphismCanvas.COLOR_GREEN))
+        c.add_edge(FlowEdge((787, 450), (787, 525), "vMotion Sync", GlassmorphismCanvas.COLOR_CYAN))
+        c.add_edge(FlowEdge((280, 605), (350, 630), "GENEVE Tunnel", GlassmorphismCanvas.COLOR_ORANGE, waypoints=[(280, 618), (350, 618)]))
+        c.add_edge(FlowEdge((787, 605), (700, 630), "GENEVE Tunnel", GlassmorphismCanvas.COLOR_ORANGE, waypoints=[(787, 618), (700, 618)]))
+
+        return c
+
+    def build_vcf_domain_architecture(self) -> GlassmorphismCanvas:
+        """3. VCF Domain Hierarchy & Control Plane Topology"""
+        c = GlassmorphismCanvas(
+            width=1080, height=760,
+            title="VCF Domain Hierarchy & Control Plane Topology",
+            subtitle="SDDC Manager Orchestration across Management & Workload Domains"
+        )
+        c.add_legend([
+            ("Management Domain", GlassmorphismCanvas.COLOR_PURPLE),
+            ("Workload Domain", GlassmorphismCanvas.COLOR_AMBER),
+            ("SDDC Orchestrator", GlassmorphismCanvas.COLOR_BLUE),
+        ])
+        
+        # SDDC Manager Orchestrator Card
+        c.add_card(GlassCard("sddc-top", 430, 80, 220, 105, "SDDC Manager", "sddcmanager-a.site-a.vcf.lab", "🎛️", "VCF 9.1", GlassmorphismCanvas.COLOR_GREEN, ["SSO: vsphere.local", "Domain & Cluster LCM", "REST API Engine"], GlassmorphismCanvas.COLOR_BLUE))
+        
+        # Management Domain Container
+        c.add_container(40, 215, 485, 515, "Management Domain: mgmt-a", subtitle="System Control Plane", icon="🏛️", border_color="rgba(188,140,255,0.3)")
+        
+        # Mgmt Domain Cards
+        c.add_card(GlassCard("vc-mgmt-d", 65, 255, 435, 95, "vCenter Server (Management)", "vc-mgmt-a.site-a.vcf.lab", "🏢", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["SSO Domain: vsphere.local", "Datacenter: dc-a | Cluster: cluster-mgmt-01a"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("nsx-mgmt-d", 65, 365, 435, 95, "NSX Manager Cluster", "nsx-mgmt-01a.site-a.vcf.lab (VIP)", "🔀", "HA READY", GlassmorphismCanvas.COLOR_GREEN, ["Management Overlay & Firewall Policies", "Transport Nodes: esx-01a .. esx-04a"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("cl-mgmt-d", 65, 475, 435, 110, "Cluster: cluster-mgmt-01a", "4 ESXi Hosts (esx-01a to esx-04a)", "🖥️", "vSAN ON", GlassmorphismCanvas.COLOR_GREEN, ["CPU Cores: 128 Total | RAM: 512 GB Total", "Management VMs: SDDC, vCenter, NSX, VCF Ops"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("ds-mgmt-d", 65, 600, 435, 95, "vSAN Datastore: vsan-cluster-mgmt-01a", "Type: vSAN Flash | Capacity: ~12.0 TB", "💾", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, ["Resiliency: FTT=1 (RAID-1 Mirroring)", "Storage Policy: VCF Default Management"], GlassmorphismCanvas.COLOR_PURPLE))
+        
+        # Workload Domain Container
+        c.add_container(555, 215, 485, 515, "Workload Domain: wld01-a", subtitle="Tenant Workload Fabric", icon="⚡", border_color="rgba(210,153,34,0.3)")
+        
+        # Wld Domain Cards
+        c.add_card(GlassCard("vc-wld-d", 580, 255, 435, 95, "vCenter Server (Workload)", "vc-wld01-a.site-a.vcf.lab", "🏬", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["SSO Domain: wld.sso (Isolated SSO)", "Datacenter: dc-wld01 | Cluster: cluster-wld01-01a"], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("nsx-wld-d", 580, 365, 435, 95, "NSX Manager Cluster (Workload)", "nsx-wld01-01a.site-a.vcf.lab", "🔀", "HA READY", GlassmorphismCanvas.COLOR_GREEN, ["Tenant Overlay & Micro-segmentation", "Transport Nodes: esx-05a .. esx-07a"], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("cl-wld-d", 580, 475, 435, 110, "Cluster: cluster-wld01-01a", "3 ESXi Hosts (esx-05a to esx-07a)", "🖥️", "vSAN ON", GlassmorphismCanvas.COLOR_GREEN, ["CPU Cores: 96 Total | RAM: 384 GB Total", "Supervisor & Tanzu K8s Workload Pods"], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("ds-wld-d", 580, 600, 435, 95, "vSAN Datastore: vsan-cluster-wld01-01a", "Type: vSAN Flash | Capacity: ~10.0 TB", "💾", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, ["Resiliency: FTT=1 (RAID-1 Mirroring)", "Storage Policy: VCF Workload Default"], GlassmorphismCanvas.COLOR_AMBER))
+
+        # Flow Edges from SDDC Manager to Domains
+        c.add_edge(FlowEdge((430, 130), (280, 255), "Mgmt Orchestration", GlassmorphismCanvas.COLOR_PURPLE, waypoints=[(280, 130)]))
+        c.add_edge(FlowEdge((650, 130), (800, 255), "Wld Orchestration", GlassmorphismCanvas.COLOR_AMBER, waypoints=[(800, 130)]))
+        c.add_edge(FlowEdge((280, 350), (280, 365), "Inventory Sync", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((280, 460), (280, 475), "Host Control", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((280, 585), (280, 600), "vSAN Claim", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((797, 350), (797, 365), "Inventory Sync", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((797, 460), (797, 475), "Host Control", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((797, 585), (797, 600), "vSAN Claim", GlassmorphismCanvas.COLOR_AMBER))
+
+        return c
+
+    def build_esxi_host_layout(self) -> GlassmorphismCanvas:
+        """4. ESXi Physical Host & Interface Fabric"""
+        c = GlassmorphismCanvas(
+            width=1100, height=720,
+            title="ESXi Physical Host & Interface Fabric",
+            subtitle="7 ESXi Hosts across Management & Workload Clusters with Multi-NIC Interfaces"
+        )
+        c.add_legend([
+            ("Management Host", GlassmorphismCanvas.COLOR_PURPLE),
+            ("Workload Host", GlassmorphismCanvas.COLOR_AMBER),
+        ])
+        
+        # Container Mgmt Cluster (Hosts 1 to 4)
+        c.add_container(30, 80, 1040, 290, "Management Cluster: cluster-mgmt-01a", subtitle="4 ESXi Hosts (10.1.1.101 - 104)", icon="🖥️", border_color="rgba(188,140,255,0.3)")
+        
+        mgmt_hosts = [
+            ("esx-01a", "10.1.1.101", "10.1.2.101", "10.1.3.101", "10.1.5.131"),
+            ("esx-02a", "10.1.1.102", "10.1.2.102", "10.1.3.102", "10.1.5.132"),
+            ("esx-03a", "10.1.1.103", "10.1.2.103", "10.1.3.103", "10.1.5.133"),
+            ("esx-04a", "10.1.1.104", "10.1.2.104", "10.1.3.104", "10.1.5.134"),
+        ]
+        
+        x_pos = 55
+        for fqdn, m_ip, v_ip, vm_ip, t_ip in mgmt_hosts:
+            c.add_card(GlassCard(
+                f"card-{fqdn}", x_pos, 115, 235, 235, f"{fqdn}.site-a.vcf.lab", "ESXi 8.0 U3", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN,
+                [
+                    "Specs: 32 Cores | 128 GB",
+                    f"MGMT: {m_ip}",
+                    f"vSAN: {v_ip}",
+                    f"vMotion: {vm_ip}",
+                    f"TEP: {t_ip}",
+                    "DS: vsan-cluster-mgmt-01a"
+                ],
+                GlassmorphismCanvas.COLOR_PURPLE
+            ))
+            x_pos += 255
+
+        # Container Wld Cluster (Hosts 5 to 7)
+        c.add_container(30, 395, 1040, 290, "Workload Cluster: cluster-wld01-01a", subtitle="3 ESXi Hosts (10.1.1.105 - 107)", icon="⚡", border_color="rgba(210,153,34,0.3)")
+        
+        wld_hosts = [
+            ("esx-05a", "10.1.1.105", "10.1.2.105", "10.1.3.105", "10.1.5.135"),
+            ("esx-06a", "10.1.1.106", "10.1.2.106", "10.1.3.106", "10.1.5.136"),
+            ("esx-07a", "10.1.1.107", "10.1.2.107", "10.1.3.107", "10.1.5.137"),
+        ]
+        
+        x_pos = 55
+        for fqdn, m_ip, v_ip, vm_ip, t_ip in wld_hosts:
+            c.add_card(GlassCard(
+                f"card-{fqdn}", x_pos, 430, 320, 235, f"{fqdn}.site-a.vcf.lab", "ESXi 8.0 U3", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN,
+                [
+                    "Specs: 32 Cores | 128 GB RAM",
+                    f"MGMT vmk0: {m_ip}",
+                    f"vSAN vmk1: {v_ip}",
+                    f"vMotion vmk2: {vm_ip}",
+                    f"GENEVE TEP vmk50: {t_ip}",
+                    "DS: vsan-cluster-wld01-01a"
+                ],
+                GlassmorphismCanvas.COLOR_AMBER
+            ))
+            x_pos += 340
+
+        return c
+
+    def build_nsx_architecture(self) -> GlassmorphismCanvas:
+        """5. NSX-T Overlay & Edge Routing Topology"""
+        c = GlassmorphismCanvas(
+            width=1080, height=720,
+            title="NSX-T Virtualization & Overlay Topology",
+            subtitle="NSX Managers, Transport Nodes, Edge Clusters & GENEVE TEP Tunnels"
+        )
+        c.add_legend([
+            ("Management NSX", GlassmorphismCanvas.COLOR_PURPLE),
+            ("Workload NSX", GlassmorphismCanvas.COLOR_AMBER),
+            ("GENEVE TEP Overlay", GlassmorphismCanvas.COLOR_ORANGE),
+        ])
+        
+        # Mgmt NSX Container
+        c.add_container(40, 85, 485, 600, "Management Domain NSX Fabric", subtitle="nsx-mgmt-01a", icon="🔀", border_color="rgba(188,140,255,0.3)")
+        c.add_card(GlassCard("nsx-mgr-1", 65, 125, 435, 95, "NSX Management Cluster VIP", "nsx-mgmt-01a.site-a.vcf.lab", "🎛️", "VIP .11", GlassmorphismCanvas.COLOR_GREEN, ["Management Plane & Central Policy", "Cluster Nodes: nsx-mgmt-01a"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("tn-mgmt-c", 65, 240, 435, 110, "Host Transport Nodes (esx-01a..04a)", "N-VDS / VDS Integration", "🖥️", "4 NODES", GlassmorphismCanvas.COLOR_GREEN, ["Overlay TEP IPs: 10.1.5.131 - 10.1.5.134", "Transport Zone: tz-overlay-mgmt", "Uplink Profile: vcf-mgmt-uplink-profile"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("edge-mgmt-c", 65, 370, 435, 125, "Edge Cluster: edge-cluster-mgmt", "2 Edge VMs (nsx-edge-01a, 02a)", "🛡️", "ACTIVE/STDBY", GlassmorphismCanvas.COLOR_GREEN, ["Edge TEP IPs: 10.1.5.141, 10.1.5.142", "Tier-0 Gateway: t0-mgmt-gw", "Tier-1 Gateway: t1-mgmt-gw"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("t0-mgmt-card", 65, 515, 435, 140, "Tier-0 / Tier-1 Gateway Fabric", "Logical Routing & BGP Uplink", "🌐", "BGP ESTABLISHED", GlassmorphismCanvas.COLOR_GREEN, ["BGP Neighbor: holorouter (10.1.10.129)", "Active Uplinks: VLAN 101, VLAN 102", "NAT Rules: Outbound Internet Access"], GlassmorphismCanvas.COLOR_PURPLE))
+
+        # Wld NSX Container
+        c.add_container(555, 85, 485, 600, "Workload Domain NSX Fabric", subtitle="nsx-wld01-01a", icon="⚡", border_color="rgba(210,153,34,0.3)")
+        c.add_card(GlassCard("nsx-mgr-2", 580, 125, 435, 95, "NSX Workload Cluster VIP", "nsx-wld01-01a.site-a.vcf.lab", "🎛️", "VIP .21", GlassmorphismCanvas.COLOR_GREEN, ["Tenant Overlay & Micro-segmentation", "Cluster Nodes: nsx-wld01-01a"], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("tn-wld-c", 580, 240, 435, 110, "Host Transport Nodes (esx-05a..07a)", "VDS Integration", "🖥️", "3 NODES", GlassmorphismCanvas.COLOR_GREEN, ["Overlay TEP IPs: 10.1.5.135 - 10.1.5.137", "Transport Zone: tz-overlay-wld01", "Uplink Profile: vcf-wld-uplink-profile"], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("edge-wld-c", 580, 370, 435, 125, "Edge Cluster: edge-cluster-wld01", "2 Edge VMs (nsx-wld-edge-01a, 02a)", "🛡️", "ACTIVE/STDBY", GlassmorphismCanvas.COLOR_GREEN, ["Edge TEP IPs: 10.1.5.143, 10.1.5.144", "Tier-0 Gateway: t0-wld01-gw", "Tier-1 Gateway: t1-wld01-gw"], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("t0-wld-card", 580, 515, 435, 140, "Supervisor & Pod Overlay Fabric", "Container Network Interface (CNI)", "☸️", "GENEVE ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Spherelet & Kube-Proxy Integration", "Segment: seg-tkg-workload", "Load Balancer: Avi / NSX Advanced Load Balancer"], GlassmorphismCanvas.COLOR_AMBER))
+
+        # Flow Edges
+        c.add_edge(FlowEdge((280, 220), (280, 240), "Policy Sync", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((280, 350), (280, 370), "GENEVE TEP", GlassmorphismCanvas.COLOR_ORANGE))
+        c.add_edge(FlowEdge((280, 495), (280, 515), "Routing", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((797, 220), (797, 240), "Policy Sync", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((797, 350), (797, 370), "GENEVE TEP", GlassmorphismCanvas.COLOR_ORANGE))
+        c.add_edge(FlowEdge((797, 495), (797, 515), "CNI Routing", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((500, 430), (580, 430), "Inter-Edge TEP Tunnel", GlassmorphismCanvas.COLOR_ORANGE))
+
+        return c
+
+    def build_lab_boot_sequence(self) -> GlassmorphismCanvas:
+        """6. Lab Startup & Service Boot Flow"""
+        c = GlassmorphismCanvas(
+            width=1100, height=720,
+            title="Lab Startup Boot & Service Initialization Flow",
+            subtitle="Orchestrated Startup Dependency Map (labstartup.py)"
+        )
+        c.add_legend([
+            ("Phase 1: Core", GlassmorphismCanvas.COLOR_BLUE),
+            ("Phase 2: Platform", GlassmorphismCanvas.COLOR_PURPLE),
+            ("Phase 3: VCF Control", GlassmorphismCanvas.COLOR_AMBER),
+            ("Phase 4: Operations", GlassmorphismCanvas.COLOR_GREEN),
+        ])
+        
+        # Cards for Boot Steps arranged in 3x3 Grid Flow
+        # Row 1
+        c.add_card(GlassCard("boot-1", 50, 110, 290, 130, "Step 1: holorouter", "10.1.10.129", "🛡️", "STAGE 1", GlassmorphismCanvas.COLOR_GREEN, ["• Initialize DNS & DHCP", "• Start Squid Proxy (:3128)", "• Set up NAT & Firewall"], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("boot-2", 405, 110, 290, 130, "Step 2: manager VM", "10.1.10.131", "🚀", "STAGE 2", GlassmorphismCanvas.COLOR_GREEN, ["• Init lsfunctions runtime", "• Mount NFS exports", "• Read /tmp/config.ini"], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("boot-3", 760, 110, 290, 130, "Step 3: ESXi Hosts", "esx-01a .. esx-07a", "🖥️", "STAGE 3", GlassmorphismCanvas.COLOR_GREEN, ["• Verify SSH management", "• Exit Maintenance Mode", "• Check host power states"], GlassmorphismCanvas.COLOR_BLUE))
+        
+        # Row 2
+        c.add_card(GlassCard("boot-6", 50, 295, 290, 130, "Step 6: vCenter Servers", "vc-mgmt-a & vc-wld01-a", "🏢", "STAGE 6", GlassmorphismCanvas.COLOR_GREEN, ["• Power on vCenter VMs", "• Poll VAMI API (:5480)", "• Verify SSO session tokens"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("boot-5", 405, 295, 290, 130, "Step 5: NSX Manager & Edges", "nsx-mgmt-01a & Edges", "🔀", "STAGE 5", GlassmorphismCanvas.COLOR_GREEN, ["• Power on NSX Cluster", "• Boot Edge Node VMs", "• Wait 5m for TEP sync"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("boot-4", 760, 295, 290, 130, "Step 4: vSAN Storage", "vsan-cluster-mgmt-01a", "💾", "STAGE 4", GlassmorphismCanvas.COLOR_GREEN, ["• Verify vSAN health", "• Mount vSAN Datastores", "• Check disk claim status"], GlassmorphismCanvas.COLOR_PURPLE))
+
+        # Row 3
+        c.add_card(GlassCard("boot-7", 50, 480, 290, 130, "Step 7: SDDC Manager", "sddcmanager-a", "🎛️", "STAGE 7", GlassmorphismCanvas.COLOR_GREEN, ["• Power on sddcmanager-a", "• Verify API access token", "• Audit domain health"], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("boot-8", 405, 480, 290, 130, "Step 8: VCF Operations", "Aria & VCF Automation", "📊", "STAGE 8", GlassmorphismCanvas.COLOR_GREEN, ["• Boot VCF Ops Suite", "• Run URL checker pass", "• Run vcf-lab-tuner pass"], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("boot-9", 760, 480, 290, 130, "Step 9: Lab Ready!", "System Fully Operational", "🎉", "COMPLETE", GlassmorphismCanvas.COLOR_GREEN, ["• Write startup_status.txt", "• Update status dashboard", "• Signal console ready"], GlassmorphismCanvas.COLOR_GREEN))
+
+        # Flow Edges connecting stages
+        c.add_edge(FlowEdge((340, 175), (405, 175), "1 → 2", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((695, 175), (760, 175), "2 → 3", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((905, 240), (905, 295), "3 → 4", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((760, 360), (695, 360), "4 → 5", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((405, 360), (340, 360), "5 → 6", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((195, 425), (195, 480), "6 → 7", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((340, 545), (405, 545), "7 → 8", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((695, 545), (760, 545), "8 → 9", GlassmorphismCanvas.COLOR_GREEN))
+
+        return c
+
+    def build_all(self) -> Dict[str, str]:
+        """Generate and return map of filename to SVG XML content"""
+        return {
+            "high_level_architecture.svg": self.build_high_level_architecture().render(),
+            "network_dataflow.svg": self.build_network_dataflow().render(),
+            "vcf_domain_architecture.svg": self.build_vcf_domain_architecture().render(),
+            "esxi_host_layout.svg": self.build_esxi_host_layout().render(),
+            "nsx_architecture.svg": self.build_nsx_architecture().render(),
+            "lab_boot_sequence.svg": self.build_lab_boot_sequence().render(),
+        }
 
 #==============================================================================
 # DATA COLLECTION
@@ -641,10 +1273,12 @@ class LabDataCollector:
 #==============================================================================
 
 class LabDetailsGenerator:
-    """Generates LABDETAILS.md from collected environment data"""
+    """Generates LABDETAILS.md & HTML documentation from collected environment data"""
     
-    def __init__(self, env: LabEnvironment):
+    def __init__(self, env: LabEnvironment, diagram_style: str = "glassmorphism", svg_rel_dir: str = "diagrams"):
         self.env = env
+        self.diagram_style = diagram_style.lower()
+        self.svg_rel_dir = svg_rel_dir
         self.lines = []
     
     def generate(self) -> str:
@@ -668,6 +1302,71 @@ class LabDetailsGenerator:
         self._add_footer()
         
         return '\n'.join(self.lines)
+
+    def generate_html(self, svg_map: Dict[str, str]) -> str:
+        """Generate standalone Glassmorphic HTML documentation with inline SVGs"""
+        html = []
+        html.append('<!DOCTYPE html>')
+        html.append('<html lang="en">')
+        html.append('<head>')
+        html.append('  <meta charset="UTF-8">')
+        html.append('  <meta name="viewport" content="width=device-width, initial-scale=1.0">')
+        html.append(f'  <title>{xml_escape(self.env.lab_sku or "VCF Lab")} - Lab Environment Documentation v2.0</title>')
+        html.append('  <style>')
+        html.append('    @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");')
+        html.append('    body { font-family: "Inter", sans-serif; background-color: #0d1117; color: #c9d1d9; margin: 0; padding: 30px; line-height: 1.6; }')
+        html.append('    .container { max-width: 1200px; margin: 0 auto; }')
+        html.append('    h1, h2, h3 { color: #f0f6fc; font-weight: 700; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 8px; margin-top: 36px; }')
+        html.append('    h1 { font-size: 28px; background: linear-gradient(90deg, #58a6ff, #bc8cff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; border: none; }')
+        html.append('    .card { background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); backdrop-filter: blur(12px); }')
+        html.append('    table { width: 100%; border-collapse: collapse; margin: 16px 0; }')
+        html.append('    th, td { padding: 10px 14px; border: 1px solid rgba(255,255,255,0.1); text-align: left; font-size: 13px; }')
+        html.append('    th { background: rgba(88, 166, 255, 0.12); color: #58a6ff; font-weight: 600; }')
+        html.append('    tr:nth-child(even) { background: rgba(255,255,255,0.02); }')
+        html.append('    .diagram-box { text-align: center; margin: 24px 0; background: rgba(0,0,0,0.2); border-radius: 12px; padding: 16px; border: 1px solid rgba(255,255,255,0.08); }')
+        html.append('    .diagram-box svg { max-width: 100%; height: auto; border-radius: 8px; }')
+        html.append('    .footer { text-align: center; margin-top: 48px; font-size: 12px; color: #8b949e; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 24px; }')
+        html.append('  </style>')
+        html.append('</head>')
+        html.append('<body>')
+        html.append('  <div class="container">')
+        html.append(f'    <h1>{xml_escape(self.env.lab_sku)} - Lab Environment Documentation</h1>')
+        html.append('    <div class="card">')
+        html.append('      <h2>Lab Overview</h2>')
+        html.append('      <table>')
+        html.append(f'        <tr><th>Lab SKU</th><td>{xml_escape(self.env.lab_sku)}</td></tr>')
+        html.append(f'        <tr><th>Lab Type</th><td>{xml_escape(self.env.lab_type)}</td></tr>')
+        html.append(f'        <tr><th>DNS Domain</th><td>{xml_escape(self.env.dns_domain)}</td></tr>')
+        html.append('        <tr><th>Credentials</th><td>See /home/holuser/creds.txt</td></tr>')
+        html.append('      </table>')
+        html.append('    </div>')
+        
+        diagram_titles = [
+            ("high_level_architecture.svg", "High-Level Architecture & Connectivity"),
+            ("network_dataflow.svg", "Multi-Plane Network & Data Flow Topology"),
+            ("vcf_domain_architecture.svg", "VCF Domain Hierarchy & Control Plane Topology"),
+            ("esxi_host_layout.svg", "ESXi Physical Host & Interface Fabric"),
+            ("nsx_architecture.svg", "NSX-T Virtualization & Overlay Topology"),
+            ("lab_boot_sequence.svg", "Lab Startup Boot Sequence"),
+        ]
+        
+        for key, title in diagram_titles:
+            if key in svg_map:
+                html.append('    <div class="card">')
+                html.append(f'      <h2>{xml_escape(title)}</h2>')
+                html.append('      <div class="diagram-box">')
+                html.append(svg_map[key])
+                html.append('      </div>')
+                html.append('    </div>')
+                
+        html.append('    <div class="footer">')
+        html.append('      <p>Generated by <code>Tools/generate_labdetails.py</code> v2.0 | Style 5 Glassmorphism Engine</p>')
+        html.append('      <p>Diagram Engine License: MIT License © 2025 fireworks-tech-graph contributors</p>')
+        html.append('    </div>')
+        html.append('  </div>')
+        html.append('</body>')
+        html.append('</html>')
+        return '\n'.join(html)
     
     def _add(self, line: str = ""):
         """Add a line to the output"""
@@ -713,69 +1412,73 @@ class LabDetailsGenerator:
         """Add high-level architecture diagram"""
         self._add("## High-Level Architecture")
         self._add()
-        self._add("```mermaid")
-        self._add("flowchart TB")
-        self._add(MERMAID_STYLES)
-        self._add()
-        self._add('    subgraph External["External Network"]')
-        self._add('        Internet[("Internet<br/>192.168.0.0/24")]')
-        self._add('    end')
-        self._add()
-        self._add('    subgraph vPod["vPod Environment"]')
-        self._add('        subgraph CoreVMs["Core Infrastructure VMs<br/>10.1.10.128/25"]')
-        self._add(f'            Router["holorouter<br/>{self.env.router_ip}<br/>(DNS/DHCP/Proxy/FW)"]')
-        self._add(f'            Console["console<br/>{self.env.console_ip}<br/>(Linux Main Console)"]')
-        self._add(f'            Manager["manager<br/>{self.env.manager_ip}<br/>(Lab Startup/Automation)"]')
-        self._add('        end')
-        self._add()
-        self._add('        subgraph VCF["VMware Cloud Foundation"]')
-        
-        # Add domains
-        for domain in self.env.domains:
-            domain_id = domain.name.replace('-', '_').replace('.', '_')
-            domain_label = "Management Domain" if domain.domain_type == "MANAGEMENT" else f"Workload Domain"
+        if self.diagram_style in ("glassmorphism", "both"):
+            self._add(f"![High-Level Architecture]({self.svg_rel_dir}/high_level_architecture.svg)")
+            self._add()
+        if self.diagram_style in ("mermaid", "both"):
+            self._add("```mermaid")
+            self._add("flowchart TB")
+            self._add(MERMAID_STYLES)
+            self._add()
+            self._add('    subgraph External["External Network"]')
+            self._add('        Internet[("Internet<br/>192.168.0.0/24")]')
+            self._add('    end')
+            self._add()
+            self._add('    subgraph vPod["vPod Environment"]')
+            self._add('        subgraph CoreVMs["Core Infrastructure VMs<br/>10.1.10.128/25"]')
+            self._add(f'            Router["holorouter<br/>{self.env.router_ip}<br/>(DNS/DHCP/Proxy/FW)"]')
+            self._add(f'            Console["console<br/>{self.env.console_ip}<br/>(Linux Main Console)"]')
+            self._add(f'            Manager["manager<br/>{self.env.manager_ip}<br/>(Lab Startup/Automation)"]')
+            self._add('        end')
+            self._add()
+            self._add('        subgraph VCF["VMware Cloud Foundation"]')
             
-            self._add(f'            subgraph {domain_id}["{domain_label} ({domain.name})"]')
+            # Add domains
+            for domain in self.env.domains:
+                domain_id = domain.name.replace('-', '_').replace('.', '_')
+                domain_label = "Management Domain" if domain.domain_type == "MANAGEMENT" else f"Workload Domain"
+                
+                self._add(f'            subgraph {domain_id}["{domain_label} ({domain.name})"]')
+                
+                if domain.domain_type == "MANAGEMENT":
+                    self._add(f'                SDDC["SDDC Manager<br/>sddcmanager-a<br/>"]')
+                
+                vc_short = domain.vcenter_fqdn.split('.')[0] if domain.vcenter_fqdn else "vCenter"
+                self._add(f'                VC_{domain_id}["vCenter<br/>{vc_short}"]')
+                
+                nsx_short = domain.nsx_fqdn.split('.')[0] if domain.nsx_fqdn else "NSX"
+                self._add(f'                NSX_{domain_id}["NSX Manager<br/>{nsx_short}"]')
+                
+                # Find cluster for this domain
+                for cl in self.env.clusters:
+                    if cl.domain == domain.name or (not cl.domain and domain.domain_type == "MANAGEMENT"):
+                        self._add(f'                Cluster_{domain_id}["{cl.name}<br/>{cl.host_count} ESXi Hosts"]')
+                        break
+                
+                self._add('            end')
             
-            if domain.domain_type == "MANAGEMENT":
-                self._add(f'                SDDC["SDDC Manager<br/>sddcmanager-a<br/>"]')
+            self._add('        end')
+            self._add('    end')
+            self._add()
+            self._add('    Internet --> Router')
+            self._add('    Router --> Console')
+            self._add('    Router --> Manager')
+            self._add('    Router --> VCF')
             
-            vc_short = domain.vcenter_fqdn.split('.')[0] if domain.vcenter_fqdn else "vCenter"
-            self._add(f'                VC_{domain_id}["vCenter<br/>{vc_short}"]')
+            # Apply styles
+            self._add()
+            self._add('    class Router,Console,Manager coreVM')
+            self._add('    class External external')
             
-            nsx_short = domain.nsx_fqdn.split('.')[0] if domain.nsx_fqdn else "NSX"
-            self._add(f'                NSX_{domain_id}["NSX Manager<br/>{nsx_short}"]')
+            for domain in self.env.domains:
+                domain_id = domain.name.replace('-', '_').replace('.', '_')
+                if domain.domain_type == "MANAGEMENT":
+                    self._add(f'    class SDDC,VC_{domain_id},NSX_{domain_id},Cluster_{domain_id} mgmtDomain')
+                else:
+                    self._add(f'    class VC_{domain_id},NSX_{domain_id},Cluster_{domain_id} wldDomain')
             
-            # Find cluster for this domain
-            for cl in self.env.clusters:
-                if cl.domain == domain.name or (not cl.domain and domain.domain_type == "MANAGEMENT"):
-                    self._add(f'                Cluster_{domain_id}["{cl.name}<br/>{cl.host_count} ESXi Hosts"]')
-                    break
-            
-            self._add('            end')
-        
-        self._add('        end')
-        self._add('    end')
-        self._add()
-        self._add('    Internet --> Router')
-        self._add('    Router --> Console')
-        self._add('    Router --> Manager')
-        self._add('    Router --> VCF')
-        
-        # Apply styles
-        self._add()
-        self._add('    class Router,Console,Manager coreVM')
-        self._add('    class External external')
-        
-        for domain in self.env.domains:
-            domain_id = domain.name.replace('-', '_').replace('.', '_')
-            if domain.domain_type == "MANAGEMENT":
-                self._add(f'    class SDDC,VC_{domain_id},NSX_{domain_id},Cluster_{domain_id} mgmtDomain')
-            else:
-                self._add(f'    class VC_{domain_id},NSX_{domain_id},Cluster_{domain_id} wldDomain')
-        
-        self._add("```")
-        self._add()
+            self._add("```")
+            self._add()
         self._add("---")
         self._add()
     
@@ -783,58 +1486,62 @@ class LabDetailsGenerator:
         """Add network architecture diagram"""
         self._add("## Network Architecture")
         self._add()
-        self._add("```mermaid")
-        self._add("flowchart LR")
-        self._add(MERMAID_STYLES)
-        self._add()
-        self._add('    subgraph External["External/Internet"]')
-        self._add('        ExtNet["192.168.0.0/24"]')
-        self._add('    end')
-        self._add()
-        self._add(f'    subgraph Router["holorouter ({self.env.router_ip})"]')
-        self._add('        FW["Firewall/NAT"]')
-        self._add('        DNS["DNS Server"]')
-        self._add('        Proxy["Squid Proxy :3128"]')
-        self._add('    end')
-        self._add()
-        self._add('    subgraph Networks["Internal Networks"]')
-        self._add('        subgraph CoreNet["Core Network<br/>10.1.10.128/25"]')
-        self._add(f'            Console2["console<br/>{self.env.console_ip}"]')
-        self._add(f'            Manager2["manager<br/>{self.env.manager_ip}"]')
-        self._add('        end')
-        self._add()
-        self._add('        subgraph MgmtNet["Management Network<br/>10.1.1.0/24"]')
-        self._add('            direction TB')
-        
-        # Add key management VMs
-        mgmt_vms_to_show = ['sddcmanager-a', 'vc-mgmt-a', 'vc-wld01-a', 'nsx-mgmt-01a', 'nsx-wld01-01a']
-        for vm in self.env.mgmt_vms:
-            name_lower = vm.name.lower()
-            for show_name in mgmt_vms_to_show:
-                if show_name in name_lower:
-                    ip_suffix = vm.ip_address.split('.')[-1] if vm.ip_address else ""
-                    self._add(f'            VM_{vm.name.replace("-", "_")}["{vm.name} .{ip_suffix}"]')
-                    break
-        
-        self._add('        end')
-        self._add()
-        self._add('        subgraph VSANNet["vSAN Network<br/>10.1.2.0/24"]')
-        self._add('            direction TB')
-        for host in self.env.hosts[:4]:  # Show first 4 hosts
-            short_name = host.fqdn.split('.')[0]
-            ip_suffix = host.vsan_ip.split('.')[-1] if host.vsan_ip else ""
-            self._add(f'            {short_name.replace("-", "_")}_v["{short_name} .{ip_suffix}"]')
-        self._add('        end')
-        self._add('    end')
-        self._add()
-        self._add('    ExtNet --> FW')
-        self._add('    FW --> CoreNet')
-        self._add('    FW --> MgmtNet')
-        self._add()
-        self._add('    class Console2,Manager2 coreVM')
-        self._add('    class ExtNet external')
-        self._add("```")
-        self._add()
+        if self.diagram_style in ("glassmorphism", "both"):
+            self._add(f"![Multi-Plane Network & Data Flow Topology]({self.svg_rel_dir}/network_dataflow.svg)")
+            self._add()
+        if self.diagram_style in ("mermaid", "both"):
+            self._add("```mermaid")
+            self._add("flowchart LR")
+            self._add(MERMAID_STYLES)
+            self._add()
+            self._add('    subgraph External["External/Internet"]')
+            self._add('        ExtNet["192.168.0.0/24"]')
+            self._add('    end')
+            self._add()
+            self._add(f'    subgraph Router["holorouter ({self.env.router_ip})"]')
+            self._add('        FW["Firewall/NAT"]')
+            self._add('        DNS["DNS Server"]')
+            self._add('        Proxy["Squid Proxy :3128"]')
+            self._add('    end')
+            self._add()
+            self._add('    subgraph Networks["Internal Networks"]')
+            self._add('        subgraph CoreNet["Core Network<br/>10.1.10.128/25"]')
+            self._add(f'            Console2["console<br/>{self.env.console_ip}"]')
+            self._add(f'            Manager2["manager<br/>{self.env.manager_ip}"]')
+            self._add('        end')
+            self._add()
+            self._add('        subgraph MgmtNet["Management Network<br/>10.1.1.0/24"]')
+            self._add('            direction TB')
+            
+            # Add key management VMs
+            mgmt_vms_to_show = ['sddcmanager-a', 'vc-mgmt-a', 'vc-wld01-a', 'nsx-mgmt-01a', 'nsx-wld01-01a']
+            for vm in self.env.mgmt_vms:
+                name_lower = vm.name.lower()
+                for show_name in mgmt_vms_to_show:
+                    if show_name in name_lower:
+                        ip_suffix = vm.ip_address.split('.')[-1] if vm.ip_address else ""
+                        self._add(f'            VM_{vm.name.replace("-", "_")}["{vm.name} .{ip_suffix}"]')
+                        break
+            
+            self._add('        end')
+            self._add()
+            self._add('        subgraph VSANNet["vSAN Network<br/>10.1.2.0/24"]')
+            self._add('            direction TB')
+            for host in self.env.hosts[:4]:  # Show first 4 hosts
+                short_name = host.fqdn.split('.')[0]
+                ip_suffix = host.vsan_ip.split('.')[-1] if host.vsan_ip else ""
+                self._add(f'            {short_name.replace("-", "_")}_v["{short_name} .{ip_suffix}"]')
+            self._add('        end')
+            self._add('    end')
+            self._add()
+            self._add('    ExtNet --> FW')
+            self._add('    FW --> CoreNet')
+            self._add('    FW --> MgmtNet')
+            self._add()
+            self._add('    class Console2,Manager2 coreVM')
+            self._add('    class ExtNet external')
+            self._add("```")
+            self._add()
         self._add("---")
         self._add()
     
@@ -842,83 +1549,87 @@ class LabDetailsGenerator:
         """Add VCF domain architecture diagram"""
         self._add("## VCF Domain Architecture")
         self._add()
-        self._add("```mermaid")
-        self._add("flowchart TB")
-        self._add(MERMAID_STYLES)
-        self._add()
-        
-        vcf_version = "9.0.1" if self.env.esxi_version and "9.0" in self.env.esxi_version else ""
-        self._add(f'    subgraph VCF["VMware Cloud Foundation {vcf_version}"]')
-        self._add('        SDDC["SDDC Manager<br/>sddcmanager-a.site-a.vcf.lab"]')
-        self._add()
-        
-        for domain in self.env.domains:
-            domain_id = domain.name.replace('-', '_').replace('.', '_')
-            domain_label = "Management Domain" if domain.domain_type == "MANAGEMENT" else "Workload Domain"
-            style_class = "mgmtDomain" if domain.domain_type == "MANAGEMENT" else "wldDomain"
+        if self.diagram_style in ("glassmorphism", "both"):
+            self._add(f"![VCF Domain Architecture]({self.svg_rel_dir}/vcf_domain_architecture.svg)")
+            self._add()
+        if self.diagram_style in ("mermaid", "both"):
+            self._add("```mermaid")
+            self._add("flowchart TB")
+            self._add(MERMAID_STYLES)
+            self._add()
             
-            self._add(f'        subgraph {domain_id}["{domain_label}: {domain.name}"]')
+            vcf_version = "9.0.1" if self.env.esxi_version and "9.0" in self.env.esxi_version else ""
+            self._add(f'    subgraph VCF["VMware Cloud Foundation {vcf_version}"]')
+            self._add('        SDDC["SDDC Manager<br/>sddcmanager-a.site-a.vcf.lab"]')
+            self._add()
             
-            # vCenter
-            if domain.vcenter_fqdn:
-                self._add(f'            subgraph VC_{domain_id}["vCenter: {domain.vcenter_fqdn}"]')
-                self._add(f'                DC_{domain_id}["Datacenter: dc-a"]')
-                self._add('            end')
-            
-            # NSX
-            if domain.nsx_fqdn:
-                self._add(f'            subgraph NSX_{domain_id}["NSX: {domain.nsx_fqdn}"]')
-                # Find NSX node for this domain
-                for vm in self.env.mgmt_vms:
-                    if 'nsx' in vm.name.lower() and domain.name.split('-')[0] in vm.name.lower():
-                        self._add(f'                NSXNode_{domain_id}["{vm.name}<br/>{vm.ip_address}"]')
-                        break
-                self._add('            end')
-            
-            # Cluster
-            for cl in self.env.clusters:
-                if cl.domain == domain.name:
-                    self._add(f'            subgraph Cluster_{domain_id}["Cluster: {cl.name}"]')
-                    # List hosts in this cluster
-                    host_count = 0
-                    for host in self.env.hosts:
-                        short_name = host.fqdn.split('.')[0]
-                        host_num = int(short_name.split('-')[1].replace('a', '')) if '-' in short_name else 0
-                        
-                        # Assign to cluster based on host number
-                        if cl.name == 'cluster-mgmt-01a' and host_num <= 4:
-                            self._add(f'                Host_{short_name.replace("-", "_")}["{short_name}<br/>{host.cpu_cores} cores / {host.memory_gb:.0f} GB"]')
-                            host_count += 1
-                        elif cl.name == 'cluster-wld01-01a' and host_num > 4:
-                            self._add(f'                Host_{short_name.replace("-", "_")}["{short_name}<br/>{host.cpu_cores} cores / {host.memory_gb:.0f} GB"]')
-                            host_count += 1
+            for domain in self.env.domains:
+                domain_id = domain.name.replace('-', '_').replace('.', '_')
+                domain_label = "Management Domain" if domain.domain_type == "MANAGEMENT" else "Workload Domain"
+                style_class = "mgmtDomain" if domain.domain_type == "MANAGEMENT" else "wldDomain"
+                
+                self._add(f'        subgraph {domain_id}["{domain_label}: {domain.name}"]')
+                
+                # vCenter
+                if domain.vcenter_fqdn:
+                    self._add(f'            subgraph VC_{domain_id}["vCenter: {domain.vcenter_fqdn}"]')
+                    self._add(f'                DC_{domain_id}["Datacenter: dc-a"]')
                     self._add('            end')
-                    
-                    # Datastore
-                    self._add(f'            subgraph DS_{domain_id}["Datastore"]')
-                    for ds in self.env.datastores:
-                        if cl.datastore and cl.datastore in ds.name:
-                            self._add(f'                {ds.name.replace("-", "_")}["{ds.name}<br/>{ds.ds_type}<br/>{ds.capacity_gb:.1f} TB"]')
+                
+                # NSX
+                if domain.nsx_fqdn:
+                    self._add(f'            subgraph NSX_{domain_id}["NSX: {domain.nsx_fqdn}"]')
+                    # Find NSX node for this domain
+                    for vm in self.env.mgmt_vms:
+                        if 'nsx' in vm.name.lower() and domain.name.split('-')[0] in vm.name.lower():
+                            self._add(f'                NSXNode_{domain_id}["{vm.name}<br/>{vm.ip_address}"]')
                             break
                     self._add('            end')
+                
+                # Cluster
+                for cl in self.env.clusters:
+                    if cl.domain == domain.name:
+                        self._add(f'            subgraph Cluster_{domain_id}["Cluster: {cl.name}"]')
+                        # List hosts in this cluster
+                        host_count = 0
+                        for host in self.env.hosts:
+                            short_name = host.fqdn.split('.')[0]
+                            host_num = int(short_name.split('-')[1].replace('a', '')) if '-' in short_name else 0
+                            
+                            # Assign to cluster based on host number
+                            if cl.name == 'cluster-mgmt-01a' and host_num <= 4:
+                                self._add(f'                Host_{short_name.replace("-", "_")}["{short_name}<br/>{host.cpu_cores} cores / {host.memory_gb:.0f} GB"]')
+                                host_count += 1
+                            elif cl.name == 'cluster-wld01-01a' and host_num > 4:
+                                self._add(f'                Host_{short_name.replace("-", "_")}["{short_name}<br/>{host.cpu_cores} cores / {host.memory_gb:.0f} GB"]')
+                                host_count += 1
+                        self._add('            end')
+                        
+                        # Datastore
+                        self._add(f'            subgraph DS_{domain_id}["Datastore"]')
+                        for ds in self.env.datastores:
+                            if cl.datastore and cl.datastore in ds.name:
+                                self._add(f'                {ds.name.replace("-", "_")}["{ds.name}<br/>{ds.ds_type}<br/>{ds.capacity_gb:.1f} TB"]')
+                                break
+                        self._add('            end')
+                
+                self._add('        end')
+                self._add()
             
-            self._add('        end')
+            self._add('        SDDC --> mgmt_a')
+            if len(self.env.domains) > 1:
+                self._add('        SDDC --> wld01_a')
+            self._add('    end')
             self._add()
-        
-        self._add('        SDDC --> mgmt_a')
-        if len(self.env.domains) > 1:
-            self._add('        SDDC --> wld01_a')
-        self._add('    end')
-        self._add()
-        
-        # Apply styles
-        self._add('    class SDDC mgmtDomain')
-        for domain in self.env.domains:
-            domain_id = domain.name.replace('-', '_').replace('.', '_')
-            style_class = "mgmtDomain" if domain.domain_type == "MANAGEMENT" else "wldDomain"
-        
-        self._add("```")
-        self._add()
+            
+            # Apply styles
+            self._add('    class SDDC mgmtDomain')
+            for domain in self.env.domains:
+                domain_id = domain.name.replace('-', '_').replace('.', '_')
+                style_class = "mgmtDomain" if domain.domain_type == "MANAGEMENT" else "wldDomain"
+            
+            self._add("```")
+            self._add()
         self._add("---")
         self._add()
     
@@ -926,50 +1637,54 @@ class LabDetailsGenerator:
         """Add ESXi host layout diagram"""
         self._add("## ESXi Host Layout")
         self._add()
-        self._add("```mermaid")
-        self._add("flowchart TB")
-        self._add(MERMAID_STYLES)
-        self._add()
-        self._add('    subgraph Site["Site A - ESXi Hosts"]')
-        
-        # Group hosts by cluster
-        for cl in self.env.clusters:
-            cl_id = cl.name.replace('-', '_').replace('.', '_')
-            style_class = "mgmtDomain" if "mgmt" in cl.name.lower() else "wldDomain"
+        if self.diagram_style in ("glassmorphism", "both"):
+            self._add(f"![ESXi Host Layout]({self.svg_rel_dir}/esxi_host_layout.svg)")
+            self._add()
+        if self.diagram_style in ("mermaid", "both"):
+            self._add("```mermaid")
+            self._add("flowchart TB")
+            self._add(MERMAID_STYLES)
+            self._add()
+            self._add('    subgraph Site["Site A - ESXi Hosts"]')
             
-            self._add(f'        subgraph {cl_id}["{cl.name}"]')
-            
-            for host in self.env.hosts:
-                short_name = host.fqdn.split('.')[0]
-                host_num = int(short_name.split('-')[1].replace('a', '')) if '-' in short_name else 0
+            # Group hosts by cluster
+            for cl in self.env.clusters:
+                cl_id = cl.name.replace('-', '_').replace('.', '_')
+                style_class = "mgmtDomain" if "mgmt" in cl.name.lower() else "wldDomain"
                 
-                # Assign to cluster based on host number (1-4 = mgmt, 5-7 = wld)
-                in_this_cluster = False
-                if "mgmt" in cl.name.lower() and host_num <= 4:
-                    in_this_cluster = True
-                elif "wld" in cl.name.lower() and host_num > 4:
-                    in_this_cluster = True
+                self._add(f'        subgraph {cl_id}["{cl.name}"]')
                 
-                if in_this_cluster:
-                    host_id = short_name.replace('-', '_')
-                    self._add(f'            subgraph {host_id}["{host.fqdn}"]')
-                    self._add(f'                {host_id}_info["{host.cpu_cores} CPU Cores | {host.memory_gb:.0f} GB RAM<br/>')
-                    if host.mgmt_ip:
-                        self._add(f'MGMT: {host.mgmt_ip}<br/>')
-                    if host.vsan_ip:
-                        self._add(f'vSAN: {host.vsan_ip}<br/>')
-                    if host.vmotion_ip:
-                        self._add(f'vMotion: {host.vmotion_ip}"]')
-                    else:
-                        self._add('"]')
-                    self._add('            end')
+                for host in self.env.hosts:
+                    short_name = host.fqdn.split('.')[0]
+                    host_num = int(short_name.split('-')[1].replace('a', '')) if '-' in short_name else 0
+                    
+                    # Assign to cluster based on host number (1-4 = mgmt, 5-7 = wld)
+                    in_this_cluster = False
+                    if "mgmt" in cl.name.lower() and host_num <= 4:
+                        in_this_cluster = True
+                    elif "wld" in cl.name.lower() and host_num > 4:
+                        in_this_cluster = True
+                    
+                    if in_this_cluster:
+                        host_id = short_name.replace('-', '_')
+                        self._add(f'            subgraph {host_id}["{host.fqdn}"]')
+                        self._add(f'                {host_id}_info["{host.cpu_cores} CPU Cores | {host.memory_gb:.0f} GB RAM<br/>')
+                        if host.mgmt_ip:
+                            self._add(f'MGMT: {host.mgmt_ip}<br/>')
+                        if host.vsan_ip:
+                            self._add(f'vSAN: {host.vsan_ip}<br/>')
+                        if host.vmotion_ip:
+                            self._add(f'vMotion: {host.vmotion_ip}"]')
+                        else:
+                            self._add('"]')
+                        self._add('            end')
+                
+                self._add('        end')
+                self._add(f'        class {cl_id} {style_class}')
             
-            self._add('        end')
-            self._add(f'        class {cl_id} {style_class}')
-        
-        self._add('    end')
-        self._add("```")
-        self._add()
+            self._add('    end')
+            self._add("```")
+            self._add()
         self._add("---")
         self._add()
     
@@ -1097,39 +1812,43 @@ class LabDetailsGenerator:
         """Add NSX architecture diagram"""
         self._add("## NSX Architecture")
         self._add()
-        self._add("```mermaid")
-        self._add("flowchart TB")
-        self._add(MERMAID_STYLES)
-        self._add()
-        self._add('    subgraph NSX["NSX-T Architecture"]')
-        
-        for domain in self.env.domains:
-            domain_id = domain.name.replace('-', '_').replace('.', '_')
-            domain_label = "Management" if domain.domain_type == "MANAGEMENT" else "Workload"
-            style_class = "mgmtDomain" if domain.domain_type == "MANAGEMENT" else "wldDomain"
+        if self.diagram_style in ("glassmorphism", "both"):
+            self._add(f"![NSX Architecture]({self.svg_rel_dir}/nsx_architecture.svg)")
+            self._add()
+        if self.diagram_style in ("mermaid", "both"):
+            self._add("```mermaid")
+            self._add("flowchart TB")
+            self._add(MERMAID_STYLES)
+            self._add()
+            self._add('    subgraph NSX["NSX-T Architecture"]')
             
-            self._add(f'        subgraph NSX_{domain_id}["{domain_label} Domain NSX"]')
+            for domain in self.env.domains:
+                domain_id = domain.name.replace('-', '_').replace('.', '_')
+                domain_label = "Management" if domain.domain_type == "MANAGEMENT" else "Workload"
+                style_class = "mgmtDomain" if domain.domain_type == "MANAGEMENT" else "wldDomain"
+                
+                self._add(f'        subgraph NSX_{domain_id}["{domain_label} Domain NSX"]')
+                
+                if domain.nsx_fqdn:
+                    self._add(f'            NSXMgr_{domain_id}["NSX Manager Cluster<br/>{domain.nsx_fqdn} (VIP)"]')
+                
+                # Find edges for this domain
+                domain_edges = [e for e in self.env.nsx_edges if domain.name.split('-')[0] in e.cluster.lower() or domain.name in e.cluster]
+                
+                if domain_edges:
+                    self._add(f'            subgraph EdgeCluster_{domain_id}["Edge Cluster"]')
+                    for edge in domain_edges:
+                        edge_id = edge.name.replace('-', '_')
+                        tep_str = ', '.join(edge.tep_ips) if edge.tep_ips else "N/A"
+                        self._add(f'                {edge_id}["{edge.name}<br/>Mgmt: {edge.mgmt_ip}<br/>TEP: {tep_str}"]')
+                    self._add('            end')
+                
+                self._add('        end')
+                self._add(f'        class NSX_{domain_id} {style_class}')
             
-            if domain.nsx_fqdn:
-                self._add(f'            NSXMgr_{domain_id}["NSX Manager Cluster<br/>{domain.nsx_fqdn} (VIP)"]')
-            
-            # Find edges for this domain
-            domain_edges = [e for e in self.env.nsx_edges if domain.name.split('-')[0] in e.cluster.lower() or domain.name in e.cluster]
-            
-            if domain_edges:
-                self._add(f'            subgraph EdgeCluster_{domain_id}["Edge Cluster"]')
-                for edge in domain_edges:
-                    edge_id = edge.name.replace('-', '_')
-                    tep_str = ', '.join(edge.tep_ips) if edge.tep_ips else "N/A"
-                    self._add(f'                {edge_id}["{edge.name}<br/>Mgmt: {edge.mgmt_ip}<br/>TEP: {tep_str}"]')
-                self._add('            end')
-            
-            self._add('        end')
-            self._add(f'        class NSX_{domain_id} {style_class}')
-        
-        self._add('    end')
-        self._add("```")
-        self._add()
+            self._add('    end')
+            self._add("```")
+            self._add()
         self._add("---")
         self._add()
     
@@ -1137,44 +1856,48 @@ class LabDetailsGenerator:
         """Add lab startup boot sequence diagram"""
         self._add("## Lab Startup Boot Sequence")
         self._add()
-        self._add("```mermaid")
-        self._add("sequenceDiagram")
-        self._add("    participant Router as holorouter")
-        self._add("    participant Manager as manager")
-        self._add("    participant ESXi as ESXi Hosts")
-        self._add("    participant NSX as NSX Manager")
-        self._add("    participant Edges as NSX Edges")
-        self._add("    participant VC as vCenter")
-        self._add("    participant SDDC as SDDC Manager")
-        self._add("    participant Ops as VCF Operations Suite")
-        self._add()
-        self._add("    Note over Router,Ops: Lab Startup Sequence (labstartup.py)")
-        self._add()
-        self._add("    Router->>Router: Start DNS/DHCP/Proxy")
-        self._add("    Manager->>Manager: Initialize lsfunctions")
-        self._add("    Manager->>ESXi: Connect to ESXi hosts")
-        self._add("    ESXi->>ESXi: Exit Maintenance Mode")
-        self._add()
-        self._add("    Manager->>Manager: Verify vSAN Datastore")
-        self._add("    Manager->>NSX: Power On NSX Manager(s)")
-        self._add("    Manager->>Edges: Power On NSX Edge VMs")
-        self._add()
-        self._add("    Note over Edges: Wait 5 minutes for Edge boot")
-        self._add()
-        self._add("    Manager->>VC: Power On vCenter(s)")
-        self._add()
-        self._add("    Note over VC: Wait for vCenter API")
-        self._add()
-        self._add("    Manager->>Manager: Connect to vCenters")
-        self._add("    Manager->>SDDC: Power On sddcmanager-a")
-        self._add("    Manager->>Ops: Power On VCF Operations Suite VMs")
-        self._add()
-        self._add("    Manager->>Manager: Verify URLs")
-        self._add("    Manager->>Router: Signal Ready")
-        self._add()
-        self._add("    Note over Router,Ops: Lab Ready!")
-        self._add("```")
-        self._add()
+        if self.diagram_style in ("glassmorphism", "both"):
+            self._add(f"![Lab Startup Boot Sequence]({self.svg_rel_dir}/lab_boot_sequence.svg)")
+            self._add()
+        if self.diagram_style in ("mermaid", "both"):
+            self._add("```mermaid")
+            self._add("sequenceDiagram")
+            self._add("    participant Router as holorouter")
+            self._add("    participant Manager as manager")
+            self._add("    participant ESXi as ESXi Hosts")
+            self._add("    participant NSX as NSX Manager")
+            self._add("    participant Edges as NSX Edges")
+            self._add("    participant VC as vCenter")
+            self._add("    participant SDDC as SDDC Manager")
+            self._add("    participant Ops as VCF Operations Suite")
+            self._add()
+            self._add("    Note over Router,Ops: Lab Startup Sequence (labstartup.py)")
+            self._add()
+            self._add("    Router->>Router: Start DNS/DHCP/Proxy")
+            self._add("    Manager->>Manager: Initialize lsfunctions")
+            self._add("    Manager->>ESXi: Connect to ESXi hosts")
+            self._add("    ESXi->>ESXi: Exit Maintenance Mode")
+            self._add()
+            self._add("    Manager->>Manager: Verify vSAN Datastore")
+            self._add("    Manager->>NSX: Power On NSX Manager(s)")
+            self._add("    Manager->>Edges: Power On NSX Edge VMs")
+            self._add()
+            self._add("    Note over Edges: Wait 5 minutes for Edge boot")
+            self._add()
+            self._add("    Manager->>VC: Power On vCenter(s)")
+            self._add()
+            self._add("    Note over VC: Wait for vCenter API")
+            self._add()
+            self._add("    Manager->>Manager: Connect to vCenters")
+            self._add("    Manager->>SDDC: Power On sddcmanager-a")
+            self._add("    Manager->>Ops: Power On VCF Operations Suite VMs")
+            self._add()
+            self._add("    Manager->>Manager: Verify URLs")
+            self._add("    Manager->>Router: Signal Ready")
+            self._add()
+            self._add("    Note over Router,Ops: Lab Ready!")
+            self._add("```")
+            self._add()
         self._add("---")
         self._add()
     
@@ -1469,23 +2192,112 @@ class LabDetailsGenerator:
         self._add("| Property | Value |")
         self._add("| -------- | ----- |")
         self._add(f"| **Generated** | {datetime.datetime.now().strftime('%B %d, %Y at %H:%M:%S')} |")
+        self._add(f"| **Generator Version** | `v2.0` (Style 5 Glassmorphism Engine) |")
         self._add(f"| **Generated By** | `python3 Tools/generate_labdetails.py` |")
+        self._add(f"| **Diagram Engine License** | MIT License © 2025 fireworks-tech-graph contributors |")
         self._add("| **Lab Configuration** | `/tmp/config.ini` |")
         self._add(f"| **Source INI** | `/home/holuser/hol/holodeck/{self.env.lab_sku}.ini` |")
         self._add("| **Lab Startup Script** | `/home/holuser/hol/labstartup.py` |")
 
 #==============================================================================
-# MAIN
+# MAIN & CLI HELP SCREEN
 #==============================================================================
 
+VERSION = "2.0.0"
+
+def show_help():
+    """Display script-help-style compliant help screen"""
+    use_color = sys.stdout.isatty()
+    
+    def c(code, text):
+        return f"\033[{code}m{text}\033[0m" if use_color else text
+        
+    cyan = lambda t: c("1;36", t)
+    blue = lambda t: c("1;34", t)
+    green = lambda t: c("1;32", t)
+    yellow = lambda t: c("1;33", t)
+    dim = lambda t: c("2;37", t)
+    bold = lambda t: c("1", t)
+
+    print(cyan("╔════════════════════════════════════════════════════════════════════════════════╗"))
+    print(cyan("║") + blue(f"                 generate_labdetails.py — Version {VERSION}                          ") + cyan("║"))
+    print(cyan("║") + bold("  Automatic Lab Documentation & Style 5 Glassmorphism Topology Generator        ") + cyan("║"))
+    print(cyan("╚════════════════════════════════════════════════════════════════════════════════╝"))
+    print()
+    print(bold("DESCRIPTION:"))
+    print("  Queries live vCenter, NSX, and SDDC Manager environments to generate comprehensive")
+    print("  LABDETAILS.md documentation along with 6 standalone Style 5 Glassmorphism SVG topology")
+    print("  diagrams illustrating connectivity and data flow across all 5 network planes.")
+    print()
+    print(bold("USAGE:"))
+    print(f"  {green('python3 Tools/generate_labdetails.py')} [{yellow('[OPTIONS]')}]")
+    print()
+    print(bold("OPTIONS:"))
+    print(f"  {green('-o, --output')} {yellow('<path>')}         Output markdown file path {dim(f'(default: {DEFAULT_OUTPUT})')}")
+    print(f"  {green('--diagram-style')} {yellow('<style>')}   Diagram format style: {yellow('glassmorphism')}, {yellow('mermaid')}, or {yellow('both')} {dim('(default: glassmorphism)')}")
+    print(f"  {green('--svg-dir')} {yellow('<path>')}         Directory for output SVG files {dim('(default: <output_dir>/diagrams)')}")
+    print(f"  {green('--html')}                    Generate standalone glassmorphic viewer {yellow('LABDETAILS.html')}")
+    print(f"  {green('--config')} {yellow('<path>')}         Path to config.ini {dim(f'(default: {CONFIG_INI})')}")
+    print(f"  {green('--dry-run')}                  Print markdown to stdout without writing files")
+    print(f"  {green('-v, --version')}              Display script version and exit")
+    print(f"  {green('-h, --help')}                 Show this styled help screen and exit")
+    print()
+    print(bold("EXAMPLES:"))
+    print(f"  {dim('# Generate standard LABDETAILS.md with Glassmorphism SVGs in diagrams/')}")
+    print(f"  {green('python3 Tools/generate_labdetails.py')}")
+    print()
+    print(f"  {dim('# Generate both Glassmorphism SVGs and Mermaid code blocks along with HTML report')}")
+    print(f"  {green('python3 Tools/generate_labdetails.py --diagram-style both --html')}")
+    print()
+    print(f"  {dim('# Dry-run generation to stdout')}")
+    print(f"  {green('python3 Tools/generate_labdetails.py --dry-run')}")
+    print()
+    print(bold("LICENSE NOTICE:"))
+    print(dim("  Portions of diagram styling, color tokens, and layout principles derived from"))
+    print(dim("  fireworks-tech-graph (https://github.com/yizhiyanhua-ai/fireworks-tech-graph)"))
+    print(dim("  MIT License © 2025 fireworks-tech-graph contributors."))
+    print()
+
+class CustomArgumentParser(argparse.ArgumentParser):
+    """Custom parser to integrate styled help and clean error reporting"""
+    def error(self, message):
+        sys.stderr.write(f"\033[1;31mERROR: {message}\033[0m\n\n" if sys.stderr.isatty() else f"ERROR: {message}\n\n")
+        show_help()
+        sys.exit(1)
+
 def main():
-    parser = argparse.ArgumentParser(
-        description='Generate LABDETAILS.md from live lab environment'
+    if '-h' in sys.argv or '--help' in sys.argv:
+        show_help()
+        sys.exit(0)
+        
+    if '-v' in sys.argv or '--version' in sys.argv:
+        print(f"generate_labdetails.py {VERSION}")
+        sys.exit(0)
+
+    parser = CustomArgumentParser(
+        description='Generate LABDETAILS.md from live lab environment',
+        add_help=False
     )
     parser.add_argument(
         '--output', '-o',
         default=DEFAULT_OUTPUT,
         help=f'Output file path (default: {DEFAULT_OUTPUT})'
+    )
+    parser.add_argument(
+        '--diagram-style',
+        choices=['glassmorphism', 'mermaid', 'both'],
+        default='glassmorphism',
+        help='Diagram rendering style'
+    )
+    parser.add_argument(
+        '--svg-dir',
+        default=None,
+        help='Directory path for generated SVGs'
+    )
+    parser.add_argument(
+        '--html',
+        action='store_true',
+        help='Generate standalone LABDETAILS.html viewer'
     )
     parser.add_argument(
         '--dry-run',
@@ -1500,27 +2312,68 @@ def main():
     
     args = parser.parse_args()
     
+    # Resolve output paths & directories
+    output_path = os.path.abspath(args.output)
+    output_dir = os.path.dirname(output_path)
+    
+    if args.svg_dir:
+        svg_dir = os.path.abspath(args.svg_dir)
+    else:
+        svg_dir = os.path.join(output_dir, 'diagrams')
+        
+    # Calculate relative SVG directory for markdown links
+    try:
+        svg_rel_dir = os.path.relpath(svg_dir, output_dir)
+    except Exception:
+        svg_rel_dir = 'diagrams'
+    
     # Check for creds.txt
     if not os.path.isfile(CREDS_FILE):
-        print(f"ERROR: Credentials file not found: {CREDS_FILE}")
-        sys.exit(1)
+        print(f"WARNING: Credentials file not found: {CREDS_FILE}. Proceeding with offline fallback mode.")
     
     # Collect lab data
     collector = LabDataCollector(args.config)
     env = collector.collect_all()
     
-    # Generate markdown
-    generator = LabDetailsGenerator(env)
+    # Build Style 5 Glassmorphism Diagrams
+    diagram_builder = LabDiagramBuilder(env)
+    svg_map = diagram_builder.build_all()
+    
+    # Generate Markdown Documentation
+    generator = LabDetailsGenerator(env, diagram_style=args.diagram_style, svg_rel_dir=svg_rel_dir)
     content = generator.generate()
     
     if args.dry_run:
         print(content)
+        print("\n--- STANDALONE GLASSMORPHISM SVG SUMMARY ---")
+        for filename, svg_data in svg_map.items():
+            print(f"  • {filename}: {len(svg_data)} bytes (valid SVG)")
     else:
-        # Write to file
-        with open(args.output, 'w') as f:
+        # Create output directories
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(svg_dir, exist_ok=True)
+        
+        # Write SVGs to disk
+        print(f"\nWriting Glassmorphism SVG diagrams to {svg_dir}...")
+        for filename, svg_data in svg_map.items():
+            svg_path = os.path.join(svg_dir, filename)
+            with open(svg_path, 'w', encoding='utf-8') as f:
+                f.write(svg_data)
+            print(f"  ✓ {filename} ({len(svg_data.splitlines())} lines)")
+            
+        # Write Markdown file
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write(content)
-        print(f"\nLABDETAILS.md generated: {args.output}")
+        print(f"\nLABDETAILS.md generated: {output_path}")
         print(f"Total lines: {len(content.splitlines())}")
+        
+        # Optionally generate HTML report
+        if args.html:
+            html_path = os.path.splitext(output_path)[0] + '.html'
+            html_content = generator.generate_html(svg_map)
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            print(f"LABDETAILS.html generated: {html_path}")
 
 if __name__ == '__main__':
     main()
