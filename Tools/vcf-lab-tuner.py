@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 1.9.1 - 2026-08-25
+Version 2.0.0 - 2026-08-26
 Author: HOL Core Team
+
+v2.0.0: Native Certificate Renewal Engine across VSP, VCFA, and Supervisor clusters:
+  - Native Cert-Manager Renewal (_renew_certmanager_leaf_certs): Auto-discovers and renews expiring/invalid cert-manager leaf certificates across all namespaces for VSP, VCFA, and Supervisor. Deletes backing secrets to trigger reissuance, correlates workloads mounting renewed secrets, and executes zero-downtime rollout restarts.
+  - Native Kubeadm & Kubelet Renewal (_renew_kubeadm_certs, _renew_kubelet_certs): Natively renews control plane certificates and node kubelet serving certs on VSP and VCFA, auto-approves node CSRs, and enforces 5-year CSR signing duration on kube-controller-manager.
+  - Native VSP Root CA Extension & Containerd Sync (_renew_certmanager_ca, _sync_containerd_ca): Extends cert-manager root CA (vcf-cluster-ca) when near expiry and synchronizes ca.crt to containerd trust stores across all VSP cluster nodes.
+  - Native Supervisor ESXi Spherelet Renewal (_renew_supervisor_spherelet_certs): Re-signs 5-year client.crt and spherelet.crt certificates for ESXi agent hosts on Supervisor clusters using SCP CA keys and manager-local openssl.
+  - Removed Delegation: Completely eliminated subprocess delegation to vsp_cert_renewer.py.
 
 v1.9.1: VCFA endpoint convergence loop & cluster-specific drift keeper:
   - VCFA Endpoint Convergence & Backoff Unblocker: In remediate mode, chk_endpoint polls up to 180s for /automation and /login/ stabilization. Once tenant-manager-0 reaches Running status, it actively resets crashed prelude auth pods (api-gateway-server, ccs-vksm-eas, resource-manager-server) to clear Kubernetes exponential backoff delays immediately.
@@ -473,8 +480,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "1.9.1"
-DATE    = "2026-08-25"
+VERSION = "2.0.0"
+DATE    = "2026-08-26"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -2487,6 +2494,562 @@ def _sweep_bad_pods(r, by_ns, ctx):
     return out
 
 
+# ─── Native Certificate Renewal Helpers ─────────────────────────────────────
+
+def _ssh_exec_esx(host, password, command, timeout=30):
+    """SSH to an ESXi host as root from the manager and return stdout as a string."""
+    subprocess.run(["ssh-keygen", "-R", host], capture_output=True)
+    esx_opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", "LogLevel=ERROR",
+    ]
+    try:
+        r = subprocess.run(
+            ["ssh", *esx_opts, "-o", "BatchMode=yes", f"root@{host}", command],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            return r.stdout
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["sshpass", "-p", password, "ssh", *esx_opts,
+             f"root@{host}", command],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return r.stdout
+    except Exception:
+        return ""
+
+
+def _scp_get_esx(host, password, remote_path, local_path, timeout=30):
+    """SCP a file FROM an ESXi host to a local path on the manager."""
+    subprocess.run(["ssh-keygen", "-R", host], capture_output=True)
+    esx_opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", "LogLevel=ERROR",
+    ]
+    try:
+        r = subprocess.run(
+            ["scp", *esx_opts, "-o", "BatchMode=yes",
+             f"root@{host}:{remote_path}", local_path],
+            capture_output=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["sshpass", "-p", password, "scp", *esx_opts,
+             f"root@{host}:{remote_path}", local_path],
+            capture_output=True, timeout=timeout,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _scp_put_esx(host, password, local_path, remote_path, timeout=30):
+    """SCP a file TO an ESXi host from a local path on the manager."""
+    subprocess.run(["ssh-keygen", "-R", host], capture_output=True)
+    esx_opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", "LogLevel=ERROR",
+    ]
+    try:
+        r = subprocess.run(
+            ["scp", *esx_opts, "-o", "BatchMode=yes",
+             local_path, f"root@{host}:{remote_path}"],
+            capture_output=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["sshpass", "-p", password, "scp", *esx_opts,
+             local_path, f"root@{host}:{remote_path}"],
+            capture_output=True, timeout=timeout,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _renew_certmanager_ca(r, ctx):
+    """Extend cert-manager root CA if remaining validity < 1 year (8760h).
+    
+    Ported from vsp_cert_renewer.py Phase 3.0.
+    Returns True if CA was rotated, False otherwise.
+    """
+    if r.cluster != "vsp":
+        return False
+
+    ca_certs = [
+        ("vmsp-platform", "vcf-cluster-ca", "vcf-cluster-ca-secret"),
+        ("vmsp-platform", "vcf-cluster-issuer", "vcf-cluster-issuer-secret"),
+    ]
+    rotated = False
+
+    for ns, cert_name, secret_name in ca_certs:
+        rc, out = r.read(f"kubectl get certificate {cert_name} -n {ns} -o json 2>/dev/null", 20)
+        if rc != 0 or not out.strip() or "{" not in out:
+            continue
+        try:
+            cert_data = json.loads(out[out.find("{"):])
+            not_after_str = cert_data.get("status", {}).get("notAfter", "")
+            if not not_after_str:
+                continue
+            not_after_dt = datetime.strptime(not_after_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            remaining_h = int((not_after_dt - datetime.now(timezone.utc)).total_seconds() / 3600)
+            if remaining_h < 8760:  # less than 1 year remaining
+                if may_act(r, "certs"):
+                    r.write(f"kubectl patch certificate {cert_name} -n {ns} --type=merge -p '{{\"spec\":{{\"duration\":\"87600h0m0s\"}}}}' 2>/dev/null",
+                            f"patch CA {ns}/{cert_name} duration to 10 years", tier="transient", timeout=15)
+                    r.write(f"kubectl delete secret {secret_name} -n {ns} --ignore-not-found=true 2>/dev/null",
+                            f"delete CA secret {ns}/{secret_name} to trigger reissuance", tier="transient", timeout=15)
+                    rotated = True
+        except Exception:
+            pass
+
+    return rotated
+
+
+def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
+    """Native cert-manager leaf certificate renewal and workload rollout restarter.
+    
+    Ported from vsp_cert_renewer.py Phase 3.1 and supervisor_stabilizer.py Phase C.
+    Supported across VSP, VCFA, and Supervisor clusters.
+    """
+    out = []
+    cl = r.cluster
+    threshold_days = ctx.get("threshold_days", CERT_WARN_DAYS)
+    data = r.read_json("kubectl get certificates -A -o json 2>/dev/null", 60)
+    if not data:
+        return [warn("certs.renew", "cert-manager Certificates: renewable",
+                     "no Certificate CRDs found or kubectl failed", cluster=cl)]
+
+    items = data.get("items", [])
+    to_renew = []
+    ca_skipped = 0
+
+    for item in items:
+        ns = item.get("metadata", {}).get("namespace", "")
+        name = item.get("metadata", {}).get("name", "")
+        spec = item.get("spec", {})
+        secret_name = spec.get("secretName", "")
+        is_ca = bool(spec.get("isCA"))
+        cur_duration = spec.get("duration") or "<none>"
+        has_owners = bool(item.get("metadata", {}).get("ownerReferences"))
+
+        if is_ca:
+            ca_skipped += 1
+            continue
+
+        conds = {c.get("type"): c.get("status") for c in item.get("status", {}).get("conditions", [])}
+        is_ready = conds.get("Ready") == "True"
+        not_after = item.get("status", {}).get("notAfter", "")
+        days = _days_until(not_after)
+
+        expiring = days is not None and days < threshold_days
+        invalid_secret = False
+
+        if cl == "supervisor" and secret_name and is_ready and not expiring and not force_all:
+            rc_sec, sec_raw = r.read(f"kubectl get secret {secret_name} -n {ns} -o json 2>/dev/null", 15)
+            if rc_sec != 0 or not sec_raw.strip():
+                invalid_secret = True
+            else:
+                try:
+                    sec_json = json.loads(sec_raw)
+                    leaf_crt_b64 = sec_json.get("data", {}).get("tls.crt", "")
+                    if not leaf_crt_b64:
+                        invalid_secret = True
+                except Exception:
+                    pass
+
+        should_renew = (not is_ready) or expiring or force_all or invalid_secret
+        if should_renew:
+            to_renew.append({
+                "ns": ns,
+                "name": name,
+                "secret": secret_name,
+                "cur_duration": cur_duration,
+                "has_owners": has_owners,
+                "is_ready": is_ready,
+                "expiring": expiring,
+                "days": days,
+                "invalid_secret": invalid_secret,
+            })
+
+    if not to_renew:
+        return [ok("certs.renew", f"cert-manager leaf certs: all {len(items) - ca_skipped} valid >{threshold_days}d", cluster=cl)]
+
+    label = f"cert-manager leaf certs: {len(to_renew)} require renewal"
+    if not may_act(r, "certs"):
+        return [warn("certs.renew", label, f"remediation needed for {len(to_renew)} cert(s)", cluster=cl)]
+
+    deleted_secrets = set()
+    renewed_names = []
+
+    for c in to_renew:
+        ns = c["ns"]
+        name = c["name"]
+        sec = c["secret"]
+        if not c["has_owners"] and c["cur_duration"] != "43830h0m0s":
+            patch_cmd = f"kubectl patch certificate {name} -n {ns} --type=merge -p '{{\"spec\":{{\"duration\":\"43830h0m0s\"}}}}' 2>/dev/null"
+            r.write(patch_cmd, f"patch {ns}/{name} duration to 5 years", tier="transient", timeout=20)
+
+        if sec:
+            del_cmd = f"kubectl delete secret {sec} -n {ns} --ignore-not-found=true 2>/dev/null"
+            r.write(del_cmd, f"delete secret {ns}/{sec} to trigger reissuance", tier="transient", timeout=30)
+            deleted_secrets.add((ns, sec))
+            renewed_names.append(f"{ns}/{name}")
+
+    restarted_workloads = []
+    if deleted_secrets:
+        sec_names_by_ns = {}
+        for ns, sec in deleted_secrets:
+            sec_names_by_ns.setdefault(ns, set()).add(sec)
+
+        all_workloads = r.read_json("kubectl get deploy,sts,ds -A -o json 2>/dev/null", 60)
+        if all_workloads:
+            restart_targets = set()
+            for w in all_workloads.get("items", []):
+                w_kind = w.get("kind", "")
+                w_ns = w.get("metadata", {}).get("namespace", "")
+                w_name = w.get("metadata", {}).get("name", "")
+                pod_spec = w.get("spec", {}).get("template", {}).get("spec", {})
+                vols = pod_spec.get("volumes", [])
+
+                mounted_secs = set()
+                for v in vols:
+                    if "secret" in v:
+                        sname = v["secret"].get("secretName")
+                        if sname: mounted_secs.add(sname)
+                    if "projected" in v:
+                        for src in v.get("projected", {}).get("sources", []):
+                            if "secret" in src:
+                                sname = src["secret"].get("name")
+                                if sname: mounted_secs.add(sname)
+
+                target_secs = sec_names_by_ns.get(w_ns, set())
+                all_target_secs = set().union(*sec_names_by_ns.values()) if sec_names_by_ns else set()
+
+                if mounted_secs.intersection(target_secs) or mounted_secs.intersection(all_target_secs):
+                    restart_targets.add((w_ns, w_kind, w_name))
+
+            for w_ns, w_kind, w_name in sorted(restart_targets):
+                roll_cmd = f"kubectl rollout restart {w_kind.lower()}/{w_name} -n {w_ns} 2>/dev/null"
+                r.write(roll_cmd, f"rollout restart {w_ns}/{w_kind}/{w_name} to mount renewed cert secret", tier="transient", timeout=30)
+                restarted_workloads.append(f"{w_ns}/{w_kind.lower()}/{w_name}")
+
+        cainjector_ns = "vmsp-platform" if cl == "vsp" else "vmware-system-cert-manager"
+        r.write(f"kubectl rollout restart deployment/cert-manager-cainjector -n {cainjector_ns} 2>/dev/null || true",
+                f"rollout restart cert-manager-cainjector in {cainjector_ns}", tier="transient", timeout=30)
+
+        if cl == "vsp":
+            r.write("kubectl rollout restart deployment/kyverno-background-controller -n vmsp-policies 2>/dev/null || true",
+                    "rollout restart kyverno-background-controller to re-sync secret clones", tier="transient", timeout=30)
+
+    res = ok("certs.renew", f"renewed {len(renewed_names)} cert-manager leaf certificate(s)", cluster=cl)
+    res.action = f"renewed {len(renewed_names)} cert(s) and restarted {len(restarted_workloads)} mounting workload(s)"
+    if not r.dry_run:
+        res.detail = f"renewed: {', '.join(renewed_names[:3])}" + (f" (+{len(renewed_names)-3} more)" if len(renewed_names) > 3 else "")
+    out.append(res)
+    return out
+
+
+def _sync_containerd_ca(r, ctx):
+    """Sync vcf-cluster-ca-secret ca.crt to containerd trust store on all VSP nodes.
+    
+    Ported from vsp_cert_renewer.py Phase 5.
+    """
+    if r.cluster != "vsp":
+        return []
+
+    out = []
+    cl = r.cluster
+    ca_ns = "vmsp-platform"
+    ca_secret = "vcf-cluster-ca-secret"
+    ca_path = "/etc/containerd/certs.d/registry.vmsp-platform.svc.cluster.local:5000/ca.crt"
+
+    rc, ca_b64 = r.read(f"kubectl get secret {ca_secret} -n {ca_ns} -o jsonpath='{{.data.ca\\.crt}}' 2>/dev/null", 20)
+    if rc != 0 or not ca_b64.strip():
+        return [warn("casync", "containerd CA trust: syncable", f"could not read {ca_secret}", cluster=cl)]
+
+    ca_pem = base64.b64decode(ca_b64.strip()).decode()
+    data = ctx.get("nodes") or r.read_json("kubectl get nodes -o json 2>/dev/null", 45)
+    if not data:
+        return [warn("casync", "containerd CA trust: syncable", "node list unavailable", cluster=cl)]
+
+    node_ips = []
+    for item in data.get("items", []):
+        for addr in item.get("status", {}).get("addresses", []):
+            if addr.get("type") == "InternalIP":
+                node_ips.append(addr["address"])
+
+    updated_nodes = []
+    for ip in node_ips:
+        rc_chk, cur_pem = r.read_on(ip, f"cat {ca_path} 2>/dev/null", 15)
+        if cur_pem.strip() != ca_pem.strip():
+            updated_nodes.append(ip)
+
+    if not updated_nodes:
+        return [ok("casync", f"containerd CA trust: synced across all {len(node_ips)} nodes", cluster=cl)]
+
+    label = f"containerd CA trust: {len(updated_nodes)} node(s) require CA sync"
+    if not may_act(r, "certs"):
+        return [warn("casync", label, f"stale nodes: {', '.join(updated_nodes)}", cluster=cl)]
+
+    for ip in updated_nodes:
+        cmd = f"mkdir -p $(dirname {ca_path}) && echo '{ca_b64.strip()}' | base64 -d > {ca_path} && systemctl restart containerd"
+        r.write_on_node(ip, cmd, f"sync containerd CA trust & restart containerd on {ip}", tier="transient", timeout=30)
+
+    res = ok("casync", label, cluster=cl)
+    res.action = f"synced containerd CA trust and restarted containerd on {len(updated_nodes)} node(s)"
+    out.append(res)
+    return out
+
+
+def _renew_supervisor_spherelet_certs(r, ctx):
+    """Native ESXi spherelet certificate renewal for Supervisor worker nodes.
+    
+    Ported from supervisor_stabilizer.py Phase 3.
+    """
+    if r.cluster != "supervisor":
+        return []
+
+    out = []
+    cl = r.cluster
+    threshold_days = ctx.get("threshold_days", CERT_WARN_DAYS)
+    threshold_sec = threshold_days * 86400
+    vc_password = get_password()
+
+    nodes_raw = r.read("kubectl get nodes -l node-role.kubernetes.io/agent -o json 2>/dev/null", 30)[1]
+    esx_nodes = []
+    if nodes_raw and "{" in nodes_raw:
+        try:
+            ndata = json.loads(nodes_raw[nodes_raw.find("{"):])
+            esx_nodes = [item["metadata"]["name"] for item in ndata.get("items", [])]
+        except Exception:
+            pass
+
+    if not esx_nodes:
+        return [ok("spherelet.certs", "ESXi spherelet certs: no agent nodes found", cluster=cl)]
+
+    expiring_nodes = []
+    for esx_host in esx_nodes:
+        cmd_chk = f"openssl x509 -in /etc/vmware/spherelet/client.crt -checkend {threshold_sec} >/dev/null 2>&1; echo $?"
+        check_out = _ssh_exec_esx(esx_host, vc_password, cmd_chk)
+        still_valid = check_out.strip() == "0"
+        if not still_valid:
+            expiring_nodes.append(esx_host)
+
+    if not expiring_nodes:
+        return [ok("spherelet.certs", f"ESXi spherelet certs: all {len(esx_nodes)} agent nodes valid >{threshold_days}d", cluster=cl)]
+
+    label = f"ESXi spherelet certs: {len(expiring_nodes)} node(s) expiring within {threshold_days}d"
+    if not may_act(r, "certs"):
+        return [warn("spherelet.certs", label, f"expiring nodes: {', '.join(expiring_nodes)}", cluster=cl)]
+
+    ca_crt_content = r.read("cat /etc/kubernetes/pki/ca.crt 2>/dev/null", 15)[1]
+    ca_key_content = r.read("cat /etc/kubernetes/pki/ca.key 2>/dev/null", 15)[1]
+
+    if not ca_crt_content.strip() or not ca_key_content.strip():
+        return [fail("spherelet.certs", label, "could not read Supervisor CA cert/key from SCP", cluster=cl)]
+
+    work_dir = tempfile.mkdtemp(prefix="spherelet_renew_vlt_")
+    try:
+        ca_crt_path = os.path.join(work_dir, "ca.crt")
+        ca_key_path = os.path.join(work_dir, "ca.key")
+        with open(ca_crt_path, "w") as fh: fh.write(ca_crt_content)
+        with open(ca_key_path, "w") as fh: fh.write(ca_key_content)
+        os.chmod(ca_key_path, 0o600)
+
+        renewed_hosts = []
+        for esx_host in expiring_nodes:
+            short = esx_host.split(".")[0]
+            fqdn = esx_host
+            node_name = f"system:node:{fqdn}"
+
+            client_key = os.path.join(work_dir, f"{short}-client.key")
+            server_key = os.path.join(work_dir, f"{short}-server.key")
+
+            if not _scp_get_esx(esx_host, vc_password, "/etc/vmware/spherelet/client.key", client_key):
+                continue
+            if not _scp_get_esx(esx_host, vc_password, "/etc/vmware/spherelet/server.key", server_key):
+                continue
+
+            client_ext = os.path.join(work_dir, f"{short}-client.ext")
+            client_csr = os.path.join(work_dir, f"{short}-client.csr")
+            client_cert = os.path.join(work_dir, f"{short}-client.crt")
+            with open(client_ext, "w") as fh:
+                fh.write("basicConstraints = critical, CA:FALSE\nkeyUsage = critical, digitalSignature, keyEncipherment\nextendedKeyUsage = clientAuth\nsubjectAltName = DNS:" + node_name + "\n")
+            subprocess.run(["openssl", "req", "-new", "-key", client_key, "-subj", f"/C=US/ST=CA/L=Palo Alto/O=system:nodes/CN={node_name}", "-out", client_csr], capture_output=True, check=True)
+            subprocess.run(["openssl", "x509", "-req", "-in", client_csr, "-CA", ca_crt_path, "-CAkey", ca_key_path, "-CAcreateserial", "-extfile", client_ext, "-days", "1825", "-sha256", "-out", client_cert], capture_output=True, check=True)
+
+            server_ext = os.path.join(work_dir, f"{short}-server.ext")
+            server_csr = os.path.join(work_dir, f"{short}-server.csr")
+            server_cert = os.path.join(work_dir, f"{short}-server.crt")
+            with open(server_ext, "w") as fh:
+                fh.write("basicConstraints = critical, CA:FALSE\nkeyUsage = critical, digitalSignature, keyEncipherment\nextendedKeyUsage = serverAuth\nsubjectAltName = DNS:" + fqdn + "\n")
+            subprocess.run(["openssl", "req", "-new", "-key", server_key, "-subj", f"/C=US/ST=CA/L=Palo Alto/O=system:nodes/CN={fqdn}", "-out", server_csr], capture_output=True, check=True)
+            subprocess.run(["openssl", "x509", "-req", "-in", server_csr, "-CA", ca_crt_path, "-CAkey", ca_key_path, "-CAcreateserial", "-extfile", server_ext, "-days", "1825", "-sha256", "-out", server_cert], capture_output=True, check=True)
+
+            if _scp_put_esx(esx_host, vc_password, client_cert, "/etc/vmware/spherelet/client.crt") and \
+               _scp_put_esx(esx_host, vc_password, server_cert, "/etc/vmware/spherelet/spherelet.crt"):
+                _ssh_exec_esx(esx_host, vc_password, "/etc/init.d/spherelet restart >/dev/null 2>&1")
+                renewed_hosts.append(esx_host)
+
+        res = ok("spherelet.certs", label, cluster=cl)
+        res.action = f"renewed spherelet certs on {len(renewed_hosts)} ESXi host(s)"
+        out.append(res)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    return out
+
+
+def _ensure_kcm_signing_duration(r, ctx):
+    """Ensure kube-controller-manager manifest specifies --cluster-signing-duration=43830h0m0s."""
+    manifest = "/etc/kubernetes/manifests/kube-controller-manager.yaml"
+    rc, content = r.read(f"cat {manifest} 2>/dev/null", 20)
+    if rc != 0 or not content.strip():
+        return
+    if "--cluster-signing-duration=" not in content and may_act(r, "kubeadm"):
+        cmd = (
+            f"sed -i '/- kube-controller-manager/a \\    - --cluster-signing-duration=43830h0m0s' {manifest} 2>/dev/null "
+            f"|| sed -i 's|--leader-elect=true|--leader-elect=true\\n    - --cluster-signing-duration=43830h0m0s|' {manifest}"
+        )
+        r.write(cmd, "patch kube-controller-manager --cluster-signing-duration=43830h0m0s", tier="transient", timeout=20)
+
+
+def _renew_kubeadm_certs(r, ctx):
+    """Native kubeadm control-plane certificate renewal.
+    
+    Ported from vsp_cert_renewer.py Phase 1.
+    """
+    out = []
+    cl = r.cluster
+    threshold_days = ctx.get("threshold_days", CERT_WARN_DAYS)
+    rc, text = r.read("kubeadm certs check-expiration 2>&1", 90)
+    if rc != 0 or not text.strip():
+        return [warn("kubeadm.renew", "kubeadm certs: renewable", "kubeadm certs check-expiration unavailable", cluster=cl)]
+
+    expiring_certs = []
+    for line in text.splitlines():
+        m = re.search(r"^(\S+)\s+.*?\s(\d+)([dyhm])\b", line)
+        if not m:
+            continue
+        c_name = m.group(1)
+        n = int(m.group(2))
+        unit = m.group(3)
+        days = n * 365 if unit == "y" else n
+        if "ca" not in c_name.lower() and days < threshold_days:
+            expiring_certs.append((c_name, days))
+
+    if not expiring_certs:
+        return [ok("kubeadm.renew", f"kubeadm control-plane certs: valid >{threshold_days}d", cluster=cl)]
+
+    label = f"kubeadm control-plane: {len(expiring_certs)} cert(s) expiring within {threshold_days}d"
+    if not may_act(r, "kubeadm"):
+        return [warn("kubeadm.renew", label, f"soonest {expiring_certs[0][0]} at {expiring_certs[0][1]}d", cluster=cl)]
+
+    yaml_content = "apiVersion: kubeadm.k8s.io/v1beta4\nkind: ClusterConfiguration\ncertificateValidityPeriod: 43830h0m0s\n"
+    yaml_b64 = base64.b64encode(yaml_content.encode()).decode()
+    r.write(f"echo '{yaml_b64}' | base64 -d > /tmp/kubeadm-renew.yaml", "write 5-year kubeadm renewal config", tier="transient", timeout=15)
+
+    r.write("kubeadm certs renew all --config /tmp/kubeadm-renew.yaml 2>&1 || kubeadm certs renew all 2>&1",
+            "renew all kubeadm control plane certificates", tier="transient", timeout=120)
+
+    r.write("rm -f /tmp/kubeadm-renew.yaml", "clean up /tmp/kubeadm-renew.yaml", tier="transient", timeout=10)
+
+    r.write("kubectl delete pod -n kube-system -l tier=control-plane --grace-period=0 2>/dev/null || true",
+            "restart control plane static pods to load renewed certs", tier="transient", timeout=30)
+
+    res = ok("kubeadm.renew", label, cluster=cl)
+    res.action = f"renewed {len(expiring_certs)} kubeadm cert(s) and restarted control plane static pods"
+    out.append(res)
+    return out
+
+
+def _renew_kubelet_certs(r, ctx):
+    """Native kubelet serving certificate renewal and CSR auto-approval.
+    
+    Ported from vsp_cert_renewer.py Phase 2.
+    """
+    out = []
+    cl = r.cluster
+    threshold_days = ctx.get("threshold_days", CERT_WARN_DAYS)
+    threshold_sec = threshold_days * 86400
+
+    if cl == "vsp":
+        _ensure_kcm_signing_duration(r, ctx)
+
+    data = ctx.get("nodes") or r.read_json("kubectl get nodes -o json 2>/dev/null", 45)
+    if not data:
+        return [warn("kubelet.renew", "kubelet certs: checkable", "node list unavailable", cluster=cl)]
+
+    nodes = []
+    for item in data.get("items", []):
+        name = item.get("metadata", {}).get("name", "")
+        ip = next((a["address"] for a in item.get("status", {}).get("addresses", []) if a.get("type") == "InternalIP"), None)
+        if name and ip:
+            nodes.append({"name": name, "ip": ip})
+
+    expiring_nodes = []
+    for node in nodes:
+        ip = node["ip"]
+        cert_path = "/var/lib/kubelet/pki/kubelet.crt"
+        rc_p, probe = r.read_on(ip, f"if [ -f {cert_path} ]; then "
+                                    f"openssl x509 -in {cert_path} -noout -checkend {threshold_sec} >/dev/null 2>&1; "
+                                    f"echo $?; else echo MISSING; fi", 20)
+        if "0" not in probe.strip().splitlines() and "MISSING" not in probe:
+            expiring_nodes.append(node)
+
+    if not expiring_nodes:
+        return [ok("kubelet.renew", f"kubelet serving certs: all {len(nodes)} nodes valid >{threshold_days}d", cluster=cl)]
+
+    label = f"kubelet serving certs: {len(expiring_nodes)} node(s) expiring within {threshold_days}d"
+    if not may_act(r, "kubeadm"):
+        return [warn("kubelet.renew", label, f"expiring nodes: {', '.join(n['name'] for n in expiring_nodes)}", cluster=cl)]
+
+    for node in expiring_nodes:
+        ip = node["ip"]
+        name = node["name"]
+        r.write_on_node(ip, "rm -f /var/lib/kubelet/pki/kubelet.crt /var/lib/kubelet/pki/kubelet.key && systemctl restart kubelet",
+                       f"delete stale kubelet cert & restart kubelet on {name} ({ip})", tier="transient", timeout=30)
+
+    rc_csr, csrs_raw = r.read("kubectl get csr -o json 2>/dev/null", 30)
+    if rc_csr == 0 and csrs_raw.strip():
+        try:
+            csrs_json = json.loads(csrs_raw)
+            pending_csrs = []
+            for item in csrs_json.get("items", []):
+                cname = item.get("metadata", {}).get("name", "")
+                conds = item.get("status", {}).get("conditions", [])
+                if not conds and cname:
+                    pending_csrs.append(cname)
+            for cname in pending_csrs:
+                r.write(f"kubectl certificate approve {cname} 2>/dev/null", f"approve kubelet CSR {cname}", tier="transient", timeout=15)
+        except Exception:
+            pass
+
+    res = ok("kubelet.renew", label, cluster=cl)
+    res.action = f"renewed kubelet serving certs on {len(expiring_nodes)} node(s)"
+    out.append(res)
+    return out
+
+
 def chk_certs(r, ctx):
     out = []
     cl = r.cluster
@@ -2591,8 +3154,19 @@ def chk_certs(r, ctx):
                     else:
                         out.append(ok("certs.service_tls", f"prelude deployments: service-tls fresh across all {len(prelude_deps)} apps", cluster=cl))
 
-    if needs_renewal and may_act(r, "certs") and not ctx.get("certs_renewed"):
-        out.extend(_delegate_cert_renewal(r, ctx))
+    if may_act(r, "certs") and not ctx.get("certs_renewed"):
+        ca_rotated = False
+        if cl == "vsp":
+            ca_rotated = _renew_certmanager_ca(r, ctx)
+
+        leaf_res = _renew_certmanager_leaf_certs(r, ctx, force_all=ca_rotated)
+        out.extend(leaf_res)
+
+        if cl == "vsp":
+            out.extend(_sync_containerd_ca(r, ctx))
+        elif cl == "supervisor":
+            out.extend(_renew_supervisor_spherelet_certs(r, ctx))
+
         ctx["certs_renewed"] = True
 
     return out
@@ -2758,55 +3332,11 @@ def chk_kubeadm(r, ctx):
         (f"{name} EXPIRED" if days < 0 else f"soonest is {name} at {days}d"),
         cluster=cl, residual_days=days)
     out = [res]
-    if may_act(r, "kubeadm") and not ctx.get("certs_renewed"):
-        out.extend(_delegate_cert_renewal(r, ctx))
-        ctx["certs_renewed"] = True
+    if may_act(r, "kubeadm") and not ctx.get("kubeadm_renewed"):
+        out.extend(_renew_kubeadm_certs(r, ctx))
+        out.extend(_renew_kubelet_certs(r, ctx))
+        ctx["kubeadm_renewed"] = True
     return out
-
-
-def _delegate_cert_renewal(r, ctx):
-    """Hand certificate renewal to vsp_cert_renewer.py rather than reimplementing it.
-
-    That script is the best-engineered file in the legacy set and its guards were
-    won the hard way: CA rotation gated on remaining life (not desired duration,
-    which made Phase 3.0 fire every boot and generate a NEW CA key pair each
-    time, invalidating every leaf cert), the unconditional isCA skip, and the
-    cert-manager Issuer-cache settle. Reimplementing any of that would be
-    strictly worse. Runs on the MANAGER, so it goes through Runner.local().
-    """
-    cl = r.cluster
-    script = "/home/holuser/hol/Tools/vsp_cert_renewer.py"
-    if not os.path.isfile(script):
-        return [warn("certs.renew", "certificate renewal: delegated",
-                     f"{script} not found", cluster=cl)]
-    if cl not in ("vsp", "vcfa"):
-        return [warn("certs.renew", "certificate renewal: delegated",
-                     f"no cert-renewer cluster mapping for '{cl}'", cluster=cl)]
-
-    argv = ["python3", "-u", script, "--cluster", cl,
-            "--threshold-days", str(ctx["threshold_days"]), "--no-timestamps"]
-    if ctx.get("site"):
-        argv.extend(["--site", ctx["site"]])
-    if r.dry_run:
-        argv.append("--dry-run")
-    rc, out = r.local(argv, f"run vsp_cert_renewer.py --cluster {cl} "
-                            f"--threshold-days {ctx['threshold_days']}",
-                      timeout=900)
-    # Its tag vocabulary is a contract (vsp-health-monitor.py:2260 parses these);
-    # a bare "renew" substring match false-positived every cycle there.
-    errors = [ln for ln in (out or "").splitlines() if "ERROR  :" in ln]
-    renewed = [ln for ln in (out or "").splitlines() if "RENEWED:" in ln]
-    if errors:
-        return [fail("certs.renew", "certificate renewal: completed cleanly",
-                     f"{len(errors)} error line(s) from vsp_cert_renewer.py",
-                     cluster=cl)]
-    # If it actually renewed something, it's a pass. If it didn't, it's a warning
-    # that we called it but it decided not to act (which is what happened here).
-    res = (ok if renewed else warn)("certs.renew", "certificate renewal: completed cleanly",
-               f"{len(renewed)} cert(s) renewed" if renewed else "no renewal needed",
-               cluster=cl)
-    res.action = "delegated to vsp_cert_renewer.py"
-    return [res]
 
 
 MANIFEST_DIR = "/etc/kubernetes/manifests"
