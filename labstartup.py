@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # labstartup.py - HOLFY27 Main Lab Startup Orchestrator
-# Version 3.1 - 2026-05-19
+# Version 3.2 - 2026-08-26
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # LabType-aware orchestrator with enhanced features
@@ -10,6 +10,7 @@ import os
 import sys
 import logging
 import argparse
+import subprocess
 
 # Setup logging
 logging.basicConfig(
@@ -209,6 +210,19 @@ def main():
     # AutoCheck support
     if lsf.start_autocheck():
         lsf.write_output('Autocheck complete.')
+
+    # Run generate_labdetails.py in background if script exists (fire-and-forget, no logging)
+    gen_script = '/home/holuser/hol/Tools/generate_labdetails.py'
+    if os.path.isfile(gen_script):
+        try:
+            subprocess.Popen(
+                ['python3', gen_script, '--html', '--output', '/lmchol/home/holuser/diagrams/LABDETAILS.md'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
