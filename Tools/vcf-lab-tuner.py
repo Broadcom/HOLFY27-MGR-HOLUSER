@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 1.9.0 - 2026-08-25
+Version 1.9.1 - 2026-08-25
 Author: HOL Core Team
+
+v1.9.1: VCFA endpoint convergence loop & cluster-specific drift keeper:
+  - VCFA Endpoint Convergence & Backoff Unblocker: In remediate mode, chk_endpoint polls up to 180s for /automation and /login/ stabilization. Once tenant-manager-0 reaches Running status, it actively resets crashed prelude auth pods (api-gateway-server, ccs-vksm-eas, resource-manager-server) to clear Kubernetes exponential backoff delays immediately.
+  - Dedicated VCFA Drift Keeper: Added KEEPER_BODY_VCFA asserting envoy-gateway 4Gi memory limit, runaway support-bundle job cleanup, stale system-shutdown Argo workflow purging, 0-replica prelude scale-up, CrashLoopBackOff pod recovery, and SDS platform-trust ConfigMap synchronization.
+  - Correct Keeper Payload Routing: do_keeper now routes KEEPER_BODY_VCFA to vcf-lab-keeper-vcfa and KEEPER_BODY_VSP to vcf-lab-keeper.
 
 v1.9.0: VCFA automated startup recovery, 0-replica prelude scale-up, and SDS SAN NACK auto-remediation:
   - 0-Replica Prelude Workload Recovery: Auto-scales all 0-replica Deployments and StatefulSets in prelude back to 1 during remediation, resolving the post-shutdown / cold-boot outage caused by resumed Fleet LCM Argo workflows.
@@ -468,7 +473,7 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 DATE    = "2026-08-25"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
@@ -822,7 +827,7 @@ SECTION_ACT_MODES = {
     "services":    ("tune", "remediate"),   # starting a stopped service is config-ish
     "contentlib":  ("tune", "remediate"),   # trust store and sync
     "webhooks":    ("tune", "remediate"),   # caBundle is durable config
-    "endpoint":    (),                      # detect-only by design
+    "endpoint":    ("remediate",),          # active convergence wait & backoff reset during remediation
     "sizing":      ("remediate",),          # an operator decision, never auto-applied by tune
     "footprint":   ("remediate",),          # opt-in density reduction, not "fixing" anything
     "storm":       ("remediate",),          # mitigation of a live symptom, not durable config
@@ -3046,12 +3051,45 @@ def chk_endpoint(r, ctx):
     if primary_path != "/login/":
         paths_to_check.append("/login/")
 
+    def _probe_paths():
+        res_map = {}
+        for p in paths_to_check:
+            rc, code_raw = r.read(
+                f"curl -k -s -o /dev/null -w '%{{http_code}}' --connect-timeout 8 "
+                f"--resolve {fqdn}:443:{vip} https://{fqdn}{p} 2>/dev/null", 45)
+            code = (code_raw or "").strip().splitlines()
+            code = code[-1].strip() if code else ""
+            res_map[p] = code
+        return res_map
+
+    codes = _probe_paths()
+    all_ok = all(codes.get(p) in ("200", "302") for p in paths_to_check)
+
+    # In remediate mode on VCFA, if the endpoint is not yet healthy (e.g. post-shutdown / cold boot),
+    # poll up to 180s for auth cell initialization, actively resetting crashed prelude auth pods
+    # (api-gateway-server, ccs-vksm-eas, resource-manager-server) as soon as tenant-manager-0 reaches Running.
+    if not all_ok and may_act(r, "endpoint") and cl == "vcfa":
+        emit(f"  {_CYAN}Endpoint initializing ({', '.join(f'{p}: HTTP {codes.get(p)}' for p in paths_to_check)}); "
+             f"waiting up to 180s for auth cell initialization & convergence...{_NC}")
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            time.sleep(5)
+            rc_tm, tm_phase = r.read("kubectl get pod tenant-manager-0 -n prelude -o jsonpath='{.status.phase}' 2>/dev/null", 20)
+            if (tm_phase or "").strip() == "Running":
+                r.write("for badpod in $(kubectl get pods -n prelude --field-selector=status.phase!=Running -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do "
+                        "case \"$badpod\" in "
+                        "api-gateway-server*|ccs-vksm-eas*|resource-manager-server*) "
+                        "kubectl delete pod \"$badpod\" -n prelude --grace-period=0 2>/dev/null ;; "
+                        "esac; done",
+                        "reset crashlooping prelude auth pods to clear backoff delay",
+                        tier="transient", timeout=30)
+            codes = _probe_paths()
+            if all(codes.get(p) in ("200", "302") for p in paths_to_check):
+                all_ok = True
+                break
+
     for p in paths_to_check:
-        rc, code_raw = r.read(
-            f"curl -k -s -o /dev/null -w '%{{http_code}}' --connect-timeout 8 "
-            f"--resolve {fqdn}:443:{vip} https://{fqdn}{p} 2>/dev/null", 45)
-        code = (code_raw or "").strip().splitlines()
-        code = code[-1].strip() if code else ""
+        code = codes.get(p, "")
         label = f"https://{fqdn}{p}: HTTP 200"
         if code in ("200", "302"):
             out.append(ok("endpoint", label, f"HTTP {code}", cluster=cl))
@@ -6068,7 +6106,7 @@ UNPORTED_OWNER = {}
 # than the 60s cadence the Flux-revert tier needs (vsp-health-monitor.py:298
 # measures 212s), so the on-node artifact is a small dependency-free shell script.
 
-KEEPER_BODY = r"""#!/bin/bash
+KEEPER_BODY_VSP = r"""#!/bin/bash
 # vcf-lab-keeper - emitted by vcf-lab-tuner.py. Do not edit by hand.
 # Re-asserts the live objects Flux/vmsp-operator revert on their ~10 minute
 # reconcile. Values are generated from the same constants vcf-lab-tuner.py's
@@ -6161,6 +6199,75 @@ $KB exec -n vmsp-platform logging-operator-fluentd-0 -c fluentd -- sh -c 'rm -rf
 
 exit 0
 """
+
+KEEPER_BODY_VCFA = r"""#!/bin/bash
+# vcf-lab-keeper-vcfa - emitted by vcf-lab-tuner.py. Do not edit by hand.
+# Re-asserts VCFA drift targets: envoy-gateway memory, support-bundle runaway cleanup,
+# 0-replica prelude scale-up, CrashLoopBackOff pod recovery, and SDS SAN NACK platform-trust ConfigMap sync.
+set -u
+KB="kubectl"
+log() { logger -t vcf-lab-keeper-vcfa "$1"; }
+
+# 1. Envoy-gateway memory limit
+EGMEM=$($KB -n vmsp-platform get deploy envoy-gateway -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}' 2>/dev/null || echo "")
+if [ -n "$EGMEM" ] && [ "$EGMEM" != "__EG_LIMIT__" ]; then
+    $KB -n vmsp-platform set resources deploy/envoy-gateway --limits=memory=__EG_LIMIT__ --requests=memory=__EG_REQUEST__ >/dev/null 2>&1 \
+        && log "drift corrected: envoy-gateway memory -> __EG_LIMIT__ (was ${EGMEM})"
+fi
+
+# 2. Cleanup runaway support-bundle jobs
+SB_COUNT=$($KB -n vmsp-platform get jobs -l app.kubernetes.io/name=support-bundle-cluster-info-dump --no-headers 2>/dev/null | wc -l)
+if [ "$SB_COUNT" -gt 3 ]; then
+    $KB -n vmsp-platform delete jobs -l app.kubernetes.io/name=support-bundle-cluster-info-dump --cascade=foreground >/dev/null 2>&1 \
+        && log "drift corrected: deleted $SB_COUNT runaway support-bundle jobs"
+fi
+
+# 3. Cleanup stale system-shutdown Argo workflows
+ARGO_COUNT=$($KB -n vmsp-platform get workflow --no-headers 2>/dev/null | grep -c system-shutdown || echo 0)
+if [ "$ARGO_COUNT" -gt 0 ]; then
+    $KB -n vmsp-platform delete workflow -l workflows.argoproj.io/workflow-template=system-shutdown --grace-period=0 >/dev/null 2>&1 \
+        && log "drift corrected: deleted $ARGO_COUNT stale system-shutdown workflow(s)"
+fi
+
+# 4. Ensure no 0-replica Deployments/StatefulSets in prelude
+for kind in deploy sts; do
+    for r in $($KB get $kind -n prelude -o jsonpath='{range .items[?(@.spec.replicas==0)]}{.metadata.name}{" "}{end}' 2>/dev/null); do
+        if [ -n "$r" ]; then
+            $KB scale $kind/$r -n prelude --replicas=1 >/dev/null 2>&1 \
+                && log "drift corrected: scaled 0-replica prelude $kind/$r to 1"
+        fi
+    done
+done
+
+# 5. Reset CrashLoopBackOff pods in prelude when tenant-manager is Running
+TM_PHASE=$($KB get pod tenant-manager-0 -n prelude -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+if [ "$TM_PHASE" = "Running" ]; then
+    for badpod in $($KB get pods -n prelude --field-selector=status.phase!=Running -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null); do
+        case "$badpod" in
+            api-gateway-server*|ccs-vksm-eas*|resource-manager-server*)
+                $KB delete pod "$badpod" -n prelude --grace-period=0 >/dev/null 2>&1 \
+                    && log "drift corrected: reset crashed $badpod to clear backoff"
+                ;;
+        esac
+    done
+fi
+
+# 6. Ensure platform-trust ConfigMap exists in every BackendTLSPolicy namespace
+for ns in $($KB get backendtlspolicy -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | sort -u | grep -v '^vmsp-platform$'); do
+    if [ -n "$ns" ]; then
+        $KB get configmap platform-trust -n "$ns" >/dev/null 2>&1 || \
+            ($KB get configmap platform-trust -n vmsp-platform -o yaml 2>/dev/null | \
+             sed "s/namespace: vmsp-platform/namespace: $ns/" | \
+             sed '/uid:/d; /resourceVersion:/d; /creationTimestamp:/d; /ownerReferences:/,/^[^ ]/d' | \
+             $KB apply -f - >/dev/null 2>&1 \
+             && log "drift corrected: copied platform-trust ConfigMap to $ns")
+    fi
+done
+
+exit 0
+"""
+
+KEEPER_BODY = KEEPER_BODY_VSP
 
 KEEPER_SERVICE = """[Unit]
 Description=VCF lab drift keeper (emitted by vcf-lab-tuner.py)
@@ -6266,7 +6373,8 @@ def do_keeper(r, cfg, cluster, remove=False, purge_legacy=False):
             emit()
             return out
 
-    body = (KEEPER_BODY
+    raw_body = KEEPER_BODY_VCFA if cluster == "vcfa" else KEEPER_BODY_VSP
+    body = (raw_body
             .replace("__EG_LIMIT__", EG_MEM_LIMIT)
             .replace("__EG_REQUEST__", EG_MEM_REQUEST)
             .replace("__LEASE__", LEASE_TRIPLE[0])

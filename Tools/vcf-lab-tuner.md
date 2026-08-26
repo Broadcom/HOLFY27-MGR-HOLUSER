@@ -1,8 +1,8 @@
 # vcf-lab-tuner.py — Design & Reference
 
-**Version 3.0 — 2026-08-25**
+**Version 3.1 — 2026-08-25**
 **Author:** Burke Azbill and HOL Core Team
-**Status:** `vcf-lab-tuner.py` **v1.9.0**. VCFA automated startup recovery, 0-replica prelude scale-up, and SDS SAN NACK auto-remediation. All three clusters ported (VSP, VCFA,
+**Status:** `vcf-lab-tuner.py` **v1.9.1**. VCFA endpoint convergence loop & dedicated VCFA drift keeper. All three clusters ported (VSP, VCFA,
 Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh`, `vcfa-stabilizer.sh`, and `supervisor_stabilizer.py`, enabling
 legacy `vsp-stabilizer.sh`, `vcfa-stabilizer.sh`, and `supervisor_stabilizer.py` to be safely retired. **Coverage audited against all legacy tools**,
 including 14/14 `vsp-health.py` sections, 11/11 `auto-health.py` sections, and full
