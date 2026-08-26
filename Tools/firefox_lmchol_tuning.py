@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Author: Burke Azbill and HOL Core Team
-Version: 1.8 2026-07-02
+Version: 1.9 2026-08-26
 
-Configure Firefox on the Main Linux Console (LMC) via enterprise policies.
+Configure Firefox on the Main Linux Console (LMC) via enterprise policies and profile tuning.
 
 Lab automation (prelim, manager scripts) runs this module on the *manager*
-VM.  Firefox profile discovery/cleanup still uses ``/lmchol`` (NFS client
+VM.  Firefox profile discovery/cleanup and SQLite tuning use ``/lmchol`` (NFS client
 mounting the console root export) since those paths are ``holuser``-owned
 and writable over NFS.  The two system-level files below are root-owned on
 the console, so they are written over SSH as root instead:
@@ -21,6 +21,13 @@ the console, so they are written over SSH as root instead:
       launch (before any profile prefs are loaded, which is when the snap
       crashreporter process is spawned).  A console re-login or reboot is
       required for this to take effect on an already-running session.
+
+  content-prefs.sqlite (per profile)
+      Configures the global default page zoom level (default 80% / 0.8) so
+      that newly started browser sessions and tabs open at 80% zoom.
+      Purges any stale site-specific zoom overrides so all sites inherit
+      the 80% default zoom while still allowing users to adjust zoom levels
+      as desired during their active lab session.
 
 Any legacy ``user.js`` HOL block written by earlier versions of this module is
 purged from each profile so it cannot shadow or conflict with the policies.
@@ -51,20 +58,46 @@ v1.8  Stopped hardcoding the proxy host/port.  The Firefox Proxy policy now
       also fixes the proxy_host/proxy_port parameters being effectively
       unusable from prelim.py (which never passed them, so the hardcoded
       defaults always won regardless of lsfunctions.py's actual config).
+v1.9  Configured default page zoom level (80% / 0.8) in content-prefs.sqlite
+      across all Firefox profiles, ensuring new tabs and sessions start at 80%
+      zoom while allowing user adjustments during active lab usage.  Updated
+      user.js purge regex to match both '//' and '#' marker comments. Added
+      styled help screen conforming to script-help-style standard.
 """
 
 from __future__ import annotations
 
+import argparse
 import glob
 import os
 import re
 import shutil
+import sqlite3
+import sys
+import time
 from typing import Any, Callable, Dict, List, Optional
 
-# Sentinel strings used to locate the legacy HOL block in user.js files so it
-# can be stripped during migration.  Not written by this version.
-_LEGACY_BEGIN = "// --- BEGIN HOL LMC Firefox tuning ---"
-_LEGACY_END   = "// --- END HOL LMC Firefox tuning ---"
+VERSION = "1.9"
+DATE = "2026-08-26"
+
+# ANSI color codes for styled terminal output
+if sys.stdout.isatty():
+    _CYAN, _BLUE, _GREEN, _BOLD, _YELLOW, _RED, _NC = (
+        "\033[0;36m",
+        "\033[38;2;0;176;255m",
+        "\033[0;32m",
+        "\033[1m",
+        "\033[1;33m",
+        "\033[0;31m",
+        "\033[0m",
+    )
+else:
+    _CYAN = _BLUE = _GREEN = _BOLD = _YELLOW = _RED = _NC = ""
+
+# Sentinel patterns used to locate the legacy HOL block in user.js files so it
+# can be stripped during migration. Matches both '//' and '#' marker prefixes.
+_LEGACY_BEGIN_RE = re.compile(r"^\s*(//|#)\s*---\s*BEGIN HOL LMC Firefox tuning\s*---")
+_LEGACY_END_RE   = re.compile(r"^\s*(//|#)\s*---\s*END HOL LMC Firefox tuning\s*---")
 
 # Patterns matching individual prefs that were managed outside the HOL block in
 # older profiles.  Stripped alongside the block during user.js purge.
@@ -220,7 +253,7 @@ def _build_policies(
                 "browser.tabs.crashReporting.sendReport": False,
                 "browser.crashReports.unsubmittedCheck.enabled": False,
                 "browser.crashReports.unsubmittedCheck.autoSubmit2": False,
-                # Prevent site specific zoom differences
+                # Prevent site specific zoom differences across tabs
                 "browser.zoom.siteSpecific": False,
                 # Autofill — preserve form and credential autofill behaviour.
                 "browser.formfill.enable": True,
@@ -280,6 +313,115 @@ def _clear_crashes_and_idb(
                     log(f"firefox_lmchol_tuning: cleared remote-settings idb files in {os.path.basename(prof)}")
 
 
+def _set_default_zoom(
+    profile_dir: str,
+    zoom_level: float = 0.8,
+    log: Callable[[str], Any] = print,
+    dry_run: bool = False,
+) -> bool:
+    """Set the global default zoom level in content-prefs.sqlite.
+
+    Firefox stores the global default page zoom level as a row in
+    ``content-prefs.sqlite`` where settingID corresponds to
+    ``browser.content.full-zoom`` and groupID is NULL (indicating global scope).
+    Site-specific zoom values have non-NULL groupIDs referencing the ``groups``
+    table.
+
+    This function:
+    1. Ensures the schema exists (tables: groups, settings, prefs, and indexes).
+    2. Ensures ``browser.content.full-zoom`` exists in the ``settings`` table.
+    3. Sets or updates the global pref (``groupID IS NULL``) to ``zoom_level`` (default 0.8 = 80%).
+    4. Deletes any stale site-specific zoom overrides (``groupID IS NOT NULL``) so
+       all sites start cleanly at the desired 80% default zoom while still
+       allowing user zoom adjustments during their active lab session.
+    """
+    db_path = os.path.join(profile_dir, "content-prefs.sqlite")
+    prof_name = os.path.basename(profile_dir)
+    zoom_pct = int(round(zoom_level * 100))
+
+    if dry_run:
+        log(
+            f"firefox_lmchol_tuning: dry-run — would set default zoom to {zoom_pct}% "
+            f"in {prof_name}/content-prefs.sqlite"
+        )
+        return True
+
+    try:
+        conn = sqlite3.connect(db_path, timeout=10.0)
+        cur = conn.cursor()
+
+        # Ensure base tables exist
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS groups ("
+            "id INTEGER PRIMARY KEY, "
+            "name TEXT NOT NULL"
+            ")"
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS settings ("
+            "id INTEGER PRIMARY KEY, "
+            "name TEXT NOT NULL"
+            ")"
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS prefs ("
+            "id INTEGER PRIMARY KEY, "
+            "groupID INTEGER REFERENCES groups(id), "
+            "settingID INTEGER NOT NULL REFERENCES settings(id), "
+            "value BLOB, "
+            "timestamp INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS groups_idx ON groups(name)")
+        cur.execute("CREATE INDEX IF NOT EXISTS settings_idx ON settings(name)")
+        cur.execute("CREATE INDEX IF NOT EXISTS prefs_idx ON prefs(timestamp, groupID, settingID)")
+
+        # Ensure setting entry for browser.content.full-zoom
+        cur.execute("SELECT id FROM settings WHERE name = 'browser.content.full-zoom'")
+        row = cur.fetchone()
+        if row:
+            setting_id = row[0]
+        else:
+            cur.execute("INSERT INTO settings (name) VALUES ('browser.content.full-zoom')")
+            setting_id = cur.lastrowid
+
+        now = int(time.time())
+
+        # Set or update global default zoom (groupID IS NULL)
+        cur.execute(
+            "SELECT id FROM prefs WHERE groupID IS NULL AND settingID = ?",
+            (setting_id,),
+        )
+        global_row = cur.fetchone()
+        if global_row:
+            cur.execute(
+                "UPDATE prefs SET value = ?, timestamp = ? WHERE id = ?",
+                (zoom_level, now, global_row[0]),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO prefs (groupID, settingID, value, timestamp) VALUES (NULL, ?, ?, ?)",
+                (setting_id, zoom_level, now),
+            )
+
+        # Clear stale site-specific zoom overrides so all sites inherit the 80% default
+        cur.execute(
+            "DELETE FROM prefs WHERE settingID = ? AND groupID IS NOT NULL",
+            (setting_id,),
+        )
+
+        conn.commit()
+        conn.close()
+        log(
+            f"firefox_lmchol_tuning: set default zoom to {zoom_pct}% "
+            f"in {prof_name}/content-prefs.sqlite"
+        )
+        return True
+    except Exception as e:
+        log(f"WARNING: firefox_lmchol_tuning: could not set zoom in {db_path}: {e}")
+        return False
+
+
 def _purge_user_js_block(
     path: str, log: Callable[[str], Any], dry_run: bool
 ) -> None:
@@ -305,12 +447,12 @@ def _purge_user_js_block(
     skip    = False
     changed = False
     for line in raw_lines:
-        if _LEGACY_BEGIN in line:
+        if _LEGACY_BEGIN_RE.search(line):
             skip    = True
             changed = True
             continue
         if skip:
-            if _LEGACY_END in line:
+            if _LEGACY_END_RE.search(line):
                 skip = False
             continue
         if any(r.search(line) for r in _STRIP_LINE_RES):
@@ -351,21 +493,22 @@ def apply_firefox_lmchol_tuning(
     proxy_host: Optional[str] = None,
     proxy_port: Optional[int] = None,
     console_host: str = "root@console.site-a.vcf.lab",
+    zoom_level: float = 0.8,
 ) -> bool:
-    """Apply Firefox LMC tuning via enterprise policies and environment variable.
+    """Apply Firefox LMC tuning via enterprise policies, environment variable, and profile DB.
 
     Writes ``/etc/firefox/policies/policies.json`` with the full policy set
     covering proxy, Nimbus/experiments, telemetry, form-data preservation,
     and perf/startup settings.  Appends ``MOZ_CRASHREPORTER_DISABLE=1`` to
-    ``/etc/environment``.  Strips the legacy user.js HOL block from each
-    profile.
+    ``/etc/environment``.  Sets the default zoom level to 80% (0.8) in
+    ``content-prefs.sqlite`` and strips legacy user.js HOL blocks from each profile.
 
     Both system files are root-owned on the console, so they are written
     over SSH as root (``lsf.set_console_firefox_policies`` /
     ``lsf.set_console_crashreporter_env``) rather than through the ``/lmchol``
     NFS mount, which is only writable as the unprivileged holuser.  Profile
-    discovery and the user.js purge still use ``/lmchol`` since those paths
-    are holuser-owned.
+    discovery, zoom configuration, and the user.js purge use ``/lmchol`` since
+    those paths are holuser-owned.
 
     When ``clear=False`` (default / HOL lab types): the Proxy policy uses
     Mode=manual pointing at proxy_host:proxy_port, sourced from lsfunctions.py's
@@ -384,6 +527,7 @@ def apply_firefox_lmchol_tuning(
     :param proxy_port:   Proxy port override (default lsf.LAB_PROXY_PORT).
     :param console_host: SSH target for the root-owned file writes, e.g.
                          'root@console.site-a.vcf.lab'.
+    :param zoom_level:   Default page zoom level (default 0.8 for 80%).
     :return: True if all operations succeeded or no profiles found; False on
              any write error.
     """
@@ -394,6 +538,7 @@ def apply_firefox_lmchol_tuning(
     no_proxy   = _build_firefox_no_proxy(lsf)
     password   = lsf.get_password()
     mode_desc  = "clear (no proxy)" if clear else f"set (manual proxy {host}:{port})"
+    zoom_pct   = int(round(zoom_level * 100))
 
     profiles = _firefox_profile_dirs(mc)
     if not profiles:
@@ -405,13 +550,14 @@ def apply_firefox_lmchol_tuning(
     if dry_run:
         log(
             f"firefox_lmchol_tuning: dry-run — would tune {len(profiles)} profile(s) "
-            f"({mode_desc})"
+            f"({mode_desc}, zoom={zoom_pct}%)"
         )
         _clear_crashes_and_idb(mc, profiles, log, dry_run=True)
         lsf.set_console_firefox_policies(console_host, password, policies, dry_run=True)
         lsf.set_console_crashreporter_env(console_host, password, dry_run=True)
         for prof in profiles:
             _purge_user_js_block(_user_js_path(prof), log, dry_run=True)
+            _set_default_zoom(prof, zoom_level=zoom_level, log=log, dry_run=True)
         return True
 
     ok_all = True
@@ -426,14 +572,59 @@ def apply_firefox_lmchol_tuning(
         except OSError as e:
             log(f"WARNING: firefox_lmchol_tuning: could not purge {_user_js_path(prof)}: {e}")
             ok_all = False
+        try:
+            if not _set_default_zoom(prof, zoom_level=zoom_level, log=log, dry_run=False):
+                ok_all = False
+        except Exception as e:
+            log(f"WARNING: firefox_lmchol_tuning: could not set zoom in {prof}: {e}")
+            ok_all = False
     return ok_all
 
 
+def show_help() -> None:
+    """Display styled help screen conforming to script-help-style standard."""
+    W = 70
+    title = "Firefox LMC Console Tuning"
+    print(f"\n{_CYAN}╔{'═' * W}╗{_NC}")
+    print(f"{_CYAN}║{_NC}{_BLUE}{title:^{W}}{_NC}{_CYAN}║{_NC}")
+    print(f"{_CYAN}║{_NC}{f'Version {VERSION}  —  {DATE}':^{W}}{_CYAN}║{_NC}")
+    print(f"{_CYAN}╚{'═' * W}╝{_NC}\n")
+    print(f"{_BOLD}USAGE:{_NC}\n    firefox_lmchol_tuning.py [OPTIONS]\n")
+    print(f"{_BOLD}OPTIONS:{_NC}")
+    print(f"    {_GREEN}--mc-base{_NC} <path>          Path to console root mount (default: /lmchol)")
+    print(f"    {_GREEN}--zoom{_NC} <level>            Initial default zoom level (default: 0.8 / 80%)")
+    print(f"    {_GREEN}--proxy-host{_NC} <host>       Proxy host override (default from lsf.LAB_PROXY_IP)")
+    print(f"    {_GREEN}--proxy-port{_NC} <port>       Proxy port override (default from lsf.LAB_PROXY_PORT)")
+    print(f"    {_GREEN}--clear{_NC}                    Write no-proxy policy variant (non-HOL lab types)")
+    print(f"    {_GREEN}--console-host{_NC} <host>     SSH target for root writes (default: root@console.site-a.vcf.lab)")
+    print(f"    {_GREEN}--dry-run{_NC}                 Log intent without making changes")
+    print(f"    {_GREEN}-h, --help{_NC}                Show this help message\n")
+    print(f"{_YELLOW}EXAMPLES:{_NC}")
+    print(f"    {_GREEN}# Apply standard LMC tuning (80% default zoom + enterprise policies){_NC}")
+    print("    python3 Tools/firefox_lmchol_tuning.py --mc-base /lmchol\n")
+    print(f"    {_GREEN}# Dry run check without applying changes{_NC}")
+    print("    python3 Tools/firefox_lmchol_tuning.py --dry-run\n")
+    print(f"    {_GREEN}# Apply tuning with a custom zoom level (e.g. 90%){_NC}")
+    print("    python3 Tools/firefox_lmchol_tuning.py --zoom 0.9\n")
+    print(f"    {_GREEN}# Clear proxy policy for non-HOL lab types{_NC}")
+    print("    python3 Tools/firefox_lmchol_tuning.py --clear\n")
+    sys.exit(0)
+
+
+class _HelpOnErrorParser(argparse.ArgumentParser):
+    """Custom parser to format errors and display styled help on parse failures."""
+    def error(self, message: str) -> None:
+        print(f"{_RED}ERROR:{_NC} {message}\n", file=sys.stderr)
+        show_help()
+
+
 def main() -> None:
-    import argparse
+    if "--help" in sys.argv or "-h" in sys.argv:
+        show_help()
+
     import lsfunctions as lsf
 
-    p = argparse.ArgumentParser(description=__doc__)
+    p = _HelpOnErrorParser(description=__doc__, add_help=False)
     p.add_argument(
         "--mc-base",
         default="/lmchol",
@@ -441,6 +632,12 @@ def main() -> None:
             "Path to console root tree (/lmchol on manager = NFS export of "
             "console; same paths are local disk when running on the console)"
         ),
+    )
+    p.add_argument(
+        "--zoom",
+        type=float,
+        default=0.8,
+        help="Initial default page zoom level (default 0.8 for 80%%)",
     )
     p.add_argument(
         "--proxy-host", default=None, help="Proxy host override (default from lsf.LAB_PROXY_IP)"
@@ -460,7 +657,16 @@ def main() -> None:
         help="SSH target for the root-owned policies.json/environment writes",
     )
     p.add_argument("--dry-run", action="store_true")
-    args = p.parse_args()
+    p.add_argument("-h", "--help", action="store_true", default=argparse.SUPPRESS)
+
+    try:
+        args = p.parse_args()
+    except SystemExit:
+        sys.exit(1)
+
+    zoom_val = args.zoom
+    if zoom_val > 5.0:  # e.g. 80 passed instead of 0.8
+        zoom_val = zoom_val / 100.0
 
     lsf.init(router=False)
     # Minimal shim: forwards the attributes consumed by apply_firefox_lmchol_tuning
@@ -475,14 +681,16 @@ def main() -> None:
         set_console_firefox_policies = staticmethod(lsf.set_console_firefox_policies)
         set_console_crashreporter_env = staticmethod(lsf.set_console_crashreporter_env)
 
-    apply_firefox_lmchol_tuning(
+    success = apply_firefox_lmchol_tuning(
         _Shim(),
         dry_run=args.dry_run,
         clear=args.clear,
         proxy_host=args.proxy_host,
         proxy_port=args.proxy_port,
         console_host=args.console_host,
+        zoom_level=zoom_val,
     )
+    sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":
