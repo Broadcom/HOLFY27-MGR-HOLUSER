@@ -388,14 +388,14 @@ class GlassmorphismCanvas:
         
         self._render_defs()
         
-        # Layer 1: Background Rect & Glows
+        # Background Rect & Glows
         self.lines.append(f'  <rect width="{self.width}" height="{self.height}" fill="url(#bg-grad)"/>')
         self.lines.append(f'  <rect width="{self.width}" height="{self.height}" fill="url(#glow-blue)"/>')
         self.lines.append(f'  <rect width="{self.width}" height="{self.height}" fill="url(#glow-purple)"/>')
         self.lines.append(f'  <rect width="{self.width}" height="{self.height}" fill="url(#glow-green)"/>')
         self.lines.append(f'  <rect width="{self.width}" height="{self.height}" fill="url(#glow-orange)"/>')
         
-        # Layer 2: Title Block
+        # Title Block
         if self.title:
             self.lines.append('  <g transform="translate(40, 36)">')
             self.lines.append(f'    <text class="hero-title" x="0" y="0">{xml_escape(self.title)}</text>')
@@ -403,7 +403,7 @@ class GlassmorphismCanvas:
                 self.lines.append(f'    <text class="hero-subtitle" x="0" y="18">{xml_escape(self.subtitle)}</text>')
             self.lines.append('  </g>')
             
-        # Layer 3: Containers
+        # Containers
         for c in self.containers:
             dash_attr = ' stroke-dasharray="6,4"' if c["dashed"] else ''
             self.lines.append(f'  <g id="container-{xml_escape(c["title"]).replace(" ", "_")}">')
@@ -418,7 +418,7 @@ class GlassmorphismCanvas:
                 self.lines.append(f'    <text class="card-subtitle" x="{c["x"] + c["width"] - 16}" y="{c["y"] + 16}" text-anchor="end">{xml_escape(c["subtitle"])}</text>')
             self.lines.append('  </g>')
 
-        # Layer 4: Edges & Glowing Lines (drawn before cards so labels/card bodies cleanly overlay)
+        # Edges & Glowing Lines (drawn before cards so labels/card bodies cleanly overlay)
         for e in self.edges:
             dash = ' stroke-dasharray="6,3"' if e.dashed else ''
             
@@ -468,7 +468,7 @@ class GlassmorphismCanvas:
                 self.lines.append(f'    <text class="edge-label" x="{mx:.1f}" y="{my + 4:.1f}" text-anchor="middle">{lbl_text}</text>')
             self.lines.append('  </g>')
 
-        # Layer 5: Glass Cards
+        # Glass Cards
         for card in self.cards:
             self.lines.append(f'  <g id="card-{xml_escape(card.id)}" filter="url(#glass-shadow)">')
             # Outer subtle glow border
@@ -506,7 +506,7 @@ class GlassmorphismCanvas:
                         self.lines.append(f'    <text class="card-detail" x="{card.x + 14}" y="{curr_y}">• {xml_escape(d)}</text>')
             self.lines.append('  </g>')
 
-        # Layer 6: Legend (if defined)
+        # Legend (if defined)
         if self.legends:
             leg_x = self.width - 200
             leg_y = 24
@@ -842,7 +842,7 @@ class LabDiagramBuilder:
         """7. Core Infrastructure & L1 Management Services Topology"""
         c = GlassmorphismCanvas(
             width=1120, height=660,
-            title="Core Infrastructure & Services Fabric (Layer 1)",
+            title="Core Infrastructure & Services Fabric",
             subtitle="L1 Management, Security, Routing, DNS/DHCP, Proxy & Lab Automation Services"
         )
         c.add_legend([
@@ -1033,24 +1033,24 @@ class LabDiagramBuilder:
         c = GlassmorphismCanvas(
             width=1200, height=880,
             title="Complete VCF Lab Infrastructure Topology",
-            subtitle="Multi-Tier Physical & Virtual Topology across External, Layer 1 Core & Layer 2 VCF Stack"
+            subtitle="Multi-Tier Physical & Virtual Topology across External, Core & VCF Stack"
         )
         c.add_legend([
             ("External / Ingress", GlassmorphismCanvas.COLOR_MUTED),
-            ("L1 Core Services", GlassmorphismCanvas.COLOR_BLUE),
+            ("Core Services", GlassmorphismCanvas.COLOR_BLUE),
             ("Management Control Plane", GlassmorphismCanvas.COLOR_PURPLE),
             ("Workload & Container Fabric", GlassmorphismCanvas.COLOR_AMBER),
             ("Operations & Automation Suite", GlassmorphismCanvas.COLOR_CYAN),
         ])
         
-        # Layer 0: External Access
-        c.add_container(40, 80, 1120, 95, "Layer 0: External Access & Upstream Network", subtitle="192.168.0.0/24", icon="🌐", border_color="rgba(139,148,158,0.3)")
+        # External Access
+        c.add_container(40, 80, 1120, 95, "External Access & Upstream Network", subtitle="192.168.0.0/24", icon="🌐", border_color="rgba(139,148,158,0.3)")
         c.add_card(GlassCard("c-ext-gw", 70, 105, 330, 60, "Internet Gateway", "192.168.0.1", "🌐", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Default Upstream Route"], GlassmorphismCanvas.COLOR_MUTED))
         c.add_card(GlassCard("c-ext-dns", 435, 105, 330, 60, "Technitium DNS Resolver", "10.1.10.129", "🔍", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Authoritative DNS: vcf.lab"], GlassmorphismCanvas.COLOR_MUTED))
         c.add_card(GlassCard("c-ext-squid", 800, 105, 330, 60, "Squid Proxy Gateway", "10.1.10.129:3128", "🛡️", "FILTERING", GlassmorphismCanvas.COLOR_GREEN, ["Web Ingress & Whitelist"], GlassmorphismCanvas.COLOR_MUTED))
         
-        # Layer 1: Core VMs
-        c.add_container(40, 195, 1120, 110, "Layer 1: Core Infrastructure VMs (L1 Fabric)", subtitle="10.1.10.128/25", icon="🛠️", border_color="rgba(88,166,255,0.3)")
+        # Core VMs
+        c.add_container(40, 195, 1120, 110, "Core Infrastructure VMs (Fabric)", subtitle="10.1.10.128/25", icon="🛠️", border_color="rgba(88,166,255,0.3)")
         r_ip = self.env.router_ip or "10.1.10.129"
         con_ip = self.env.console_ip or "10.1.10.130"
         mgr_ip = self.env.manager_ip or "10.1.10.131"
@@ -1058,24 +1058,24 @@ class LabDiagramBuilder:
         c.add_card(GlassCard("c-console", 435, 225, 330, 68, "console (Linux Desktop)", con_ip, "🖥️", "READY", GlassmorphismCanvas.COLOR_GREEN, ["Ubuntu Desktop, Firefox 80%, VNC"], GlassmorphismCanvas.COLOR_BLUE))
         c.add_card(GlassCard("c-manager", 800, 225, 330, 68, "manager (Lab Automation Engine)", mgr_ip, "🚀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["labstartup.py, Python lsfunctions"], GlassmorphismCanvas.COLOR_BLUE))
         
-        # Layer 2: VCF Management Domain
-        c.add_container(40, 325, 545, 370, "Layer 2: Management Domain (mgmt-a)", subtitle="10.1.1.0/24", icon="🏛️", border_color="rgba(188,140,255,0.3)")
+        # VCF Management Domain
+        c.add_container(40, 325, 545, 370, "Management Domain (mgmt-a)", subtitle="10.1.1.0/24", icon="🏛️", border_color="rgba(188,140,255,0.3)")
         c.add_card(GlassCard("c-sddc", 65, 360, 235, 80, "SDDC Manager", "sddcmanager-a (10.1.1.5)", "🎛️", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["VCF Fleet LCM", "REST API :443"], GlassmorphismCanvas.COLOR_PURPLE))
         c.add_card(GlassCard("c-vcmgmt", 325, 360, 235, 80, "vCenter Server", "vc-mgmt-a (10.1.1.10)", "🏢", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["SSO: vsphere.local", "VAMI :5480"], GlassmorphismCanvas.COLOR_PURPLE))
         c.add_card(GlassCard("c-nsxmgmt", 65, 455, 235, 80, "NSX Manager", "nsx-mgmt-01a (10.1.1.21)", "🔀", "HA READY", GlassmorphismCanvas.COLOR_GREEN, ["Policy & Overlay", "VIP Management"], GlassmorphismCanvas.COLOR_PURPLE))
         c.add_card(GlassCard("c-mgmthosts", 325, 455, 235, 80, "Mgmt ESXi Cluster", "4 Hosts (esx-01a..04a)", "🖥️", "4/4 UP", GlassmorphismCanvas.COLOR_GREEN, ["128 Cores | 512 GB", "10.1.1.101 - 104"], GlassmorphismCanvas.COLOR_PURPLE))
         c.add_card(GlassCard("c-vsanmgmt", 65, 550, 495, 80, "vSAN Datastore: vsan-mgmt-01a", "Capacity: ~4.8 TB | FTT=1 Mirroring", "💾", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, ["vSAN ESA/OSA Storage Fabric for Management VMs"], GlassmorphismCanvas.COLOR_PURPLE))
         
-        # Layer 2: VCF Workload Domain
-        c.add_container(615, 325, 545, 370, "Layer 2: Workload Domain (wld01-a)", subtitle="10.1.1.0/24", icon="⚡", border_color="rgba(210,153,34,0.3)")
+        # VCF Workload Domain
+        c.add_container(615, 325, 545, 370, "Workload Domain (wld01-a)", subtitle="10.1.1.0/24", icon="⚡", border_color="rgba(210,153,34,0.3)")
         c.add_card(GlassCard("c-vcwld", 640, 360, 235, 80, "vCenter Workload", "vc-wld01-a (10.1.1.11)", "🏬", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["SSO: wld.sso", "VAMI :5480"], GlassmorphismCanvas.COLOR_AMBER))
         c.add_card(GlassCard("c-nsxwld", 900, 360, 235, 80, "NSX Workload", "nsx-wld01-01a (10.1.1.25)", "🔀", "HA READY", GlassmorphismCanvas.COLOR_GREEN, ["Tenant Overlay & CNI", "VIP Management"], GlassmorphismCanvas.COLOR_AMBER))
         c.add_card(GlassCard("c-wldhosts", 640, 455, 235, 80, "Workload ESXi Cluster", "3 Hosts (esx-05a..07a)", "🖥️", "3/3 UP", GlassmorphismCanvas.COLOR_GREEN, ["96 Cores | 384 GB", "10.1.1.105 - 107"], GlassmorphismCanvas.COLOR_AMBER))
         c.add_card(GlassCard("c-scp", 900, 455, 235, 80, "Supervisor CP & Tanzu", "SupervisorControlPlaneVM", "☸️", "RUNNING", GlassmorphismCanvas.COLOR_GREEN, ["Spherelet & K8s VIP", "Bookstore & DSM Apps"], GlassmorphismCanvas.COLOR_AMBER))
         c.add_card(GlassCard("c-vsanwld", 640, 550, 495, 80, "vSAN Datastore: vsan-wld01-01a", "Capacity: ~2.7 TB | FTT=1 Mirroring", "💾", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, ["vSAN Workload Storage Fabric for Tanzu PVCs"], GlassmorphismCanvas.COLOR_AMBER))
         
-        # Layer 2: VCF Operations & Automation Suite
-        c.add_container(40, 715, 1120, 140, "Layer 2: VCF Operations Suite & Automation Appliances", subtitle="Management & Analytics Plane", icon="📊", border_color="rgba(56,189,248,0.3)")
+        # VCF Operations & Automation Suite
+        c.add_container(40, 715, 1120, 140, "VCF Operations Suite & Automation Appliances", subtitle="Management & Analytics Plane", icon="📊", border_color="rgba(56,189,248,0.3)")
         c.add_card(GlassCard("c-ops-a", 70, 750, 255, 85, "VCF Operations (Aria)", "ops-a.site-a.vcf.lab (10.1.1.30)", "📊", "RUNNING", GlassmorphismCanvas.COLOR_GREEN, ["Telemetry, Analytics & Dashboards"], GlassmorphismCanvas.COLOR_CYAN))
         c.add_card(GlassCard("c-auto", 355, 750, 255, 85, "VCF Automation Platform", "auto-platform-a (10.1.1.73)", "⚡", "RUNNING", GlassmorphismCanvas.COLOR_GREEN, ["Microservices & Cloud Templates"], GlassmorphismCanvas.COLOR_CYAN))
         c.add_card(GlassCard("c-opscoll", 640, 750, 240, 85, "Ops Collector & Networks", "opscollector / opsnet (10.1.1.41/60)", "📡", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Network & Metric Ingestion"], GlassmorphismCanvas.COLOR_CYAN))
@@ -1810,7 +1810,7 @@ class LabDetailsGenerator:
         html.append('    </div>')
 
         # 7. Core Infrastructure VMs
-        add_diagram_card("core-vms", "🛠️", "Core Infrastructure & Services Fabric (Layer 1)", "core_infrastructure.svg", "L1 routing, Technitium DNS, DHCP, Squid proxy, desktop console, and manager automation.")
+        add_diagram_card("core-vms", "🛠️", "Core Infrastructure & Services Fabric", "core_infrastructure.svg", "L1 routing, Technitium DNS, DHCP, Squid proxy, desktop console, and manager automation.")
 
         # 8. Network Subnets Reference Table
         html.append('    <!-- Network Subnets Reference -->')
@@ -1926,7 +1926,7 @@ class LabDetailsGenerator:
         html.append('    </div>')
 
         # 15. Complete Infrastructure Diagram
-        add_diagram_card("complete", "🗺️", "Complete VCF Lab Holistic Infrastructure Topology", "complete_infrastructure.svg", "End-to-end multi-tier physical and virtual topology across External, Layer 1 Core, and Layer 2 VCF domains.")
+        add_diagram_card("complete", "🗺️", "Complete VCF Lab Holistic Infrastructure Topology", "complete_infrastructure.svg", "End-to-end multi-tier physical and virtual topology across External, Core, and VCF domains.")
 
         # 16. Quick Reference Commands
         html.append('    <!-- Quick Reference Commands -->')
@@ -2643,13 +2643,13 @@ class LabDetailsGenerator:
             self._add('    end')
             self._add()
             self._add('    subgraph vPod["VMware Hands-on Lab vPod"]')
-            self._add('        subgraph L1["Layer 1 - Core VMs"]')
+            self._add('        subgraph L1["Core VMs"]')
             self._add(f'            Router["holorouter<br/>{self.env.router_ip}<br/>DNS/DHCP/Proxy/FW"]')
             self._add(f'            Console["console<br/>{self.env.console_ip}<br/>Linux Desktop"]')
             self._add(f'            Manager["manager<br/>{self.env.manager_ip}<br/>Automation"]')
             self._add('        end')
             self._add()
-            self._add('        subgraph L2["Layer 2 - VCF Infrastructure"]')
+            self._add('        subgraph L2["VCF Infrastructure"]')
             
             # Management Domain
             self._add('            subgraph MgmtDomain["Management Domain"]')
