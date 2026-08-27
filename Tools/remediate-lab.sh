@@ -832,7 +832,7 @@ govc() { printf '. %q && %q %s\n' "$GOVC_ENV" "$GOVC" "$*" | mgr_run; }
 GOVC_OK_CACHE=""
 GOVC_STAGE_ATTEMPTED=""
 # Nested vCenter creds (NOT physical/outer infra -- these share the pod's standard lab password,
-# confirmed on 10.138.150.5: administrator@vsphere.local / the same VMware123!VMware123!-style
+# confirmed on 10.138.150.5: administrator@vsphere.local / the same standard HOL
 # password used everywhere else in the pod). Override via env if a pod ever differs.
 GOVC_ADMIN_USER="${GOVC_ADMIN_USER:-administrator@vsphere.local}"
 GOVC_ADMIN_PW="${GOVC_ADMIN_PW:-$MGR_PW}"
