@@ -71,7 +71,7 @@
     <rect x="40" y="80" width="1120" height="95" rx="14" ry="14" fill="rgba(255, 255, 255, 0.02)" stroke="rgba(139,148,158,0.3)" stroke-width="1.2"/>
     <rect x="52" y="68" width="295.0" height="24" rx="12" fill="#161b22" stroke="rgba(139,148,158,0.3)" stroke-width="1"/>
     <text class="container-title" x="64" y="84">🌐 External Access &amp; Upstream Network</text>
-    <text class="card-subtitle" x="1144" y="96" text-anchor="end">192.168.0.0/24</text>
+    <text class="card-subtitle" x="1144" y="96" text-anchor="end">Upstream Ingress</text>
   </g>
   <g id="container-Core_Infrastructure_VMs_(Fabric)">
     <rect x="40" y="195" width="1120" height="120" rx="14" ry="14" fill="rgba(255, 255, 255, 0.02)" stroke="rgba(88,166,255,0.3)" stroke-width="1.2"/>
@@ -83,13 +83,13 @@
     <rect x="40" y="335" width="545" height="370" rx="14" ry="14" fill="rgba(255, 255, 255, 0.02)" stroke="rgba(188,140,255,0.3)" stroke-width="1.2"/>
     <rect x="52" y="323" width="220.0" height="24" rx="12" fill="#161b22" stroke="rgba(188,140,255,0.3)" stroke-width="1"/>
     <text class="container-title" x="64" y="339">🏛️ Site A Datacenter Fabric</text>
-    <text class="card-subtitle" x="569" y="351" text-anchor="end">10.1.1.0/24</text>
+    <text class="card-subtitle" x="569" y="351" text-anchor="end">Site A Primary Plane</text>
   </g>
   <g id="container-Site_B_Datacenter_Fabric">
     <rect x="615" y="335" width="545" height="370" rx="14" ry="14" fill="rgba(255, 255, 255, 0.02)" stroke="rgba(210,153,34,0.3)" stroke-width="1.2"/>
     <rect x="627" y="323" width="220.0" height="24" rx="12" fill="#161b22" stroke="rgba(210,153,34,0.3)" stroke-width="1"/>
     <text class="container-title" x="639" y="339">🏢 Site B Datacenter Fabric</text>
-    <text class="card-subtitle" x="1144" y="351" text-anchor="end">10.2.1.0/24</text>
+    <text class="card-subtitle" x="1144" y="351" text-anchor="end">Site B Secondary Plane</text>
   </g>
   <g id="card-c-ext-gw" filter="url(#glass-shadow)">
     <rect x="435" y="105" width="330" height="60" rx="12" ry="12" fill="rgba(22, 27, 34, 0.75)" stroke="rgba(255, 255, 255, 0.12)" stroke-width="1.2"/>
@@ -102,7 +102,7 @@
     </circle>
     <circle cx="711.8" cy="124" r="3.5" fill="#ffffff" opacity="0.9"/>
     <text class="badge-text" x="733.4" y="127.5" text-anchor="middle">ONLINE</text>
-    <text class="card-subtitle" x="449" y="143">192.168.0.1</text>
+    <text class="card-subtitle" x="449" y="143">Upstream Gateway</text>
   </g>
   <g id="card-c-router" filter="url(#glass-shadow)">
     <rect x="70" y="220" width="330" height="85" rx="12" ry="12" fill="rgba(22, 27, 34, 0.75)" stroke="rgba(255, 255, 255, 0.12)" stroke-width="1.2"/>
@@ -163,7 +163,7 @@
   <g id="card-c-site-a-hosts" filter="url(#glass-shadow)">
     <rect x="65" y="465" width="495" height="80" rx="12" ry="12" fill="rgba(22, 27, 34, 0.75)" stroke="rgba(255, 255, 255, 0.12)" stroke-width="1.2"/>
     <rect x="66" y="477" width="3.5" height="56" rx="1.7" fill="#bc8cff"/>
-    <g class="animated-icon"><text class="card-title" x="79" y="487">🖥️ Site-A ESXi Cluster (4 Hosts)</text></g>
+    <g class="animated-icon"><text class="card-title" x="79" y="487">🖥️ Site-A ESXi Cluster</text></g>
     <rect x="498.8" y="475" width="51.2" height="18" rx="9" fill="#3fb950"/>
     <circle cx="506.8" cy="484" r="3.5" fill="#3fb950">
       <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
@@ -171,7 +171,7 @@
     </circle>
     <circle cx="506.8" cy="484" r="3.5" fill="#ffffff" opacity="0.9"/>
     <text class="badge-text" x="528.4" y="487.5" text-anchor="middle">ONLINE</text>
-    <text class="card-subtitle" x="79" y="503">esx-01a.site-a.vcf.lab .. esx-04a</text>
+    <text class="card-subtitle" x="79" y="503">Site A ESXi Physical Hosts</text>
     <text class="card-detail" x="79" y="531">• Site A vSAN Storage Fabric</text>
   </g>
   <g id="card-c-site-a-ds" filter="url(#glass-shadow)">
@@ -205,7 +205,7 @@
   <g id="card-c-site-b-hosts" filter="url(#glass-shadow)">
     <rect x="640" y="465" width="495" height="80" rx="12" ry="12" fill="rgba(22, 27, 34, 0.75)" stroke="rgba(255, 255, 255, 0.12)" stroke-width="1.2"/>
     <rect x="641" y="477" width="3.5" height="56" rx="1.7" fill="#d29922"/>
-    <g class="animated-icon"><text class="card-title" x="654" y="487">🖥️ Site-B ESXi Cluster (4 Hosts)</text></g>
+    <g class="animated-icon"><text class="card-title" x="654" y="487">🖥️ Site-B ESXi Cluster</text></g>
     <rect x="1073.8" y="475" width="51.2" height="18" rx="9" fill="#3fb950"/>
     <circle cx="1081.8" cy="484" r="3.5" fill="#3fb950">
       <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
@@ -213,7 +213,7 @@
     </circle>
     <circle cx="1081.8" cy="484" r="3.5" fill="#ffffff" opacity="0.9"/>
     <text class="badge-text" x="1103.3999999999999" y="487.5" text-anchor="middle">ONLINE</text>
-    <text class="card-subtitle" x="654" y="503">esx-01b.site-b.vcf.lab .. esx-04b</text>
+    <text class="card-subtitle" x="654" y="503">Site B ESXi Physical Hosts</text>
     <text class="card-detail" x="654" y="531">• Site B vSAN Storage Fabric</text>
   </g>
   <g id="card-c-site-b-ds" filter="url(#glass-shadow)">

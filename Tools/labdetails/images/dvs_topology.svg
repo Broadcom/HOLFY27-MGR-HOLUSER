@@ -105,7 +105,7 @@
     <circle cx="481.8" cy="234" r="3.5" fill="#ffffff" opacity="0.9"/>
     <text class="badge-text" x="503.40000000000003" y="237.5" text-anchor="middle">ACTIVE</text>
     <text class="card-subtitle" x="79" y="253">VLAN 102</text>
-    <text class="card-detail" x="79" y="281">• Kernel vmk1 vSAN Storage Traffic (10.1.2.x)</text>
+    <text class="card-detail" x="79" y="281">• Kernel vmk1 vSAN Storage Traffic</text>
   </g>
   <g id="card-dvs-m-3" filter="url(#glass-shadow)">
     <rect x="65" y="305" width="470" height="75" rx="12" ry="12" fill="rgba(22, 27, 34, 0.75)" stroke="rgba(255, 255, 255, 0.12)" stroke-width="1.2"/>
@@ -119,7 +119,7 @@
     <circle cx="481.8" cy="324" r="3.5" fill="#ffffff" opacity="0.9"/>
     <text class="badge-text" x="503.40000000000003" y="327.5" text-anchor="middle">ACTIVE</text>
     <text class="card-subtitle" x="79" y="343">VLAN 103</text>
-    <text class="card-detail" x="79" y="371">• Kernel vmk2 vMotion Traffic (10.1.3.x)</text>
+    <text class="card-detail" x="79" y="371">• Kernel vmk2 vMotion Live State Migration</text>
   </g>
   <g id="card-dvs-m-4" filter="url(#glass-shadow)">
     <rect x="65" y="395" width="470" height="75" rx="12" ry="12" fill="rgba(22, 27, 34, 0.75)" stroke="rgba(255, 255, 255, 0.12)" stroke-width="1.2"/>
@@ -133,7 +133,7 @@
     <circle cx="481.8" cy="414" r="3.5" fill="#ffffff" opacity="0.9"/>
     <text class="badge-text" x="503.40000000000003" y="417.5" text-anchor="middle">ACTIVE</text>
     <text class="card-subtitle" x="79" y="433">VLAN 105</text>
-    <text class="card-detail" x="79" y="461">• Kernel vmk50 GENEVE TEP Traffic</text>
+    <text class="card-detail" x="79" y="461">• Kernel vmk50 GENEVE TEP Overlay Traffic</text>
   </g>
   <g id="card-dvs-w-1" filter="url(#glass-shadow)">
     <rect x="620" y="125" width="475" height="75" rx="12" ry="12" fill="rgba(22, 27, 34, 0.75)" stroke="rgba(255, 255, 255, 0.12)" stroke-width="1.2"/>
@@ -161,7 +161,7 @@
     <circle cx="1041.8" cy="234" r="3.5" fill="#ffffff" opacity="0.9"/>
     <text class="badge-text" x="1063.3999999999999" y="237.5" text-anchor="middle">ACTIVE</text>
     <text class="card-subtitle" x="634" y="253">VLAN 102</text>
-    <text class="card-detail" x="634" y="281">• Kernel vmk1 vSAN Storage Traffic</text>
+    <text class="card-detail" x="634" y="281">• Kernel vmk1 vSAN Workload Storage Traffic</text>
   </g>
   <g id="card-dvs-w-3" filter="url(#glass-shadow)">
     <rect x="620" y="305" width="475" height="75" rx="12" ry="12" fill="rgba(22, 27, 34, 0.75)" stroke="rgba(255, 255, 255, 0.12)" stroke-width="1.2"/>
@@ -175,7 +175,7 @@
     <circle cx="1041.8" cy="324" r="3.5" fill="#ffffff" opacity="0.9"/>
     <text class="badge-text" x="1063.3999999999999" y="327.5" text-anchor="middle">ACTIVE</text>
     <text class="card-subtitle" x="634" y="343">VLAN 103</text>
-    <text class="card-detail" x="634" y="371">• Kernel vmk2 vMotion Traffic</text>
+    <text class="card-detail" x="634" y="371">• Kernel vmk2 Workload vMotion Live Migration</text>
   </g>
   <g id="card-dvs-w-4" filter="url(#glass-shadow)">
     <rect x="620" y="395" width="475" height="75" rx="12" ry="12" fill="rgba(22, 27, 34, 0.75)" stroke="rgba(255, 255, 255, 0.12)" stroke-width="1.2"/>

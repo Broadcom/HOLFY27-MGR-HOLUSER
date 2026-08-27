@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 generate_labdetails.py - Automatic Lab Documentation & Multi-Style Architecture Topology Generator
-Version 2.3.1 - 2026-08-27
+Version 2.3.3 - 2026-08-27
 Author - Broadcom HOL Core Team
 
 License:
@@ -28,6 +28,8 @@ import socket
 import argparse
 import datetime
 import subprocess
+import ipaddress
+import base64
 from xml.sax.saxutils import escape
 from configparser import ConfigParser
 from dataclasses import dataclass, field
@@ -193,6 +195,9 @@ class K8sClusterInfo:
     nodes: List[K8sNodeInfo] = field(default_factory=list)
     namespaces: List[Dict[str, Any]] = field(default_factory=list)
     pods: List[Dict[str, Any]] = field(default_factory=list)
+    services: List[Dict[str, Any]] = field(default_factory=list)
+    storage_classes: List[str] = field(default_factory=list)
+    extra_info: Dict[str, Any] = field(default_factory=dict)
     cpu_capacity_mhz: int = 0
     cpu_used_mhz: int = 0
     memory_capacity_mb: int = 0
@@ -203,7 +208,7 @@ class K8sClusterInfo:
 @dataclass
 class HolorouterInfo:
     """Holorouter services & status"""
-    ip: str = "10.1.10.129"
+    ip: str = ""
     technitium_status: str = "Active"
     authentik_status: str = "Active"
     gitlab_status: str = "Active"
@@ -226,9 +231,12 @@ class LabEnvironment:
     dns_domain: str = "site-a.vcf.lab"
     
     # Core VMs & Gateway
+    gateway_ip: str = ""
     router_ip: str = ""
     console_ip: str = ""
     manager_ip: str = ""
+    core_subnet: str = ""
+    external_subnet: str = ""
     holorouter: HolorouterInfo = field(default_factory=HolorouterInfo)
     
     # Domains
@@ -283,12 +291,81 @@ def test_ping(host: str, timeout: int = 2) -> bool:
     except Exception:
         return False
 
-def resolve_host(hostname: str) -> str:
-    """Resolve hostname to IP address"""
-    try:
-        return socket.gethostbyname(hostname)
-    except Exception:
+_HOST_CACHE: Dict[str, str] = {}
+
+def resolve_host(hostname: str, domain: str = "") -> str:
+    """Dynamically resolve hostname or FQDN to IP address via /etc/hosts, DNS, and socket with caching"""
+    if not hostname:
         return ""
+    # If already an IPv4 address
+    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', hostname):
+        return hostname
+        
+    cache_key = f"{hostname}::{domain}"
+    if cache_key in _HOST_CACHE:
+        return _HOST_CACHE[cache_key]
+        
+    # List of candidates to try
+    candidates = [hostname]
+    if '.' not in hostname:
+        if domain:
+            candidates.append(f"{hostname}.{domain}")
+        candidates.extend([
+            f"{hostname}.site-a.vcf.lab",
+            f"{hostname}.site-b.vcf.lab",
+            f"{hostname}.vcf.lab"
+        ])
+        
+    # Check /etc/hosts first for fastest local resolution
+    try:
+        if os.path.isfile('/etc/hosts'):
+            with open('/etc/hosts', 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            ip_cand = parts[0]
+                            host_aliases = parts[1:]
+                            for cand in candidates:
+                                if cand in host_aliases or cand.split('.')[0] in host_aliases:
+                                    if not ip_cand.startswith('127.'):
+                                        _HOST_CACHE[cache_key] = ip_cand
+                                        return ip_cand
+    except Exception:
+        pass
+        
+    # Try socket resolution
+    for cand in candidates:
+        try:
+            ip = socket.gethostbyname(cand)
+            if ip and not ip.startswith('127.'):
+                _HOST_CACHE[cache_key] = ip
+                return ip
+        except Exception:
+            pass
+            
+    _HOST_CACHE[cache_key] = ""
+    return ""
+
+def get_subnet_for_ip(ip_str: Optional[str], default_prefix: int = 24) -> str:
+    """Dynamically derive CIDR notation from an IP address"""
+    if not ip_str or not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip_str):
+        return ""
+    try:
+        if default_prefix == 24:
+            base = ip_str.rsplit('.', 1)[0]
+            return f"{base}.0/24"
+        elif default_prefix == 25:
+            octets = [int(x) for x in ip_str.split('.')]
+            fourth = 128 if octets[3] >= 128 else 0
+            return f"{octets[0]}.{octets[1]}.{octets[2]}.{fourth}/25"
+        else:
+            iface = ipaddress.ip_interface(f"{ip_str}/{default_prefix}")
+            return str(iface.network)
+    except Exception:
+        pass
+    return ""
 
 def safe_api_call(func, *args, **kwargs) -> Optional[Any]:
     """Safely execute an API call and return None on failure"""
@@ -856,33 +933,47 @@ class LabDiagramBuilder:
             ("Gateway / External", GlassmorphismCanvas.COLOR_MUTED),
         ])
         
+        # Dynamic IP & Subnet resolution
+        gw_ip = self.env.gateway_ip or resolve_host('gateway', domain_str) or resolve_host('ext-gw', domain_str) or "Upstream Gateway"
+        r_ip = self.env.router_ip or resolve_host('router', domain_str) or resolve_host('holorouter', domain_str) or "DNS/Router"
+        con_ip = self.env.console_ip or resolve_host('console', domain_str) or "Console UI"
+        mgr_ip = self.env.manager_ip or resolve_host('manager', domain_str) or "Automation Engine"
+        
+        core_sub = self.env.core_subnet or get_subnet_for_ip(r_ip, 25) or "Core Fabric"
+        
+        vc_mgmt_ip = resolve_host('vc-mgmt-a', domain_str)
+        mgmt_sub = get_subnet_for_ip(vc_mgmt_ip, 24) or "Management Fabric"
+        
+        vc_wld_ip = resolve_host('vc-wld01-a', domain_str)
+        wld_sub = get_subnet_for_ip(vc_wld_ip, 24) or "Workload Fabric"
+        
+        vc_mgmt_b_ip = resolve_host('vc-mgmt-b', 'site-b.vcf.lab')
+        site_b_sub = get_subnet_for_ip(vc_mgmt_b_ip, 24) or "Site B Fabric"
+
         c.add_container(40, 80, 230, 600, "External Access Network", subtitle="Upstream Ingress", icon="🌐")
-        c.add_container(300, 80, 230, 600, "Core Infrastructure", subtitle="10.1.10.128/25", icon="🛠️", accent_color=GlassmorphismCanvas.COLOR_BLUE)
+        c.add_container(300, 80, 230, 600, "Core Infrastructure", subtitle=core_sub, icon="🛠️", accent_color=GlassmorphismCanvas.COLOR_BLUE)
         
         if self.env.has_site_b:
-            c.add_container(560, 80, 550, 290, "Site A: Primary Datacenter", subtitle="10.1.1.0/24", icon="🏛️", accent_color=GlassmorphismCanvas.COLOR_PURPLE)
-            c.add_container(560, 390, 550, 290, "Site B: Secondary Datacenter", subtitle="10.2.1.0/24", icon="🏢", accent_color=GlassmorphismCanvas.COLOR_AMBER)
+            c.add_container(560, 80, 550, 290, "Site A: Primary Datacenter", subtitle=mgmt_sub, icon="🏛️", accent_color=GlassmorphismCanvas.COLOR_PURPLE)
+            c.add_container(560, 390, 550, 290, "Site B: Secondary Datacenter", subtitle=site_b_sub, icon="🏢", accent_color=GlassmorphismCanvas.COLOR_AMBER)
         else:
             c.add_container(560, 80, 550, 600, "VMware Cloud Foundation", subtitle="SDDC & Workload Fabric", icon="☁️", accent_color=GlassmorphismCanvas.COLOR_PURPLE)
-            c.add_container(580, 115, 510, 260, "Management Domain: mgmt-a", subtitle="10.1.1.0/24", icon="🏛️", border_color="rgba(188,140,255,0.25)")
-            c.add_container(580, 390, 510, 260, "Workload Domain: wld01-a", subtitle="10.1.1.0/24", icon="⚡", border_color="rgba(210,153,34,0.25)")
+            c.add_container(580, 115, 510, 260, "Management Domain: mgmt-a", subtitle=mgmt_sub, icon="🏛️", border_color="rgba(188,140,255,0.25)")
+            c.add_container(580, 390, 510, 260, "Workload Domain: wld01-a", subtitle=wld_sub, icon="⚡", border_color="rgba(210,153,34,0.25)")
         
         # Nodes - External
-        c.add_card(GlassCard("ext-gateway", 65, 130, 180, 100, "Internet Gateway", "192.168.0.1", "🌐", "UP", GlassmorphismCanvas.COLOR_GREEN, ["Default Upstream Route"], GlassmorphismCanvas.COLOR_MUTED))
-        c.add_card(GlassCard("ext-dns", 65, 270, 180, 90, "DNS Resolver", "10.1.10.129", "🔍", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Technitium DNS"], GlassmorphismCanvas.COLOR_MUTED))
+        c.add_card(GlassCard("ext-gateway", 65, 130, 180, 100, "Internet Gateway", gw_ip, "🌐", "UP", GlassmorphismCanvas.COLOR_GREEN, ["Default Upstream Route"], GlassmorphismCanvas.COLOR_MUTED))
+        c.add_card(GlassCard("ext-dns", 65, 270, 180, 90, "DNS Resolver", r_ip, "🔍", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Technitium DNS"], GlassmorphismCanvas.COLOR_MUTED))
         
         # Nodes - Core
         h = self.env.holorouter
-        r_ip = self.env.router_ip or "10.1.10.129"
-        con_ip = self.env.console_ip or "10.1.10.130"
-        mgr_ip = self.env.manager_ip or "10.1.10.131"
         c.add_card(GlassCard("holorouter", 325, 130, 180, 125, "holorouter", r_ip, "🛡️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["DNS / DHCP", f"Squid: {h.squid_filter_mode[:12]}"], GlassmorphismCanvas.COLOR_BLUE))
         c.add_card(GlassCard("console", 325, 285, 180, 100, "console", con_ip, "🖥️", "READY", GlassmorphismCanvas.COLOR_GREEN, ["Ubuntu GUI"], GlassmorphismCanvas.COLOR_BLUE))
         c.add_card(GlassCard("manager", 325, 415, 180, 100, "manager", mgr_ip, "🚀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Automation Engine"], GlassmorphismCanvas.COLOR_BLUE))
         
         if not self.env.has_site_b:
             c.add_card(GlassCard("sddc", 600, 155, 220, 95, "SDDC Manager", "sddcmanager-a", "🎛️", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, ["VCF Lifecycle API"], GlassmorphismCanvas.COLOR_PURPLE))
-            c.add_card(GlassCard("vc-mgmt", 845, 155, 220, 95, "vCenter Mgmt", "vc-mgmt-a", "🏢", "RUNNING", GlassmorphismCanvas.COLOR_GREEN, ["vSphere 9.1"], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_card(GlassCard("vc-mgmt", 845, 155, 220, 95, "vCenter Mgmt", "vc-mgmt-a", "🏢", "RUNNING", GlassmorphismCanvas.COLOR_GREEN, ["vSphere Control Plane"], GlassmorphismCanvas.COLOR_PURPLE))
             c.add_card(GlassCard("nsx-mgmt", 600, 265, 220, 90, "NSX Manager", "nsx-mgmt-01a", "🔀", "READY", GlassmorphismCanvas.COLOR_GREEN, ["Tier-0 / Tier-1 Routing"], GlassmorphismCanvas.COLOR_PURPLE))
             c.add_card(GlassCard("mgmt-hosts", 845, 265, 220, 90, "Mgmt ESXi Cluster", f"{len(self.env.hosts) or 4} Hosts", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, [f"ESXi {self.env.esxi_version[:12]}"], GlassmorphismCanvas.COLOR_PURPLE))
             
@@ -891,10 +982,10 @@ class LabDiagramBuilder:
             c.add_card(GlassCard("wld-hosts", 600, 535, 465, 80, "Workload Fabric Cluster", "vSAN Cluster", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Supervisor & Tanzu K8s"], GlassmorphismCanvas.COLOR_AMBER))
         else:
             c.add_card(GlassCard("site-a-vc", 580, 130, 240, 110, "Site-A vCenter", "vc-mgmt-a.site-a.vcf.lab", "🏢", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Site A Control Plane"], GlassmorphismCanvas.COLOR_PURPLE))
-            c.add_card(GlassCard("site-a-hosts", 845, 130, 240, 110, "Site-A ESXi Cluster", "ESXi Hosts (esx-01a..04a)", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Site A vSAN Fabric"], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_card(GlassCard("site-a-hosts", 845, 130, 240, 110, "Site-A ESXi Cluster", "ESXi Hosts (Site A)", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Site A vSAN Fabric"], GlassmorphismCanvas.COLOR_PURPLE))
             
             c.add_card(GlassCard("site-b-vc", 580, 440, 240, 110, "Site-B vCenter", "vc-mgmt-b.site-b.vcf.lab", "🏬", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Site B Control Plane"], GlassmorphismCanvas.COLOR_AMBER))
-            c.add_card(GlassCard("site-b-hosts", 845, 440, 240, 110, "Site-B ESXi Cluster", "ESXi Hosts (esx-01b..04b)", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Site B vSAN Fabric"], GlassmorphismCanvas.COLOR_AMBER))
+            c.add_card(GlassCard("site-b-hosts", 845, 440, 240, 110, "Site-B ESXi Cluster", "ESXi Hosts (Site B)", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Site B vSAN Fabric"], GlassmorphismCanvas.COLOR_AMBER))
 
         c.add_edge(FlowEdge((245, 180), (325, 180), "Ingress", GlassmorphismCanvas.COLOR_MUTED))
         c.add_edge(FlowEdge((415, 255), (415, 285), "Local LAN", GlassmorphismCanvas.COLOR_BLUE))
@@ -919,45 +1010,72 @@ class LabDiagramBuilder:
             ("Plane 5: NSX GENEVE TEP", GlassmorphismCanvas.COLOR_ORANGE),
         ])
         
-        c.add_container(40, 80, 1030, 110, "Plane 1: Core & Services Subnet", subtitle="10.1.10.128/25", icon="⚡", border_color="rgba(88,166,255,0.3)")
+        # Dynamic IP & Subnet resolution
+        r_ip = self.env.router_ip or resolve_host('router', domain_str) or "Router"
+        con_ip = self.env.console_ip or resolve_host('console', domain_str) or "Console"
+        m_ip = self.env.manager_ip or resolve_host('manager', domain_str) or "Manager"
+        
+        core_sub = self.env.core_subnet or get_subnet_for_ip(r_ip, 25) or "Core Services Subnet"
+        
+        vc_a_ip = resolve_host('vc-mgmt-a', domain_str) or "vCenter-A"
+        nsx_a_ip = resolve_host('nsx-mgmt-01a', domain_str) or "NSX-A"
+        sddc_ip = resolve_host('sddcmanager-a', domain_str) or "SDDC-Manager"
+        
+        vc_b_ip = resolve_host('vc-mgmt-b', 'site-b.vcf.lab') or "vCenter-B"
+        nsx_b_ip = resolve_host('nsx-mgmt-01b', 'site-b.vcf.lab') or "NSX-B"
+        
+        vc_wld_ip = resolve_host('vc-wld01-a', domain_str) or "vCenter-WLD"
+        
+        sample_host_a = next((h for h in self.env.hosts if h.site == "Site A" or "mgmt" in h.cluster), self.env.hosts[0] if self.env.hosts else None)
+        sample_host_b = next((h for h in self.env.hosts if h.site == "Site B" or "site-b" in h.fqdn), None)
+        
+        mgmt_a_sub = get_subnet_for_ip(vc_a_ip, 24) or (get_subnet_for_ip(sample_host_a.mgmt_ip, 24) if sample_host_a else "Management Subnet")
+        vsan_a_sub = get_subnet_for_ip(sample_host_a.vsan_ip, 24) if sample_host_a and sample_host_a.vsan_ip else "vSAN Storage"
+        vmotion_a_sub = get_subnet_for_ip(sample_host_a.vmotion_ip, 24) if sample_host_a and sample_host_a.vmotion_ip else "vMotion Migration"
+        tep_a_sub = get_subnet_for_ip(sample_host_a.tep_ip, 25) if sample_host_a and sample_host_a.tep_ip else "NSX GENEVE Overlay"
+        
+        c.add_container(40, 80, 1030, 110, "Plane 1: Core & Services Subnet", subtitle=core_sub, icon="⚡", border_color="rgba(88,166,255,0.3)")
         
         if self.env.has_site_b:
-            c.add_container(40, 210, 500, 115, "Plane 2: Site A Management Subnet", subtitle="10.1.1.0/24", icon="🏛️", border_color="rgba(188,140,255,0.3)")
-            c.add_container(560, 210, 510, 115, "Plane 2: Site B Management Subnet", subtitle="10.2.1.0/24", icon="🏢", border_color="rgba(210,153,34,0.3)")
-            c.add_container(40, 345, 500, 115, "Plane 3/4: Site A vSAN & vMotion", subtitle="vSAN: 10.1.2.0/24 | vMotion: 10.1.3.0/24", icon="💾", border_color="rgba(63,185,80,0.3)")
-            c.add_container(560, 345, 510, 115, "Plane 3/4: Site B vSAN & vMotion", subtitle="vSAN: 10.2.2.0/24 | vMotion: 10.2.3.0/24", icon="💾", border_color="rgba(56,189,248,0.3)")
-            c.add_container(40, 480, 1030, 245, "Plane 5: Cross-Site NSX GENEVE Overlay TEP Subnets", subtitle="Site A: 10.1.5.128/25 | Site B: 10.2.5.128/25", icon="🔀", border_color="rgba(247,129,102,0.3)")
+            mgmt_b_sub = get_subnet_for_ip(vc_b_ip, 24) or (get_subnet_for_ip(sample_host_b.mgmt_ip, 24) if sample_host_b else "Site B Management")
+            vsan_b_sub = get_subnet_for_ip(sample_host_b.vsan_ip, 24) if sample_host_b and sample_host_b.vsan_ip else "Site B vSAN"
+            vmotion_b_sub = get_subnet_for_ip(sample_host_b.vmotion_ip, 24) if sample_host_b and sample_host_b.vmotion_ip else "Site B vMotion"
+            tep_b_sub = get_subnet_for_ip(sample_host_b.tep_ip, 25) if sample_host_b and sample_host_b.tep_ip else "Site B TEP Overlay"
+            
+            c.add_container(40, 210, 500, 115, "Plane 2: Site A Management Subnet", subtitle=mgmt_a_sub, icon="🏛️", border_color="rgba(188,140,255,0.3)")
+            c.add_container(560, 210, 510, 115, "Plane 2: Site B Management Subnet", subtitle=mgmt_b_sub, icon="🏢", border_color="rgba(210,153,34,0.3)")
+            c.add_container(40, 345, 500, 115, "Plane 3/4: Site A vSAN & vMotion", subtitle=f"vSAN: {vsan_a_sub} | vMotion: {vmotion_a_sub}", icon="💾", border_color="rgba(63,185,80,0.3)")
+            c.add_container(560, 345, 510, 115, "Plane 3/4: Site B vSAN & vMotion", subtitle=f"vSAN: {vsan_b_sub} | vMotion: {vmotion_b_sub}", icon="💾", border_color="rgba(56,189,248,0.3)")
+            c.add_container(40, 480, 1030, 245, "Plane 5: Cross-Site NSX GENEVE Overlay TEP Subnets", subtitle=f"Site A: {tep_a_sub} | Site B: {tep_b_sub}", icon="🔀", border_color="rgba(247,129,102,0.3)")
         else:
-            c.add_container(40, 210, 1030, 115, "Plane 2: VCF Management Subnet", subtitle="10.1.1.0/24", icon="🏛️", border_color="rgba(188,140,255,0.3)")
-            c.add_container(40, 345, 500, 115, "Plane 3: vSAN Storage Subnet", subtitle="10.1.2.0/24", icon="💾", border_color="rgba(63,185,80,0.3)")
-            c.add_container(560, 345, 510, 115, "Plane 4: vMotion Live Migration", subtitle="10.1.3.0/24", icon="🔄", border_color="rgba(56,189,248,0.3)")
-            c.add_container(40, 480, 1030, 245, "Plane 5: NSX GENEVE Overlay TEP Subnet", subtitle="10.1.5.128/25", icon="🔀", border_color="rgba(247,129,102,0.3)")
+            c.add_container(40, 210, 1030, 115, "Plane 2: VCF Management Subnet", subtitle=mgmt_a_sub, icon="🏛️", border_color="rgba(188,140,255,0.3)")
+            c.add_container(40, 345, 500, 115, "Plane 3: vSAN Storage Subnet", subtitle=vsan_a_sub, icon="💾", border_color="rgba(63,185,80,0.3)")
+            c.add_container(560, 345, 510, 115, "Plane 4: vMotion Live Migration", subtitle=vmotion_a_sub, icon="🔄", border_color="rgba(56,189,248,0.3)")
+            c.add_container(40, 480, 1030, 245, "Plane 5: NSX GENEVE Overlay TEP Subnet", subtitle=tep_a_sub, icon="🔀", border_color="rgba(247,129,102,0.3)")
         
-        r_ip = self.env.router_ip or "10.1.10.129"
-        m_ip = self.env.manager_ip or "10.1.10.131"
         c.add_card(GlassCard("p1-router", 70, 115, 210, 65, "holorouter", r_ip, "🛡️", "GW", GlassmorphismCanvas.COLOR_GREEN, ["DNS/DHCP/Proxy"], GlassmorphismCanvas.COLOR_BLUE))
-        c.add_card(GlassCard("p1-console", 440, 115, 210, 65, "console", "10.1.10.130", "🖥️", "IP .130", GlassmorphismCanvas.COLOR_GREEN, ["Management UI"], GlassmorphismCanvas.COLOR_BLUE))
-        c.add_card(GlassCard("p1-manager", 810, 115, 210, 65, "manager", m_ip, "🚀", "IP .131", GlassmorphismCanvas.COLOR_GREEN, ["Automation Engine"], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("p1-console", 440, 115, 210, 65, "console", con_ip, "🖥️", "READY", GlassmorphismCanvas.COLOR_GREEN, ["Management UI"], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("p1-manager", 810, 115, 210, 65, "manager", m_ip, "🚀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Automation Engine"], GlassmorphismCanvas.COLOR_BLUE))
         
         if self.env.has_site_b:
-            c.add_card(GlassCard("p2-vca", 65, 245, 220, 65, "Site A vCenter", "vc-mgmt-a", "🏢", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["10.1.1.10"], GlassmorphismCanvas.COLOR_PURPLE))
-            c.add_card(GlassCard("p2-nsxa", 300, 245, 220, 65, "Site A NSX", "nsx-mgmt-01a", "🔀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["10.1.1.21"], GlassmorphismCanvas.COLOR_PURPLE))
-            c.add_card(GlassCard("p2-vcb", 585, 245, 225, 65, "Site B vCenter", "vc-mgmt-b", "🏬", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["10.2.1.10"], GlassmorphismCanvas.COLOR_AMBER))
-            c.add_card(GlassCard("p2-nsxb", 825, 245, 225, 65, "Site B NSX", "nsx-mgmt-01b", "🔀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["10.2.1.21"], GlassmorphismCanvas.COLOR_AMBER))
+            c.add_card(GlassCard("p2-vca", 65, 245, 220, 65, "Site A vCenter", "vc-mgmt-a", "🏢", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [vc_a_ip], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_card(GlassCard("p2-nsxa", 300, 245, 220, 65, "Site A NSX", "nsx-mgmt-01a", "🔀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [nsx_a_ip], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_card(GlassCard("p2-vcb", 585, 245, 225, 65, "Site B vCenter", "vc-mgmt-b", "🏬", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [vc_b_ip], GlassmorphismCanvas.COLOR_AMBER))
+            c.add_card(GlassCard("p2-nsxb", 825, 245, 225, 65, "Site B NSX", "nsx-mgmt-01b", "🔀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [nsx_b_ip], GlassmorphismCanvas.COLOR_AMBER))
 
-            c.add_card(GlassCard("p3-vsana", 65, 380, 445, 65, "Site A Storage Fabric", "Kernel vmk1 (vSAN) & vmk2 (vMotion)", "💾", "ESA", GlassmorphismCanvas.COLOR_GREEN, ["FTT=1 vSAN & 10G vMotion"], GlassmorphismCanvas.COLOR_GREEN))
-            c.add_card(GlassCard("p3-vsanb", 585, 380, 460, 65, "Site B Storage Fabric", "Kernel vmk1 (vSAN) & vmk2 (vMotion)", "💾", "ESA", GlassmorphismCanvas.COLOR_GREEN, ["FTT=1 vSAN & 10G vMotion"], GlassmorphismCanvas.COLOR_CYAN))
+            c.add_card(GlassCard("p3-vsana", 65, 380, 445, 65, "Site A Storage Fabric", "Kernel vmk1 (vSAN) & vmk2 (vMotion)", "💾", "ESA", GlassmorphismCanvas.COLOR_GREEN, ["vSAN & vMotion Storage Mesh"], GlassmorphismCanvas.COLOR_GREEN))
+            c.add_card(GlassCard("p3-vsanb", 585, 380, 460, 65, "Site B Storage Fabric", "Kernel vmk1 (vSAN) & vmk2 (vMotion)", "💾", "ESA", GlassmorphismCanvas.COLOR_GREEN, ["vSAN & vMotion Storage Mesh"], GlassmorphismCanvas.COLOR_CYAN))
 
-            c.add_card(GlassCard("p5-tna", 65, 520, 445, 80, "Site A Transport Nodes", "4 ESXi Hosts + Edge Cluster", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk50 GENEVE (10.1.5.x)"], GlassmorphismCanvas.COLOR_ORANGE))
-            c.add_card(GlassCard("p5-tnb", 585, 520, 460, 80, "Site B Transport Nodes", "4 ESXi Hosts + Edge Cluster", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk50 GENEVE (10.2.5.x)"], GlassmorphismCanvas.COLOR_ORANGE))
+            c.add_card(GlassCard("p5-tna", 65, 520, 445, 80, "Site A Transport Nodes", "ESXi Hosts + Edge Cluster", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk50 GENEVE Endpoints"], GlassmorphismCanvas.COLOR_ORANGE))
+            c.add_card(GlassCard("p5-tnb", 585, 520, 460, 80, "Site B Transport Nodes", "ESXi Hosts + Edge Cluster", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk50 GENEVE Endpoints"], GlassmorphismCanvas.COLOR_ORANGE))
             c.add_edge(FlowEdge((510, 560), (585, 560), "Inter-Site DCI / IPSec Tunnel", GlassmorphismCanvas.COLOR_ORANGE))
         else:
-            c.add_card(GlassCard("p2-sddc", 70, 245, 220, 65, "SDDC Manager", "10.1.1.5", "🎛️", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["LCM Control"], GlassmorphismCanvas.COLOR_PURPLE))
-            c.add_card(GlassCard("p2-vcmgmt", 315, 245, 220, 65, "vCenter Server", "vc-mgmt-a", "🏢", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["vSphere Control"], GlassmorphismCanvas.COLOR_PURPLE))
-            c.add_card(GlassCard("p2-vcwld", 560, 245, 220, 65, "vCenter Wld", "vc-wld01-a", "🏬", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Wld Control"], GlassmorphismCanvas.COLOR_PURPLE))
-            c.add_card(GlassCard("p2-nsx", 805, 245, 215, 65, "NSX Managers", "10.1.1.x", "🔀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Overlay Control"], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_card(GlassCard("p2-sddc", 70, 245, 220, 65, "SDDC Manager", sddc_ip, "🎛️", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["LCM Control"], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_card(GlassCard("p2-vcmgmt", 315, 245, 220, 65, "vCenter Server", "vc-mgmt-a", "🏢", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [vc_a_ip], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_card(GlassCard("p2-vcwld", 560, 245, 220, 65, "vCenter Wld", "vc-wld01-a", "🏬", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [vc_wld_ip], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_card(GlassCard("p2-nsx", 805, 245, 215, 65, "NSX Managers", nsx_a_ip, "🔀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Overlay Control"], GlassmorphismCanvas.COLOR_PURPLE))
             
-            c.add_card(GlassCard("p3-vsan", 70, 380, 445, 65, "vSAN Storage Fabric", "Kernel vmk1", "💾", "ESA/OSA", GlassmorphismCanvas.COLOR_GREEN, ["FTT=1 Resiliency Fabric"], GlassmorphismCanvas.COLOR_GREEN))
+            c.add_card(GlassCard("p3-vsan", 70, 380, 445, 65, "vSAN Storage Fabric", "Kernel vmk1", "💾", "ESA/OSA", GlassmorphismCanvas.COLOR_GREEN, ["Storage Resiliency Fabric"], GlassmorphismCanvas.COLOR_GREEN))
             c.add_card(GlassCard("p4-vmotion", 585, 380, 460, 65, "vMotion Migration Fabric", "Kernel vmk2", "🔄", "10 GbE", GlassmorphismCanvas.COLOR_GREEN, ["Live VM State Migration"], GlassmorphismCanvas.COLOR_CYAN))
             
             c.add_card(GlassCard("p5-tn-mgmt", 70, 520, 445, 80, "ESXi Transport Nodes", f"{len(self.env.hosts) or 7} ESXi Hosts", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk50 GENEVE Endpoints"], GlassmorphismCanvas.COLOR_ORANGE))
@@ -966,6 +1084,8 @@ class LabDiagramBuilder:
         
         c.add_edge(FlowEdge((280, 147), (440, 147), "DNS/DHCP", GlassmorphismCanvas.COLOR_BLUE))
         c.add_edge(FlowEdge((175, 180), (175, 245), "Routing", GlassmorphismCanvas.COLOR_PURPLE))
+
+        return c
 
         return c
 
@@ -1153,10 +1273,14 @@ class LabDiagramBuilder:
 
     def build_lab_boot_sequence(self) -> GlassmorphismCanvas:
         """6. Lab Startup & Service Boot Flow"""
+        domain_str = self.env.dns_domain or "site-a.vcf.lab"
+        r_ip = self.env.router_ip or resolve_host('router', domain_str) or "Router"
+        mgr_ip = self.env.manager_ip or resolve_host('manager', domain_str) or "Manager"
+        
         c = GlassmorphismCanvas(
             width=1100, height=720,
             title="Lab Startup Boot & Service Initialization Flow",
-            subtitle="Orchestrated Startup Dependency Map (labstartup.py)",
+            subtitle=f"Orchestrated Startup Dependency Map (labstartup.py) | Domain: {domain_str}",
             style_name=self.diagram_style
         )
         c.add_legend([
@@ -1166,15 +1290,15 @@ class LabDiagramBuilder:
             ("Phase 4: Operations", GlassmorphismCanvas.COLOR_GREEN),
         ])
         
-        c.add_card(GlassCard("boot-1", 50, 110, 290, 130, "Step 1: holorouter", "10.1.10.129", "🛡️", "STAGE 1", GlassmorphismCanvas.COLOR_GREEN, ["• Initialize DNS & DHCP", "• Start Squid Proxy (:3128)", "• Set up NAT & Firewall"], GlassmorphismCanvas.COLOR_BLUE))
-        c.add_card(GlassCard("boot-2", 405, 110, 290, 130, "Step 2: manager VM", "10.1.10.131", "🚀", "STAGE 2", GlassmorphismCanvas.COLOR_GREEN, ["• Init lsfunctions runtime", "• Mount NFS exports", "• Read /tmp/config.ini"], GlassmorphismCanvas.COLOR_BLUE))
-        c.add_card(GlassCard("boot-3", 760, 110, 290, 130, "Step 3: ESXi Hosts", "esx-01a .. esx-07a", "🖥️", "STAGE 3", GlassmorphismCanvas.COLOR_GREEN, ["• Verify SSH management", "• Exit Maintenance Mode", "• Check host power states"], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("boot-1", 50, 110, 290, 130, "Step 1: holorouter", r_ip, "🛡️", "STAGE 1", GlassmorphismCanvas.COLOR_GREEN, ["• Initialize DNS & DHCP", "• Start Squid Proxy (:3128)", "• Set up NAT & Firewall"], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("boot-2", 405, 110, 290, 130, "Step 2: manager VM", mgr_ip, "🚀", "STAGE 2", GlassmorphismCanvas.COLOR_GREEN, ["• Init lsfunctions runtime", "• Mount NFS exports", "• Read /tmp/config.ini"], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("boot-3", 760, 110, 290, 130, "Step 3: ESXi Hosts", "ESXi Compute Nodes", "🖥️", "STAGE 3", GlassmorphismCanvas.COLOR_GREEN, ["• Verify SSH management", "• Exit Maintenance Mode", "• Check host power states"], GlassmorphismCanvas.COLOR_BLUE))
         
-        c.add_card(GlassCard("boot-6", 50, 295, 290, 130, "Step 6: vCenter Servers", "vc-mgmt-a & vc-wld01-a", "🏢", "STAGE 6", GlassmorphismCanvas.COLOR_GREEN, ["• Power on vCenter VMs", "• Poll VAMI API (:5480)", "• Verify SSO session tokens"], GlassmorphismCanvas.COLOR_PURPLE))
-        c.add_card(GlassCard("boot-5", 405, 295, 290, 130, "Step 5: NSX Manager & Edges", "nsx-mgmt-01a & Edges", "🔀", "STAGE 5", GlassmorphismCanvas.COLOR_GREEN, ["• Power on NSX Cluster", "• Boot Edge Node VMs", "• Wait 5m for TEP sync"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("boot-6", 50, 295, 290, 130, "Step 6: vCenter Servers", "vCenter Instances", "🏢", "STAGE 6", GlassmorphismCanvas.COLOR_GREEN, ["• Power on vCenter VMs", "• Poll VAMI API (:5480)", "• Verify SSO session tokens"], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("boot-5", 405, 295, 290, 130, "Step 5: NSX Manager & Edges", "NSX Fabric & Edges", "🔀", "STAGE 5", GlassmorphismCanvas.COLOR_GREEN, ["• Power on NSX Cluster", "• Boot Edge Node VMs", "• Wait 5m for TEP sync"], GlassmorphismCanvas.COLOR_PURPLE))
         c.add_card(GlassCard("boot-4", 760, 295, 290, 130, "Step 4: vSAN Storage", "vSAN Cluster Datastores", "💾", "STAGE 4", GlassmorphismCanvas.COLOR_GREEN, ["• Verify vSAN health", "• Mount vSAN Datastores", "• Check disk claim status"], GlassmorphismCanvas.COLOR_PURPLE))
 
-        c.add_card(GlassCard("boot-7", 50, 480, 290, 130, "Step 7: SDDC Manager", "sddcmanager-a", "🎛️", "STAGE 7", GlassmorphismCanvas.COLOR_GREEN, ["• Power on sddcmanager-a", "• Verify API access token", "• Audit domain health"], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("boot-7", 50, 480, 290, 130, "Step 7: SDDC Manager", "SDDC Orchestrator", "🎛️", "STAGE 7", GlassmorphismCanvas.COLOR_GREEN, ["• Power on sddcmanager-a", "• Verify API access token", "• Audit domain health"], GlassmorphismCanvas.COLOR_AMBER))
         c.add_card(GlassCard("boot-8", 405, 480, 290, 130, "Step 8: VCF Operations", "Aria & VCF Automation", "📊", "STAGE 8", GlassmorphismCanvas.COLOR_GREEN, ["• Boot VCF Ops Suite", "• Run URL checker pass", "• Run vcf-lab-tuner pass"], GlassmorphismCanvas.COLOR_AMBER))
         c.add_card(GlassCard("boot-9", 760, 480, 290, 130, "Step 9: Lab Ready!", "System Fully Operational", "🎉", "COMPLETE", GlassmorphismCanvas.COLOR_GREEN, ["• Write startup_status.txt", "• Update status dashboard", "• Signal console ready"], GlassmorphismCanvas.COLOR_GREEN))
 
@@ -1191,10 +1315,20 @@ class LabDiagramBuilder:
 
     def build_core_infrastructure(self) -> GlassmorphismCanvas:
         """7. Core Infrastructure Services Topology"""
+        domain_str = self.env.dns_domain or "site-a.vcf.lab"
+        gw_ip = self.env.gateway_ip or resolve_host('gateway', domain_str) or resolve_host('ext-gw', domain_str) or "Upstream Gateway"
+        r_ip = self.env.router_ip or resolve_host('router', domain_str) or resolve_host('holorouter', domain_str) or "DNS/Router"
+        con_ip = self.env.console_ip or resolve_host('console', domain_str) or "Console UI"
+        mgr_ip = self.env.manager_ip or resolve_host('manager', domain_str) or "Automation Engine"
+        vc_mgmt_ip = resolve_host('vc-mgmt-a', domain_str) or "vCenter Control Plane"
+        
+        core_sub = self.env.core_subnet or get_subnet_for_ip(r_ip, 25) or "Core Fabric"
+        mgmt_sub = get_subnet_for_ip(vc_mgmt_ip, 24) or "Management Fabric"
+
         c = GlassmorphismCanvas(
             width=1120, height=660,
             title="Core Infrastructure & Services Fabric",
-            subtitle="L1 Management, Security, Routing, DNS/DHCP, Proxy & Lab Automation Services",
+            subtitle=f"L1 Management, Security, Routing, DNS/DHCP, Proxy & Lab Automation Services | Domain: {domain_str}",
             style_name=self.diagram_style
         )
         c.add_legend([
@@ -1205,16 +1339,12 @@ class LabDiagramBuilder:
         ])
         
         c.add_container(40, 85, 230, 535, "External Access", subtitle="Upstream Ingress", icon="🌐", border_color="rgba(139,148,158,0.3)")
-        c.add_container(305, 85, 490, 535, "Core Services Fabric (L1)", subtitle="10.1.10.128/25", icon="🛠️", border_color="rgba(88,166,255,0.3)")
-        c.add_container(825, 85, 255, 535, "VCF Ingress Plane", subtitle="10.1.1.0/24", icon="☁️", border_color="rgba(188,140,255,0.3)")
+        c.add_container(305, 85, 490, 535, "Core Services Fabric (L1)", subtitle=core_sub, icon="🛠️", border_color="rgba(88,166,255,0.3)")
+        c.add_container(825, 85, 255, 535, "VCF Ingress Plane", subtitle=mgmt_sub, icon="☁️", border_color="rgba(188,140,255,0.3)")
         
-        c.add_card(GlassCard("ext-gateway", 65, 130, 180, 110, "Internet Gateway", "192.168.0.1", "🌐", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Default Upstream Route"], GlassmorphismCanvas.COLOR_MUTED))
+        c.add_card(GlassCard("ext-gateway", 65, 130, 180, 110, "Internet Gateway", gw_ip, "🌐", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Default Upstream Route"], GlassmorphismCanvas.COLOR_MUTED))
         
-        r_ip = self.env.router_ip or "10.1.10.129"
-        con_ip = self.env.console_ip or "10.1.10.130"
-        mgr_ip = self.env.manager_ip or "10.1.10.131"
         h = self.env.holorouter
-        
         c.add_card(GlassCard("holorouter", 330, 130, 440, 155, "holorouter (Core Gateway & Security VM)", r_ip, "🛡️", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, [
             "• Technitium DNS & DHCP Server",
             f"• Squid Proxy: {h.squid_filter_mode}",
@@ -1234,7 +1364,7 @@ class LabDiagramBuilder:
             "• NFS /tmp Export"
         ], GlassmorphismCanvas.COLOR_PURPLE))
         
-        c.add_card(GlassCard("vcf-ingress", 845, 130, 215, 165, "VCF Control Plane", "10.1.1.x", "🎛️", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+        c.add_card(GlassCard("vcf-ingress", 845, 130, 215, 165, "VCF Control Plane", vc_mgmt_ip, "🎛️", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
             "• SDDC Manager API",
             "• vCenter Server VAMI",
             "• NSX Management VIP"
@@ -1262,14 +1392,14 @@ class LabDiagramBuilder:
         
         c.add_container(35, 85, 530, 640, "Management vCenter: vc-mgmt-a", subtitle="System DVS Fabric", icon="🏢", border_color="rgba(188,140,255,0.3)")
         c.add_card(GlassCard("dvs-m-1", 65, 125, 470, 75, "dpg-mgmt (Management)", "VLAN 101", "⚡", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["ESXi vmk0 Management, vCenter & SDDC IPs"], GlassmorphismCanvas.COLOR_PURPLE))
-        c.add_card(GlassCard("dvs-m-2", 65, 215, 470, 75, "dpg-vsan (vSAN Fabric)", "VLAN 102", "💾", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk1 vSAN Storage Traffic (10.1.2.x)"], GlassmorphismCanvas.COLOR_GREEN))
-        c.add_card(GlassCard("dvs-m-3", 65, 305, 470, 75, "dpg-vmotion (Live Migration)", "VLAN 103", "🔄", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk2 vMotion Traffic (10.1.3.x)"], GlassmorphismCanvas.COLOR_CYAN))
-        c.add_card(GlassCard("dvs-m-4", 65, 395, 470, 75, "dpg-tep (NSX Overlay)", "VLAN 105", "🔀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk50 GENEVE TEP Traffic"], GlassmorphismCanvas.COLOR_ORANGE))
+        c.add_card(GlassCard("dvs-m-2", 65, 215, 470, 75, "dpg-vsan (vSAN Fabric)", "VLAN 102", "💾", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk1 vSAN Storage Traffic"], GlassmorphismCanvas.COLOR_GREEN))
+        c.add_card(GlassCard("dvs-m-3", 65, 305, 470, 75, "dpg-vmotion (Live Migration)", "VLAN 103", "🔄", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk2 vMotion Live State Migration"], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("dvs-m-4", 65, 395, 470, 75, "dpg-tep (NSX Overlay)", "VLAN 105", "🔀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk50 GENEVE TEP Overlay Traffic"], GlassmorphismCanvas.COLOR_ORANGE))
         
         c.add_container(595, 85, 530, 640, "Workload vCenter: vc-wld01-a", subtitle="Tenant DVS Fabric", icon="🏬", border_color="rgba(210,153,34,0.3)")
         c.add_card(GlassCard("dvs-w-1", 620, 125, 475, 75, "dpg-wld01-mgmt", "VLAN 101", "⚡", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["vc-wld01-a, nsx-wld01-a & Supervisor VMs"], GlassmorphismCanvas.COLOR_AMBER))
-        c.add_card(GlassCard("dvs-w-2", 620, 215, 475, 75, "dpg-wld01-vsan", "VLAN 102", "💾", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk1 vSAN Storage Traffic"], GlassmorphismCanvas.COLOR_GREEN))
-        c.add_card(GlassCard("dvs-w-3", 620, 305, 475, 75, "dpg-wld01-vmotion", "VLAN 103", "🔄", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk2 vMotion Traffic"], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("dvs-w-2", 620, 215, 475, 75, "dpg-wld01-vsan", "VLAN 102", "💾", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk1 vSAN Workload Storage Traffic"], GlassmorphismCanvas.COLOR_GREEN))
+        c.add_card(GlassCard("dvs-w-3", 620, 305, 475, 75, "dpg-wld01-vmotion", "VLAN 103", "🔄", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Kernel vmk2 Workload vMotion Live Migration"], GlassmorphismCanvas.COLOR_CYAN))
         c.add_card(GlassCard("dvs-w-4", 620, 395, 475, 75, "seg-tkg-cluster (CNI Overlay)", "GENEVE Overlay", "☸️", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Spherelet & Antrea CNI Pod Segments"], GlassmorphismCanvas.COLOR_AMBER))
         
         return c
@@ -1374,6 +1504,27 @@ class LabDiagramBuilder:
     def build_complete_infrastructure(self) -> GlassmorphismCanvas:
         """10. Complete VCF Lab Holistic Multi-Tier Infrastructure Topology"""
         domain_str = self.env.dns_domain or "site-a.vcf.lab"
+        gw_ip = self.env.gateway_ip or resolve_host('gateway', domain_str) or resolve_host('ext-gw', domain_str) or "Upstream Gateway"
+        r_ip = self.env.router_ip or resolve_host('router', domain_str) or resolve_host('holorouter', domain_str) or "DNS/Router"
+        con_ip = self.env.console_ip or resolve_host('console', domain_str) or "Console UI"
+        mgr_ip = self.env.manager_ip or resolve_host('manager', domain_str) or "Automation Engine"
+        
+        core_sub = self.env.core_subnet or get_subnet_for_ip(r_ip, 25) or "Core Fabric"
+        ext_sub = self.env.external_subnet or get_subnet_for_ip(gw_ip, 24) or "Upstream Ingress"
+
+        vc_mgmt_ip = resolve_host('vc-mgmt-a', domain_str) or "vCenter Control Plane"
+        mgmt_sub = get_subnet_for_ip(vc_mgmt_ip, 24) or "Management Fabric"
+        
+        vc_wld_ip = resolve_host('vc-wld01-a', domain_str) or "Workload vCenter"
+        wld_sub = get_subnet_for_ip(vc_wld_ip, 24) or "Workload Fabric"
+        
+        sddc_ip = resolve_host('sddcmanager-a', domain_str) or "SDDC Manager"
+        nsx_mgmt_ip = resolve_host('nsx-mgmt-01a', domain_str) or "NSX Mgmt"
+        nsx_wld_ip = resolve_host('nsx-wld01-01a', domain_str) or "NSX Wld"
+        
+        sup_cl = next((cl for cl in self.env.k8s_clusters if cl.cluster_type == "Supervisor"), None)
+        sup_vip = sup_cl.vip if sup_cl and sup_cl.vip else (resolve_host('supervisor', domain_str) or "10.1.1.140")
+
         c = GlassmorphismCanvas(
             width=1200, height=920,
             title="Complete VCF Lab Infrastructure Topology",
@@ -1389,14 +1540,11 @@ class LabDiagramBuilder:
         ])
         
         # External Access - Internet Gateway centered as ONLY item
-        c.add_container(40, 80, 1120, 95, "External Access & Upstream Network", subtitle="192.168.0.0/24", icon="🌐", border_color="rgba(139,148,158,0.3)")
-        c.add_card(GlassCard("c-ext-gw", 435, 105, 330, 60, "Internet Gateway", "192.168.0.1", "🌐", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Default Upstream Route"], GlassmorphismCanvas.COLOR_MUTED))
+        c.add_container(40, 80, 1120, 95, "External Access & Upstream Network", subtitle=ext_sub, icon="🌐", border_color="rgba(139,148,158,0.3)")
+        c.add_card(GlassCard("c-ext-gw", 435, 105, 330, 60, "Internet Gateway", gw_ip, "🌐", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Default Upstream Route"], GlassmorphismCanvas.COLOR_MUTED))
         
         # Core VMs
-        c.add_container(40, 195, 1120, 120, "Core Infrastructure VMs (Fabric)", subtitle="10.1.10.128/25", icon="🛠️", border_color="rgba(88,166,255,0.3)")
-        r_ip = self.env.router_ip or "10.1.10.129"
-        con_ip = self.env.console_ip or "10.1.10.130"
-        mgr_ip = self.env.manager_ip or "10.1.10.131"
+        c.add_container(40, 195, 1120, 120, "Core Infrastructure VMs (Fabric)", subtitle=core_sub, icon="🛠️", border_color="rgba(88,166,255,0.3)")
         h = self.env.holorouter
         
         c.add_card(GlassCard("c-router", 70, 220, 330, 85, "holorouter (Router/FW/DNS/Proxy/Git/Auth/CA)", r_ip, "🛡️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, [
@@ -1410,102 +1558,179 @@ class LabDiagramBuilder:
         
         # VCF Domains / Sites
         if not self.env.has_site_b:
-            c.add_container(40, 335, 545, 370, "Management Domain (mgmt-a)", subtitle="10.1.1.0/24", icon="🏛️", border_color="rgba(188,140,255,0.3)")
-            c.add_card(GlassCard("c-sddc", 65, 370, 235, 80, "SDDC Manager", "sddcmanager-a (10.1.1.5)", "🎛️", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["VCF Fleet LCM", "REST API :443"], GlassmorphismCanvas.COLOR_PURPLE))
-            c.add_card(GlassCard("c-vcmgmt", 325, 370, 235, 80, "vCenter Server", "vc-mgmt-a (10.1.1.10)", "🏢", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["SSO: vsphere.local", "VAMI :5480"], GlassmorphismCanvas.COLOR_PURPLE))
-            c.add_card(GlassCard("c-nsxmgmt", 65, 465, 235, 80, "NSX Manager", "nsx-mgmt-01a (10.1.1.21)", "🔀", "HA READY", GlassmorphismCanvas.COLOR_GREEN, ["Policy & Overlay", "VIP Management"], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_container(40, 335, 545, 370, "Management Domain (mgmt-a)", subtitle=mgmt_sub, icon="🏛️", border_color="rgba(188,140,255,0.3)")
+            c.add_card(GlassCard("c-sddc", 65, 370, 235, 80, "SDDC Manager", f"sddcmanager-a ({sddc_ip})", "🎛️", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["VCF Fleet LCM", "REST API :443"], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_card(GlassCard("c-vcmgmt", 325, 370, 235, 80, "vCenter Server", f"vc-mgmt-a ({vc_mgmt_ip})", "🏢", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["SSO: vsphere.local", "VAMI :5480"], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_card(GlassCard("c-nsxmgmt", 65, 465, 235, 80, "NSX Manager", f"nsx-mgmt-01a ({nsx_mgmt_ip})", "🔀", "HA READY", GlassmorphismCanvas.COLOR_GREEN, ["Policy & Overlay", "VIP Management"], GlassmorphismCanvas.COLOR_PURPLE))
             c.add_card(GlassCard("c-mgmthosts", 325, 465, 235, 80, "Mgmt ESXi Cluster", f"{len(self.env.hosts) or 4} ESXi Hosts", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, [f"ESXi {self.env.esxi_version[:12]}"], GlassmorphismCanvas.COLOR_PURPLE))
-            c.add_card(GlassCard("c-vsanmgmt", 65, 560, 495, 80, "vSAN Datastore: vsan-mgmt-01a", "Management Storage Fabric", "💾", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, ["vSAN ESA/OSA Storage Fabric for Management VMs"], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_card(GlassCard("c-vsanmgmt", 65, 560, 495, 80, "vSAN Datastore: vsan-mgmt-01a", "Management Storage Fabric", "💾", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, ["vSAN Storage Fabric for Management VMs"], GlassmorphismCanvas.COLOR_PURPLE))
             
-            c.add_container(615, 335, 545, 370, "Workload Domain (wld01-a)", subtitle="10.1.1.0/24", icon="⚡", border_color="rgba(210,153,34,0.3)")
-            c.add_card(GlassCard("c-vcwld", 640, 370, 235, 80, "vCenter Workload", "vc-wld01-a (10.1.1.11)", "🏬", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["SSO: wld.sso", "VAMI :5480"], GlassmorphismCanvas.COLOR_AMBER))
-            c.add_card(GlassCard("c-nsxwld", 900, 370, 235, 80, "NSX Workload", "nsx-wld01-01a (10.1.1.25)", "🔀", "HA READY", GlassmorphismCanvas.COLOR_GREEN, ["Tenant Overlay & CNI", "VIP Management"], GlassmorphismCanvas.COLOR_AMBER))
+            c.add_container(615, 335, 545, 370, "Workload Domain (wld01-a)", subtitle=wld_sub, icon="⚡", border_color="rgba(210,153,34,0.3)")
+            c.add_card(GlassCard("c-vcwld", 640, 370, 235, 80, "vCenter Workload", f"vc-wld01-a ({vc_wld_ip})", "🏬", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["SSO: wld.sso", "VAMI :5480"], GlassmorphismCanvas.COLOR_AMBER))
+            c.add_card(GlassCard("c-nsxwld", 900, 370, 235, 80, "NSX Workload", f"nsx-wld01-01a ({nsx_wld_ip})", "🔀", "HA READY", GlassmorphismCanvas.COLOR_GREEN, ["Tenant Overlay & CNI", "VIP Management"], GlassmorphismCanvas.COLOR_AMBER))
             c.add_card(GlassCard("c-wldhosts", 640, 465, 235, 80, "Workload ESXi Cluster", "ESXi Compute Nodes", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Supervisor & Tanzu K8s Pods"], GlassmorphismCanvas.COLOR_AMBER))
-            c.add_card(GlassCard("c-scp", 900, 465, 235, 80, "Supervisor CP & Tanzu", "Supervisor VIP (10.1.1.140)", "☸️", "RUNNING", GlassmorphismCanvas.COLOR_GREEN, ["Spherelet & K8s VIP", "Namespace Applications"], GlassmorphismCanvas.COLOR_AMBER))
+            c.add_card(GlassCard("c-scp", 900, 465, 235, 80, "Supervisor CP & Tanzu", f"Supervisor VIP ({sup_vip})", "☸️", "RUNNING", GlassmorphismCanvas.COLOR_GREEN, ["Spherelet & K8s VIP", "Namespace Applications"], GlassmorphismCanvas.COLOR_AMBER))
             c.add_card(GlassCard("c-vsanwld", 640, 560, 495, 80, "vSAN Datastore: vsan-wld01-01a", "Workload Storage Fabric", "💾", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, ["vSAN Workload Storage Fabric for Tanzu PVCs"], GlassmorphismCanvas.COLOR_AMBER))
         else:
-            c.add_container(40, 335, 545, 370, "Site A Datacenter Fabric", subtitle="10.1.1.0/24", icon="🏛️", border_color="rgba(188,140,255,0.3)")
+            c.add_container(40, 335, 545, 370, "Site A Datacenter Fabric", subtitle="Site A Primary Plane", icon="🏛️", border_color="rgba(188,140,255,0.3)")
             c.add_card(GlassCard("c-site-a-vc", 65, 370, 495, 80, "Site-A vCenter Server", "vc-mgmt-a.site-a.vcf.lab", "🏢", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Site A Control Plane & Compute Cluster"], GlassmorphismCanvas.COLOR_PURPLE))
-            c.add_card(GlassCard("c-site-a-hosts", 65, 465, 495, 80, "Site-A ESXi Cluster (4 Hosts)", "esx-01a.site-a.vcf.lab .. esx-04a", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Site A vSAN Storage Fabric"], GlassmorphismCanvas.COLOR_PURPLE))
+            c.add_card(GlassCard("c-site-a-hosts", 65, 465, 495, 80, "Site-A ESXi Cluster", "Site A ESXi Physical Hosts", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Site A vSAN Storage Fabric"], GlassmorphismCanvas.COLOR_PURPLE))
             c.add_card(GlassCard("c-site-a-ds", 65, 560, 495, 80, "Site-A vSAN Datastore", "vsan-site-a-01", "💾", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, ["Site A Clustered vSAN ESA Storage"], GlassmorphismCanvas.COLOR_PURPLE))
             
-            c.add_container(615, 335, 545, 370, "Site B Datacenter Fabric", subtitle="10.2.1.0/24", icon="🏢", border_color="rgba(210,153,34,0.3)")
+            c.add_container(615, 335, 545, 370, "Site B Datacenter Fabric", subtitle="Site B Secondary Plane", icon="🏢", border_color="rgba(210,153,34,0.3)")
             c.add_card(GlassCard("c-site-b-vc", 640, 370, 495, 80, "Site-B vCenter Server", "vc-mgmt-b.site-b.vcf.lab", "🏬", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, ["Site B Control Plane & Compute Cluster"], GlassmorphismCanvas.COLOR_AMBER))
-            c.add_card(GlassCard("c-site-b-hosts", 640, 465, 495, 80, "Site-B ESXi Cluster (4 Hosts)", "esx-01b.site-b.vcf.lab .. esx-04b", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Site B vSAN Storage Fabric"], GlassmorphismCanvas.COLOR_AMBER))
+            c.add_card(GlassCard("c-site-b-hosts", 640, 465, 495, 80, "Site-B ESXi Cluster", "Site B ESXi Physical Hosts", "🖥️", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, ["Site B vSAN Storage Fabric"], GlassmorphismCanvas.COLOR_AMBER))
             c.add_card(GlassCard("c-site-b-ds", 640, 560, 495, 80, "Site-B vSAN Datastore", "vsan-site-b-01", "💾", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, ["Site B Clustered vSAN ESA Storage"], GlassmorphismCanvas.COLOR_AMBER))
 
         return c
 
     def build_supervisor_k8s_architecture(self) -> GlassmorphismCanvas:
-        """11. Supervisor Tanzu Kubernetes Architecture & Pod Topology"""
+        """11. Supervisor Tanzu Kubernetes Architecture & Workload Fabric"""
         domain_str = self.env.dns_domain or "site-a.vcf.lab"
+        vc_mgmt = resolve_host('vc-mgmt-a', domain_str) or f"vc-mgmt-a.{domain_str}"
         
         # Resolve dynamic Supervisor cluster details if discovered
         sup_cl = next((cl for cl in self.env.k8s_clusters if cl.cluster_type == "Supervisor"), None)
-        sup_vip = sup_cl.vip if sup_cl and sup_cl.vip else "10.1.1.140"
+        sup_vip = sup_cl.vip if sup_cl and sup_cl.vip else (resolve_host('supervisor', domain_str) or resolve_host('wcp', domain_str) or "10.1.1.140")
         
         # Resolve Supervisor Control Plane nodes
         cp_nodes = sup_cl.nodes if sup_cl and sup_cl.nodes else [
-            K8sNodeInfo(name="SupervisorControlPlaneVM (1)", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=16384, ip_address="10.1.1.137", taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
-            K8sNodeInfo(name="SupervisorControlPlaneVM (2)", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=16384, ip_address="10.1.1.138", taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
-            K8sNodeInfo(name="SupervisorControlPlaneVM (3)", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=16384, ip_address="10.1.1.139", taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
+            K8sNodeInfo(name="SupervisorControlPlaneVM (1)", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=16384, ip_address=resolve_host('sup-cp-1', domain_str) or resolve_host('SupervisorControlPlaneVM-1', domain_str) or "10.1.1.137", taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
+            K8sNodeInfo(name="SupervisorControlPlaneVM (2)", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=16384, ip_address=resolve_host('sup-cp-2', domain_str) or resolve_host('SupervisorControlPlaneVM-2', domain_str) or "10.1.1.138", taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
+            K8sNodeInfo(name="SupervisorControlPlaneVM (3)", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=16384, ip_address=resolve_host('sup-cp-3', domain_str) or resolve_host('SupervisorControlPlaneVM-3', domain_str) or "10.1.1.139", taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
         ]
         
         cp1 = cp_nodes[0] if len(cp_nodes) > 0 else K8sNodeInfo("SupervisorControlPlaneVM (1)", "control-plane", "Ready", 4, 16384, "10.1.1.137")
         cp2 = cp_nodes[1] if len(cp_nodes) > 1 else K8sNodeInfo("SupervisorControlPlaneVM (2)", "control-plane", "Ready", 4, 16384, "10.1.1.138")
         cp3 = cp_nodes[2] if len(cp_nodes) > 2 else K8sNodeInfo("SupervisorControlPlaneVM (3)", "control-plane", "Ready", 4, 16384, "10.1.1.139")
 
+        # Resolve ESXi Hypervisor Worker hosts
+        hosts_to_show = self.env.hosts[:4] if self.env.hosts else [
+            HostInfo(fqdn=f"esx-01a.{domain_str}", mgmt_ip=resolve_host('esx-01a', domain_str) or "10.1.1.101", cpu_cores=32, memory_gb=128.0),
+            HostInfo(fqdn=f"esx-02a.{domain_str}", mgmt_ip=resolve_host('esx-02a', domain_str) or "10.1.1.102", cpu_cores=32, memory_gb=128.0),
+            HostInfo(fqdn=f"esx-03a.{domain_str}", mgmt_ip=resolve_host('esx-03a', domain_str) or "10.1.1.103", cpu_cores=32, memory_gb=128.0),
+            HostInfo(fqdn=f"esx-04a.{domain_str}", mgmt_ip=resolve_host('esx-04a', domain_str) or "10.1.1.104", cpu_cores=32, memory_gb=128.0),
+        ]
+
         c = GlassmorphismCanvas(
-            width=1150, height=740,
-            title="Supervisor Tanzu K8s Architecture & Pod Topology",
-            subtitle=f"Floating CP VIP ({sup_vip}:6443), Control Plane VMs, Spherelet & vSAN CSI | Domain: {domain_str}",
+            width=1200, height=980,
+            title="Supervisor Tanzu Kubernetes Architecture & Workload Fabric",
+            subtitle=f"Floating CP VIP ({sup_vip}:6443), 3 CP VMs, ESXi Spherelet Hypervisor Workers, Namespaces & vSAN CNS | Domain: {domain_str}",
             style_name=self.diagram_style
         )
         c.add_legend([
-            ("Floating Virtual IP (VIP)", GlassmorphismCanvas.COLOR_AMBER),
-            ("Control Plane Node", GlassmorphismCanvas.COLOR_PURPLE),
-            ("Active Namespace", GlassmorphismCanvas.COLOR_BLUE),
-            ("Microservice Pod", GlassmorphismCanvas.COLOR_GREEN),
-            ("Storage PVC", GlassmorphismCanvas.COLOR_CYAN),
+            ("Ingress & API VIP", GlassmorphismCanvas.COLOR_AMBER),
+            ("Control Plane (etcd)", GlassmorphismCanvas.COLOR_PURPLE),
+            ("Worker Compute (Spherelet)", GlassmorphismCanvas.COLOR_BLUE),
+            ("Supervisor Microservices", GlassmorphismCanvas.COLOR_GREEN),
+            ("Cloud Native Storage (CNS)", GlassmorphismCanvas.COLOR_CYAN),
         ])
-        
-        c.add_container(40, 85, 1070, 180, "Supervisor Tanzu Control Plane Fabric", subtitle=f"Floating VIP ({sup_vip}:6443) -> 3 Control Plane VMs", icon="☸️", border_color="rgba(188,140,255,0.3)")
-        c.add_card(GlassCard("sup-vip", 65, 120, 240, 125, "Supervisor Cluster VIP", f"{sup_vip}:6443 (Floating)", "⚡", "VIP ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
-            f"• API Endpoint: https://{sup_vip}",
-            "• HA DLB Load Balanced",
-            "• Directs API Traffic to Active CP Node"
+
+        # Tier 1: Ingress & Tanzu API Virtual Endpoints (NSX Distributed Load Balancer)
+        c.add_container(40, 85, 1120, 115, "Supervisor Ingress, Tanzu API & DLB Virtual Endpoints (NSX Load Balancer)", subtitle=f"Virtual IP Endpoints (Floating API & DNS)", icon="🌐", border_color="rgba(210,153,34,0.3)")
+        c.add_card(GlassCard("sup-vip", 65, 115, 345, 75, "⚡ Supervisor Cluster Floating VIP", f"https://{sup_vip}:6443", "🌐", "VIP ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• vSphere with Tanzu API Server Endpoint",
+            "• NSX Distributed Load Balancer (DLB) Service"
         ], GlassmorphismCanvas.COLOR_AMBER))
-        
-        c.add_card(GlassCard("sup-cp1", 330, 120, 240, 125, cp1.name, cp1.ip_address, "☸️", cp1.status, GlassmorphismCanvas.COLOR_GREEN, [
-            f"Role: {cp1.role}",
-            f"{cp1.cpu_capacity} vCPUs | {cp1.memory_mb // 1024 if cp1.memory_mb else 16} GB RAM",
-            "Taint: NoSchedule"
+        c.add_card(GlassCard("sup-dns-vip", 430, 115, 345, 75, "🌐 CoreDNS Virtual Service VIP", "172.16.200.x / :53 (Cluster DNS)", "⚡", "VIP ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• CoreDNS Pod Virtual Service IP (kube-dns)",
+            "• Antrea DLB Asymmetric Route Protection"
+        ], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("sup-sso-auth", 795, 115, 345, 75, "🔒 vSphere SSO & WCP Webhook", f"https://{vc_mgmt}:443 (WCP Auth)", "🔀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• SSO administrator@vsphere.local OIDC Auth",
+            "• Supervisor Namespace Permissions Sync"
+        ], GlassmorphismCanvas.COLOR_AMBER))
+
+        # Tier 2: Supervisor Control Plane Quorum
+        c.add_container(40, 215, 1120, 130, "Supervisor Control Plane Quorum (3-Node HA Fabric | K8s v1.30+ / Photon OS)", subtitle=f"3-Node HA Control Plane Quorum ({cp1.ip_address}, {cp2.ip_address}, {cp3.ip_address})", icon="☸️", border_color="rgba(188,140,255,0.3)")
+        c.add_card(GlassCard("sup-cp1", 65, 245, 345, 90, f"☸️ {cp1.name}", cp1.ip_address, "☸️", cp1.status, GlassmorphismCanvas.COLOR_GREEN, [
+            f"• {cp1.cpu_capacity} vCPU | {cp1.memory_mb // 1024 if cp1.memory_mb else 16} GB RAM",
+            "• etcd Member 1, kube-apiserver, WCP Leader",
+            "• Taint: node-role.kubernetes.io/control-plane"
         ], GlassmorphismCanvas.COLOR_PURPLE))
-        c.add_card(GlassCard("sup-cp2", 590, 120, 240, 125, cp2.name, cp2.ip_address, "☸️", cp2.status, GlassmorphismCanvas.COLOR_GREEN, [
-            f"Role: {cp2.role}",
-            f"{cp2.cpu_capacity} vCPUs | {cp2.memory_mb // 1024 if cp2.memory_mb else 16} GB RAM",
-            "Taint: NoSchedule"
+        c.add_card(GlassCard("sup-cp2", 430, 245, 345, 90, f"☸️ {cp2.name}", cp2.ip_address, "☸️", cp2.status, GlassmorphismCanvas.COLOR_GREEN, [
+            f"• {cp2.cpu_capacity} vCPU | {cp2.memory_mb // 1024 if cp2.memory_mb else 16} GB RAM",
+            "• etcd Member 2, kube-controller-manager",
+            "• Taint: node-role.kubernetes.io/control-plane"
         ], GlassmorphismCanvas.COLOR_PURPLE))
-        c.add_card(GlassCard("sup-cp3", 850, 120, 240, 125, cp3.name, cp3.ip_address, "☸️", cp3.status, GlassmorphismCanvas.COLOR_GREEN, [
-            f"Role: {cp3.role}",
-            f"{cp3.cpu_capacity} vCPUs | {cp3.memory_mb // 1024 if cp3.memory_mb else 16} GB RAM",
-            "Taint: NoSchedule"
+        c.add_card(GlassCard("sup-cp3", 795, 245, 345, 90, f"☸️ {cp3.name}", cp3.ip_address, "☸️", cp3.status, GlassmorphismCanvas.COLOR_GREEN, [
+            f"• {cp3.cpu_capacity} vCPU | {cp3.memory_mb // 1024 if cp3.memory_mb else 16} GB RAM",
+            "• etcd Member 3, kube-scheduler, CAPV Controller",
+            "• Taint: node-role.kubernetes.io/control-plane"
         ], GlassmorphismCanvas.COLOR_PURPLE))
 
-        c.add_container(40, 285, 1070, 420, "Supervisor Namespaces & Workload Pod Fabric", subtitle="vSphere Pods & CNI Services", icon="📦", border_color="rgba(88,166,255,0.3)")
-        c.add_card(GlassCard("ns-sys", 65, 320, 325, 170, "System Namespace (kube-system)", "Core Infrastructure", "⚙️", "RUNNING", GlassmorphismCanvas.COLOR_GREEN, ["• spherelet-agent (Spherelet CNI)", "• antrea-agent (Antrea Overlay)", "• coredns (Cluster DNS 172.16.200.x)", "• vmware-system-license"], GlassmorphismCanvas.COLOR_BLUE))
-        c.add_card(GlassCard("ns-harbor", 415, 320, 325, 170, "Namespace: svc-harbor", "Container Registry", "📦", "RUNNING", GlassmorphismCanvas.COLOR_GREEN, ["• harbor-core-0", "• harbor-database-0", "• harbor-redis-0", "• harbor-trivy-0"], GlassmorphismCanvas.COLOR_GREEN))
-        c.add_card(GlassCard("ns-user", 765, 320, 325, 170, "Namespace: ns-hol-apps", "User Applications", "🚀", "RUNNING", GlassmorphismCanvas.COLOR_GREEN, ["• bookstore-app-deployment", "• dsm-postgres-cluster-1", "• acme-frontend-pod"], GlassmorphismCanvas.COLOR_AMBER))
+        # Tier 3: Hypervisor Worker Node Compute Fabric (Spherelet Agents on ESXi)
+        c.add_container(40, 360, 1120, 130, "Hypervisor Worker Node Compute Fabric (ESXi Hosts | Spherelet Agent & Antrea CNI)", subtitle="ESXi Hypervisors Acting as Native K8s Worker Nodes via Spherelet Process", icon="🖥️", border_color="rgba(88,166,255,0.3)")
+        for idx, h in enumerate(hosts_to_show[:4]):
+            x_pos = 65 + (idx * 280)
+            short_name = h.fqdn.split('.')[0]
+            c.add_card(GlassCard(f"sup-host-{idx+1}", x_pos, 390, 260, 85, f"🖥️ {short_name}", h.mgmt_ip or "ESXi Host", "🖥️", "Ready", GlassmorphismCanvas.COLOR_GREEN, [
+                f"• {h.cpu_cores} Cores | {h.memory_gb:.0f} GB RAM",
+                "• Spherelet Native Pod Runtime"
+            ], GlassmorphismCanvas.COLOR_BLUE))
 
-        c.add_card(GlassCard("sup-pvc", 65, 510, 1025, 170, "vSAN Persistent Volume Claims (CSI Storage Fabric)", "Storage Policy: VCF Workload Default", "💾", "BOUND", GlassmorphismCanvas.COLOR_GREEN, [
-            "• PVC pvc-harbor-data -> vSAN Storage Object (20.0 GB)",
-            "• PVC pvc-postgres-data -> vSAN Storage Object (10.0 GB)",
-            "• Dynamic Provisioning via vsphere-csi-driver on ESXi Cluster"
+        # Tier 4: Supervisor Namespaces & Microservice Fabric
+        c.add_container(40, 505, 1120, 230, "Supervisor Namespaces & Workload Pod Fabric", subtitle="Platform Services, Harbor Registry, Cloud Consumption Interface (CCI) & Workload Pods", icon="📦", border_color="rgba(63,185,80,0.3)")
+        c.add_card(GlassCard("sup-ns-sys", 65, 535, 260, 185, "⚙️ kube-system & wcp", "Platform Core", "⚙️", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• spherelet-agent & daemon",
+            "• antrea-agent & ovs-node",
+            "• coredns cluster resolver",
+            "• wcp-operator & capv",
+            "• vmware-system-license"
+        ], GlassmorphismCanvas.COLOR_GREEN))
+        c.add_card(GlassCard("sup-ns-harbor", 345, 535, 260, 185, "📦 svc-harbor", "Container Registry", "📦", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• harbor-core-0 portal",
+            "• harbor-database (Postgres)",
+            "• harbor-redis-0 cache",
+            "• harbor-trivy scanner",
+            "• harbor-jobservice"
+        ], GlassmorphismCanvas.COLOR_GREEN))
+        c.add_card(GlassCard("sup-ns-cci", 625, 535, 260, 185, "🎛️ svc-cci & ns-argocd", "Consumption & GitOps", "🎛️", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• cci-supervisor-operator",
+            "• argo-workflow-controller",
+            "• argocd-server & repo",
+            "• tanzu-package-controller",
+            "• kapp-controller-manager"
+        ], GlassmorphismCanvas.COLOR_GREEN))
+        c.add_card(GlassCard("sup-ns-user", 905, 535, 260, 185, "🚀 ns-hol-apps", "User Workloads", "🚀", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• bookstore-app (3 Pods)",
+            "• dsm-postgres-cluster-1",
+            "• acme-frontend-service",
+            "• cert-manager & secret-injector",
+            "• guest-cluster-tkg-infra"
+        ], GlassmorphismCanvas.COLOR_PURPLE))
+
+        # Tier 5: Storage Classes, Bound PVCs & Cloud Native Storage (CNS) Subsystem
+        c.add_container(40, 750, 1120, 175, "Storage Classes, Bound PVCs & Cloud Native Storage (CNS) Subsystem", subtitle="VMware Cloud Native Storage (CNS), CSI Driver & Underlying Clustered vSAN Datastore", icon="💾", border_color="rgba(56,189,248,0.3)")
+        c.add_card(GlassCard("sup-csi", 65, 780, 345, 130, "💾 VMware vSphere CSI Driver", "Cloud Native Storage", "💾", "BOUND", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Driver: csi.vsphere.vmware.com",
+            "• Syncer: vsphere-csi-controller",
+            "• SPBM Storage Policy Binding",
+            "• First-Class Disk (FCD) Attachment"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("sup-pvcs", 430, 780, 345, 130, "📦 Bound Persistent Volumes (PVCs)", "Dynamic Allocation", "📦", "BOUND", GlassmorphismCanvas.COLOR_GREEN, [
+            "• StorageClass: vsphere-csi-sc (Default)",
+            "• pvc-harbor-data (20 GB Bound)",
+            "• pvc-postgres-data (10 GB Bound)",
+            "• pvc-argocd-repo (5 GB Bound)"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("sup-vsan", 795, 780, 345, 130, "🏛️ Clustered vSAN Datastore", "Resilient Underlying Tier", "🏛️", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, [
+            "• vsan-wld01-01a / vsan-mgmt-01a",
+            "• vSAN ESA NVMe Fast-Tier Storage",
+            "• RAID-5/6 Resilient SPBM Policy",
+            "• Zero-Loss Stateful Pod Recovery"
         ], GlassmorphismCanvas.COLOR_CYAN))
 
-        c.add_edge(FlowEdge((305, 180), (330, 180), "K8s API", GlassmorphismCanvas.COLOR_AMBER))
-        c.add_edge(FlowEdge((575, 265), (575, 285), "Control Flow", GlassmorphismCanvas.COLOR_PURPLE))
-        c.add_edge(FlowEdge((575, 490), (575, 510), "CSI Volume Attach", GlassmorphismCanvas.COLOR_GREEN))
+        # Flow Edges
+        c.add_edge(FlowEdge((235, 190), (235, 245), "kubectl API", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((600, 190), (600, 245), "Cluster DNS", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((235, 335), (195, 390), "Spherelet Sync", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((600, 335), (475, 390), "Spherelet Sync", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((195, 475), (195, 535), "Native Pods", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((475, 475), (475, 535), "Harbor Pods", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((755, 475), (755, 535), "CCI Pods", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((1035, 475), (1035, 535), "User Pods", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((600, 720), (600, 750), "vSphere CSI Mount", GlassmorphismCanvas.COLOR_CYAN))
 
         return c
 
@@ -1515,7 +1740,7 @@ class LabDiagramBuilder:
         
         # Resolve dynamic VSP cluster details if discovered
         vsp_cl = next((cl for cl in self.env.k8s_clusters if cl.cluster_type == "VSP"), None)
-        vsp_vip = vsp_cl.vip if vsp_cl and vsp_cl.vip else "10.1.1.142"
+        vsp_vip = vsp_cl.vip if vsp_cl and vsp_cl.vip else (resolve_host('vsp', domain_str) or resolve_host('vsp-vip', domain_str) or "10.1.1.142")
         
         vsp_node = vsp_cl.nodes[0] if vsp_cl and vsp_cl.nodes else K8sNodeInfo(
             name=f"vsp-01a.{domain_str}",
@@ -1523,7 +1748,7 @@ class LabDiagramBuilder:
             status="Ready",
             cpu_capacity=8,
             memory_mb=32768,
-            ip_address="10.1.1.141",
+            ip_address=resolve_host('vsp-01a', domain_str) or "10.1.1.141",
             taints=["node-role.kubernetes.io/control-plane:NoSchedule"]
         )
         
@@ -1534,133 +1759,567 @@ class LabDiagramBuilder:
         node_status = vsp_node.status or "Ready"
 
         c = GlassmorphismCanvas(
-            width=1150, height=720,
-            title="VSP Management Cluster (Fleet LCM) Architecture",
-            subtitle=f"Single Control Plane Node ({node_ip}) with Floating VIP ({vsp_vip}:5480) | Domain: {domain_str}",
+            width=1200, height=980,
+            title="VSP Management Cluster (Fleet LCM) K8s Architecture",
+            subtitle=f"Ingress VIP ({vsp_vip}:5480), Single Node CP/Worker ({node_ip}), LCM Microservices & Offline Depot | Domain: {domain_str}",
             style_name=self.diagram_style
         )
         c.add_legend([
-            ("Floating Virtual IP (VIP)", GlassmorphismCanvas.COLOR_AMBER),
-            ("Control Node", GlassmorphismCanvas.COLOR_PURPLE),
-            ("LCM Microservice", GlassmorphismCanvas.COLOR_BLUE),
-            ("Platform Service", GlassmorphismCanvas.COLOR_GREEN),
+            ("Ingress & Management VIP", GlassmorphismCanvas.COLOR_AMBER),
+            ("Control Plane & Worker", GlassmorphismCanvas.COLOR_PURPLE),
+            ("LCM Operator & Workflows", GlassmorphismCanvas.COLOR_BLUE),
+            ("Depot & Platform Services", GlassmorphismCanvas.COLOR_GREEN),
+            ("Local Storage & Repos", GlassmorphismCanvas.COLOR_CYAN),
         ])
         
-        c.add_container(40, 85, 1070, 170, "VSP Control Plane Node & Ingress Virtual IP", subtitle=f"Single Node CP ({node_ip}) with Ingress VIP ({vsp_vip}:5480)", icon="⚙️", border_color="rgba(188,140,255,0.3)")
-        c.add_card(GlassCard("vsp-vip", 70, 120, 480, 115, "VSP Management VIP (Floating Endpoint)", f"{vsp_vip}:5480", "⚡", "VIP ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
-            "• Managed by kube-vip Virtual IP Daemon",
-            f"• Ingress Routing to {node_name}",
-            "• Fleet Management Console & API Authentication"
+        # Tier 1: Ingress & Fleet LCM Virtual Endpoints (kube-vip Layer 2)
+        c.add_container(40, 85, 1120, 115, "VSP Ingress & Fleet Lifecycle Management Virtual Endpoints (kube-vip Layer 2)", subtitle=f"Virtual IP Endpoints (Fleet Management & Suite Proxy)", icon="⚙️", border_color="rgba(210,153,34,0.3)")
+        c.add_card(GlassCard("vsp-vip", 65, 115, 345, 75, "⚡ VSP Fleet LCM Ingress VIP", f"https://{vsp_vip}:5480", "⚡", "VIP ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• VCF Fleet Lifecycle Management Portal",
+            "• kube-vip Layer 2 Virtual IP Daemon"
         ], GlassmorphismCanvas.COLOR_AMBER))
-        
-        c.add_card(GlassCard("vsp-node1", 590, 120, 490, 115, f"{node_name} (Single Node CP/Worker)", node_ip, "🖥️", node_status, GlassmorphismCanvas.COLOR_GREEN, [
-            "• Role: control-plane, master, worker (Single Node)",
+        c.add_card(GlassCard("vsp-reg-vip", 430, 115, 345, 75, "🌐 Internal Container Registry VIP", "198.18.128.16:5000", "🌐", "VIP ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Service CIDR: 198.18.128.0/17",
+            "• NO_PROXY bypass for local image pulls"
+        ], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("vsp-proxy-vip", 795, 115, 345, 75, "🔒 SDDC Manager Suite Proxy VIP", f"https://{vsp_vip}:443", "🎛️", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Fleet-to-SDDC Manager API Gateway",
+            "• Single Sign-On Token Authentication"
+        ], GlassmorphismCanvas.COLOR_AMBER))
+
+        # Tier 2: Single-Node Control Plane & Worker Infrastructure
+        c.add_container(40, 215, 1120, 130, "Single-Node Control Plane & Worker Infrastructure (Photon OS / K8s v1.30+)", subtitle=f"Single-Node Control Plane & Worker VM ({node_ip}) | Kubernetes v1.30+ Runtime", icon="🖥️", border_color="rgba(188,140,255,0.3)")
+        c.add_card(GlassCard("vsp-node1", 65, 245, 530, 90, f"🖥️ {node_name} (Control Plane & Worker)", node_ip, "🖥️", node_status, GlassmorphismCanvas.COLOR_GREEN, [
             f"• Sizing: {node_cpu} vCPUs | {node_ram_gb} GB RAM",
-            "• Taint: node-role.kubernetes.io/control-plane:NoSchedule",
-            "• Workloads: Fleet & SDDC LCM Microservices"
+            "• Photon OS Linux (Single Node Master/Worker)",
+            "• Runtime: containerd 1.7+ & kubelet v1.30"
+        ], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("vsp-k8s-core", 625, 245, 530, 90, "⚙️ K8s Subsystems & Taint Tolerations", "Cluster Core Services", "⚙️", "Ready", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Taint: node-role.kubernetes.io/control-plane:NoSchedule (Tolerated)",
+            "• CNI: Calico / Host-Local Subnet (10.244.0.0/16)",
+            "• kube-vip DaemonSet, CoreDNS & Vault Agent Sidecars"
         ], GlassmorphismCanvas.COLOR_PURPLE))
 
-        c.add_container(40, 275, 1070, 400, "VSP LCM Workload Microservices (Namespaces)", subtitle="Fleet Lifecycle Engine", icon="🚀", border_color="rgba(88,166,255,0.3)")
-        c.add_card(GlassCard("pod-fleet", 70, 315, 320, 160, "vcf-fleet-lcm", "Lifecycle Engine", "🛠️", "Running", GlassmorphismCanvas.COLOR_GREEN, ["• fleet-lcm-operator", "• vcf-fleet-depot-service", "• lcm-workflow-controller", "• argo-workflows-agent"], GlassmorphismCanvas.COLOR_BLUE))
-        c.add_card(GlassCard("pod-sddc", 415, 315, 320, 160, "vcf-sddc-lcm", "Domain Orchestration", "🎛️", "Running", GlassmorphismCanvas.COLOR_GREEN, ["• sddc-lcm-service", "• platform-lock-cleaner", "• domain-remediator", "• vcf-suite-proxy"], GlassmorphismCanvas.COLOR_BLUE))
-        c.add_card(GlassCard("pod-telem", 760, 315, 320, 160, "telemetry & observability", "Telemetry Ingestion", "📡", "Running", GlassmorphismCanvas.COLOR_GREEN, ["• telemetry-collector", "• fluentbit-logging-daemon", "• metrics-aggregator", "• status-exporter"], GlassmorphismCanvas.COLOR_GREEN))
+        # Tier 3: Lifecycle Orchestrators, Depots & Task Engines (Operators Pool)
+        c.add_container(40, 360, 1120, 130, "Lifecycle Orchestrators, Depots & Task Engines (Operators Pool)", subtitle="Fleet Lifecycle Engine, SDDC Domain Manager & Observability Collector", icon="🚀", border_color="rgba(88,166,255,0.3)")
+        c.add_card(GlassCard("vsp-op-fleet", 65, 390, 345, 85, "🛠️ VCF Fleet LCM Operator", "vcf-fleet-lcm", "🛠️", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• fleet-lcm-operator & daemon",
+            "• argo-workflows-agent & bundle-downloader"
+        ], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("vsp-op-sddc", 430, 390, 345, 85, "🎛️ SDDC LCM Domain Orchestrator", "vcf-sddc-lcm", "🎛️", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• sddc-lcm-service & suite-proxy",
+            "• platform-lock-cleaner & remediator"
+        ], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("vsp-op-telem", 795, 390, 345, 85, "📡 Telemetry & Observability", "telemetry", "📡", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• telemetry-collector & exporter",
+            "• fluentbit-logging-daemon & metrics"
+        ], GlassmorphismCanvas.COLOR_GREEN))
 
-        c.add_edge(FlowEdge((550, 175), (590, 175), "VIP Routing", GlassmorphismCanvas.COLOR_AMBER))
-        c.add_edge(FlowEdge((835, 235), (835, 275), "API Commands", GlassmorphismCanvas.COLOR_PURPLE))
+        # Tier 4: VSP Workload Microservices Fabric (Namespaces Breakdown)
+        c.add_container(40, 505, 1120, 230, "VSP Workload Microservices Fabric (Namespaces Breakdown)", subtitle="vcf-fleet-lcm, vcf-sddc-lcm, telemetry, and vmsp-platform Workflows", icon="📦", border_color="rgba(63,185,80,0.3)")
+        c.add_card(GlassCard("pod-fleet", 65, 535, 260, 185, "🛠️ vcf-fleet-lcm", "Fleet Lifecycle", "🛠️", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• fleet-lcm-operator",
+            "• vcf-fleet-depot-service",
+            "• lcm-workflow-controller",
+            "• fleet-upgrade-service",
+            "• bundle-downloader-daemon"
+        ], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("pod-sddc", 345, 535, 260, 185, "🎛️ vcf-sddc-lcm", "Domain Management", "🎛️", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• sddc-lcm-service",
+            "• platform-lock-cleaner",
+            "• domain-remediator",
+            "• vcf-suite-proxy",
+            "• credentials-sync-watcher"
+        ], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("pod-telem", 625, 535, 260, 185, "📡 telemetry", "Telemetry & Logs", "📡", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• telemetry-collector",
+            "• fluentbit-logging-daemon",
+            "• metrics-aggregator",
+            "• prometheus-node-exporter",
+            "• audit-trail-shipper"
+        ], GlassmorphismCanvas.COLOR_GREEN))
+        c.add_card(GlassCard("pod-platform", 905, 535, 260, 185, "🔄 vmsp-platform", "Core Platform", "🔄", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• argo-workflow-controller",
+            "• identity-broker-service",
+            "• system-shutdown-watcher",
+            "• platform-secret-syncer",
+            "• cert-rotation-agent"
+        ], GlassmorphismCanvas.COLOR_PURPLE))
+
+        # Tier 5: Storage Subsystems, Offline Depots & Task State Repositories
+        c.add_container(40, 750, 1120, 175, "Storage Subsystems, Offline Depots & Task State Repositories", subtitle="Local Path CSI Storage, Offline Package Bundles & Stateful SQLite/Postgres DBs", icon="💾", border_color="rgba(56,189,248,0.3)")
+        c.add_card(GlassCard("vsp-storage-csi", 65, 780, 345, 130, "💾 Local Path CSI Provisioner", "Dynamic Host Storage", "💾", "BOUND", GlassmorphismCanvas.COLOR_GREEN, [
+            "• StorageClass: local-path (Default)",
+            "• HostPath dynamic PV volume binder",
+            "• Local NVMe SSD mount (/opt/vmware)",
+            "• High IOPS state persistence"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("vsp-depot", 430, 780, 345, 130, "📦 Offline Upgrade Depot & Binaries", "Package Cache", "📦", "AVAILABLE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• /opt/vmware/vcf/depot (50+ GB)",
+            "• VCF 9.x Upgrade Bundle Binaries",
+            "• ESXi, vCenter, NSX ISO Staging",
+            "• Signature Verification Checksums"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("vsp-db-state", 795, 780, 345, 130, "🗄️ Task History & Database State", "SQLite & PostgreSQL", "🗄️", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Embedded PostgreSQL & SQLite DBs",
+            "• Fleet LCM Task Metadata Store",
+            "• Argo Workflow Execution DAGs",
+            "• Lock Status & Entity History Cache"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+
+        # Flow Edges
+        c.add_edge(FlowEdge((235, 190), (330, 245), "kube-vip Route", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((600, 190), (890, 245), "Depot Mirror", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((330, 335), (235, 390), "LCM Operator", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((890, 335), (600, 390), "Orchestration", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((235, 475), (195, 535), "Fleet Pods", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((600, 475), (475, 535), "SDDC Pods", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((970, 475), (755, 535), "Telemetry Pods", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((600, 720), (600, 750), "Local Storage Mount", GlassmorphismCanvas.COLOR_CYAN))
 
         return c
 
     def build_vcfa_k8s_architecture(self) -> GlassmorphismCanvas:
         """13. VCF Automation Microservices K8s Architecture"""
         domain_str = self.env.dns_domain or "site-a.vcf.lab"
+        
+        # Resolve dynamic VCFA cluster details if discovered
+        vcfa_cl = next((cl for cl in self.env.k8s_clusters if cl.cluster_type == "VCFA"), None)
+        vcfa_vip = vcfa_cl.vip if vcfa_cl and vcfa_cl.vip else (resolve_host('auto-a', domain_str) or resolve_host('auto', domain_str) or "10.1.1.70")
+        vcfa_node_ip = (vcfa_cl.nodes[0].ip_address if vcfa_cl and vcfa_cl.nodes and vcfa_cl.nodes[0].ip_address 
+                        else (resolve_host('auto-platform-a', domain_str) or resolve_host('auto-a', domain_str) or "10.1.1.69"))
+        vcfa_node_cpu = vcfa_cl.nodes[0].cpu_capacity if vcfa_cl and vcfa_cl.nodes and vcfa_cl.nodes[0].cpu_capacity else 24
+        vcfa_node_ram = vcfa_cl.nodes[0].memory_mb // 1024 if vcfa_cl and vcfa_cl.nodes and vcfa_cl.nodes[0].memory_mb else 96
+        vcfa_status = vcfa_cl.status if vcfa_cl else "Ready"
+
         c = GlassmorphismCanvas(
-            width=1150, height=720,
-            title="VCF Automation Microservices K8s Architecture",
-            subtitle=f"Node Sizing (24 vCPUs / 96 GB RAM), Istio Ingress VIP (10.1.1.70:443) & Prelude Pods | Domain: {domain_str}",
+            width=1200, height=980,
+            title="VCF Automation (VCFA 9.x) Microservices K8s Architecture",
+            subtitle=f"Istio Ingress VIP ({vcfa_vip}:443), Node ({vcfa_node_ip}), Prelude & VMSP Platform Microservices | Domain: {domain_str}",
             style_name=self.diagram_style
         )
         c.add_legend([
-            ("Ingress Gateway VIP", GlassmorphismCanvas.COLOR_AMBER),
-            ("Platform Node", GlassmorphismCanvas.COLOR_PURPLE),
-            ("Prelude Microservice", GlassmorphismCanvas.COLOR_BLUE),
-            ("Platform Pod", GlassmorphismCanvas.COLOR_GREEN),
+            ("Ingress & Istio Gateway VIP", GlassmorphismCanvas.COLOR_AMBER),
+            ("Platform Compute Node", GlassmorphismCanvas.COLOR_PURPLE),
+            ("Prelude Automation Services", GlassmorphismCanvas.COLOR_BLUE),
+            ("VMSP Core Platform", GlassmorphismCanvas.COLOR_GREEN),
+            ("Storage & State Store", GlassmorphismCanvas.COLOR_CYAN),
         ])
         
-        c.add_container(40, 85, 1070, 155, "VCF Automation K8s Ingress & Node Pool", subtitle="Istio VIP (10.1.1.70) & Host Node (10.1.1.69)", icon="⚡", border_color="rgba(188,140,255,0.3)")
-        c.add_card(GlassCard("vcfa-vip", 70, 120, 440, 105, "Istio Ingress Gateway VIP", "10.1.1.70:443 (Floating)", "🌐", "VIP ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
-            "• Main UI / API Automation Access Endpoint",
-            "• Managed by kube-vip + Envoy Gateway",
-            "• Dispatches Traffic to Prelude Microservices"
+        # Tier 1: Ingress & Traffic Management Layer (kube-vip + Istio Ingress Gateway)
+        c.add_container(40, 85, 1120, 115, "VCF Automation Ingress & Traffic Routing Plane (kube-vip + Istio Gateway)", subtitle=f"Istio VIP ({vcfa_vip}:443) & Direct Platform Endpoint ({vcfa_node_ip}:443)", icon="⚡", border_color="rgba(210,153,34,0.3)")
+        c.add_card(GlassCard("vcfa-vip", 65, 115, 345, 75, "⚡ Istio Ingress Gateway VIP", f"https://{vcfa_vip}:443 (Floating)", "🌐", "VIP ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Unified Automation Portal (Cloud Templates, Pipelines)",
+            "• Envoy Proxy TLS Termination & Path Routing"
         ], GlassmorphismCanvas.COLOR_AMBER))
-        
-        c.add_card(GlassCard("vcfa-node", 550, 120, 530, 105, "auto-a (VCF Automation Platform Node)", "10.1.1.70 / 10.1.1.69", "⚡", "Ready", GlassmorphismCanvas.COLOR_GREEN, [
-            "• Node Sizing: 24 vCPUs | 96 GB RAM",
-            "• Kubernetes: Single Node Control-Plane / Worker",
-            "• Local Storage & Microservice Runtime Fabric"
+        c.add_card(GlassCard("vcfa-direct", 430, 115, 345, 75, "🌐 Automation Platform Direct IP", f"{vcfa_node_ip}:443 (auto-platform-a)", "⚡", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• auto-platform-a Direct Management Endpoint",
+            "• Cluster Management & Diagnostics API"
+        ], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("vcfa-oidc", 795, 115, 345, 75, "🔒 Identity Broker & OIDC Gateway", f"https://{vcfa_vip}/auth (VIDB Proxy)", "🔀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Authentik OIDC (auth.vcf.lab) Integration",
+            "• SCIM 2.0 User & Group RBAC Provisioning"
+        ], GlassmorphismCanvas.COLOR_AMBER))
+
+        # Tier 2: Single-Node Platform Compute & Service Mesh
+        c.add_container(40, 215, 1120, 130, "Single-Node Platform Compute & Service Mesh (Photon OS / K8s v1.30+)", subtitle=f"Single-Node Platform Host VM ({vcfa_node_ip}) | Sizing: {vcfa_node_cpu} vCPUs, {vcfa_node_ram} GB RAM | Antrea CNI", icon="🖥️", border_color="rgba(188,140,255,0.3)")
+        c.add_card(GlassCard("vcfa-node", 65, 245, 530, 90, "🖥️ auto-a / auto-platform-a", f"{vcfa_node_ip}", "🖥️", vcfa_status, GlassmorphismCanvas.COLOR_GREEN, [
+            f"• Sizing: {vcfa_node_cpu} vCPUs | {vcfa_node_ram} GB RAM",
+            "• Photon OS Linux (Single Node Control-Plane & Worker)",
+            "• Runtime: containerd & Kubelet (sudo -i login shell)"
+        ], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("vcfa-istiod", 625, 245, 530, 90, "🕸️ Istio Service Mesh Control Plane", "istio-system", "🕸️", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• istiod Control Plane & Pilot Service Discovery",
+            "• Envoy Sidecar Proxies in all Prelude Pods",
+            "• Mutual TLS (mTLS) & Antrea CNI (10.244.0.0/16)"
         ], GlassmorphismCanvas.COLOR_PURPLE))
 
-        c.add_container(40, 260, 1070, 415, "VCF Automation Microservices Fabric", subtitle="Prelude & VMSP Platform", icon="📦", border_color="rgba(88,166,255,0.3)")
-        c.add_card(GlassCard("pod-istio", 70, 295, 320, 165, "istio-system", "Service Mesh Gateway", "🌐", "Running", GlassmorphismCanvas.COLOR_GREEN, ["• istio-ingressgateway", "• istiod-control-plane", "• kube-vip-ds (VIP 10.1.1.70)", "• envoy-proxy-sidecars"], GlassmorphismCanvas.COLOR_PURPLE))
-        c.add_card(GlassCard("pod-prelude", 415, 295, 320, 165, "prelude (Automation)", "Cloud Templates & Automation", "⚡", "Running", GlassmorphismCanvas.COLOR_GREEN, ["• cloud-template-service", "• blueprint-service", "• provisioning-service", "• catalog-service"], GlassmorphismCanvas.COLOR_BLUE))
-        c.add_card(GlassCard("pod-vmsp", 760, 295, 320, 165, "vmsp-platform", "Platform Core", "🛠️", "Running", GlassmorphismCanvas.COLOR_GREEN, ["• argo-workflow-controller", "• identity-broker-service", "• vault-agent-injector", "• system-shutdown-watcher"], GlassmorphismCanvas.COLOR_GREEN))
+        # Tier 3: Automation Engines, Orchestrators & Extensibility Layer (Core Runtimes)
+        c.add_container(40, 360, 1120, 130, "Automation Engines, Orchestrators & Extensibility Layer (Core Runtimes)", subtitle="Cloud Templates, Resource Allocation & Embedded Orchestrator", icon="⚙️", border_color="rgba(88,166,255,0.3)")
+        c.add_card(GlassCard("vcfa-rt-iac", 65, 390, 345, 85, "⚡ Cloud Templates & IaC Engine", "prelude", "⚡", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• cloud-template-service & blueprints",
+            "• Terraform & Content Gateway"
+        ], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("vcfa-rt-alloc", 430, 390, 345, 85, "🚀 Resource Allocation & Placement", "prelude", "🚀", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• provisioning-service & placement",
+            "• lease-service & project-service"
+        ], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("vcfa-rt-vro", 795, 390, 345, 85, "⚙️ Extensibility & vRO Workflow Engine", "prelude", "⚙️", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• orchestration-service (vRO Embedded)",
+            "• abx-server (Serverless Actions)"
+        ], GlassmorphismCanvas.COLOR_GREEN))
 
-        c.add_edge(FlowEdge((510, 172), (550, 172), "Service Mesh", GlassmorphismCanvas.COLOR_AMBER))
-        c.add_edge(FlowEdge((815, 225), (815, 260), "Istio Mesh Routing", GlassmorphismCanvas.COLOR_PURPLE))
+        # Tier 4: VCF Automation Microservices Fabric (Prelude & VMSP Platform Namespaces)
+        c.add_container(40, 505, 1120, 230, "VCF Automation Microservices Fabric (Prelude & VMSP Platform Namespaces)", subtitle="Cloud Templates, Blueprints, Extensibility (ABX), Service Broker & VMSP Core", icon="📦", border_color="rgba(63,185,80,0.3)")
+        c.add_card(GlassCard("pod-prelude-iac", 65, 535, 260, 185, "⚡ Cloud Templates & IaC", "prelude", "⚡", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• cloud-template-service",
+            "• blueprint-service",
+            "• terraform-service",
+            "• content-gateway-service",
+            "• schema-service"
+        ], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("pod-prelude-broker", 345, 535, 260, 185, "📦 Service Broker & Catalog", "prelude", "📦", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• catalog-service",
+            "• consumer-service",
+            "• policy-service (Governance)",
+            "• approval-service",
+            "• pricing-service"
+        ], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("pod-vmsp-core", 625, 535, 260, 185, "🛠️ VMSP Platform Core", "vmsp-platform", "🛠️", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• argo-workflow-controller",
+            "• identity-broker-service",
+            "• vault-agent-injector",
+            "• system-shutdown-watcher",
+            "• deployment-autoscaler"
+        ], GlassmorphismCanvas.COLOR_GREEN))
+        c.add_card(GlassCard("pod-vmsp-data", 905, 535, 260, 185, "💾 Database & Cache State", "vmsp-platform", "💾", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• postgresql-ha (Pgpool-II)",
+            "• postgres-prelude-master",
+            "• postgres-vmsp-master",
+            "• redis-cluster (Cache)",
+            "• rabbitmq-ha (Event Bus)"
+        ], GlassmorphismCanvas.COLOR_PURPLE))
+
+        # Tier 5: Local Storage CSI Operator, Bound PVCs & Underlying Fast SSD Storage
+        c.add_container(40, 750, 1120, 175, "Local Storage CSI Operator, Bound PVCs & Underlying Fast SSD Storage", subtitle="HostPath / Local Storage CSI, Bound PVCs for vRO DB, Blueprints & Workflow Logs", icon="💾", border_color="rgba(56,189,248,0.3)")
+        c.add_card(GlassCard("vcfa-csi", 65, 780, 345, 130, "💾 Local Storage CSI Operator", "HostPath Dynamic Binding", "💾", "BOUND", GlassmorphismCanvas.COLOR_GREEN, [
+            "• StorageClass: local-path-provisioner",
+            "• HostPath dynamic PV volume binder",
+            "• High IOPS SSD local volumes",
+            "• Volume snapshot & backup integration"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("vcfa-pvcs", 430, 780, 345, 130, "📦 Bound Persistent Volumes (PVCs)", "Dynamic Allocation", "📦", "BOUND", GlassmorphismCanvas.COLOR_GREEN, [
+            "• pvc-vro-db-data (15 GB Bound)",
+            "• pvc-postgres-vmsp (25 GB Bound)",
+            "• pvc-blueprint-repo (10 GB Bound)",
+            "• pvc-argo-artifact-store (20 GB Bound)"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("vcfa-disk", 795, 780, 345, 130, "🏛️ Fast Local SSD Storage Tier", "High-IOPS Subsystem", "🏛️", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, [
+            "• /var/lib/containerd & /data/pvcs",
+            "• Sub-millisecond IOPS for Prelude DBs",
+            "• Rapid container startup & staging",
+            "• Auto-recovering stateful failover"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+
+        # Flow Edges
+        c.add_edge(FlowEdge((235, 190), (330, 245), "Envoy Ingress", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((600, 190), (890, 245), "Service Mesh", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((330, 335), (235, 390), "IaC Engine", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((890, 335), (600, 390), "Placement", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((235, 475), (195, 535), "Blueprints", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((600, 475), (475, 535), "Catalog", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((970, 475), (755, 535), "Platform Core", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((600, 720), (600, 750), "Local Storage CSI", GlassmorphismCanvas.COLOR_CYAN))
+
+        return c
+
+    def build_holorouter_architecture(self) -> GlassmorphismCanvas:
+        """15. Holorouter Services, Container Breakdown & Reverse Proxy Architecture"""
+        domain_str = self.env.dns_domain or "site-a.vcf.lab"
+        h = self.env.holorouter
+        r_ip = h.ip or resolve_host('router', domain_str) or "10.1.10.129"
+        gw_ip = self.env.gateway_ip or resolve_host('gateway', domain_str) or "192.168.0.1"
+        core_sub = self.env.core_subnet or get_subnet_for_ip(r_ip, 25) or "10.1.10.128/25"
+        ext_sub = self.env.external_subnet or get_subnet_for_ip(gw_ip, 24) or "192.168.0.0/24"
+        squid_mode = h.squid_filter_mode or "open"
+        squid_badge = "FILTERING" if squid_mode == "filtered" else "OPEN"
+        squid_badge_color = GlassmorphismCanvas.COLOR_AMBER if squid_mode == "filtered" else GlassmorphismCanvas.COLOR_GREEN
+
+        c = GlassmorphismCanvas(
+            width=1200, height=980,
+            title="Holorouter Services & Container Reverse Proxy Architecture",
+            subtitle=f"NGINX TLS Reverse Proxy, Docker Containers, Authentik OIDC, Technitium DNS, Vault PKI & Squid Filtering | Host: {r_ip}",
+            style_name=self.diagram_style
+        )
+        c.add_legend([
+            ("Ingress & Network Ports", GlassmorphismCanvas.COLOR_AMBER),
+            ("NGINX & TLS Reverse Proxy", GlassmorphismCanvas.COLOR_PURPLE),
+            ("Identity & Security Containers", GlassmorphismCanvas.COLOR_BLUE),
+            ("DNS & Core Service Containers", GlassmorphismCanvas.COLOR_GREEN),
+            ("Network Gateway & Storage", GlassmorphismCanvas.COLOR_CYAN),
+        ])
+
+        # Tier 1: Dual-Homed Network Interfaces & Ingress Ports Matrix
+        c.add_container(40, 85, 1120, 115, "Dual-Homed Network Interfaces & Ingress Ports Matrix (Firewall / NAT)", subtitle=f"External Ingress ({ext_sub}) & Internal Core Fabric ({core_sub}) Port Forwarding", icon="🌐", border_color="rgba(210,153,34,0.3)")
+        c.add_card(GlassCard("holo-eth0", 65, 115, 345, 75, "🌐 External Interface (eth0)", f"{gw_ip} / Upstream Gateway", "🌐", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Default Gateway & Outbound NAT",
+            "• nftables / iptables Stateful Firewall"
+        ], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("holo-eth1", 430, 115, 345, 75, "🔌 Internal Interface (eth1)", f"{r_ip} (holorouter)", "⚡", "ONLINE", GlassmorphismCanvas.COLOR_GREEN, [
+            f"• Core Subnet Gateway: {core_sub}",
+            "• Internal Route to VCF (10.1.0.0/16)"
+        ], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("holo-ports", 795, 115, 345, 75, "⚡ Ingress Ports Matrix", "TCP/UDP Port Mappings", "🎛️", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• :80/:443 (Web/TLS), :53 (DNS), :3128 (Squid)",
+            "• :32000 (Vault), :5380 (DNS UI), :9000 (Auth)"
+        ], GlassmorphismCanvas.COLOR_AMBER))
+
+        # Tier 2: NGINX Reverse Proxy & Dynamic TLS Certificate Termination
+        c.add_container(40, 215, 1120, 130, "NGINX Reverse Proxy & Dynamic TLS Certificate Termination (Vault PKI)", subtitle=f"NGINX Virtual Host SNI Router & Vault PKI Root CA SSL/TLS Certificate Distribution", icon="🔒", border_color="rgba(188,140,255,0.3)")
+        c.add_card(GlassCard("holo-nginx", 65, 245, 345, 90, "🔒 NGINX Reverse Proxy Engine", "NGINX 1.24+ (Systemd)", "🔒", "Active", GlassmorphismCanvas.COLOR_GREEN, [
+            "• SNI Virtual Host Request Router",
+            "• SSL/TLS Offloading & HSTS Headers",
+            "• Upstream HTTP/1.1 & WebSocket Proxy"
+        ], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("holo-vault-certs", 430, 245, 345, 90, "📜 Vault PKI Signed Certificates", "Root CA: holodeck", "📜", "Active", GlassmorphismCanvas.COLOR_GREEN, [
+            "• CA: holodeck Root CA (2-Year Validity)",
+            "• /etc/ssl/certs/holodeck-ca.pem",
+            "• SAN: *.site-a.vcf.lab, *.vcf.lab"
+        ], GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_card(GlassCard("holo-sni-routes", 795, 245, 345, 90, "🔀 Virtual Host & SNI Upstreams", "Reverse Proxy Map", "🔀", "Active", GlassmorphismCanvas.COLOR_GREEN, [
+            "• auth.vcf.lab:443 -> 127.0.0.1:9000 (Authentik)",
+            "• ca.vcf.lab:443 -> 127.0.0.1:8000 (MS ADCS Proxy)",
+            "• git.vcf.lab:443 -> 127.0.0.1:8080 (GitLab CE)"
+        ], GlassmorphismCanvas.COLOR_PURPLE))
+
+        # Tier 3: Core Identity, Security & PKI Container Services
+        c.add_container(40, 360, 1120, 130, "Core Identity, Security & PKI Container Services (Docker & Systemd)", subtitle="Authentik OIDC / SCIM, HashiCorp Vault PKI Engine & Microsoft ADCS CA Proxy", icon="🛡️", border_color="rgba(88,166,255,0.3)")
+        c.add_card(GlassCard("holo-auth", 65, 390, 345, 85, "🛡️ Authentik Identity Platform", "Docker (:9000)", "🛡️", "Active", GlassmorphismCanvas.COLOR_GREEN, [
+            "• OIDC / OAuth2 & SCIM 2.0 Syncer",
+            "• authentik-server & worker"
+        ], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("holo-vault", 430, 390, 345, 85, "🔐 HashiCorp Vault PKI & Secrets", "Systemd (:32000)", "🔐", "Active", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Root CA PKI Engine & KV Secrets",
+            "• sign-verbatim CSR Signing"
+        ], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("holo-ca-proxy", 795, 390, 345, 85, "🏛️ Microsoft ADCS CA Proxy", "Python/Flask (:8000)", "🏛️", "Active", GlassmorphismCanvas.COLOR_GREEN, [
+            "• ADCS Emulator for SDDC Manager",
+            "• Orders PKCS#7 & Signs via Vault"
+        ], GlassmorphismCanvas.COLOR_GREEN))
+
+        # Tier 4: Core Infrastructure, DNS, SCM & Forward Proxy Services
+        c.add_container(40, 505, 1120, 230, "Core Infrastructure, DNS, SCM & Forward Proxy Services (Docker & Systemd)", subtitle="Technitium DNS/DHCP, GitLab SCM Repository & Squid Forward Proxy Filtering", icon="📦", border_color="rgba(63,185,80,0.3)")
+        c.add_card(GlassCard("holo-dns", 65, 535, 260, 185, "🌐 Technitium DNS", "Docker (:53, :5380)", "🌐", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Core DNS Listener (:53)",
+            "• Web UI (:5380 / dns.vcf.lab)",
+            "• Zones: site-a.vcf.lab, vcf.lab",
+            "• DHCP Server Engine",
+            "• Dynamic DNS REST API"
+        ], GlassmorphismCanvas.COLOR_GREEN))
+        c.add_card(GlassCard("holo-gitlab", 345, 535, 260, 185, "🦊 GitLab CE Repository", "Docker (:8080, :2222)", "🦊", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Web UI & Git HTTP (:8080)",
+            "• Git SSH Protocol (:2222)",
+            "• Lab Automation Repos",
+            "• CI/CD Pipelines & Webhooks",
+            "• Embedded PostgreSQL DB"
+        ], GlassmorphismCanvas.COLOR_BLUE))
+        c.add_card(GlassCard("holo-squid", 625, 535, 260, 185, "🛡️ Squid Forward Proxy", f"Systemd (:3128)", "🛡️", squid_badge, squid_badge_color, [
+            "• HTTP/HTTPS Egress Proxy",
+            "• Allowlist: /etc/squid/allowlist",
+            f"• Mode: {squid_mode.upper()}",
+            "• Whitelist Domain Filtering",
+            "• Egress Traffic Logger"
+        ], GlassmorphismCanvas.COLOR_GREEN))
+        c.add_card(GlassCard("holo-host-svc", 905, 535, 260, 185, "⚙️ Core Host Services", "Systemd & SSH", "⚙️", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• OpenSSH Server (:22)",
+            "• Chrony NTP Time Sync",
+            "• iptables / nftables NAT",
+            "• Rsyslog Central Collector",
+            "• Docker Daemon (dockerd)"
+        ], GlassmorphismCanvas.COLOR_PURPLE))
+
+        # Tier 5: Storage Volumes, Kernel Routing & Stateful Subsystems
+        c.add_container(40, 750, 1120, 175, "Storage Volumes, Kernel Routing & Stateful Subsystems", subtitle="Persistent Docker Volumes, nftables Packet NAT & Kernel IP Forwarding", icon="💾", border_color="rgba(56,189,248,0.3)")
+        c.add_card(GlassCard("holo-vols", 65, 780, 345, 130, "💾 Persistent Docker Volumes", "Local Host Mounts", "💾", "MOUNTED", GlassmorphismCanvas.COLOR_GREEN, [
+            "• authentik_media & authentik_db_data",
+            "• gitlab_data, gitlab_config & logs",
+            "• technitium_config & dns_data",
+            "• Stored under /opt/holodeck"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("holo-nat", 430, 780, 345, 130, "🔀 Linux Kernel IP Routing & NAT", "Packet Forwarding", "🔀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• net.ipv4.ip_forward = 1",
+            "• nftables / iptables MASQUERADE eth0",
+            "• Conntrack Stateful Inspection",
+            "• Inter-Subnet Routing (Core <-> VCF)"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("holo-logs", 795, 780, 345, 130, "📜 System Logs & Observability", "Service Monitoring", "📜", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, [
+            "• /var/log/nginx/access.log & error.log",
+            "• /var/log/squid/access.log & cache.log",
+            "• Docker Container logs (journald)",
+            "• Systemd Watchers & Auto-Restart"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+
+        # Flow Edges
+        c.add_edge(FlowEdge((235, 190), (235, 245), "Port 443", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((600, 190), (600, 245), "TLS Certs", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((970, 190), (970, 245), "SNI Proxy", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((235, 335), (235, 390), "OIDC Traffic", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((600, 335), (600, 390), "Vault API", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((970, 335), (970, 390), "ADCS Proxy", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((195, 475), (195, 535), "DNS :53", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((475, 475), (475, 535), "Git :8080", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((755, 475), (755, 535), "Squid :3128", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((600, 720), (600, 750), "Stateful Volumes", GlassmorphismCanvas.COLOR_CYAN))
 
         return c
 
     def build_ssp_k8s_architecture(self) -> GlassmorphismCanvas:
-        """14. Security Services Platform (SSP / vDefend) Architecture"""
+        """14. Security Services Platform (SSP 5.2 / vDefend) Architecture"""
         domain_str = self.env.dns_domain or "site-a.vcf.lab"
+        
+        # Resolve dynamic SSP cluster details if discovered
+        ssp_cl = next((cl for cl in self.env.k8s_clusters if cl.cluster_type == "SSP"), None)
+        capi_ip = (ssp_cl.extra_info.get('capi_mgmt_ip') if ssp_cl and ssp_cl.extra_info and ssp_cl.extra_info.get('capi_mgmt_ip')
+                   else (resolve_host('ssp-i', domain_str) or resolve_host('ssp-installer', domain_str) or '10.1.0.10'))
+        ingress_vip = ssp_cl.vip if ssp_cl and ssp_cl.vip else (resolve_host('ssp', domain_str) or "10.1.0.11")
+        
+        raw_kv = ssp_cl.extra_info.get('kafka_vips') if (ssp_cl and ssp_cl.extra_info) else None
+        if isinstance(raw_kv, list) and len(raw_kv) >= 4:
+            kafka_vips = [str(x) for x in raw_kv]
+        else:
+            kafka_vips = [
+                resolve_host('kafka-0', domain_str) or '10.1.0.12',
+                resolve_host('kafka-1', domain_str) or '10.1.0.13',
+                resolve_host('kafka-2', domain_str) or '10.1.0.14',
+                resolve_host('kafka-3', domain_str) or '10.1.0.15'
+            ]
+        
+        ssp_sub = get_subnet_for_ip(capi_ip, 24) or get_subnet_for_ip(ingress_vip, 24) or "SSP Network Fabric"
+        
+        # Resolve control plane and worker nodes
+        cp_nodes = [n for n in ssp_cl.nodes if n.role == 'control-plane'] if ssp_cl else []
+        if not cp_nodes:
+            cp_nodes = [
+                K8sNodeInfo(name="ssp-controller-6v77j", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=8192, ip_address=resolve_host('ssp-cp-1', domain_str) or "10.1.0.22", taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
+                K8sNodeInfo(name="ssp-controller-t27v4", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=8192, ip_address=resolve_host('ssp-cp-2', domain_str) or "10.1.0.29", taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
+                K8sNodeInfo(name="ssp-controller-rhx6j", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=8192, ip_address=resolve_host('ssp-cp-3', domain_str) or "10.1.0.31", taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
+            ]
+            
+        worker_nodes = [n for n in ssp_cl.nodes if n.role == 'worker'] if ssp_cl else []
+        if not worker_nodes:
+            worker_nodes = [
+                K8sNodeInfo(name="ssp-md-0-worker-vmnr7", role="worker", status="Ready", cpu_capacity=12, memory_mb=57344, ip_address=resolve_host('ssp-worker-1', domain_str) or "10.1.0.23"),
+                K8sNodeInfo(name="ssp-md-0-worker-jzxpd", role="worker", status="Ready", cpu_capacity=12, memory_mb=57344, ip_address=resolve_host('ssp-worker-2', domain_str) or "10.1.0.24"),
+                K8sNodeInfo(name="ssp-md-0-worker-xczc5", role="worker", status="Ready", cpu_capacity=12, memory_mb=57344, ip_address=resolve_host('ssp-worker-3', domain_str) or "10.1.0.25"),
+                K8sNodeInfo(name="ssp-md-0-worker-4znbw", role="worker", status="Ready", cpu_capacity=12, memory_mb=57344, ip_address=resolve_host('ssp-worker-4', domain_str) or "10.1.0.26"),
+                K8sNodeInfo(name="ssp-md-0-worker-mfg2m", role="worker", status="Ready", cpu_capacity=12, memory_mb=57344, ip_address=resolve_host('ssp-worker-5', domain_str) or "10.1.0.27"),
+                K8sNodeInfo(name="ssp-md-0-worker-m82wf", role="worker", status="Ready", cpu_capacity=12, memory_mb=57344, ip_address=resolve_host('ssp-worker-6', domain_str) or "10.1.0.28"),
+            ]
+            
         c = GlassmorphismCanvas(
-            width=1150, height=720,
-            title="Security Services Platform (SSP / vDefend) Architecture",
-            subtitle=f"CAPI Management Plane, NSX Intelligence & Security Microservices | Domain: {domain_str}",
+            width=1200, height=980,
+            title="Security Services Platform (SSP 5.2 / vDefend) Architecture",
+            subtitle=f"CAPI Mgmt ({capi_ip}), Ingress VIP ({ingress_vip}), {len(cp_nodes)+len(worker_nodes)}-Node Cluster & vDefend Security Fabric | Domain: {domain_str}",
             style_name=self.diagram_style
         )
         c.add_legend([
+            ("Ingress & Telemetry VIP", GlassmorphismCanvas.COLOR_AMBER),
             ("CAPI Management", GlassmorphismCanvas.COLOR_PURPLE),
+            ("Control Plane (etcd)", GlassmorphismCanvas.COLOR_PURPLE),
+            ("Worker Compute Node", GlassmorphismCanvas.COLOR_BLUE),
             ("Security Microservice", GlassmorphismCanvas.COLOR_GREEN),
-            ("Streaming Bus", GlassmorphismCanvas.COLOR_AMBER),
+            ("Data Lake & Storage", GlassmorphismCanvas.COLOR_CYAN),
         ])
         
-        c.add_container(40, 85, 1070, 160, "SSP CAPI Management Cluster (ssp-i)", subtitle="10.1.0.10 (sysadmin)", icon="🛡️", border_color="rgba(188,140,255,0.3)")
-        c.add_card(GlassCard("ssp-mgr", 70, 120, 1010, 105, "ssp-installer / ssp-controller", "10.1.0.10", "🛡️", "Ready", GlassmorphismCanvas.COLOR_GREEN, ["CAPI Management: Cluster API, MachineDeployment, KubeadmControlPlane", "Secret: ssp-kubeconfig (kubeconfig for Security Workload Cluster)", "Integration: NSX Manager Security Policy Engine"], GlassmorphismCanvas.COLOR_PURPLE))
+        # Tier 1: Ingress & Telemetry Virtual Endpoints (MetalLB Layer 2)
+        c.add_container(40, 85, 1120, 115, "SSP Ingress & Telemetry Virtual Endpoints (MetalLB Layer 2)", subtitle=f"Virtual IP Endpoints ({ssp_sub})", icon="🌐", border_color="rgba(210,153,34,0.3)")
+        c.add_card(GlassCard("ssp-ing-vip", 65, 115, 345, 75, "⚡ Ingress Gateway VIP", f"https://ssp.{domain_str} ({ingress_vip}:443)", "🌐", "VIP ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Project Contour Envoy Ingress",
+            "• Web UI & AuthServer OIDC Proxy"
+        ], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("ssp-kafka-vip", 430, 115, 345, 75, "⚡ Kafka External Telemetry VIP", f"{kafka_vips[0]}:9092 (Flow Bus)", "⚡", "VIP ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• NSX Security Flow Ingestion",
+            "• High-Throughput Stream Pipeline"
+        ], GlassmorphismCanvas.COLOR_AMBER))
+        c.add_card(GlassCard("ssp-kafka-kraft", 795, 115, 345, 75, "⚡ Kafka KRaft Controller VIPs", f"{kafka_vips[1]}..{kafka_vips[-1]}:9092", "🎛️", "VIP ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Kafka Controller 0, 1, 2 Endpoints",
+            "• Consensus & Metadata Management"
+        ], GlassmorphismCanvas.COLOR_AMBER))
 
-        c.add_container(40, 265, 1070, 410, "nsxi-platform Security Workload Microservices", subtitle="NSX Intelligence & vDefend Fabric", icon="🔒", border_color="rgba(63,185,80,0.3)")
-        c.add_card(GlassCard("pod-intel", 70, 305, 320, 160, "NSX Intelligence", "Flow & Network Analytics", "🔍", "Running", GlassmorphismCanvas.COLOR_GREEN, ["• intelligence-collector", "• flow-analyzer-service", "• recommendation-engine", "• visualization-api"], GlassmorphismCanvas.COLOR_GREEN))
-        c.add_card(GlassCard("pod-ndr", 415, 305, 320, 160, "vDefend NDR & IDS/IPS", "Network Threat Detection", "🛡️", "Running", GlassmorphismCanvas.COLOR_GREEN, ["• ndr-detection-engine", "• malware-analysis-agent", "• distributed-ids-service", "• signature-updater"], GlassmorphismCanvas.COLOR_GREEN))
-        c.add_card(GlassCard("pod-kafka", 760, 305, 320, 160, "Kafka & Storage Bus", "Streaming Telemetry Bus", "⚡", "Running", GlassmorphismCanvas.COLOR_AMBER, ["• kafka-cluster-0", "• zookeeper-cluster-0", "• clickhouse-analytics-db", "• redis-cache-instance"], GlassmorphismCanvas.COLOR_AMBER))
-
-        c.add_edge(FlowEdge((575, 245), (575, 265), "CAPI Orchestration", GlassmorphismCanvas.COLOR_PURPLE))
-
-        return c
-        c.add_legend([
-            ("CAPI Management", GlassmorphismCanvas.COLOR_PURPLE),
-            ("Security Microservice", GlassmorphismCanvas.COLOR_GREEN),
-            ("Streaming Bus", GlassmorphismCanvas.COLOR_AMBER),
-        ])
+        # Tier 2: CAPI Management & Workload Control Plane Quorum
+        c.add_container(40, 215, 1120, 130, "Cluster API Management (ssp-i) & Workload Control Plane Quorum", subtitle=f"CAPI Management Plane ({capi_ip}) & 3-Node Workload CP Quorum (K8s v1.35.6)", icon="🛡️", border_color="rgba(188,140,255,0.3)")
+        c.add_card(GlassCard("ssp-capi", 65, 245, 255, 90, "🛡️ ssp-i (CAPI Installer)", f"{capi_ip} (sysadmin)", "🛡️", "Ready", GlassmorphismCanvas.COLOR_GREEN, [
+            "• CAPI, MachineDeployment",
+            "• Secret: ssp-kubeconfig"
+        ], GlassmorphismCanvas.COLOR_PURPLE))
         
-        c.add_container(40, 85, 1070, 160, "SSP CAPI Management Cluster (ssp-i)", subtitle="10.1.0.10 (sysadmin)", icon="🛡️", border_color="rgba(188,140,255,0.3)")
-        c.add_card(GlassCard("ssp-mgr", 70, 120, 1010, 105, "ssp-installer / ssp-controller", "10.1.0.10", "🛡️", "Ready", GlassmorphismCanvas.COLOR_GREEN, ["CAPI Management: Cluster API, MachineDeployment, KubeadmControlPlane", "Secret: ssp-kubeconfig (kubeconfig for Security Workload Cluster)", "Integration: NSX Manager Security Policy Engine"], GlassmorphismCanvas.COLOR_PURPLE))
+        for idx, cp in enumerate(cp_nodes[:3]):
+            x_pos = 340 + (idx * 275)
+            c.add_card(GlassCard(f"ssp-cp-{idx+1}", x_pos, 245, 255, 90, f"☸️ {cp.name}", cp.ip_address, "☸️", cp.status, GlassmorphismCanvas.COLOR_GREEN, [
+                f"• {cp.cpu_capacity} vCPU | {cp.memory_mb // 1024 if cp.memory_mb else 8} GB RAM",
+                "• etcd quorum & K8s API"
+            ], GlassmorphismCanvas.COLOR_PURPLE))
 
-        c.add_container(40, 265, 1070, 410, "nsxi-platform Security Workload Microservices", subtitle="NSX Intelligence & vDefend Fabric", icon="🔒", border_color="rgba(63,185,80,0.3)")
-        c.add_card(GlassCard("pod-intel", 70, 305, 320, 160, "NSX Intelligence", "Flow & Network Analytics", "🔍", "Running", GlassmorphismCanvas.COLOR_GREEN, ["• intelligence-collector", "• flow-analyzer-service", "• recommendation-engine", "• visualization-api"], GlassmorphismCanvas.COLOR_GREEN))
-        c.add_card(GlassCard("pod-ndr", 415, 305, 320, 160, "vDefend NDR & IDS/IPS", "Network Threat Detection", "🛡️", "Running", GlassmorphismCanvas.COLOR_GREEN, ["• ndr-detection-engine", "• malware-analysis-agent", "• distributed-ids-service", "• signature-updater"], GlassmorphismCanvas.COLOR_GREEN))
-        c.add_card(GlassCard("pod-kafka", 760, 305, 320, 160, "Kafka & Storage Bus", "Streaming Telemetry Bus", "⚡", "Running", GlassmorphismCanvas.COLOR_AMBER, ["• kafka-cluster-0", "• zookeeper-cluster-0", "• clickhouse-analytics-db", "• redis-cache-instance"], GlassmorphismCanvas.COLOR_AMBER))
+        # Tier 3: Workload Worker Node Fabric (6 Nodes Pool)
+        c.add_container(40, 360, 1120, 130, "Workload Worker Node Fabric (6 Compute Nodes | Calico CNI 172.21.0.0/16)", subtitle="Hosts vDefend, NSX Intelligence, Analytics & Ingress Pods", icon="🖥️", border_color="rgba(88,166,255,0.3)")
+        for idx, w in enumerate(worker_nodes[:6]):
+            col = idx % 3
+            row = idx // 3
+            x_pos = 65 + (col * 365)
+            y_pos = 390 + (row * 45)
+            c.add_card(GlassCard(f"ssp-w-{idx+1}", x_pos, y_pos, 350, 40, f"🖥️ {w.name}", f"{w.ip_address} | {w.cpu_capacity} vCPU, {w.memory_mb // 1024 if w.memory_mb else 56}GB", "🖥️", w.status, GlassmorphismCanvas.COLOR_GREEN, [], GlassmorphismCanvas.COLOR_BLUE))
 
-        c.add_edge(FlowEdge((575, 245), (575, 265), "CAPI Orchestration", GlassmorphismCanvas.COLOR_PURPLE))
+        # Tier 4: vDefend & NSX Intelligence Microservices Fabric (nsxi-platform)
+        c.add_container(40, 505, 1120, 230, "vDefend & NSX Intelligence Microservices Fabric (nsxi-platform)", subtitle="NSX Intelligence, Network Detection & Response (NDR), Distributed Threat Analytics & Data Bus", icon="🔒", border_color="rgba(63,185,80,0.3)")
+        c.add_card(GlassCard("pod-intel", 65, 535, 260, 185, "🔍 NSX Intelligence", "Flow & Network Analytics", "🔍", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• intelligence-ui (Portal)",
+            "• latestflow (Correlation)",
+            "• app-discovery & monitor",
+            "• recommendation-engine",
+            "• spark-operator-kf"
+        ], GlassmorphismCanvas.COLOR_GREEN))
+        c.add_card(GlassCard("pod-ndr", 345, 535, 260, 185, "🛡️ vDefend NDR & IDS", "Threat Detection & Response", "🛡️", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• ndr-ui & nsx-ndr-api",
+            "• ids & signature engines",
+            "• event-aggregator & scorer",
+            "• llanta-detectors & NTA",
+            "• pcap-storer & SIEM sender"
+        ], GlassmorphismCanvas.COLOR_GREEN))
+        c.add_card(GlassCard("pod-kafka", 625, 535, 260, 185, "⚡ Data Lake & Streaming", "OLAP & Stream Processing", "⚡", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• kafka-controller (3 KRaft)",
+            "• druid-broker & coordinator",
+            "• druid-historical & router",
+            "• minio (4 S3 Object Pods)",
+            "• redis-cluster (3 nodes)"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("pod-platform", 905, 535, 260, 185, "🔒 Platform & Storage", "Core Identity & State", "🔒", "Running", GlassmorphismCanvas.COLOR_GREEN, [
+            "• postgresql-ha-pgpool (2)",
+            "• authserver & authelia",
+            "• cloud-connector & telemetry",
+            "• trust-manager & debezium",
+            "• ssp-sc (vSAN CSI Volume)"
+        ], GlassmorphismCanvas.COLOR_PURPLE))
+
+        # Tier 5: Ingress, Networking & CSI Storage Subsystems
+        c.add_container(40, 750, 1120, 175, "Ingress, Networking & vSphere CNS Storage Subsystems", subtitle="Contour Ingress Controller, MetalLB Speaker BGP/L2, and VMware vSphere CNS / CSI Storage", icon="💾", border_color="rgba(56,189,248,0.3)")
+        c.add_card(GlassCard("sub-contour", 65, 780, 345, 130, "🔀 Project Contour & MetalLB", "Ingress Controller & L2 LB", "🔀", "ACTIVE", GlassmorphismCanvas.COLOR_GREEN, [
+            "• projectcontour & Envoy DaemonSet",
+            "• metallb-controller & metallb-speaker",
+            "• cert-manager & TLS Certificate Injector",
+            "• HTTPProxy Custom Resource Routing"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("sub-csi", 430, 780, 345, 130, "💾 VMware vSphere CSI Storage", "Cloud Native Storage (CNS)", "💾", "BOUND", GlassmorphismCanvas.COLOR_GREEN, [
+            "• Driver: csi.vsphere.vmware.com",
+            "• StorageClass: ssp-sc (Default)",
+            "• 27+ Bound Persistent Volume Claims",
+            "• Direct vSAN Block Volume Attachment"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+        c.add_card(GlassCard("sub-vsan", 795, 780, 345, 130, "🏛️ Clustered vSAN Datastore", "Underlying Persistent Tier", "🏛️", "HEALTHY", GlassmorphismCanvas.COLOR_GREEN, [
+            "• High-Performance NVMe / SSD vSAN ESA",
+            "• RAID-5/6 Resilient Storage Policy",
+            "• Backs Druid, Kafka, MinIO & DB Data",
+            "• Zero-Loss Stateful Failover Quorum"
+        ], GlassmorphismCanvas.COLOR_CYAN))
+
+        # Flow Edges
+        c.add_edge(FlowEdge((235, 190), (235, 780), "Ingress Route", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((600, 190), (755, 535), "Stream Flow", GlassmorphismCanvas.COLOR_AMBER))
+        c.add_edge(FlowEdge((190, 335), (190, 390), "CAPI Deploy", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((600, 335), (600, 360), "K8s Scheduling", GlassmorphismCanvas.COLOR_PURPLE))
+        c.add_edge(FlowEdge((600, 490), (600, 505), "Workload Host", GlassmorphismCanvas.COLOR_BLUE))
+        c.add_edge(FlowEdge((600, 735), (600, 750), "CNS Volume Mount", GlassmorphismCanvas.COLOR_CYAN))
 
         return c
 
     def build_all(self) -> Dict[str, str]:
-        """Generate and return map of filename to SVG XML content for all 14 diagrams"""
+        """Generate and return map of filename to SVG XML content for all 15 diagrams"""
         return {
             "high_level_architecture.svg": self.build_high_level_architecture().render(),
             "network_dataflow.svg": self.build_network_dataflow().render(),
             "vcf_domain_architecture.svg": self.build_vcf_domain_architecture().render(),
             "esxi_host_layout.svg": self.build_esxi_host_layout().render(),
             "core_infrastructure.svg": self.build_core_infrastructure().render(),
+            "holorouter_architecture.svg": self.build_holorouter_architecture().render(),
             "dvs_topology.svg": self.build_dvs_topology().render(),
             "nsx_architecture.svg": self.build_nsx_architecture().render(),
             "lab_boot_sequence.svg": self.build_lab_boot_sequence().render(),
@@ -1753,6 +2412,10 @@ class LabDataCollector:
         else:
             self.env.has_site_b = False
             self.env.topology_type = "Single Site"
+
+        # Detect Security Services Platform (SSP / vDefend) presence from config
+        if 'ssp' in raw_text.lower() or 'secop' in raw_text.lower() or 'vdefend' in raw_text.lower() or '2770' in self.env.lab_sku:
+            self.env.has_ssp = True
 
         # Get DNS domain from resolv.conf
         try:
@@ -1854,12 +2517,15 @@ class LabDataCollector:
         print(f"  Manager: {self.env.manager_ip}")
         print(f"  Holorouter Squid Mode: {h.squid_filter_mode}")
     
-    def _check_tcp_port(self, host: str, port: int, timeout: int = 2) -> bool:
+    def _check_tcp_port(self, host: str, port: int, timeout: float = 0.5) -> bool:
         """Check if a TCP port is open"""
         try:
+            resolved_ip = resolve_host(host) or host
+            if not resolved_ip:
+                return False
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(timeout)
-            res = s.connect_ex((host, port))
+            res = s.connect_ex((resolved_ip, port))
             s.close()
             return res == 0
         except Exception:
@@ -1868,6 +2534,8 @@ class LabDataCollector:
     def _get_sddc_token(self, host: str) -> Optional[str]:
         """Get SDDC Manager access token trying multiple administrative users"""
         if not REQUESTS_AVAILABLE or requests is None:
+            return None
+        if not self._check_tcp_port(host, 443, timeout=0.5):
             return None
         for user in ['admin@local', 'vcf', 'administrator@vsphere.local']:
             try:
@@ -2186,6 +2854,8 @@ class LabDataCollector:
         """Connect to a vCenter server with SSL verification disabled"""
         if not PYVMOMI_AVAILABLE or connect is None:
             return None
+        if not self._check_tcp_port(host, 443, timeout=0.5):
+            return None
         try:
             try:
                 si = connect.SmartConnect(
@@ -2227,13 +2897,15 @@ class LabDataCollector:
             nsx_managers.extend(['nsx-mgmt-01b.site-b.vcf.lab', 'nsx-wld01-01b.site-b.vcf.lab'])
 
         for nsx_node in nsx_managers:
+            if not self._check_tcp_port(nsx_node, 443, timeout=0.5):
+                continue
             print(f"  Querying NSX Manager {nsx_node}...")
             try:
                 resp = requests.get(
                     f'https://{nsx_node}/api/v1/transport-nodes?node_types=EdgeNode',
                     auth=('admin', self.password),
                     verify=False,
-                    timeout=10
+                    timeout=5
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -2358,11 +3030,12 @@ class LabDataCollector:
         """Collect VSP Fleet LCM K8s Cluster via SSH (Single Node CP/Worker)"""
         print("  Collecting VSP Fleet LCM K8s cluster...")
         domain_s = self.env.dns_domain or "site-a.vcf.lab"
-        target_vip = "10.1.1.142"
+        target_vip = resolve_host('vsp', domain_s) or resolve_host('vsp-vip', domain_s) or "10.1.1.142"
         vsp_fqdn = f"vsp-01a.{domain_s}"
+        vsp_ip = resolve_host('vsp-01a', domain_s) or "10.1.1.141"
         
         # Candidates to probe
-        candidates = [target_vip, vsp_fqdn, "10.1.1.141"]
+        candidates = [target_vip, vsp_fqdn, vsp_ip]
         target_ip = None
         
         if self.password:
@@ -2389,7 +3062,7 @@ class LabDataCollector:
                 status="Ready",
                 cpu_capacity=8,
                 memory_mb=32768,
-                ip_address="10.1.1.141",
+                ip_address=vsp_ip,
                 taints=["node-role.kubernetes.io/control-plane:NoSchedule"]
             ))
             vsp_cluster.pods = [
@@ -2429,7 +3102,7 @@ class LabDataCollector:
                     mem_mb = int(mem_str) * 1024 if 'Gi' in alloc.get('memory', '') else int(int(mem_str) / 1024)
                     
                     addresses = status.get('addresses', [])
-                    node_ip = next((a.get('address') for a in addresses if a.get('type') == 'InternalIP'), "10.1.1.141")
+                    node_ip = next((a.get('address') for a in addresses if a.get('type') == 'InternalIP'), vsp_ip)
                     
                     node = K8sNodeInfo(
                         name=m.get('name', vsp_fqdn),
@@ -2449,7 +3122,7 @@ class LabDataCollector:
                     status="Ready",
                     cpu_capacity=8,
                     memory_mb=32768,
-                    ip_address="10.1.1.141",
+                    ip_address=vsp_ip,
                     taints=["node-role.kubernetes.io/control-plane:NoSchedule"]
                 ))
 
@@ -2476,9 +3149,10 @@ class LabDataCollector:
             print(f"    VSP collection failed: {e}")
 
     def _collect_vcfa_k8s(self):
-        """Collect VCF Automation K8s Cluster via SSH to auto-a (10.1.1.70)"""
+        """Collect VCF Automation K8s Cluster via SSH to auto-a"""
         print("  Collecting VCF Automation K8s cluster...")
-        target_ip = "10.1.1.70"
+        domain_s = self.env.dns_domain or "site-a.vcf.lab"
+        target_ip = resolve_host('auto-a', domain_s) or resolve_host('auto', domain_s) or "10.1.1.70"
         if not self.password or not self._check_tcp_port(target_ip, 22, timeout=1):
             print("    VCFA cluster SSH unreachable, using architecture specs")
             return
@@ -2546,71 +3220,180 @@ class LabDataCollector:
             print(f"    VCFA collection failed: {e}")
 
     def _collect_ssp_k8s(self):
-        """Collect Security Services Platform (SSP / vDefend) K8s Cluster if present"""
+        """Collect Security Services Platform (SSP 5.2 / vDefend) K8s Cluster if present"""
         print("  Checking for Security Services Platform (SSP)...")
-        ssp_ip = "10.1.0.10"
-        if not self.password or not self._check_tcp_port(ssp_ip, 22, timeout=1):
-            print("    SSP cluster not present in this lab")
+        domain_s = self.env.dns_domain or "site-a.vcf.lab"
+        ssp_ip = resolve_host('ssp-i', domain_s) or resolve_host('ssp-installer', domain_s) or resolve_host('ssp', domain_s) or "10.1.0.10"
+        
+        if not self.password or not self._check_tcp_port(ssp_ip, 22, timeout=2):
+            if self.env.has_ssp:
+                print("    SSP cluster detected in config, but SSH unreachable; will use architecture baseline")
+            else:
+                print("    SSP cluster not present in this lab")
             return
         
-        print("  Collecting SSP K8s cluster details...")
+        print(f"  Collecting live SSP K8s cluster details via ssp-i ({ssp_ip})...")
         try:
+            py_collector = (
+                "import json, subprocess, base64\n"
+                "def run(cmd):\n"
+                "    try:\n"
+                "        return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode('utf-8')\n"
+                "    except Exception:\n"
+                "        return ''\n"
+                "out = {}\n"
+                "try:\n"
+                "    m_nodes = run('kubectl get nodes -o json')\n"
+                "    if m_nodes: out['mgmt_nodes'] = json.loads(m_nodes)\n"
+                "    capi_cl = run('kubectl -n ssp get cluster ssp -o json')\n"
+                "    if capi_cl: out['capi_cluster'] = json.loads(capi_cl)\n"
+                "    run('kubectl -n ssp get secret ssp-kubeconfig -o jsonpath=\"{.data.value}\" | base64 -d > /tmp/wlkc 2>/dev/null')\n"
+                "    wl_nodes = run('kubectl --kubeconfig=/tmp/wlkc get nodes -o json')\n"
+                "    if wl_nodes: out['wl_nodes'] = json.loads(wl_nodes)\n"
+                "    wl_svc = run('kubectl --kubeconfig=/tmp/wlkc get svc -A -o json')\n"
+                "    if wl_svc: out['wl_svc'] = json.loads(wl_svc)\n"
+                "    wl_proxies = run('kubectl --kubeconfig=/tmp/wlkc get httpproxy -A -o json')\n"
+                "    if wl_proxies: out['wl_proxies'] = json.loads(wl_proxies)\n"
+                "    wl_ns = run('kubectl --kubeconfig=/tmp/wlkc get ns -o json')\n"
+                "    if wl_ns: out['wl_ns'] = json.loads(wl_ns)\n"
+                "    wl_sc = run('kubectl --kubeconfig=/tmp/wlkc get sc -o json')\n"
+                "    if wl_sc: out['wl_sc'] = json.loads(wl_sc)\n"
+                "    wl_pvc = run('kubectl --kubeconfig=/tmp/wlkc get pvc -A -o json')\n"
+                "    if wl_pvc: out['wl_pvc'] = json.loads(wl_pvc)\n"
+                "    wl_pods = run('kubectl --kubeconfig=/tmp/wlkc get pods -A -o json')\n"
+                "    if wl_pods: out['wl_pods'] = json.loads(wl_pods)\n"
+                "    run('rm -f /tmp/wlkc')\n"
+                "    print('JSON_START' + json.dumps(out) + 'JSON_END')\n"
+                "except Exception as e:\n"
+                "    print('JSON_START' + json.dumps({'error': str(e)}) + 'JSON_END')\n"
+            )
+            b64_script = base64.b64encode(py_collector.encode('utf-8')).decode('utf-8')
+            
             ssh_cmd = [
                 'sshpass', '-p', self.password,
                 'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
                 f'sysadmin@{ssp_ip}',
-                'kubectl -n ssp get secret ssp-kubeconfig -o jsonpath="{.data.value}" 2>/dev/null | base64 -d > /tmp/ssp-kc 2>/dev/null; kubectl --kubeconfig=/tmp/ssp-kc get nodes -o json 2>/dev/null'
+                f'echo {b64_script} | base64 -d | python3'
             ]
-            res = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=5)
-            if res.returncode == 0 and res.stdout.strip():
-                nodes_data = json.loads(res.stdout.strip())
-                ssp_cluster = K8sClusterInfo(
-                    cluster_type="SSP",
-                    name="security-services-platform",
-                    vip=ssp_ip,
-                    status="Healthy"
-                )
-                
-                for item in nodes_data.get('items', []):
-                    m = item.get('metadata', {})
-                    status = item.get('status', {})
-                    alloc = status.get('allocatable', {})
-                    taint_list = [t.get('key', '') + '=' + t.get('effect', '') for t in item.get('spec', {}).get('taints', [])]
-                    
-                    addresses = status.get('addresses', [])
-                    node_ip = next((a.get('address') for a in addresses if a.get('type') == 'InternalIP'), ssp_ip)
-                    
-                    node = K8sNodeInfo(
-                        name=m.get('name', 'ssp-node'),
-                        role="worker",
-                        status="Ready",
-                        cpu_capacity=8,
-                        memory_mb=32768,
-                        ip_address=node_ip,
-                        taints=taint_list
-                    )
-                    ssp_cluster.nodes.append(node)
-
-                # Pods query
-                ssh_pods_cmd = [
-                    'sshpass', '-p', self.password,
-                    'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
-                    f'sysadmin@{ssp_ip}',
-                    'kubectl --kubeconfig=/tmp/ssp-kc get pods -n nsxi-platform -o json 2>/dev/null'
-                ]
-                res_pods = subprocess.run(ssh_pods_cmd, capture_output=True, text=True, timeout=10)
-                if res_pods.returncode == 0 and res_pods.stdout.strip():
-                    pods_data = json.loads(res_pods.stdout.strip())
-                    for item in pods_data.get('items', []):
-                        ssp_cluster.pods.append({
-                            'name': item.get('metadata', {}).get('name', ''),
-                            'namespace': item.get('metadata', {}).get('namespace', ''),
-                            'status': item.get('status', {}).get('phase', 'Running')
-                        })
-
-                self.env.has_ssp = True
-                self.env.k8s_clusters.append(ssp_cluster)
-                print(f"    SSP Cluster: {len(ssp_cluster.nodes)} nodes, {len(ssp_cluster.pods)} pods collected")
+            res = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=20)
+            if res.returncode == 0 and 'JSON_START' in res.stdout:
+                start_idx = res.stdout.find('JSON_START') + len('JSON_START')
+                end_idx = res.stdout.find('JSON_END')
+                if end_idx > start_idx:
+                    data = json.loads(res.stdout[start_idx:end_idx])
+                    if 'error' not in data and 'wl_nodes' in data:
+                        ssp_cluster = K8sClusterInfo(
+                            cluster_type="SSP",
+                            name="ssp",
+                            version="v1.35.6",
+                            vip="10.1.0.11",
+                            status="Healthy"
+                        )
+                        
+                        # Process Workload Nodes
+                        for item in data.get('wl_nodes', {}).get('items', []):
+                            m = item.get('metadata', {})
+                            status = item.get('status', {})
+                            alloc = status.get('allocatable', {})
+                            cap = status.get('capacity', {})
+                            labels = m.get('labels', {})
+                            taint_list = [t.get('key', '') + ('=' + t.get('effect', '') if t.get('effect') else '') for t in item.get('spec', {}).get('taints', [])]
+                            
+                            is_cp = 'node-role.kubernetes.io/control-plane' in labels or 'controller' in m.get('name', '')
+                            role = 'control-plane' if is_cp else 'worker'
+                            
+                            cpu_cap_str = cap.get('cpu', alloc.get('cpu', '12'))
+                            try:
+                                cpu_cap = int(cpu_cap_str.replace('m', ''))
+                            except Exception:
+                                cpu_cap = 12 if role == 'worker' else 4
+                                
+                            mem_str = cap.get('memory', alloc.get('memory', '56Gi'))
+                            try:
+                                if 'Ki' in mem_str:
+                                    mem_mb = int(int(mem_str.replace('Ki', '')) / 1024)
+                                elif 'Gi' in mem_str:
+                                    mem_mb = int(float(mem_str.replace('Gi', '')) * 1024)
+                                elif 'Mi' in mem_str:
+                                    mem_mb = int(float(mem_str.replace('Mi', '')))
+                                else:
+                                    mem_mb = int(int(mem_str) / (1024 * 1024))
+                            except Exception:
+                                mem_mb = 57344 if role == 'worker' else 8192
+                                
+                            addresses = status.get('addresses', [])
+                            node_ip = next((a.get('address') for a in addresses if a.get('type') == 'InternalIP'), '')
+                            
+                            node = K8sNodeInfo(
+                                name=m.get('name', 'ssp-node'),
+                                role=role,
+                                status="Ready",
+                                cpu_capacity=cpu_cap,
+                                memory_mb=mem_mb,
+                                ip_address=node_ip,
+                                taints=taint_list
+                            )
+                            ssp_cluster.nodes.append(node)
+                            
+                        # Process Workload Services & Endpoints
+                        for item in data.get('wl_svc', {}).get('items', []):
+                            m = item.get('metadata', {})
+                            spec = item.get('spec', {})
+                            status = item.get('status', {})
+                            if spec.get('type') == 'LoadBalancer':
+                                ing = status.get('loadBalancer', {}).get('ingress', [])
+                                lb_ip = ing[0].get('ip') if ing else spec.get('loadBalancerIP', '')
+                                ssp_cluster.services.append({
+                                    'name': m.get('name', ''),
+                                    'namespace': m.get('namespace', ''),
+                                    'vip': lb_ip,
+                                    'ports': [p.get('port') for p in spec.get('ports', [])]
+                                })
+                                
+                        # Process Namespaces
+                        for item in data.get('wl_ns', {}).get('items', []):
+                            m = item.get('metadata', {})
+                            status = item.get('status', {})
+                            ssp_cluster.namespaces.append({
+                                'name': m.get('name', ''),
+                                'status': status.get('phase', 'Active')
+                            })
+                            
+                        # Process Pods
+                        for item in data.get('wl_pods', {}).get('items', []):
+                            m = item.get('metadata', {})
+                            status = item.get('status', {})
+                            ssp_cluster.pods.append({
+                                'name': m.get('name', ''),
+                                'namespace': m.get('namespace', ''),
+                                'status': status.get('phase', 'Running'),
+                                'node': item.get('spec', {}).get('nodeName', '')
+                            })
+                            
+                        # Process StorageClasses & PVCs
+                        for item in data.get('wl_sc', {}).get('items', []):
+                            ssp_cluster.storage_classes.append(item.get('metadata', {}).get('name', ''))
+                            
+                        bound_pvc_count = len([p for p in data.get('wl_pvc', {}).get('items', []) if p.get('status', {}).get('phase') == 'Bound'])
+                        
+                        # Extra metadata
+                        ssp_cluster.extra_info = {
+                            'capi_mgmt_ip': ssp_ip,
+                            'capi_mgmt_role': 'Installer & CAPI Management Node (ssp-i)',
+                            'ingress_vip': '10.1.0.11',
+                            'ingress_fqdn': f'ssp.{self.env.dns_domain or "site-a.vcf.lab"}',
+                            'kafka_vips': ['10.1.0.12', '10.1.0.13', '10.1.0.14', '10.1.0.15'],
+                            'storage_class': 'ssp-sc (csi.vsphere.vmware.com)',
+                            'pvc_count': bound_pvc_count,
+                            'capi_status': 'Provisioned (3 CPs, 6 Workers)',
+                        }
+                        
+                        self.env.has_ssp = True
+                        self.env.k8s_clusters.append(ssp_cluster)
+                        cp_count = len([n for n in ssp_cluster.nodes if n.role == 'control-plane'])
+                        w_count = len([n for n in ssp_cluster.nodes if n.role == 'worker'])
+                        print(f"    SSP Cluster: {len(ssp_cluster.nodes)} nodes ({cp_count} CPs, {w_count} Workers), {len(ssp_cluster.pods)} pods, {len(ssp_cluster.services)} LBs collected")
+                        return
         except Exception as e:
             print(f"    SSP collection failed: {e}")
 
@@ -2693,32 +3476,38 @@ class LabDataCollector:
 
         # 4. NSX Edges fallback if empty
         if not self.env.nsx_edges:
+            edge1_ip = resolve_host('vna-wld01-01a', domain_s) or resolve_host('edge-wld01-01a', domain_s) or "10.1.1.51"
+            edge2_ip = resolve_host('vna-wld01-02a', domain_s) or resolve_host('edge-wld01-02a', domain_s) or "10.1.1.52"
             self.env.nsx_edges.append(NSXEdgeInfo(
                 name="vna-wld01-01a",
-                cluster="nsx-wld01-01a.site-a.vcf.lab",
-                mgmt_ip="10.1.1.51",
-                tep_ips=["10.1.3.51", "10.1.3.52"]
+                cluster=f"nsx-wld01-01a.{domain_s}",
+                mgmt_ip=edge1_ip,
+                tep_ips=[f"10.1.3.{i}" for i in [51, 52]]
             ))
             self.env.nsx_edges.append(NSXEdgeInfo(
                 name="vna-wld01-02a",
-                cluster="nsx-wld01-01a.site-a.vcf.lab",
-                mgmt_ip="10.1.1.52",
-                tep_ips=["10.1.3.53", "10.1.3.54"]
+                cluster=f"nsx-wld01-01a.{domain_s}",
+                mgmt_ip=edge2_ip,
+                tep_ips=[f"10.1.3.{i}" for i in [53, 54]]
             ))
 
         # 5. Kubernetes clusters baseline if empty or missing
         has_sup = any(c.cluster_type == "Supervisor" for c in self.env.k8s_clusters)
         if not has_sup:
+            sup_vip = resolve_host('supervisor', domain_s) or resolve_host('wcp', domain_s) or "10.1.1.140"
+            cp1_ip = resolve_host('sup-cp-1', domain_s) or resolve_host('SupervisorControlPlaneVM-1', domain_s) or "10.1.1.137"
+            cp2_ip = resolve_host('sup-cp-2', domain_s) or resolve_host('SupervisorControlPlaneVM-2', domain_s) or "10.1.1.138"
+            cp3_ip = resolve_host('sup-cp-3', domain_s) or resolve_host('SupervisorControlPlaneVM-3', domain_s) or "10.1.1.139"
             self.env.k8s_clusters.append(K8sClusterInfo(
                 cluster_type="Supervisor",
                 name="domain-c8:supervisor",
                 version="v1.28.2+vmware.1",
-                vip="10.1.1.140",
+                vip=sup_vip,
                 status="Healthy",
                 nodes=[
-                    K8sNodeInfo(name="SupervisorControlPlaneVM (1)", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=16384, ip_address="10.1.1.137", taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
-                    K8sNodeInfo(name="SupervisorControlPlaneVM (2)", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=16384, ip_address="10.1.1.138", taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
-                    K8sNodeInfo(name="SupervisorControlPlaneVM (3)", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=16384, ip_address="10.1.1.139", taints=["node-role.kubernetes.io/control-plane:NoSchedule"])
+                    K8sNodeInfo(name="SupervisorControlPlaneVM (1)", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=16384, ip_address=cp1_ip, taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
+                    K8sNodeInfo(name="SupervisorControlPlaneVM (2)", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=16384, ip_address=cp2_ip, taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
+                    K8sNodeInfo(name="SupervisorControlPlaneVM (3)", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=16384, ip_address=cp3_ip, taints=["node-role.kubernetes.io/control-plane:NoSchedule"])
                 ],
                 namespaces=[
                     {'name': 'kube-system', 'status': 'RUNNING'},
@@ -2735,11 +3524,13 @@ class LabDataCollector:
 
         has_vsp = any(c.cluster_type == "VSP" for c in self.env.k8s_clusters)
         if not has_vsp:
+            vsp_vip = resolve_host('vsp', domain_s) or resolve_host('vsp-vip', domain_s) or "10.1.1.142"
+            vsp_node_ip = resolve_host('vsp-01a', domain_s) or "10.1.1.141"
             self.env.k8s_clusters.append(K8sClusterInfo(
                 cluster_type="VSP",
                 name="vsp-fleet-lcm",
                 version="v1.28.6",
-                vip="10.1.1.142",
+                vip=vsp_vip,
                 status="Healthy",
                 nodes=[
                     K8sNodeInfo(
@@ -2748,7 +3539,7 @@ class LabDataCollector:
                         status="Ready",
                         cpu_capacity=8,
                         memory_mb=32768,
-                        ip_address="10.1.1.141",
+                        ip_address=vsp_node_ip,
                         taints=["node-role.kubernetes.io/control-plane:NoSchedule"]
                     )
                 ],
@@ -2767,11 +3558,13 @@ class LabDataCollector:
 
         has_vcfa = any(c.cluster_type == "VCFA" for c in self.env.k8s_clusters)
         if not has_vcfa:
+            vcfa_vip = resolve_host('auto-a', domain_s) or resolve_host('auto', domain_s) or "10.1.1.70"
+            vcfa_node_ip = resolve_host('auto-platform-a', domain_s) or resolve_host('auto-a', domain_s) or "10.1.1.69"
             self.env.k8s_clusters.append(K8sClusterInfo(
                 cluster_type="VCFA",
                 name="vcfa-platform",
                 version="v1.28.6",
-                vip="10.1.1.70",
+                vip=vcfa_vip,
                 status="Healthy",
                 nodes=[
                     K8sNodeInfo(
@@ -2780,7 +3573,7 @@ class LabDataCollector:
                         status="Ready",
                         cpu_capacity=24,
                         memory_mb=98304,
-                        ip_address="10.1.1.70",
+                        ip_address=vcfa_node_ip,
                         taints=[]
                     )
                 ],
@@ -2793,6 +3586,86 @@ class LabDataCollector:
                     {'name': 'authentication-server', 'namespace': 'prelude', 'status': 'Running'},
                     {'name': 'resource-manager-server', 'namespace': 'prelude', 'status': 'Running'},
                     {'name': 'istio-ingressgateway', 'namespace': 'istio-system', 'status': 'Running'}
+                ]
+            ))
+
+        has_ssp = any(c.cluster_type == "SSP" for c in self.env.k8s_clusters)
+        if self.env.has_ssp and not has_ssp:
+            ssp_vip = resolve_host('ssp', domain_s) or "10.1.0.11"
+            ssp_i_ip = resolve_host('ssp-i', domain_s) or resolve_host('ssp-installer', domain_s) or "10.1.0.10"
+            ssp_cp1_ip = resolve_host('ssp-cp-1', domain_s) or "10.1.0.22"
+            ssp_cp2_ip = resolve_host('ssp-cp-2', domain_s) or "10.1.0.29"
+            ssp_cp3_ip = resolve_host('ssp-cp-3', domain_s) or "10.1.0.31"
+            ssp_w1_ip = resolve_host('ssp-worker-1', domain_s) or "10.1.0.23"
+            ssp_w2_ip = resolve_host('ssp-worker-2', domain_s) or "10.1.0.24"
+            ssp_w3_ip = resolve_host('ssp-worker-3', domain_s) or "10.1.0.25"
+            ssp_w4_ip = resolve_host('ssp-worker-4', domain_s) or "10.1.0.26"
+            ssp_w5_ip = resolve_host('ssp-worker-5', domain_s) or "10.1.0.27"
+            ssp_w6_ip = resolve_host('ssp-worker-6', domain_s) or "10.1.0.28"
+            
+            k1 = resolve_host('kafka-0', domain_s) or '10.1.0.12'
+            k2 = resolve_host('kafka-1', domain_s) or '10.1.0.13'
+            k3 = resolve_host('kafka-2', domain_s) or '10.1.0.14'
+            k4 = resolve_host('kafka-3', domain_s) or '10.1.0.15'
+
+            self.env.k8s_clusters.append(K8sClusterInfo(
+                cluster_type="SSP",
+                name="ssp",
+                version="v1.35.6",
+                vip=ssp_vip,
+                status="Healthy",
+                nodes=[
+                    K8sNodeInfo(name="ssp-controller-6v77j", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=8192, ip_address=ssp_cp1_ip, taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
+                    K8sNodeInfo(name="ssp-controller-t27v4", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=8192, ip_address=ssp_cp2_ip, taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
+                    K8sNodeInfo(name="ssp-controller-rhx6j", role="control-plane", status="Ready", cpu_capacity=4, memory_mb=8192, ip_address=ssp_cp3_ip, taints=["node-role.kubernetes.io/control-plane:NoSchedule"]),
+                    K8sNodeInfo(name="ssp-md-0-worker-vmnr7", role="worker", status="Ready", cpu_capacity=12, memory_mb=57344, ip_address=ssp_w1_ip),
+                    K8sNodeInfo(name="ssp-md-0-worker-jzxpd", role="worker", status="Ready", cpu_capacity=12, memory_mb=57344, ip_address=ssp_w2_ip),
+                    K8sNodeInfo(name="ssp-md-0-worker-xczc5", role="worker", status="Ready", cpu_capacity=12, memory_mb=57344, ip_address=ssp_w3_ip),
+                    K8sNodeInfo(name="ssp-md-0-worker-4znbw", role="worker", status="Ready", cpu_capacity=12, memory_mb=57344, ip_address=ssp_w4_ip),
+                    K8sNodeInfo(name="ssp-md-0-worker-mfg2m", role="worker", status="Ready", cpu_capacity=12, memory_mb=57344, ip_address=ssp_w5_ip),
+                    K8sNodeInfo(name="ssp-md-0-worker-m82wf", role="worker", status="Ready", cpu_capacity=12, memory_mb=57344, ip_address=ssp_w6_ip),
+                ],
+                namespaces=[
+                    {'name': 'nsxi-platform', 'status': 'Active'},
+                    {'name': 'projectcontour', 'status': 'Active'},
+                    {'name': 'metallb-system', 'status': 'Active'},
+                    {'name': 'cert-manager', 'status': 'Active'},
+                    {'name': 'vmware-system-csi', 'status': 'Active'},
+                    {'name': 'kube-system', 'status': 'Active'}
+                ],
+                services=[
+                    {'name': 'projectcontour-envoy', 'namespace': 'projectcontour', 'vip': ssp_vip, 'ports': [80, 443]},
+                    {'name': 'kafka-external', 'namespace': 'nsxi-platform', 'vip': k1, 'ports': [9092]},
+                    {'name': 'kafka-controller-2-external', 'namespace': 'nsxi-platform', 'vip': k2, 'ports': [9092]},
+                    {'name': 'kafka-controller-1-external', 'namespace': 'nsxi-platform', 'vip': k3, 'ports': [9092]},
+                    {'name': 'kafka-controller-0-external', 'namespace': 'nsxi-platform', 'vip': k4, 'ports': [9092]}
+                ],
+                storage_classes=['ssp-sc'],
+                extra_info={
+                    'capi_mgmt_ip': ssp_i_ip,
+                    'capi_mgmt_role': 'Installer & CAPI Management Node (ssp-i)',
+                    'ingress_vip': ssp_vip,
+                    'ingress_fqdn': f'ssp.{domain_s}',
+                    'kafka_vips': [k1, k2, k3, k4],
+                    'storage_class': 'ssp-sc (csi.vsphere.vmware.com)',
+                    'pvc_count': 27,
+                    'capi_status': 'Provisioned (3 CPs, 6 Workers)',
+                },
+                pods=[
+                    {'name': 'intelligence-ui', 'namespace': 'nsxi-platform', 'status': 'Running'},
+                    {'name': 'latestflow', 'namespace': 'nsxi-platform', 'status': 'Running'},
+                    {'name': 'app-discovery', 'namespace': 'nsxi-platform', 'status': 'Running'},
+                    {'name': 'ndr-ui', 'namespace': 'nsxi-platform', 'status': 'Running'},
+                    {'name': 'ids', 'namespace': 'nsxi-platform', 'status': 'Running'},
+                    {'name': 'nsx-ndr-api', 'namespace': 'nsxi-platform', 'status': 'Running'},
+                    {'name': 'kafka-controller-0', 'namespace': 'nsxi-platform', 'status': 'Running'},
+                    {'name': 'druid-broker', 'namespace': 'nsxi-platform', 'status': 'Running'},
+                    {'name': 'minio-0', 'namespace': 'nsxi-platform', 'status': 'Running'},
+                    {'name': 'postgresql-ha-pg-0', 'namespace': 'nsxi-platform', 'status': 'Running'},
+                    {'name': 'redis-cluster-0', 'namespace': 'nsxi-platform', 'status': 'Running'},
+                    {'name': 'projectcontour-envoy', 'namespace': 'projectcontour', 'status': 'Running'},
+                    {'name': 'ssp-metallb-speaker', 'namespace': 'metallb-system', 'status': 'Running'},
+                    {'name': 'vsphere-csi-controller', 'namespace': 'vmware-system-csi', 'status': 'Running'}
                 ]
             ))
 
@@ -2972,7 +3845,12 @@ class LabDetailsGenerator:
         html.append('      <a class="nav-link" href="#domains">VCF Domains</a>')
         html.append('      <a class="nav-link" href="#hosts">ESXi Hosts</a>')
         html.append('      <a class="nav-link" href="#inventory">VM Inventory</a>')
+        html.append('      <a class="nav-link" href="#k8s-supervisor">Supervisor</a>')
+        html.append('      <a class="nav-link" href="#k8s-vsp">VSP LCM</a>')
+        html.append('      <a class="nav-link" href="#k8s-vcfa">VCFA</a>')
+        html.append('      <a class="nav-link" href="#k8s-ssp">SSP</a>')
         html.append('      <a class="nav-link" href="#core-vms">Core VMs</a>')
+        html.append('      <a class="nav-link" href="#holorouter">Holorouter</a>')
         html.append('      <a class="nav-link" href="#subnets">Subnets</a>')
         html.append('      <a class="nav-link" href="#dvs">Virtual Switches</a>')
         html.append('      <a class="nav-link" href="#nsx">NSX-T</a>')
@@ -3076,8 +3954,16 @@ class LabDetailsGenerator:
             html.append('      </div>')
         html.append('    </div>')
 
-        # 7. Core Infrastructure VMs
+        # 6b. Kubernetes & Platform Architectures
+        add_diagram_card("k8s-supervisor", "☸️", "Supervisor Tanzu Kubernetes Architecture & Workload Fabric", "supervisor_k8s_architecture.svg", "3-node HA control plane, ESXi Spherelet hypervisor workers, vSAN Cloud Native Storage (CNS), and namespaces.")
+        add_diagram_card("k8s-vsp", "⚙️", "VSP Management Cluster (Fleet LCM) K8s Architecture", "vsp_k8s_architecture.svg", "Single-node control plane/worker, kube-vip Layer 2 VIP (:5480), Fleet LCM operators, and local depot storage.")
+        add_diagram_card("k8s-vcfa", "⚡", "VCF Automation (VCFA 9.x) Microservices K8s Architecture", "vcfa_k8s_architecture.svg", "Istio ingress gateway (:443), Prelude cloud templates/pipelines, VMSP platform microservices, and local CSI.")
+        if self.env.has_ssp or "ssp_k8s_architecture.svg" in svg_map:
+            add_diagram_card("k8s-ssp", "🛡️", "Security Services Platform (SSP 5.2 / vDefend) Architecture", "ssp_k8s_architecture.svg", "MetalLB ingress/Kafka telemetry VIPs, CAPI management host, multi-node compute fabric, and vDefend security microservices.")
+
+        # 7. Core Infrastructure VMs & Holorouter Services
         add_diagram_card("core-vms", "🛠️", "Core Infrastructure & Services Fabric", "core_infrastructure.svg", "L1 routing, Technitium DNS, DHCP, Squid proxy, desktop console, and manager automation.")
+        add_diagram_card("holorouter", "🛡️", "Holorouter Services & Container Reverse Proxy Architecture", "holorouter_architecture.svg", "NGINX TLS reverse proxy, Authentik OIDC, Technitium DNS, Vault PKI engine, Squid forward proxy, and kernel routing.")
 
         # 8. Network Subnets Reference Table
         html.append('    <!-- Network Subnets Reference -->')
@@ -3087,12 +3973,25 @@ class LabDetailsGenerator:
         html.append('        <table>')
         html.append('          <thead><tr><th>Network</th><th>Subnet</th><th>Gateway</th><th>Purpose</th></tr></thead>')
         html.append('          <tbody>')
-        html.append('            <tr><td><strong>Core / Services</strong></td><td><code>10.1.10.128/25</code></td><td><code>10.1.10.129</code></td><td>Console, Manager VM, Router, DNS/DHCP</td></tr>')
-        html.append('            <tr><td><strong>VCF Management</strong></td><td><code>10.1.1.0/24</code></td><td><code>10.1.1.1</code></td><td>vCenter, SDDC Manager, NSX Manager, Aria Suite</td></tr>')
-        html.append('            <tr><td><strong>vSAN Storage</strong></td><td><code>10.1.2.0/24</code></td><td>-</td><td>Dedicated Clustered vSAN Storage Fabric</td></tr>')
-        html.append('            <tr><td><strong>vMotion Migration</strong></td><td><code>10.1.3.0/24</code></td><td>-</td><td>High-Speed Live VM State Migration</td></tr>')
-        html.append('            <tr><td><strong>NSX GENEVE TEP</strong></td><td><code>10.1.5.128/25</code></td><td><code>10.1.5.129</code></td><td>NSX Overlay Transport Node &amp; Edge Tunnel Endpoints</td></tr>')
-        html.append('            <tr><td><strong>External (Holodeck)</strong></td><td><code>192.168.0.0/24</code></td><td><code>192.168.0.1</code></td><td>vPod Host Uplink &amp; External Internet Access</td></tr>')
+        
+        domain_s = self.env.dns_domain or "site-a.vcf.lab"
+        core_sub = self.env.core_subnet or get_subnet_for_ip(self.env.router_ip, 25) or "10.1.10.128/25"
+        core_gw = self.env.router_ip or resolve_host('router', domain_s) or "10.1.10.129"
+        ext_sub = self.env.external_subnet or get_subnet_for_ip(self.env.gateway_ip, 24) or "192.168.0.0/24"
+        ext_gw = self.env.gateway_ip or resolve_host('gateway', domain_s) or "192.168.0.1"
+        
+        sample_host = self.env.hosts[0] if self.env.hosts else None
+        mgmt_sub = get_subnet_for_ip(sample_host.mgmt_ip, 24) if sample_host and sample_host.mgmt_ip else "10.1.1.0/24"
+        vsan_sub = get_subnet_for_ip(sample_host.vsan_ip, 24) if sample_host and sample_host.vsan_ip else "10.1.2.0/24"
+        vmotion_sub = get_subnet_for_ip(sample_host.vmotion_ip, 24) if sample_host and sample_host.vmotion_ip else "10.1.3.0/24"
+        tep_sub = get_subnet_for_ip(sample_host.tep_ip, 25) if sample_host and sample_host.tep_ip else "10.1.5.128/25"
+
+        html.append(f'            <tr><td><strong>Core / Services</strong></td><td><code>{xml_escape(core_sub)}</code></td><td><code>{xml_escape(core_gw)}</code></td><td>Console, Manager VM, Router, DNS/DHCP</td></tr>')
+        html.append(f'            <tr><td><strong>VCF Management</strong></td><td><code>{xml_escape(mgmt_sub)}</code></td><td><code>{xml_escape(mgmt_sub.rsplit(".", 1)[0] + ".1")}</code></td><td>vCenter, SDDC Manager, NSX Manager, Aria Suite</td></tr>')
+        html.append(f'            <tr><td><strong>vSAN Storage</strong></td><td><code>{xml_escape(vsan_sub)}</code></td><td>-</td><td>Dedicated Clustered vSAN Storage Fabric</td></tr>')
+        html.append(f'            <tr><td><strong>vMotion Migration</strong></td><td><code>{xml_escape(vmotion_sub)}</code></td><td>-</td><td>High-Speed Live VM State Migration</td></tr>')
+        html.append(f'            <tr><td><strong>NSX GENEVE TEP</strong></td><td><code>{xml_escape(tep_sub)}</code></td><td><code>{xml_escape(tep_sub.rsplit(".", 1)[0] + ".129")}</code></td><td>NSX Overlay Transport Node &amp; Edge Tunnel Endpoints</td></tr>')
+        html.append(f'            <tr><td><strong>External (Holodeck)</strong></td><td><code>{xml_escape(ext_sub)}</code></td><td><code>{xml_escape(ext_gw)}</code></td><td>vPod Host Uplink &amp; External Internet Access</td></tr>')
         html.append('          </tbody>')
         html.append('        </table>')
         html.append('      </div>')
@@ -3307,16 +4206,18 @@ class LabDetailsGenerator:
             self._add(f"![High-Level Architecture]({self.svg_rel_dir}/high_level_architecture.svg)")
             self._add()
         if self.diagram_style in ("mermaid", "both"):
+            ext_sub = self.env.external_subnet or "192.168.0.0/24"
+            core_sub = self.env.core_subnet or "10.1.10.128/25"
             self._add("```mermaid")
             self._add("flowchart TB")
             self._add(MERMAID_STYLES)
             self._add()
             self._add('    subgraph External["External Network"]')
-            self._add('        Internet[("Internet<br/>192.168.0.0/24")]')
+            self._add(f'        Internet[("Internet<br/>{ext_sub}")]')
             self._add('    end')
             self._add()
             self._add('    subgraph vPod["vPod Environment"]')
-            self._add('        subgraph CoreVMs["Core Infrastructure VMs<br/>10.1.10.128/25"]')
+            self._add(f'        subgraph CoreVMs["Core Infrastructure VMs<br/>{core_sub}"]')
             self._add(f'            Router["holorouter<br/>{self.env.router_ip}<br/>(DNS/DHCP/Proxy/FW)"]')
             self._add(f'            Console["console<br/>{self.env.console_ip}<br/>(Linux Main Console)"]')
             self._add(f'            Manager["manager<br/>{self.env.manager_ip}<br/>(Lab Startup/Automation)"]')
@@ -3381,12 +4282,18 @@ class LabDetailsGenerator:
             self._add(f"![Multi-Plane Network & Data Flow Topology]({self.svg_rel_dir}/network_dataflow.svg)")
             self._add()
         if self.diagram_style in ("mermaid", "both"):
+            ext_sub = self.env.external_subnet or "192.168.0.0/24"
+            core_sub = self.env.core_subnet or "10.1.10.128/25"
+            sample_host = self.env.hosts[0] if self.env.hosts else None
+            mgmt_sub = get_subnet_for_ip(sample_host.mgmt_ip, 24) if sample_host and sample_host.mgmt_ip else "10.1.1.0/24"
+            vsan_sub = get_subnet_for_ip(sample_host.vsan_ip, 24) if sample_host and sample_host.vsan_ip else "10.1.2.0/24"
+
             self._add("```mermaid")
             self._add("flowchart LR")
             self._add(MERMAID_STYLES)
             self._add()
             self._add('    subgraph External["External/Internet"]')
-            self._add('        ExtNet["192.168.0.0/24"]')
+            self._add(f'        ExtNet["{ext_sub}"]')
             self._add('    end')
             self._add()
             self._add(f'    subgraph Router["holorouter ({self.env.router_ip})"]')
@@ -3396,12 +4303,12 @@ class LabDetailsGenerator:
             self._add('    end')
             self._add()
             self._add('    subgraph Networks["Internal Networks"]')
-            self._add('        subgraph CoreNet["Core Network<br/>10.1.10.128/25"]')
+            self._add(f'        subgraph CoreNet["Core Network<br/>{core_sub}"]')
             self._add(f'            Console2["console<br/>{self.env.console_ip}"]')
             self._add(f'            Manager2["manager<br/>{self.env.manager_ip}"]')
             self._add('        end')
             self._add()
-            self._add('        subgraph MgmtNet["Management Network<br/>10.1.1.0/24"]')
+            self._add(f'        subgraph MgmtNet["Management Network<br/>{mgmt_sub}"]')
             self._add('            direction TB')
             
             # Add key management VMs
@@ -3416,7 +4323,7 @@ class LabDetailsGenerator:
             
             self._add('        end')
             self._add()
-            self._add('        subgraph VSANNet["vSAN Network<br/>10.1.2.0/24"]')
+            self._add(f'        subgraph VSANNet["vSAN Network<br/>{vsan_sub}"]')
             self._add('            direction TB')
             for host in self.env.hosts[:4]:  # Show first 4 hosts
                 short_name = host.fqdn.split('.')[0]
@@ -3622,11 +4529,15 @@ class LabDetailsGenerator:
             self._add(f"![Supervisor K8s Architecture]({self.svg_rel_dir}/supervisor_k8s_architecture.svg)")
             self._add()
             
-        sup_vip = sup_cl.vip if sup_cl and sup_cl.vip else "10.1.1.140"
+        domain_s = self.env.dns_domain or "site-a.vcf.lab"
+        sup_vip = sup_cl.vip if sup_cl and sup_cl.vip else (resolve_host('supervisor', domain_s) or resolve_host('wcp', domain_s) or "10.1.1.140")
         if sup_cl and sup_cl.nodes:
             sup_nodes_desc = ", ".join([f"`{n.name}` (`{n.ip_address}`)" for n in sup_cl.nodes])
         else:
-            sup_nodes_desc = "3 Control Plane Nodes (`SupervisorControlPlaneVM (1)..3` / `10.1.1.137..139`)"
+            cp1 = resolve_host('sup-cp-1', domain_s) or resolve_host('SupervisorControlPlaneVM-1', domain_s) or "10.1.1.137"
+            cp2 = resolve_host('sup-cp-2', domain_s) or resolve_host('SupervisorControlPlaneVM-2', domain_s) or "10.1.1.138"
+            cp3 = resolve_host('sup-cp-3', domain_s) or resolve_host('SupervisorControlPlaneVM-3', domain_s) or "10.1.1.139"
+            sup_nodes_desc = f"3 Control Plane Nodes (`SupervisorControlPlaneVM (1)..3` / `{cp1}..{cp3}`)"
 
         self._add("| Component | Details |")
         self._add("| --------- | ------- |")
@@ -3644,14 +4555,14 @@ class LabDetailsGenerator:
             self._add(f"![VSP Fleet LCM Architecture]({self.svg_rel_dir}/vsp_k8s_architecture.svg)")
             self._add()
             
-        vsp_vip = vsp_cl.vip if vsp_cl and vsp_cl.vip else "10.1.1.142"
+        vsp_vip = vsp_cl.vip if vsp_cl and vsp_cl.vip else (resolve_host('vsp', domain_s) or resolve_host('vsp-vip', domain_s) or "10.1.1.142")
         if vsp_cl and vsp_cl.nodes:
             vsp_n = vsp_cl.nodes[0]
             vsp_node_desc = f"`{vsp_n.name}` (`{vsp_n.ip_address}`)"
             vsp_sizing_desc = f"{vsp_n.cpu_capacity} vCPUs / {vsp_n.memory_mb // 1024 if vsp_n.memory_mb else 32} GB RAM (Single Node)"
         else:
-            domain_s = self.env.dns_domain or "site-a.vcf.lab"
-            vsp_node_desc = f"`vsp-01a.{domain_s}` (`10.1.1.141`)"
+            vsp_node_ip = resolve_host('vsp-01a', domain_s) or "10.1.1.141"
+            vsp_node_desc = f"`vsp-01a.{domain_s}` (`{vsp_node_ip}`)"
             vsp_sizing_desc = "8 vCPUs / 32 GB RAM (Single Node)"
 
         self._add("| Component | Details |")
@@ -3670,25 +4581,43 @@ class LabDetailsGenerator:
         if self.diagram_style in ("glassmorphism", "both"):
             self._add(f"![VCF Automation Architecture]({self.svg_rel_dir}/vcfa_k8s_architecture.svg)")
             self._add()
+            
+        domain_s = self.env.dns_domain or "site-a.vcf.lab"
+        vcfa_cl = next((c for c in self.env.k8s_clusters if c.cluster_type == "VCFA"), None)
+        vcfa_vip = vcfa_cl.vip if vcfa_cl and vcfa_cl.vip else (resolve_host('auto-a', domain_s) or "10.1.1.70")
+        vcfa_node_ip = (vcfa_cl.nodes[0].ip_address if vcfa_cl and vcfa_cl.nodes and vcfa_cl.nodes[0].ip_address
+                        else (resolve_host('auto-platform-a', domain_s) or "10.1.1.69"))
+        vcfa_node_cpu = vcfa_cl.nodes[0].cpu_capacity if vcfa_cl and vcfa_cl.nodes and vcfa_cl.nodes[0].cpu_capacity else 24
+        vcfa_node_ram = vcfa_cl.nodes[0].memory_mb // 1024 if vcfa_cl and vcfa_cl.nodes and vcfa_cl.nodes[0].memory_mb else 96
+
         self._add("| Component | Details |")
         self._add("| --------- | ------- |")
-        self._add("| **Node VIP / IP** | `10.1.1.70` (`auto-a.site-a.vcf.lab`) / `10.1.1.69` (`auto-platform-a`) |")
-        self._add("| **Node Sizing** | 24 vCPUs / 96 GB RAM |")
+        self._add(f"| **Node VIP / IP** | `{vcfa_vip}` (`auto-a.{domain_s}`) / `{vcfa_node_ip}` (`auto-platform-a`) |")
+        self._add(f"| **Node Sizing** | {vcfa_node_cpu} vCPUs / {vcfa_node_ram} GB RAM |")
         self._add("| **Ingress Mesh** | Istio Ingress Gateway & Kube-VIP |")
         self._add("| **Microservices** | `prelude`, `istio-system`, `vmsp-platform` |")
         self._add()
         
         # 4. Security Services Platform (SSP / vDefend) if detected
-        if self.env.has_ssp or "SSP" in self.env.k8s_clusters:
+        if self.env.has_ssp or any(c.cluster_type == "SSP" for c in self.env.k8s_clusters):
             self._add("### 4. Security Services Platform (SSP / vDefend)")
             self._add()
             if self.diagram_style in ("glassmorphism", "both"):
                 self._add(f"![SSP Security Platform Architecture]({self.svg_rel_dir}/ssp_k8s_architecture.svg)")
                 self._add()
+                
+            ssp_cl = next((c for c in self.env.k8s_clusters if c.cluster_type == "SSP"), None)
+            capi_ip = (ssp_cl.extra_info.get('capi_mgmt_ip') if ssp_cl and ssp_cl.extra_info 
+                       else (resolve_host('ssp-i', domain_s) or resolve_host('ssp-installer', domain_s) or "10.1.0.10"))
+            ingress_vip = ssp_cl.vip if ssp_cl and ssp_cl.vip else (resolve_host('ssp', domain_s) or "10.1.0.11")
+            cp_count = len([n for n in ssp_cl.nodes if n.role == 'control-plane']) if ssp_cl else 3
+            worker_count = len([n for n in ssp_cl.nodes if n.role == 'worker']) if ssp_cl else 6
+
             self._add("| Component | Details |")
             self._add("| --------- | ------- |")
-            self._add("| **Management Host** | `10.1.0.10` (`sysadmin` / CAPI installer) |")
-            self._add("| **CAPI Cluster** | `ssp` namespace, MachineDeployment, KubeadmControlPlane |")
+            self._add(f"| **Management Host** | `{capi_ip}` (`sysadmin` / CAPI installer) |")
+            self._add(f"| **Ingress VIP** | `{ingress_vip}` (`https://ssp.{domain_s}`) |")
+            self._add(f"| **CAPI Cluster** | `ssp` namespace ({cp_count} Control Planes, {worker_count} Workers) |")
             self._add("| **Microservices** | `nsxi-platform` (NSX Intelligence, vDefend NDR, Malware Analysis, Distributed IDS/IPS, Kafka bus) |")
             self._add()
         
@@ -3696,11 +4625,17 @@ class LabDetailsGenerator:
         self._add()
 
     def _add_core_infrastructure(self):
-        """Add core infrastructure VMs diagram"""
-        self._add("## Core Infrastructure VMs")
+        """Add core infrastructure VMs & Holorouter architecture diagrams"""
+        self._add("## Core Infrastructure & Holorouter Services")
+        self._add()
+        self._add("Core management appliances, Linux routing, TLS reverse proxy, and identity services powering the HOL pod fabric.")
         self._add()
         if self.diagram_style in ("glassmorphism", "both"):
             self._add(f"![Core Infrastructure VMs]({self.svg_rel_dir}/core_infrastructure.svg)")
+            self._add()
+            self._add("### Holorouter Services & Container Reverse Proxy Topology")
+            self._add()
+            self._add(f"![Holorouter Services & Reverse Proxy Architecture]({self.svg_rel_dir}/holorouter_architecture.svg)")
             self._add()
         if self.diagram_style in ("mermaid", "both"):
             self._add("```mermaid")
@@ -3709,7 +4644,7 @@ class LabDetailsGenerator:
             self._add()
             self._add('    subgraph Core["Core Infrastructure VMs (L1)"]')
             self._add(f'        subgraph RouterVM["holorouter - {self.env.router_ip}"]')
-            self._add('            RouterSvc["Services:<br/>- DNS Server<br/>- DHCP Server<br/>- Squid Proxy (:3128)<br/>- Firewall/NAT<br/>- NTP Server"]')
+            self._add('            RouterSvc["Services:<br/>- NGINX Reverse Proxy (:443)<br/>- Technitium DNS (:53/:5380)<br/>- Authentik OIDC (:9000)<br/>- Vault PKI (:32000)<br/>- Squid Proxy (:3128)<br/>- Firewall/NAT"]')
             self._add('        end')
             self._add()
             self._add(f'        subgraph ConsoleVM["console - {self.env.console_ip}"]')
@@ -3732,16 +4667,28 @@ class LabDetailsGenerator:
 
     def _add_network_subnets(self):
         """Add network subnets reference table"""
+        domain_s = self.env.dns_domain or "site-a.vcf.lab"
+        core_sub = self.env.core_subnet or get_subnet_for_ip(self.env.router_ip, 25) or "10.1.10.128/25"
+        core_gw = self.env.router_ip or resolve_host('router', domain_s) or "10.1.10.129"
+        ext_sub = self.env.external_subnet or get_subnet_for_ip(self.env.gateway_ip, 24) or "192.168.0.0/24"
+        ext_gw = self.env.gateway_ip or resolve_host('gateway', domain_s) or "192.168.0.1"
+        
+        sample_host = self.env.hosts[0] if self.env.hosts else None
+        mgmt_sub = get_subnet_for_ip(sample_host.mgmt_ip, 24) if sample_host and sample_host.mgmt_ip else "10.1.1.0/24"
+        vsan_sub = get_subnet_for_ip(sample_host.vsan_ip, 24) if sample_host and sample_host.vsan_ip else "10.1.2.0/24"
+        vmotion_sub = get_subnet_for_ip(sample_host.vmotion_ip, 24) if sample_host and sample_host.vmotion_ip else "10.1.3.0/24"
+        tep_sub = get_subnet_for_ip(sample_host.tep_ip, 25) if sample_host and sample_host.tep_ip else "10.1.5.128/25"
+
         self._add("## Network Subnets Reference")
         self._add()
         self._add("| Network | Subnet | Gateway | Purpose |")
         self._add("| ------- | ------ | ------- | ------- |")
-        self._add("| Core/External | 10.1.10.128/25 | 10.1.10.129 | Console, Manager, Router |")
-        self._add("| Management | 10.1.1.0/24 | 10.1.1.1 | VCF Management Components |")
-        self._add("| vSAN | 10.1.2.0/24 | - | vSAN Traffic |")
-        self._add("| vMotion | 10.1.3.0/24 | - | vMotion Traffic |")
-        self._add("| TEP (Overlay) | 10.1.5.128/25 | 10.1.5.129 | NSX Transport Endpoint (GENEVE) |")
-        self._add("| External (Holodeck) | 192.168.0.0/24 | 192.168.0.1 | External/Internet Access |")
+        self._add(f"| Core/External | {core_sub} | {core_gw} | Console, Manager, Router |")
+        self._add(f"| Management | {mgmt_sub} | {mgmt_sub.rsplit('.', 1)[0] + '.1'} | VCF Management Components |")
+        self._add(f"| vSAN | {vsan_sub} | - | vSAN Traffic |")
+        self._add(f"| vMotion | {vmotion_sub} | - | vMotion Traffic |")
+        self._add(f"| TEP (Overlay) | {tep_sub} | {tep_sub.rsplit('.', 1)[0] + '.129'} | NSX Transport Endpoint (GENEVE) |")
+        self._add(f"| External (Holodeck) | {ext_sub} | {ext_gw} | External/Internet Access |")
         self._add()
         self._add("---")
         self._add()
@@ -3990,12 +4937,13 @@ class LabDetailsGenerator:
             self._add(f"![Complete Infrastructure Diagram]({self.svg_rel_dir}/complete_infrastructure.svg)")
             self._add()
         if self.diagram_style in ("mermaid", "both"):
+            ext_sub = self.env.external_subnet or "192.168.0.0/24"
             self._add("```mermaid")
             self._add("flowchart TB")
             self._add(MERMAID_STYLES)
             self._add()
             self._add('    subgraph External["External Access"]')
-            self._add('        Internet["Internet<br/>192.168.0.0/24"]')
+            self._add(f'        Internet["Internet<br/>{ext_sub}"]')
             self._add('    end')
             self._add()
             self._add('    subgraph vPod["VMware Hands-on Lab vPod"]')
@@ -4187,7 +5135,7 @@ class LabDetailsGenerator:
         self._add("| Property | Value |")
         self._add("| -------- | ----- |")
         self._add(f"| **Generated** | {datetime.datetime.now().strftime('%B %d, %Y at %H:%M:%S')} |")
-        self._add(f"| **Generator Version** | `v2.3.1` (Style 5 Glassmorphism Engine) |")
+        self._add(f"| **Generator Version** | `v2.3.2` (Style 5 Glassmorphism Engine) |")
         self._add(f"| **Generated By** | `python3 Tools/labdetails/generate_labdetails.py` |")
         self._add(f"| **Diagram Engine License** | MIT License © 2025 fireworks-tech-graph contributors |")
         self._add("| **Lab Configuration** | `/tmp/config.ini` |")
@@ -4198,7 +5146,7 @@ class LabDetailsGenerator:
 # MAIN & CLI HELP SCREEN
 #==============================================================================
 
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 
 def show_help():
     """Display script-help-style compliant help screen"""
@@ -4402,9 +5350,6 @@ def main():
         with open(output_html_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
         print(f"{html_filename} generated: {output_html_path}")
-
-if __name__ == '__main__':
-    main()
 
 if __name__ == '__main__':
     main()
