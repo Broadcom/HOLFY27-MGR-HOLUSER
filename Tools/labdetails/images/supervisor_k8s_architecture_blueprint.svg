@@ -1,0 +1,254 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1150 740" width="1150" height="740">
+  <defs>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&amp;display=swap");
+      text { font-family: "Courier New", Courier, monospace; }
+      .hero-title { font-size: 20px; font-weight: 700; fill: #38bdf8; animation: title-glow 4s ease-in-out infinite; }
+      .hero-subtitle { font-size: 12px; fill: #38bdf8; }
+      .card-title { font-size: 13px; font-weight: 600; fill: #e0f2fe; }
+      .card-subtitle { font-size: 11px; fill: #38bdf8; }
+      .card-detail { font-size: 10.5px; fill: #7dd3fc; }
+      .container-title { font-size: 12px; font-weight: 600; fill: #e0f2fe; }
+      .edge-label { font-size: 10px; font-weight: 600; fill: #e0f2fe; }
+      .badge-text { font-size: 9.5px; font-weight: 600; fill: #ffffff; }
+      @keyframes icon-float { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-2.5px); } }
+      @keyframes dash-flow { to { stroke-dashoffset: -24px; } }
+      @keyframes title-glow { 0%, 100% { opacity: 0.95; } 50% { opacity: 1; filter: drop-shadow(0 0 6px rgba(88,166,255,0.4)); } }
+      .animated-icon { animation: icon-float 3s ease-in-out infinite; transform-origin: center; }
+      .flow-dash { animation: dash-flow 1.5s linear infinite; }
+    </style>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0a1628"/>
+      <stop offset="50%" stop-color="#0f2342"/>
+      <stop offset="100%" stop-color="#0a1628"/>
+    </linearGradient>
+    <linearGradient id="title-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00d2ff"/>
+      <stop offset="100%" stop-color="#bc8cff"/>
+    </linearGradient>
+    <pattern id="grid-pattern" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(0, 210, 255, 0.08)" stroke-width="1"/>
+    </pattern>
+    <radialGradient id="glow-blue" cx="30%" cy="30%" r="50%">
+      <stop offset="0%" stop-color="rgba(88,166,255,0.15)"/>
+      <stop offset="100%" stop-color="rgba(88,166,255,0)"/>
+    </radialGradient>
+    <radialGradient id="glow-purple" cx="75%" cy="65%" r="45%">
+      <stop offset="0%" stop-color="rgba(188,140,255,0.12)"/>
+      <stop offset="100%" stop-color="rgba(188,140,255,0)"/>
+    </radialGradient>
+    <filter id="glass-shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#000000" flood-opacity="0.25"/>
+    </filter>
+    <marker id="arrow-blue" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#58a6ff"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#bc8cff"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#3fb950"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#f78166"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#d29922"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrow-muted" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#8b949e"/>
+    </marker>
+  </defs>
+  <rect width="1150" height="740" fill="url(#bg-grad)"/>
+  <rect width="1150" height="740" fill="url(#grid-pattern)"/>
+  <g transform="translate(40, 36)">
+    <text class="hero-title" x="0" y="0">Supervisor Tanzu K8s Architecture &amp; Pod Topology</text>
+    <text class="hero-subtitle" x="0" y="18">Floating CP VIP (10.1.1.140:6443), Control Plane VMs, Spherelet &amp; vSAN CSI | Domain: site-a.vcf.lab</text>
+  </g>
+  <g id="container-Supervisor_Tanzu_Control_Plane_Fabric">
+    <rect x="40" y="85" width="1070" height="180" rx="14" ry="14" fill="rgba(16, 42, 69, 0.5)" stroke="rgba(188,140,255,0.3)" stroke-width="1.2"/>
+    <rect x="52" y="73" width="317.5" height="24" rx="12" fill="#0a1628" stroke="rgba(188,140,255,0.3)" stroke-width="1"/>
+    <text class="container-title" x="64" y="89">☸️ Supervisor Tanzu Control Plane Fabric</text>
+    <text class="card-subtitle" x="1094" y="101" text-anchor="end">Floating VIP (10.1.1.140:6443) -&gt; 3 Control Plane VMs</text>
+  </g>
+  <g id="container-Supervisor_Namespaces_&amp;_Workload_Pod_Fabric">
+    <rect x="40" y="285" width="1070" height="420" rx="14" ry="14" fill="rgba(16, 42, 69, 0.5)" stroke="rgba(88,166,255,0.3)" stroke-width="1.2"/>
+    <rect x="52" y="273" width="362.5" height="24" rx="12" fill="#0a1628" stroke="rgba(88,166,255,0.3)" stroke-width="1"/>
+    <text class="container-title" x="64" y="289">📦 Supervisor Namespaces &amp; Workload Pod Fabric</text>
+    <text class="card-subtitle" x="1094" y="301" text-anchor="end">vSphere Pods &amp; CNI Services</text>
+  </g>
+  <g>
+    <path d="M 305.0,180.0 L 330.0,180.0" fill="none" stroke="#d29922" stroke-width="4.0" stroke-opacity="0.25"/>
+    <path d="M 305.0,180.0 L 330.0,180.0" fill="none" stroke="#d29922" stroke-width="2.0" stroke-opacity="0.9" marker-end="url(#arrow-amber)"/>
+    <circle r="3" fill="#d29922" opacity="0.85">
+      <animateMotion path="M 305.0,180.0 L 330.0,180.0" dur="3.5s" repeatCount="indefinite"/>
+    </circle>
+    <rect x="286.8" y="170.0" width="61.5" height="20" rx="6" fill="#0a1628" fill-opacity="0.95" stroke="#d29922" stroke-width="0.8"/>
+    <text class="edge-label" x="317.5" y="184.0" text-anchor="middle">K8s API</text>
+  </g>
+  <g>
+    <path d="M 575.0,265.0 L 575.0,285.0" fill="none" stroke="#bc8cff" stroke-width="4.0" stroke-opacity="0.25"/>
+    <path d="M 575.0,265.0 L 575.0,285.0" fill="none" stroke="#bc8cff" stroke-width="2.0" stroke-opacity="0.9" marker-end="url(#arrow-purple)"/>
+    <circle r="3" fill="#bc8cff" opacity="0.85">
+      <animateMotion path="M 575.0,265.0 L 575.0,285.0" dur="3.5s" repeatCount="indefinite"/>
+    </circle>
+    <rect x="528.0" y="265.0" width="94.0" height="20" rx="6" fill="#0a1628" fill-opacity="0.95" stroke="#bc8cff" stroke-width="0.8"/>
+    <text class="edge-label" x="575.0" y="279.0" text-anchor="middle">Control Flow</text>
+  </g>
+  <g>
+    <path d="M 575.0,490.0 L 575.0,510.0" fill="none" stroke="#3fb950" stroke-width="4.0" stroke-opacity="0.25"/>
+    <path d="M 575.0,490.0 L 575.0,510.0" fill="none" stroke="#3fb950" stroke-width="2.0" stroke-opacity="0.9" marker-end="url(#arrow-green)"/>
+    <circle r="3" fill="#3fb950" opacity="0.85">
+      <animateMotion path="M 575.0,490.0 L 575.0,510.0" dur="3.5s" repeatCount="indefinite"/>
+    </circle>
+    <rect x="511.8" y="490.0" width="126.5" height="20" rx="6" fill="#0a1628" fill-opacity="0.95" stroke="#3fb950" stroke-width="0.8"/>
+    <text class="edge-label" x="575.0" y="504.0" text-anchor="middle">CSI Volume Attach</text>
+  </g>
+  <g id="card-sup-vip">
+    <rect x="65" y="120" width="240" height="125" rx="12" ry="12" fill="#102a45" stroke="#00d2ff" stroke-width="1.2"/>
+    <rect x="66" y="132" width="3.5" height="101" rx="1.7" fill="#d29922"/>
+    <g class="animated-icon"><text class="card-title" x="79" y="142">⚡ Supervisor Cluster VIP</text></g>
+    <rect x="219.0" y="130" width="76.0" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="227.0" cy="139" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="227.0" cy="139" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="261.0" y="142.5" text-anchor="middle">VIP ACTIVE</text>
+    <text class="card-subtitle" x="79" y="158">10.1.1.140:6443 (Floating)</text>
+    <text class="card-detail" x="79" y="186">• • API Endpoint: https://10.1.1.140</text>
+    <text class="card-detail" x="79" y="200">• • HA DLB Load Balanced</text>
+    <text class="card-detail" x="79" y="214">• • Directs API Traffic to Active CP Node</text>
+  </g>
+  <g id="card-sup-cp1">
+    <rect x="330" y="120" width="240" height="125" rx="12" ry="12" fill="#102a45" stroke="#00d2ff" stroke-width="1.2"/>
+    <rect x="331" y="132" width="3.5" height="101" rx="1.7" fill="#bc8cff"/>
+    <g class="animated-icon"><text class="card-title" x="344" y="142">☸️ Supervisor CP VM 1</text></g>
+    <rect x="515.0" y="130" width="45.0" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="523.0" cy="139" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="523.0" cy="139" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="541.5" y="142.5" text-anchor="middle">Ready</text>
+    <text class="card-subtitle" x="344" y="158">10.1.1.141</text>
+    <text class="card-detail" x="344" y="186">• Role: control-plane-1</text>
+    <text class="card-detail" x="344" y="200">• 4 vCPUs | 16 GB RAM</text>
+    <text class="card-detail" x="344" y="214">• Taint: NoSchedule</text>
+  </g>
+  <g id="card-sup-cp2">
+    <rect x="590" y="120" width="240" height="125" rx="12" ry="12" fill="#102a45" stroke="#00d2ff" stroke-width="1.2"/>
+    <rect x="591" y="132" width="3.5" height="101" rx="1.7" fill="#bc8cff"/>
+    <g class="animated-icon"><text class="card-title" x="604" y="142">☸️ Supervisor CP VM 2</text></g>
+    <rect x="775.0" y="130" width="45.0" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="783.0" cy="139" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="783.0" cy="139" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="801.5" y="142.5" text-anchor="middle">Ready</text>
+    <text class="card-subtitle" x="604" y="158">10.1.1.142</text>
+    <text class="card-detail" x="604" y="186">• Role: control-plane-2</text>
+    <text class="card-detail" x="604" y="200">• 4 vCPUs | 16 GB RAM</text>
+    <text class="card-detail" x="604" y="214">• Taint: NoSchedule</text>
+  </g>
+  <g id="card-sup-cp3">
+    <rect x="850" y="120" width="240" height="125" rx="12" ry="12" fill="#102a45" stroke="#00d2ff" stroke-width="1.2"/>
+    <rect x="851" y="132" width="3.5" height="101" rx="1.7" fill="#bc8cff"/>
+    <g class="animated-icon"><text class="card-title" x="864" y="142">☸️ Supervisor CP VM 3</text></g>
+    <rect x="1035.0" y="130" width="45.0" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="1043.0" cy="139" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="1043.0" cy="139" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="1061.5" y="142.5" text-anchor="middle">Ready</text>
+    <text class="card-subtitle" x="864" y="158">10.1.1.143</text>
+    <text class="card-detail" x="864" y="186">• Role: control-plane-3</text>
+    <text class="card-detail" x="864" y="200">• 4 vCPUs | 16 GB RAM</text>
+    <text class="card-detail" x="864" y="214">• Taint: NoSchedule</text>
+  </g>
+  <g id="card-ns-sys">
+    <rect x="65" y="320" width="325" height="170" rx="12" ry="12" fill="#102a45" stroke="#00d2ff" stroke-width="1.2"/>
+    <rect x="66" y="332" width="3.5" height="146" rx="1.7" fill="#58a6ff"/>
+    <g class="animated-icon"><text class="card-title" x="79" y="342">⚙️ System Namespace (kube-system)</text></g>
+    <rect x="322.6" y="330" width="57.4" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="330.6" cy="339" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="330.6" cy="339" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="355.3" y="342.5" text-anchor="middle">RUNNING</text>
+    <text class="card-subtitle" x="79" y="358">Core Infrastructure</text>
+    <text class="card-detail" x="79" y="386">• • spherelet-agent (Spherelet CNI)</text>
+    <text class="card-detail" x="79" y="400">• • antrea-agent (Antrea Overlay)</text>
+    <text class="card-detail" x="79" y="414">• • coredns (Cluster DNS 172.16.200.x)</text>
+    <text class="card-detail" x="79" y="428">• • vmware-system-license</text>
+  </g>
+  <g id="card-ns-harbor">
+    <rect x="415" y="320" width="325" height="170" rx="12" ry="12" fill="#102a45" stroke="#00d2ff" stroke-width="1.2"/>
+    <rect x="416" y="332" width="3.5" height="146" rx="1.7" fill="#3fb950"/>
+    <g class="animated-icon"><text class="card-title" x="429" y="342">📦 Namespace: svc-harbor</text></g>
+    <rect x="672.6" y="330" width="57.4" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="680.6" cy="339" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="680.6" cy="339" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="705.3000000000001" y="342.5" text-anchor="middle">RUNNING</text>
+    <text class="card-subtitle" x="429" y="358">Container Registry</text>
+    <text class="card-detail" x="429" y="386">• • harbor-core-0</text>
+    <text class="card-detail" x="429" y="400">• • harbor-database-0</text>
+    <text class="card-detail" x="429" y="414">• • harbor-redis-0</text>
+    <text class="card-detail" x="429" y="428">• • harbor-trivy-0</text>
+  </g>
+  <g id="card-ns-user">
+    <rect x="765" y="320" width="325" height="170" rx="12" ry="12" fill="#102a45" stroke="#00d2ff" stroke-width="1.2"/>
+    <rect x="766" y="332" width="3.5" height="146" rx="1.7" fill="#d29922"/>
+    <g class="animated-icon"><text class="card-title" x="779" y="342">🚀 Namespace: ns-hol-apps</text></g>
+    <rect x="1022.5999999999999" y="330" width="57.4" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="1030.6" cy="339" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="1030.6" cy="339" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="1055.3" y="342.5" text-anchor="middle">RUNNING</text>
+    <text class="card-subtitle" x="779" y="358">User Applications</text>
+    <text class="card-detail" x="779" y="386">• • bookstore-app-deployment</text>
+    <text class="card-detail" x="779" y="400">• • dsm-postgres-cluster-1</text>
+    <text class="card-detail" x="779" y="414">• • acme-frontend-pod</text>
+  </g>
+  <g id="card-sup-pvc">
+    <rect x="65" y="510" width="1025" height="170" rx="12" ry="12" fill="#102a45" stroke="#00d2ff" stroke-width="1.2"/>
+    <rect x="66" y="522" width="3.5" height="146" rx="1.7" fill="#38bdf8"/>
+    <g class="animated-icon"><text class="card-title" x="79" y="532">💾 vSAN Persistent Volume Claims (CSI Storage Fabric)</text></g>
+    <rect x="1035.0" y="520" width="45.0" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="1043.0" cy="529" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="1043.0" cy="529" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="1061.5" y="532.5" text-anchor="middle">BOUND</text>
+    <text class="card-subtitle" x="79" y="548">Storage Policy: VCF Workload Default</text>
+    <text class="card-detail" x="79" y="576">• • PVC pvc-harbor-data -&gt; vSAN Storage Object (20.0 GB)</text>
+    <text class="card-detail" x="79" y="590">• • PVC pvc-postgres-data -&gt; vSAN Storage Object (10.0 GB)</text>
+    <text class="card-detail" x="79" y="604">• • Dynamic Provisioning via vsphere-csi-driver on ESXi Cluster</text>
+  </g>
+  <g id="legend">
+    <rect x="950" y="24" width="170" height="120" rx="8" fill="#0a1628" stroke="#00d2ff" stroke-width="1"/>
+    <circle cx="966" cy="38" r="5" fill="#d29922"/>
+    <text class="card-detail" x="980" y="42">Floating Virtual IP (VIP)</text>
+    <circle cx="966" cy="58" r="5" fill="#bc8cff"/>
+    <text class="card-detail" x="980" y="62">Control Plane Node</text>
+    <circle cx="966" cy="78" r="5" fill="#58a6ff"/>
+    <text class="card-detail" x="980" y="82">Active Namespace</text>
+    <circle cx="966" cy="98" r="5" fill="#3fb950"/>
+    <text class="card-detail" x="980" y="102">Microservice Pod</text>
+    <circle cx="966" cy="118" r="5" fill="#38bdf8"/>
+    <text class="card-detail" x="980" y="122">Storage PVC</text>
+  </g>
+</svg>
