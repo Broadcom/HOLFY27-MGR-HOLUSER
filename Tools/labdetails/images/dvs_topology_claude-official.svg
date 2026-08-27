@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 780" width="1160" height="780">
+  <defs>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&amp;display=swap");
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .hero-title { font-size: 20px; font-weight: 700; fill: #da7756; animation: title-glow 4s ease-in-out infinite; }
+      .hero-subtitle { font-size: 12px; fill: #6b6863; }
+      .card-title { font-size: 13px; font-weight: 600; fill: #1f1e1c; }
+      .card-subtitle { font-size: 11px; fill: #6b6863; }
+      .card-detail { font-size: 10.5px; fill: #474542; }
+      .container-title { font-size: 12px; font-weight: 600; fill: #1f1e1c; }
+      .edge-label { font-size: 10px; font-weight: 600; fill: #1f1e1c; }
+      .badge-text { font-size: 9.5px; font-weight: 600; fill: #ffffff; }
+      @keyframes icon-float { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-2.5px); } }
+      @keyframes dash-flow { to { stroke-dashoffset: -24px; } }
+      @keyframes title-glow { 0%, 100% { opacity: 0.95; } 50% { opacity: 1; filter: drop-shadow(0 0 6px rgba(88,166,255,0.4)); } }
+      .animated-icon { animation: icon-float 3s ease-in-out infinite; transform-origin: center; }
+      .flow-dash { animation: dash-flow 1.5s linear infinite; }
+    </style>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f8f6f3"/>
+      <stop offset="50%" stop-color="#f2efe9"/>
+      <stop offset="100%" stop-color="#f8f6f3"/>
+    </linearGradient>
+    <linearGradient id="title-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#da7756"/>
+      <stop offset="100%" stop-color="#bc8cff"/>
+    </linearGradient>
+    <radialGradient id="glow-blue" cx="30%" cy="30%" r="50%">
+      <stop offset="0%" stop-color="rgba(88,166,255,0.15)"/>
+      <stop offset="100%" stop-color="rgba(88,166,255,0)"/>
+    </radialGradient>
+    <radialGradient id="glow-purple" cx="75%" cy="65%" r="45%">
+      <stop offset="0%" stop-color="rgba(188,140,255,0.12)"/>
+      <stop offset="100%" stop-color="rgba(188,140,255,0)"/>
+    </radialGradient>
+    <filter id="glass-shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#000000" flood-opacity="0.25"/>
+    </filter>
+    <marker id="arrow-blue" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#58a6ff"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#bc8cff"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#3fb950"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#f78166"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#d29922"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrow-muted" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#8b949e"/>
+    </marker>
+  </defs>
+  <rect width="1160" height="780" fill="url(#bg-grad)"/>
+  <rect width="1160" height="780" fill="url(#glow-blue)"/>
+  <rect width="1160" height="780" fill="url(#glow-purple)"/>
+  <g transform="translate(40, 36)">
+    <text class="hero-title" x="0" y="0">Distributed Virtual Switch (VDS) &amp; Port Group Topology</text>
+    <text class="hero-subtitle" x="0" y="18">Virtual Networking Fabric across Management &amp; Workload vCenter Instances | Domain: site-a.vcf.lab</text>
+  </g>
+  <g id="container-Management_vCenter:_vc-mgmt-a">
+    <rect x="35" y="85" width="530" height="640" rx="14" ry="14" fill="rgba(255, 255, 255, 0.7)" stroke="rgba(188,140,255,0.3)" stroke-width="1.2"/>
+    <rect x="47" y="73" width="257.5" height="24" rx="12" fill="#e6e4df" stroke="rgba(188,140,255,0.3)" stroke-width="1"/>
+    <text class="container-title" x="59" y="89">🏢 Management vCenter: vc-mgmt-a</text>
+    <text class="card-subtitle" x="549" y="101" text-anchor="end">System DVS Fabric</text>
+  </g>
+  <g id="container-Workload_vCenter:_vc-wld01-a">
+    <rect x="595" y="85" width="530" height="640" rx="14" ry="14" fill="rgba(255, 255, 255, 0.7)" stroke="rgba(210,153,34,0.3)" stroke-width="1.2"/>
+    <rect x="607" y="73" width="250.0" height="24" rx="12" fill="#e6e4df" stroke="rgba(210,153,34,0.3)" stroke-width="1"/>
+    <text class="container-title" x="619" y="89">🏬 Workload vCenter: vc-wld01-a</text>
+    <text class="card-subtitle" x="1109" y="101" text-anchor="end">Tenant DVS Fabric</text>
+  </g>
+  <g id="card-dvs-m-1" filter="url(#glass-shadow)">
+    <rect x="65" y="125" width="470" height="75" rx="12" ry="12" fill="#ffffff" stroke="#e6e4df" stroke-width="1.2"/>
+    <rect x="66" y="137" width="3.5" height="51" rx="1.7" fill="#bc8cff"/>
+    <g class="animated-icon"><text class="card-title" x="79" y="147">⚡ dpg-mgmt (Management)</text></g>
+    <rect x="473.8" y="135" width="51.2" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="481.8" cy="144" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="481.8" cy="144" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="503.40000000000003" y="147.5" text-anchor="middle">ACTIVE</text>
+    <text class="card-subtitle" x="79" y="163">VLAN 101</text>
+    <text class="card-detail" x="79" y="191">• ESXi vmk0 Management, vCenter &amp; SDDC IPs</text>
+  </g>
+  <g id="card-dvs-m-2" filter="url(#glass-shadow)">
+    <rect x="65" y="215" width="470" height="75" rx="12" ry="12" fill="#ffffff" stroke="#e6e4df" stroke-width="1.2"/>
+    <rect x="66" y="227" width="3.5" height="51" rx="1.7" fill="#3fb950"/>
+    <g class="animated-icon"><text class="card-title" x="79" y="237">💾 dpg-vsan (vSAN Fabric)</text></g>
+    <rect x="473.8" y="225" width="51.2" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="481.8" cy="234" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="481.8" cy="234" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="503.40000000000003" y="237.5" text-anchor="middle">ACTIVE</text>
+    <text class="card-subtitle" x="79" y="253">VLAN 102</text>
+    <text class="card-detail" x="79" y="281">• Kernel vmk1 vSAN Storage Traffic</text>
+  </g>
+  <g id="card-dvs-m-3" filter="url(#glass-shadow)">
+    <rect x="65" y="305" width="470" height="75" rx="12" ry="12" fill="#ffffff" stroke="#e6e4df" stroke-width="1.2"/>
+    <rect x="66" y="317" width="3.5" height="51" rx="1.7" fill="#38bdf8"/>
+    <g class="animated-icon"><text class="card-title" x="79" y="327">🔄 dpg-vmotion (Live Migration)</text></g>
+    <rect x="473.8" y="315" width="51.2" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="481.8" cy="324" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="481.8" cy="324" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="503.40000000000003" y="327.5" text-anchor="middle">ACTIVE</text>
+    <text class="card-subtitle" x="79" y="343">VLAN 103</text>
+    <text class="card-detail" x="79" y="371">• Kernel vmk2 vMotion Live State Migration</text>
+  </g>
+  <g id="card-dvs-m-4" filter="url(#glass-shadow)">
+    <rect x="65" y="395" width="470" height="75" rx="12" ry="12" fill="#ffffff" stroke="#e6e4df" stroke-width="1.2"/>
+    <rect x="66" y="407" width="3.5" height="51" rx="1.7" fill="#f78166"/>
+    <g class="animated-icon"><text class="card-title" x="79" y="417">🔀 dpg-tep (NSX Overlay)</text></g>
+    <rect x="473.8" y="405" width="51.2" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="481.8" cy="414" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="481.8" cy="414" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="503.40000000000003" y="417.5" text-anchor="middle">ACTIVE</text>
+    <text class="card-subtitle" x="79" y="433">VLAN 105</text>
+    <text class="card-detail" x="79" y="461">• Kernel vmk50 GENEVE TEP Overlay Traffic</text>
+  </g>
+  <g id="card-dvs-w-1" filter="url(#glass-shadow)">
+    <rect x="620" y="125" width="475" height="75" rx="12" ry="12" fill="#ffffff" stroke="#e6e4df" stroke-width="1.2"/>
+    <rect x="621" y="137" width="3.5" height="51" rx="1.7" fill="#d29922"/>
+    <g class="animated-icon"><text class="card-title" x="634" y="147">⚡ dpg-wld01-mgmt</text></g>
+    <rect x="1033.8" y="135" width="51.2" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="1041.8" cy="144" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="1041.8" cy="144" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="1063.3999999999999" y="147.5" text-anchor="middle">ACTIVE</text>
+    <text class="card-subtitle" x="634" y="163">VLAN 101</text>
+    <text class="card-detail" x="634" y="191">• vc-wld01-a, nsx-wld01-a &amp; Supervisor VMs</text>
+  </g>
+  <g id="card-dvs-w-2" filter="url(#glass-shadow)">
+    <rect x="620" y="215" width="475" height="75" rx="12" ry="12" fill="#ffffff" stroke="#e6e4df" stroke-width="1.2"/>
+    <rect x="621" y="227" width="3.5" height="51" rx="1.7" fill="#3fb950"/>
+    <g class="animated-icon"><text class="card-title" x="634" y="237">💾 dpg-wld01-vsan</text></g>
+    <rect x="1033.8" y="225" width="51.2" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="1041.8" cy="234" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="1041.8" cy="234" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="1063.3999999999999" y="237.5" text-anchor="middle">ACTIVE</text>
+    <text class="card-subtitle" x="634" y="253">VLAN 102</text>
+    <text class="card-detail" x="634" y="281">• Kernel vmk1 vSAN Workload Storage Traffic</text>
+  </g>
+  <g id="card-dvs-w-3" filter="url(#glass-shadow)">
+    <rect x="620" y="305" width="475" height="75" rx="12" ry="12" fill="#ffffff" stroke="#e6e4df" stroke-width="1.2"/>
+    <rect x="621" y="317" width="3.5" height="51" rx="1.7" fill="#38bdf8"/>
+    <g class="animated-icon"><text class="card-title" x="634" y="327">🔄 dpg-wld01-vmotion</text></g>
+    <rect x="1033.8" y="315" width="51.2" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="1041.8" cy="324" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="1041.8" cy="324" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="1063.3999999999999" y="327.5" text-anchor="middle">ACTIVE</text>
+    <text class="card-subtitle" x="634" y="343">VLAN 103</text>
+    <text class="card-detail" x="634" y="371">• Kernel vmk2 Workload vMotion Live Migration</text>
+  </g>
+  <g id="card-dvs-w-4" filter="url(#glass-shadow)">
+    <rect x="620" y="395" width="475" height="75" rx="12" ry="12" fill="#ffffff" stroke="#e6e4df" stroke-width="1.2"/>
+    <rect x="621" y="407" width="3.5" height="51" rx="1.7" fill="#d29922"/>
+    <g class="animated-icon"><text class="card-title" x="634" y="417">☸️ seg-tkg-cluster (CNI Overlay)</text></g>
+    <rect x="1033.8" y="405" width="51.2" height="18" rx="9" fill="#3fb950"/>
+    <circle cx="1041.8" cy="414" r="3.5" fill="#3fb950">
+      <animate attributeName="r" values="3.5;8.5;3.5" dur="2.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="1041.8" cy="414" r="3.5" fill="#ffffff" opacity="0.9"/>
+    <text class="badge-text" x="1063.3999999999999" y="417.5" text-anchor="middle">ACTIVE</text>
+    <text class="card-subtitle" x="634" y="433">GENEVE Overlay</text>
+    <text class="card-detail" x="634" y="461">• Spherelet &amp; Antrea CNI Pod Segments</text>
+  </g>
+  <g id="legend">
+    <rect x="960" y="24" width="170" height="100" rx="8" fill="#e6e4df" stroke="#e6e4df" stroke-width="1"/>
+    <circle cx="976" cy="38" r="5" fill="#bc8cff"/>
+    <text class="card-detail" x="990" y="42">Management DVS</text>
+    <circle cx="976" cy="58" r="5" fill="#d29922"/>
+    <text class="card-detail" x="990" y="62">Workload DVS</text>
+    <circle cx="976" cy="78" r="5" fill="#3fb950"/>
+    <text class="card-detail" x="990" y="82">Storage / Infrastructure PG</text>
+    <circle cx="976" cy="98" r="5" fill="#38bdf8"/>
+    <text class="card-detail" x="990" y="102">App &amp; Tanzu CNI PG</text>
+  </g>
+</svg>

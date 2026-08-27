@@ -1,6 +1,6 @@
 # `generate_labdetails.py` - Dynamic Lab Architecture & Multi-Style Topology Generator
 
-**Version:** 2.3.1  
+**Version:** 2.3.3  
 **Last Updated:** 2026-08-27  
 **Author:** Broadcom HOL Core Team  
 
@@ -17,14 +17,15 @@ Unlike legacy documentation tools that rely on static template assumptions, `gen
 - **Zero-Hardcoding Live Discovery**: Queries live vCenter instances, SDDC Manager, NSX Manager, and Kubernetes clusters to discover true CPU core totals, memory allocations, storage capacities, build numbers, and VM kernel interface mappings.
 - **Auto-Detection of Lab Flavor (VCF vs. VVF)**: Automatically detects whether the lab is running VMware Cloud Foundation (VCF) or VMware Validated Foundation (VVF) and dynamically adjusts table headers (e.g., **"VVF Version"** vs. **"VCF Version"**).
 - **Single Site & Dual Site Support**: Automatically detects multi-site topologies (`Site A` and `Site B`) and dynamically reorganizes layout containers, host layouts, storage summaries, and network diagrams to reflect multi-datacenter connectivity.
-- **Accurate Kubernetes VIP & Node Architecture**: Refactored architecture diagrams for Kubernetes clusters clearly distinguish floating Virtual IPs (VIPs) from physical/VM control plane nodes:
-  - **Supervisor Tanzu Cluster**: Shows the Supervisor Cluster Floating VIP (`10.1.1.140:6443`) routing to 3 CP VMs (`SupervisorControlPlaneVM (1..3)` / `10.1.1.137..139`), Spherelet agents on ESXi worker nodes, namespaces, and persistent vSAN CSI storage.
-  - **VSP Management Cluster (Fleet LCM)**: Accurately reflects the single control plane & worker VM (`vsp-01a.site-a.vcf.lab` / `10.1.1.141`) fronted by its kube-vip floating endpoint (`10.1.1.142:5480`).
-  - **VCF Automation Cluster (VCFA)**: Shows the single-node platform VM (`auto-a` / `10.1.1.70`) fronted by the Istio Ingress Gateway VIP (`10.1.1.70:443`).
-  - **Security Services Platform (SSP / vDefend)**: Dynamic detection and visualization if present (`10.1.0.10`).
-- **Holorouter Gateway & Proxy Filtering Probe**: Inspects Holorouter core services (Technitium DNS, Authentik OIDC, GitLab, HashiCorp Vault, Squid Proxy) and parses `/etc/squid/allowlist` to report whether proxy filtering is **Filtering Enabled (N domains)** or **Open (Filtering Disabled)**.
+- **Comprehensive 5-Tier Kubernetes Architectures**: Detailed multi-tier diagrams for all Kubernetes and container environments:
+  - **Supervisor Tanzu Cluster**: Shows the Supervisor Cluster Floating VIP (`10.1.1.140:6443`), 3-node HA CP VMs (`SupervisorControlPlaneVM (1..3)` / `10.1.1.137..139`), ESXi Spherelet hypervisor worker nodes, Harbor/CCI/system namespaces, and persistent vSAN CSI storage.
+  - **VSP Management Cluster (Fleet LCM)**: Accurately reflects the single control plane & worker VM (`vsp-01a.site-a.vcf.lab` / `10.1.1.141`), kube-vip floating endpoint (`10.1.1.142:5480`), internal registry (`198.18.128.16:5000`), Fleet/SDDC LCM microservices, and offline upgrade depot storage.
+  - **VCF Automation Cluster (VCFA)**: Shows the single-node platform VM (`auto-a` / `10.1.1.70`) fronted by the Istio Ingress Gateway VIP (`10.1.1.70:443`), direct management endpoint (`auto-platform-a`), Prelude cloud template/catalog services, VMSP platform core, and local CSI storage.
+  - **Security Services Platform (SSP / vDefend)**: Dynamic detection and visualization if present (`10.1.0.10`), including MetalLB ingress VIP, Kafka telemetry bus VIPs, CAPI management node, multi-node compute fabric, and vDefend security microservices.
+  - **Holorouter Services & Container Reverse Proxy**: Complete breakdown of dual-homed network routing, NGINX TLS reverse proxy SNI mappings, Authentik OIDC (`:9000`), Vault PKI engine (`:32000`), Microsoft ADCS CA proxy (`:8000`), Technitium DNS (`:53/:5380`), GitLab CE (`:8080`), Squid forward proxy (`:3128`), and persistent container volumes.
+- **Holorouter Gateway & Proxy Filtering Probe**: Inspects Holorouter core services and parses `/etc/squid/allowlist` to report whether proxy filtering is **Filtering Enabled (N domains)** or **Open (Filtering Disabled)**.
 - **12 Visual Themes & Live SVG Animations**: Pure-Python SVG engine supporting all 12 styles from `fireworks-tech-graph` (`Glassmorphism`, `Blueprint`, `Dark Terminal`, `Claude Official`, `OpenAI Official`, `Dark Luxury`, `Flat Icon`, `C4 Review`, `Cloud Fabric`, `Notion Clean`, `Event Transit`, `Ops Pulse`) featuring floating icon oscillations, flowing dashed lines, pulsating title glows, animated particle flows, and radar ping status indicators.
-- **Consistent Output File Naming**: All generated deliverables (`<SKU>-labdetails.md`, `<SKU>-labdetails.html`, and `images/*.svg`) are placed directly into the specified `--output` destination folder named with the discovered or configured Lab SKU.
+- **Consistent Output File Placement**: All generated deliverables (`<SKU>-labdetails.md`, `<SKU>-labdetails.html`, and `images/*.svg`) reside in `Tools/labdetails` (or the specified `--output` destination folder).
 
 ---
 
@@ -148,7 +149,7 @@ python3 Tools/labdetails/generate_labdetails.py [OPTIONS]
 `generate_labdetails.py` includes a theme engine adapted from `fireworks-tech-graph`. You can specify any of the 12 themes using `--style <name>` or `--theme <alias>`:
 
 | # | Theme Name | Aliases | Background | Palette & Aesthetics | Recommended Use Case |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 1 | **Flat Icon** | `flat-icon`, `flat` | `#ffffff` (White) | Clean light layout, dark grey borders, pastel status badges | Standard technical documentation & whitepapers |
 | 2 | **Dark Terminal** | `dark-terminal`, `terminal` | `#0f0f1a` (Dark Cyan) | Monospace SF Mono font, neon cyan & electric green glows | SRE, DevOps, and command-line guides |
 | 3 | **Blueprint** | `blueprint` | `#0a1628` (CAD Blue) | Grid background pattern, bright cyan vectors & technical CAD lines | Network topology & infrastructure engineering |
@@ -157,10 +158,10 @@ python3 Tools/labdetails/generate_labdetails.py [OPTIONS]
 | 6 | **Claude Official** | `claude-official`, `claude` | `#f8f6f3` (Warm Cream) | Anthropic editorial palette, terracotta accents `#da7756`, dark charcoal text | Elegant publications & technical blog posts |
 | 7 | **OpenAI Official** | `openai-official`, `openai` | `#ffffff` (Clean White) | Sleek slate, emerald green `#10a37f` highlights, fine line borders | AI / ML architecture & developer documentation |
 | 8 | **Dark Luxury** | `dark-luxury`, `luxury` | `#0a0a0a` (Onyx) | Deep black surface, champagne gold `#d4af37` card borders & titles | Executive briefings & high-impact visual decks |
-| 9 | **C4 Review Canvas**| `c4-review`, `c4` | `#f7f2e8` (Paper) | Architectural review paper layout, bold boundaries, high contrast | Architectural review boards & design docs |
-| 10| **Cloud Fabric** | `cloud-fabric`, `cloud` | `#edf5fb` (Soft Azure) | Sky blue palette, azure `#0284c7` highlights, cloud container styling | Multi-cloud & hybrid cloud topology maps |
-| 11| **Event Transit** | `event-transit`, `transit` | `#fbf7ee` (Metro Warm) | Metro transit map layout, connected rail lines, station nodes | Event-driven microservices & messaging streams |
-| 12| **Ops Pulse** | `ops-pulse`, `ops` | `#07111f` (Deep Navy) | SRE observability theme, dark navy cards, ECG pulse line indicators | Observability, monitoring, & incident response |
+| 9 | **C4 Review Canvas** | `c4-review`, `c4` | `#f7f2e8` (Paper) | Architectural review paper layout, bold boundaries, high contrast | Architectural review boards & design docs |
+| 10 | **Cloud Fabric** | `cloud-fabric`, `cloud` | `#edf5fb` (Soft Azure) | Sky blue palette, azure `#0284c7` highlights, cloud container styling | Multi-cloud & hybrid cloud topology maps |
+| 11 | **Event Transit** | `event-transit`, `transit` | `#fbf7ee` (Metro Warm) | Metro transit map layout, connected rail lines, station nodes | Event-driven microservices & messaging streams |
+| 12 | **Ops Pulse** | `ops-pulse`, `ops` | `#07111f` (Deep Navy) | SRE observability theme, dark navy cards, ECG pulse line indicators | Observability, monitoring, & incident response |
 
 ---
 
@@ -227,13 +228,19 @@ Displays the Supervisor Cluster Floating VIP (`10.1.1.140:6443`), Spherelet inte
 
 ![Supervisor K8s Architecture](images/supervisor_k8s_architecture_flat-icon.svg)
 
-### 4. High-Level Architecture (`Claude Official` Theme)
+### 4. Holorouter Services & Container Reverse Proxy Architecture (`Glassmorphism` Theme)
+
+Displays dual-homed routing, NGINX TLS reverse proxy SNI routes, Authentik OIDC, Technitium DNS, Vault PKI, and Squid proxy filtering.
+
+![Holorouter Architecture](images/holorouter_architecture.svg)
+
+### 5. High-Level Architecture (`Claude Official` Theme)
 
 Warm Anthropic editorial aesthetic featuring terracotta highlights and clean container borders.
 
 ![Claude Theme High Level Architecture](images/high_level_architecture_claude-official.svg)
 
-### 5. Complete Infrastructure Topology (`Dark Luxury` Theme)
+### 6. Complete Infrastructure Topology (`Dark Luxury` Theme)
 
 Deep black onyx backdrop with champagne gold accents.
 
@@ -243,22 +250,23 @@ Deep black onyx backdrop with champagne gold accents.
 
 ## 9. Output Artifacts & Deliverables
 
-When executed without `--dry-run`, the script generates the following files in the target `--output` destination directory:
+When executed without `--dry-run`, the script generates the following files in the target `--output` destination directory (`Tools/labdetails/`):
 
 1. **`<SKU>-labdetails.md`**: Primary Markdown document containing:
    - Lab Overview table (**VCF Version** or **VVF Version**, Dual Site or Single Site status, DNS Domain, Squid Proxy mode).
-   - Core Control Plane & Holorouter service status.
+   - Core Control Plane, Holorouter, and reverse proxy service statuses.
    - ESXi Host Specifications (true CPU cores, memory, ESXi build, VMkernel IPs for management, vSAN, vMotion, and TEPs).
    - Storage Summary (vSAN ESA/OSA capacities, FTT resiliency policies, NFS backups).
-   - Kubernetes Platform Summaries (Supervisor, VSP, VCFA, SSP).
+   - Comprehensive Kubernetes Platform Summaries (Supervisor, VSP, VCFA, SSP).
    - Embedded standalone SVG diagrams from the `images/` directory.
-2. **`<SKU>-labdetails.html`**: A self-contained, interactive HTML web document with tabbed navigation, embedded inline SVGs, theme toggle support, and searchable tables.
-3. **`images/*.svg`**: 14 standalone SVG architecture vector files with animated icons, dashed flows, and radar ping indicators:
+2. **`<SKU>-labdetails.html`**: A self-contained, interactive HTML web document with sticky navigation, embedded inline SVGs, theme toggle support, terminal snippets, and searchable tables.
+3. **`images/*.svg`**: 15 standalone SVG architecture vector files with animated icons, dashed flows, and radar ping indicators:
    - `high_level_architecture.svg`
    - `network_dataflow.svg`
    - `vcf_domain_architecture.svg`
    - `esxi_host_layout.svg`
    - `core_infrastructure.svg`
+   - `holorouter_architecture.svg`
    - `dvs_topology.svg`
    - `nsx_architecture.svg`
    - `lab_boot_sequence.svg`

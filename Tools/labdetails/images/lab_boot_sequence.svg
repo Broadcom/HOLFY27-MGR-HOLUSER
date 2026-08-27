@@ -65,7 +65,7 @@
   <rect width="1100" height="720" fill="url(#glow-purple)"/>
   <g transform="translate(40, 36)">
     <text class="hero-title" x="0" y="0">Lab Startup Boot &amp; Service Initialization Flow</text>
-    <text class="hero-subtitle" x="0" y="18">Orchestrated Startup Dependency Map (labstartup.py)</text>
+    <text class="hero-subtitle" x="0" y="18">Orchestrated Startup Dependency Map (labstartup.py) | Domain: site-a.vcf.lab</text>
   </g>
   <g>
     <path d="M 340.0,175.0 L 405.0,175.0" fill="none" stroke="#58a6ff" stroke-width="4.0" stroke-opacity="0.25"/>
@@ -182,7 +182,7 @@
     </circle>
     <circle cx="990.6" cy="129" r="3.5" fill="#ffffff" opacity="0.9"/>
     <text class="badge-text" x="1015.3000000000001" y="132.5" text-anchor="middle">STAGE 3</text>
-    <text class="card-subtitle" x="774" y="148">esx-01a .. esx-07a</text>
+    <text class="card-subtitle" x="774" y="148">ESXi Compute Nodes</text>
     <text class="card-detail" x="774" y="176">• • Verify SSH management</text>
     <text class="card-detail" x="774" y="190">• • Exit Maintenance Mode</text>
     <text class="card-detail" x="774" y="204">• • Check host power states</text>
@@ -198,7 +198,7 @@
     </circle>
     <circle cx="280.6" cy="314" r="3.5" fill="#ffffff" opacity="0.9"/>
     <text class="badge-text" x="305.3" y="317.5" text-anchor="middle">STAGE 6</text>
-    <text class="card-subtitle" x="64" y="333">vc-mgmt-a &amp; vc-wld01-a</text>
+    <text class="card-subtitle" x="64" y="333">vCenter Instances</text>
     <text class="card-detail" x="64" y="361">• • Power on vCenter VMs</text>
     <text class="card-detail" x="64" y="375">• • Poll VAMI API (:5480)</text>
     <text class="card-detail" x="64" y="389">• • Verify SSO session tokens</text>
@@ -214,7 +214,7 @@
     </circle>
     <circle cx="635.6" cy="314" r="3.5" fill="#ffffff" opacity="0.9"/>
     <text class="badge-text" x="660.3000000000001" y="317.5" text-anchor="middle">STAGE 5</text>
-    <text class="card-subtitle" x="419" y="333">nsx-mgmt-01a &amp; Edges</text>
+    <text class="card-subtitle" x="419" y="333">NSX Fabric &amp; Edges</text>
     <text class="card-detail" x="419" y="361">• • Power on NSX Cluster</text>
     <text class="card-detail" x="419" y="375">• • Boot Edge Node VMs</text>
     <text class="card-detail" x="419" y="389">• • Wait 5m for TEP sync</text>
@@ -246,7 +246,7 @@
     </circle>
     <circle cx="280.6" cy="499" r="3.5" fill="#ffffff" opacity="0.9"/>
     <text class="badge-text" x="305.3" y="502.5" text-anchor="middle">STAGE 7</text>
-    <text class="card-subtitle" x="64" y="518">sddcmanager-a</text>
+    <text class="card-subtitle" x="64" y="518">SDDC Orchestrator</text>
     <text class="card-detail" x="64" y="546">• • Power on sddcmanager-a</text>
     <text class="card-detail" x="64" y="560">• • Verify API access token</text>
     <text class="card-detail" x="64" y="574">• • Audit domain health</text>
