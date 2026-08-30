@@ -1,5 +1,9 @@
+pypi.org
+quay.io
 github.com
+googleapis.com
 hashicorp.com
+s3.amazonaws.com
 
 # VS Code Marketplace (required for extension browsing/install)
 marketplace.visualstudio.com
