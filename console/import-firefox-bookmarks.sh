@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # import-firefox-bookmarks.sh — Install a bookmarks JSON file into the Firefox profile
 #
-# Copies a bookmarks*.json file (sourced from the vpodrepo) into the Firefox
-# profile's bookmarkbackups/ directory, removes places.sqlite so Firefox rebuilds
-# its database from the backup on the next launch, and sets the required user.js
-# preference to suppress Firefox's built-in default bookmarks.
+# Copies a bookmark*.json file (sourced from the vpodrepo) into the Firefox
+# profile's bookmarkbackups/ directory, purges stale backups, removes places.sqlite
+# so Firefox rebuilds its database from the backup on the next launch, and sets the
+# required user.js preferences to suppress Firefox's built-in default bookmarks.
 #
 # IMPORTANT: Removing places.sqlite also removes browsing history (not just
 # bookmarks). This is intentional for a lab environment — the goal is a clean,
@@ -13,9 +13,13 @@
 # If no --bookmark-file is provided or the file does not exist, the script exits
 # cleanly without touching the profile (existing bookmarks are preserved).
 #
-# If Firefox is currently running (.parentlock detected), the script skips the
-# import and logs a warning rather than corrupting the live database.
+# If Firefox is currently running, the script skips the import and logs a warning
+# rather than corrupting the live database. Stale lock files from inactive sessions
+# are cleaned up automatically.
 #
+# Version 1.2 - 2026-08-29: Fixed backup filename format to match Firefox's native
+#   regex (bookmarks-YYYY-MM-DD.json); purged stale bookmarkbackups/ files to prevent
+#   restoring old backups; enhanced running process detection and stale lock cleanup.
 # Version 1.1 - 2026-08-18: Standardized BLUE color code (\033[0;34m) for universal console/VCD terminal compatibility.
 # Version 1.0 - 2026-06-30
 # Author - Burke Azbill and HOL Core Team
@@ -33,7 +37,7 @@
 set -euo pipefail
 
 TOOL_NAME="import-firefox-bookmarks.sh"
-VERSION="1.1"
+VERSION="1.2"
 VERSION_STR="Version ${VERSION}"
 
 # ---------------------------------------------------------------------------
@@ -180,28 +184,54 @@ info "Firefox profile: ${PROFILE_DIR}"
 
 # ---------------------------------------------------------------------------
 # Guard: do not modify the profile while Firefox is running.
-# Firefox holds .parentlock for the duration of its session.
+# Checks for active Firefox processes and cleans up stale lock files.
 # ---------------------------------------------------------------------------
-if [[ -f "${PROFILE_DIR}/.parentlock" ]]; then
-    warn "Firefox appears to be running (.parentlock found in profile)."
+firefox_is_running() {
+    if [[ "$MC_BASE" == "" || "$MC_BASE" == "/" ]]; then
+        # Running locally on the console
+        if pidof firefox firefox-bin >/dev/null 2>&1 || pgrep -x firefox >/dev/null 2>&1 || pgrep -x firefox-bin >/dev/null 2>&1; then
+            return 0
+        fi
+        return 1
+    else
+        # Running from Manager VM via NFS
+        if [[ -f "${PROFILE_DIR}/.parentlock" || -L "${PROFILE_DIR}/lock" ]]; then
+            if command -v sshpass >/dev/null 2>&1 && [[ -f /home/holuser/creds.txt ]]; then
+                if sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 root@console.site-a.vcf.lab "pidof firefox firefox-bin >/dev/null 2>&1 || pgrep -x firefox >/dev/null 2>&1 || pgrep -x firefox-bin >/dev/null 2>&1" 2>/dev/null; then
+                    return 0
+                fi
+            fi
+        fi
+        return 1
+    fi
+}
+
+if firefox_is_running; then
+    warn "Firefox appears to be running."
     warn "Skipping bookmark import to avoid corrupting the live database."
     warn "Re-run after Firefox has been closed, or on the next lab boot."
     exit 0
 fi
 
+# Clean up stale lock files if present while Firefox is not running
+rm -f "${PROFILE_DIR}/.parentlock" "${PROFILE_DIR}/lock"
+
 # ---------------------------------------------------------------------------
 # Dry-run summary
 # ---------------------------------------------------------------------------
+# Use yesterday's date so Firefox's future-date check (getDateForFile > new Date())
+# never discards the backup due to timezone skew between manager (UTC) and console (PDT).
+DATE_STR=$(date -d "yesterday" +%Y-%m-%d 2>/dev/null || date -v-1d +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
 if [[ "$DRY_RUN" -eq 1 ]]; then
     print_header
     echo ""
     info "DRY-RUN mode — no changes will be made."
     info "Bookmark file:   ${BOOKMARK_FILE}"
     info "Profile dir:     ${PROFILE_DIR}"
-    _ts_preview=$(date +%Y-%m-%dT%H%M%S)
-    info "Would copy to:   ${PROFILE_DIR}/bookmarkbackups/bookmarks-${_ts_preview}.json"
+    info "Would purge:     ${PROFILE_DIR}/bookmarkbackups/*"
+    info "Would copy to:   ${PROFILE_DIR}/bookmarkbackups/bookmarks-${DATE_STR}.json"
     info "Would remove:    ${PROFILE_DIR}/places.sqlite (and -shm, -wal if present)"
-    info "Would update:    ${PROFILE_DIR}/user.js (browser.bookmarks.restore_default_bookmark_count = 0)"
+    info "Would update:    ${PROFILE_DIR}/user.js (browser.bookmarks.restore_default_bookmark_count = 0, restore_default_bookmarks = false)"
     exit 0
 fi
 
@@ -209,28 +239,38 @@ print_header
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 1: Copy the JSON into bookmarkbackups/ with a timestamped filename.
-# Firefox picks up the most recently modified bookmarks-*.json file from this
-# directory when rebuilding a missing places.sqlite.
+# Step 1: Purge stale backups and copy the JSON into bookmarkbackups/.
+# Firefox expects backup filenames matching:
+#   bookmarks-YYYY-MM-DD.json  or  bookmarks-YYYY-MM-DD_<count>_<hash>.jsonlz4
+# Any non-matching filename (such as ISO timestamps with 'T') is ignored by Firefox.
+# Existing backups are purged so Firefox restores exclusively from this file.
 # ---------------------------------------------------------------------------
 BACKUPS_DIR="${PROFILE_DIR}/bookmarkbackups"
 mkdir -p "$BACKUPS_DIR"
 
-TS=$(date +%Y-%m-%dT%H%M%S)
-DEST_JSON="${BACKUPS_DIR}/bookmarks-${TS}.json"
+# Purge existing backup files so Firefox only finds and restores from this backup
+rm -f "${BACKUPS_DIR}"/bookmarks-*.json \
+      "${BACKUPS_DIR}"/bookmarks-*.jsonlz4 \
+      "${BACKUPS_DIR}"/*.json \
+      "${BACKUPS_DIR}"/*.jsonlz4
+
+DEST_JSON="${BACKUPS_DIR}/bookmarks-${DATE_STR}.json"
 
 cp "$BOOKMARK_FILE" "$DEST_JSON"
-info "Installed: $(basename "$BOOKMARK_FILE") → bookmarkbackups/bookmarks-${TS}.json"
+touch "$DEST_JSON"
+info "Installed: $(basename "$BOOKMARK_FILE") → bookmarkbackups/bookmarks-${DATE_STR}.json"
 
 # ---------------------------------------------------------------------------
-# Step 2: Remove places.sqlite (and WAL/SHM files if present).
+# Step 2: Remove places.sqlite (and WAL/SHM/lock files if present).
 # On the next Firefox launch, the absence of places.sqlite causes Firefox to
 # create a fresh database and immediately restore from the newest backup.
 # NOTE: This also clears browsing history — intentional for lab environments.
 # ---------------------------------------------------------------------------
 rm -f "${PROFILE_DIR}/places.sqlite" \
       "${PROFILE_DIR}/places.sqlite-shm" \
-      "${PROFILE_DIR}/places.sqlite-wal"
+      "${PROFILE_DIR}/places.sqlite-wal" \
+      "${PROFILE_DIR}/.parentlock" \
+      "${PROFILE_DIR}/lock"
 info "Removed places.sqlite (Firefox will rebuild from bookmark backup on next launch)."
 
 # ---------------------------------------------------------------------------
@@ -241,11 +281,13 @@ info "Removed places.sqlite (Firefox will rebuild from bookmark backup on next l
 USER_JS="${PROFILE_DIR}/user.js"
 touch "$USER_JS"
 
-# Remove any existing instance of this pref (idempotent)
+# Remove any existing instance of these prefs (idempotent)
 # shellcheck disable=SC2016
 sed -i '/browser\.bookmarks\.restore_default_bookmark_count/d' "$USER_JS"
+sed -i '/browser\.bookmarks\.restore_default_bookmarks/d' "$USER_JS"
 echo 'user_pref("browser.bookmarks.restore_default_bookmark_count", 0);' >> "$USER_JS"
-info "Updated user.js: browser.bookmarks.restore_default_bookmark_count = 0"
+echo 'user_pref("browser.bookmarks.restore_default_bookmarks", false);' >> "$USER_JS"
+info "Updated user.js: browser.bookmarks.restore_default_bookmark_count = 0, restore_default_bookmarks = false"
 
 echo ""
 echo -e "${GREEN}Bookmark import queued.${NC} Firefox will restore bookmarks on next launch."

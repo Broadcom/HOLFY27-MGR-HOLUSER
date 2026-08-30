@@ -1,7 +1,9 @@
 #!/bin/bash
 # labstartup.sh - HOLFY27 Lab Startup Shell Wrapper
-# Version 3.17 - 2026-08-25
+# Version 3.18 - 2026-08-29
 # Changes:
+# - Update Firefox bookmark import to support bookmark*.json glob pattern (matching
+#   both bookmark*.json and bookmarks*.json) when searching vpodgitdir/console/ and vpodgitdir/
 # - Remove any legacy vsp-health-monitor crontab entry if present
 # - Added check_and_fix_console_taskbar(): preflight check and self-heal for the
 #   Main Console bottom taskbar (Ubuntu Dock). Detects missing/disabled GNOME extensions,
@@ -1029,14 +1031,14 @@ push_console_files_nfs() {
     fi
 
     # Import vpodrepo bookmarks into the Firefox profile (if provided by the lab).
-    # Search order: vpodgitdir/console/bookmarks*.json (highest priority),
-    # then vpodgitdir/bookmarks*.json (fallback). The most recently modified
+    # Search order: vpodgitdir/console/bookmark*.json (highest priority),
+    # then vpodgitdir/bookmark*.json (fallback). The most recently modified
     # file in the winning location is selected. If neither location has a
-    # bookmarks*.json the existing profile bookmarks are left untouched.
+    # bookmark*.json the existing profile bookmarks are left untouched.
     local _bm_src=""
-    _bm_src=$(ls -t "${vpodgitdir}/console"/bookmarks*.json 2>/dev/null | head -1)
+    _bm_src=$(ls -t "${vpodgitdir}/console"/bookmark*.json 2>/dev/null | head -1)
     if [[ -z "$_bm_src" ]]; then
-        _bm_src=$(ls -t "${vpodgitdir}"/bookmarks*.json 2>/dev/null | head -1)
+        _bm_src=$(ls -t "${vpodgitdir}"/bookmark*.json 2>/dev/null | head -1)
     fi
     if [[ -n "$_bm_src" ]]; then
         log_msg "Found bookmark file for console: ${_bm_src}" "${logfile}"
