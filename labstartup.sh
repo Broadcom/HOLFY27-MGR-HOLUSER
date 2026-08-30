@@ -998,6 +998,11 @@ push_console_files_nfs() {
 
     _run_rebuild_firefox_profile_if_needed "${logfile}" || true
 
+    # Terminate any running Firefox instances on console so profile tuning and bookmark import succeed cleanly
+    if command -v sshpass >/dev/null 2>&1 && [ -f /home/holuser/creds.txt ]; then
+        sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 root@console.site-a.vcf.lab "pkill -x firefox firefox-bin 2>/dev/null || killall -q firefox firefox-bin 2>/dev/null || true" 2>/dev/null || true
+    fi
+
     # Now make sure the user-agent override is present in the Firefox profile:
     log_msg "Making sure user-agent override is present in Firefox profile." "${logfile}"
     FIREFOX_DIR="/lmchol/home/holuser/snap/firefox/common/.mozilla/firefox"
@@ -1046,7 +1051,8 @@ push_console_files_nfs() {
             log_msg "Copied to /lmchol/home/holuser/bookmarks-lab.json" "${logfile}"
             if bash "${holroot}/console/import-firefox-bookmarks.sh" \
                     --bookmark-file "/lmchol/home/holuser/bookmarks-lab.json" \
-                    --mc-base /lmchol >>"${logfile}" 2>&1; then
+                    --mc-base /lmchol \
+                    --force >>"${logfile}" 2>&1; then
                 log_msg "Firefox bookmark import completed." "${logfile}"
             else
                 log_msg "Firefox bookmark import returned non-zero (see ${logfile})." "${logfile}"
