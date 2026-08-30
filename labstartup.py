@@ -216,7 +216,7 @@ def main():
     if os.path.isfile(gen_script):
         try:
             subprocess.Popen(
-                ['python3', gen_script, '--output', '/home/holuser'],
+                ['python3', gen_script, '--output', '/lmchol/home/holuser/labdetails'],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True
