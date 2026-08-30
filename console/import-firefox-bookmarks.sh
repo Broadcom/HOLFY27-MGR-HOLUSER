@@ -13,13 +13,14 @@
 # If no --bookmark-file is provided or the file does not exist, the script exits
 # cleanly without touching the profile (existing bookmarks are preserved).
 #
-# If Firefox is currently running, the script skips the import and logs a warning
-# rather than corrupting the live database. Stale lock files from inactive sessions
-# are cleaned up automatically.
+# If Firefox is currently running, the script skips the import unless --force
+# is specified, in which case running instances are terminated cleanly. Stale
+# lock files from inactive sessions are cleaned up automatically.
 #
 # Version 1.2 - 2026-08-29: Fixed backup filename format to match Firefox's native
 #   regex (bookmarks-YYYY-MM-DD.json); purged stale bookmarkbackups/ files to prevent
-#   restoring old backups; enhanced running process detection and stale lock cleanup.
+#   restoring old backups; added --force flag to terminate running Firefox instances;
+#   enhanced running process detection and stale lock cleanup.
 # Version 1.1 - 2026-08-18: Standardized BLUE color code (\033[0;34m) for universal console/VCD terminal compatibility.
 # Version 1.0 - 2026-06-30
 # Author - Burke Azbill and HOL Core Team
@@ -31,6 +32,7 @@
 #   --bookmark-file FILE   Path to the bookmarks JSON file to import
 #   --mc-base PATH         NFS mount prefix for accessing the console from the
 #                          manager VM (default: /, i.e. running locally)
+#   --force                Terminate any running Firefox instances before importing
 #   --dry-run              Print what would happen; make no changes
 #   -h, --help             Show this help
 
@@ -82,12 +84,13 @@ show_help() {
     echo -e "    ${GREEN}--bookmark-file FILE${NC}   ${BOLD}(required)${NC} Path to the bookmarks JSON to import"
     echo -e "    ${GREEN}--mc-base PATH${NC}          NFS mount prefix for console home dir"
     echo -e "                           (default: /, i.e. running locally on console)"
+    echo -e "    ${GREEN}--force${NC}                 Terminate running Firefox instances before import"
     echo -e "    ${GREEN}--dry-run${NC}               Print actions only; make no changes"
     echo -e "    ${GREEN}-h, --help${NC}              Show this help"
     echo ""
     echo -e "${YELLOW}EXAMPLES:${NC}"
     echo -e "    ${GREEN}# Run from the manager VM (via NFS, called by labstartup.sh)${NC}"
-    echo -e "    ${TOOL_NAME} --bookmark-file /lmchol/home/holuser/bookmarks-lab.json --mc-base /lmchol"
+    echo -e "    ${TOOL_NAME} --bookmark-file /lmchol/home/holuser/bookmarks-lab.json --mc-base /lmchol --force"
     echo ""
     echo -e "    ${GREEN}# Run locally on the console VM${NC}"
     echo -e "    ${TOOL_NAME} --bookmark-file ~/bookmarks-lab.json"
@@ -103,6 +106,7 @@ show_help() {
 # ---------------------------------------------------------------------------
 BOOKMARK_FILE=""
 MC_BASE="/"
+FORCE=0
 DRY_RUN=0
 
 if [[ $# -eq 0 ]]; then
@@ -119,6 +123,10 @@ while [[ $# -gt 0 ]]; do
         --mc-base)
             MC_BASE="${2:-}"
             shift 2 || die "--mc-base requires a value"
+            ;;
+        --force|--kill-running|--close-running)
+            FORCE=1
+            shift
             ;;
         --dry-run) DRY_RUN=1; shift ;;
         *) die "Unknown option: $1 (use --help)" ;;
@@ -184,7 +192,7 @@ info "Firefox profile: ${PROFILE_DIR}"
 
 # ---------------------------------------------------------------------------
 # Guard: do not modify the profile while Firefox is running.
-# Checks for active Firefox processes and cleans up stale lock files.
+# Checks for active Firefox processes and handles termination / stale locks.
 # ---------------------------------------------------------------------------
 firefox_is_running() {
     if [[ "$MC_BASE" == "" || "$MC_BASE" == "/" ]]; then
@@ -206,11 +214,32 @@ firefox_is_running() {
     fi
 }
 
+kill_firefox() {
+    if [[ "$MC_BASE" == "" || "$MC_BASE" == "/" ]]; then
+        # Running locally on the console
+        pkill -x firefox firefox-bin 2>/dev/null || killall -q firefox firefox-bin 2>/dev/null || true
+    else
+        # Running from Manager VM via NFS over SSH
+        if command -v sshpass >/dev/null 2>&1 && [[ -f /home/holuser/creds.txt ]]; then
+            sshpass -f /home/holuser/creds.txt ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 root@console.site-a.vcf.lab "pkill -x firefox firefox-bin 2>/dev/null || killall -q firefox firefox-bin 2>/dev/null || true" 2>/dev/null || true
+        fi
+    fi
+    sleep 2
+}
+
 if firefox_is_running; then
-    warn "Firefox appears to be running."
-    warn "Skipping bookmark import to avoid corrupting the live database."
-    warn "Re-run after Firefox has been closed, or on the next lab boot."
-    exit 0
+    if [[ "$FORCE" -eq 1 ]]; then
+        info "Firefox is running. Terminating Firefox processes (--force enabled)..."
+        kill_firefox
+        if firefox_is_running; then
+            kill_firefox
+        fi
+    else
+        warn "Firefox appears to be running."
+        warn "Skipping bookmark import to avoid corrupting the live database."
+        warn "Pass --force to terminate Firefox automatically, or re-run after Firefox is closed."
+        exit 0
+    fi
 fi
 
 # Clean up stale lock files if present while Firefox is not running
