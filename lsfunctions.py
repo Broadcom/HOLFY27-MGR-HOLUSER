@@ -1,8 +1,10 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.24 - 2026-08-11
+# Version 3.25 - 2026-09-01
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
+# v3.25: Added set_console_docker_proxy() and clear_console_docker_proxy() to configure
+#        or clear the systemd Docker daemon HTTP/HTTPS proxy drop-in on the console VM.
 # v3.24: Added get_cloudinfo() (reads /tmp/cloudinfo.txt written by labstartup.sh)
 #        so Startup/odyssey.py's VLP-deployment check actually resolves instead
 #        of always falling back to 'NOT REPORTED' via a nonexistent attribute.
@@ -1576,6 +1578,103 @@ def clear_console_gnome_proxy(console_host, password, dry_run=False):
     else:
         write_output(
             f'WARNING: {label}: GNOME proxy clear failed (ssh rc={result.returncode}): '
+            f'{result.stderr.strip()}'
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Group D-4: Console VM Docker Daemon proxy (/etc/systemd/system/docker.service.d/http-proxy.conf)
+# ---------------------------------------------------------------------------
+
+def set_console_docker_proxy(console_host, password, dry_run=False):
+    """Configure HTTP/HTTPS proxy drop-in for the Docker daemon on the console VM.
+
+    Creates /etc/systemd/system/docker.service.d/http-proxy.conf with canonical
+    LAB_PROXY_URL and build_lab_no_proxy() values, then reloads the systemd
+    daemon and restarts the Docker service.
+
+    :param console_host: SSH target, e.g. 'root@console.site-a.vcf.lab'
+    :param password:     SSH password
+    :param dry_run:      If True log intent, make no changes
+    :return: True on success, False on SSH error (non-fatal)
+    """
+    label = console_host.split('@')[-1].split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would set Docker daemon proxy on {console_host}')
+        return True
+
+    no_proxy_str = build_lab_no_proxy()
+    dropin_dir = '/etc/systemd/system/docker.service.d'
+    dropin_file = f'{dropin_dir}/http-proxy.conf'
+    conf_content = (
+        '[Service]\n'
+        f'Environment="HTTP_PROXY={LAB_PROXY_URL}"\n'
+        f'Environment="HTTPS_PROXY={LAB_PROXY_URL}"\n'
+        f'Environment="NO_PROXY={no_proxy_str}"\n'
+    )
+    conf_b64 = base64.b64encode(conf_content.encode()).decode()
+    script = (
+        f'mkdir -p {dropin_dir}\n'
+        f'echo {conf_b64} | base64 -d > {dropin_file}\n'
+        'systemctl daemon-reload\n'
+        'if systemctl is-active --quiet docker || systemctl is-enabled --quiet docker || '
+        '[ -f /lib/systemd/system/docker.service ] || [ -f /etc/systemd/system/docker.service ] || '
+        '[ -f /usr/lib/systemd/system/docker.service ]; then\n'
+        '    systemctl restart docker\n'
+        'fi\n'
+    )
+    script_b64 = base64.b64encode(script.encode()).decode()
+    cmd = f"echo {script_b64} | base64 -d | bash"
+    result = ssh(cmd, console_host, password)
+    if result.returncode == 0:
+        write_output(f'{label}: Docker daemon proxy set in {dropin_file} ({LAB_PROXY_URL})')
+        return True
+    else:
+        write_output(
+            f'WARNING: {label}: Docker daemon proxy set failed (ssh rc={result.returncode}): '
+            f'{result.stderr.strip()}'
+        )
+        return False
+
+
+def clear_console_docker_proxy(console_host, password, dry_run=False):
+    """Remove Docker daemon proxy drop-in on the console VM and restart docker.
+
+    Deletes /etc/systemd/system/docker.service.d/http-proxy.conf if present,
+    reloads systemd daemon, and restarts docker so it operates directly.
+
+    :param console_host: SSH target, e.g. 'root@console.site-a.vcf.lab'
+    :param password:     SSH password
+    :param dry_run:      If True log intent, make no changes
+    :return: True on success, False on SSH error (non-fatal)
+    """
+    label = console_host.split('@')[-1].split('.')[0]
+    if dry_run:
+        write_output(f'[dry-run] would clear Docker daemon proxy on {console_host}')
+        return True
+
+    dropin_file = '/etc/systemd/system/docker.service.d/http-proxy.conf'
+    script = (
+        f'if [ -f {dropin_file} ]; then\n'
+        f'    rm -f {dropin_file}\n'
+        '    systemctl daemon-reload\n'
+        '    if systemctl is-active --quiet docker || systemctl is-enabled --quiet docker || '
+        '       [ -f /lib/systemd/system/docker.service ] || [ -f /etc/systemd/system/docker.service ] || '
+        '       [ -f /usr/lib/systemd/system/docker.service ]; then\n'
+        '        systemctl restart docker 2>/dev/null || true\n'
+        '    fi\n'
+        'fi\n'
+    )
+    script_b64 = base64.b64encode(script.encode()).decode()
+    cmd = f"echo {script_b64} | base64 -d | bash"
+    result = ssh(cmd, console_host, password)
+    if result.returncode == 0:
+        write_output(f'{label}: Docker daemon proxy cleared ({dropin_file})')
+        return True
+    else:
+        write_output(
+            f'WARNING: {label}: Docker daemon proxy clear failed (ssh rc={result.returncode}): '
             f'{result.stderr.strip()}'
         )
         return False

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # prelim.py - HOLFY27 Core Preliminary Tasks Module
-# Version 3.17 - 2026-08-21
+# Version 3.18 - 2026-09-01
 # Author - Burke Azbill and HOL Core Team
 # Initial lab startup checks and configuration
+# v3.18: Added Docker daemon proxy configuration to Task 8b for HOL lab types.
 
 import os
 import sys
@@ -432,6 +433,17 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.clear_console_gnome_proxy(_console_host, _pw, dry_run)
     except Exception as e:
         lsf.write_output(f'WARNING: Console GNOME proxy step skipped: {e}')
+
+    # Docker Daemon proxy (/etc/systemd/system/docker.service.d/http-proxy.conf)
+    try:
+        _console_host = 'root@console.site-a.vcf.lab'
+        _pw = lsf.get_password()
+        if loader.requires_proxy_filter():
+            lsf.set_console_docker_proxy(_console_host, _pw, dry_run)
+        else:
+            lsf.clear_console_docker_proxy(_console_host, _pw, dry_run)
+    except Exception as e:
+        lsf.write_output(f'WARNING: Console Docker proxy step skipped: {e}')
 
     if dashboard:
         dashboard.update_task('prelim', 'console_os_proxy', 'complete')
