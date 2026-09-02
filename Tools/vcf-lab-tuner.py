@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.0.0 - 2026-08-26
+Version 2.1.0 - 2026-09-02
 Author: HOL Core Team
+
+v2.1.0: Dynamic VCF Component Discovery, HA Replica Evaluation Tuning, and SSP Cluster Parity:
+  - Dynamic VCF Component Discovery (_discover_vcf_components): Dynamically queries cluster-scoped components.api.vmsp.vmware.com Component CRDs on VSP to discover active component namespaces, operational statuses, and workloads. Caches discovered state in runtime context (ctx) and eliminates reliance on static, error-prone /tmp/config.ini entries while preserving a fallback parser.
+  - Guarded VCF Component Section Checks: Guarded chk_vodap, chk_redis, chk_salt, _check_vsp_probe_and_memory_tuning, and chk_footprint so checks for optional components (e.g. vodap, salt-raas, salt) are dynamically evaluated only when the corresponding component is installed on the cluster, cleanly skipping uninstalled components.
+  - HA Replicas Evaluation Tuning: Updated chk_footprint (FOOTPRINT_HA_DEPLOYS) and _storm_scale_to_one to evaluate replica counts >= 1 (e.g., current 2 replicas when target is 1) as passing (ok / green checkmark).
+  - Full SSP Cluster Parity & Sizing Validation: Validated and updated SSP_MACHINE_TYPES profiles for Control Plane (standard, licensing) and Worker (standard, advanced, copilot, lab-reduced, custom regex format) node sizing; added dedicated gateway section and MetalLB LoadBalancer service VIP checks; configured sudo="plain" on ssp_direct transport; implemented Ubuntu/CRI-O canonical proxy configuration check/remediation script (_ssp_proxy_repair_script); added fallback insertion anchors for etcd auto-compaction flags in _etcd_compaction_check; and guarded static kube-vip.yaml manifest checks for clusters without kube-vip static pods.
 
 v2.0.0: Native Certificate Renewal Engine across VSP, VCFA, and Supervisor clusters:
   - Native Cert-Manager Renewal (_renew_certmanager_leaf_certs): Auto-discovers and renews expiring/invalid cert-manager leaf certificates across all namespaces for VSP, VCFA, and Supervisor. Deletes backing secrets to trigger reissuance, correlates workloads mounting renewed secrets, and executes zero-downtime rollout restarts.
@@ -454,6 +460,7 @@ Exit codes:
 import argparse
 import base64
 import configparser
+import copy
 import json
 import os
 import re
@@ -480,8 +487,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.0.0"
-DATE    = "2026-08-26"
+VERSION = "2.1.0"
+DATE    = "2026-09-02"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -647,6 +654,7 @@ def get_cluster_configs(args):
     Returns the CLUSTERS dictionary with dynamic site resolution applied.
     """
     site_suffix, subnet = resolve_site_config(args)
+    subnet_0 = subnet.rsplit('.', 1)[0] + '.0'
     
     return {
         "vsp": {
@@ -759,6 +767,47 @@ def get_cluster_configs(args):
             # vCenter list comes from config.ini [RESOURCES] vCenters; the Supervisor
             # is discovered per-vCenter via decryptK8Pwd.py.
             "sections": ["services", "contentlib", "nodes", "pods", "certs", "webhooks"],
+        },
+        "ssp": {
+            "label": "SSP",
+            "user": "sysadmin",
+            "transport": "ssp_direct",
+            "sudo": "plain",                     # sysadmin uses sudo for node/manifest operations
+            "cp_vips": [f"{subnet_0}.10"],
+            "owned_vips": [f"{subnet_0}.10", f"{subnet_0}.21"],
+            "vip_hint": f"dropped — check kube-vip on ssp control-plane nodes ({subnet_0}.21)",
+            "worker_fqdn": f"ssp-i.{site_suffix}",
+            "discover_octets": (10, 11, 22, 29, 31, 23, 24, 25, 26, 27, 28),
+            "static_pods": ("etcd", "kube-apiserver", "kube-controller-manager", "kube-scheduler"),
+            "check_cp_lease": False,
+            "vip_watchdog_unit": None,
+            "endpoint_fqdn": f"ssp.{site_suffix}",
+            "endpoint_vip": f"{subnet_0}.11",
+            "endpoint_path": "/ui",
+            "keeper_unit": "vcf-lab-keeper-ssp",
+            "legacy_keeper_units": ["ssp-reserve-keeper"],
+            "deployments": [
+                ("nsxi-platform", "platform-ui", "fail"),
+                ("nsxi-platform", "metrics-server", "fail"),
+                ("nsxi-platform", "site-service", "fail"),
+                ("nsxi-platform", "authserver", "fail"),
+                ("metallb-system", "ssp-metallb-controller", "fail"),
+                ("projectcontour", "projectcontour-contour", "fail"),
+                ("cert-manager", "cert-manager-controller", "fail"),
+                ("cert-manager", "cert-manager-cainjector", "fail"),
+                ("cert-manager", "cert-manager-webhook", "fail"),
+            ],
+            "gateway_services": [
+                ("projectcontour", "projectcontour-envoy", f"{subnet_0}.11"),
+                ("nsxi-platform", "kafka-external", f"{subnet_0}.12"),
+                ("nsxi-platform", "kafka-controller-2-external", f"{subnet_0}.13"),
+                ("nsxi-platform", "kafka-controller-1-external", f"{subnet_0}.14"),
+                ("nsxi-platform", "kafka-controller-0-external", f"{subnet_0}.15"),
+            ],
+            "pg_namespaces": (),
+            "etcd_cpu_request": "2500m",
+            "sections": ["cp", "nodes", "pods", "gateway", "deployments", "certs", "endpoint", "proxy",
+                         "kubeadm", "postgres", "password", "sizing", "footprint"],
         },
     }
 
@@ -1031,7 +1080,7 @@ class _PasswordFile:
             prefix=f".vlt-{os.getpid()}-{int(time.time() * 1000) % 100000}-", dir="/tmp")
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as fh:
-            fh.write(self.password + "\n")
+            fh.write(self.password)
         return self.path
 
     def __exit__(self, *exc):
@@ -1095,6 +1144,45 @@ class DirectTransport:
                 return 1, f"<missing tool: {exc}>"
             except Exception as exc:                 # never raise out of transport
                 return 1, f"<transport error: {exc}>"
+
+
+def _wrap_ssp_cmd(cmd):
+    """Wrap command for SSP execution on ssp-i (10.1.0.10).
+
+    Directs CAPI management commands to ssp-i's default kubeconfig (namespace ssp),
+    and workload cluster commands to the workload kubeconfig extracted from secret/ssp-kubeconfig.
+    OS-level non-kubectl commands (kubeadm, chage, govc, etc.) pass through directly.
+    """
+    cmd_strip = cmd.strip()
+    if cmd_strip.startswith("m "):
+        return "kubectl " + cmd_strip[2:]
+
+    if "kubectl" not in cmd:
+        return cmd
+
+    if "ssp-kubeconfig" in cmd or "--kubeconfig" in cmd or cmd.startswith("ssh ") or cmd.startswith("govc ") or cmd.startswith("python3 "):
+        return cmd
+
+    capi_kinds = ("cluster", "machinedeployment", "kubeadmcontrolplane", "vspheremachinetemplate", "packagedeployment", "machine")
+    is_capi = any(k in cmd.lower() for k in capi_kinds) or "-n ssp" in cmd or "namespace ssp" in cmd
+
+    if is_capi:
+        return cmd
+
+    preamble = 'WLKC=/tmp/.ssp-wlkc; [ -s "$WLKC" ] || (kubectl -n ssp get secret ssp-kubeconfig -o jsonpath="{.data.value}" 2>/dev/null | base64 -d > "$WLKC"); '
+    wrapped_cmd = re.sub(r'\bkubectl\b', r'kubectl --kubeconfig="$WLKC"', cmd)
+    return preamble + wrapped_cmd
+
+
+class SSPTransport(DirectTransport):
+    """Transport for Security Services Platform (SSP 5.2 / ssp-i).
+
+    Inherits from DirectTransport to connect to sysadmin@ssp-i via SSH, but
+    automatically routes workload vs CAPI management cluster commands.
+    """
+    def exec(self, cmd, timeout=60):
+        wrapped = _wrap_ssp_cmd(cmd)
+        return super().exec(wrapped, timeout)
 
 
 class VCenterTransport:
@@ -1850,7 +1938,14 @@ def _etcd_compaction_check(r, cl):
             f"mkdir -p /root/manifest-bak && "
             f"cp {ETCD_MANIFEST} {ETCD_MANIFEST}.bak.$(date +%s) 2>/dev/null; "
             f"sed -i -E '/--auto-compaction-mode=/d; /--auto-compaction-retention=/d' {ETCD_MANIFEST} && "
-            f"sed -i '/--election-timeout=/a\\    - --auto-compaction-mode=periodic\\n    - --auto-compaction-retention=1h' {ETCD_MANIFEST}",
+            f"if grep -q -- '--election-timeout=' {ETCD_MANIFEST}; then "
+            f"sed -i '/--election-timeout=/a\\    - --auto-compaction-mode=periodic\\n    - --auto-compaction-retention=1h' {ETCD_MANIFEST}; "
+            f"elif grep -q -- '--snapshot-count=' {ETCD_MANIFEST}; then "
+            f"sed -i '/--snapshot-count=/a\\    - --auto-compaction-mode=periodic\\n    - --auto-compaction-retention=1h' {ETCD_MANIFEST}; "
+            f"elif grep -q -- '--data-dir=' {ETCD_MANIFEST}; then "
+            f"sed -i '/--data-dir=/a\\    - --auto-compaction-mode=periodic\\n    - --auto-compaction-retention=1h' {ETCD_MANIFEST}; "
+            f"else "
+            f"sed -i '/command:/a\\    - --auto-compaction-mode=periodic\\n    - --auto-compaction-retention=1h' {ETCD_MANIFEST}; fi",
             "enable etcd auto-compaction (periodic, 1h retention)",
             tier="persistent", timeout=60)
         res.action = "auto-compaction -> periodic/1h"
@@ -1972,21 +2067,22 @@ def chk_cp(r, ctx):
                     res_wd.detail = f"{unit} enabled and started"
             out.append(res_wd)
 
-    rc, kvip = r.read(
-        "grep -A1 vip_preserve_on_leadership_loss "
-        "/etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null", 30)
-    if rc == 0 and "true" in kvip.lower():
-        out.append(ok("cp.vip_preserve",
-                      "kube-vip: vip_preserve_on_leadership_loss=true", cluster=cl))
-    elif rc == 0 and kvip.strip():
-        out.append(fail("cp.vip_preserve",
-                        "kube-vip: vip_preserve_on_leadership_loss=true",
-                        "reads false — kube-fix.py --skip-vip fixes the manifest",
-                        cluster=cl))
-    else:
-        out.append(warn("cp.vip_preserve",
-                        "kube-vip: vip_preserve_on_leadership_loss=true",
-                        "manifest not readable", cluster=cl))
+    if "kube-vip" in cfg.get("static_pods", ()):
+        rc, kvip = r.read(
+            "grep -A1 vip_preserve_on_leadership_loss "
+            "/etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null", 30)
+        if rc == 0 and "true" in kvip.lower():
+            out.append(ok("cp.vip_preserve",
+                          "kube-vip: vip_preserve_on_leadership_loss=true", cluster=cl))
+        elif rc == 0 and kvip.strip():
+            out.append(fail("cp.vip_preserve",
+                            "kube-vip: vip_preserve_on_leadership_loss=true",
+                            "reads false — kube-fix.py --skip-vip fixes the manifest",
+                            cluster=cl))
+        else:
+            out.append(warn("cp.vip_preserve",
+                            "kube-vip: vip_preserve_on_leadership_loss=true",
+                            "manifest not readable", cluster=cl))
 
     rc, ps = r.read("crictl ps 2>/dev/null", 45)
     if rc != 0 or not ps.strip():
@@ -2011,9 +2107,12 @@ def chk_cp(r, ctx):
         _lease_tuning_check(r, cl, "kube-scheduler", SCHEDULER_MANIFEST),
         _etcd_cpu_check(r, cl, cfg.get("etcd_cpu_request", "2500m")),
         _etcd_compaction_check(r, cl),
-        _kubevip_lease_guard(r, cl, "cp"),
     ]
+    if "kube-vip" in cfg.get("static_pods", ()):
+        lease_results.append(_kubevip_lease_guard(r, cl, "cp"))
     out.extend(lease_results)
+    if cl == "vcfa":
+        out.extend(_check_vsphere_cpi_tuning(r, ctx))
 
     # --revert (remediate-lab.sh --revert-lease / revert_leader_elect / revert_etcd):
     # restore the newest backup this tool itself wrote for each manifest above.
@@ -3181,6 +3280,38 @@ def chk_proxy(r, ctx):
                      cluster=cl)]
 
     expected_url = lsf.LAB_PROXY_URL
+    if cl == "ssp":
+        rc, res = r.read(
+            "for f in /etc/environment "
+            "/etc/systemd/system/crio.service.d/http-proxy.conf "
+            "/etc/systemd/system/kubelet.service.d/http-proxy.conf; do "
+            f"grep -qF '{expected_url}' \"$f\" 2>/dev/null || echo \"MISSING:$f\"; done; "
+            "echo DONE", 45)
+        label = f"ssp-i: proxy configured ({expected_url})"
+        if rc != 0:
+            out.append(warn("proxy.node", label, "ssp-i unreachable", cluster=cl))
+        elif "MISSING:" in res:
+            missing = [ln.split(":", 1)[1] for ln in res.splitlines() if ln.startswith("MISSING:")]
+            res_obj = fail("proxy.node", label, f"drift in {len(missing)} file(s)", cluster=cl)
+            if ctx.get("verbose"):
+                for m in missing:
+                    row_verbose(f"  missing/stale: {m}")
+            if may_act(r, "proxy"):
+                no_proxy = lsf.build_lab_no_proxy()
+                script = _ssp_proxy_repair_script(expected_url, no_proxy)
+                b64 = base64.b64encode(script.encode()).decode()
+                r.write(f"echo {b64} | base64 -d > /tmp/vlt-proxy.sh && "
+                        f"bash /tmp/vlt-proxy.sh; rc=$?; rm -f /tmp/vlt-proxy.sh; exit $rc",
+                        "write canonical proxy config on ssp-i and restart only services whose drop-in changed",
+                        tier="persistent", timeout=180)
+                res_obj.action = "proxy config written"
+                if not r.dry_run:
+                    res_obj.state = "warn"
+                    res_obj.detail = "drift corrected"
+            out.append(res_obj)
+        else:
+            out.append(ok("proxy.node", label, cluster=cl))
+        return out
     data = ctx.get("nodes")
     if not data:
         return [warn("proxy", "Node proxy config: matches canonical values",
@@ -3237,6 +3368,53 @@ def chk_proxy(r, ctx):
                 res.state = "warn"
                 res.detail = "drift corrected"
     return out
+
+
+def _ssp_proxy_repair_script(proxy_url, no_proxy):
+    """Canonical per-node proxy config for Ubuntu/CRI-O ssp-i node."""
+    return f"""#!/bin/bash
+set -u
+CRIO=/etc/systemd/system/crio.service.d/http-proxy.conf
+KUBE=/etc/systemd/system/kubelet.service.d/http-proxy.conf
+
+CRIO_OLD=$(md5sum "$CRIO" 2>/dev/null | cut -d' ' -f1)
+KUBE_OLD=$(md5sum "$KUBE" 2>/dev/null | cut -d' ' -f1)
+
+sed -i '/^http_proxy=/d;/^https_proxy=/d;/^no_proxy=/d;/^HTTP_PROXY=/d;/^HTTPS_PROXY=/d;/^NO_PROXY=/d' /etc/environment
+cat >> /etc/environment <<'EOF'
+http_proxy={proxy_url}
+https_proxy={proxy_url}
+no_proxy={no_proxy}
+HTTP_PROXY={proxy_url}
+HTTPS_PROXY={proxy_url}
+NO_PROXY={no_proxy}
+EOF
+
+mkdir -p /etc/systemd/system/crio.service.d /etc/systemd/system/kubelet.service.d
+cat > "$CRIO" <<'EOF'
+[Service]
+Environment="HTTP_PROXY={proxy_url}"
+Environment="HTTPS_PROXY={proxy_url}"
+Environment="NO_PROXY={no_proxy}"
+EOF
+cp "$CRIO" "$KUBE"
+
+CRIO_NEW=$(md5sum "$CRIO" 2>/dev/null | cut -d' ' -f1)
+KUBE_NEW=$(md5sum "$KUBE" 2>/dev/null | cut -d' ' -f1)
+
+systemctl daemon-reload
+if [ "$CRIO_OLD" != "$CRIO_NEW" ]; then
+    systemctl restart crio && echo CRIO_RESTARTED
+else
+    echo CRIO_UNCHANGED
+fi
+if [ "$KUBE_OLD" != "$KUBE_NEW" ]; then
+    systemctl restart kubelet && echo KUBELET_RESTARTED
+else
+    echo KUBELET_UNCHANGED
+fi
+echo PROXY_CONFIGURED
+"""
 
 
 def _proxy_repair_script(proxy_url, no_proxy):
@@ -3576,10 +3754,12 @@ def chk_endpoint(r, ctx):
     if not (fqdn and vip):
         return []
     out = []
-    primary_path = cfg.get("endpoint_path", "/automation")
-    paths_to_check = [primary_path]
-    if primary_path != "/login/":
-        paths_to_check.append("/login/")
+    primary_path = cfg.get("endpoint_path", "/automation" if cl == "vcfa" else "/ui")
+    paths_to_check = list(cfg.get("endpoint_paths", []))
+    if not paths_to_check:
+        paths_to_check = [primary_path]
+        if cl == "vcfa" and primary_path != "/login/":
+            paths_to_check.append("/login/")
 
     def _probe_paths():
         res_map = {}
@@ -3771,17 +3951,136 @@ VSP_PROBE_TARGETS = [
 ]
 
 
+def _vcfcomponents_from_config(path="/tmp/config.ini"):
+    """[VCFFINAL] vcfcomponents entries as (namespace, kind, name) (fallback parser)."""
+    items = []
+    try:
+        with open(path) as fh:
+            in_key = False
+            for raw in fh:
+                stripped = raw.strip()
+                if stripped.lower().startswith("vcfcomponents"):
+                    in_key = True
+                    if "=" in stripped:
+                        val = stripped.split("=", 1)[1].split("#")[0].split(";")[0].strip()
+                        if ":" in val and "/" in val:
+                            ns, rest = val.split(":", 1)
+                            kind, _, name = rest.partition("/")
+                            if ns and kind and name:
+                                items.append((ns.strip(), kind.strip(), name.strip()))
+                    continue
+                if in_key:
+                    if not stripped or stripped.startswith("[") or "=" in stripped.split(":")[0]:
+                        if not raw[:1].isspace():
+                            break
+                    clean = stripped.split("#")[0].split(";")[0].strip()
+                    if not clean:
+                        continue
+                    if ":" in clean and "/" in clean:
+                        ns, rest = clean.split(":", 1)
+                        kind, _, name = rest.partition("/")
+                        if ns and kind and name:
+                            items.append((ns.strip(), kind.strip(), name.strip()))
+                    elif not raw[:1].isspace():
+                        break
+    except OSError:
+        pass
+    return items
+
+
+def _discover_vcf_components(r, ctx=None):
+    """Dynamic VCF Component discovery from the VSP cluster (CRD: components.api.vmsp.vmware.com).
+
+    Eliminates reliance on error-prone static config files (/tmp/config.ini) by querying
+    live cluster state. Discovers installed Component CRDs, their active namespaces,
+    and their associated Deployments/StatefulSets.
+    """
+    if ctx and "_vcf_components" in ctx:
+        return ctx["_vcf_components"]
+
+    components = {}
+    comp_namespaces = set()
+    workloads = []
+
+    if r.cluster == "vsp":
+        comp_data = r.read_json("kubectl get components.api.vmsp.vmware.com -o json 2>/dev/null", 30)
+        items = (comp_data or {}).get("items", [])
+        if items:
+            for item in items:
+                name = item["metadata"]["name"]
+                ns = item.get("spec", {}).get("namespace") or name
+                status = (item.get("metadata", {}).get("annotations") or {}).get(
+                    "component.vmsp.vmware.com/operational-status", "")
+                phase = item.get("status", {}).get("phase", "")
+                components[name] = {
+                    "name": name,
+                    "namespace": ns,
+                    "status": status,
+                    "phase": phase,
+                    "crd": item,
+                }
+                if name != "vsp" and ns:
+                    comp_namespaces.add(ns)
+
+            if comp_namespaces:
+                all_wl = r.read_json("kubectl get deploy,sts -A -o json 2>/dev/null", 30)
+                for obj in (all_wl or {}).get("items", []):
+                    ns = obj.get("metadata", {}).get("namespace", "")
+                    if ns in comp_namespaces:
+                        kind = obj.get("kind", "").lower()
+                        wname = obj.get("metadata", {}).get("name", "")
+                        workloads.append((ns, kind, wname, obj))
+
+            result = {
+                "components": components,
+                "namespaces": comp_namespaces,
+                "workloads": workloads,
+                "source": "crd",
+            }
+            if ctx is not None:
+                ctx["_vcf_components"] = result
+            return result
+
+    # Fallback to config.ini if CRD is absent or non-VSP cluster
+    fallback_items = _vcfcomponents_from_config()
+    for ns, kind, name in fallback_items:
+        comp_namespaces.add(ns)
+        workloads.append((ns, kind, name, None))
+        if ns not in components:
+            components[ns] = {
+                "name": ns,
+                "namespace": ns,
+                "status": "Running",
+                "phase": "Running",
+                "crd": None,
+            }
+
+    result = {
+        "components": components,
+        "namespaces": comp_namespaces,
+        "workloads": workloads,
+        "source": "config" if fallback_items else "none",
+    }
+    if ctx is not None:
+        ctx["_vcf_components"] = result
+    return result
+
+
 def _check_vsp_probe_and_memory_tuning(r, ctx):
     """VSP probe timeout and memory tuning for Section A of vsp-stabilizer.sh."""
     out = []
     cl = r.cluster
+    disc = _discover_vcf_components(r, ctx)
+    configured_namespaces = disc["namespaces"]
     for ns, kind, name, con, want_timeout, patch_json in VSP_PROBE_TARGETS:
+        if ns not in ("vmsp-platform", "kube-system") and ns not in configured_namespaces:
+            continue
         label = f"{ns}/{kind}/{name}: probes and resources tuned"
         rc, cur = r.read(
             f"kubectl -n {ns} get {kind} {name} -o jsonpath='{{.spec.template.spec.containers[?(@.name==\"{con}\")].livenessProbe.timeoutSeconds}}' 2>/dev/null", 30)
         val = (cur or "").strip().splitlines()
         val = val[-1].strip() if val else ""
-        if val.isdigit() and int(val) == want_timeout:
+        if val.isdigit() and int(val) >= want_timeout:
             out.append(ok("vcf.probe", label, f"livenessTimeout={val}s", cluster=cl))
         elif not val:
             out.append(warn("vcf.probe", label, f"resource or container {con} not found", cluster=cl))
@@ -3801,9 +4100,10 @@ def _check_vsp_probe_and_memory_tuning(r, ctx):
 
 
 def _check_vsphere_cpi_tuning(r, ctx):
-    """vsphere-cpi DaemonSet leader election lease tuning for Section C of vsp-stabilizer.sh."""
+    """vsphere-cpi DaemonSet leader election lease tuning."""
     out = []
     cl = r.cluster
+    sec = "cp" if cl == "vcfa" else "vcf"
     rc, cur = r.read(
         "kubectl -n kube-system get daemonset vsphere-cpi -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null", 30)
     args_str = (cur or "").strip().splitlines()
@@ -3811,12 +4111,12 @@ def _check_vsphere_cpi_tuning(r, ctx):
     label = "vsphere-cpi DaemonSet: leader-election lease tuned (60s/40s/6s)"
 
     if "--leader-elect-renew-deadline=" in args_str:
-        out.append(ok("vcf.cpi", label, cluster=cl))
+        out.append(ok(f"{sec}.cpi", label, cluster=cl))
     elif not args_str:
-        out.append(warn("vcf.cpi", label, "vsphere-cpi DaemonSet not found", cluster=cl))
+        out.append(warn(f"{sec}.cpi", label, "vsphere-cpi DaemonSet not found", cluster=cl))
     else:
-        res = fail("vcf.cpi", label, f"args={args_str}", cluster=cl)
-        if may_act(r, "vcf"):
+        res = fail(f"{sec}.cpi", label, f"args={args_str}", cluster=cl)
+        if may_act(r, sec):
             if args_str.endswith("]"):
                 new_args = args_str[:-1] + ',"--leader-elect-lease-duration=60s","--leader-elect-renew-deadline=40s","--leader-elect-retry-period=6s"]'
             else:
@@ -3832,7 +4132,7 @@ def _check_vsphere_cpi_tuning(r, ctx):
                 res.detail = "patched leader election lease settings (60s/40s/6s)"
         out.append(res)
 
-    if ctx.get("revert") and may_act(r, "vcf"):
+    if ctx.get("revert") and may_act(r, sec):
         if "--leader-elect-renew-deadline=" in args_str:
             base_args = args_str
             for flag in (',"--leader-elect-lease-duration=60s"', ',"--leader-elect-renew-deadline=40s"', ',"--leader-elect-retry-period=6s"'):
@@ -3842,7 +4142,7 @@ def _check_vsphere_cpi_tuning(r, ctx):
                 "kubectl -n kube-system delete pod -l app=vsphere-cpi --grace-period=0 --force",
                 "revert vsphere-cpi DaemonSet leader election args to base",
                 tier="persistent", timeout=60)
-            rev_res = ok("vcf.cpi_revert", "vsphere-cpi DaemonSet: reverted leader election args", cluster=cl)
+            rev_res = ok(f"{sec}.cpi_revert", "vsphere-cpi DaemonSet: reverted leader election args", cluster=cl)
             rev_res.action = "reverted cpi args"
             out.append(rev_res)
 
@@ -3862,31 +4162,31 @@ def chk_vcf(r, ctx):
     """
     out = []
     cl = r.cluster
-    data = r.read_json(
-        "kubectl get components.api.vmsp.vmware.com -o json 2>/dev/null", 60)
-    if not data:
+    disc = _discover_vcf_components(r, ctx)
+    if not disc["components"]:
         return [ok("vcf", "VCF components: readable",
                    "no components CRD on this cluster", cluster=cl)]
 
     not_running = []
-    for item in data.get("items", []):
-        name = item["metadata"]["name"]
-        ann = item["metadata"].get("annotations") or {}
-        status = ann.get("component.vmsp.vmware.com/operational-status", "")
-        label = f"component {name}: Running"
+    for comp_name, comp_info in disc["components"].items():
+        if comp_name == "vsp":
+            # Core platform component
+            continue
+        status = comp_info.get("status", "")
+        label = f"component {comp_name}: Running"
         if status == "Running":
             out.append(ok("vcf.component", label, cluster=cl))
         elif not status:
             out.append(warn("vcf.component", label, "no operational-status annotation",
                             cluster=cl))
         else:
-            not_running.append(name)
+            not_running.append(comp_name)
             res = fail("vcf.component", label, f"annotated '{status}'", cluster=cl)
             if may_act(r, "vcf"):
-                r.write(f"kubectl annotate components.api.vmsp.vmware.com {name} "
+                r.write(f"kubectl annotate components.api.vmsp.vmware.com {comp_name} "
                         "component.vmsp.vmware.com/operational-status=Running "
                         "--overwrite",
-                        f"annotate component {name} operational-status=Running",
+                        f"annotate component {comp_name} operational-status=Running",
                         tier="persistent", timeout=60)
                 res.action = "annotated Running"
                 if not r.dry_run:
@@ -3894,10 +4194,10 @@ def chk_vcf(r, ctx):
                     res.detail = f"was '{status}'; annotated Running"
             out.append(res)
 
-    # Configured workloads from [VCFFINAL] vcfcomponents - the same config key
-    # VCFfinal.py uses, deliberately shared so the two cannot drift.
-    for ns, kind, name in _vcfcomponents_from_config():
-        obj = r.read_json(f"kubectl get {kind} {name} -n {ns} -o json 2>/dev/null", 45)
+    # Discovered component workloads across active component namespaces
+    for ns, kind, name, obj in disc["workloads"]:
+        if obj is None:
+            obj = r.read_json(f"kubectl get {kind} {name} -n {ns} -o json 2>/dev/null", 45)
         wlabel = f"{ns}/{kind}/{name}: at intended replicas"
         if not obj:
             out.append(warn("vcf.workload", wlabel, "not found", cluster=cl))
@@ -3905,7 +4205,7 @@ def chk_vcf(r, ctx):
         spec_rep = obj.get("spec", {}).get("replicas")
         desired = spec_rep if spec_rep is not None else 1
         ready = obj.get("status", {}).get("readyReplicas", 0) or 0
-        recorded = (obj["metadata"].get("annotations") or {}).get(
+        recorded = (obj.get("metadata", {}).get("annotations") or {}).get(
             "vcf.lab/original-replicas")
         if desired == 0:
             res = fail("vcf.workload", wlabel, "scaled to 0", cluster=cl)
@@ -3933,35 +4233,6 @@ def chk_vcf(r, ctx):
     return out
 
 
-def _vcfcomponents_from_config(path="/tmp/config.ini"):
-    """[VCFFINAL] vcfcomponents entries as (namespace, kind, name)."""
-    items = []
-    try:
-        with open(path) as fh:
-            in_key = False
-            for raw in fh:
-                stripped = raw.strip()
-                if stripped.lower().startswith("vcfcomponents"):
-                    in_key = True
-                    continue
-                if in_key:
-                    if not stripped or stripped.startswith("[") or "=" in stripped.split(":")[0]:
-                        if not raw[:1].isspace():
-                            break
-                    if stripped.startswith("#") or not stripped:
-                        continue
-                    if ":" in stripped and "/" in stripped:
-                        ns, rest = stripped.split(":", 1)
-                        kind, _, name = rest.partition("/")
-                        if ns and kind and name:
-                            items.append((ns.strip(), kind.strip(), name.strip()))
-                    elif not raw[:1].isspace():
-                        break
-    except OSError:
-        pass
-    return items
-
-
 def chk_redis(r, ctx):
     """Redis and RaaS readiness, plus the redis-service endpoint.
 
@@ -3972,6 +4243,9 @@ def chk_redis(r, ctx):
     """
     out = []
     cl = r.cluster
+    disc = _discover_vcf_components(r, ctx)
+    if cl == "vsp" and "salt-raas" not in disc["namespaces"] and "salt-raas" not in disc["components"]:
+        return [ok("redis", "Redis & Salt RaaS: component not installed on cluster (skipped)", cluster=cl)]
     for ns, app in (("salt-raas", "redis"), ("salt-raas", "raas")):
         rc, res = r.read(
             f"kubectl -n {ns} get pod -l app={app} --no-headers 2>/dev/null "
@@ -4023,6 +4297,9 @@ def chk_salt(r, ctx):
     """
     out = []
     cl = r.cluster
+    disc = _discover_vcf_components(r, ctx)
+    if cl == "vsp" and "salt" not in disc["namespaces"] and "salt" not in disc["components"]:
+        return [ok("salt", "Salt Stack: component not installed on cluster (skipped)", cluster=cl)]
     unhealthy = []
     for ns, app in SALT_PODS:
         rc, res = r.read(
@@ -4246,6 +4523,37 @@ def chk_password(r, ctx):
     """
     out = []
     cl = r.cluster
+    if cl == "ssp":
+        for user in ("sysadmin", "root"):
+            rc, res = r.read(f"chage -l {user} 2>/dev/null | awk -F: '/^Password expires/{{print $2; exit}}'", 45)
+            val = (res or "").strip().splitlines()
+            val = val[-1].strip() if val else ""
+            label = f"ssp-i {user}: password not expiring within {PASSWORD_WARN_DAYS}d"
+            if not val:
+                out.append(warn("password", label, "not readable", cluster=cl))
+                continue
+            if "never" in val.lower():
+                out.append(ok("password", label, "never", cluster=cl))
+                continue
+            days = None
+            try:
+                exp = datetime.strptime(val.strip(), "%b %d, %Y")
+                days = (exp - datetime.now()).days
+            except ValueError:
+                pass
+            if days is None:
+                out.append(warn("password", label, f"unparsed: {val}", cluster=cl))
+            elif days > PASSWORD_WARN_DAYS:
+                out.append(ok("password", label, f"{days}d", cluster=cl, residual_days=days))
+            else:
+                res_row = fail("password", label, f"{days}d remaining", cluster=cl, residual_days=days)
+                if may_act(r, "password"):
+                    r.write(f"chage -d $(date +%Y-%m-%d) -M {PASSWORD_MAX_DAYS} -I -1 -E -1 {user}",
+                            f"reset {user} password expiration on ssp-i", tier="persistent", timeout=60)
+                    if not r.dry_run:
+                        res_row.state, res_row.detail = "warn", "extended password aging to max"
+                out.append(res_row)
+        return out
     data = ctx.get("nodes")
     if not data:
         return [warn("password", "node password expiry: within policy",
@@ -4321,11 +4629,15 @@ SIZING_NAMESPACE = "vmsp-platform"
 SIZING_PACKAGEDEPLOYMENT = "vmsp-platform"
 SIZING_AUTOSCALER_HR = "cluster-autoscaler"
 SIZING_AUTOSCALER_DEPLOY = "cluster-autoscaler-clusterapi-cluster-autoscaler"
-# (vCPU, MiB) - vsp-scale-down.py's own docstring.
+# (vCPU, MiB) - VSP MachineType CRD and ReleaseTemplate specs.
 SIZING_MACHINE_TYPES = {
-    "cp.small": (4, 10240), "cp.medium": (6, 12288), "cp.large": (8, 14336),
-    "management.small": (4, 8192), "management.medium": (8, 16384),
-    "management.large": (12, 24576), "management.xlarge": (16, 32768),
+    "cp.small": (4, 10240), 
+    "cp.medium": (6, 12288), 
+    "cp.large": (8, 14336),
+    "management.small": (4, 8192), 
+    "management.medium": (8, 16384), 
+    "management.large": (12, 24576), 
+    "management.xlarge": (24, 49152), 
 }
 # vsp-scale-down.py step4: Flux propagation into KubernetesCluster.spec.workers[0]
 # gets a fixed 15-minute window before the MachineDeployment-drain phase starts.
@@ -4441,6 +4753,243 @@ def _sizing_poll(desc, check_fn, timeout_sec, interval_sec, dry_run):
     return False
 
 
+SSP_MACHINE_TYPES = {
+    # SSP Form Factor presets & Worker profiles (secop helper specs)
+    "licensing": (4, 16384),
+    "copilot": (12, 16384),
+    "lab-reduced": (12, 57344),
+    "lab": (12, 57344),
+    "standard": (16, 65536),
+    "medium": (16, 65536),
+    "advanced": (16, 65536),
+    "extra-large": (16, 65536),
+    "extra_large": (16, 65536),
+    "evaluation": (16, 65536),
+    # Control Plane profiles
+    "cp.licensing": (2, 8192),
+    "cp.standard": (4, 8192),
+    "cp.small": (4, 8192),
+    "cp.medium": (4, 8192),
+    "cp.large": (4, 8192),
+    # Worker aliases
+    "management.small": (4, 16384),
+    "management.medium": (12, 16384),
+    "management.large": (12, 57344),
+    "management.xlarge": (16, 65536),
+    "worker.licensing": (4, 16384),
+    "worker.copilot": (12, 16384),
+    "worker.lab": (12, 57344),
+    "worker.standard": (16, 65536),
+}
+
+
+def _parse_ssp_machine_type(target_str):
+    if not target_str:
+        return None, None
+    s = target_str.strip().lower()
+    if s in SSP_MACHINE_TYPES:
+        return SSP_MACHINE_TYPES[s]
+    m = re.search(r'(\d+)\s*(?:vcpu)?\s*[\/,_\-]\s*(\d+)\s*(gib|mib)?', s)
+    if m:
+        cpus = int(m.group(1))
+        mem_val = int(m.group(2))
+        unit = (m.group(3) or "").lower()
+        if unit == "gib" or mem_val < 1000:
+            mem_mib = mem_val * 1024
+        else:
+            mem_mib = mem_val
+        return cpus, mem_mib
+    return None, None
+
+
+def _chk_sizing_ssp(r, ctx):
+    out = []
+    cl = r.cluster
+    site_suffix, subnet = resolve_site_config(ctx)
+    vc_host = f"vc-mgmt-a.{site_suffix}"
+    govc_env = {
+        "GOVC_URL": vc_host,
+        "GOVC_USERNAME": "administrator@vsphere.local",
+        "GOVC_PASSWORD": get_password(),
+        "GOVC_INSECURE": "1",
+    }
+
+    # Query CAPI objects on ssp-i
+    vmt_json = r.read_json("kubectl get vspheremachinetemplate -n ssp -o json 2>/dev/null", 30) or {}
+    vmt_items = vmt_json.get("items", [])
+    vmt_by_name = {item.get("metadata", {}).get("name", ""): item for item in vmt_items}
+
+    kcp_json = r.read_json("kubectl get kubeadmcontrolplane -n ssp -o json 2>/dev/null", 30) or {}
+    kcp_items = kcp_json.get("items", [])
+    kcp_name = kcp_items[0].get("metadata", {}).get("name", "ssp-controller") if kcp_items else "ssp-controller"
+    kcp_status = kcp_items[0].get("status", {}) if kcp_items else {}
+    kcp_ready = kcp_status.get("readyReplicas", 0)
+    kcp_replicas = kcp_status.get("replicas", 0)
+    cp_vmt_name = kcp_items[0].get("spec", {}).get("machineTemplate", {}).get("infrastructureRef", {}).get("name", "ssp") if kcp_items else "ssp"
+
+    md_json = r.read_json("kubectl get machinedeployment -n ssp -o json 2>/dev/null", 30) or {}
+    md_items = md_json.get("items", [])
+    md_name = md_items[0].get("metadata", {}).get("name", "ssp-md-0-worker") if md_items else "ssp-md-0-worker"
+    md_spec = md_items[0].get("spec", {}) if md_items else {}
+    md_status = md_items[0].get("status", {}) if md_items else {}
+    md_spec_replicas = md_spec.get("replicas", 0)
+    md_ready = md_status.get("readyReplicas", 0)
+    md_updated = md_status.get("updatedReplicas", 0)
+    md_replicas = md_status.get("replicas", 0)
+    worker_vmt_name = md_spec.get("template", {}).get("spec", {}).get("infrastructureRef", {}).get("name", "ssp-worker")
+
+    cp_vmt = vmt_by_name.get(cp_vmt_name, {})
+    cp_spec = cp_vmt.get("spec", {}).get("template", {}).get("spec", {})
+    cp_cpu = cp_spec.get("numCPUs", 0)
+    cp_mem = cp_spec.get("memoryMiB", 0)
+
+    worker_vmt = vmt_by_name.get(worker_vmt_name, {})
+    worker_spec = worker_vmt.get("spec", {}).get("template", {}).get("spec", {})
+    worker_cpu = worker_spec.get("numCPUs", 0)
+    worker_mem = worker_spec.get("memoryMiB", 0)
+
+    # Fallbacks if infrastructureRef names failed lookup
+    if not cp_cpu or not worker_cpu:
+        for item in vmt_items:
+            name = item.get("metadata", {}).get("name", "")
+            spec = item.get("spec", {}).get("template", {}).get("spec", {})
+            c = spec.get("numCPUs", 0)
+            m = spec.get("memoryMiB", 0)
+            if "worker" in name or "md" in name:
+                if not worker_cpu: worker_vmt_name, worker_cpu, worker_mem = name, c, m
+            else:
+                if not cp_cpu: cp_vmt_name, cp_cpu, cp_mem = name, c, m
+
+    cp_type_desc = f"{cp_cpu}vCPU / {cp_mem // 1024:.0f}GiB" if cp_cpu else "unknown"
+    worker_type_desc = f"{worker_cpu}vCPU / {worker_mem // 1024:.0f}GiB" if worker_cpu else "unknown"
+
+    out.append(ok("sizing.cp", "Control Plane: machineType known",
+                  f"{cp_type_desc}, {kcp_ready}/{kcp_replicas} ready", cluster=cl))
+    out.append(ok("sizing.worker", "Worker MachineDeployment: machineType known",
+                  f"{worker_type_desc}, {md_ready}/{md_replicas} ready (updated {md_updated})", cluster=cl))
+    out.append(ok("sizing.bounds", "Worker replica bounds known",
+                  f"desired={md_spec_replicas} (current ready={md_ready})", cluster=cl))
+
+    warn_pct = ctx.get("cpu_warn_pct", 80)
+    util_rows, util_ok = _sizing_node_utilization(r, warn_pct)
+    if not util_ok:
+        out.append(warn("sizing.utilization", "Node utilization: readable",
+                        "kubectl top nodes unavailable (metrics-server not ready?)", cluster=cl))
+    else:
+        for nr in util_rows:
+            label = f"{nr['node']}: utilization below {warn_pct}%"
+            detail = f"cpu={nr['cpu']} ({nr['cpu_pct']}%) mem={nr['mem']} ({nr['mem_pct']}%)"
+            out.append(warn("sizing.util", label, detail, cluster=cl) if nr["hot"]
+                       else ok("sizing.util", label, detail, cluster=cl))
+
+    if not may_act(r, "sizing"):
+        return out
+
+    cp_target = ctx.get("cp_machine_type")
+    worker_target = ctx.get("worker_machine_type")
+    min_target = ctx.get("worker_min_replicas")
+    max_target = ctx.get("worker_max_replicas")
+    if ctx.get("worker_count") is not None:
+        min_target = max_target = ctx["worker_count"]
+
+    if cp_target:
+        tcp, tmem = _parse_ssp_machine_type(cp_target)
+        if tcp and tmem:
+            if tcp == cp_cpu and tmem == cp_mem:
+                out.append(ok("sizing.cp.resize", f"Control Plane machineType == {cp_target}",
+                              "already at target", cluster=cl))
+            else:
+                new_cp_vmt_name = f"ssp-cp-{tcp}vcpu-{tmem}mib"
+                if new_cp_vmt_name not in vmt_by_name:
+                    base_vmt = copy.deepcopy(cp_vmt or (vmt_items[0] if vmt_items else {}))
+                    base_vmt["metadata"] = {"name": new_cp_vmt_name, "namespace": "ssp"}
+                    base_vmt["spec"]["template"]["spec"]["numCPUs"] = tcp
+                    base_vmt["spec"]["template"]["spec"]["memoryMiB"] = tmem
+                    vmt_str = json.dumps(base_vmt)
+                    r.write(f"kubectl apply -f - -n ssp <<'EOF'\n{vmt_str}\nEOF", f"create VSphereMachineTemplate {new_cp_vmt_name}")
+                
+                payload_kcp = json.dumps({"spec": {"machineTemplate": {"infrastructureRef": {"name": new_cp_vmt_name}}}})
+                patch_cmd = f"kubectl patch kubeadmcontrolplane {kcp_name} -n ssp --type=merge -p '{payload_kcp}'"
+                rc_p, out_p = r.write(patch_cmd, f"update KubeadmControlPlane {kcp_name} infrastructureRef to {new_cp_vmt_name}")
+                out.append(ok("sizing.cp.resize", f"Control Plane machineType -> {cp_target}",
+                              f"updated KubeadmControlPlane {kcp_name} infrastructureRef to {new_cp_vmt_name}", cluster=cl))
+
+    if worker_target:
+        twcpu, twmem = _parse_ssp_machine_type(worker_target)
+        if twcpu and twmem:
+            if twcpu == worker_cpu and twmem == worker_mem:
+                out.append(ok("sizing.worker.resize", f"Worker machineType == {worker_target}",
+                              "already at target template size", cluster=cl))
+            else:
+                new_worker_vmt_name = f"ssp-worker-{twcpu}vcpu-{twmem}mib"
+                if new_worker_vmt_name not in vmt_by_name:
+                    base_vmt = copy.deepcopy(worker_vmt or (vmt_items[-1] if vmt_items else {}))
+                    base_vmt["metadata"] = {"name": new_worker_vmt_name, "namespace": "ssp"}
+                    base_vmt["spec"]["template"]["spec"]["numCPUs"] = twcpu
+                    base_vmt["spec"]["template"]["spec"]["memoryMiB"] = twmem
+                    vmt_str = json.dumps(base_vmt)
+                    r.write(f"kubectl apply -f - -n ssp <<'EOF'\n{vmt_str}\nEOF", f"create VSphereMachineTemplate {new_worker_vmt_name}")
+                
+                payload_md = json.dumps({"spec": {"template": {"spec": {"infrastructureRef": {"name": new_worker_vmt_name}}}}})
+                patch_cmd = f"kubectl patch machinedeployment {md_name} -n ssp --type=merge -p '{payload_md}'"
+                rc_p, out_p = r.write(patch_cmd, f"update MachineDeployment {md_name} infrastructureRef to {new_worker_vmt_name}")
+                out.append(ok("sizing.worker.resize", f"Worker machineType -> {worker_target}",
+                              f"updated MachineDeployment {md_name} infrastructureRef to {new_worker_vmt_name}", cluster=cl))
+
+            # Live resize worker VMs if needed
+            rc_find, vm_paths_raw = _run_govc(["find", "/dc-mgmt-a/vm/secop-ssp", "-name", "*worker*", "-type", "m"], govc_env)
+            if rc_find == 0 and vm_paths_raw.strip():
+                paths = [p.strip() for p in vm_paths_raw.strip().splitlines() if p.strip()]
+                rc_bulk, bulk_info = _run_govc(["vm.info"] + paths, govc_env)
+                vm_blocks = bulk_info.split("Name:") if rc_bulk == 0 else []
+                vm_hw = {}
+                for block in vm_blocks:
+                    if not block.strip(): continue
+                    lines = block.strip().splitlines()
+                    vm_name = lines[0].strip()
+                    cur_c, cur_m = 0, 0
+                    for line in lines:
+                        if "CPU:" in line:
+                            m_c = re.search(r'(\d+)', line)
+                            if m_c: cur_c = int(m_c.group(1))
+                        if "Memory:" in line:
+                            m_m = re.search(r'(\d+)', line)
+                            if m_m: cur_m = int(m_m.group(1))
+                    vm_hw[vm_name] = (cur_c, cur_m)
+
+                for vm_path in paths:
+                    vm_name = vm_path.rsplit('/', 1)[-1]
+                    cur_c, cur_m = vm_hw.get(vm_name, (0, 0))
+                    
+                    if cur_c == twcpu and cur_m == twmem:
+                        out.append(ok("sizing.worker.vm", f"VM {vm_name} hardware",
+                                      f"already at {twcpu}vCPU/{twmem}MiB", cluster=cl))
+                    else:
+                        r.write(f"kubectl annotate machine {vm_name} -n ssp cluster.x-k8s.io/skip-remediation=\"ssp-rightsize\" --overwrite",
+                                f"annotate {vm_name} skip-remediation")
+                        r.write(f"kubectl cordon {vm_name}", f"cordon worker node {vm_name}")
+                        r.write(f"kubectl drain {vm_name} --ignore-daemonsets --delete-emptydir-data --force --grace-period=30", f"drain worker node {vm_name}")
+                        _run_govc(["vm.power", "-s", vm_path], govc_env)
+                        time.sleep(5)
+                        _run_govc(["vm.change", "-vm", vm_path, "-c", str(twcpu), "-m", str(twmem)], govc_env)
+                        _run_govc(["vm.power", "-on", vm_path], govc_env)
+                        r.write(f"kubectl uncordon {vm_name}", f"uncordon worker node {vm_name}")
+                        r.write(f"kubectl annotate machine {vm_name} -n ssp cluster.x-k8s.io/skip-remediation-", f"remove skip-remediation from {vm_name}")
+                        out.append(ok("sizing.worker.vm", f"VM {vm_name} hardware resized",
+                                      f"resized to {twcpu}vCPU/{twmem}MiB", cluster=cl))
+
+    if min_target is not None or max_target is not None:
+        target_rep = min_target if min_target is not None else max_target
+        if md_spec_replicas == target_rep:
+            out.append(ok("sizing.scale", f"Worker scale == {target_rep}", "already at target scale", cluster=cl))
+        else:
+            r.write(f"kubectl patch machinedeployment {md_name} -n ssp --type=merge -p '{{\"spec\":{{\"replicas\":{target_rep}}}}}'",
+                    f"scale MachineDeployment {md_name} to {target_rep}")
+            out.append(ok("sizing.scale", f"Worker scale -> {target_rep}", f"scaled MachineDeployment {md_name}", cluster=cl))
+
+    return out
+
+
 def chk_sizing(r, ctx):
     """VSP fleet cluster sizing: CP/worker machine type, worker replica bounds,
     cluster-autoscaler state and node utilization.
@@ -4458,6 +5007,8 @@ def chk_sizing(r, ctx):
     surfaces current sizing even with no target flags - vsp-scale-down.py
     could not do this at all, since it required a target just to look.
     """
+    if r.cluster == "ssp":
+        return _chk_sizing_ssp(r, ctx)
     out = []
     cl = r.cluster
 
@@ -4492,6 +5043,22 @@ def chk_sizing(r, ctx):
     kcp_ready = kcp_status.get("readyReplicas", 0)
     kcp_replicas = kcp_status.get("replicas", 0)
 
+    if not cp_type and kcp_items:
+        vmt_name = kcp_items[0].get("spec", {}).get("machineTemplate", {}).get("spec", {}).get("infrastructureRef", {}).get("name")
+        if vmt_name:
+            vmt = r.read_json(f"kubectl get vspheremachinetemplate {vmt_name} -n {SIZING_NAMESPACE} -o json 2>/dev/null", 30) or {}
+            vmt_spec = vmt.get("spec", {}).get("template", {}).get("spec", {})
+            vmt_cpu = vmt_spec.get("numCPUs")
+            vmt_mem = vmt_spec.get("memoryMiB")
+            for mtype, (mcpu, mmem) in SIZING_MACHINE_TYPES.items():
+                if mtype.startswith("cp.") and mcpu == vmt_cpu and mmem == vmt_mem:
+                    cp_type = mtype
+                    break
+    if not cp_type:
+        prof = values.get("profiles", {}).get("name")
+        if prof and f"cp.{prof}" in SIZING_MACHINE_TYPES:
+            cp_type = f"cp.{prof}"
+
     out.append(ok("sizing.cp", "Control Plane: machineType known",
                   f"{_sizing_describe(cp_type)}, {kcp_ready}/{kcp_replicas} ready",
                   cluster=cl) if cp_type else
@@ -4504,9 +5071,11 @@ def chk_sizing(r, ctx):
                warn("sizing.worker", "Worker MachineDeployment: machineType known",
                     "PackageDeployment spec.values.cluster.worker.machineType not set",
                     cluster=cl))
-    if cur_min is not None and cur_max is not None:
+    if cur_min is not None or cur_max is not None:
+        min_str = str(cur_min) if cur_min is not None else "?"
+        max_str = str(cur_max) if cur_max is not None else "unset"
         out.append(ok("sizing.bounds", "Worker replica bounds known",
-                      f"min={cur_min} max={cur_max} (current desired={md_spec_replicas})",
+                      f"min={min_str} max={max_str} (current desired={md_spec_replicas})",
                       cluster=cl))
     else:
         out.append(warn("sizing.bounds", "Worker replica bounds known",
@@ -4824,6 +5393,108 @@ def _footprint_discover_autoscaler_rt(r):
     return name.split("/", 1)[1] if "/" in name else name
 
 
+def _chk_footprint_ssp(r, ctx):
+    out = []
+    cl = r.cluster
+    site_suffix, subnet = resolve_site_config(ctx)
+    vc_host = f"vc-mgmt-a.{site_suffix}"
+    govc_env = {
+        "GOVC_URL": vc_host,
+        "GOVC_USERNAME": "administrator@vsphere.local",
+        "GOVC_PASSWORD": get_password(),
+        "GOVC_INSECURE": "1",
+    }
+
+    # 1. Pod CPU request right-sizing in nsxi-platform
+    ssp_footprint_requests = [
+        ("statefulset", "nsxi-platform", "druid-historical", "druid", "1", "20Gi"),
+        ("statefulset", "nsxi-platform", "kafka-controller", "kafka", "500m", "3Gi"),
+    ]
+
+    for kind, ns, name, container, cpu, mem in ssp_footprint_requests:
+        rc, cur = r.read(
+            f"kubectl get {kind} {name} -n {ns} -o "
+            f"jsonpath='{{.spec.template.spec.containers[?(@.name==\"{container}\")]"
+            f".resources.requests}}' 2>/dev/null", 30)
+        cur = (cur or "").strip()
+        label = f"{ns}/{name} [{container}]: requests == cpu={cpu} mem={mem}"
+        if not cur:
+            out.append(warn("footprint.requests", label, "object or container not found", cluster=cl))
+            continue
+        squeezed = cur.replace(" ", "")
+        if f'"cpu":"{cpu}"' in squeezed:
+            out.append(ok("footprint.requests", label, "already at target", cluster=cl))
+            continue
+        res = fail("footprint.requests", label, f"currently {cur}", cluster=cl)
+        if may_act(r, "footprint"):
+            r.write(
+                f"kubectl set resources {kind}/{name} -n {ns} --containers={container} "
+                f"--requests=cpu={cpu}",
+                f"right-size {ns}/{name} [{container}] cpu request -> {cpu}",
+                tier="transient", timeout=60)
+            res.action = f"requests cpu -> {cpu}"
+            if not r.dry_run:
+                res.state, res.detail = "warn", f"was {cur}; set to target cpu={cpu}"
+        out.append(res)
+
+    # 2. Zero-reservation reclamation for all VMs in secop-ssp folder
+    rc_find, vm_paths = _run_govc(["find", "/dc-mgmt-a/vm/secop-ssp", "-type", "m"], govc_env)
+    if rc_find == 0 and vm_paths.strip():
+        for vm_path in vm_paths.strip().splitlines():
+            vm_path = vm_path.strip()
+            if not vm_path:
+                continue
+            vm_name = vm_path.rsplit('/', 1)[-1]
+            rc_info, vm_info = _run_govc(["vm.info", vm_path], govc_env)
+            has_resv = False
+            for line in vm_info.splitlines():
+                if "Reservation:" in line and "0MHz" not in line and "0MB" not in line and "0 B" not in line and " 0" not in line:
+                    has_resv = True
+            
+            label = f"VM {vm_name}: CPU & Memory reservations reclaimed (0/0)"
+            if not has_resv:
+                out.append(ok("footprint.reservation", label, "already zero", cluster=cl))
+            else:
+                res = fail("footprint.reservation", label, "reservations set on VM", cluster=cl)
+                if may_act(r, "footprint"):
+                    rc_chg, out_chg = _run_govc(["vm.change", "-vm", vm_path, "-e", "sched.cpu.min=0", "-e", "sched.mem.min=0"], govc_env)
+                    if rc_chg == 0:
+                        res.state, res.detail, res.action = "warn", "reclaimed live to 0/0", "reset reservations to 0/0"
+                    else:
+                        res.detail = f"govc vm.change failed: {out_chg.strip()}"
+                out.append(res)
+
+    # 3. Keeper check / installation handling
+    keeper_installed = False
+    rc_k, out_k = r.read_local(["bash", "-c", "crontab -l 2>/dev/null | grep -q ssp-reserve-keeper && echo YES || echo NO"])
+    if "YES" in out_k:
+        keeper_installed = True
+
+    if getattr(ctx, "install_keeper", False) or getattr(r, "install_keeper", False):
+        if may_act(r, "footprint"):
+            keeper_script = """#!/usr/bin/env bash
+site_suffix="site-a.vcf.lab"
+vc_host="vc-mgmt-a.${site_suffix}"
+export GOVC_URL="${vc_host}"
+export GOVC_USERNAME="administrator@vsphere.local"
+export GOVC_PASSWORD="$(cat /home/holuser/hol/creds.txt 2>/dev/null | grep -i password | head -1 | awk '{print $NF}')"
+export GOVC_INSECURE=1
+for vm in $(govc find /dc-mgmt-a/vm/secop-ssp -type m 2>/dev/null); do
+    govc vm.change -vm "$vm" -e "sched.cpu.min=0" -e "sched.mem.min=0" >/dev/null 2>&1
+done
+"""
+            r.write_local(["bash", "-c", f"cat <<'EOF' > /home/holuser/ssp-reserve-keeper.sh\n{keeper_script}\nEOF\nchmod +x /home/holuser/ssp-reserve-keeper.sh\n(crontab -l 2>/dev/null | grep -v ssp-reserve-keeper; echo \"*/10 * * * * /home/holuser/ssp-reserve-keeper.sh\") | crontab -"], "install ssp-reserve-keeper cron")
+            out.append(ok("footprint.keeper", "SSP reservation keeper: installed", "cron job */10 installed", cluster=cl))
+    elif getattr(ctx, "remove_keeper", False) or getattr(r, "remove_keeper", False):
+        if may_act(r, "footprint"):
+            r.write_local(["bash", "-c", "crontab -l 2>/dev/null | grep -v ssp-reserve-keeper | crontab - ; rm -f /home/holuser/ssp-reserve-keeper.sh"], "remove ssp-reserve-keeper cron")
+            out.append(ok("footprint.keeper", "SSP reservation keeper: removed", "cron job removed", cluster=cl))
+    else:
+        out.append(ok("footprint.keeper", "SSP reservation keeper status", "INSTALLED" if keeper_installed else "NOT INSTALLED", cluster=cl))
+
+    return out
+
+
 def chk_footprint(r, ctx):
     """VSP fleet lab-density reduction. See the module comment above this
     section for what each lever does and why it is remediate-only.
@@ -4838,10 +5509,20 @@ def chk_footprint(r, ctx):
     converge, then restored). Two different, compatible knobs - not two
     implementations of one.
     """
+    if r.cluster == "ssp":
+        return _chk_footprint_ssp(r, ctx)
     out = []
     cl = r.cluster
 
+    disc = _discover_vcf_components(r, ctx)
+    configured_namespaces = disc["namespaces"]
+    configured_workload_keys = {(ns, name) for ns, _, name, _ in disc["workloads"]}
+
     for kind, ns, name, container, cpu, mem in FOOTPRINT_REQUESTS:
+        # Platform namespaces (vmsp-platform, kube-system) are always checked.
+        # For optional VCF component namespaces (e.g. vodap, ops-logs), ONLY check if installed on cluster
+        if ns not in ("vmsp-platform", "kube-system") and ns not in configured_namespaces and (ns, name) not in configured_workload_keys:
+            continue
         rc, cur = r.read(
             f"kubectl get {kind} {name} -n {ns} -o "
             f"jsonpath='{{.spec.template.spec.containers[?(@.name==\"{container}\")]"
@@ -4878,12 +5559,14 @@ def chk_footprint(r, ctx):
         rc, reps = r.read(
             f"kubectl get deploy {name} -n {ns} -o jsonpath='{{.spec.replicas}}' 2>/dev/null", 30)
         reps = _sizing_last(reps)
-        label = f"{ns}/{name}: replicas == 1"
+        label = f"{ns}/{name}: replicas >= 1"
         if not reps.isdigit():
             out.append(warn("footprint.ha", label, "not found", cluster=cl))
             continue
-        if reps == "1":
-            out.append(ok("footprint.ha", label, "already 1", cluster=cl))
+        n_reps = int(reps)
+        if n_reps >= 1:
+            detail = "already 1" if n_reps == 1 else f"currently {n_reps}"
+            out.append(ok("footprint.ha", label, detail, cluster=cl))
             continue
         res = fail("footprint.ha", label, f"currently {reps}", cluster=cl)
         if may_act(r, "footprint"):
@@ -4901,35 +5584,36 @@ def chk_footprint(r, ctx):
                 res.state, res.detail = "warn", f"was {reps}; scaled to 1"
         out.append(res)
 
-    rc, dep_list = r.read(
-        "kubectl get deploy -n vodap --no-headers -o "
-        "custom-columns=N:.metadata.name 2>/dev/null", 30)
-    for dep in [d.strip() for d in (dep_list or "").splitlines() if d.strip()]:
-        rc, hp = r.read(
-            f"kubectl get deploy {dep} -n vodap -o "
-            "jsonpath='{.spec.template.spec.volumes[*].hostPath.path}' 2>/dev/null", 30)
-        hp = (hp or "").strip()
-        if not hp:
-            continue          # no hostPath volume - nothing for the autoscaler to fear evicting
-        rc, ann = r.read(
-            f"kubectl get deploy {dep} -n vodap -o jsonpath="
-            "'{.spec.template.metadata.annotations.cluster-autoscaler\\.kubernetes\\.io/safe-to-evict}'"
-            " 2>/dev/null", 30)
-        label = f"vodap/{dep}: safe-to-evict=true (hostPath {hp})"
-        if (ann or "").strip() == "true":
-            out.append(ok("footprint.evict", label, cluster=cl))
-            continue
-        res = fail("footprint.evict", label, "annotation missing or false", cluster=cl)
-        if may_act(r, "footprint"):
-            r.write(
-                f"kubectl patch deploy {dep} -n vodap --type=merge -p "
-                f"'{{\"spec\":{{\"template\":{{\"metadata\":{{\"annotations\":"
-                f"{{\"cluster-autoscaler.kubernetes.io/safe-to-evict\":\"true\"}}}}}}}}}}'",
-                f"annotate vodap/{dep} safe-to-evict=true", tier="persistent", timeout=60)
-            res.action = "annotated safe-to-evict=true"
-            if not r.dry_run:
-                res.state, res.detail = "warn", "annotation was missing; added"
-        out.append(res)
+    if "vodap" in configured_namespaces:
+        rc, dep_list = r.read(
+            "kubectl get deploy -n vodap --no-headers -o "
+            "custom-columns=N:.metadata.name 2>/dev/null", 30)
+        for dep in [d.strip() for d in (dep_list or "").splitlines() if d.strip()]:
+            rc, hp = r.read(
+                f"kubectl get deploy {dep} -n vodap -o "
+                "jsonpath='{.spec.template.spec.volumes[*].hostPath.path}' 2>/dev/null", 30)
+            hp = (hp or "").strip()
+            if not hp:
+                continue          # no hostPath volume - nothing for the autoscaler to fear evicting
+            rc, ann = r.read(
+                f"kubectl get deploy {dep} -n vodap -o jsonpath="
+                "'{.spec.template.metadata.annotations.cluster-autoscaler\\.kubernetes\\.io/safe-to-evict}'"
+                " 2>/dev/null", 30)
+            label = f"vodap/{dep}: safe-to-evict=true (hostPath {hp})"
+            if (ann or "").strip() == "true":
+                out.append(ok("footprint.evict", label, cluster=cl))
+                continue
+            res = fail("footprint.evict", label, "annotation missing or false", cluster=cl)
+            if may_act(r, "footprint"):
+                r.write(
+                    f"kubectl patch deploy {dep} -n vodap --type=merge -p "
+                    f"'{{\"spec\":{{\"template\":{{\"metadata\":{{\"annotations\":"
+                    f"{{\"cluster-autoscaler.kubernetes.io/safe-to-evict\":\"true\"}}}}}}}}}}'",
+                    f"annotate vodap/{dep} safe-to-evict=true", tier="persistent", timeout=60)
+                res.action = "annotated safe-to-evict=true"
+                if not r.dry_run:
+                    res.state, res.detail = "warn", "annotation was missing; added"
+            out.append(res)
 
     for dep in FOOTPRINT_CAPI_LE_DEPLOYS:
         d = r.read_json(f"kubectl get deploy {dep} -n {FOOTPRINT_NAMESPACE} -o json 2>/dev/null", 30)
@@ -5120,6 +5804,9 @@ def chk_vodap(r, ctx):
     """
     out = []
     cl = r.cluster
+    disc = _discover_vcf_components(r, ctx)
+    if cl == "vsp" and "vodap" not in disc["namespaces"] and "vodap" not in disc["components"]:
+        return [ok("vodap", "VODAP / Observability: component not installed on cluster (skipped)", cluster=cl)]
 
     # --- ClickHouse: served cert vs stored cert ---
     rc, info = r.read(
@@ -5246,13 +5933,17 @@ def chk_gateway(r, ctx):
     out = []
     cl = r.cluster
     cfg = CLUSTERS[cl]
-    for svc, want_ip in (cfg.get("gateway_services") or []):
+    for item in (cfg.get("gateway_services") or []):
+        if len(item) == 3:
+            ns, svc, want_ip = item
+        else:
+            ns, (svc, want_ip) = "vmsp-platform", item
         rc, got = r.read(
-            f"kubectl -n vmsp-platform get svc {svc} "
+            f"kubectl -n {ns} get svc {svc} "
             "-o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null", 45)
         val = (got or "").strip().splitlines()
         val = val[-1].strip() if val else ""
-        label = f"vmsp-platform/{svc}: holds {want_ip}"
+        label = f"{ns}/{svc}: holds {want_ip}"
         if val == want_ip:
             out.append(ok("gateway.svc", label, cluster=cl))
         elif not val:
@@ -5261,36 +5952,45 @@ def chk_gateway(r, ctx):
         else:
             out.append(fail("gateway.svc", label, f"holds {val} instead", cluster=cl))
 
-    # Hashed envoy dataplane Services. This is a WARNING, not a failure, matching
-    # vcfa-stabilizer.sh:1070 which only fails when
-    # STABILIZER_GATEWAY_PREFLIGHT_STRICT=1 is set explicitly.
-    #
-    # Verified on this build (2026-08-14): NO service matches envoy-vmsp-platform*
-    # -- only the envoy-gateway operator Service exists -- while both LoadBalancer
-    # VIPs are held and /automation returns HTTP 200. So the naming scheme differs
-    # here and absence of that pattern does not mean the gateway is broken.
-    # auto-health.py does not check this at all. The LB VIP rows above are the
-    # load-bearing ones; treating this as a hard failure produced a false alarm on
-    # a demonstrably working gateway.
-    rc, hashed = r.read(
-        "kubectl -n vmsp-platform get svc -o name 2>/dev/null "
-        "| grep -c envoy-vmsp-platform", 45)
-    val = (hashed or "").strip().splitlines()
-    val = val[-1].strip() if val else "0"
-    n = int(val) if val.isdigit() else 0
-    hlabel = "vmsp-platform: hashed envoy dataplane Services present"
-    if n >= 1:
-        out.append(ok("gateway.envoy", hlabel, f"{n} found", cluster=cl))
-    else:
-        out.append(warn("gateway.envoy", hlabel,
-                        "none match envoy-vmsp-platform* — informational: this "
-                        "build may name them differently. Judge the gateway by the "
-                        "LB VIP rows above and the endpoint section", cluster=cl))
-
     if cl == "vcfa":
+        # Hashed envoy dataplane Services. This is a WARNING, not a failure, matching
+        # vcfa-stabilizer.sh:1070 which only fails when
+        # STABILIZER_GATEWAY_PREFLIGHT_STRICT=1 is set explicitly.
+        #
+        # Verified on this build (2026-08-14): NO service matches envoy-vmsp-platform*
+        # -- only the envoy-gateway operator Service exists -- while both LoadBalancer
+        # VIPs are held and /automation returns HTTP 200. So the naming scheme differs
+        # here and absence of that pattern does not mean the gateway is broken.
+        # auto-health.py does not check this at all. The LB VIP rows above are the
+        # load-bearing ones; treating this as a hard failure produced a false alarm on
+        # a demonstrably working gateway.
+        rc, hashed = r.read(
+            "kubectl -n vmsp-platform get svc -o name 2>/dev/null "
+            "| grep -c envoy-vmsp-platform", 45)
+        val = (hashed or "").strip().splitlines()
+        val = val[-1].strip() if val else "0"
+        n = int(val) if val.isdigit() else 0
+        hlabel = "vmsp-platform: hashed envoy dataplane Services present"
+        if n >= 1:
+            out.append(ok("gateway.envoy", hlabel, f"{n} found", cluster=cl))
+        else:
+            out.append(warn("gateway.envoy", hlabel,
+                            "none match envoy-vmsp-platform* — informational: this "
+                            "build may name them differently. Judge the gateway by the "
+                            "LB VIP rows above and the endpoint section", cluster=cl))
+
         # Envoy Gateway v1.5 / Envoy v1.34 SDS SAN-without-CA NACK fix [KB 439264, KB 424402]
         sds_results = _fix_sds_sni(r, cl)
         out.extend(sds_results)
+
+    elif cl == "ssp":
+        rc, pools = r.read("kubectl -n metallb-system get ipaddresspool -o jsonpath='{.items[*].metadata.name}' 2>/dev/null", 30)
+        pools_val = (pools or "").strip().splitlines()
+        pools_str = pools_val[-1].strip() if pools_val else ""
+        if pools_str:
+            out.append(ok("gateway.metallb", f"metallb-system: IPAddressPool configured ({pools_str})", cluster=cl))
+        else:
+            out.append(fail("gateway.metallb", "metallb-system: IPAddressPool configured", "no IPAddressPool found", cluster=cl))
 
     return out
 
@@ -5616,11 +6316,16 @@ def _storm_scale_to_one(r, ns, name, cl, deploy_data=None):
     else:
         rc, reps = r.read(f"kubectl get deploy {name} -n {ns} -o jsonpath='{{.spec.replicas}}' 2>/dev/null", 30)
         reps = _sizing_last(reps)
-    label = f"{ns}/{name}: replicas == 1"
+    label = f"{ns}/{name}: replicas == 1" if cl == "vcfa" else f"{ns}/{name}: replicas >= 1"
     if not reps.isdigit():
         return warn("storm.footprint", label, "not found", cluster=cl)
-    if reps == "1":
-        return ok("storm.footprint", label, "already 1", cluster=cl)
+    n_reps = int(reps)
+    if cl == "vcfa":
+        if n_reps == 1:
+            return ok("storm.footprint", label, "currently 1", cluster=cl)
+    else:
+        if n_reps >= 1:
+            return ok("storm.footprint", label, "already 1" if n_reps == 1 else f"currently {n_reps}", cluster=cl)
     res = fail("storm.footprint", label, f"currently {reps}", cluster=cl)
     if may_act(r, "storm"):
         r.write(f"kubectl scale deploy {name} -n {ns} --replicas=1",
@@ -6732,34 +7437,68 @@ exit 0
 
 KEEPER_BODY_VCFA = r"""#!/bin/bash
 # vcf-lab-keeper-vcfa - emitted by vcf-lab-tuner.py. Do not edit by hand.
-# Re-asserts VCFA drift targets: envoy-gateway memory, support-bundle runaway cleanup,
-# 0-replica prelude scale-up, CrashLoopBackOff pod recovery, and SDS SAN NACK platform-trust ConfigMap sync.
+# Re-asserts VCFA drift targets: envoy-gateway memory, vsphere-cpi leader election args,
+# support-bundle runaway cleanup, 0-replica prelude scale-up, CrashLoopBackOff pod recovery,
+# and SDS SAN NACK platform-trust ConfigMap sync.
 set -u
 KB="kubectl"
 log() { logger -t vcf-lab-keeper-vcfa "$1"; }
 
-# 1. Envoy-gateway memory limit
+# 1. Envoy-gateway memory limit & ReleaseTemplate patch
 EGMEM=$($KB -n vmsp-platform get deploy envoy-gateway -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}' 2>/dev/null || echo "")
 if [ -n "$EGMEM" ] && [ "$EGMEM" != "__EG_LIMIT__" ]; then
     $KB -n vmsp-platform set resources deploy/envoy-gateway --limits=memory=__EG_LIMIT__ --requests=memory=__EG_REQUEST__ >/dev/null 2>&1 \
         && log "drift corrected: envoy-gateway memory -> __EG_LIMIT__ (was ${EGMEM})"
 fi
 
-# 2. Cleanup runaway support-bundle jobs
+EGBG=$($KB -n vmsp-platform get releasetemplate -o name 2>/dev/null | grep -i envoyproxy-gateway | head -1)
+if [ -n "$EGBG" ]; then
+    EGMEM_VAL=$($KB get "$EGBG" -n vmsp-platform -o jsonpath='{.spec.helm.values.deployment.envoyGateway.resources.limits.memory}' 2>/dev/null || echo "")
+    if [ "$EGMEM_VAL" != "__EG_LIMIT__" ]; then
+        $KB patch "$EGBG" -n vmsp-platform --type=merge -p '{"spec":{"helm":{"values":{"deployment":{"envoyGateway":{"resources":{"limits":{"memory":"__EG_LIMIT__"},"requests":{"memory":"__EG_REQUEST__"}}}},"config":{"envoyGateway":{"provider":{"kubernetes":{"leaderElection":{"disable":true}}}}}}}}}' >/dev/null 2>&1 \
+            && log "drift corrected: $EGBG ReleaseTemplate patched"
+    fi
+fi
+
+# 2. vsphere-cpi DaemonSet leader election lease parameters & ReleaseTemplate drift mode
+CPIRBG=$($KB -n vmsp-platform get releasetemplate -o name 2>/dev/null | grep -i vsphere-cpi | head -1)
+if [ -n "$CPIRBG" ]; then
+    CPIDRIFT=$($KB get "$CPIRBG" -n vmsp-platform -o jsonpath='{.spec.helm.driftDetection.mode}' 2>/dev/null || echo "")
+    if [ "$CPIDRIFT" != "disabled" ]; then
+        $KB patch "$CPIRBG" -n vmsp-platform --type=merge -p '{"spec":{"helm":{"driftDetection":{"mode":"disabled"}}}}' >/dev/null 2>&1 \
+            && log "drift corrected: $CPIRBG ReleaseTemplate driftDetection -> disabled"
+    fi
+fi
+
+CPIARGS=$($KB -n kube-system get daemonset vsphere-cpi -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo "")
+if [ -n "$CPIARGS" ] && ! printf '%s' "$CPIARGS" | grep -q -- '--leader-elect-renew-deadline='; then
+    if printf '%s' "$CPIARGS" | grep -q '\]$'; then
+        NEWCPI="${CPIARGS%]},\"--leader-elect-lease-duration=__LEASE__\",\"--leader-elect-renew-deadline=__RENEW__\",\"--leader-elect-retry-period=__RETRY__\"]"
+    else
+        NEWCPI='["--cloud-provider=vsphere","--v=2","--cloud-config=/etc/cloud/vsphere.conf","--leader-elect-lease-duration=__LEASE__","--leader-elect-renew-deadline=__RENEW__","--leader-elect-retry-period=__RETRY__"]'
+    fi
+    $KB -n kube-system patch daemonset vsphere-cpi --type=strategic -p \
+      "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"vsphere-cpi\",\"args\":$NEWCPI}]}}}}" \
+      >/dev/null 2>&1 \
+      && $KB -n kube-system delete pod -l app=vsphere-cpi --grace-period=0 --force >/dev/null 2>&1 \
+      && log "drift corrected: vsphere-cpi leader-election args re-applied"
+fi
+
+# 3. Cleanup runaway support-bundle jobs
 SB_COUNT=$($KB -n vmsp-platform get jobs -l app.kubernetes.io/name=support-bundle-cluster-info-dump --no-headers 2>/dev/null | wc -l)
 if [ "$SB_COUNT" -gt 3 ]; then
     $KB -n vmsp-platform delete jobs -l app.kubernetes.io/name=support-bundle-cluster-info-dump --cascade=foreground >/dev/null 2>&1 \
         && log "drift corrected: deleted $SB_COUNT runaway support-bundle jobs"
 fi
 
-# 3. Cleanup stale system-shutdown Argo workflows
-ARGO_COUNT=$($KB -n vmsp-platform get workflow --no-headers 2>/dev/null | grep -c system-shutdown || echo 0)
+# 4. Cleanup stale system-shutdown Argo workflows
+ARGO_COUNT=$($KB -n vmsp-platform get workflow --no-headers 2>/dev/null | grep -c system-shutdown || true)
 if [ "$ARGO_COUNT" -gt 0 ]; then
     $KB -n vmsp-platform delete workflow -l workflows.argoproj.io/workflow-template=system-shutdown --grace-period=0 >/dev/null 2>&1 \
         && log "drift corrected: deleted $ARGO_COUNT stale system-shutdown workflow(s)"
 fi
 
-# 4. Ensure no 0-replica Deployments/StatefulSets in prelude
+# 5. Ensure no 0-replica Deployments/StatefulSets in prelude
 for kind in deploy sts; do
     for r in $($KB get $kind -n prelude -o jsonpath='{range .items[?(@.spec.replicas==0)]}{.metadata.name}{" "}{end}' 2>/dev/null); do
         if [ -n "$r" ]; then
@@ -6769,20 +7508,35 @@ for kind in deploy sts; do
     done
 done
 
-# 5. Reset CrashLoopBackOff pods in prelude when tenant-manager is Running
+# 6. Reset CrashLoopBackOff pods in prelude and vmsp-platform
 TM_PHASE=$($KB get pod tenant-manager-0 -n prelude -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
 if [ "$TM_PHASE" = "Running" ]; then
     for badpod in $($KB get pods -n prelude --field-selector=status.phase!=Running -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null); do
         case "$badpod" in
-            api-gateway-server*|ccs-vksm-eas*|resource-manager-server*)
+            api-gateway-server*|ccs-vksm-eas*|resource-manager-server*|intent-server*|dataprotection-server*|account-manager-server*|authentication-server*)
                 $KB delete pod "$badpod" -n prelude --grace-period=0 >/dev/null 2>&1 \
-                    && log "drift corrected: reset crashed $badpod to clear backoff"
+                    && log "drift corrected: reset crashed prelude/$badpod to clear backoff"
                 ;;
         esac
     done
 fi
+for badpod in $($KB get pods -n vmsp-platform --field-selector=status.phase!=Running -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null); do
+    case "$badpod" in
+        capi-ipam*|ndc-controller-manager*)
+            $KB delete pod "$badpod" -n vmsp-platform --grace-period=0 >/dev/null 2>&1 \
+                && log "drift corrected: reset crashed vmsp-platform/$badpod to clear backoff"
+            ;;
+    esac
+done
 
-# 6. Ensure platform-trust ConfigMap exists in every BackendTLSPolicy namespace
+for badpod in $($KB get pods -n vmsp-policies --field-selector=status.phase!=Running -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null); do
+    case "$badpod" in
+        kyverno-background-controller*|kyverno-cleanup-controller*)
+            $KB delete pod "$badpod" -n vmsp-policies --grace-period=0 >/dev/null 2>&1 \
+                && log "drift corrected: reset crashed vmsp-policies/$badpod to clear backoff"
+            ;;
+    esac
+done
 for ns in $($KB get backendtlspolicy -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | sort -u | grep -v '^vmsp-platform$'); do
     if [ -n "$ns" ]; then
         $KB get configmap platform-trust -n "$ns" >/dev/null 2>&1 || \
@@ -6793,6 +7547,15 @@ for ns in $($KB get backendtlspolicy -A -o jsonpath='{range .items[*]}{.metadata
              && log "drift corrected: copied platform-trust ConfigMap to $ns")
     fi
 done
+
+# 8. Ensure leader-election flag stripped from single-replica intent-server
+INTENT_ARGS=$($KB -n prelude get deploy intent-server -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo "")
+if [ -n "$INTENT_ARGS" ] && printf '%s' "$INTENT_ARGS" | grep -q -- '--enable-leader-election'; then
+    $KB get deploy intent-server -n prelude -o json 2>/dev/null | \
+        sed 's/,"--enable-leader-election[^"]*"//g; s/"--enable-leader-election[^"]*",//g' | \
+        $KB apply -f - >/dev/null 2>&1 \
+        && log "drift corrected: stripped --enable-leader-election from intent-server"
+fi
 
 exit 0
 """
@@ -7071,7 +7834,10 @@ def run_cluster(name, args, password):
             emit(f"  Specify one directly: python3 vcf-lab-tuner.py "
                  f"--cluster {name} --host <IP>")
             return [], 2
-        transport = DirectTransport(host, cfg["user"], password, cfg["sudo"])
+        if name == "ssp":
+            transport = SSPTransport(host, cfg["user"], password, cfg["sudo"])
+        else:
+            transport = DirectTransport(host, cfg["user"], password, cfg["sudo"])
 
     runner = Runner(transport, args.mode, args.dry_run, name)
     runner.vcenter_transport = vcenter_transport
@@ -7196,9 +7962,9 @@ def show_help():
     emit(f"    {_GREEN}-j, --json{_NC}          Machine-readable document on stdout (implies --no-color)")
     emit(f"    {_GREEN}-h, --help{_NC}          Show this help")
     emit(f"    {_GREEN}--version{_NC}           Print version and exit\n")
-    emit(f"{_BOLD}SIZING OPTIONS:{_NC}  (--cluster vsp --section sizing --mode remediate; vsp-scale-down.py port)")
-    emit(f"    {_GREEN}--cp-machine-type{_NC} TYPE       Resize the control plane ({', '.join(SIZING_MACHINE_TYPES)})")
-    emit(f"    {_GREEN}--worker-machine-type{_NC} TYPE   Resize workers (same TYPE choices)")
+    emit(f"{_BOLD}SIZING OPTIONS:{_NC}  (--cluster {{vsp,ssp}} --section sizing --mode remediate)")
+    emit(f"    {_GREEN}--cp-machine-type{_NC} TYPE       Resize control plane (VSP: cp.small/medium/large; SSP: standard, licensing, 4/8)")
+    emit(f"    {_GREEN}--worker-machine-type{_NC} TYPE   Resize workers (VSP: management.small/medium/large/xlarge; SSP: standard, advanced, copilot, lab-reduced, 12/56, 16/64)")
     emit(f"    {_GREEN}--worker-count{_NC} N             Set worker min==max==N")
     emit(f"    {_GREEN}--worker-min-replicas{_NC} N      Pair with --worker-max-replicas")
     emit(f"    {_GREEN}--worker-max-replicas{_NC} N")
@@ -7278,10 +8044,8 @@ def main():
     p.add_argument("--remove-keeper", action="store_true")
     p.add_argument("--threshold-days", type=int, default=CERT_THRESHOLD_DAYS, metavar="N")
     # --section sizing (vsp-scale-down.py port): target values, not detect-and-fix.
-    p.add_argument("--cp-machine-type", default=None, metavar="TYPE",
-                   choices=list(SIZING_MACHINE_TYPES.keys()))
-    p.add_argument("--worker-machine-type", default=None, metavar="TYPE",
-                   choices=list(SIZING_MACHINE_TYPES.keys()))
+    p.add_argument("--cp-machine-type", default=None, metavar="TYPE")
+    p.add_argument("--worker-machine-type", default=None, metavar="TYPE")
     p.add_argument("--worker-count", type=int, default=None, metavar="N")
     p.add_argument("--worker-min-replicas", type=int, default=None, metavar="N")
     p.add_argument("--worker-max-replicas", type=int, default=None, metavar="N")

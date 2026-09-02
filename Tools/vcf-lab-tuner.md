@@ -1,14 +1,14 @@
 # vcf-lab-tuner.py — Design & Reference
 
-**Version 4.0 — 2026-08-26**
+**Version 2.8 — 2026-08-20**
 **Author:** Burke Azbill and HOL Core Team
-**Status:** `vcf-lab-tuner.py` **v2.0.0**. Native Certificate Renewal Engine across VSP, VCFA, and Supervisor clusters. All three clusters ported (VSP, VCFA,
-Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh`, `vcfa-stabilizer.sh`, and `supervisor_stabilizer.py`, enabling
-legacy `vsp-stabilizer.sh`, `vcfa-stabilizer.sh`, and `supervisor_stabilizer.py` to be safely retired. **Coverage audited against all legacy tools**,
+**Status:** `vcf-lab-tuner.py` **v1.7.0**. All three clusters ported (VSP, VCFA,
+Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh` **and** `vcfa-stabilizer.sh`, enabling
+legacy `vsp-stabilizer.sh` and `vcfa-stabilizer.sh` to be safely retired. **Coverage audited against all legacy tools**,
 including 14/14 `vsp-health.py` sections, 11/11 `auto-health.py` sections, and full
-remediation parity across `vsp-stabilizer.sh`, `vcfa-stabilizer.sh`, `supervisor_stabilizer.py`, and `remediate-lab.sh`.
+remediation parity across `vsp-stabilizer.sh`, `vcfa-stabilizer.sh`, and `remediate-lab.sh`.
 Remediation implemented for every section, keeper management working, deprecation
-banners applied, **offline unit test suite passing**. Validated live on
+banners applied, **23-assertion offline unit test suite passing**. Validated live on
 DevPod.
 
 ---
@@ -373,7 +373,7 @@ sections it had chosen to port — which was circular. The audit below is agains
 | `kyverno`      | `kyverno`  | UpdateRequest backlog + all three controllers                                    |
 | `vodap`        | `vodap`    | Adds **served-vs-stored** cert comparison and buffer purge                       |
 | `proxy`        | `proxy`    | Values imported from `lsfunctions`, not re-hardcoded                             |
-| `kubeadm`      | `kubeadm`  | Native control-plane & kubelet cert renewal (VSP/VCFA)                        |
+| `kubeadm`      | `kubeadm`  | Delegates renewal to `vsp_cert_renewer.py`                                       |
 | `password`     | `password` | Repairs **both** `-M` and the last-change date                                   |
 
 
@@ -746,12 +746,12 @@ python3 Tools/test-vcf-lab-tuner.py
 | `postgres`    | vsp, vcfa             | ✓   |     | ✓   | pgdata perms across **every** spilo namespace                                                                                                                       |
 | `redis`       | vsp                   | ✓   |     | ✓   | Readiness + the empty-`redis-service`-endpoint cert-timing race                                                                                                     |
 | `salt`        | vsp                   | ✓   |     | ✓   | Gated restart only — never unconditional (F7)                                                                                                                       |
-| `certs`       | vsp, vcfa, supervisor | ✓   | ✓   | ✓   | Native cert-manager leaf renewal & rollout restarter for VSP, VCFA, and Supervisor; Root CA extension & containerd CA trust sync for VSP; ESXi spherelet cert renewal for Supervisor |
+| `certs`       | vsp, vcfa, supervisor | ✓   | ✓   | ✓   | Delegates renewal to `vsp_cert_renewer.py` for vsp/vcfa. **Supervisor is detect-only in practice** — no delegate mapping exists for that cluster (§6)               |
 | `argo`        | vsp, vcfa             | ✓   |     | ✓   | Stale `system-shutdown` workflows + power-off marker                                                                                                                |
 | `kyverno`     | vsp                   | ✓   |     | ✓   | UpdateRequest backlog + all three controllers                                                                                                                       |
 | `vodap`       | vsp                   | ✓   |     | ✓   | ClickHouse served-vs-stored cert + fluentd buffer purge                                                                                                             |
 | `proxy`       | vsp                   | ✓   | ✓   |     | Per-node proxy drift vs `lsfunctions`, restart only the service whose drop-in changed                                                                               |
-| `kubeadm`     | vsp, vcfa             | ✓   | ✓   | ✓   | Native control plane & kubelet serving cert renewal + auto-approval of node CSRs (VSP & VCFA)                                                               |
+| `kubeadm`     | vsp, vcfa             | ✓   | ✓   | ✓   | Delegates renewal to `vsp_cert_renewer.py` (v1.2.0: now reachable for vcfa too)                                                                                     |
 | `password`    | vsp                   | ✓   | ✓   |     | `chage -M` **and** the last-change date                                                                                                                             |
 | `sizing`      | vsp                   | ✓   |     | ✓   | vsp-scale-down.py port — CP/worker machineType, replica bounds, autoscaler, utilization. Target flags only fire with `--section sizing`                             |
 | `footprint`   | vsp                   | ✓   |     | ✓   | remediate-lab.sh non-disruptive VSP levers — right-size requests, HA counts, safe-to-evict, CAPI LE, autoscaler pin                                                 |
@@ -1311,49 +1311,7 @@ cross-script locking.
 
 ## 15. Changelog
 
-**3.0 — 2026-08-25** — `vcf-lab-tuner.md` v3.0 / `vcf-lab-tuner.py` **v1.9.0**.
-
-### VCFA Automated Startup Recovery, 0-Replica Prelude Scale-Up, and SDS SAN NACK Auto-Remediation
-
-Resolved VCFA cold-boot / post-shutdown stabilization failures where `vcf-lab-tuner.py --cluster vcfa --mode remediate` encountered HTTP 500 on user-facing endpoints.
-
-#### Key Enhancements & Technical Details
-- **0-Replica Prelude Workload Recovery**:
-  - Automatically discovers and scales up any 0-replica Deployments and StatefulSets in the `prelude` namespace to 1 during remediation (`chk_edge` and `chk_deployments`).
-  - Corrects the condition where resumed Fleet LCM `system-shutdown-*` Argo workflows leave critical microservices scaled down to 0 without annotations.
-- **VCFA Section Re-ordering**:
-  - Re-ordered VCFA execution sequence (`argo -> nodes -> cp -> etcd -> postgres -> pods -> storm -> edge -> certs -> gateway -> deployments -> endpoint -> kubeadm`).
-  - Ensures stale shutdown workflows are deleted, nodes uncordoned, databases healthy, probe tolerances relaxed (10s), and deadlocks cleared BEFORE evaluating deployment readiness and testing gateway endpoints.
-- **Integrated SDS SAN-Without-CA NACK Auto-Fix**:
-  - `chk_gateway` on VCFA automatically checks for missing `platform-trust` ConfigMaps across BackendTLSPolicy namespaces and verifies the `vcfa-btp-wellknown-to-carefs` Kyverno ClusterPolicy.
-  - In `remediate` mode, copies missing ConfigMaps, applies the mutation policy, and triggers atomic rollout restarts of the gateway dataplanes (`envoy-gateway`, `vmsp-gateway`, `vcfa-gateway-configuration`).
-- **Active Resource Manager gRPC Deadlock Unblocker**:
-  - Embedded the `nsenter` HTTP/2 SETTINGS frame injector in `chk_edge`, actively accepting the client dial and returning the HTTP/2 preface so `resource-manager-server` completes its bootstrap sequence and binds to `:7777`.
-- **CrashLoopBackOff Auth Pod Reset**:
-  - Automatically resets crashed auth pods in `prelude` with `--grace-period=0` during deployment remediation to eliminate exponential backoff delay.
-- **Comprehensive Endpoint Probing**:
-  - `chk_endpoint` validates both `/automation` and `/login/` via gateway VIP resolution.
-
-**2.9 — 2026-08-24** — `vcf-lab-tuner.md` v2.9 / `vcf-lab-tuner.py` **v1.8.0**.
-
-### Comprehensive Failed, Stale, and Hanging Pod Cleanup Across Supervisor, VSP, and VCFA Clusters
-
-Resolved pod sweep gaps where stale/failed one-shot Job pods, wedged `Terminating` pods, and vSphere-specific Supervisor failure reasons (`AgentUnreachable`, `ProviderFailed`, `PodVMAnnotationsMissing`, `Evicted`) were skipped by default damped checks.
-
-#### Key Enhancements & Technical Details
-- **Supervisor Workload Pre-Flight Scale-Up & Reason-Agnostic Phase Sweeps**:
-  - Automatically discovers and scales up CCI (`svc-cci-ns*`), ArgoCD (`argocd`), and Harbor (`svc-harbor*`) deployments/statefulsets.
-  - Queries `--field-selector status.phase=Failed` and `--field-selector status.phase=Succeeded` to delete terminal pods across all namespaces regardless of failure reason string.
-  - Filters and cleans stuck container states (`CrashLoopBackOff`, `ImagePullBackOff`, `CreateContainerConfigError`, `RunContainerError`, `OOMKilled`).
-  - Implements two-pass deployment readiness polling with secondary stray pod sweep.
-- **VSP & VCFA Terminal Job/Workflow & Wedged Pod Sweeping**:
-  - Sweeps terminal completed/failed pods owned by Jobs, CronJobs, and Argo Workflows (`support-bundle-*`, `platform-trust-*`, `scheduled-etcd-*`, `service-account-rotation-*`, `vcenter-path-sync-*`, `wal-s3-*`, `descheduler-*`, `configure-component-*`, `system-shutdown-*`, etc.) without artificial restart count gating.
-  - Force-deletes hanging pods wedged in `Terminating` status (`metadata.deletionTimestamp` set).
-  - Recreates crash-looping workloads (`CrashLoopBackOff` / `Error` with `restarts >= 5` or when in failed state).
-- **Multi-Supervisor & Multi-vCenter Iteration**:
-  - Fully supports auto-discovery and sequential stabilization of all Supervisor control planes across all configured vCenters via `decryptK8Pwd.py` and VPX DB fallback.
-- **Real-Time Streaming Output Parity**:
-  - Emits real-time progress (`[SUPERVISOR] <ns>: deleted X stale pod(s) — ...`, `[VSP] <ns>: deleted X terminal pod(s)`, `[VCFA] <ns>: deleted X terminal pod(s)`) streamed directly into `labstartup.log` when called by `VCFfinal.py`.
+**2.7 — 2026-08-20** — `vcf-lab-tuner.md` v2.7 / `vcf-lab-tuner.py` **v1.5.0**.
 
 ### OpenSSH ControlMaster Multiplexing, Remote Batching, ASCII 16-Color Display, and Broadcom KB Traceability
 
@@ -2101,84 +2059,9 @@ response to a parity percentage.
 
 ---
 
+
+
 ## 18. Version History
-
-**v2.0.0 additions (2026-08-26)**: Native Certificate Renewal Engine across VSP, VCFA, and Supervisor clusters:
-
-- **Native Cert-Manager Leaf Renewal**: Auto-discovers and renews expiring or invalid cert-manager leaf certificates across all namespaces for VSP, VCFA, and Supervisor. Deletes backing secrets to trigger reissuance, correlates workloads mounting renewed secrets, and executes zero-downtime rollout restarts.
-- **Native Kubeadm & Kubelet Renewal**: Natively renews control plane certificates and node kubelet serving certs on VSP and VCFA, auto-approves node CSRs, and enforces 5-year CSR signing duration on `kube-controller-manager`.
-- **Native VSP Root CA Extension & Containerd Sync**: Extends cert-manager root CA (`vcf-cluster-ca`) when near expiry and synchronizes `ca.crt` to containerd trust stores across all VSP cluster nodes.
-- **Native Supervisor ESXi Spherelet Renewal**: Re-signs 5-year `client.crt` and `spherelet.crt` certificates for ESXi agent hosts on Supervisor clusters using SCP CA keys and manager-local openssl.
-- **Removed Delegation**: Completely eliminated subprocess delegation to `vsp_cert_renewer.py`.
-
-### Architecture & Workflow Overview
-
-```mermaid
-flowchart TD
-    Start["vcf-lab-tuner remediate"] --> ClusterType{"Cluster Target"}
-    
-    ClusterType -->|"vsp"| VSPFlow["VSP Flow"]
-    ClusterType -->|"vcfa"| VCFAFlow["VCFA Flow"]
-    ClusterType -->|"supervisor"| SupFlow["Supervisor Flow"]
-    
-    subgraph VSP ["VSP Certificate Renewal"]
-        VSPFlow --> VSP_KCM["1. Ensure KCM signing duration (5y)"]
-        VSP_KCM --> VSP_Kubeadm["2. Renew Kubeadm CP Certs & Bounce Static Pods"]
-        VSP_Kubeadm --> VSP_Kubelet["3. Check Kubelet Certs & Auto-approve CSRs"]
-        VSP_Kubelet --> VSP_CA["4. Extend cert-manager Root CA (vcf-cluster-ca)"]
-        VSP_CA --> VSP_Leaf["5. Dynamic Leaf Cert Renewal & Workload Rollout Restarts"]
-        VSP_Leaf --> VSP_CASync["6. Sync containerd CA Trust (casync)"]
-    end
-    
-    subgraph VCFA ["VCFA Certificate Renewal"]
-        VCFAFlow --> VCFA_Kubeadm["1. Renew Kubeadm CP Certs & Bounce Static Pods"]
-        VCFA_Kubeadm --> VCFA_Kubelet["2. Check Kubelet Certs & Auto-approve CSRs"]
-        VCFA_Kubelet --> VCFA_Leaf["3. Dynamic Leaf Certs & Service-TLS Workload Restarts"]
-    end
-    
-    subgraph Supervisor ["Supervisor Certificate Renewal"]
-        SupFlow --> Sup_Leaf["1. Dynamic Leaf Cert Renewal across all Namespaces"]
-        Sup_Leaf --> Sup_Rollout["2. Rollout Restart Workloads Mounting Renewed Secrets"]
-        Sup_Rollout --> Sup_CAInj["3. Restart cert-manager-cainjector"]
-        Sup_CAInj --> Sup_Spherelet["4. ESXi Spherelet Cert Renewal (client.crt & spherelet.crt)"]
-    end
-```
-
-
-**v1.9.1 additions (2026-08-25)**: VCFA endpoint convergence loop & cluster-specific drift keeper:
-
-- **VCFA Endpoint Convergence & Backoff Unblocker**: In remediate mode, `chk_endpoint` polls up to 180s for `/automation` and `/login/` stabilization. Once `tenant-manager-0` reaches Running status, it actively resets crashed prelude auth pods (`api-gateway-server`, `ccs-vksm-eas`, `resource-manager-server`) to clear Kubernetes exponential backoff delays immediately.
-- **Dedicated VCFA Drift Keeper**: Added `KEEPER_BODY_VCFA` asserting envoy-gateway 4Gi memory limit, runaway support-bundle job cleanup, stale system-shutdown Argo workflow purging, 0-replica prelude scale-up, CrashLoopBackOff pod recovery, and SDS platform-trust ConfigMap synchronization.
-- **Correct Keeper Payload Routing**: `do_keeper` now routes `KEEPER_BODY_VCFA` to `vcf-lab-keeper-vcfa` and `KEEPER_BODY_VSP` to `vcf-lab-keeper`.
-
-**v1.9.0 additions (2026-08-25)**: VCFA automated startup recovery, 0-replica prelude scale-up, and SDS SAN NACK auto-remediation:
-
-- **0-Replica Prelude Workload Recovery**: Auto-scales all 0-replica Deployments and StatefulSets in prelude back to 1 during remediation, resolving post-shutdown / cold-boot outages caused by resumed Fleet LCM Argo workflows.
-- **VCFA Section Re-ordering**: Re-ordered VCFA execution flow (`argo` -> `nodes` -> `cp` -> `etcd` -> `postgres` -> `pods` -> `storm` -> `edge` -> `certs` -> `gateway` -> `deployments` -> `endpoint` -> `kubeadm`) so workflows are swept, nodes uncordoned, and deadlocks cleared before deployments and endpoints are validated.
-- **Integrated SDS SAN NACK Auto-Fix**: `chk_gateway` on VCFA automatically verifies and synchronizes platform-trust ConfigMaps across BackendTLSPolicy namespaces, applies the Kyverno `vcfa-btp-wellknown-to-carefs` ClusterPolicy, and rolls dataplanes if modified during remediation.
-- **Active Resource Manager gRPC Bootstrap Deadlock Unblocker**: Embedded `nsenter` HTTP/2 SETTINGS frame injector in `chk_edge`, actively resolving the self-dial race condition during startup so `resource-manager` binds `:7777` reliably.
-- **CrashLoopBackOff Pod Reset**: Automatically clears crashed auth pods in prelude during deployment remediation to reset exponential backoff delay.
-- **Comprehensive Endpoint Probing**: `chk_endpoint` tests both `/automation` and `/login/` endpoints via gateway VIP.
-
-**v1.8.0 additions (2026-08-24)**: Comprehensive failed, stale, and hanging pod cleanup across Supervisor, VSP, and VCFA clusters:
-
-- **Supervisor**: Full parity with legacy `supervisor_stabilizer.py` workload recovery & stale pod sweep:
-  - Auto-discovery of all Supervisor clusters across all configured vCenters via `decryptK8Pwd.py` & VPX DB fallback.
-  - Automatic pre-flight scale-up of CCI (`svc-cci-ns*`), ArgoCD (`argocd`), and Harbor (`svc-harbor*`) workloads.
-  - Reason-agnostic phase field-selector batch deletion (`--field-selector status.phase=Failed` and `status.phase=Succeeded`) eliminating vSphere-specific failure reason gaps (`AgentUnreachable`, `ProviderFailed`, `PodVMAnnotationsMissing`, `Evicted`, etc.).
-  - Two-pass deployment readiness polling and secondary stray pod sweep.
-  - Real-time streaming log outputs matching legacy format for `labstartup.log` visibility.
-- **VSP & VCFA**: Cluster-wide sweeping of terminal Job/CronJob/Workflow pods, hanging Terminating pods, and crashed workloads:
-  - Deletes terminal completed/failed pods owned by Jobs, CronJobs, and Argo Workflows (`support-bundle-*`, `platform-trust-*`, `scheduled-etcd-*`, `service-account-rotation-*`, `vcenter-path-sync-*`, `wal-s3-*`, `descheduler-*`, `configure-component-*`, etc.) without requiring artificial restart thresholds.
-  - Force-deletes hanging pods wedged in Terminating status (`metadata.deletionTimestamp` set).
-  - Restarts crashed workload pods (`CrashLoopBackOff` / `Error`) in active microservice namespaces (`prelude`, `vidb-external`, `vcf-sddc-lcm`, `salt-raas`).
-- **Broadcom KB Traceability**: Integrated `KB 326114`, `KB 326113` (pod health validation), `KB 435491` (CSI controller & stale pods), and `KB 326110` (storage pressure evictions).
-
-**v1.7.1 additions (2026-08-22)**: Fixed VCFA envoyproxy-gateway `ReleaseTemplate` patching, legacy keeper detection, and `vsphere-cpi` args in drift keeper:
-
-- Dynamic discovery and patching for envoyproxy-gateway `ReleaseTemplate` in `KEEPER_BODY`, ensuring 4Gi limit applies even when resources was previously undefined.
-- Fixed `detect_legacy_keepers` exact-token matching so systemd "inactive" output is not falsely matched as "active".
-- Preserved existing `vsphere-cpi` base args (`--cloud-provider`, `--cloud-config`) when injecting leader election flags in drift keeper.
 
 **v1.7.0 additions (2026-08-20)**: Achieved 100% functional parity with `vsp-stabilizer.sh`:
 
