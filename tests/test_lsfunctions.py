@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # test_lsfunctions.py - HOLFY27 lsfunctions.py Unit Tests
-# Version 1.0 - January 2026
+# Version 1.1 - 2026-09-01
 # Author - Burke Azbill and HOL Core Team
 
 import pytest
@@ -489,3 +489,70 @@ class TestLabTypeRepoPatterns:
             loader = LabTypeLoader(labtype_input, '/home/holuser/hol')
             assert loader.labtype == 'DISCOVERY'
             assert loader.get_repo_pattern() == 'named'
+
+
+class TestConsoleDockerProxy:
+    """Test console Docker daemon proxy set and clear helpers"""
+
+    def test_set_console_docker_proxy_dry_run(self):
+        """Test set_console_docker_proxy in dry-run mode"""
+        import lsfunctions as lsf
+        with patch.object(lsf, 'ssh') as mock_ssh, \
+             patch.object(lsf, 'write_output') as mock_write:
+            result = lsf.set_console_docker_proxy('root@console.site-a.vcf.lab', 'pwd', dry_run=True)
+            assert result is True
+            mock_ssh.assert_not_called()
+
+    def test_set_console_docker_proxy_success(self):
+        """Test set_console_docker_proxy execution"""
+        import lsfunctions as lsf
+        mock_res = MagicMock(returncode=0, stdout='ok', stderr='')
+        with patch.object(lsf, 'ssh', return_value=mock_res) as mock_ssh, \
+             patch.object(lsf, 'write_output') as mock_write:
+            result = lsf.set_console_docker_proxy('root@console.site-a.vcf.lab', 'pwd', dry_run=False)
+            assert result is True
+            mock_ssh.assert_called_once()
+            cmd = mock_ssh.call_args[0][0]
+            assert 'base64' in cmd
+            assert 'bash' in cmd
+
+    def test_set_console_docker_proxy_failure(self):
+        """Test set_console_docker_proxy when SSH fails"""
+        import lsfunctions as lsf
+        mock_res = MagicMock(returncode=1, stdout='', stderr='Connection refused')
+        with patch.object(lsf, 'ssh', return_value=mock_res) as mock_ssh, \
+             patch.object(lsf, 'write_output') as mock_write:
+            result = lsf.set_console_docker_proxy('root@console.site-a.vcf.lab', 'pwd', dry_run=False)
+            assert result is False
+
+    def test_clear_console_docker_proxy_dry_run(self):
+        """Test clear_console_docker_proxy in dry-run mode"""
+        import lsfunctions as lsf
+        with patch.object(lsf, 'ssh') as mock_ssh, \
+             patch.object(lsf, 'write_output') as mock_write:
+            result = lsf.clear_console_docker_proxy('root@console.site-a.vcf.lab', 'pwd', dry_run=True)
+            assert result is True
+            mock_ssh.assert_not_called()
+
+    def test_clear_console_docker_proxy_success(self):
+        """Test clear_console_docker_proxy execution"""
+        import lsfunctions as lsf
+        mock_res = MagicMock(returncode=0, stdout='ok', stderr='')
+        with patch.object(lsf, 'ssh', return_value=mock_res) as mock_ssh, \
+             patch.object(lsf, 'write_output') as mock_write:
+            result = lsf.clear_console_docker_proxy('root@console.site-a.vcf.lab', 'pwd', dry_run=False)
+            assert result is True
+            mock_ssh.assert_called_once()
+            cmd = mock_ssh.call_args[0][0]
+            assert 'base64' in cmd
+            assert 'bash' in cmd
+
+    def test_clear_console_docker_proxy_failure(self):
+        """Test clear_console_docker_proxy when SSH fails"""
+        import lsfunctions as lsf
+        mock_res = MagicMock(returncode=1, stdout='', stderr='Connection failed')
+        with patch.object(lsf, 'ssh', return_value=mock_res) as mock_ssh, \
+             patch.object(lsf, 'write_output') as mock_write:
+            result = lsf.clear_console_docker_proxy('root@console.site-a.vcf.lab', 'pwd', dry_run=False)
+            assert result is False
+
