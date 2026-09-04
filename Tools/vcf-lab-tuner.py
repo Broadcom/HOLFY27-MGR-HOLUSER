@@ -6364,7 +6364,10 @@ def _storm_capi_le_false(r, dep, cl, deploy_data=None):
         return warn("storm.footprint", label, "no --leader-elect arg on this build", cluster=cl)
     res = fail("storm.footprint", label, "still --leader-elect=true", cluster=cl)
     if may_act(r, "storm"):
+        rt_patch = json.dumps({"spec": {"helm": {"driftDetection": {"mode": "disabled"}}}})
         r.write(
+            f"for rt in $(kubectl get releasetemplate -n {STORM_NAMESPACE} -o name 2>/dev/null | grep -E 'cluster-api-installer-'); do "
+            f"kubectl patch $rt -n {STORM_NAMESPACE} --type=merge -p '{rt_patch}' >/dev/null 2>&1 || true; done && "
             "python3 - <<'PY'\n"
             "import subprocess, json\n"
             "KC=['kubectl']\n"
@@ -6499,7 +6502,16 @@ def _storm_vcfa_vmsp_le_false(r, dep, cl, deploy_data=None):
         return ok("storm.le_tuning", label, cluster=cl)
     res = fail("storm.le_tuning", label, f"args={args}", cluster=cl)
     if may_act(r, "storm"):
+        rt_prefix = "ndc-" if "ndc" in dep else "vmsp-identity-" if "identity" in dep else ""
+        rt_cmd = ""
+        if rt_prefix:
+            rt_patch = json.dumps({"spec": {"helm": {"driftDetection": {"mode": "disabled"}}}})
+            rt_cmd = (
+                f"for rt in $(kubectl get releasetemplate -n {STORM_NAMESPACE} -o name 2>/dev/null | grep -E '{rt_prefix}'); do "
+                f"kubectl patch $rt -n {STORM_NAMESPACE} --type=merge -p '{rt_patch}' >/dev/null 2>&1 || true; done && "
+            )
         r.write(
+            f"{rt_cmd}"
             "python3 - <<'PY'\n"
             "import subprocess, json\n"
             "KC=['kubectl']\n"
@@ -6534,8 +6546,13 @@ def _storm_vcfa_cron_stagger(r, cl):
     else:
         res = fail("storm.cron_stagger", label_wal, f"currently top-of-the-hour '{cur_wal}'", cluster=cl)
         if may_act(r, "storm"):
+            wal_rt_val = {"spec": {"helm": {"driftDetection": {"mode": "disabled"}, "values": {"walCleanup": {"schedule": "25 * * * *"}}}}}
+            wal_rt_patch = json.dumps(wal_rt_val)
+            wal_cw_patch = json.dumps({"spec": {"schedules": ["25 * * * *"]}})
             r.write(
-                f"kubectl patch cronworkflow wal-s3-cleanup -n {STORM_NAMESPACE} --type=merge -p '{{\"spec\":{{\"schedules\":[\"25 * * * *\"]}}}}'",
+                f"for rt in $(kubectl get releasetemplate -n {STORM_NAMESPACE} -o name 2>/dev/null | grep -E 'vmsp-backup-'); do "
+                f"kubectl patch $rt -n {STORM_NAMESPACE} --type=merge -p '{wal_rt_patch}' >/dev/null 2>&1 || true; done && "
+                f"kubectl patch cronworkflow wal-s3-cleanup -n {STORM_NAMESPACE} --type=merge -p '{wal_cw_patch}'",
                 f"storm cron-stagger: wal-s3-cleanup schedule -> 25 * * * *",
                 tier="transient", timeout=60)
             res.action = "schedule -> 25 * * * *"
@@ -6554,8 +6571,12 @@ def _storm_vcfa_cron_stagger(r, cl):
     else:
         res = fail("storm.cron_stagger", label_etcd, f"currently top-of-the-hour '{cur_etcd}'", cluster=cl)
         if may_act(r, "storm"):
+            etcd_rt_patch = json.dumps({"spec": {"helm": {"driftDetection": {"mode": "disabled"}}}})
+            etcd_cw_patch = json.dumps({"spec": {"schedule": "40 */3 * * *"}})
             r.write(
-                f"kubectl patch cronworkflow scheduled-etcd-backup -n {STORM_NAMESPACE} --type=merge -p '{{\"spec\":{{\"schedule\":\"40 */3 * * *\"}}}}'",
+                f"for rt in $(kubectl get releasetemplate -n {STORM_NAMESPACE} -o name 2>/dev/null | grep -E 'vmsp-backup-'); do "
+                f"kubectl patch $rt -n {STORM_NAMESPACE} --type=merge -p '{etcd_rt_patch}' >/dev/null 2>&1 || true; done && "
+                f"kubectl patch cronworkflow scheduled-etcd-backup -n {STORM_NAMESPACE} --type=merge -p '{etcd_cw_patch}'",
                 f"storm cron-stagger: scheduled-etcd-backup schedule -> 40 */3 * * *",
                 tier="transient", timeout=60)
             res.action = "schedule -> 40 */3 * * *"
@@ -6576,13 +6597,10 @@ def _storm_vcfa_webhook_resilience(r, cl):
         return warn("storm.webhook", label, "webhook configuration not found", cluster=cl)
     res = fail("storm.webhook", label, f"currently {cur_fp}", cluster=cl)
     if may_act(r, "storm"):
-        kyverno_rt = _storm_discover_rt(r, "kyverno-", exclude=("policies",))
-        rt_cmd = ""
-        if kyverno_rt:
-            rt_patch = json.dumps({"spec": {"helm": {"values": {"admissionController": {"forceFailurePolicyIgnore": True}}}}})
-            rt_cmd = f"kubectl patch releasetemplate {kyverno_rt} -n {STORM_NAMESPACE} --type=merge -p '{rt_patch}' && "
+        kyv_rt_patch = json.dumps({"spec": {"helm": {"driftDetection": {"mode": "disabled"}, "values": {"admissionController": {"forceFailurePolicyIgnore": True}}}}})
         r.write(
-            f"{rt_cmd}"
+            f"for rt in $(kubectl get releasetemplate -n {STORM_NAMESPACE} -o name 2>/dev/null | grep -E 'kyverno-1\\.'); do "
+            f"kubectl patch $rt -n {STORM_NAMESPACE} --type=merge -p '{kyv_rt_patch}' >/dev/null 2>&1 || true; done && "
             "kubectl patch validatingwebhookconfigurations kyverno-resource-validating-webhook-cfg --type=json -p '[{\"op\": \"replace\", \"path\": \"/webhooks/0/failurePolicy\", \"value\": \"Ignore\"}]' && "
             "python3 - <<'PY'\n"
             "import subprocess, json\n"
@@ -7864,6 +7882,17 @@ if [ "$KYVFP" = "Fail" ]; then
     $KB patch validatingwebhookconfigurations kyverno-resource-validating-webhook-cfg --type=json -p '[{"op": "replace", "path": "/webhooks/0/failurePolicy", "value": "Ignore"}]' >/dev/null 2>&1 \
         && log "drift corrected: kyverno validating webhook failurePolicy -> Ignore"
 fi
+
+# 12. Disable Flux driftDetection on ReleaseTemplates to ensure durability
+for rtname in ndc vmsp-identity vmsp-backup kyverno-1 cluster-api-installer; do
+    for rtm in $($KB -n vmsp-platform get releasetemplate -o name 2>/dev/null | grep -E "$rtname" | grep -v policies); do
+        RT_DRIFT=$($KB get "$rtm" -n vmsp-platform -o jsonpath='{.spec.helm.driftDetection.mode}' 2>/dev/null || echo "")
+        if [ "$RT_DRIFT" != "disabled" ]; then
+            $KB patch "$rtm" -n vmsp-platform --type=merge -p '{"spec":{"helm":{"driftDetection":{"mode":"disabled"}}}}' >/dev/null 2>&1 \
+                && log "drift corrected: $rtm ReleaseTemplate driftDetection -> disabled"
+        fi
+    done
+done
 
 exit 0
 """

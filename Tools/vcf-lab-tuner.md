@@ -872,6 +872,7 @@ flowchart LR
 - **9. Fluentd Buffer Volume Cleanup**: Automatically purges stale `/buffers/backup` directory inside `logging-operator-fluentd-0` container when fluentd container is `NotReady`.
 - **10. Argo CronWorkflow Schedule Staggering**: Staggers `wal-s3-cleanup` to `25 * * * *` and `scheduled-etcd-backup` to `40 */3 * * *` to eliminate concurrent top-of-the-hour API server and disk I/O bursts.
 - **11. Kyverno Admission Webhook Resilience**: Enforces `failurePolicy=Ignore` on `kyverno-resource-validating-webhook-cfg` and sets `forceFailurePolicyIgnore=true` on Kyverno ReleaseTemplate and Deployment arguments.
+- **12. ReleaseTemplate FluxCD Drift Detection Disabling**: Explicitly enforces `spec.helm.driftDetection.mode=disabled` across all managed ReleaseTemplates (`ndc-*`, `vmsp-identity-*`, `vmsp-backup-*`, `cluster-api-installer-*`, `kyverno-1.*`), preventing FluxCD automated reconciliation cycles from reverting live pod arguments, staggered CronWorkflow schedules, and webhook failure policies.
 
 ---
 
@@ -1352,13 +1353,14 @@ Root cause analysis of intermittent VCF Automation (VCFA) unresponsiveness and E
 - **Kyverno Admission Webhook Resilience & ReleaseTemplate Durability**:
   - *WHAT*: Configures `failurePolicy` to `Ignore` on `ValidatingWebhookConfiguration/kyverno-resource-validating-webhook-cfg`. Concurrently patches the Kyverno ReleaseTemplate (`spec.helm.values.admissionController.forceFailurePolicyIgnore=true`) and updates the `kyverno-admission-controller` deployment argument (`--forceFailurePolicyIgnore=true`).
   - *WHY (RCA)*: When Kyverno admission controllers experienced high CPU load, admission webhook validation timed out (`timeoutSeconds=10`). With `failurePolicy=Fail`, timed-out requests blocked pod lifecycle operations and lease updates, deadlocking the cluster. Setting `failurePolicy=Ignore` prevents webhooks from failing closed. Patching the ReleaseTemplate and deployment arguments ensures Kyverno's internal auto-reconciliation (`--autoUpdateWebhooks=true`) does not revert the setting back to `Fail`.
-- **Enhanced VCFA Drift Keeper (`vcf-lab-keeper-vcfa`)**:
-  - *WHAT*: Extended the 60-second systemd timer drift keeper to continuously assert:
+- **Enhanced VCFA Drift Keeper (`vcf-lab-keeper-vcfa`) & ReleaseTemplate Durability**:
+  - *WHAT*: Extended the 60-second systemd timer drift keeper and Python remediation routines to:
+    - Automatically disable FluxCD drift detection (`spec.helm.driftDetection.mode: disabled`) across all underlying ReleaseTemplates (`ndc-*`, `vmsp-identity-*`, `vmsp-backup-*`, `cluster-api-installer-*`, `kyverno-1.*`).
     - Stripping/disabling leader election across all single-replica prelude microservices and vmsp-platform controllers.
     - Purging stale `/buffers/backup` directory on `logging-operator-fluentd-0` whenever the fluentd container becomes `NotReady` due to disk overflow.
-    - Staggered CronWorkflow schedules (`wal-s3-cleanup` and `scheduled-etcd-backup`).
+    - Staggering CronWorkflow schedules (`wal-s3-cleanup` to minute 25 and `scheduled-etcd-backup` to minute 40) directly in both the live CRDs and `ReleaseTemplate/vmsp-backup`.
     - Kyverno validating webhook `failurePolicy=Ignore` and ReleaseTemplate `forceFailurePolicyIgnore=true`.
-  - *WHY*: FluxCD drift detection and controller reconciliations periodically attempt to re-assert default manifests. The enhanced keeper guarantees that VCFA stability fixes persist through operator cycles without manual intervention.
+  - *WHY (RCA)*: FluxCD's background reconciliation loop on HelmReleases periodically compares live Kubernetes objects against the baseline Helm charts rendered by `ReleaseTemplate` CRDs. If `driftDetection.mode` is left as `enabled` (the default), FluxCD detects manual pod argument changes and staggered cron schedules as "drift" and silently reverts them every 5–10 minutes. Disabling `driftDetection` at the `ReleaseTemplate` level stops FluxCD from reverting these changes, making all VCFA tuning and resilience modifications permanently durable.
 - **Dynamic Credential Sourcing Contract**:
   - *WHAT*: Validated that all cluster configurations, SSH transports, and API calls strictly source passwords from `/home/holuser/creds.txt` via `get_password()`, eliminating hardcoded fallback credentials across all execution paths.
 
