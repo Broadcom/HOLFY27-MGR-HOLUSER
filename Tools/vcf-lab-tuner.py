@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.1.0 - 2026-09-02
+Version 2.2.0 - 2026-09-04
 Author: HOL Core Team
+
+v2.2.0: VCFA Leader Election Hardening, CronWorkflow Staggering, Webhook Resilience, and Enhanced Keeper:
+  - Single-Node VCFA Microservice Leader Election Hardening: Explicitly disables leader election on single-replica prelude microservices (authentication-server, account-manager-server, intent-server, policy-engine-server, policy-insights-server, cluster-service-server, cluster-object-service-server) and vmsp-platform controllers (ndc-controller-manager, vmsp-identity, capi/capv controllers) to eliminate cascade crashes and leadership lease timeouts during system load.
+  - Argo CronWorkflow Staggering: Staggers background CronWorkflows (wal-s3-cleanup shifted to 25 * * * * and scheduled-etcd-backup shifted to 40 */3 * * *) to eliminate top-of-the-hour concurrent job spikes on the API server and etcd.
+  - Kyverno Admission Webhook Resilience: Configures kyverno-resource-validating-webhook-cfg failurePolicy to Ignore on single-node VCFA so admission validation bursts do not deadlock API server operations.
+  - Enhanced VCFA Drift Keeper: Updated vcf-lab-keeper-vcfa to automatically assert leader election settings, CronWorkflow schedules, Kyverno webhook failure policy, and fluentd buffer volume cleanup.
 
 v2.1.0: Dynamic VCF Component Discovery, HA Replica Evaluation Tuning, and SSP Cluster Parity:
   - Dynamic VCF Component Discovery (_discover_vcf_components): Dynamically queries cluster-scoped components.api.vmsp.vmware.com Component CRDs on VSP to discover active component namespaces, operational statuses, and workloads. Caches discovered state in runtime context (ctx) and eliminates reliance on static, error-prone /tmp/config.ini entries while preserving a fallback parser.
@@ -487,8 +493,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.1.0"
-DATE    = "2026-09-02"
+VERSION = "2.2.0"
+DATE    = "2026-09-04"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -6382,6 +6388,219 @@ def _storm_capi_le_false(r, dep, cl, deploy_data=None):
     return res
 
 
+def _storm_vcfa_strip_le(r, dep, cl, deploy_data=None):
+    if deploy_data is not None:
+        d = deploy_data
+    else:
+        d = r.read_json(f"kubectl get deploy {dep} -n {STORM_PRELUDE_NAMESPACE} -o json 2>/dev/null", 30)
+    label = f"{STORM_PRELUDE_NAMESPACE}/{dep}: leader-election disabled"
+    if not d:
+        return warn("storm.le_tuning", label, "not found", cluster=cl)
+    args = []
+    for c in d.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+        args.extend(c.get("args") or [])
+    has_le = any(a.startswith("--enable-leader-election") for a in args)
+    if not has_le:
+        return ok("storm.le_tuning", label, "disabled", cluster=cl)
+    res = fail("storm.le_tuning", label, "flag --enable-leader-election present", cluster=cl)
+    if may_act(r, "storm"):
+        r.write(
+            "python3 - <<'PY'\n"
+            "import subprocess, json\n"
+            "KC=['kubectl']\n"
+            f"r=subprocess.run(KC+['get','deploy','{dep}','-n','{STORM_PRELUDE_NAMESPACE}','-o','json'],capture_output=True,text=True)\n"
+            "d=json.loads(r.stdout)\n"
+            "for c in d['spec']['template']['spec']['containers']:\n"
+            "    c['args'] = [a for a in c.get('args', []) if not a.startswith('--enable-leader-election')]\n"
+            f"subprocess.run(KC+['apply','-f','-'],input=json.dumps(d),text=True)\n"
+            "PY\n",
+            f"storm le-tuning: stripped --enable-leader-election from {STORM_PRELUDE_NAMESPACE}/{dep}",
+            tier="transient", timeout=60)
+        res.action = "--enable-leader-election stripped"
+        if not r.dry_run:
+            res.state, res.detail = "warn", "stripped --enable-leader-election flag"
+    return res
+
+
+def _storm_vcfa_explicit_le_false(r, dep, cl, deploy_data=None):
+    if deploy_data is not None:
+        d = deploy_data
+    else:
+        d = r.read_json(f"kubectl get deploy {dep} -n {STORM_PRELUDE_NAMESPACE} -o json 2>/dev/null", 30)
+    label = f"{STORM_PRELUDE_NAMESPACE}/{dep}: --enable-leader-election=false"
+    if not d:
+        return warn("storm.le_tuning", label, "not found", cluster=cl)
+    args = []
+    for c in d.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+        args.extend(c.get("args") or [])
+    if "--enable-leader-election=false" in args:
+        return ok("storm.le_tuning", label, cluster=cl)
+    res = fail("storm.le_tuning", label, "not explicitly set to false", cluster=cl)
+    if may_act(r, "storm"):
+        r.write(
+            "python3 - <<'PY'\n"
+            "import subprocess, json\n"
+            "KC=['kubectl']\n"
+            f"r=subprocess.run(KC+['get','deploy','{dep}','-n','{STORM_PRELUDE_NAMESPACE}','-o','json'],capture_output=True,text=True)\n"
+            "d=json.loads(r.stdout)\n"
+            "for c in d['spec']['template']['spec']['containers']:\n"
+            "    new_args = [a if not a.startswith('--enable-leader-election') else '--enable-leader-election=false' for a in c.get('args', [])]\n"
+            "    if '--enable-leader-election=false' not in new_args:\n"
+            "        new_args.append('--enable-leader-election=false')\n"
+            "    c['args'] = new_args\n"
+            f"subprocess.run(KC+['apply','-f','-'],input=json.dumps(d),text=True)\n"
+            "PY\n",
+            f"storm le-tuning: --enable-leader-election=false on {STORM_PRELUDE_NAMESPACE}/{dep}",
+            tier="transient", timeout=60)
+        res.action = "--enable-leader-election=false"
+        if not r.dry_run:
+            res.state, res.detail = "warn", "set --enable-leader-election=false"
+    return res
+
+
+def _storm_vcfa_env_le_false(r, dep, cl, deploy_data=None):
+    if deploy_data is not None:
+        d = deploy_data
+    else:
+        d = r.read_json(f"kubectl get deploy {dep} -n {STORM_PRELUDE_NAMESPACE} -o json 2>/dev/null", 30)
+    label = f"{STORM_PRELUDE_NAMESPACE}/{dep}: env ENABLE_LEADER_ELECTION=false"
+    if not d:
+        return warn("storm.le_tuning", label, "not found", cluster=cl)
+    env_vars = {}
+    for c in d.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+        for e in c.get("env") or []:
+            env_vars[e.get("name")] = e.get("value")
+    if env_vars.get("ENABLE_LEADER_ELECTION") == "false":
+        return ok("storm.le_tuning", label, cluster=cl)
+    res = fail("storm.le_tuning", label, f"currently {env_vars.get('ENABLE_LEADER_ELECTION', 'unset')}", cluster=cl)
+    if may_act(r, "storm"):
+        r.write(
+            f"kubectl set env deploy/{dep} -n {STORM_PRELUDE_NAMESPACE} ENABLE_LEADER_ELECTION=false",
+            f"storm le-tuning: set ENABLE_LEADER_ELECTION=false on {STORM_PRELUDE_NAMESPACE}/{dep}",
+            tier="transient", timeout=60)
+        res.action = "ENABLE_LEADER_ELECTION=false"
+        if not r.dry_run:
+            res.state, res.detail = "warn", "set ENABLE_LEADER_ELECTION=false"
+    return res
+
+
+def _storm_vcfa_vmsp_le_false(r, dep, cl, deploy_data=None):
+    if deploy_data is not None:
+        d = deploy_data
+    else:
+        d = r.read_json(f"kubectl get deploy {dep} -n {STORM_NAMESPACE} -o json 2>/dev/null", 30)
+    label = f"{STORM_NAMESPACE}/{dep}: --leader-elect=false"
+    if not d:
+        return warn("storm.le_tuning", label, "not found", cluster=cl)
+    args = []
+    for c in d.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+        args.extend(c.get("args") or [])
+    if "--leader-elect=false" in args:
+        return ok("storm.le_tuning", label, cluster=cl)
+    res = fail("storm.le_tuning", label, f"args={args}", cluster=cl)
+    if may_act(r, "storm"):
+        r.write(
+            "python3 - <<'PY'\n"
+            "import subprocess, json\n"
+            "KC=['kubectl']\n"
+            f"r=subprocess.run(KC+['get','deploy','{dep}','-n','{STORM_NAMESPACE}','-o','json'],capture_output=True,text=True)\n"
+            "d=json.loads(r.stdout)\n"
+            "for c in d['spec']['template']['spec']['containers']:\n"
+            "    args = c.get('args', [])\n"
+            "    new_args = [a if a != '--leader-elect' else '--leader-elect=false' for a in args]\n"
+            "    if '--leader-elect=false' not in new_args and '--leader-elect' in args:\n"
+            "        new_args.append('--leader-elect=false')\n"
+            "    c['args'] = new_args\n"
+            f"subprocess.run(KC+['apply','-f','-'],input=json.dumps(d),text=True)\n"
+            "PY\n",
+            f"storm le-tuning: --leader-elect=false on {STORM_NAMESPACE}/{dep}",
+            tier="transient", timeout=60)
+        res.action = "--leader-elect=false"
+        if not r.dry_run:
+            res.state, res.detail = "warn", "set --leader-elect=false"
+    return res
+
+
+def _storm_vcfa_cron_stagger(r, cl):
+    out = []
+    # wal-s3-cleanup
+    label_wal = f"{STORM_NAMESPACE}/wal-s3-cleanup: staggered schedule (25 * * * *)"
+    rc, cur_wal = r.read(f"kubectl get cronworkflow wal-s3-cleanup -n {STORM_NAMESPACE} -o jsonpath='{{.spec.schedules[0]}}' 2>/dev/null", 30)
+    cur_wal = _sizing_last(cur_wal)
+    if cur_wal and cur_wal != "0 * * * *":
+        out.append(ok("storm.cron_stagger", label_wal, f"schedule={cur_wal}", cluster=cl))
+    elif not cur_wal:
+        out.append(warn("storm.cron_stagger", label_wal, "cronworkflow not found", cluster=cl))
+    else:
+        res = fail("storm.cron_stagger", label_wal, f"currently top-of-the-hour '{cur_wal}'", cluster=cl)
+        if may_act(r, "storm"):
+            r.write(
+                f"kubectl patch cronworkflow wal-s3-cleanup -n {STORM_NAMESPACE} --type=merge -p '{{\"spec\":{{\"schedules\":[\"25 * * * *\"]}}}}'",
+                f"storm cron-stagger: wal-s3-cleanup schedule -> 25 * * * *",
+                tier="transient", timeout=60)
+            res.action = "schedule -> 25 * * * *"
+            if not r.dry_run:
+                res.state, res.detail = "warn", "staggered schedule to 25 * * * *"
+        out.append(res)
+
+    # scheduled-etcd-backup
+    label_etcd = f"{STORM_NAMESPACE}/scheduled-etcd-backup: staggered schedule (40 */3 * * *)"
+    rc, cur_etcd = r.read(f"kubectl get cronworkflow scheduled-etcd-backup -n {STORM_NAMESPACE} -o jsonpath='{{.spec.schedule}}' 2>/dev/null", 30)
+    cur_etcd = _sizing_last(cur_etcd)
+    if cur_etcd and cur_etcd != "0 */3 * * *":
+        out.append(ok("storm.cron_stagger", label_etcd, f"schedule={cur_etcd}", cluster=cl))
+    elif not cur_etcd:
+        out.append(warn("storm.cron_stagger", label_etcd, "cronworkflow not found", cluster=cl))
+    else:
+        res = fail("storm.cron_stagger", label_etcd, f"currently top-of-the-hour '{cur_etcd}'", cluster=cl)
+        if may_act(r, "storm"):
+            r.write(
+                f"kubectl patch cronworkflow scheduled-etcd-backup -n {STORM_NAMESPACE} --type=merge -p '{{\"spec\":{{\"schedule\":\"40 */3 * * *\"}}}}'",
+                f"storm cron-stagger: scheduled-etcd-backup schedule -> 40 */3 * * *",
+                tier="transient", timeout=60)
+            res.action = "schedule -> 40 */3 * * *"
+            if not r.dry_run:
+                res.state, res.detail = "warn", "staggered schedule to 40 */3 * * *"
+        out.append(res)
+
+    return out
+
+
+def _storm_vcfa_webhook_resilience(r, cl):
+    label = "kyverno-resource-validating-webhook-cfg: failurePolicy == Ignore"
+    rc, cur_fp = r.read("kubectl get validatingwebhookconfigurations kyverno-resource-validating-webhook-cfg -o jsonpath='{.webhooks[0].failurePolicy}' 2>/dev/null", 30)
+    cur_fp = _sizing_last(cur_fp)
+    if cur_fp == "Ignore":
+        return ok("storm.webhook", label, "Ignore", cluster=cl)
+    elif not cur_fp:
+        return warn("storm.webhook", label, "webhook configuration not found", cluster=cl)
+    res = fail("storm.webhook", label, f"currently {cur_fp}", cluster=cl)
+    if may_act(r, "storm"):
+        kyverno_rt = _storm_discover_rt(r, "kyverno-", exclude=("policies",))
+        rt_cmd = ""
+        if kyverno_rt:
+            rt_patch = json.dumps({"spec": {"helm": {"values": {"admissionController": {"forceFailurePolicyIgnore": True}}}}})
+            rt_cmd = f"kubectl patch releasetemplate {kyverno_rt} -n {STORM_NAMESPACE} --type=merge -p '{rt_patch}' && "
+        r.write(
+            f"{rt_cmd}"
+            "kubectl patch validatingwebhookconfigurations kyverno-resource-validating-webhook-cfg --type=json -p '[{\"op\": \"replace\", \"path\": \"/webhooks/0/failurePolicy\", \"value\": \"Ignore\"}]' && "
+            "python3 - <<'PY'\n"
+            "import subprocess, json\n"
+            "KC=['kubectl']\n"
+            "r=subprocess.run(KC+['get','deploy','kyverno-admission-controller','-n','vmsp-policies','-o','json'],capture_output=True,text=True)\n"
+            "d=json.loads(r.stdout)\n"
+            "for c in d['spec']['template']['spec']['containers']:\n"
+            "    c['args'] = [a if not a.startswith('--forceFailurePolicyIgnore=') else '--forceFailurePolicyIgnore=true' for a in c.get('args', [])]\n"
+            "subprocess.run(KC+['apply','-f','-'],input=json.dumps(d),text=True)\n"
+            "PY\n",
+            "storm webhook: kyverno failurePolicy -> Ignore & RT/deploy forceFailurePolicyIgnore=true",
+            tier="transient", timeout=60)
+        res.action = "failurePolicy -> Ignore"
+        if not r.dry_run:
+            res.state, res.detail = "warn", "failurePolicy patched to Ignore"
+    return res
+
+
 def chk_storm(r, ctx):
     """VCFA CPU-storm mitigation [KB 322724, KB 439264]. See the module comment above this section."""
     out = []
@@ -6587,6 +6806,23 @@ def chk_storm(r, ctx):
             if not r.dry_run:
                 res.state, res.detail = "warn", "was BestEffort; requests added"
         out.append(res)
+
+    # --- VCFA SINGLE-NODE HARDENING: microservice LE, CronWorkflow staggering, webhook resilience ---
+    if cl == "vcfa":
+        prelude_deploys_json = r.read_json(f"kubectl get deploy -n {STORM_PRELUDE_NAMESPACE} -o json 2>/dev/null", 60) or {}
+        prelude_deploy_map = {item["metadata"]["name"]: item for item in prelude_deploys_json.get("items", [])}
+
+        for dep in ("authentication-server", "intent-server"):
+            out.append(_storm_vcfa_strip_le(r, dep, cl, deploy_data=prelude_deploy_map.get(dep)))
+        for dep in ("account-manager-server",):
+            out.append(_storm_vcfa_explicit_le_false(r, dep, cl, deploy_data=prelude_deploy_map.get(dep)))
+        for dep in ("policy-engine-server", "policy-insights-server", "cluster-service-server", "cluster-object-service-server"):
+            out.append(_storm_vcfa_env_le_false(r, dep, cl, deploy_data=prelude_deploy_map.get(dep)))
+        for dep in ("ndc-controller-manager", "vmsp-identity"):
+            out.append(_storm_vcfa_vmsp_le_false(r, dep, cl, deploy_data=storm_deploy_map.get(dep)))
+
+        out.extend(_storm_vcfa_cron_stagger(r, cl))
+        out.append(_storm_vcfa_webhook_resilience(r, cl))
 
     # --- opt-in, disruptive levers: only when explicitly requested ---
     if ctx.get("storm_disable_le") and may_act(r, "storm"):
@@ -7548,7 +7784,7 @@ for ns in $($KB get backendtlspolicy -A -o jsonpath='{range .items[*]}{.metadata
     fi
 done
 
-# 8. Ensure leader-election flag stripped from single-replica intent-server, capi-controller-manager, and capi-ipam
+# 8. Ensure leader-election flags/envs stripped from single-replica microservices
 INTENT_ARGS=$($KB -n prelude get deploy intent-server -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo "")
 if [ -n "$INTENT_ARGS" ] && printf '%s' "$INTENT_ARGS" | grep -q -- '--enable-leader-election'; then
     $KB get deploy intent-server -n prelude -o json 2>/dev/null | \
@@ -7557,7 +7793,31 @@ if [ -n "$INTENT_ARGS" ] && printf '%s' "$INTENT_ARGS" | grep -q -- '--enable-le
         && log "drift corrected: stripped --enable-leader-election from intent-server"
 fi
 
-for cdep in capi-controller-manager capi-ipam-in-cluster-controller-manager; do
+AUTH_ARGS=$($KB -n prelude get deploy authentication-server -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo "")
+if [ -n "$AUTH_ARGS" ] && printf '%s' "$AUTH_ARGS" | grep -q -- '--enable-leader-election'; then
+    $KB get deploy authentication-server -n prelude -o json 2>/dev/null | \
+        sed 's/,"--enable-leader-election[^"]*"//g; s/"--enable-leader-election[^"]*",//g' | \
+        $KB apply -f - >/dev/null 2>&1 \
+        && log "drift corrected: stripped --enable-leader-election from authentication-server"
+fi
+
+ACCT_ARGS=$($KB -n prelude get deploy account-manager-server -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo "")
+if [ -n "$ACCT_ARGS" ] && ! printf '%s' "$ACCT_ARGS" | grep -q -- '--enable-leader-election=false'; then
+    $KB get deploy account-manager-server -n prelude -o json 2>/dev/null | \
+        sed 's/"--enable-leader-election=true"/"--enable-leader-election=false"/g; s/"--enable-leader-election"/"--enable-leader-election=false"/g' | \
+        $KB apply -f - >/dev/null 2>&1 \
+        && log "drift corrected: --enable-leader-election=false set on account-manager-server"
+fi
+
+for edep in policy-engine-server policy-insights-server cluster-service-server cluster-object-service-server; do
+    EVAL=$($KB -n prelude get deploy "$edep" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENABLE_LEADER_ELECTION")].value}' 2>/dev/null || echo "")
+    if [ "$EVAL" != "false" ]; then
+        $KB set env deploy/"$edep" -n prelude ENABLE_LEADER_ELECTION=false >/dev/null 2>&1 \
+            && log "drift corrected: ENABLE_LEADER_ELECTION=false set on prelude/$edep"
+    fi
+done
+
+for cdep in capi-controller-manager capi-ipam-in-cluster-controller-manager capi-kubeadm-bootstrap-controller-manager capi-kubeadm-control-plane-controller-manager capv-controller-manager ndc-controller-manager vmsp-identity; do
     CARGS=$($KB -n vmsp-platform get deploy "$cdep" -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo "")
     if [ -n "$CARGS" ] && printf '%s' "$CARGS" | grep -q -- '--leader-elect'; then
         if ! printf '%s' "$CARGS" | grep -q -- '--leader-elect=false'; then
@@ -7574,6 +7834,35 @@ FL_READY=$($KB get pod logging-operator-fluentd-0 -n vmsp-platform -o jsonpath='
 if [ "$FL_READY" = "false" ]; then
     $KB exec -n vmsp-platform logging-operator-fluentd-0 -c fluentd -- rm -rf /buffers/backup >/dev/null 2>&1 \
         && log "drift corrected: purged stale /buffers/backup on logging-operator-fluentd-0"
+fi
+
+# 10. Stagger CronWorkflows in vmsp-platform
+WALSCHED=$($KB get cronworkflow wal-s3-cleanup -n vmsp-platform -o jsonpath='{.spec.schedules[0]}' 2>/dev/null || echo "")
+if [ -n "$WALSCHED" ] && [ "$WALSCHED" = "0 * * * *" ]; then
+    $KB patch cronworkflow wal-s3-cleanup -n vmsp-platform --type=merge -p '{"spec":{"schedules":["25 * * * *"]}}' >/dev/null 2>&1 \
+        && log "drift corrected: staggered wal-s3-cleanup schedule to 25 * * * *"
+fi
+
+ETCDSCHED=$($KB get cronworkflow scheduled-etcd-backup -n vmsp-platform -o jsonpath='{.spec.schedule}' 2>/dev/null || echo "")
+if [ -n "$ETCDSCHED" ] && [ "$ETCDSCHED" = "0 */3 * * *" ]; then
+    $KB patch cronworkflow scheduled-etcd-backup -n vmsp-platform --type=merge -p '{"spec":{"schedule":"40 */3 * * *"}}' >/dev/null 2>&1 \
+        && log "drift corrected: staggered scheduled-etcd-backup schedule to 40 */3 * * *"
+fi
+
+# 11. Kyverno validating webhook failurePolicy -> Ignore & ReleaseTemplate patch
+KYVRBG=$($KB -n vmsp-platform get releasetemplate -o name 2>/dev/null | grep -i kyverno | grep -v policies | head -1)
+if [ -n "$KYVRBG" ]; then
+    KYV_IGN=$($KB get "$KYVRBG" -n vmsp-platform -o jsonpath='{.spec.helm.values.admissionController.forceFailurePolicyIgnore}' 2>/dev/null || echo "")
+    if [ "$KYV_IGN" != "true" ]; then
+        $KB patch "$KYVRBG" -n vmsp-platform --type=merge -p '{"spec":{"helm":{"values":{"admissionController":{"forceFailurePolicyIgnore":true}}}}}' >/dev/null 2>&1 \
+            && log "drift corrected: $KYVRBG ReleaseTemplate forceFailurePolicyIgnore -> true"
+    fi
+fi
+
+KYVFP=$($KB get validatingwebhookconfigurations kyverno-resource-validating-webhook-cfg -o jsonpath='{.webhooks[0].failurePolicy}' 2>/dev/null || echo "")
+if [ "$KYVFP" = "Fail" ]; then
+    $KB patch validatingwebhookconfigurations kyverno-resource-validating-webhook-cfg --type=json -p '[{"op": "replace", "path": "/webhooks/0/failurePolicy", "value": "Ignore"}]' >/dev/null 2>&1 \
+        && log "drift corrected: kyverno validating webhook failurePolicy -> Ignore"
 fi
 
 exit 0
