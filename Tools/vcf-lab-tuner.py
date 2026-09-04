@@ -7548,13 +7548,32 @@ for ns in $($KB get backendtlspolicy -A -o jsonpath='{range .items[*]}{.metadata
     fi
 done
 
-# 8. Ensure leader-election flag stripped from single-replica intent-server
+# 8. Ensure leader-election flag stripped from single-replica intent-server, capi-controller-manager, and capi-ipam
 INTENT_ARGS=$($KB -n prelude get deploy intent-server -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo "")
 if [ -n "$INTENT_ARGS" ] && printf '%s' "$INTENT_ARGS" | grep -q -- '--enable-leader-election'; then
     $KB get deploy intent-server -n prelude -o json 2>/dev/null | \
         sed 's/,"--enable-leader-election[^"]*"//g; s/"--enable-leader-election[^"]*",//g' | \
         $KB apply -f - >/dev/null 2>&1 \
         && log "drift corrected: stripped --enable-leader-election from intent-server"
+fi
+
+for cdep in capi-controller-manager capi-ipam-in-cluster-controller-manager; do
+    CARGS=$($KB -n vmsp-platform get deploy "$cdep" -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo "")
+    if [ -n "$CARGS" ] && printf '%s' "$CARGS" | grep -q -- '--leader-elect'; then
+        if ! printf '%s' "$CARGS" | grep -q -- '--leader-elect=false'; then
+            $KB get deploy "$cdep" -n vmsp-platform -o json 2>/dev/null | \
+                sed 's/"--leader-elect=true"/"--leader-elect=false"/g; s/"--leader-elect"/"--leader-elect=false"/g' | \
+                $KB apply -f - >/dev/null 2>&1 \
+                && log "drift corrected: --leader-elect=false set on vmsp-platform/$cdep"
+        fi
+    fi
+done
+
+# 9. Clean up logging-operator-fluentd buffer volume drift if overflowed
+FL_READY=$($KB get pod logging-operator-fluentd-0 -n vmsp-platform -o jsonpath='{.status.containerStatuses[?(@.name=="fluentd")].ready}' 2>/dev/null || echo "")
+if [ "$FL_READY" = "false" ]; then
+    $KB exec -n vmsp-platform logging-operator-fluentd-0 -c fluentd -- rm -rf /buffers/backup >/dev/null 2>&1 \
+        && log "drift corrected: purged stale /buffers/backup on logging-operator-fluentd-0"
 fi
 
 exit 0
