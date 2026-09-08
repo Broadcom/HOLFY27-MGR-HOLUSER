@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.48 - 2026-08-24
+# Version 6.3.49 - 2026-09-08
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.49 Changes:
+# - Task 5: Trigger a background `vcf-lab-tuner.py --cluster vcfa --mode remediate` pass
+#   if URL verification reaches attempt 10, healing latent VCFA issues that did not
+#   resolve during the initial pre-URL remediation pass.
 #
 # v6.3.48 Changes:
 # - Task 2: Gate VSP CP machine type resize (cp.medium) behind [VCFFINAL]
@@ -4275,6 +4280,34 @@ echo "PROXY_CONFIGURED"
                             urls_failed += 1
                             lsf.labfail(f'VCF Automation URL {url} not accessible after {VCFA_URL_MAX_RETRIES} minutes - should be reached in under 8 minutes')
                         else:
+                            # At attempt 10, trigger a background remediation pass of vcf-lab-tuner
+                            # to heal any latent VCFA issues that did not resolve on the first pass
+                            if attempt == 10:
+                                _vlt_script = '/home/holuser/hol/Tools/vcf-lab-tuner.py'
+                                if os.path.isfile(_vlt_script):
+                                    try:
+                                        lsf.write_output(
+                                            '  [ATTEMPT 10 REMEDIATION] Triggering background '
+                                            'vcf-lab-tuner.py remediate on VCFA...'
+                                        )
+                                        _vcfa_bg_cmd = [
+                                            'python3', '-u', _vlt_script,
+                                            '--cluster', 'vcfa',
+                                            '--mode', 'remediate',
+                                        ]
+                                        if dry_run:
+                                            _vcfa_bg_cmd.append('--dry-run')
+                                        subprocess.Popen(
+                                            _vcfa_bg_cmd,
+                                            stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL,
+                                            start_new_session=True,
+                                        )
+                                    except Exception as _bg_err:
+                                        lsf.write_output(
+                                            f'  WARNING: Failed to launch background vcf-lab-tuner.py: {_bg_err}'
+                                        )
+
                             # Every 3 attempts re-check node scheduling — catches vmsp-operator
                             # re-cordons that slip through (e.g. very slow startup).
                             if attempt % 3 == 0:
