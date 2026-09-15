@@ -1936,6 +1936,12 @@ for the full story. Quick reference:
 
 All of the above require `--cluster vsp --section sizing --mode remediate`.
 
+Example Usage:
+
+```bash
+Tools/vcf-lab-tuner.py --cluster vsp --mode remediate --section sizing --cp-machine-type cp.medium
+```
+
 ### `vsp_cert_renewer.py` → delegates-to (via `--section certs` / `--section kubeadm`)
 
 Not reimplemented — `chk_kubeadm` calls it through `Runner.local()` when a kubeadm cert is inside
