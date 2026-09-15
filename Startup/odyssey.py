@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # odyssey.py - HOLFY27 Core Odyssey Installation Module
-# Version 3.5 - 2026-08-13
+# Version 3.6 - 2026-09-15
 # Author - Burke Azbill and HOL Core Team
 # VMware Odyssey client installation for VLP deployments
 
@@ -71,9 +71,11 @@ def download_odyssey(lsf, proxies):
     :param proxies: Proxy configuration
     :return: True if downloaded successfully
     """
+    import json
     import requests
     
     local_path = f'/tmp/{ODYSSEY_APP_LINUX}'
+    min_size_bytes = 10 * 1024 * 1024  # 10 MB
     
     max_retries = 5
     for attempt in range(max_retries):
@@ -89,8 +91,72 @@ def download_odyssey(lsf, proxies):
                 with open(local_path, 'wb') as out_file:
                     shutil.copyfileobj(response.raw, out_file)
                 
+                # Check file size (> 10M)
+                file_size = os.path.getsize(local_path)
+                if file_size <= min_size_bytes:
+                    lsf.write_output(
+                        f'Download attempt {attempt + 1}: file size ({file_size} bytes) '
+                        f'is not greater than 10M'
+                    )
+                    if os.path.isfile(local_path):
+                        os.remove(local_path)
+                    lsf.labstartup_sleep(lsf.sleep_seconds)
+                    continue
+
+                # Check if file is JSON
+                is_json = False
+                content_type = response.headers.get('Content-Type', '').lower()
+                if 'application/json' in content_type:
+                    is_json = True
+                else:
+                    try:
+                        with open(local_path, 'r', encoding='utf-8') as f:
+                            sample = f.read(4096).strip()
+                            if sample.startswith(('{', '[')):
+                                try:
+                                    json.loads(sample)
+                                    is_json = True
+                                except json.JSONDecodeError:
+                                    f.seek(0)
+                                    json.load(f)
+                                    is_json = True
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        is_json = False
+                    except Exception:
+                        pass
+                
+                if is_json:
+                    lsf.write_output(
+                        f'Download attempt {attempt + 1}: file is JSON, not a valid binary'
+                    )
+                    if os.path.isfile(local_path):
+                        os.remove(local_path)
+                    lsf.labstartup_sleep(lsf.sleep_seconds)
+                    continue
+                else:
+                    lsf.write_output(f'Confirmed: file is not JSON')
+                
+                # Confirm the file is a binary file (ELF magic \x7fELF or contains null bytes)
+                is_binary = False
+                try:
+                    with open(local_path, 'rb') as f:
+                        header = f.read(1024)
+                        if header.startswith(b'\x7fELF') or b'\x00' in header:
+                            is_binary = True
+                except Exception as e:
+                    lsf.write_output(f'Error inspecting downloaded file: {e}')
+                
+                if not is_binary:
+                    lsf.write_output(
+                        f'Download attempt {attempt + 1}: file is not a valid binary'
+                    )
+                    if os.path.isfile(local_path):
+                        os.remove(local_path)
+                    lsf.labstartup_sleep(lsf.sleep_seconds)
+                    continue
+                
                 os.chmod(local_path, 0o755)
-                lsf.write_output(f'Downloaded {ODYSSEY_APP_LINUX}')
+                lsf.write_output(f'Downloaded {ODYSSEY_APP_LINUX} ({file_size / (1024 * 1024):.1f} MB)')
                 return True
             else:
                 lsf.write_output(f'Download failed (HTTP {response.status_code})')
