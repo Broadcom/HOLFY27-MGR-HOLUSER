@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.2.0 - 2026-09-04
+Version 2.3.2 - 2026-09-16
 Author: HOL Core Team
+
+v2.3.2: Top 10 Over-Allocated Workloads Terminal Summary:
+  - Updated Compact Terminal Output: Expanded Top Over-Allocated Workloads table in chk_nodes from top 5 to top 10 rows in default non-verbose report output.
+
+v2.3.1: Compact Three-Column Node Readiness Display:
+  - Three-Column Node Readiness Output: Formats node readiness check output in chk_nodes into three side-by-side columns (Column 1: Controller node(s), Column 2: First set of 4 worker nodes, Column 3: Remaining worker node(s)) to optimize vertical screen space and keep node reports on a single terminal view.
+
+v2.3.0: Cluster Node Resource Analysis & Interactive HTML Export (--export-html):
+  - Cluster-Agnostic Workload CPU Right-Sizing Analysis: Added _analyze_workload_resources querying deployments, statefulsets, daemonsets, and live kubectl top metrics across all cluster types (SSP, VSP, VCFA, Supervisor) to calculate real-versus-requested CPU allocation, reclaimable slack, and right-sized CPU request recommendations.
+  - Compact Single-Screen Terminal Output: Updated chk_nodes to render a 1-line KPI allocation summary banner and a compact 5-row Top Over-Allocated Workloads table directly under the node capacity grid, fitting the entire section on a single terminal screen.
+  - Self-Contained Interactive HTML Export (--export-html [PATH]): Added --export-html CLI flag to generate a standalone single-file HTML dashboard featuring dark-theme UI, interactive SVG multi-series bar charts, dynamic tier/kind filter pills, real-time workload search, and sortable data tables.
 
 v2.2.0: VCFA Leader Election Hardening, CronWorkflow Staggering, Webhook Resilience, and Enhanced Keeper:
   - Single-Node VCFA Microservice Leader Election Hardening: Explicitly disables leader election on single-replica prelude microservices (authentication-server, account-manager-server, intent-server, policy-engine-server, policy-insights-server, cluster-service-server, cluster-object-service-server) and vmsp-platform controllers (ndc-controller-manager, vmsp-identity, capi/capv controllers) to eliminate cascade crashes and leadership lease timeouts during system load.
@@ -493,8 +504,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.2.0"
-DATE    = "2026-09-04"
+VERSION = "2.3.2"
+DATE    = "2026-09-16"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -1774,6 +1785,688 @@ def _parse_cpu(v):
         return 0
 
 
+def _analyze_workload_resources(r, ctx):
+    """Analyze cluster workloads (Deployment, StatefulSet, DaemonSet) CPU requests vs actual usage."""
+    nodes_data = ctx.get("nodes")
+    if not nodes_data:
+        nodes_data = r.read_json("kubectl get nodes -o json 2>/dev/null", 45) or {}
+
+    worker_nodes = []
+    all_nodes = []
+    for item in nodes_data.get("items", []) or []:
+        name = item.get("metadata", {}).get("name", "")
+        labels = item.get("metadata", {}).get("labels", {}) or {}
+        taints = [t.get("key", "") for t in (item.get("spec", {}).get("taints") or []) if t.get("key")]
+
+        is_cp = any("control-plane" in k or "master" in k for k in list(labels.keys()) + taints)
+        alloc = item.get("status", {}).get("allocatable", {}) or {}
+        cpu_alloc_m = _parse_cpu(alloc.get("cpu"))
+        mem_alloc_mib = _parse_mem_mib(alloc.get("memory"))
+
+        node_info = {"name": name, "is_cp": is_cp, "cpu_alloc_m": cpu_alloc_m, "mem_alloc_mib": mem_alloc_mib}
+        all_nodes.append(node_info)
+        if not is_cp:
+            worker_nodes.append(node_info)
+
+    if not worker_nodes:
+        worker_nodes = all_nodes
+
+    total_allocatable_cpu_m = sum(n["cpu_alloc_m"] for n in worker_nodes)
+
+    pod_usage = {}
+    rc, top_out = r.read("kubectl top pods -A 2>/dev/null", 45)
+    if rc == 0 and top_out:
+        for line in top_out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] != "NAMESPACE":
+                pod_usage[f"{parts[0]}/{parts[1]}"] = (_parse_cpu(parts[2]), _parse_mem_mib(parts[3]))
+
+    wl_json = r.read_json("kubectl get deploy,sts,ds -A -o json 2>/dev/null", 60) or {}
+    items = wl_json.get("items", [])
+    if not items:
+        d_json = r.read_json("kubectl get deploy -A -o json 2>/dev/null", 45) or {}
+        s_json = r.read_json("kubectl get sts -A -o json 2>/dev/null", 45) or {}
+        ds_json = r.read_json("kubectl get ds -A -o json 2>/dev/null", 45) or {}
+        items = (d_json.get("items", []) or []) + (s_json.get("items", []) or []) + (ds_json.get("items", []) or [])
+
+    if not items:
+        return None
+
+    workloads = []
+    for item in items:
+        kind = item.get("kind", "Deployment")
+        ns = item.get("metadata", {}).get("namespace", "default")
+        name = item.get("metadata", {}).get("name", "")
+        spec = item.get("spec", {}) or {}
+
+        replicas = spec.get("replicas", 1)
+        if replicas is None:
+            replicas = 1
+
+        tmpl_spec = (spec.get("template", {}) or {}).get("spec", {}) or {}
+        containers = tmpl_spec.get("containers", []) or []
+
+        pod_req_cpu = 0
+        pod_lim_cpu = 0
+        pod_req_mem = 0
+        pod_lim_mem = 0
+        c_details = []
+
+        for c in containers:
+            cname = c.get("name", "")
+            res = c.get("resources", {}) or {}
+            req = res.get("requests", {}) or {}
+            lim = res.get("limits", {}) or {}
+
+            c_req_cpu = _parse_cpu(req.get("cpu"))
+            c_lim_cpu = _parse_cpu(lim.get("cpu"))
+            c_req_mem = _parse_mem_mib(req.get("memory"))
+            c_lim_mem = _parse_mem_mib(lim.get("memory"))
+
+            pod_req_cpu += c_req_cpu
+            pod_lim_cpu += c_lim_cpu
+            pod_req_mem += c_req_mem
+            pod_lim_mem += c_lim_mem
+
+            c_details.append({
+                "name": cname,
+                "req_cpu": c_req_cpu,
+                "lim_cpu": c_lim_cpu,
+                "req_mem": int(c_req_mem),
+                "lim_mem": int(c_lim_mem)
+            })
+
+        matched_cpus = []
+        matched_mems = []
+        for pkey, (pcpu, pmem) in pod_usage.items():
+            pns, pname = pkey.split("/", 1)
+            if pns == ns and (pname == name or pname.startswith(f"{name}-")):
+                matched_cpus.append(pcpu)
+                matched_mems.append(pmem)
+
+        avg_act_cpu = sum(matched_cpus) / len(matched_cpus) if matched_cpus else 0
+        max_act_cpu = max(matched_cpus) if matched_cpus else 0
+
+        rec_pod_req = pod_req_cpu
+        if pod_req_cpu >= 100 and (max_act_cpu == 0 or pod_req_cpu > 2.0 * max_act_cpu):
+            if max_act_cpu <= 10:
+                rec_pod_req = 50 if pod_req_cpu < 500 else 100
+            elif max_act_cpu <= 50:
+                rec_pod_req = 100 if pod_req_cpu < 500 else 150
+            elif max_act_cpu <= 200:
+                rec_pod_req = max(200, int(max_act_cpu * 2.0))
+            else:
+                rec_pod_req = max(350, int(max_act_cpu * 1.5))
+
+            rec_pod_req = min(pod_req_cpu, rec_pod_req)
+            rec_pod_req = ((rec_pod_req + 49) // 50) * 50
+
+        tot_curr_req = pod_req_cpu * replicas
+        tot_rec_req = rec_pod_req * replicas
+        savings = tot_curr_req - tot_rec_req
+        ratio = (pod_req_cpu / max_act_cpu) if max_act_cpu > 0 else (999.0 if pod_req_cpu > 0 else 1.0)
+
+        if savings >= 3000:
+            tier = "Critical"
+        elif savings >= 1000:
+            tier = "High"
+        elif savings >= 500:
+            tier = "Moderate"
+        elif savings > 0:
+            tier = "Minor"
+        else:
+            tier = "Optimal"
+
+        workloads.append({
+            "kind": kind,
+            "namespace": ns,
+            "name": name,
+            "replicas": replicas,
+            "pod_req": pod_req_cpu,
+            "pod_lim": pod_lim_cpu,
+            "pod_mem_req": int(pod_req_mem),
+            "pod_mem_lim": int(pod_lim_mem),
+            "tot_curr_req": tot_curr_req,
+            "tot_rec_req": tot_rec_req,
+            "rec_pod_req": rec_pod_req,
+            "savings": savings,
+            "max_act_cpu": int(max_act_cpu),
+            "avg_act_cpu": int(avg_act_cpu),
+            "ratio": round(ratio, 1),
+            "tier": tier,
+            "containers": c_details
+        })
+
+    workloads.sort(key=lambda x: x["savings"], reverse=True)
+    overprovisioned = [w for w in workloads if w["savings"] > 0]
+
+    total_curr_req_m = sum(w["tot_curr_req"] for w in workloads)
+    total_act_cpu_m = sum(w["avg_act_cpu"] * w["replicas"] for w in workloads)
+    total_rec_req_m = sum(w["tot_rec_req"] for w in workloads)
+    total_savings_m = sum(w["savings"] for w in overprovisioned)
+    reclaimable_slack_m = max(0, total_curr_req_m - total_act_cpu_m)
+
+    return {
+        "cluster": r.cluster,
+        "worker_node_count": len(worker_nodes),
+        "total_allocatable_cpu_m": total_allocatable_cpu_m,
+        "total_curr_req_m": total_curr_req_m,
+        "total_act_cpu_m": total_act_cpu_m,
+        "total_rec_req_m": total_rec_req_m,
+        "total_savings_m": total_savings_m,
+        "reclaimable_slack_m": reclaimable_slack_m,
+        "workloads": workloads,
+        "overprovisioned": overprovisioned
+    }
+
+
+def _print_compact_right_sizing_table(analysis, verbose=False):
+    """Print single-screen compact terminal table of overprovisioned workloads."""
+    if not analysis or not analysis.get("workloads"):
+        return
+
+    alloc_m = analysis["total_allocatable_cpu_m"]
+    curr_req_m = analysis["total_curr_req_m"]
+    act_cpu_m = analysis["total_act_cpu_m"]
+    slack_m = analysis["reclaimable_slack_m"]
+
+    alloc_c = alloc_m / 1000.0
+    curr_c = curr_req_m / 1000.0
+    act_c = act_cpu_m / 1000.0
+    slack_c = slack_m / 1000.0
+
+    curr_pct = (curr_req_m / alloc_m * 100) if alloc_m else 0
+    act_pct = (act_cpu_m / alloc_m * 100) if alloc_m else 0
+    slack_pct = (slack_m / curr_req_m * 100) if curr_req_m else 0
+
+    emit(f"\n{_DIM}  Workload CPU Allocation & Right-Sizing Summary:{_NC}")
+    emit(f"  {_BOLD}Capacity:{_NC} {alloc_c:.1f} Cores ({alloc_m:,}m) | "
+         f"{_BOLD}Requested:{_NC} {curr_c:.1f} Cores ({curr_pct:.1f}%) | "
+         f"{_BOLD}Actual:{_NC} {act_c:.1f} Cores ({act_pct:.1f}%) | "
+         f"{_BOLD}Reclaimable Slack:{_NC} {slack_c:.1f} Cores ({slack_pct:.1f}%)")
+
+    overprovisioned = analysis.get("overprovisioned") or []
+    if not overprovisioned:
+        emit(f"  {_GREEN}All workloads are accurately sized. No overprovisioning detected.{_NC}")
+        return
+
+    headers = ["Workload (Namespace/Name)", "Kind", "Reps", "Curr Req", "Act Peak", "Rec Req", "Savings", "Ratio"]
+    widths = [38, 6, 4, 9, 9, 8, 8, 7]
+
+    sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+    hdr_line = "| " + " | ".join(f"{headers[i]:<{widths[i]}}" if i in (0,1) else f"{headers[i]:>{widths[i]}}" for i in range(len(headers))) + " |"
+
+    emit(f"\n{_DIM}  Top Over-Allocated Workloads:{_NC}")
+    emit(f"{_DIM}  {sep}{_NC}")
+    emit(f"{_DIM}  {hdr_line}{_NC}")
+    emit(f"{_DIM}  {sep}{_NC}")
+
+    rows_to_show = overprovisioned if verbose else overprovisioned[:10]
+    for w in rows_to_show:
+        wl_str = f"{w['namespace']}/{w['name']}"
+        if len(wl_str) > widths[0]:
+            wl_str = wl_str[:widths[0]-2] + ".."
+
+        kind_str = w["kind"][:widths[1]]
+        reps_str = str(w["replicas"])
+        curr_str = f"{w['pod_req']}m"
+        act_str = f"{w['max_act_cpu']}m"
+        rec_str = f"{w['rec_pod_req']}m"
+        sav_str = f"{w['savings']}m"
+        ratio_str = f"{w['ratio']:.1f}x" if w['max_act_cpu'] > 0 else "N/A"
+
+        row_line = (f"| {wl_str:<{widths[0]}} | {kind_str:<{widths[1]}} | "
+                    f"{reps_str:>{widths[2]}} | {curr_str:>{widths[3]}} | "
+                    f"{act_str:>{widths[4]}} | {rec_str:>{widths[5]}} | "
+                    f"{sav_str:>{widths[6]}} | {ratio_str:>{widths[7]}} |")
+        emit(f"{_DIM}  {row_line}{_NC}")
+
+    emit(f"{_DIM}  {sep}{_NC}")
+    if not verbose and len(overprovisioned) > 10:
+        emit(f"{_DIM}  (Showing top 10 of {len(overprovisioned)} over-allocated workloads. "
+             f"Use -v for full table, or --export-html for interactive report){_NC}")
+
+
+def _generate_html_resource_report(analysis, cluster_name, output_path):
+    """Generate self-contained interactive HTML resource report."""
+    workloads_json = json.dumps(analysis["workloads"])
+    summary_json = json.dumps({
+        "cluster": cluster_name,
+        "worker_count": analysis["worker_node_count"],
+        "total_allocatable_cpu_m": analysis["total_allocatable_cpu_m"],
+        "total_curr_req_m": analysis["total_curr_req_m"],
+        "total_act_cpu_m": analysis["total_act_cpu_m"],
+        "total_rec_req_m": analysis["total_rec_req_m"],
+        "total_savings_m": analysis["total_savings_m"],
+        "reclaimable_slack_m": analysis["reclaimable_slack_m"]
+    })
+
+    gen_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VCF Lab Tuner - {cluster_name.upper()} Resource Analysis</title>
+<style>
+  :root {{
+    --bg-main: #0d1117;
+    --bg-card: #161b22;
+    --bg-card-hover: #1c2128;
+    --border: #30363d;
+    --text-main: #c9d1d9;
+    --text-muted: #8b949e;
+    --accent-blue: #58a6ff;
+    --accent-green: #3fb950;
+    --accent-orange: #d29922;
+    --accent-red: #f85149;
+    --accent-purple: #bc8cff;
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background-color: var(--bg-main);
+    color: var(--text-main);
+    padding: 24px;
+    line-height: 1.5;
+  }}
+  .header {{
+    margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 16px;
+  }}
+  .header h1 {{
+    font-size: 24px;
+    font-weight: 600;
+    color: var(--text-main);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }}
+  .badge {{
+    background: #1f6beb33;
+    color: var(--accent-blue);
+    border: 1px solid #1f6beb66;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+  }}
+  .sub-title {{
+    color: var(--text-muted);
+    font-size: 14px;
+    margin-top: 4px;
+  }}
+  .kpi-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }}
+  .kpi-card {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }}
+  .kpi-title {{
+    font-size: 12px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+  }}
+  .kpi-value {{
+    font-size: 26px;
+    font-weight: 700;
+    margin: 8px 0 4px 0;
+  }}
+  .kpi-value.red {{ color: var(--accent-red); }}
+  .kpi-value.green {{ color: var(--accent-green); }}
+  .kpi-value.blue {{ color: var(--accent-blue); }}
+  .kpi-value.orange {{ color: var(--accent-orange); }}
+  .kpi-sub {{
+    font-size: 12px;
+    color: var(--text-muted);
+  }}
+  .section-card {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 24px;
+  }}
+  .section-title {{
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 16px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }}
+  .controls-row {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 16px;
+  }}
+  .search-input {{
+    background: var(--bg-main);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    color: var(--text-main);
+    font-size: 14px;
+    width: 260px;
+    outline: none;
+  }}
+  .search-input:focus {{
+    border-color: var(--accent-blue);
+  }}
+  .pill-group {{
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }}
+  .pill {{
+    background: var(--bg-main);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    padding: 4px 12px;
+    border-radius: 14px;
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+    transition: all 0.15s ease;
+  }}
+  .pill:hover {{
+    border-color: var(--text-muted);
+    color: var(--text-main);
+  }}
+  .pill.active {{
+    background: var(--accent-blue);
+    color: #fff;
+    border-color: var(--accent-blue);
+  }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    text-align: left;
+  }}
+  th, td {{
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+  }}
+  th {{
+    background: var(--bg-main);
+    color: var(--text-muted);
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+  }}
+  th:hover {{
+    color: var(--text-main);
+  }}
+  tbody tr:hover {{
+    background-color: var(--bg-card-hover);
+  }}
+  .tag {{
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }}
+  .tag.Critical {{ background: #f8514922; color: var(--accent-red); border: 1px solid #f8514944; }}
+  .tag.High {{ background: #d2992222; color: var(--accent-orange); border: 1px solid #d2992244; }}
+  .tag.Moderate {{ background: #e3b34122; color: #e3b341; border: 1px solid #e3b34144; }}
+  .tag.Minor {{ background: #8b949e22; color: var(--text-muted); border: 1px solid #8b949e44; }}
+  .tag.Optimal {{ background: #3fb95022; color: var(--accent-green); border: 1px solid #3fb95044; }}
+  .text-right {{ text-align: right; }}
+  .text-center {{ text-align: center; }}
+  .svg-chart {{
+    width: 100%;
+    height: 260px;
+  }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>VCF Lab Tuner <span class="badge">{cluster_name.upper()} CLUSTER</span></h1>
+  <div class="sub-title">Workload Resource Allocation & Right-Sizing Analysis &bull; Generated {gen_time}</div>
+</div>
+
+<div class="kpi-grid">
+  <div class="kpi-card">
+    <div class="kpi-title">Worker Capacity</div>
+    <div class="kpi-value blue">{analysis['total_allocatable_cpu_m']/1000.0:.1f} <span style="font-size:16px;">Cores</span></div>
+    <div class="kpi-sub">{analysis['worker_node_count']} Worker Nodes ({analysis['total_allocatable_cpu_m']:,}m)</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-title">Requested Allocation</div>
+    <div class="kpi-value red">{analysis['total_curr_req_m']/1000.0:.1f} <span style="font-size:16px;">Cores</span></div>
+    <div class="kpi-sub">{(analysis['total_curr_req_m']/analysis['total_allocatable_cpu_m']*100) if analysis['total_allocatable_cpu_m'] else 0:.1f}% of Worker Capacity</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-title">Actual CPU Usage</div>
+    <div class="kpi-value blue">{analysis['total_act_cpu_m']/1000.0:.1f} <span style="font-size:16px;">Cores</span></div>
+    <div class="kpi-sub">{(analysis['total_act_cpu_m']/analysis['total_allocatable_cpu_m']*100) if analysis['total_allocatable_cpu_m'] else 0:.1f}% Real Utilization</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-title">Reclaimable Slack</div>
+    <div class="kpi-value green">{analysis['reclaimable_slack_m']/1000.0:.1f} <span style="font-size:16px;">Cores</span></div>
+    <div class="kpi-sub">{(analysis['reclaimable_slack_m']/analysis['total_curr_req_m']*100) if analysis['total_curr_req_m'] else 0:.1f}% Unused Reservation</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-title">Target Request</div>
+    <div class="kpi-value green">{analysis['total_rec_req_m']/1000.0:.1f} <span style="font-size:16px;">Cores</span></div>
+    <div class="kpi-sub">Save {analysis['total_savings_m']/1000.0:.1f} Cores Across Workloads</div>
+  </div>
+</div>
+
+<div class="section-card">
+  <div class="section-title">
+    Top Over-Allocated Workloads (Current vs Actual vs Recommended mCPU)
+  </div>
+  <svg class="svg-chart" viewBox="0 0 900 240" id="barChart"></svg>
+</div>
+
+<div class="section-card">
+  <div class="section-title">
+    Workload Resource Audit & Right-Sizing Table
+  </div>
+  
+  <div class="controls-row">
+    <input type="text" id="searchInput" class="search-input" placeholder="Search workload or namespace..." oninput="onFilterChange()">
+    
+    <div class="pill-group">
+      <span style="font-size:12px; color:var(--text-muted); font-weight:600;">Tier:</span>
+      <div class="pill active" onclick="setTier('All', this)">All</div>
+      <div class="pill" onclick="setTier('Critical', this)">Critical</div>
+      <div class="pill" onclick="setTier('High', this)">High</div>
+      <div class="pill" onclick="setTier('Moderate', this)">Moderate</div>
+      <div class="pill" onclick="setTier('Minor', this)">Minor</div>
+    </div>
+
+    <div class="pill-group">
+      <span style="font-size:12px; color:var(--text-muted); font-weight:600;">Kind:</span>
+      <div class="pill active" onclick="setKind('All', this)">All</div>
+      <div class="pill" onclick="setKind('Deployment', this)">Deployment</div>
+      <div class="pill" onclick="setKind('StatefulSet', this)">StatefulSet</div>
+      <div class="pill" onclick="setKind('DaemonSet', this)">DaemonSet</div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th onclick="sortTable('kind')">Kind</th>
+        <th onclick="sortTable('namespace')">Namespace</th>
+        <th onclick="sortTable('name')">Workload Name</th>
+        <th onclick="sortTable('replicas')" class="text-center">Reps</th>
+        <th onclick="sortTable('pod_req')" class="text-right">Pod Req</th>
+        <th onclick="sortTable('max_act_cpu')" class="text-right">Peak Act</th>
+        <th onclick="sortTable('rec_pod_req')" class="text-right">Rec Req</th>
+        <th onclick="sortTable('savings')" class="text-right">Total Savings</th>
+        <th onclick="sortTable('ratio')" class="text-right">Ratio</th>
+        <th onclick="sortTable('tier')" class="text-center">Tier</th>
+      </tr>
+    </thead>
+    <tbody id="tableBody"></tbody>
+  </table>
+</div>
+
+<script>
+const DATA = {workloads_json};
+const SUMMARY = {summary_json};
+
+let activeTier = 'All';
+let activeKind = 'All';
+let sortCol = 'savings';
+let sortAsc = false;
+
+function renderChart() {{
+  const svg = document.getElementById('barChart');
+  const items = DATA.filter(d => d.savings > 0).slice(0, 7);
+  if (!items.length) return;
+
+  const maxVal = Math.max(...items.map(d => d.tot_curr_req));
+  const svgWidth = 900;
+  const svgHeight = 240;
+  const margin = {{ top: 20, right: 30, bottom: 40, left: 180 }};
+  const chartWidth = svgWidth - margin.left - margin.right;
+  const chartHeight = svgHeight - margin.top - margin.bottom;
+  const rowHeight = chartHeight / items.length;
+
+  let html = '';
+  items.forEach((item, idx) => {{
+    const y = margin.top + idx * rowHeight;
+    const barHeight = rowHeight * 0.22;
+    
+    const wCurr = (item.tot_curr_req / maxVal) * chartWidth;
+    const wAct = (item.avg_act_cpu * item.replicas / maxVal) * chartWidth;
+    const wRec = (item.tot_rec_req / maxVal) * chartWidth;
+
+    const labelName = item.name.length > 22 ? item.name.substring(0, 20) + '..' : item.name;
+    html += `<text x="${{margin.left - 10}}" y="${{y + rowHeight/2}}" fill="#8b949e" font-size="11" text-anchor="end" dominant-baseline="middle">${{labelName}}</text>`;
+
+    html += `<rect x="${{margin.left}}" y="${{y + 2}}" width="${{Math.max(2, wCurr)}}" height="${{barHeight}}" fill="#f85149" rx="2" />`;
+    html += `<text x="${{margin.left + wCurr + 6}}" y="${{y + 2 + barHeight/2}}" fill="#c9d1d9" font-size="10" dominant-baseline="middle">${{item.tot_curr_req}}m</text>`;
+
+    html += `<rect x="${{margin.left}}" y="${{y + 2 + barHeight + 2}}" width="${{Math.max(2, wAct)}}" height="${{barHeight}}" fill="#58a6ff" rx="2" />`;
+    html += `<rect x="${{margin.left}}" y="${{y + 2 + (barHeight + 2)*2}}" width="${{Math.max(2, wRec)}}" height="${{barHeight}}" fill="#3fb950" rx="2" />`;
+  }});
+
+  html += `
+    <g transform="translate(${{svgWidth - 260}}, 10)">
+      <rect x="0" y="0" width="10" height="10" fill="#f85149" rx="2" />
+      <text x="15" y="9" fill="#8b949e" font-size="11">Current Req</text>
+      <rect x="90" y="0" width="10" height="10" fill="#58a6ff" rx="2" />
+      <text x="105" y="9" fill="#8b949e" font-size="11">Actual Peak</text>
+      <rect x="180" y="0" width="10" height="10" fill="#3fb950" rx="2" />
+      <text x="195" y="9" fill="#8b949e" font-size="11">Rec Req</text>
+    </g>
+  `;
+
+  svg.innerHTML = html;
+}}
+
+function renderTable() {{
+  const search = document.getElementById('searchInput').value.toLowerCase();
+  
+  let filtered = DATA.filter(item => {{
+    if (activeTier !== 'All' && item.tier !== activeTier) return false;
+    if (activeKind !== 'All' && item.kind !== activeKind) return false;
+    if (search) {{
+      const matchName = item.name.toLowerCase().includes(search);
+      const matchNs = item.namespace.toLowerCase().includes(search);
+      if (!matchName && !matchNs) return false;
+    }}
+    return true;
+  }});
+
+  filtered.sort((a, b) => {{
+    let vA = a[sortCol];
+    let vB = b[sortCol];
+    if (typeof vA === 'string') {{
+      vA = vA.toLowerCase();
+      vB = vB.toLowerCase();
+    }}
+    if (vA < vB) return sortAsc ? -1 : 1;
+    if (vA > vB) return sortAsc ? 1 : -1;
+    return 0;
+  }});
+
+  const tbody = document.getElementById('tableBody');
+  if (!filtered.length) {{
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center; color:var(--text-muted); padding:24px;">No workloads match the selected criteria.</td></tr>';
+    return;
+  }}
+
+  let html = '';
+  filtered.forEach(item => {{
+    const ratioStr = item.max_act_cpu > 0 ? (item.pod_req / item.max_act_cpu).toFixed(1) + 'x' : 'N/A';
+    html += `<tr>
+      <td>${{item.kind}}</td>
+      <td style="color:var(--text-muted);">${{item.namespace}}</td>
+      <td style="font-weight:600;">${{item.name}}</td>
+      <td class="text-center">${{item.replicas}}</td>
+      <td class="text-right">${{item.pod_req}}m</td>
+      <td class="text-right" style="color:var(--accent-blue);">${{item.max_act_cpu}}m</td>
+      <td class="text-right" style="color:var(--accent-green); font-weight:600;">${{item.rec_pod_req}}m</td>
+      <td class="text-right" style="color:var(--accent-green); font-weight:700;">${{item.savings}}m</td>
+      <td class="text-right">${{ratioStr}}</td>
+      <td class="text-center"><span class="tag ${{item.tier}}">${{item.tier}}</span></td>
+    </tr>`;
+  }});
+
+  tbody.innerHTML = html;
+}}
+
+function setTier(tier, el) {{
+  activeTier = tier;
+  el.parentElement.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+  el.classList.add('active');
+  renderTable();
+}}
+
+function setKind(kind, el) {{
+  activeKind = kind;
+  el.parentElement.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+  el.classList.add('active');
+  renderTable();
+}}
+
+function sortTable(col) {{
+  if (sortCol === col) {{
+    sortAsc = !sortAsc;
+  }} else {{
+    sortCol = col;
+    sortAsc = false;
+  }}
+  renderTable();
+}}
+
+function onFilterChange() {{
+  renderTable();
+}}
+
+document.addEventListener('DOMContentLoaded', () => {{
+  renderChart();
+  renderTable();
+}});
+</script>
+</body>
+</html>"""
+
+    with open(output_path, "w") as f:
+        f.write(html_content)
+
+
 def _days_until(iso):
     try:
         dt = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -2202,18 +2895,110 @@ def chk_nodes(r, ctx):
     rc, describe = r.read("kubectl describe nodes 2>/dev/null", 90)
     if rc == 0 and describe:
         print_node_capacity_table(describe)
+
+    # Workload resource request right-sizing analysis
+    analysis = _analyze_workload_resources(r, ctx)
+    if analysis:
+        _print_compact_right_sizing_table(analysis, verbose=ctx.get("verbose", False))
+        export_html = ctx.get("export_html")
+        if export_html:
+            if export_html == "AUTO":
+                export_html = f"./vlt-{cl}-resource-report.html"
+            _generate_html_resource_report(analysis, cl, export_html)
+            emit(f"\n  {_OK} {_BOLD}Exported interactive HTML resource report to {export_html}{_NC}")
+
+    _print_3col_nodes(out, data)
     return out
 
 
 def _cp_node_names(nodes_data):
     """Set of control-plane node names, for the CP-vs-Worker pod breakdown."""
     cp = set()
-    for item in (nodes_data or {}).get("items", []):
-        labels = item.get("metadata", {}).get("labels", {})
+    for item in (nodes_data or {}).get("items", []) or []:
+        name = item.get("metadata", {}).get("name", "")
+        labels = item.get("metadata", {}).get("labels", {}) or {}
+        taints = [t.get("key", "") for t in (item.get("spec", {}).get("taints") or []) if t.get("key")]
         if ("node-role.kubernetes.io/control-plane" in labels
-                or "node-role.kubernetes.io/master" in labels):
-            cp.add(item["metadata"]["name"])
+                or "node-role.kubernetes.io/master" in labels
+                or any("control-plane" in k or "master" in k for k in taints)
+                or "controller" in name.lower()
+                or "control-plane" in name.lower()):
+            cp.add(name)
     return cp
+
+
+def _visible_len(s):
+    """Calculate visible character length stripping ANSI color escape codes."""
+    return len(re.sub(r"\033\[[0-9;]*m", "", str(s or "")))
+
+
+def _pad_cell(cell, col_width):
+    """Pad string to col_width based on visible character length."""
+    vis_len = _visible_len(cell)
+    padding = max(0, col_width - vis_len)
+    return cell + (" " * padding)
+
+
+def _format_node_res(res):
+    glyph = {"pass": _OK, "fail": _FAIL, "warn": _WARN}.get(res.state, _OK)
+    color = {"pass": _DIM, "fail": _RED, "warn": _YELLOW}.get(res.state, _DIM)
+    suffix = f"  {color}{res.detail}{_NC}" if res.detail else ""
+    return f"  {glyph} {res.label}{suffix}"
+
+
+def _print_3col_nodes(out, data):
+    """Format and print node readiness checks in three columns:
+    Col 1: Controller node(s)
+    Col 2: First set of 4 worker nodes
+    Col 3: Remaining worker node(s)
+    """
+    if not out:
+        return
+
+    cp_names = _cp_node_names(data)
+    cp_results = []
+    worker_results = []
+
+    for res in out:
+        m = re.search(r"Node\s+(\S+?):", res.label)
+        node_name = m.group(1) if m else ""
+        if node_name and node_name in cp_names:
+            cp_results.append(res)
+        else:
+            worker_results.append(res)
+
+    workers_set1 = worker_results[:4]
+    workers_set2 = worker_results[4:]
+
+    col1_formatted = [_format_node_res(r) for r in cp_results]
+    col2_formatted = [_format_node_res(r) for r in workers_set1]
+    col3_formatted = [_format_node_res(r) for r in workers_set2]
+
+    max_rows = max(len(col1_formatted), len(col2_formatted), len(col3_formatted))
+    if max_rows == 0:
+        return
+
+    col1_width = max([_visible_len(f) for f in col1_formatted] + [35]) + 2
+    col2_width = max([_visible_len(f) for f in col2_formatted] + [35]) + 2
+
+    emit()
+    for i in range(max_rows):
+        cell1 = col1_formatted[i] if i < len(col1_formatted) else ""
+        cell2 = col2_formatted[i] if i < len(col2_formatted) else ""
+        cell3 = col3_formatted[i] if i < len(col3_formatted) else ""
+
+        if cell3:
+            p1 = _pad_cell(cell1, col1_width)
+            p2 = _pad_cell(cell2, col2_width)
+            emit(f"{p1}{p2}{cell3}")
+        elif cell2:
+            p1 = _pad_cell(cell1, col1_width)
+            emit(f"{p1}{cell2}")
+        else:
+            emit(f"{cell1}")
+
+    for res in out:
+        res.printed = True
 
 
 def chk_pods(r, ctx):
@@ -8136,7 +8921,8 @@ def run_cluster(name, args, password):
                    "fix_sds_sni": args.fix_sds_sni,
                    "cpu_tune": args.cpu_tune,
                    "rollback_cpu_tune": args.rollback_cpu_tune,
-                   "recover_gateway_503": args.recover_gateway_503}
+                   "recover_gateway_503": args.recover_gateway_503,
+                   "export_html": getattr(args, "export_html", None)}
             if want is None or want in SECTIONS_NEEDING_NODES:
                 emit(f"{_DIM}  fetching cluster state ...{_NC}")
                 ctx["nodes"] = runner.read_json("kubectl get nodes -o json 2>/dev/null", 45)
@@ -8156,7 +8942,8 @@ def run_cluster(name, args, password):
                     rows = [fail(key, f"{title}: handler contract",
                                  "handler did not return list[CheckResult]", cluster=name)]
                 for res in rows:
-                    row(res)
+                    if not getattr(res, "printed", False):
+                        row(res)
                     render_legacy(res)
                 results.extend(rows)
                 emit(f"  {_DIM}({time.time() - started:.1f}s){_NC}")
@@ -8206,7 +8993,8 @@ def run_cluster(name, args, password):
            "fix_sds_sni": args.fix_sds_sni,
            "cpu_tune": args.cpu_tune,
            "rollback_cpu_tune": args.rollback_cpu_tune,
-           "recover_gateway_503": args.recover_gateway_503}
+           "recover_gateway_503": args.recover_gateway_503,
+           "export_html": getattr(args, "export_html", None)}
     if want is None or want in SECTIONS_NEEDING_NODES:
         emit(f"{_DIM}  fetching cluster state ...{_NC}")
         ctx["nodes"] = runner.read_json("kubectl get nodes -o json 2>/dev/null", 45)
@@ -8226,7 +9014,8 @@ def run_cluster(name, args, password):
             rows = [fail(key, f"{title}: handler contract",
                          "handler did not return list[CheckResult]", cluster=name)]
         for res in rows:
-            row(res)
+            if not getattr(res, "printed", False):
+                row(res)
             render_legacy(res)
         results.extend(rows)
         emit(f"  {_DIM}({time.time() - started:.1f}s){_NC}")
@@ -8409,6 +9198,8 @@ def main():
     p.add_argument("--recover-gateway-503", action="store_true")
     # --install-keeper / --remove-keeper extra.
     p.add_argument("--purge-legacy-keepers", action="store_true")
+    p.add_argument("--export-html", nargs="?", const="AUTO", default=None, metavar="PATH",
+                   help="Export interactive HTML resource analysis dashboard to PATH (default: ./vlt-<cluster>-resource-report.html)")
     p.add_argument("--site", default=None, metavar="SITE", choices=("a", "b"),
                    help="Target site (a or b) for dynamic resolution")
     p.add_argument("--target-domain", default=None, metavar="DOMAIN",
@@ -8556,7 +9347,7 @@ def main():
 
     if not args.json:
         color = _GREEN if failed == 0 else _RED
-        emit(f"\n{_CYAN}{'─' * 64}{_NC}")
+        emit(f"{_CYAN}{'─' * 64}{_NC}")
         action_note = f", actions: {acted}" if acted else ""
         emit(f"  {color}{_BOLD}RESULT: {total - failed}/{total} checks passed{_NC}"
              f"  {_DIM}(warn: {warned}{action_note}, total: {elapsed:.1f}s){_NC}")
@@ -8564,7 +9355,7 @@ def main():
             emit(f"  {_RED}  {failed} check(s) require attention — see {_FAIL} rows above{_NC}")
         elif total:
             emit(f"  {_GREEN}  No failing checks{_NC}")
-        emit(f"{_CYAN}{'─' * 64}{_NC}\n")
+        emit(f"{_CYAN}{'─' * 64}{_NC}")
     else:
         # Exclusive, labelled JSON on stdout - not appended after human output
         # with positional keys, which is what makes vsp-health.py:1569

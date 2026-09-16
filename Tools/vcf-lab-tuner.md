@@ -1,8 +1,8 @@
 # vcf-lab-tuner.py — Design & Reference
 
-**Version 3.2 — 2026-09-04**
+**Version 3.5 — 2026-09-16**
 **Author:** Burke Azbill and HOL Core Team
-**Status:** `vcf-lab-tuner.py` **v2.2.0**. All clusters supported (VSP, VCFA, SSP, Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh` **and** `vcfa-stabilizer.sh`, enabling legacy scripts to be safely retired. **Full native certificate renewal engine (v2.0.0)**, dynamic component discovery & SSP cluster parity (v2.1.0), and **VCFA single-node leader election hardening, Argo CronWorkflow staggering, Kyverno webhook resilience, and enhanced drift keeper (v2.2.0)**. Remediation implemented for every section, keeper management working, deprecation banners applied, and offline unit test suite passing. Validated live on DevPod.
+**Status:** `vcf-lab-tuner.py` **v2.3.2**. All clusters supported (VSP, VCFA, SSP, Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh` **and** `vcfa-stabilizer.sh`, enabling legacy scripts to be safely retired. **Full native certificate renewal engine (v2.0.0)**, dynamic component discovery & SSP cluster parity (v2.1.0), **VCFA single-node leader election hardening, Argo CronWorkflow staggering, Kyverno webhook resilience, and enhanced drift keeper (v2.2.0)**, **cluster-agnostic workload CPU request right-sizing analysis with single-screen terminal output and interactive HTML dashboard export (v2.3.0)**, **compact three-column node readiness terminal formatting (v2.3.1)**, and **expanded top 10 over-allocated workloads terminal summary (v2.3.2)**. Remediation implemented for every section, keeper management working, deprecation banners applied, and offline unit test suite passing. Validated live on DevPod.
 
 ---
 
@@ -274,6 +274,7 @@ typos in scripted use.
 | `--revert`                                                | off                                                                    | `cp` only (v1.3.0). Restores the newest `.bak.<epoch>` this tool wrote for KCM/scheduler/etcd/kube-vip manifests                                                                                                    |
 | `--kubelet-reload`                                        | off                                                                    | `cp` only (v1.3.0). OPT-IN, **DISRUPTIVE**: restarts kubelet if a manifest edit ran this pass — only for the rare case where its own file watcher is stuck. 5-second abort window unless `--dry-run`                |
 | `--purge-legacy-keepers`                                  | off                                                                    | With `--remove-keeper` (v1.3.0). Also stops/deletes every unit named in that cluster's `legacy_keeper_units` — previously that list was used only to detect-and-refuse installing over them, never to clean them up |
+| `--export-html [PATH]`                                    | off                                                                    | Export interactive HTML resource analysis dashboard to PATH (default: `./vlt-<cluster>-resource-report.html`)                                                                                                    |
 | `--no-color`                                              | auto-off when not a TTY                                                | Also honours `NO_COLOR`                                                                                                                                                                                             |
 | `-v, --verbose`                                           | off                                                                    | Raw command output, per-item detail, per-pod role/node                                                                                                                                                              |
 | `-j, --json`                                              | off                                                                    | Machine-readable document on stdout, human output suppressed                                                                                                                                                        |
@@ -733,7 +734,7 @@ python3 Tools/test-vcf-lab-tuner.py
 | Section       | Cluster(s)            | P   | T   | R   | Notes                                                                                                                                                               |
 | ------------- | --------------------- | --- | --- | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `cp`          | vsp, vcfa             | ✓   | ✓   | ✓   | VIP presence/pinning, `vip_preserve`, static pods via `crictl`, shadow-manifest sweep first                                                                         |
-| `nodes`       | vsp, vcfa, supervisor | ✓   |     | ✓   | Ready, `SchedulingDisabled`, uncordon (never an autoscaler-tainted node), capacity table                                                                            |
+| `nodes`       | vsp, vcfa, supervisor, ssp | ✓   |     | ✓   | Ready, `SchedulingDisabled`, uncordon (never an autoscaler-tainted node), capacity table & workload CPU right-sizing summary (with `--export-html`)                                                 |
 | `pods`        | vsp, vcfa, supervisor | ✓   |     | ✓   | One row per namespace; sweep is damped by default, `--aggressive` to bypass (F8)                                                                                    |
 | `vcf`         | vsp                   | ✓   |     | ✓   | VCF managed components' operational-status + workload replicas, record-then-restore (F9)                                                                            |
 | `postgres`    | vsp, vcfa             | ✓   |     | ✓   | pgdata perms across **every** spilo namespace                                                                                                                       |
@@ -1328,6 +1329,48 @@ cross-script locking.
 
 
 ## 15. Changelog
+
+**3.5 — 2026-09-16** — `vcf-lab-tuner.md` v3.5 / `vcf-lab-tuner.py` **v2.3.2**.
+
+### Top 10 Over-Allocated Workloads Terminal Summary
+
+Updated `_print_compact_right_sizing_table` in `chk_nodes` across all cluster types (`ssp`, `vsp`, `vcfa`, `supervisor`).
+
+#### Newly Added Capabilities & Technical Details (WHAT & WHY)
+- **Top 10 Over-Allocated Workloads Display**:
+  - *WHAT*: Expanded the default non-verbose terminal output table from 5 rows to 10 rows when rendering top over-allocated workloads.
+  - *WHY*: Provides deeper visibility into top resource-intensive workloads directly in terminal reports without requiring `-v` verbose mode.
+
+**3.4 — 2026-09-16** — `vcf-lab-tuner.md` v3.4 / `vcf-lab-tuner.py` **v2.3.1**.
+
+### Compact Three-Column Node Readiness Output
+
+Updated the node readiness check formatting (`chk_nodes`) across all cluster types (`ssp`, `vsp`, `vcfa`, `supervisor`).
+
+#### Newly Added Capabilities & Technical Details (WHAT & WHY)
+- **Three-Column Node Readiness Terminal Display (`_print_3col_nodes`)**:
+  - *WHAT*: Formats ready node check status lines into three side-by-side columns:
+    - **Column 1**: Controller node(s)
+    - **Column 2**: First set of 4 worker nodes
+    - **Column 3**: Any remaining worker node(s)
+  - *WHY*: In clusters with large node counts (e.g. SSP with 11 nodes), rendering nodes sequentially consumed 11+ vertical lines, forcing terminal scrollback. The 3-column layout reduces vertical height to 4 lines, ensuring the entire `nodes` report section fits cleanly on a single terminal view.
+
+**3.3 — 2026-09-16** — `vcf-lab-tuner.md` v3.3 / `vcf-lab-tuner.py` **v2.3.0**.
+
+### Cluster Node Resource Analysis & Interactive HTML Dashboard Export
+
+Introduced cluster-wide workload CPU request right-sizing analysis to the `nodes` section across all supported cluster types (`ssp`, `vsp`, `vcfa`, `supervisor`). Output is provided as both a single-screen compact terminal summary and a self-contained, interactive HTML dashboard.
+
+#### Newly Added Capabilities & Technical Details (WHAT & WHY)
+- **Cluster-Agnostic Workload CPU Right-Sizing Engine (`_analyze_workload_resources`)**:
+  - *WHAT*: Automatically queries `kubectl get deploy,sts,ds -A -o json` and `kubectl top pods -A` across any cluster to calculate per-workload CPU requests, limits, replicas, and live pod utilization. Computes lab-optimized right-sized CPU request recommendations using a multi-tiered sizing algorithm (handling ultra-low, light, moderate, and heavy consumer profiles).
+  - *WHY*: Default enterprise production templates reserve excessive static CPU capacity (e.g. 6.0 cores for a single Druid node), forcing Kubernetes schedulers to scale out nodes for static reservation rather than actual utilization.
+- **Single-Screen Compact Console Output (`_print_compact_right_sizing_table`)**:
+  - *WHAT*: Formats a 1-line KPI allocation summary banner and a compact 5-row Top Over-Allocated Workloads table directly under the `kubectl describe nodes` capacity grid, ensuring the entire `nodes` section output fits on a single terminal screen without scrolling.
+  - *WHY*: Provides high-signal, immediate visibility into over-allocated cluster CPU requests without requiring terminal scrollback.
+- **Self-Contained Interactive HTML Dashboard Export (`--export-html [PATH]`)**:
+  - *WHAT*: Generates a 100% self-contained single-file HTML report featuring dark-theme styling, interactive SVG bar charts, real-time search, tier/kind filter pills, and column sorting.
+  - *WHY*: Enables lab administrators to inspect, search, and share detailed workload right-sizing metrics in a rich browser interface without external dependencies.
 
 **3.2 — 2026-09-04** — `vcf-lab-tuner.md` v3.2 / `vcf-lab-tuner.py` **v2.2.0**.
 
