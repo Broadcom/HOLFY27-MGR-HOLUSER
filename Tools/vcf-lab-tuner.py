@@ -817,12 +817,13 @@ def get_cluster_configs(args):
             "gateway_services": [
                 ("projectcontour", "projectcontour-envoy", f"{subnet_0}.11"),
                 ("nsxi-platform", "kafka-external", f"{subnet_0}.12"),
-                ("nsxi-platform", "kafka-controller-2-external", f"{subnet_0}.13"),
-                ("nsxi-platform", "kafka-controller-1-external", f"{subnet_0}.14"),
-                ("nsxi-platform", "kafka-controller-0-external", f"{subnet_0}.15"),
+                ("nsxi-platform", "kafka-controller-0-external", (f"{subnet_0}.13", f"{subnet_0}.14", f"{subnet_0}.15")),
+                ("nsxi-platform", "kafka-controller-1-external", (f"{subnet_0}.13", f"{subnet_0}.14", f"{subnet_0}.15")),
+                ("nsxi-platform", "kafka-controller-2-external", (f"{subnet_0}.13", f"{subnet_0}.14", f"{subnet_0}.15")),
             ],
             "pg_namespaces": (),
-            "etcd_cpu_request": "2500m",
+            "etcd_cpu_request": None,
+            "check_cp_leader_elect": False,
             "sections": ["cp", "nodes", "pods", "gateway", "deployments", "certs", "endpoint", "proxy",
                          "kubeadm", "postgres", "password", "sizing", "footprint"],
         },
@@ -1180,8 +1181,14 @@ def _wrap_ssp_cmd(cmd):
     if "ssp-kubeconfig" in cmd or "--kubeconfig" in cmd or cmd.startswith("ssh ") or cmd.startswith("govc ") or cmd.startswith("python3 "):
         return cmd
 
-    capi_kinds = ("cluster", "machinedeployment", "kubeadmcontrolplane", "vspheremachinetemplate", "packagedeployment", "machine")
-    is_capi = any(k in cmd.lower() for k in capi_kinds) or "-n ssp" in cmd or "namespace ssp" in cmd
+    is_capi = False
+    if "-n ssp" in cmd or "namespace ssp" in cmd or "namespace=ssp" in cmd:
+        is_capi = True
+    elif re.search(r'(?:-n\s+|--namespace[=\s]+)(?!ssp\b)[a-zA-Z0-9_\-]+', cmd):
+        is_capi = False
+    else:
+        capi_patterns = r'\b(clusterclasses?|clusters?|machinedeployments?|kubeadmcontrolplanes?|vspheremachinetemplates?|packagedeployments?|machinesets?|vsphereclusters?|vspheremachines?)\b'
+        is_capi = bool(re.search(capi_patterns, cmd, re.IGNORECASE))
 
     if is_capi:
         return cmd
@@ -1764,6 +1771,17 @@ def _parse_mem_mib(v):
         return 0
 
 
+def _format_mem_disp(mib):
+    """Format MiB quantity nicely into MiB or GiB string for tables."""
+    if mib is None:
+        return "N/A"
+    if mib >= 1024 and mib % 1024 == 0:
+        return f"{int(mib // 1024)} GiB"
+    elif mib >= 1024:
+        return f"{mib / 1024.0:.1f} GiB"
+    return f"{int(mib)} MiB"
+
+
 def _parse_cpu(v):
     """Kubernetes CPU quantity -> MILLICORES (int), matching vsp-health.py:443.
 
@@ -1786,7 +1804,7 @@ def _parse_cpu(v):
 
 
 def _analyze_workload_resources(r, ctx):
-    """Analyze cluster workloads (Deployment, StatefulSet, DaemonSet) CPU requests vs actual usage."""
+    """Analyze cluster workloads (Deployment, StatefulSet, DaemonSet) CPU & Memory requests vs actual usage."""
     nodes_data = ctx.get("nodes")
     if not nodes_data:
         nodes_data = r.read_json("kubectl get nodes -o json 2>/dev/null", 45) or {}
@@ -1812,6 +1830,7 @@ def _analyze_workload_resources(r, ctx):
         worker_nodes = all_nodes
 
     total_allocatable_cpu_m = sum(n["cpu_alloc_m"] for n in worker_nodes)
+    total_allocatable_mem_mib = sum(n["mem_alloc_mib"] for n in worker_nodes)
 
     pod_usage = {}
     rc, top_out = r.read("kubectl top pods -A 2>/dev/null", 45)
@@ -1886,25 +1905,80 @@ def _analyze_workload_resources(r, ctx):
 
         avg_act_cpu = sum(matched_cpus) / len(matched_cpus) if matched_cpus else 0
         max_act_cpu = max(matched_cpus) if matched_cpus else 0
+        avg_act_mem = sum(matched_mems) / len(matched_mems) if matched_mems else 0
+        max_act_mem = max(matched_mems) if matched_mems else 0
 
+        # CPU right-sizing recommendation
         rec_pod_req = pod_req_cpu
-        if pod_req_cpu >= 100 and (max_act_cpu == 0 or pod_req_cpu > 2.0 * max_act_cpu):
-            if max_act_cpu <= 10:
-                rec_pod_req = 50 if pod_req_cpu < 500 else 100
-            elif max_act_cpu <= 50:
-                rec_pod_req = 100 if pod_req_cpu < 500 else 150
-            elif max_act_cpu <= 200:
-                rec_pod_req = max(200, int(max_act_cpu * 2.0))
+        if pod_req_cpu > 25 and (max_act_cpu == 0 or pod_req_cpu > 1.3 * max_act_cpu):
+            num_c = len(containers) or 1
+            if max_act_cpu == 0 or max_act_cpu <= 15:
+                rec_pod_req = 50 if num_c == 1 else max(25 * num_c, 50)
+            elif max_act_cpu <= 40:
+                rec_pod_req = 50 if num_c == 1 else max(25 * num_c, 50)
+            elif max_act_cpu <= 80:
+                rec_pod_req = max(75, int(max_act_cpu * 1.35))
+            elif max_act_cpu <= 150:
+                rec_pod_req = max(100, int(max_act_cpu * 1.3))
+            elif max_act_cpu <= 300:
+                rec_pod_req = max(150, int(max_act_cpu * 1.25))
             else:
-                rec_pod_req = max(350, int(max_act_cpu * 1.5))
+                rec_pod_req = max(250, int(max_act_cpu * 1.2))
 
             rec_pod_req = min(pod_req_cpu, rec_pod_req)
-            rec_pod_req = ((rec_pod_req + 49) // 50) * 50
+            if rec_pod_req <= 100:
+                rec_pod_req = ((rec_pod_req + 24) // 25) * 25
+            else:
+                rec_pod_req = ((rec_pod_req + 49) // 50) * 50
+
+        # Memory right-sizing recommendation
+        rec_pod_mem = pod_req_mem
+        if pod_req_mem > 32:
+            num_c = len(containers) or 1
+            if max_act_mem == 0:
+                if pod_req_mem <= 64:
+                    rec_pod_mem = pod_req_mem
+                elif pod_req_mem <= 128:
+                    rec_pod_mem = 64
+                elif pod_req_mem <= 256:
+                    rec_pod_mem = 128
+                elif pod_req_mem <= 1024:
+                    rec_pod_mem = 256
+                elif pod_req_mem <= 2048:
+                    rec_pod_mem = 512
+                else:
+                    rec_pod_mem = 1024
+            elif pod_req_mem > 1.2 * max_act_mem:
+                if max_act_mem <= 32:
+                    rec_pod_mem = max(32 * num_c, int(max_act_mem * 1.4))
+                elif max_act_mem <= 128:
+                    rec_pod_mem = max(64 * num_c, int(max_act_mem * 1.35))
+                elif max_act_mem <= 512:
+                    rec_pod_mem = max(128 * num_c, int(max_act_mem * 1.3))
+                elif max_act_mem <= 2048:
+                    rec_pod_mem = max(256 * num_c, int(max_act_mem * 1.25))
+                else:
+                    rec_pod_mem = max(1024, int(max_act_mem * 1.15))
+            else:
+                rec_pod_mem = pod_req_mem
+
+            rec_pod_mem = min(pod_req_mem, rec_pod_mem)
+            if rec_pod_mem < 256:
+                rec_pod_mem = ((int(rec_pod_mem) + 15) // 16) * 16
+            elif rec_pod_mem < 1024:
+                rec_pod_mem = ((int(rec_pod_mem) + 63) // 64) * 64
+            else:
+                rec_pod_mem = ((int(rec_pod_mem) + 127) // 128) * 128
 
         tot_curr_req = pod_req_cpu * replicas
         tot_rec_req = rec_pod_req * replicas
         savings = tot_curr_req - tot_rec_req
         ratio = (pod_req_cpu / max_act_cpu) if max_act_cpu > 0 else (999.0 if pod_req_cpu > 0 else 1.0)
+
+        tot_curr_mem_req = pod_req_mem * replicas
+        tot_rec_mem_req = rec_pod_mem * replicas
+        mem_savings = tot_curr_mem_req - tot_rec_mem_req
+        mem_ratio = (pod_req_mem / max_act_mem) if max_act_mem > 0 else (999.0 if pod_req_mem > 0 else 1.0)
 
         if savings >= 3000:
             tier = "Critical"
@@ -1934,17 +2008,30 @@ def _analyze_workload_resources(r, ctx):
             "avg_act_cpu": int(avg_act_cpu),
             "ratio": round(ratio, 1),
             "tier": tier,
+            "tot_curr_mem_req": tot_curr_mem_req,
+            "tot_rec_mem_req": tot_rec_mem_req,
+            "rec_pod_mem": rec_pod_mem,
+            "mem_savings": mem_savings,
+            "max_act_mem": int(max_act_mem),
+            "avg_act_mem": int(avg_act_mem),
+            "mem_ratio": round(mem_ratio, 1),
             "containers": c_details
         })
 
-    workloads.sort(key=lambda x: x["savings"], reverse=True)
-    overprovisioned = [w for w in workloads if w["savings"] > 0]
+    overprovisioned_cpu = sorted([w for w in workloads if w["savings"] > 0], key=lambda x: x["savings"], reverse=True)
+    overprovisioned_mem = sorted([w for w in workloads if w["mem_savings"] > 0], key=lambda x: x["mem_savings"], reverse=True)
 
     total_curr_req_m = sum(w["tot_curr_req"] for w in workloads)
     total_act_cpu_m = sum(w["avg_act_cpu"] * w["replicas"] for w in workloads)
     total_rec_req_m = sum(w["tot_rec_req"] for w in workloads)
-    total_savings_m = sum(w["savings"] for w in overprovisioned)
+    total_savings_m = sum(w["savings"] for w in overprovisioned_cpu)
     reclaimable_slack_m = max(0, total_curr_req_m - total_act_cpu_m)
+
+    total_curr_mem_req_mib = sum(w["tot_curr_mem_req"] for w in workloads)
+    total_act_mem_mib = sum(w["avg_act_mem"] * w["replicas"] for w in workloads)
+    total_rec_mem_req_mib = sum(w["tot_rec_mem_req"] for w in workloads)
+    total_mem_savings_mib = sum(w["mem_savings"] for w in overprovisioned_mem)
+    reclaimable_mem_slack_mib = max(0, total_curr_mem_req_mib - total_act_mem_mib)
 
     return {
         "cluster": r.cluster,
@@ -1955,16 +2042,25 @@ def _analyze_workload_resources(r, ctx):
         "total_rec_req_m": total_rec_req_m,
         "total_savings_m": total_savings_m,
         "reclaimable_slack_m": reclaimable_slack_m,
+        "total_allocatable_mem_mib": total_allocatable_mem_mib,
+        "total_curr_mem_req_mib": total_curr_mem_req_mib,
+        "total_act_mem_mib": total_act_mem_mib,
+        "total_rec_mem_req_mib": total_rec_mem_req_mib,
+        "total_mem_savings_mib": total_mem_savings_mib,
+        "reclaimable_mem_slack_mib": reclaimable_mem_slack_mib,
         "workloads": workloads,
-        "overprovisioned": overprovisioned
+        "overprovisioned": overprovisioned_cpu,
+        "overprovisioned_cpu": overprovisioned_cpu,
+        "overprovisioned_mem": overprovisioned_mem
     }
 
 
 def _print_compact_right_sizing_table(analysis, verbose=False):
-    """Print single-screen compact terminal table of overprovisioned workloads."""
+    """Print compact terminal tables of overprovisioned CPU & Memory workloads."""
     if not analysis or not analysis.get("workloads"):
         return
 
+    # 1. CPU Allocation & Right-Sizing
     alloc_m = analysis["total_allocatable_cpu_m"]
     curr_req_m = analysis["total_curr_req_m"]
     act_cpu_m = analysis["total_act_cpu_m"]
@@ -1985,46 +2081,110 @@ def _print_compact_right_sizing_table(analysis, verbose=False):
          f"{_BOLD}Actual:{_NC} {act_c:.1f} Cores ({act_pct:.1f}%) | "
          f"{_BOLD}Reclaimable Slack:{_NC} {slack_c:.1f} Cores ({slack_pct:.1f}%)")
 
-    overprovisioned = analysis.get("overprovisioned") or []
-    if not overprovisioned:
-        emit(f"  {_GREEN}All workloads are accurately sized. No overprovisioning detected.{_NC}")
-        return
+    over_cpu = analysis.get("overprovisioned_cpu") or analysis.get("overprovisioned") or []
+    if not over_cpu:
+        emit(f"  {_GREEN}All workloads have accurately sized CPU requests. No CPU overprovisioning detected.{_NC}")
+    else:
+        headers_cpu = ["Workload (Namespace/Name)", "Kind", "Reps", "Curr Req", "Act Peak", "Rec Req", "Savings", "Ratio"]
+        widths_cpu = [38, 6, 4, 9, 9, 8, 8, 7]
 
-    headers = ["Workload (Namespace/Name)", "Kind", "Reps", "Curr Req", "Act Peak", "Rec Req", "Savings", "Ratio"]
-    widths = [38, 6, 4, 9, 9, 8, 8, 7]
+        sep_cpu = "+" + "+".join("-" * (w + 2) for w in widths_cpu) + "+"
+        hdr_line_cpu = "| " + " | ".join(f"{headers_cpu[i]:<{widths_cpu[i]}}" if i in (0,1) else f"{headers_cpu[i]:>{widths_cpu[i]}}" for i in range(len(headers_cpu))) + " |"
 
-    sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
-    hdr_line = "| " + " | ".join(f"{headers[i]:<{widths[i]}}" if i in (0,1) else f"{headers[i]:>{widths[i]}}" for i in range(len(headers))) + " |"
+        emit(f"\n{_DIM}  Top Over-Allocated Workloads (CPU Requests):{_NC}")
+        emit(f"{_DIM}  {sep_cpu}{_NC}")
+        emit(f"{_DIM}  {hdr_line_cpu}{_NC}")
+        emit(f"{_DIM}  {sep_cpu}{_NC}")
 
-    emit(f"\n{_DIM}  Top Over-Allocated Workloads:{_NC}")
-    emit(f"{_DIM}  {sep}{_NC}")
-    emit(f"{_DIM}  {hdr_line}{_NC}")
-    emit(f"{_DIM}  {sep}{_NC}")
+        rows_cpu = over_cpu if verbose else over_cpu[:10]
+        for w in rows_cpu:
+            wl_ns = w["namespace"]
+            wl_name = w["name"]
+            wl_str = f"{wl_ns}/{wl_name}"
+            if len(wl_str) > widths_cpu[0]:
+                wl_str = wl_str[:widths_cpu[0]-2] + ".."
 
-    rows_to_show = overprovisioned if verbose else overprovisioned[:10]
-    for w in rows_to_show:
-        wl_str = f"{w['namespace']}/{w['name']}"
-        if len(wl_str) > widths[0]:
-            wl_str = wl_str[:widths[0]-2] + ".."
+            kind_str = w["kind"][:widths_cpu[1]]
+            reps_str = str(w["replicas"])
+            curr_str = f"{w['pod_req']}m"
+            act_str = f"{w['max_act_cpu']}m"
+            rec_str = f"{w['rec_pod_req']}m"
+            sav_str = f"{w['savings']}m"
+            ratio_str = f"{w['ratio']:.1f}x" if w['max_act_cpu'] > 0 else "N/A"
 
-        kind_str = w["kind"][:widths[1]]
-        reps_str = str(w["replicas"])
-        curr_str = f"{w['pod_req']}m"
-        act_str = f"{w['max_act_cpu']}m"
-        rec_str = f"{w['rec_pod_req']}m"
-        sav_str = f"{w['savings']}m"
-        ratio_str = f"{w['ratio']:.1f}x" if w['max_act_cpu'] > 0 else "N/A"
+            row_line = (f"| {wl_str:<{widths_cpu[0]}} | {kind_str:<{widths_cpu[1]}} | "
+                        f"{reps_str:>{widths_cpu[2]}} | {curr_str:>{widths_cpu[3]}} | "
+                        f"{act_str:>{widths_cpu[4]}} | {rec_str:>{widths_cpu[5]}} | "
+                        f"{sav_str:>{widths_cpu[6]}} | {ratio_str:>{widths_cpu[7]}} |")
+            emit(f"{_DIM}  {row_line}{_NC}")
 
-        row_line = (f"| {wl_str:<{widths[0]}} | {kind_str:<{widths[1]}} | "
-                    f"{reps_str:>{widths[2]}} | {curr_str:>{widths[3]}} | "
-                    f"{act_str:>{widths[4]}} | {rec_str:>{widths[5]}} | "
-                    f"{sav_str:>{widths[6]}} | {ratio_str:>{widths[7]}} |")
-        emit(f"{_DIM}  {row_line}{_NC}")
+        emit(f"{_DIM}  {sep_cpu}{_NC}")
+        if not verbose and len(over_cpu) > 10:
+            emit(f"{_DIM}  (Showing top 10 of {len(over_cpu)} CPU over-allocated workloads. "
+                 f"Use -v for full table, or --export-html for interactive report){_NC}")
 
-    emit(f"{_DIM}  {sep}{_NC}")
-    if not verbose and len(overprovisioned) > 10:
-        emit(f"{_DIM}  (Showing top 10 of {len(overprovisioned)} over-allocated workloads. "
-             f"Use -v for full table, or --export-html for interactive report){_NC}")
+    # 2. Memory Allocation & Right-Sizing
+    alloc_mem_mib = analysis.get("total_allocatable_mem_mib", 0)
+    curr_req_mem_mib = analysis.get("total_curr_mem_req_mib", 0)
+    act_mem_mib = analysis.get("total_act_mem_mib", 0)
+    slack_mem_mib = analysis.get("reclaimable_mem_slack_mib", 0)
+
+    alloc_mem_gib = alloc_mem_mib / 1024.0
+    curr_mem_gib = curr_req_mem_mib / 1024.0
+    act_mem_gib = act_mem_mib / 1024.0
+    slack_mem_gib = slack_mem_mib / 1024.0
+
+    curr_mem_pct = (curr_req_mem_mib / alloc_mem_mib * 100) if alloc_mem_mib else 0
+    act_mem_pct = (act_mem_mib / alloc_mem_mib * 100) if alloc_mem_mib else 0
+    slack_mem_pct = (slack_mem_mib / curr_req_mem_mib * 100) if curr_req_mem_mib else 0
+
+    emit(f"\n{_DIM}  Workload Memory Allocation & Right-Sizing Summary:{_NC}")
+    emit(f"  {_BOLD}Capacity:{_NC} {alloc_mem_gib:.1f} GiB ({int(alloc_mem_mib):,} MiB) | "
+         f"{_BOLD}Requested:{_NC} {curr_mem_gib:.1f} GiB ({curr_mem_pct:.1f}%) | "
+         f"{_BOLD}Actual:{_NC} {act_mem_gib:.1f} GiB ({act_mem_pct:.1f}%) | "
+         f"{_BOLD}Reclaimable Slack:{_NC} {slack_mem_gib:.1f} GiB ({slack_mem_pct:.1f}%)")
+
+    over_mem = analysis.get("overprovisioned_mem") or []
+    if not over_mem:
+        emit(f"  {_GREEN}All workloads have accurately sized Memory requests. No Memory overprovisioning detected.{_NC}")
+    else:
+        headers_mem = ["Workload (Namespace/Name)", "Kind", "Reps", "Curr Req", "Act Peak", "Rec Req", "Savings", "Ratio"]
+        widths_mem = [38, 6, 4, 10, 10, 10, 10, 7]
+
+        sep_mem = "+" + "+".join("-" * (w + 2) for w in widths_mem) + "+"
+        hdr_line_mem = "| " + " | ".join(f"{headers_mem[i]:<{widths_mem[i]}}" if i in (0,1) else f"{headers_mem[i]:>{widths_mem[i]}}" for i in range(len(headers_mem))) + " |"
+
+        emit(f"\n{_DIM}  Top Over-Allocated Workloads (Memory Requests):{_NC}")
+        emit(f"{_DIM}  {sep_mem}{_NC}")
+        emit(f"{_DIM}  {hdr_line_mem}{_NC}")
+        emit(f"{_DIM}  {sep_mem}{_NC}")
+
+        rows_mem = over_mem if verbose else over_mem[:10]
+        for w in rows_mem:
+            wl_ns = w["namespace"]
+            wl_name = w["name"]
+            wl_str = f"{wl_ns}/{wl_name}"
+            if len(wl_str) > widths_mem[0]:
+                wl_str = wl_str[:widths_mem[0]-2] + ".."
+
+            kind_str = w["kind"][:widths_mem[1]]
+            reps_str = str(w["replicas"])
+            curr_str = _format_mem_disp(w["pod_mem_req"])
+            act_str = _format_mem_disp(w["max_act_mem"])
+            rec_str = _format_mem_disp(w["rec_pod_mem"])
+            sav_str = _format_mem_disp(w["mem_savings"])
+            ratio_str = f"{w['mem_ratio']:.1f}x" if w['max_act_mem'] > 0 else "N/A"
+
+            row_line = (f"| {wl_str:<{widths_mem[0]}} | {kind_str:<{widths_mem[1]}} | "
+                        f"{reps_str:>{widths_mem[2]}} | {curr_str:>{widths_mem[3]}} | "
+                        f"{act_str:>{widths_mem[4]}} | {rec_str:>{widths_mem[5]}} | "
+                        f"{sav_str:>{widths_mem[6]}} | {ratio_str:>{widths_mem[7]}} |")
+            emit(f"{_DIM}  {row_line}{_NC}")
+
+        emit(f"{_DIM}  {sep_mem}{_NC}")
+        if not verbose and len(over_mem) > 10:
+            emit(f"{_DIM}  (Showing top 10 of {len(over_mem)} Memory over-allocated workloads. "
+                 f"Use -v for full table, or --export-html for interactive report){_NC}")
 
 
 def _generate_html_resource_report(analysis, cluster_name, output_path):
@@ -2798,15 +2958,16 @@ def chk_cp(r, ctx):
                 row_verbose(f"  {line}")
 
     # remediate-lab.sh Family B: KCM/scheduler lease timing + etcd CPU request +
-    # kube-vip's own numeric lease-ordering guard. Runs on BOTH clusters -
-    # remediate-lab.sh's own header states these families run "per-node on
-    # both nodes", not VSP-only.
-    lease_results = [
-        _lease_tuning_check(r, cl, "kube-controller-manager", KCM_MANIFEST),
-        _lease_tuning_check(r, cl, "kube-scheduler", SCHEDULER_MANIFEST),
-        _etcd_cpu_check(r, cl, cfg.get("etcd_cpu_request", "2500m")),
-        _etcd_compaction_check(r, cl),
-    ]
+    # kube-vip's own numeric lease-ordering guard. Runs on VSP and VCFA; skipped on
+    # multi-node CP clusters like SSP (3 CP nodes) where default KCP leader election
+    # and standard etcd resource requests apply.
+    lease_results = []
+    if cfg.get("check_cp_leader_elect", True) and cl != "ssp":
+        lease_results.append(_lease_tuning_check(r, cl, "kube-controller-manager", KCM_MANIFEST))
+        lease_results.append(_lease_tuning_check(r, cl, "kube-scheduler", SCHEDULER_MANIFEST))
+    if cfg.get("etcd_cpu_request") and cl != "ssp":
+        lease_results.append(_etcd_cpu_check(r, cl, cfg.get("etcd_cpu_request")))
+    lease_results.append(_etcd_compaction_check(r, cl))
     if "kube-vip" in cfg.get("static_pods", ()):
         lease_results.append(_kubevip_lease_guard(r, cl, "cp"))
     out.extend(lease_results)
@@ -5548,7 +5709,7 @@ SSP_MACHINE_TYPES = {
     # SSP Form Factor presets & Worker profiles (secop helper specs)
     "licensing": (4, 16384),
     "copilot": (12, 16384),
-    "lab-reduced": (12, 57344),
+    "lab-reduced": (8, 49152),
     "lab": (12, 57344),
     "standard": (16, 65536),
     "medium": (16, 65536),
@@ -5570,6 +5731,7 @@ SSP_MACHINE_TYPES = {
     "worker.licensing": (4, 16384),
     "worker.copilot": (12, 16384),
     "worker.lab": (12, 57344),
+    "worker.lab-reduced": (8, 49152),
     "worker.standard": (16, 65536),
 }
 
@@ -5661,6 +5823,21 @@ def _chk_sizing_ssp(r, ctx):
     out.append(ok("sizing.bounds", "Worker replica bounds known",
                   f"desired={md_spec_replicas} (current ready={md_ready})", cluster=cl))
 
+    # Also report clusterctl settings.json if present
+    chk_settings_cmd = "test -f /config/clusterctl/settings.json && echo exists"
+    rc_chk, out_chk = r.read(chk_settings_cmd, 10)
+    if rc_chk == 0 and "exists" in out_chk:
+        settings_json = r.read_json("cat /config/clusterctl/settings.json 2>/dev/null", 15) or {}
+        if settings_json:
+            cfg_w_cpu = settings_json.get("worker_num_cpu")
+            cfg_w_mem = settings_json.get("worker_memory_mb")
+            cfg_cp_cpu = settings_json.get("controller_num_cpu")
+            cfg_cp_mem = settings_json.get("controller_memory_mb")
+            cfg_w_desc = f"{cfg_w_cpu}vCPU / {cfg_w_mem // 1024:.0f}GiB ({cfg_w_mem}MiB)" if cfg_w_cpu and cfg_w_mem else "unknown"
+            cfg_cp_desc = f"{cfg_cp_cpu}vCPU / {cfg_cp_mem // 1024:.0f}GiB ({cfg_cp_mem}MiB)" if cfg_cp_cpu and cfg_cp_mem else "unknown"
+            out.append(ok("sizing.clusterctl", "clusterctl settings.json: sizing configured",
+                          f"worker={cfg_w_desc}, cp={cfg_cp_desc}", cluster=cl))
+
     warn_pct = ctx.get("cpu_warn_pct", 80)
     util_rows, util_ok = _sizing_node_utilization(r, warn_pct)
     if not util_ok:
@@ -5686,6 +5863,30 @@ def _chk_sizing_ssp(r, ctx):
     if cp_target:
         tcp, tmem = _parse_ssp_machine_type(cp_target)
         if tcp and tmem:
+            # Update /config/clusterctl/settings.json if present
+            chk_settings_cmd = "test -f /config/clusterctl/settings.json && echo exists"
+            rc_chk, out_chk = r.read(chk_settings_cmd, 10)
+            if rc_chk == 0 and "exists" in out_chk:
+                settings_json = r.read_json("cat /config/clusterctl/settings.json 2>/dev/null", 15) or {}
+                cur_s_cp_cpu = settings_json.get("controller_num_cpu")
+                cur_s_cp_mem = settings_json.get("controller_memory_mb")
+                if cur_s_cp_cpu == tcp and cur_s_cp_mem == tmem:
+                    out.append(ok("sizing.clusterctl.cp", f"clusterctl settings.json: controller sizing == {cp_target}",
+                                  f"already at controller_num_cpu={tcp}, controller_memory_mb={tmem}", cluster=cl))
+                else:
+                    py_update = (
+                        f"python3 -c \""
+                        f"import json; "
+                        f"p = '/config/clusterctl/settings.json'; "
+                        f"d = json.load(open(p)); "
+                        f"d['controller_num_cpu'] = {tcp}; "
+                        f"d['controller_memory_mb'] = {tmem}; "
+                        f"open(p, 'w').write(json.dumps(d, indent=2) + '\\n')\""
+                    )
+                    rc_up, out_up = r.write(py_update, f"update /config/clusterctl/settings.json controller to {tcp}vCPU/{tmem}MiB")
+                    out.append(ok("sizing.clusterctl.cp", f"clusterctl settings.json: controller sizing -> {cp_target}",
+                                  f"updated controller_num_cpu={tcp}, controller_memory_mb={tmem}", cluster=cl))
+
             if tcp == cp_cpu and tmem == cp_mem:
                 out.append(ok("sizing.cp.resize", f"Control Plane machineType == {cp_target}",
                               "already at target", cluster=cl))
@@ -5708,6 +5909,30 @@ def _chk_sizing_ssp(r, ctx):
     if worker_target:
         twcpu, twmem = _parse_ssp_machine_type(worker_target)
         if twcpu and twmem:
+            # Update /config/clusterctl/settings.json if present
+            chk_settings_cmd = "test -f /config/clusterctl/settings.json && echo exists"
+            rc_chk, out_chk = r.read(chk_settings_cmd, 10)
+            if rc_chk == 0 and "exists" in out_chk:
+                settings_json = r.read_json("cat /config/clusterctl/settings.json 2>/dev/null", 15) or {}
+                cur_s_cpu = settings_json.get("worker_num_cpu")
+                cur_s_mem = settings_json.get("worker_memory_mb")
+                if cur_s_cpu == twcpu and cur_s_mem == twmem:
+                    out.append(ok("sizing.clusterctl.worker", f"clusterctl settings.json: worker sizing == {worker_target}",
+                                  f"already at worker_num_cpu={twcpu}, worker_memory_mb={twmem}", cluster=cl))
+                else:
+                    py_update = (
+                        f"python3 -c \""
+                        f"import json; "
+                        f"p = '/config/clusterctl/settings.json'; "
+                        f"d = json.load(open(p)); "
+                        f"d['worker_num_cpu'] = {twcpu}; "
+                        f"d['worker_memory_mb'] = {twmem}; "
+                        f"open(p, 'w').write(json.dumps(d, indent=2) + '\\n')\""
+                    )
+                    rc_up, out_up = r.write(py_update, f"update /config/clusterctl/settings.json worker to {twcpu}vCPU/{twmem}MiB")
+                    out.append(ok("sizing.clusterctl.worker", f"clusterctl settings.json: worker sizing -> {worker_target}",
+                                  f"updated worker_num_cpu={twcpu}, worker_memory_mb={twmem}", cluster=cl))
+
             if twcpu == worker_cpu and twmem == worker_mem:
                 out.append(ok("sizing.worker.resize", f"Worker machineType == {worker_target}",
                               "already at target template size", cluster=cl))
@@ -5760,10 +5985,14 @@ def _chk_sizing_ssp(r, ctx):
                                 f"annotate {vm_name} skip-remediation")
                         r.write(f"kubectl cordon {vm_name}", f"cordon worker node {vm_name}")
                         r.write(f"kubectl drain {vm_name} --ignore-daemonsets --delete-emptydir-data --force --grace-period=30", f"drain worker node {vm_name}")
-                        _run_govc(["vm.power", "-s", vm_path], govc_env)
-                        time.sleep(5)
-                        _run_govc(["vm.change", "-vm", vm_path, "-c", str(twcpu), "-m", str(twmem)], govc_env)
-                        _run_govc(["vm.power", "-on", vm_path], govc_env)
+                        if not r.dry_run:
+                            _run_govc(["vm.power", "-s", vm_path], govc_env)
+                            time.sleep(5)
+                            _run_govc(["vm.change", "-vm", vm_path, "-c", str(twcpu), "-m", str(twmem)], govc_env)
+                            _run_govc(["vm.power", "-on", vm_path], govc_env)
+                        else:
+                            r.planned.append(f"govc resize {vm_name} to {twcpu}vCPU/{twmem}MiB")
+                            row_verbose(f"[dry-run] would power off, resize ({twcpu}vCPU/{twmem}MiB), power on {vm_name}")
                         r.write(f"kubectl uncordon {vm_name}", f"uncordon worker node {vm_name}")
                         r.write(f"kubectl annotate machine {vm_name} -n ssp cluster.x-k8s.io/skip-remediation-", f"remove skip-remediation from {vm_name}")
                         out.append(ok("sizing.worker.vm", f"VM {vm_name} hardware resized",
@@ -6175,6 +6404,163 @@ FOOTPRINT_CAPI_LE_DEPLOYS = (
     "capi-kubeadm-control-plane-controller-manager", "capv-controller-manager",
 )
 
+SSP_FOOTPRINT_REQUESTS = [
+    # (kind, namespace, name, container, cpu, memory) - right-sized for lab density & workload stability
+    ("statefulset", "nsxi-platform", "app-discovery", "app-discovery", "100m", "1280Mi"),
+    ("statefulset", "nsxi-platform", "baremetal-controller", "bms-controller", "25m", "32Mi"),
+    ("statefulset", "nsxi-platform", "baremetal-controller", "mp-adapter", "25m", "112Mi"),
+    ("statefulset", "nsxi-platform", "baremetal-controller", "nestdb", "25m", "48Mi"),
+    ("statefulset", "nsxi-platform", "baremetal-controller", "tn-proxy", "25m", "96Mi"),
+    ("statefulset", "nsxi-platform", "cypress-postgresql-ha-pg", "postgresql", "50m", "80Mi"),
+    ("statefulset", "nsxi-platform", "druid-historical", "druid", "100m", "6464Mi"),
+    ("statefulset", "nsxi-platform", "kafka-broker", "kafka", "25m", "32Mi"),
+    ("statefulset", "nsxi-platform", "kafka-broker", "truststore-reloader", "25m", "64Mi"),
+    ("statefulset", "nsxi-platform", "kafka-controller", "kafka", "350m", "512Mi"),
+    ("statefulset", "nsxi-platform", "kafka-controller", "truststore-reloader", "25m", "128Mi"),
+    ("statefulset", "nsxi-platform", "llanta-detectors", "llanta-service", "50m", "1024Mi"),
+    ("statefulset", "nsxi-platform", "log-collector", "fluentd", "150m", "384Mi"),
+    ("statefulset", "nsxi-platform", "log-collector", "logrotate", "25m", "32Mi"),
+    ("statefulset", "nsxi-platform", "log-collector", "support-bundle", "25m", "48Mi"),
+    ("statefulset", "nsxi-platform", "malware-analysis-lltic", "lltic", "200m", "128Mi"),
+    ("statefulset", "nsxi-platform", "malware-analysis-pcapapi", "nginx", "50m", "32Mi"),
+    ("statefulset", "nsxi-platform", "malware-analysis-pcapapi", "suricata-runner-1", "75m", "640Mi"),
+    ("statefulset", "nsxi-platform", "malware-analysis-pcapapi", "suricata-update-daemon", "25m", "80Mi"),
+    ("statefulset", "nsxi-platform", "malware-analysis-pcapapi", "uwsgi", "25m", "128Mi"),
+    ("statefulset", "nsxi-platform", "metrics-postgresql-ha-pg", "postgresql", "100m", "512Mi"),
+    ("statefulset", "nsxi-platform", "minio", "minio", "300m", "768Mi"),
+    ("statefulset", "nsxi-platform", "nsx-config-0", "nsx-config", "100m", "1408Mi"),
+    ("statefulset", "nsxi-platform", "nsx-config-1", "nsx-config", "100m", "1472Mi"),
+    ("statefulset", "nsxi-platform", "postgresql-ha-pg", "postgresql", "250m", "1280Mi"),
+    ("statefulset", "nsxi-platform", "redis-cluster", "redis-cluster", "50m", "32Mi"),
+    ("deploy", "cert-manager", "cert-manager-bcfks-webhook", "bcfks-webhook", "50m", "96Mi"),
+    ("deploy", "cert-manager", "cert-manager-cainjector", "cainjector", "50m", "48Mi"),
+    ("deploy", "cert-manager", "cert-manager-controller", "cert-manager", "50m", "128Mi"),
+    ("deploy", "cert-manager", "cert-manager-webhook", "cert-manager-webhook", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "app-monitoring", "app-monitoring", "50m", "512Mi"),
+    ("deploy", "nsxi-platform", "authelia", "authelia", "25m", "96Mi"),
+    ("deploy", "nsxi-platform", "authelia", "authelia-ldap", "25m", "96Mi"),
+    ("deploy", "nsxi-platform", "authelia", "authena", "25m", "96Mi"),
+    ("deploy", "nsxi-platform", "authserver", "authserver", "50m", "112Mi"),
+    ("deploy", "nsxi-platform", "bare-metal-ui", "bare-metal-ui", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "baremetal-orchestrator", "baremetal-orchestrator", "50m", "112Mi"),
+    ("deploy", "nsxi-platform", "cloud-connector-check-license-status", "check-license-status", "50m", "64Mi"),
+    ("deploy", "nsxi-platform", "cloud-connector-proxy", "nginx", "50m", "48Mi"),
+    ("deploy", "nsxi-platform", "cloud-connector-update-license-status", "update-license-status", "50m", "64Mi"),
+    ("deploy", "nsxi-platform", "cluster-api", "cluster-api", "75m", "384Mi"),
+    ("deploy", "nsxi-platform", "config-enrichment-service", "config-enrichment-service", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "config-processing-service", "config-processing-service", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "cypress-chatbot", "cypress-chatbot", "50m", "256Mi"),
+    ("deploy", "nsxi-platform", "cypress-chatbot-worker", "cypress-chatbot-worker", "50m", "256Mi"),
+    ("deploy", "nsxi-platform", "cypress-remediator", "cypress-remediator", "50m", "256Mi"),
+    ("deploy", "nsxi-platform", "cypress-ui", "cypress-ui", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "debezium-onprem", "debezium-onprem", "100m", "512Mi"),
+    ("deploy", "nsxi-platform", "druid-broker", "druid", "150m", "1024Mi"),
+    ("deploy", "nsxi-platform", "druid-coordinator", "druid", "150m", "512Mi"),
+    ("deploy", "nsxi-platform", "druid-router", "druid", "50m", "512Mi"),
+    ("deploy", "nsxi-platform", "intelligence-ui", "intelligence-ui", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-browser", "browser", "50m", "48Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-edge", "edge", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-models", "models", "50m", "160Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-nginx", "nginx", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-search", "search", "50m", "112Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-tutor", "tutor", "50m", "512Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-vdefend-dialog-0", "dialog", "50m", "256Mi"),
+    ("deploy", "nsxi-platform", "latestflow", "latestflow", "100m", "1280Mi"),
+    ("deploy", "nsxi-platform", "licensing-client-service", "licensing-client-service", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "llanta-detectors-sts-controller", "llanta-sts-controller", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-anonvpn", "anonvpn", "50m", "64Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-anonvpn", "webproxy-tunnel", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-avbd-scan", "avbd-scan", "125m", "512Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-feature-switch-watcher-notifier-malware-analys", "feature-switch-watcher", "50m", "64Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-lladoc", "lladoc", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-llurl-framework", "llurl-framework", "50m", "128Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-analyst-completed-backend-task", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-analyst-completion-0-local-scheduler", "processing", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-analyst-processing", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-analyst-timeout-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-api", "nginx", "25m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-api", "uwsgi", "25m", "512Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-av-processing", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-av-timeout-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-backend-scoring", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-classification-processing", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-classification-timeout-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-detection-evaluation-processor", "processing", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-hook-file-metadata-upload", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-hook-file-research-malscape-upload", "processing", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-hook-stats-global", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-llpcapapi-processing", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-llpcapapi-timeout-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-manual-score-processing-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-requeue", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-signature-check-processing", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-signature-check-timeout-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-submission-completion", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-task-scoring", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-unpacker-processing", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-unpacker-timeout-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-masapi", "nginx", "25m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-masapi", "uwsgi", "25m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-sapemo", "sapemo", "50m", "640Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-scheduler-api", "nginx", "25m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-scheduler-api", "uwsgi", "25m", "192Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-vc-llama-windows", "llama", "50m", "256Mi"),
+    ("deploy", "nsxi-platform", "malware-prevention-malware-prevention-report-ui", "nginx", "50m", "64Mi"),
+    ("deploy", "nsxi-platform", "malware-prevention-ui", "malware-prevention-ui", "25m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-prevention-ui", "svm-url-generator", "25m", "16Mi"),
+    ("deploy", "nsxi-platform", "metrics-app-server", "metrics-app-server", "50m", "896Mi"),
+    ("deploy", "nsxi-platform", "metrics-db-helper", "metrics-db-helper", "50m", "48Mi"),
+    ("deploy", "nsxi-platform", "metrics-manager", "metrics-manager", "75m", "48Mi"),
+    ("deploy", "nsxi-platform", "metrics-postgresql-ha-pgpool", "pgpool", "75m", "384Mi"),
+    ("deploy", "nsxi-platform", "metrics-query-server", "metrics-query-server", "50m", "112Mi"),
+    ("deploy", "nsxi-platform", "metrics-server", "metrics-server", "50m", "128Mi"),
+    ("deploy", "nsxi-platform", "monitor", "monitor", "60m", "896Mi"),
+    ("deploy", "nsxi-platform", "ndr-ui", "ndr-ui", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "nsx-metadata-service", "nsx-metadata-api-nginx", "25m", "32Mi"),
+    ("deploy", "nsxi-platform", "nsx-metadata-service", "nsx-metadata-api-uwsgi", "25m", "128Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-api", "nsx-ndr-api-nginx", "25m", "32Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-api", "nsx-ndr-api-uwsgi", "25m", "160Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-data-sharing-uploader-data-sharing-uploader", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-data-sharing-worker-data-sharing-processor", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-feature-switch-watcher-notifier-ndr-data-sharing", "feature-switch-watcher", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-campaign-manager", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-correlation-rule-runner", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-correlation-task-matcher", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-detection-event-aggregator", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-detection-event-scorer", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-detection-event-update-windower", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-enriched-ids-event-translator", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-file-event-translator", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-nta-event-translator", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-siem-notification-scheduler", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-siem-notification-sender", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "nta-server", "nta-server", "50m", "512Mi"),
+    ("deploy", "nsxi-platform", "pcap-storer-pcapstorer", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "platform-ui", "platform-ui", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "platform-ui-middleware", "platform-ui-middleware", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "postgresql-ha-pgpool", "pgpool", "250m", "512Mi"),
+    ("deploy", "nsxi-platform", "pubsub", "pubsub", "75m", "896Mi"),
+    ("deploy", "nsxi-platform", "recommendation", "recommendation", "25m", "256Mi"),
+    ("deploy", "nsxi-platform", "reputation-service", "reputation-service", "150m", "640Mi"),
+    ("deploy", "nsxi-platform", "routing-controller", "routing-controller", "50m", "48Mi"),
+    ("deploy", "nsxi-platform", "rule-analysis", "rule-analysis", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "rule-analysis-engine", "rule-analysis-engine", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "rule-analysis-ui", "rule-analysis-ui", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "sa-asds", "sa-asds", "25m", "256Mi"),
+    ("deploy", "nsxi-platform", "sa-events-processor", "sa-events-processor", "50m", "896Mi"),
+    ("deploy", "nsxi-platform", "sa-scheduler-services", "sa-scheduler-services", "50m", "1280Mi"),
+    ("deploy", "nsxi-platform", "sa-web-services", "sa-web-services", "50m", "768Mi"),
+    ("deploy", "nsxi-platform", "security-pov", "security-pov", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "spark-job-manager-v2", "spark-job-manager", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "spark-operator-kf-controller", "spark-operator-controller", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "spark-operator-kf-webhook", "spark-operator-webhook", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "telemetry", "telemetry", "50m", "640Mi"),
+    ("deploy", "nsxi-platform", "trust-manager", "trust-manager", "50m", "896Mi"),
+    ("deploy", "nsxi-platform", "visualization", "visualization", "150m", "3840Mi"),
+    ("deploy", "nsxi-platform", "workload", "workload", "50m", "768Mi"),
+    ("daemonset", "projectcontour", "projectcontour-envoy", "envoy", "75m", "128Mi"),
+]
+
 
 def _footprint_discover_autoscaler_rt(r):
     rc, out = r.read(
@@ -6196,36 +6582,70 @@ def _chk_footprint_ssp(r, ctx):
         "GOVC_INSECURE": "1",
     }
 
-    # 1. Pod CPU request right-sizing in nsxi-platform
-    ssp_footprint_requests = [
-        ("statefulset", "nsxi-platform", "druid-historical", "druid", "1", "20Gi"),
-        ("statefulset", "nsxi-platform", "kafka-controller", "kafka", "500m", "3Gi"),
-    ]
+    # 1. Pod CPU & Memory request right-sizing in nsxi-platform
+    wl_json = r.read_json("kubectl get deploy,sts,ds -A -o json 2>/dev/null", 30) or {}
+    items_by_key = {}
+    for item in wl_json.get("items", []) or []:
+        ikind = item.get("kind", "").lower()
+        ins = item.get("metadata", {}).get("namespace", "")
+        iname = item.get("metadata", {}).get("name", "")
+        items_by_key[(ikind, ins, iname)] = item
+        if ikind == "deployment":
+            items_by_key[("deploy", ins, iname)] = item
+        elif ikind == "daemonset":
+            items_by_key[("ds", ins, iname)] = item
+            items_by_key[("daemonset", ins, iname)] = item
 
-    for kind, ns, name, container, cpu, mem in ssp_footprint_requests:
-        rc, cur = r.read(
-            f"kubectl get {kind} {name} -n {ns} -o "
-            f"jsonpath='{{.spec.template.spec.containers[?(@.name==\"{container}\")]"
-            f".resources.requests}}' 2>/dev/null", 30)
-        cur = (cur or "").strip()
+    for kind, ns, name, container, cpu, mem in SSP_FOOTPRINT_REQUESTS:
+        item = items_by_key.get((kind.lower(), ns, name))
+        c_obj = None
+        if item:
+            containers = (item.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []) or [])
+            c_obj = next((c for c in containers if c.get("name") == container), None)
+
+        if c_obj:
+            reqs = c_obj.get("resources", {}).get("requests", {}) or {}
+            cur = json.dumps(reqs)
+            cur_cpu = str(reqs.get("cpu", ""))
+            cur_mem = str(reqs.get("memory", ""))
+        else:
+            rc, cur = r.read(
+                f"kubectl get {kind} {name} -n {ns} -o "
+                f"jsonpath='{{.spec.template.spec.containers[?(@.name==\"{container}\")]"
+                f".resources.requests}}' 2>/dev/null", 30)
+            cur = (cur or "").strip()
+            cur_cpu_m = re.search(r'"cpu":"([^"]+)"', cur.replace(" ", "")) if cur else None
+            cur_cpu = cur_cpu_m.group(1) if cur_cpu_m else ""
+            cur_mem_m = re.search(r'"memory":"([^"]+)"', cur.replace(" ", "")) if cur else None
+            cur_mem = cur_mem_m.group(1) if cur_mem_m else ""
+
         label = f"{ns}/{name} [{container}]: requests == cpu={cpu} mem={mem}"
-        if not cur:
+        if not cur or cur == "{}":
             out.append(warn("footprint.requests", label, "object or container not found", cluster=cl))
             continue
-        squeezed = cur.replace(" ", "")
-        if f'"cpu":"{cpu}"' in squeezed:
+
+        cpu_match = (not cpu) or (cur_cpu and _parse_cpu(cur_cpu) == _parse_cpu(cpu))
+        mem_match = (not mem) or (cur_mem and _parse_mem_mib(cur_mem) == _parse_mem_mib(mem))
+
+        if cpu_match and mem_match:
             out.append(ok("footprint.requests", label, "already at target", cluster=cl))
             continue
         res = fail("footprint.requests", label, f"currently {cur}", cluster=cl)
         if may_act(r, "footprint"):
+            req_parts = []
+            if cpu:
+                req_parts.append(f"cpu={cpu}")
+            if mem:
+                req_parts.append(f"memory={mem}")
+            req_str = ",".join(req_parts)
             r.write(
                 f"kubectl set resources {kind}/{name} -n {ns} --containers={container} "
-                f"--requests=cpu={cpu}",
-                f"right-size {ns}/{name} [{container}] cpu request -> {cpu}",
+                f"--requests={req_str}",
+                f"right-size {ns}/{name} [{container}] requests -> {req_str}",
                 tier="transient", timeout=60)
-            res.action = f"requests cpu -> {cpu}"
+            res.action = f"requests -> {req_str}"
             if not r.dry_run:
-                res.state, res.detail = "warn", f"was {cur}; set to target cpu={cpu}"
+                res.state, res.detail = "warn", f"was {cur}; set to target {req_str}"
         out.append(res)
 
     # 2. Zero-reservation reclamation for all VMs in secop-ssp folder
@@ -6734,14 +7154,27 @@ def chk_gateway(r, ctx):
             "-o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null", 45)
         val = (got or "").strip().splitlines()
         val = val[-1].strip() if val else ""
-        label = f"{ns}/{svc}: holds {want_ip}"
-        if val == want_ip:
-            out.append(ok("gateway.svc", label, cluster=cl))
-        elif not val:
-            out.append(fail("gateway.svc", label,
-                            "no LoadBalancer ingress IP assigned", cluster=cl))
+
+        if cl == "ssp" and isinstance(want_ip, (list, tuple, set)):
+            if val and val in want_ip:
+                label = f"{ns}/{svc}: holds {val}"
+                out.append(ok("gateway.svc", label, cluster=cl))
+            elif not val:
+                label = f"{ns}/{svc}: holds {'/'.join(want_ip)}"
+                out.append(fail("gateway.svc", label,
+                                "no LoadBalancer ingress IP assigned", cluster=cl))
+            else:
+                label = f"{ns}/{svc}: holds {'/'.join(want_ip)}"
+                out.append(fail("gateway.svc", label, f"holds {val} instead", cluster=cl))
         else:
-            out.append(fail("gateway.svc", label, f"holds {val} instead", cluster=cl))
+            label = f"{ns}/{svc}: holds {want_ip}"
+            if val == want_ip:
+                out.append(ok("gateway.svc", label, cluster=cl))
+            elif not val:
+                out.append(fail("gateway.svc", label,
+                                "no LoadBalancer ingress IP assigned", cluster=cl))
+            else:
+                out.append(fail("gateway.svc", label, f"holds {val} instead", cluster=cl))
 
     if cl == "vcfa":
         # Hashed envoy dataplane Services. This is a WARNING, not a failure, matching
