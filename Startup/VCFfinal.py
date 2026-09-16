@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.49 - 2026-09-08
+# Version 6.3.50 - 2026-09-16
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.50 Changes:
+# - Task 7: Fixed NSX Manager and Edge/VNA transport-node password expiration checks
+#   to accurately compute remaining days until expiry (password_change_frequency - last_password_change)
+#   rather than comparing password_change_frequency directly or querying non-existent API keys.
+#   Prevents Edge node accounts from being skipped when policy is 90 days but remaining time is < 60 days.
 #
 # v6.3.49 Changes:
 # - Task 5: Trigger a background `vcf-lab-tuner.py --cluster vcfa --mode remediate` pass
@@ -4463,15 +4469,15 @@ echo "PROXY_CONFIGURED"
         """Return days until NSX user password expires via REST API.
 
         Returns:
-            int  > 0               — days remaining until expiry
-            0                      — NSX "no expiry" sentinel in response
-            None                   — key absent from response (no expiry configured)
+            int  >= 0              — days remaining until expiry
+            None                   — password does not expire (frequency=0 or not configured)
             _NSX_EXPIRY_API_ERROR  — REST call failed; caller should update
         """
         import urllib.request as _ureq
         import ssl as _ssl
         import base64 as _b64
         import json as _json
+        import datetime as _dt
         uid = _nsx_user_id.get(username)
         if uid is None:
             return None
@@ -4486,8 +4492,19 @@ echo "PROXY_CONFIGURED"
         )
         try:
             with _ureq.urlopen(_req, timeout=10, context=_ctx) as _r:
-                return _json.loads(_r.read().decode()).get(
-                    'days_until_password_expiry')
+                data = _json.loads(_r.read().decode())
+                freq = data.get('password_change_frequency')
+                if freq is None or freq == 0 or freq > 9000:
+                    return None
+                last_change = data.get('last_password_change')
+                if last_change is not None:
+                    if last_change > 1e9:
+                        last_change_date = _dt.datetime.fromtimestamp(last_change / 1000).date()
+                        exp_date = last_change_date + _dt.timedelta(days=freq)
+                        return max(0, (exp_date - _dt.date.today()).days)
+                    else:
+                        return max(0, freq - last_change)
+                return freq
         except Exception:
             return _NSX_EXPIRY_API_ERROR
 
@@ -4555,6 +4572,7 @@ echo "PROXY_CONFIGURED"
         if not dry_run:
             import requests as _vna_req
             import urllib3 as _vna_urllib3
+            import datetime as _vna_dt
             _vna_urllib3.disable_warnings(
                 _vna_urllib3.exceptions.InsecureRequestWarning)
             _vna_auth = ('admin', password)
@@ -4612,16 +4630,31 @@ echo "PROXY_CONFIGURED"
                         uid = user_data.get('userid')
                         if uname not in _vna_target_users:
                             continue
-                        current = user_data.get('password_change_frequency',
-                                                'unset')
-                        # Mirror the NSX Manager threshold check (line ~4188): only PUT
-                        # when the current value is not already at/above the desired
-                        # setting, instead of unconditionally writing on every run.
-                        if isinstance(current, (int, float)) and current >= nsx_expiry_threshold_days:
+
+                        # Calculate remaining days until password expiry
+                        freq = user_data.get('password_change_frequency')
+                        last_change = user_data.get('last_password_change')
+                        days_until = None
+                        if freq is not None:
+                            if freq == 0 or freq > 9000:
+                                days_until = None  # No expiry
+                            elif last_change is not None:
+                                if last_change > 1e9:
+                                    last_change_date = _vna_dt.datetime.fromtimestamp(last_change / 1000).date()
+                                    exp_date = last_change_date + _vna_dt.timedelta(days=freq)
+                                    days_until = max(0, (exp_date - _vna_dt.date.today()).days)
+                                else:
+                                    days_until = max(0, freq - last_change)
+                            else:
+                                days_until = freq
+
+                        if days_until is not None and days_until > nsx_expiry_threshold_days:
                             lsf.write_output(
-                                f'        [~] {uname} (id={uid}): {current}d — '
-                                f'skip (>= {nsx_expiry_threshold_days}d threshold)')
+                                f'        [~] {uname} (id={uid}): {days_until}d — '
+                                f'skip (> {nsx_expiry_threshold_days}d threshold)')
                             continue
+
+                        current_display = 'no-expiry' if days_until is None else f'{days_until}d'
                         user_data['password_change_frequency'] = nsx_expiry_days
                         try:
                             presp = _vna_req.put(
@@ -4632,7 +4665,7 @@ echo "PROXY_CONFIGURED"
                             if presp.status_code == 200:
                                 lsf.write_output(
                                     f'        [+] {uname} (id={uid}): '
-                                    f'{current} -> {nsx_expiry_days}d  [OK]')
+                                    f'{current_display} -> {nsx_expiry_days}d  [OK]')
                             else:
                                 lsf.write_output(
                                     f'        [-] {uname} (id={uid}): FAILED '
