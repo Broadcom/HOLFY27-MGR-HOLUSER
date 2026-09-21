@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.32 - 2026-09-21
+# Version 2.33 - 2026-09-21
 # Author - Burke Azbill and HOL Core Team
+#
+# v2.33: Prioritized account processing order in configure_nsx_manager() and
+#        set_nsx_edge_password_expiration() (root -> admin -> audit -> system -> service
+#        accounts) ensuring privileged accounts are configured first.
 #
 # v2.32: Updated configure_nsx_manager() to discover all local NSX accounts (UIDs 0, 10000+, 11000+)
 #        and apply dual-layer password extension (chage -d $(date +%Y-%m-%d) -M 999 via root SSH +
@@ -453,7 +457,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.32'
+SCRIPT_VERSION = '2.33'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -1838,7 +1842,20 @@ def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
                 except Exception:
                     pass
 
-        for user, user_id in nsx_users_map.items():
+        def _nsx_user_sort_key(item):
+            user, user_id = item
+            if user == 'root' or user_id == 0:
+                return (0, 0, user)
+            if user == 'admin' or user_id == 10000:
+                return (1, 0, user)
+            if user == 'audit' or user_id == 10002:
+                return (2, 0, user)
+            if user_id < 11000:
+                return (3, user_id, user)
+            return (4, user_id, user)
+
+        sorted_users = sorted(nsx_users_map.items(), key=_nsx_user_sort_key)
+        for user, user_id in sorted_users:
             # Reset shadow epoch and set max days via SSH chage
             chage_cmd = f'chage -d $(date +%Y-%m-%d) -M {NSX_PASSWORD_EXPIRY_DAYS} {user}'
             lsf.ssh(chage_cmd, f'root@{hostname}', root_password)
@@ -2007,6 +2024,21 @@ def set_nsx_edge_password_expiration(edge_hostname: str, nsx_manager: str,
         if not edge_users:
             for user, user_id in NSX_USER_ID_MAP.items():
                 edge_users.append({'username': user, 'userid': user_id, 'status': 'ACTIVE'})
+
+        def _edge_user_sort_key(u):
+            uname = u.get('username', '')
+            uid = u.get('userid', 99999)
+            if uname == 'root' or uid == 0:
+                return (0, 0, uname)
+            if uname == 'admin' or uid == 10000:
+                return (1, 0, uname)
+            if uname == 'audit' or uid == 10002:
+                return (2, 0, uname)
+            if uid < 11000:
+                return (3, uid, uname)
+            return (4, uid, uname)
+
+        edge_users.sort(key=_edge_user_sort_key)
 
         for user_data in edge_users:
             user = user_data.get('username')
