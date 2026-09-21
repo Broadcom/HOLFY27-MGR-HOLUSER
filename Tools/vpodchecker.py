@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.8.9 - 2026-08-18
+# Version 2.8.10 - 2026-09-21
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.8.10 - 2026-09-21: Expanded check_passwords() to discover and validate
+#   all NSX Manager system and service accounts (UIDs 0, 10000+, 11000+) as well as
+#   transport node accounts, flagging any expired or soon-to-expire service accounts.
 # v2.8.9 - 2026-08-18: check_k8s_certs() updated to probe for Site B VSP CP node
 #   (10.2.1.142) and execute vsp_cert_renewer.py --site for both Site A and Site B.
 # v2.8.8 - 2026-08-06: check_auto_platform_isolation() updated to match the
@@ -1442,20 +1445,46 @@ NSX_USER_IDS = {
 }
 
 
+def get_nsx_all_users_for_check(hostname: str, password: str) -> Dict[str, int]:
+    """Discover all system and service accounts on NSX Manager for checking."""
+    users_map = dict(NSX_USER_IDS)
+    try:
+        res = lsf.ssh('cat /etc/passwd', f'root@{hostname}', password)
+        if res.returncode == 0 and getattr(res, 'stdout', None):
+            for line in res.stdout.strip().splitlines():
+                parts = line.strip().split(':')
+                if len(parts) >= 3 and parts[2].isdigit():
+                    uid = int(parts[2])
+                    if uid == 0 or (10000 <= uid < 60000):
+                        users_map[parts[0]] = uid
+        else:
+            import requests, urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            for uid in range(11000, 11015):
+                try:
+                    r = requests.get(f'https://{hostname}/api/v1/node/users/{uid}', auth=('admin', password), verify=False, timeout=5)
+                    if r.status_code == 200:
+                        u = r.json()
+                        if u.get('username'):
+                            users_map[u['username']] = uid
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return users_map
+
+
 def get_nsx_user_expiration(hostname: str, username: str, password: str,
-                              target_user: str) -> Optional[int]:
+                              target_user: str, user_id: Optional[int] = None) -> Optional[int]:
     """
     Get password expiration for NSX user via REST API.
     
     The NSX API identifies users by numeric userid, not username:
-      root=0, admin=10000, audit=10002
-    
-    If the target_user is not in the known ID map, falls back to
-    listing all users and matching by username.
+      root=0, admin=10000, audit=10002, service=11000+
     
     Returns:
         - None if password never expires or check failed
-        - Number of days until expiration
+        - Number of days until expiration (negative if expired)
     """
     try:
         import requests
@@ -1465,7 +1494,8 @@ def get_nsx_user_expiration(hostname: str, username: str, password: str,
         session = requests.Session()
         session.verify = False
         
-        user_id = NSX_USER_IDS.get(target_user)
+        if user_id is None:
+            user_id = NSX_USER_IDS.get(target_user)
         data = None
         
         if user_id is not None:
@@ -1486,6 +1516,20 @@ def get_nsx_user_expiration(hostname: str, username: str, password: str,
         if data is None:
             return None
         
+        if data.get('status') == 'NOT_ACTIVATED':
+            return None
+
+        if data.get('status') == 'PASSWORD_EXPIRED':
+            freq = data.get('password_change_frequency', 90)
+            last_change_epoch = data.get('last_password_change', 0)
+            if last_change_epoch > 1e9:
+                last_change = datetime.datetime.fromtimestamp(last_change_epoch / 1000).date()
+            else:
+                last_change = datetime.date.today() - datetime.timedelta(days=last_change_epoch)
+            exp_date = last_change + datetime.timedelta(days=freq)
+            days_until = (exp_date - datetime.date.today()).days
+            return days_until if days_until < 0 else -1
+
         if 'password_change_frequency' in data:
             freq = data['password_change_frequency']
             if freq == 0 or freq > 9000:
@@ -1512,19 +1556,10 @@ def get_nsx_user_expiration(hostname: str, username: str, password: str,
 
 def get_nsx_edge_user_expiration(edge_hostname: str, nsx_manager: str,
                                   password: str,
-                                  target_user: str) -> Optional[int]:
+                                  target_user: str,
+                                  user_id: Optional[int] = None) -> Optional[int]:
     """
     Get password expiration for an NSX Edge user via the NSX Manager transport node API.
-    
-    Edges don't expose /api/v1/node/users directly; the managing NSX Manager
-    proxies these calls through:
-        GET /api/v1/transport-nodes/{node-id}/node/users/{user-id}
-    
-    :param edge_hostname: Edge display name (e.g. edge-wld01-01a)
-    :param nsx_manager: NSX Manager FQDN that manages this edge
-    :param password: Admin password for the NSX Manager
-    :param target_user: User to check (root, admin, audit)
-    :return: None if never expires or check failed, else days until expiration
     """
     try:
         import requests
@@ -1534,7 +1569,6 @@ def get_nsx_edge_user_expiration(edge_hostname: str, nsx_manager: str,
         session = requests.Session()
         session.verify = False
 
-        # Find the edge's transport node ID
         tn_url = f'https://{nsx_manager}/api/v1/transport-nodes'
         resp = session.get(tn_url, auth=('admin', password), timeout=30)
         if resp.status_code != 200:
@@ -1549,7 +1583,8 @@ def get_nsx_edge_user_expiration(edge_hostname: str, nsx_manager: str,
         if not node_id:
             return None
 
-        user_id = NSX_USER_IDS.get(target_user)
+        if user_id is None:
+            user_id = NSX_USER_IDS.get(target_user)
         data = None
 
         if user_id is not None:
@@ -1569,6 +1604,20 @@ def get_nsx_edge_user_expiration(edge_hostname: str, nsx_manager: str,
 
         if data is None:
             return None
+
+        if data.get('status') == 'NOT_ACTIVATED':
+            return None
+
+        if data.get('status') == 'PASSWORD_EXPIRED':
+            freq = data.get('password_change_frequency', 90)
+            last_change_epoch = data.get('last_password_change', 0)
+            if last_change_epoch > 1e9:
+                last_change = datetime.datetime.fromtimestamp(last_change_epoch / 1000).date()
+            else:
+                last_change = datetime.date.today() - datetime.timedelta(days=last_change_epoch)
+            exp_date = last_change + datetime.timedelta(days=freq)
+            days_until = (exp_date - datetime.date.today()).days
+            return days_until if days_until < 0 else -1
 
         if 'password_change_frequency' in data:
             freq = data['password_change_frequency']
@@ -1840,14 +1889,10 @@ def check_password_expirations() -> List[CheckResult]:
                 nsx_managers.append(hostname)
     
     for hostname in nsx_managers:
-        for user in ['admin', 'root', 'audit']:
+        all_users_map = get_nsx_all_users_for_check(hostname, password)
+        for user, user_id in all_users_map.items():
             try:
-                if user == 'root':
-                    # Root is a Linux account
-                    days = get_linux_password_expiration(hostname, user, password)
-                else:
-                    # admin and audit are NSX API users
-                    days = get_nsx_user_expiration(hostname, 'admin', password, user)
+                days = get_nsx_user_expiration(hostname, 'admin', password, user, user_id=user_id)
                 
                 if days is None:
                     status = "PASS"
@@ -1901,9 +1946,30 @@ def check_password_expirations() -> List[CheckResult]:
             ))
             continue
         
-        for user in ['admin', 'root', 'audit']:
+        edge_users_map = {'root': 0, 'admin': 10000, 'audit': 10002}
+        try:
+            import requests as _er
+            import urllib3 as _eur
+            _eur.disable_warnings(_eur.exceptions.InsecureRequestWarning)
+            tn_url = f'https://{nsx_mgr}/api/v1/transport-nodes'
+            tn_resp = _er.get(tn_url, auth=('admin', password), verify=False, timeout=15)
+            if tn_resp.status_code == 200:
+                for node_item in tn_resp.json().get('results', []):
+                    if node_item.get('display_name', '') == hostname:
+                        node_id = node_item.get('node_id', node_item.get('id'))
+                        uurl = f'https://{nsx_mgr}/api/v1/transport-nodes/{node_id}/node/users'
+                        uresp = _er.get(uurl, auth=('admin', password), verify=False, timeout=15)
+                        if uresp.status_code == 200:
+                            for uentry in uresp.json().get('results', []):
+                                if uentry.get('status') != 'NOT_ACTIVATED':
+                                    edge_users_map[uentry.get('username')] = uentry.get('userid')
+                        break
+        except Exception:
+            pass
+
+        for user, user_id in edge_users_map.items():
             try:
-                days = get_nsx_edge_user_expiration(hostname, nsx_mgr, password, user)
+                days = get_nsx_edge_user_expiration(hostname, nsx_mgr, password, user, user_id=user_id)
                 
                 if days is None:
                     status = "PASS"
