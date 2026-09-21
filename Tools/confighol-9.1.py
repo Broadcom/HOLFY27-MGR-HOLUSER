@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 # confighol-9.1.py - HOLFY27 vApp HOLification Tool
-# Version 2.31 - 2026-08-18
+# Version 2.33 - 2026-09-21
 # Author - Burke Azbill and HOL Core Team
+#
+# v2.33: Prioritized account processing order in configure_nsx_manager() and
+#        set_nsx_edge_password_expiration() (root -> admin -> audit -> system -> service
+#        accounts) ensuring privileged accounts are configured first.
+#
+# v2.32: Updated configure_nsx_manager() to discover all local NSX accounts (UIDs 0, 10000+, 11000+)
+#        and apply dual-layer password extension (chage -d $(date +%Y-%m-%d) -M 999 via root SSH +
+#        REST API PUT /api/v1/node/users/{uid}) to ensure zero expired service accounts remain.
+#        Updated set_nsx_edge_password_expiration() to process all transport node accounts.
 #
 # v2.31: Updated Step 10 (configure_k8s_certs) to probe for Site B VSP CP node
 #        (10.2.1.142) and execute vsp_cert_renewer.py for both Site A and Site B.
@@ -448,7 +457,7 @@ import lsfunctions as lsf
 # CONFIGURATION CONSTANTS
 #==============================================================================
 
-SCRIPT_VERSION = '2.30'
+SCRIPT_VERSION = '2.33'
 SCRIPT_NAME = 'confighol.py'
 
 # SSH key paths
@@ -1812,20 +1821,52 @@ def configure_nsx_manager(hostname: str, auth_keys_file: str, password: str,
         # Step 3: Configure SSH to start on boot
         configure_nsx_ssh_start_on_boot(hostname, password, dry_run)
         
-        # Step 4: Set password expiration via REST API (CLI is unreliable for admin/audit)
-        for user in NSX_USERS:
-            user_id = NSX_USER_ID_MAP.get(user)
-            if user_id is not None:
-                set_nsx_password_expiration_via_api(hostname, password, user_id, user,
-                                                    NSX_PASSWORD_EXPIRY_DAYS, dry_run)
-            else:
-                lsf.write_output(f'{hostname}: WARNING - Unknown NSX user {user}, skipping')
+        # Step 4: Discover all accounts (system & service UIDs 0, 10000+, 11000+) and set password expiration
+        nsx_users_map = dict(NSX_USER_ID_MAP)
+        pwd_res = lsf.ssh("cat /etc/passwd", f'root@{hostname}', root_password)
+        if pwd_res.returncode == 0 and getattr(pwd_res, 'stdout', None):
+            for line in pwd_res.stdout.strip().splitlines():
+                parts = line.strip().split(':')
+                if len(parts) >= 3 and parts[2].isdigit():
+                    uid = int(parts[2])
+                    if uid == 0 or (10000 <= uid < 60000):
+                        nsx_users_map[parts[0]] = uid
+        else:
+            for uid in range(11000, 11015):
+                try:
+                    resp = requests.get(f'https://{hostname}/api/v1/node/users/{uid}', auth=('admin', password), verify=False, timeout=5)
+                    if resp.status_code == 200:
+                        u = resp.json()
+                        if u.get('username'):
+                            nsx_users_map[u['username']] = uid
+                except Exception:
+                    pass
+
+        def _nsx_user_sort_key(item):
+            user, user_id = item
+            if user == 'root' or user_id == 0:
+                return (0, 0, user)
+            if user == 'admin' or user_id == 10000:
+                return (1, 0, user)
+            if user == 'audit' or user_id == 10002:
+                return (2, 0, user)
+            if user_id < 11000:
+                return (3, user_id, user)
+            return (4, user_id, user)
+
+        sorted_users = sorted(nsx_users_map.items(), key=_nsx_user_sort_key)
+        for user, user_id in sorted_users:
+            # Reset shadow epoch and set max days via SSH chage
+            chage_cmd = f'chage -d $(date +%Y-%m-%d) -M {NSX_PASSWORD_EXPIRY_DAYS} {user}'
+            lsf.ssh(chage_cmd, f'root@{hostname}', root_password)
+            # Align via REST API
+            set_nsx_password_expiration_via_api(hostname, password, user_id, user,
+                                                NSX_PASSWORD_EXPIRY_DAYS, dry_run)
     else:
         lsf.write_output(f'{hostname}: Would enable SSH via API')
         lsf.write_output(f'{hostname}: Would copy authorized_keys (with SDDC Manager password fallback)')
         lsf.write_output(f'{hostname}: Would configure SSH start-on-boot')
-        for user in NSX_USERS:
-            lsf.write_output(f'{hostname}: Would set {NSX_PASSWORD_EXPIRY_DAYS}-day password expiration for {user}')
+        lsf.write_output(f'{hostname}: Would set {NSX_PASSWORD_EXPIRY_DAYS}-day password expiration for all system and service accounts')
     
     return success
 
@@ -1975,11 +2016,41 @@ def set_nsx_edge_password_expiration(edge_hostname: str, nsx_manager: str,
             return False
         
         success = True
-        for user, user_id in NSX_USER_ID_MAP.items():
+        # Query all users for this transport node
+        uurl = f'https://{nsx_manager}/api/v1/transport-nodes/{node_id}/node/users'
+        uresp = requests.get(uurl, auth=('admin', password), verify=False, timeout=30)
+        edge_users = uresp.json().get('results', []) if uresp.status_code == 200 else []
+
+        if not edge_users:
+            for user, user_id in NSX_USER_ID_MAP.items():
+                edge_users.append({'username': user, 'userid': user_id, 'status': 'ACTIVE'})
+
+        def _edge_user_sort_key(u):
+            uname = u.get('username', '')
+            uid = u.get('userid', 99999)
+            if uname == 'root' or uid == 0:
+                return (0, 0, uname)
+            if uname == 'admin' or uid == 10000:
+                return (1, 0, uname)
+            if uname == 'audit' or uid == 10002:
+                return (2, 0, uname)
+            if uid < 11000:
+                return (3, uid, uname)
+            return (4, uid, uname)
+
+        edge_users.sort(key=_edge_user_sort_key)
+
+        for user_data in edge_users:
+            user = user_data.get('username')
+            user_id = user_data.get('userid')
+            if user_data.get('status') == 'NOT_ACTIVATED':
+                continue
+
             lsf.write_output(f'{edge_hostname}: Setting {days}-day password expiration for {user}...')
             url = f'https://{nsx_manager}/api/v1/transport-nodes/{node_id}/node/users/{user_id}'
+            user_data['password_change_frequency'] = days
             resp = requests.put(url, auth=('admin', password),
-                                json={'password_change_frequency': days},
+                                json=user_data,
                                 verify=False, timeout=30)
             if resp.status_code == 200:
                 freq = resp.json().get('password_change_frequency', 'unknown')

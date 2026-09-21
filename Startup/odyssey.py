@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # odyssey.py - HOLFY27 Core Odyssey Installation Module
-# Version 3.6 - 2026-09-15
+# Version 3.7 - 2026-09-21
 # Author - Burke Azbill and HOL Core Team
 # VMware Odyssey client installation for VLP deployments
+#
+# v3.7: Added cleanup of /tmp/VCFfinal.done session marker if present during startup.
+#
+# v3.6: Fixed NFS close-to-open consistency race (ETXTBSY / rc=126) on Ubuntu 24.04+
+#       by retrying squashfs-root extraction on the console and killing any lingering
+#       odyssey processes before touching the AppImage.
 
 import os
 import sys
@@ -34,10 +40,29 @@ ODYSSEY_LAUNCHER_URL = f'https://odyssey.vmware.com/client/{ODYSSEY_APP_LINUX}'
 ODYSSEY_SHORTCUT = 'launch_odyssey.desktop'
 ODYSSEY_LAUNCHER = 'odyssey-launch.sh'
 ODYSSEY_ICON = 'icon-256.png'
+VCFFINAL_DONE_FILE = '/tmp/VCFfinal.done'
 
 #==============================================================================
 # HELPER FUNCTIONS
 #==============================================================================
+
+def cleanup_vcffinal_done(lsf, dry_run=False):
+    """
+    Remove /tmp/VCFfinal.done session marker if it exists
+    
+    :param lsf: lsfunctions module
+    :param dry_run: Whether running in dry-run mode
+    """
+    if os.path.isfile(VCFFINAL_DONE_FILE):
+        if dry_run:
+            lsf.write_output(f'[DRY-RUN] Would remove: {VCFFINAL_DONE_FILE}')
+            return
+        try:
+            os.remove(VCFFINAL_DONE_FILE)
+            lsf.write_output(f'Removed: {VCFFINAL_DONE_FILE}')
+        except Exception as e:
+            lsf.write_output(f'Could not remove {VCFFINAL_DONE_FILE}: {e}')
+
 
 def cleanup_old_odyssey(lsf, mc, desktop, odyssey_dst):
     """
@@ -313,6 +338,9 @@ def main(lsf=None, standalone=False, dry_run=False):
         import lsfunctions as lsf
         if not standalone:
             lsf.init(router=False)
+    
+    # Remove /tmp/VCFfinal.done if present from the current startup session
+    cleanup_vcffinal_done(lsf, dry_run=dry_run)
     
     # Initialize dashboard early so we can update it for skip cases
     dashboard = None

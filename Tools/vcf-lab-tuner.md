@@ -1,8 +1,8 @@
 # vcf-lab-tuner.py — Design & Reference
 
-**Version 3.5 — 2026-09-16**
+**Version 3.9.5 — 2026-09-21**
 **Author:** Burke Azbill and HOL Core Team
-**Status:** `vcf-lab-tuner.py` **v2.3.2**. All clusters supported (VSP, VCFA, SSP, Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh` **and** `vcfa-stabilizer.sh`, enabling legacy scripts to be safely retired. **Full native certificate renewal engine (v2.0.0)**, dynamic component discovery & SSP cluster parity (v2.1.0), **VCFA single-node leader election hardening, Argo CronWorkflow staggering, Kyverno webhook resilience, and enhanced drift keeper (v2.2.0)**, **cluster-agnostic workload CPU request right-sizing analysis with single-screen terminal output and interactive HTML dashboard export (v2.3.0)**, **compact three-column node readiness terminal formatting (v2.3.1)**, and **expanded top 10 over-allocated workloads terminal summary (v2.3.2)**. Remediation implemented for every section, keeper management working, deprecation banners applied, and offline unit test suite passing. Validated live on DevPod.
+**Status:** `vcf-lab-tuner.py` **v2.5.6**. All clusters supported (VSP, VCFA, SSP, Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh` **and** `vcfa-stabilizer.sh`, enabling legacy scripts to be safely retired. **Full native certificate renewal engine (v2.0.0)**, dynamic component discovery & SSP cluster parity (v2.1.0), **VCFA single-node leader election hardening, Argo CronWorkflow staggering, Kyverno webhook resilience, and enhanced drift keeper (v2.2.0)**, **cluster-agnostic workload CPU request right-sizing analysis with interactive HTML dashboard export (v2.3.0)**, **expanded top 10 over-allocated workloads terminal summary (v2.3.2)**, **version-aware SDS NACK remediation & 9.1.1+ upstream alignment (v2.4.0)**, **version-aware VCFA resource naming & HA replica evaluation alignment (v2.4.1)**, **two-tier revert to defaults architecture with automated single pre-remediation snapshot retention (v2.5.0)**, **VCF 9.1.1+ native settings alignment & interruption prevention across VCFA & VSP (v2.5.1/v2.5.2)**, **multi-node proxy drift peer node execution fix (v2.5.3)**, **Supervisor cluster VCF 9.1.1+ alignment, ESXi spherelet SSH reachability auto-enable, and pod sweep gating (v2.5.4)**, **VCFA SeaweedFS mTLS certificate freshness check & auth pod backoff recovery (v2.5.5)**, and **Supervisor & multi-cluster backing secret & x509 certificate renewal fixes (v2.5.6)**. Remediation implemented for every section, keeper management working, deprecation banners applied, and offline unit test suite passing. Validated live on DevPod.
 
 ---
 
@@ -205,16 +205,20 @@ Implemented in `DirectTransport._wrap()`.
 vcf-lab-tuner.py --cluster {vsp|vcfa|supervisor|all} [--mode MODE] [options]
 
 MODES (--mode, default: report)
-    preflight    Read-only checks. Mutates nothing, ever. Exit code carries the verdict.
-    tune         Apply DURABLE one-shot configuration only (see §7 tier table).
-    remediate    Fix what is broken right now. Implies preflight detection first.
-    report       Full diagnostic render, read-only. The vsp-health.py experience.
+    preflight      Read-only checks. Mutates nothing, ever. Exit code carries the verdict.
+    tune           Apply DURABLE one-shot configuration only (see §7 tier table).
+    remediate      Fix what is broken right now. Implies preflight detection first.
+    report         Full diagnostic render, read-only. The vsp-health.py experience.
+    snapshot       Capture pre-remediation live cluster state bundle (strictly retains 1 snapshot).
+    rollback       Restore cluster configuration from a recorded snapshot bundle.
+    reset-defaults Reset cluster configuration to VMware stock chart and manifest defaults.
 
 OPTIONS
     --cluster <name>       vsp | vcfa | supervisor | all          (required)
     --section <name>       Run one section only (see SECTIONS below)
     --host <IP>            Override cluster entry point; skips discovery
     --dry-run              Preview. Structurally cannot mutate -- see §9.
+    --snapshot <PATH>      Path to snapshot JSON file (for --mode rollback, default: snapshot-latest.json)
     --aggressive           Opt in to unthresholded/uncapped sweeps (default: damped)
     --install-keeper       Emit + enable the on-node 60s drift-keeper, then exit
     --remove-keeper        Disable + remove the keeper
@@ -251,7 +255,8 @@ typos in scripted use.
 | Flag                                                      | Values / default                                                       | Notes                                                                                                                                                                                                               |
 | --------------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--cluster`                                               | `vsp` | `vcfa` | `supervisor` | `all` — **required**                   | `all` visits each in turn; an absent cluster is reported and skipped, not an error                                                                                                                                  |
-| `--mode`                                                  | `preflight` | `tune` | `remediate` | `report` — default `report`       | See the mode table below                                                                                                                                                                                            |
+| `--mode`                                                  | `preflight` | `tune` | `remediate` | `report` | `snapshot` | `rollback` | `reset-defaults` — default `report` | See the mode table below |
+| `--snapshot <PATH>`                                       | none (defaults to `snapshot-latest.json`)                              | `rollback` mode only. Path to a specific snapshot JSON file bundle to restore configuration from                                                                                                                    |
 | `--section`                                               | one section name                                                       | Erroring if the section does not exist for that cluster, rather than silently doing nothing                                                                                                                         |
 | `--host <IP>`                                             | none                                                                   | Skips discovery. Cannot be combined with `--cluster all`                                                                                                                                                            |
 | `--dry-run`                                               | off                                                                    | Valid with `tune` and `remediate`. Cannot reach the transport at all                                                                                                                                                |
@@ -291,12 +296,15 @@ cannot fire a resize as a side effect (`main()` checks this before any cluster i
 ### 4b. What each mode is for
 
 
-| Mode        | Mutates?            | Use it when                                                                                |
-| ----------- | ------------------- | ------------------------------------------------------------------------------------------ |
-| `report`    | No                  | You want the full picture. This is the `vsp-health.py` / `auto-health.py` experience       |
-| `preflight` | No                  | You want a verdict and an exit code — CI, a gate before an upgrade, a pre-change check     |
-| `tune`      | Durable config only | Template prep, or re-asserting configuration on a healthy lab. **Never restarts anything** |
-| `remediate` | Yes                 | Something is broken now and you want it fixed                                              |
+| Mode             | Mutates?            | Use it when                                                                                                                                                                                            |
+| ---------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `report`         | No                  | You want the full picture. This is the `vsp-health.py` / `auto-health.py` experience                                                                                                                   |
+| `preflight`      | No                  | You want a verdict and an exit code — CI, a gate before an upgrade, a pre-change check                                                                                                                |
+| `tune`           | Durable config only | Template prep, or re-asserting configuration on a healthy lab. **Never restarts anything**                                                                                                             |
+| `remediate`      | Yes                 | Something is broken now and you want it fixed                                                                                                                                                          |
+| `snapshot`       | No (writes file)    | Explicitly capture pre-remediation live cluster state bundle. Purges older snapshots to strictly retain 1 file (`snapshot-latest.json`)                                                               |
+| `rollback`       | Yes                 | Restore exact pre-remediation cluster state from a recorded snapshot bundle (`snapshot-latest.json` or specified `--snapshot PATH`)                                                                   |
+| `reset-defaults` | Yes                 | Return cluster to stock VMware 9.1.1 defaults via Flux CD reconciliation, manifest reset (KCM/scheduler/etcd), Kyverno failurePolicy reset (`Fail`), CPI DS reset, CronWorkflow reset, and keeper purge |
 
 
 `preflight` and `report` differ only in verbosity of intent: both are read-only and
@@ -1330,6 +1338,95 @@ cross-script locking.
 
 ## 15. Changelog
 
+**3.9.5 — 2026-09-21** — `vcf-lab-tuner.md` v3.9.5 / `vcf-lab-tuner.py` **v2.5.6**.
+
+### Supervisor & Multi-Cluster Certificate Verification & Renewal Fixes
+
+#### Newly Added Capabilities & Technical Details (WHAT & WHY)
+- **Backing Secret & x509 Expiry Verification (`_renew_certmanager_leaf_certs`, `chk_certs`)**:
+  - *WHAT*: Added proactive backing Secret and x509 certificate validation across all namespaces for all cluster types (Supervisor, VCFA, VSP, SSP). When Certificate CR status lacks `notAfter` or Secret is missing/stale, dynamically inspects Secret `tls.crt` data and OpenSSL `notAfter` expiry.
+  - *WHY*: When a Certificate CR status has cached `Ready=True` but the backing Secret was deleted, corrupted, or has no `tls.crt`, standard status inspections previously failed to identify that the secret was missing. On Supervisor clusters (such as `metrics-endpoint-downstream-server-cert` in `svc-metrics-aggregator-*`), this caused certificates to report `EXPIRED (expires: unknown)` or fail to regenerate without explicit Secret validation.
+- **Cert-Manager Explicit Reissuance & Request Purge (`_renew_certmanager_leaf_certs`)**:
+  - *WHAT*: Explicitly forces cert-manager reissuance via `cert-manager.io/reissue-at` annotation and purges stale CertificateRequests across all renewed leaf certs, ensuring all leaf certs are reliably re-issued and renewed to 5 years (`43830h0m0s`).
+  - *WHY*: If a Secret is missing and the Certificate CR duration is already `43830h0m0s`, patching duration alone is a no-op that does not trigger cert-manager reconciliation. Annotating with `reissue-at` forces cert-manager to immediately create a new CertificateRequest and write the TLS Secret.
+- **Robust ISO & OpenSSL Date Parsing (`_days_until`, `_parse_openssl_date`, `_parse_iso_date`)**:
+  - *WHAT*: Upgraded date parsing to support ISO format variants (fractional seconds, timezone offsets) and multi-format OpenSSL enddate strings across Linux locales.
+  - *WHY*: Prevents `ValueError` exceptions and fallback to unparseable dates when parsing diverse x509 timestamps.
+
+**3.9.4 — 2026-09-21** — `vcf-lab-tuner.md` v3.9.4 / `vcf-lab-tuner.py` **v2.5.5**.
+
+### VCFA SeaweedFS mTLS Certificate Freshness Check & Auth Pod Convergence
+
+#### Newly Added Capabilities & Technical Details (WHAT & WHY)
+- **SeaweedFS In-Memory mTLS Certificate Freshness Check (`chk_certs`)**:
+  - *WHAT*: Proactively checks the `seaweedfs-master-cert` Secret `notBefore` timestamp against running pod start times for all SeaweedFS pods (`seaweedfs-master-0`, `seaweedfs-filer-0`, `seaweedfs-volume-0..2`) in `vmsp-platform`. Automatically force-restarts any SeaweedFS pod whose `startTime` precedes the renewed certificate timestamp.
+  - *WHY*: When cert-manager automatically renews `seaweedfs-master-cert`, SeaweedFS (Go runtime) does not dynamically reload the new mTLS certificate from disk without a process restart. This causes mTLS gRPC handshakes to fail between filer and master, preventing `tenant-manager-0` (VCD Cell) from verifying the `/opt/vmware/vcloud-director/data/transfer` S3 transfer spooling area and sending `tenant-manager-0` into a continuous crash loop.
+- **VCFA Endpoint Convergence & Auth Pod Reset Expansion (`chk_endpoint`)**:
+  - *WHAT*: Expanded the active pod reset pattern to include `ccs-infra-eas*` and `intent-server*` alongside `api-gateway-server*`, `ccs-vksm-eas*`, and `resource-manager-server*` when `tenant-manager-0` reaches `Running` status.
+  - *WHY*: These authentication and intent microservices experience Kubernetes exponential backoff during `tenant-manager` outages; immediately clearing them upon `tenant-manager-0` recovery restores `/login/` (HTTP 200) without waiting minutes for exponential backoff timers to expire.
+
+**3.9.3 — 2026-09-17** — `vcf-lab-tuner.md` v3.9.3 / `vcf-lab-tuner.py` **v2.5.4**.
+
+### Supervisor Cluster VCF 9.1.1+ Alignment, ESXi Spherelet SSH Reachability Auto-Enable, and Pod Sweep Gating
+
+#### Newly Added Capabilities & Technical Details (WHAT & WHY)
+- **Supervisor Cluster Version Detection (`_detect_cluster_version`)**:
+  - *WHAT*: Dynamically identifies Supervisor cluster version (tuple `(9, 1, 1)` or `(9, 1, 0)`) by querying vCenter appliance version banner (`cat /etc/issue`) and Supervisor Control Plane Kubernetes version (K8s v1.33+ on VCF 9.1.1+ vs v1.30/v1.31 on 9.1.0).
+  - *WHY*: Enables version-aware logic on Supervisor clusters just as on VSP and VCFA.
+- **ESXi Spherelet Probing & Reachability Auto-Enable (`_ensure_esx_ssh`, `_renew_supervisor_spherelet_certs`)**:
+  - *WHAT*: Auto-starts the `TSM-SSH` service on ESXi agent hosts via vCenter pyVmomi prior to probing or renewing spherelet certificates. Accurately evaluates OpenSSL exit codes (`0` valid, `1` expiring) and separates SSH reachability issues from expiring certificates.
+  - *WHY*: Stock ESXi hosts often have the SSH service stopped by default, which previously generated false 60-day certificate expiration warnings and attempted re-signing on perfectly valid 5-year spherelet certificates.
+- **Supervisor Pod Sweep & Succeeded Phase Gating (`_sweep_bad_pods`)**:
+  - *WHAT*: Gated terminal pod phase selection on Supervisor clusters to `Failed` only (`sup_phases = ("Failed",)`).
+  - *WHY*: Prevents `_sweep_bad_pods` from force-deleting legitimate `Completed` (`status.phase=Succeeded`) Job pods spawned by recurring CronJobs (such as `svc-tmc-c9/tmc-agent-installer`) and eliminates false warning logs on every run.
+- **Declarative Scalable Service Workload Scaling (`_sweep_bad_pods`)**:
+  - *WHAT*: Inspects deployment and statefulset replica counts for CCI, ArgoCD, and Harbor namespaces before issuing `kubectl scale`, only scaling if `replicas == 0`.
+  - *WHY*: Prevents unnecessary rolling restarts and controller conflicts on healthy running workloads.
+
+**3.8 — 2026-09-17** — `vcf-lab-tuner.md` v3.8 / `vcf-lab-tuner.py` **v2.5.0**.
+
+### VCFA Two-Tier Revert to Defaults Architecture & Automated Single Pre-Remediation Snapshot Retention
+
+Implemented a complete revert-to-defaults architecture allowing lab administrators to capture baseline cluster states, execute targeted snapshot rollbacks, or restore stock VMware 9.1.1 chart and manifest settings.
+
+#### Newly Added Capabilities & Technical Details (WHAT & WHY)
+- **Automated Single Pre-Remediation Snapshot Capture (`_capture_pre_remediation_snapshot`)**:
+  - *WHAT*: Automatically records full live cluster state (static pod manifests, ReleaseTemplates, workloads, CronWorkflows, webhooks, DaemonSets) to `/var/lib/vcf-lab-tuner/snapshots/` before executing any remediations on `vcfa`. Purges previous snapshot files on each capture to strictly retain 1 snapshot file (`snapshot-latest.json`).
+  - *WHY*: Guarantees a clean pre-remediation restore point without stale snapshot file accumulation.
+- **Snapshot Rollback Execution (`--mode rollback [--snapshot PATH]`)**:
+  - *WHAT*: Restores exact pre-remediation cluster state from a captured snapshot bundle (`snapshot-latest.json` by default or explicit path). Restores static pod manifests, ReleaseTemplate `driftDetection.mode` settings, CronWorkflow schedules, Kyverno webhook `failurePolicy`, and CPI DaemonSet leader election args.
+  - *WHY*: Provides immediate rollback capability to pre-tuning state.
+- **Stock Defaults Reset Engine (`--mode reset-defaults`)**:
+  - *WHAT*: Re-enables Flux `driftDetection.mode=enabled` on ReleaseTemplates, triggers Flux CD reconciliation across HelmReleases to restore VMware stock 9.1.1 chart values, resets static manifests (KCM, scheduler, etcd), Kyverno webhook `failurePolicy` (`Fail`), CPI DaemonSet arguments, Argo CronWorkflow schedules (`0 * * * *` and `0 */3 * * *`), stops/disables/purges lab keeper daemons (`vcf-lab-keeper-vcfa`), and purges snapshot files.
+  - *WHY*: Provides a single command to return the VCFA appliance to vendor stock 9.1.1 defaults following testing or upgrades.
+- **Dedicated CLI Modes (`--mode snapshot`, `--mode rollback`, `--mode reset-defaults`)**:
+  - *WHAT*: Integrated top-level modes with `--dry-run` preview support.
+
+**3.7 — 2026-09-17** — `vcf-lab-tuner.md` v3.7 / `vcf-lab-tuner.py` **v2.4.1**.
+
+### Version-Aware VCFA Naming & HA Replica Evaluation Alignment
+
+Gated VCFA check routines based on dynamically detected cluster version (9.1.0 vs 9.1.1+) and updated replica evaluation rules.
+
+#### Newly Added Capabilities & Technical Details (WHAT & WHY)
+- **Version-Aware Resource Naming**:
+  - *WHAT*: `chk_edge` evaluates `copy-rabbitmq-config` on 9.1.1+ vs `copy-config` on 9.1.0; `chk_deployments` automatically skips `trust-manager-sds-server` on 9.1.1+; `chk_gateway` evaluates Gateway API LoadBalancer services on 9.1.1+ without false warnings on legacy `envoy-vmsp-platform*` hashed names; `_storm_vcfa_cron_stagger` queries `.spec.schedules[0]`.
+  - *WHY*: Eliminates false-positive error reports caused by upstream chart resource name changes between VCF 9.1.0 and 9.1.1+.
+- **HA Replicas Evaluation Alignment**:
+  - *WHAT*: Updated `_storm_scale_to_one`, `_storm_capi_le_false`, and `chk_footprint` to evaluate 2+ replicas as a passing/success state across all checks.
+  - *WHY*: High Availability (HA) replica counts (2+) should never be reported as errors or warnings.
+
+**3.6 — 2026-09-17** — `vcf-lab-tuner.md` v3.6 / `vcf-lab-tuner.py` **v2.4.0**.
+
+### Version-Aware Envoy Gateway SDS SAN NACK Remediation & 9.1.1+ Upstream Alignment
+
+Dynamically adapts Envoy Gateway SDS NACK remediations based on VCFA cluster version.
+
+#### Newly Added Capabilities & Technical Details (WHAT & WHY)
+- **Version-Aware SDS Remediation (`_fix_sds_sni`)**:
+  - *WHAT*: On VCF 9.1.0, continues enforcing KB 439264 / KB 424402 workaround (`platform-trust` sync across namespaces + Kyverno `vcfa-btp-wellknown-to-carefs` mutation). On VCF 9.1.1+, purges the obsolete Kyverno mutation policy and cleans up any conflicting dual-field `BackendTLSPolicy` objects (`ndc-backendtlspolicy`, `vmsp-identity-backendtlspolicy`).
+  - *WHY*: Upstream VCF 9.1.1+ charts natively fix Envoy Gateway SDS NACK. Retaining the legacy Kyverno mutation on 9.1.1+ caused invalid dual-field (`wellKnownCACertificates` + `caCertificateRefs`) `BackendTLSPolicy` CRDs that failed Kubernetes CEL validation, locking package deployments in `InProgress` (`VCFMS-HEALTH-002`).
+
 **3.5 — 2026-09-16** — `vcf-lab-tuner.md` v3.5 / `vcf-lab-tuner.py` **v2.3.2**.
 
 ### Top 10 Over-Allocated Workloads Terminal Summary
@@ -2219,6 +2316,64 @@ response to a parity percentage.
 
 
 ## 18. Version History
+
+**v2.5.6 additions (2026-09-21)**: Supervisor & Multi-Cluster Certificate Verification & Renewal Fixes:
+
+- **Backing Secret & x509 Expiry Verification (`_renew_certmanager_leaf_certs`, `chk_certs`)**: Added proactive backing Secret and x509 certificate validation across all namespaces for all cluster types (Supervisor, VCFA, VSP, SSP). When Certificate CR status lacks `notAfter` or Secret is missing/stale, dynamically inspects Secret `tls.crt` data and OpenSSL `notAfter` expiry.
+- **Cert-Manager Explicit Reissuance & Request Purge (`_renew_certmanager_leaf_certs`)**: Explicitly forces cert-manager reissuance via `cert-manager.io/reissue-at` annotation and purges stale CertificateRequests across all renewed leaf certs, ensuring all leaf certs are reliably re-issued and renewed to 5 years (`43830h0m0s`).
+- **Robust ISO & OpenSSL Date Parsing (`_days_until`, `_parse_openssl_date`, `_parse_iso_date`)**: Upgraded date parsing to support ISO format variants (fractional seconds, timezone offsets) and multi-format OpenSSL enddate strings across Linux locales.
+
+**v2.5.5 additions (2026-09-21)**: VCFA SeaweedFS mTLS Certificate Freshness Check & Auth Pod Convergence:
+
+- **SeaweedFS mTLS Certificate Reload (`chk_certs`)**: Added proactive verification in `chk_certs` for `vcfa` to check `seaweedfs-master-cert` Secret `notBefore` timestamp against pod start times and restart `seaweedfs` pods (`seaweedfs-master-0`, `seaweedfs-filer-0`, `seaweedfs-volume-0..2`) in `vmsp-platform` if running with stale in-memory certificates.
+- **Expanded Auth Pod Reset (`chk_endpoint`)**: Included `ccs-infra-eas*` and `intent-server*` alongside `api-gateway-server*`, `ccs-vksm-eas*`, and `resource-manager-server*` in `chk_endpoint` post-`tenant-manager-0` recovery to instantly clear exponential backoffs on the `/login/` critical path.
+
+**v2.5.4 additions (2026-09-17)**: Supervisor Cluster VCF 9.1.1+ Alignment, ESXi Spherelet SSH Reachability Auto-Enable, and Pod Sweep Gating:
+
+- **Supervisor Cluster Version Detection (`_detect_cluster_version`)**: Added dynamic version detection for Supervisor clusters from vCenter appliance version banner (9.1.1+) and Supervisor control plane Kubernetes version (K8s v1.33+ on VCF 9.1.1+ vs v1.30/v1.31 on 9.1.0).
+- **ESXi Spherelet Probing & Reachability Auto-Enable (`_ensure_esx_ssh`, `_renew_supervisor_spherelet_certs`)**: Auto-starts the `TSM-SSH` service on ESXi agent hosts via vCenter pyVmomi prior to probing or renewing spherelet certificates. Accurately evaluates OpenSSL exit codes (`0` valid, `1` expiring) and separates SSH reachability issues from expiring certificates.
+- **Supervisor Pod Sweep & Succeeded Phase Gating (`_sweep_bad_pods`)**: Gated terminal pod phase selection on Supervisor clusters to `Failed` only (`sup_phases = ("Failed",)`). Prevents force-deleting legitimate `Completed` (`status.phase=Succeeded`) Job pods spawned by recurring CronJobs (such as `svc-tmc-c9/tmc-agent-installer`) and eliminates false warning logs on every run.
+- **Declarative Scalable Service Workload Scaling (`_sweep_bad_pods`)**: Inspects deployment and statefulset replica counts for CCI, ArgoCD, and Harbor namespaces before issuing `kubectl scale`, only scaling if `replicas == 0`.
+
+**v2.5.3 additions (2026-09-17)**: Multi-Node Proxy Drift Peer Node Execution Fix:
+
+- **Multi-Node Proxy Remediation Execution (`chk_proxy`)**: Fixed peer node mutation routing when remediating node proxy configuration on multi-node clusters. Replaced primary transport `r.write()` with `r.write_on_node(ip, ...)` so that proxy drop-in files (`/etc/sysconfig/proxy`, `/etc/systemd/system/containerd.service.d/http-proxy.conf`, `/etc/systemd/system/kubelet.service.d/http-proxy.conf`) are written directly to the target worker node rather than repeatedly executing against the primary Control Plane VIP.
+
+**v2.5.2 additions (2026-09-17)**: VSP Cluster VCF 9.1.1+ Native Settings Alignment & Interruption Prevention:
+
+- **Cluster Version Detection (`_detect_cluster_version`)**: Unified version detection across VSP and VCFA clusters (via `components.api.vmsp.vmware.com`, `ndc` HelmRelease 9.1.3162+, `envoyproxy-gateway` v1.8+, and `tenant-manager`).
+- **VSP kube-vip Static Manifest Gating (`cp.vip_preserve`)**: Gated `vip_preserve_on_leadership_loss` static manifest edit to 9.1.0 on VSP clusters. On VCF 9.1.1+, accepts stock `kube-vip.yaml` settings natively, preventing on-disk sed edits from restarting kube-vip static pods and dropping Control Plane VIPs.
+- **VSP vsphere-cpi Leader Election Gating (`_check_vsphere_cpi_tuning`)**: Gated `vsphere-cpi` DaemonSet leader election lease patching to 9.1.0 on VSP clusters. On VCF 9.1.1+, accepts stock `vsphere-cpi` 1.35 args natively, preventing DaemonSet restarts and Flux CD drift reconciliation.
+- **VSP Microservice Probe Tuning Gating (`_check_vsp_probe_and_memory_tuning`)**: Gated liveness/readiness probe strategic patching on VSP microservices (`depot-service`, `fleetbuild`, `sddcbuild`, `sddcupgrade`, `vidb`, `prometheus`, `kube-state-metrics`, `node-exporter`) to 9.1.0. On VCF 9.1.1+, accepts vendor stock 9.1.1 chart probe tolerances natively, preventing unnecessary rolling restarts and Flux CD drift.
+- **VSP Kyverno Webhook Gating (`chk_kyverno`)**: Gated `kyverno-cleanup-validating-webhook-cfg` failurePolicy mutation to 9.1.0. On VCF 9.1.1+, accepts native Kyverno 3.8+ webhook configurations natively.
+- **VSP Footprint Alignment (`chk_footprint`)**: Gated `envoyproxy-gateway` ReleaseTemplate patching to 9.1.0 (Envoy Gateway v1.8+ handles memory/LE natively on 9.1.1+), recognized GlobalConfig templating on `cluster-autoscaler` ReleaseTemplate, and gated `ops-logs-gateway` check when `ops-logs` is not installed.
+- **VSP 9.1.1 Sizing Machine Types (`SIZING_MACHINE_TYPES`)**: Added `management.nonha.small` (12 vCPU / 24 GiB), `management.ci.*` types, and updated 9.1.1 sizing table.
+- **VSP 9.1.1 Drift Keeper Alignment (`KEEPER_BODY_VSP_911`)**: Updated `vcf-lab-keeper` for VSP on 9.1.1+ to retain maintenance tasks (fluentd buffer cleanup, VCF component replica restoration) while eliminating obsolete 9.1.0 probe/CPI/Kyverno/Envoy patches that fight Flux CD.
+
+**v2.5.1 additions (2026-09-17)**: VCF 9.1.1+ Native Settings Alignment & Interruption Prevention:
+
+- **kube-vip Static Manifest Edit Gating (`cp.vip_preserve`)**: Gated `vip_preserve_on_leadership_loss` static manifest edit to VCF 9.1.0 only. On VCF 9.1.1+, accepts stock `kube-vip.yaml` settings natively, preventing on-disk `sed` edits from restarting `kube-vip` static pods and dropping the Control Plane VIP (`10.1.1.72`) mid-run.
+- **VIP Watchdog Service Check Gating (`cp.watchdog`)**: Gated `vcfa-vip-watchdog.service` active check to VCF 9.1.0 only. On VCF 9.1.1+, `kube-vip` 0.8+ natively maintains VIP stability without host watchdog scripting, accepting stock 9.1.1 VIP management.
+- **Kyverno Validating Webhook Gating (`_storm_vcfa_webhook_resilience`)**: Gated `kyverno-resource-validating-webhook-cfg` `failurePolicy: Ignore` enforcement to VCF 9.1.0 only. On VCF 9.1.1+, Kyverno v1.15.2-4 and admission controllers run natively with stock `failurePolicy: Fail`.
+- **vsphere-cpi Leader Election Lease Tuning Gating (`_check_vsphere_cpi_tuning`)**: Gated `vsphere-cpi` DaemonSet leader election lease patching to VCF 9.1.0 only. On VCF 9.1.1+, accepts stock `vsphere-cpi` 1.35 args natively, preventing DaemonSet restarts and Flux CD drift reconciliation.
+- **Prelude Probe Relaxation Alignment (`_storm_probe_relax`)**: Gated prelude microservice liveness/readiness probe strategic-patching to VCF 9.1.0 only. On VCF 9.1.1+, accepts native prelude deployer probe tolerances, preventing simultaneous rolling restarts across 25 Spring Boot microservices.
+- **Prelude Leader Election Alignment (`_storm_vcfa_*_le`)**: Gated single-replica microservice leader election stripping to VCF 9.1.0 only. On VCF 9.1.1+, accepts stock 9.1.1 Helm values natively unless `--storm-disable-le` is explicitly passed.
+
+**v2.5.0 additions (2026-09-17)**: VCFA Two-Tier Revert to Defaults Architecture & Automated Pre-Remediation Snapshots:
+
+- **Automated Pre-Remediation Snapshot Capture (`_capture_pre_remediation_snapshot`)**: Automatically records full live cluster state (static pod manifests, ReleaseTemplates, workloads, CronWorkflows, webhooks, DaemonSets) to `/var/lib/vcf-lab-tuner/snapshots/` before executing remediations on `vcfa`. Purges previous snapshot files on each capture to strictly retain 1 snapshot file (`snapshot-latest.json`).
+- **Snapshot Rollback Execution (`--mode rollback [--snapshot PATH]`)**: Restores exact pre-remediation cluster state from a captured snapshot bundle (`snapshot-latest.json` or custom path), including static pod manifests, ReleaseTemplate `driftDetection.mode` settings, CronWorkflow schedules, Kyverno webhook `failurePolicy`, and CPI DaemonSet leader election arguments.
+- **Stock Defaults Reset Engine (`--mode reset-defaults`)**: Re-enables Flux `driftDetection.mode=enabled` on ReleaseTemplates, triggers Flux CD reconciliation across HelmReleases to restore VMware stock 9.1.1 chart values, resets static pod manifests (KCM, scheduler, etcd), Kyverno webhook failurePolicy (`Fail`), CPI DaemonSet arguments, CronWorkflow schedules, stops/disables/purges lab keeper daemons (`vcf-lab-keeper-vcfa`), and purges snapshot files.
+- **Dedicated CLI Modes (`--mode snapshot`, `--mode rollback`, `--mode reset-defaults`)**: Top-level CLI modes with full `--dry-run` preview support.
+
+**v2.4.1 additions (2026-09-17)**: Version-Aware VCFA Naming & HA Replica Evaluation Alignment:
+
+- **Version-Aware Resource Naming**: Gated VCFA check routines based on dynamically detected cluster version (9.1.0 vs 9.1.1+). `chk_edge` checks `copy-rabbitmq-config` on 9.1.1+ vs `copy-config` on 9.1.0; `chk_deployments` automatically skips `trust-manager-sds-server` on 9.1.1+; `chk_gateway` evaluates Gateway API LoadBalancer services on 9.1.1+; `_storm_vcfa_cron_stagger` queries `.spec.schedules[0]`.
+- **HA Replicas Evaluation Alignment**: Updated `_storm_scale_to_one`, `_storm_capi_le_false`, and `chk_footprint` to evaluate 2+ replicas as a passing/success state across all checks rather than reporting errors or warnings.
+
+**v2.4.0 additions (2026-09-17)**: Version-Aware Envoy Gateway SDS SAN NACK Remediation & 9.1.1+ Upstream Alignment:
+
+- **Version-Aware SDS Remediation (`_fix_sds_sni`)**: Detects VCFA cluster version dynamically. On VCF 9.1.0, continues enforcing KB 439264 / KB 424402 workaround (`platform-trust` sync + Kyverno `vcfa-btp-wellknown-to-carefs` mutation). On VCF 9.1.1+, purges the obsolete Kyverno mutation policy and cleans up conflicting dual-field `BackendTLSPolicy` objects (`ndc-backendtlspolicy`, `vmsp-identity-backendtlspolicy`) so upstream charts reconcile cleanly without Gateway API CEL validation errors (`PackageDeployment InProgress` / `VCFMS-HEALTH-002`).
 
 **v2.2.0 additions (2026-09-04)**: VCFA Leader Election Hardening, CronWorkflow Staggering, Webhook Resilience, and Enhanced Keeper:
 

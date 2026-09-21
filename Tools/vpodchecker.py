@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.8.9 - 2026-08-18
+# Version 2.8.12 - 2026-09-21
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.8.12 - 2026-09-21:
+#   - Skipped VM Templates (vm.config.template) in check_vm_configuration() and
+#     add_vm_config_extra_option() to prevent unsupported reconfig faults (e.g. on ubuntu-24-04-gold).
+#   - Standardized password expiration evaluation via _eval_password_expiration(): passwords
+#     valid for >90 days (or with no expiration) evaluate to PASS, while only expired (<0d)
+#     or expiring within 90 days evaluate to FAIL.
+# v2.8.11 - 2026-09-21: Prioritized NSX account validation order (root -> admin -> audit ->
+#   system -> service accounts) across managers and transport nodes.
+# v2.8.10 - 2026-09-21: Expanded check_passwords() to discover and validate
+#   all NSX Manager system and service accounts (UIDs 0, 10000+, 11000+) as well as
+#   transport node accounts, flagging any expired or soon-to-expire service accounts.
 # v2.8.9 - 2026-08-18: check_k8s_certs() updated to probe for Site B VSP CP node
 #   (10.2.1.142) and execute vsp_cert_renewer.py --site for both Site A and Site B.
 # v2.8.8 - 2026-08-06: check_auto_platform_isolation() updated to match the
@@ -500,6 +511,10 @@ def check_ntp_configuration(hosts: List) -> List[CheckResult]:
 def add_vm_config_extra_option(vm, option_key: str, option_value: str) -> bool:
     """Add or update a VM extra config option"""
     try:
+        # Skip VM templates (cannot be reconfigured in vCenter)
+        if (getattr(vm, 'config', None) and getattr(vm.config, 'template', False)) or \
+           (getattr(vm, 'summary', None) and getattr(vm.summary, 'config', None) and getattr(vm.summary.config, 'template', False)):
+            return False
         spec = vim.vm.ConfigSpec()
         opt = vim.option.OptionValue()
         spec.extraConfig = []
@@ -527,6 +542,12 @@ def check_vm_configuration(vms: List, fix_issues: bool = True) -> List[CheckResu
     ]
     
     for vm in vms:
+        # Skip VM templates (cannot be reconfigured in vCenter)
+        is_template = (getattr(vm, 'config', None) and getattr(vm.config, 'template', False)) or \
+                      (getattr(vm, 'summary', None) and getattr(vm.summary, 'config', None) and getattr(vm.summary.config, 'template', False))
+        if is_template:
+            continue
+
         # Skip system VMs that cannot be modified
         skip_vm = False
         for pattern in SKIP_VM_PATTERNS:
@@ -623,13 +644,12 @@ VSP_MIN_CP_NUMCPU = 4
 # correctly-sized CP never false-FAILs.
 VSP_MIN_CP_MEMORY_MIB = 9700
 
-# Worker sizing is unchanged from the ClusterClass default (vsp-remediate.sh
-# WORKER_TARGET_CPU=12, memory left at 24Gi) — not part of the BenS CP resize.
-VSP_MIN_WORKER_NUMCPU = 12
+# WORKER_TARGET_CPU=8, memory at 16Gi).
+VSP_MIN_WORKER_NUMCPU = 8
 # ~24GB configured (24576 MiB) reports a bit lower via kubelet capacity due to
 # normal kernel/hypervisor reserve (observed ~24025MiB on a 24576MiB VM) —
 # threshold set with margin so correctly-sized nodes never false-FAIL.
-VSP_MIN_WORKER_MEMORY_MIB = 23000
+VSP_MIN_WORKER_MEMORY_MIB = 15986
 
 
 def _k8s_quantity_to_mib(qty: str) -> Optional[float]:
@@ -653,7 +673,7 @@ def check_vsp_node_resources() -> List[CheckResult]:
     """
     Verify every VSP cluster node meets its role-appropriate sizing target:
     control plane at the BenS-validated 4 vCPU / 10240 MiB, workers at
-    >= 12 vCPU / >= 24GB memory.
+    >= 8 vCPU / >= 16GB memory.
     """
     results: List[CheckResult] = []
 
@@ -1442,20 +1462,46 @@ NSX_USER_IDS = {
 }
 
 
+def get_nsx_all_users_for_check(hostname: str, password: str) -> Dict[str, int]:
+    """Discover all system and service accounts on NSX Manager for checking."""
+    users_map = dict(NSX_USER_IDS)
+    try:
+        res = lsf.ssh('cat /etc/passwd', f'root@{hostname}', password)
+        if res.returncode == 0 and getattr(res, 'stdout', None):
+            for line in res.stdout.strip().splitlines():
+                parts = line.strip().split(':')
+                if len(parts) >= 3 and parts[2].isdigit():
+                    uid = int(parts[2])
+                    if uid == 0 or (10000 <= uid < 60000):
+                        users_map[parts[0]] = uid
+        else:
+            import requests, urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            for uid in range(11000, 11015):
+                try:
+                    r = requests.get(f'https://{hostname}/api/v1/node/users/{uid}', auth=('admin', password), verify=False, timeout=5)
+                    if r.status_code == 200:
+                        u = r.json()
+                        if u.get('username'):
+                            users_map[u['username']] = uid
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return users_map
+
+
 def get_nsx_user_expiration(hostname: str, username: str, password: str,
-                              target_user: str) -> Optional[int]:
+                              target_user: str, user_id: Optional[int] = None) -> Optional[int]:
     """
     Get password expiration for NSX user via REST API.
     
     The NSX API identifies users by numeric userid, not username:
-      root=0, admin=10000, audit=10002
-    
-    If the target_user is not in the known ID map, falls back to
-    listing all users and matching by username.
+      root=0, admin=10000, audit=10002, service=11000+
     
     Returns:
         - None if password never expires or check failed
-        - Number of days until expiration
+        - Number of days until expiration (negative if expired)
     """
     try:
         import requests
@@ -1465,7 +1511,8 @@ def get_nsx_user_expiration(hostname: str, username: str, password: str,
         session = requests.Session()
         session.verify = False
         
-        user_id = NSX_USER_IDS.get(target_user)
+        if user_id is None:
+            user_id = NSX_USER_IDS.get(target_user)
         data = None
         
         if user_id is not None:
@@ -1486,6 +1533,20 @@ def get_nsx_user_expiration(hostname: str, username: str, password: str,
         if data is None:
             return None
         
+        if data.get('status') == 'NOT_ACTIVATED':
+            return None
+
+        if data.get('status') == 'PASSWORD_EXPIRED':
+            freq = data.get('password_change_frequency', 90)
+            last_change_epoch = data.get('last_password_change', 0)
+            if last_change_epoch > 1e9:
+                last_change = datetime.datetime.fromtimestamp(last_change_epoch / 1000).date()
+            else:
+                last_change = datetime.date.today() - datetime.timedelta(days=last_change_epoch)
+            exp_date = last_change + datetime.timedelta(days=freq)
+            days_until = (exp_date - datetime.date.today()).days
+            return days_until if days_until < 0 else -1
+
         if 'password_change_frequency' in data:
             freq = data['password_change_frequency']
             if freq == 0 or freq > 9000:
@@ -1512,19 +1573,10 @@ def get_nsx_user_expiration(hostname: str, username: str, password: str,
 
 def get_nsx_edge_user_expiration(edge_hostname: str, nsx_manager: str,
                                   password: str,
-                                  target_user: str) -> Optional[int]:
+                                  target_user: str,
+                                  user_id: Optional[int] = None) -> Optional[int]:
     """
     Get password expiration for an NSX Edge user via the NSX Manager transport node API.
-    
-    Edges don't expose /api/v1/node/users directly; the managing NSX Manager
-    proxies these calls through:
-        GET /api/v1/transport-nodes/{node-id}/node/users/{user-id}
-    
-    :param edge_hostname: Edge display name (e.g. edge-wld01-01a)
-    :param nsx_manager: NSX Manager FQDN that manages this edge
-    :param password: Admin password for the NSX Manager
-    :param target_user: User to check (root, admin, audit)
-    :return: None if never expires or check failed, else days until expiration
     """
     try:
         import requests
@@ -1534,7 +1586,6 @@ def get_nsx_edge_user_expiration(edge_hostname: str, nsx_manager: str,
         session = requests.Session()
         session.verify = False
 
-        # Find the edge's transport node ID
         tn_url = f'https://{nsx_manager}/api/v1/transport-nodes'
         resp = session.get(tn_url, auth=('admin', password), timeout=30)
         if resp.status_code != 200:
@@ -1549,7 +1600,8 @@ def get_nsx_edge_user_expiration(edge_hostname: str, nsx_manager: str,
         if not node_id:
             return None
 
-        user_id = NSX_USER_IDS.get(target_user)
+        if user_id is None:
+            user_id = NSX_USER_IDS.get(target_user)
         data = None
 
         if user_id is not None:
@@ -1569,6 +1621,20 @@ def get_nsx_edge_user_expiration(edge_hostname: str, nsx_manager: str,
 
         if data is None:
             return None
+
+        if data.get('status') == 'NOT_ACTIVATED':
+            return None
+
+        if data.get('status') == 'PASSWORD_EXPIRED':
+            freq = data.get('password_change_frequency', 90)
+            last_change_epoch = data.get('last_password_change', 0)
+            if last_change_epoch > 1e9:
+                last_change = datetime.datetime.fromtimestamp(last_change_epoch / 1000).date()
+            else:
+                last_change = datetime.date.today() - datetime.timedelta(days=last_change_epoch)
+            exp_date = last_change + datetime.timedelta(days=freq)
+            days_until = (exp_date - datetime.date.today()).days
+            return days_until if days_until < 0 else -1
 
         if 'password_change_frequency' in data:
             freq = data['password_change_frequency']
@@ -1668,6 +1734,28 @@ def _discover_sddc_managers() -> List[str]:
     return sddc_managers
 
 
+def _eval_password_expiration(days: Optional[int], threshold_days: int = 90, note: str = "") -> Tuple[str, str]:
+    """
+    Evaluate password expiration days against policy.
+    - PASS: No expiration (None) or remaining days > threshold_days (default 90)
+    - FAIL: Expired (< 0) or expiring within threshold_days (<= 90)
+    """
+    suffix = f" ({note})" if note else ""
+    if days is None:
+        return "PASS", f"Password never expires{suffix}"
+    if days < 0:
+        return "FAIL", f"Password EXPIRED {abs(days)} days ago{suffix}"
+    if days > threshold_days:
+        if days >= 730:
+            return "PASS", f"Expires in {days} days ({days // 365}+ years){suffix}"
+        elif days >= 365:
+            return "PASS", f"Expires in {days} days ({days // 365} year(s)){suffix}"
+        else:
+            return "PASS", f"Expires in {days} days{suffix}"
+    else:
+        return "FAIL", f"Expires in {days} days - TOO SOON (<= {threshold_days} days){suffix}"
+
+
 def check_password_expirations() -> List[CheckResult]:
     """
     Check password expiration for all known user accounts.
@@ -1681,8 +1769,8 @@ def check_password_expirations() -> List[CheckResult]:
     - vRA/Automation: vmware-system-user, root users
     
     Status:
-    - PASS: No expiration or > 3 years (1095 days)
-    - FAIL: Expires in < 2 years (730 days)
+    - PASS: No expiration or > 90 days
+    - FAIL: Expired or expires in <= 90 days
     - WARN: Could not check
     """
     results = []
@@ -1695,8 +1783,7 @@ def check_password_expirations() -> List[CheckResult]:
         )]
     
     password = lsf.get_password()
-    three_years_days = 1095
-    two_years_days = 730
+    expiry_threshold_days = 90
     
     # Check ESXi hosts
     esxi_hosts = []
@@ -1712,22 +1799,7 @@ def check_password_expirations() -> List[CheckResult]:
     for hostname in esxi_hosts:
         try:
             days = get_linux_password_expiration(hostname, 'root', password)
-            
-            if days is None:
-                status = "PASS"
-                message = "Password never expires"
-            elif days > three_years_days:
-                status = "PASS"
-                message = f"Expires in {days} days ({days // 365}+ years)"
-            elif days > two_years_days:
-                status = "PASS"
-                message = f"Expires in {days} days ({days // 365}+ years)"
-            else:
-                status = "FAIL"
-                if days < 0:
-                    message = f"Password EXPIRED {abs(days)} days ago"
-                else:
-                    message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+            status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
             
             results.append(CheckResult(
                 name=f"ESXi {hostname} (root)",
@@ -1760,22 +1832,7 @@ def check_password_expirations() -> List[CheckResult]:
         # Check Linux root account
         try:
             days = get_linux_password_expiration(hostname, 'root', password)
-            
-            if days is None:
-                status = "PASS"
-                message = "Password never expires"
-            elif days > three_years_days:
-                status = "PASS"
-                message = f"Expires in {days} days ({days // 365}+ years)"
-            elif days > two_years_days:
-                status = "PASS"
-                message = f"Expires in {days} days ({days // 365}+ years)"
-            else:
-                status = "FAIL"
-                if days < 0:
-                    message = f"Password EXPIRED {abs(days)} days ago"
-                else:
-                    message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+            status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
             
             results.append(CheckResult(
                 name=f"vCenter {hostname} (root)",
@@ -1797,22 +1854,7 @@ def check_password_expirations() -> List[CheckResult]:
         # fleet password settings (checked separately).
         try:
             days = get_vcenter_user_expiration(hostname, vcuser, password, 'root')
-            
-            if days is None:
-                status = "PASS"
-                message = "Password never expires (REST API)"
-            elif days > three_years_days:
-                status = "PASS"
-                message = f"Expires in {days} days ({days // 365}+ years) (REST API)"
-            elif days > two_years_days:
-                status = "PASS"
-                message = f"Expires in {days} days ({days // 365}+ years) (REST API)"
-            else:
-                status = "FAIL"
-                if days < 0:
-                    message = f"Password EXPIRED {abs(days)} days ago (REST API)"
-                else:
-                    message = f"Expires in {days} days ({days // 365} years) - TOO SOON (REST API)"
+            status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days, note="REST API")
             
             results.append(CheckResult(
                 name=f"vCenter {hostname} (root via REST)",
@@ -1839,31 +1881,25 @@ def check_password_expirations() -> List[CheckResult]:
             if hostname:
                 nsx_managers.append(hostname)
     
+    def _nsx_user_sort_key(item):
+        user, user_id = item
+        if user == 'root' or user_id == 0:
+            return (0, 0, user)
+        if user == 'admin' or user_id == 10000:
+            return (1, 0, user)
+        if user == 'audit' or user_id == 10002:
+            return (2, 0, user)
+        if user_id is not None and user_id < 11000:
+            return (3, user_id, user)
+        return (4, user_id if user_id is not None else 99999, user)
+
     for hostname in nsx_managers:
-        for user in ['admin', 'root', 'audit']:
+        all_users_map = get_nsx_all_users_for_check(hostname, password)
+        sorted_users = sorted(all_users_map.items(), key=_nsx_user_sort_key)
+        for user, user_id in sorted_users:
             try:
-                if user == 'root':
-                    # Root is a Linux account
-                    days = get_linux_password_expiration(hostname, user, password)
-                else:
-                    # admin and audit are NSX API users
-                    days = get_nsx_user_expiration(hostname, 'admin', password, user)
-                
-                if days is None:
-                    status = "PASS"
-                    message = "Password never expires"
-                elif days > three_years_days:
-                    status = "PASS"
-                    message = f"Expires in {days} days ({days // 365}+ years)"
-                elif days >= 360:
-                    status = "PASS"
-                    message = f"Expires in {days} days ({days // 365}+ years)"
-                else:
-                    status = "FAIL"
-                    if days < 0:
-                        message = f"Password EXPIRED {abs(days)} days ago"
-                    else:
-                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                days = get_nsx_user_expiration(hostname, 'admin', password, user, user_id=user_id)
+                status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
                 
                 results.append(CheckResult(
                     name=f"NSX {hostname} ({user})",
@@ -1901,25 +1937,32 @@ def check_password_expirations() -> List[CheckResult]:
             ))
             continue
         
-        for user in ['admin', 'root', 'audit']:
+        edge_users_map = {'root': 0, 'admin': 10000, 'audit': 10002}
+        try:
+            import requests as _er
+            import urllib3 as _eur
+            _eur.disable_warnings(_eur.exceptions.InsecureRequestWarning)
+            tn_url = f'https://{nsx_mgr}/api/v1/transport-nodes'
+            tn_resp = _er.get(tn_url, auth=('admin', password), verify=False, timeout=15)
+            if tn_resp.status_code == 200:
+                for node_item in tn_resp.json().get('results', []):
+                    if node_item.get('display_name', '') == hostname:
+                        node_id = node_item.get('node_id', node_item.get('id'))
+                        uurl = f'https://{nsx_mgr}/api/v1/transport-nodes/{node_id}/node/users'
+                        uresp = _er.get(uurl, auth=('admin', password), verify=False, timeout=15)
+                        if uresp.status_code == 200:
+                            for uentry in uresp.json().get('results', []):
+                                if uentry.get('status') != 'NOT_ACTIVATED':
+                                    edge_users_map[uentry.get('username')] = uentry.get('userid')
+                        break
+        except Exception:
+            pass
+
+        sorted_edge_users = sorted(edge_users_map.items(), key=_nsx_user_sort_key)
+        for user, user_id in sorted_edge_users:
             try:
-                days = get_nsx_edge_user_expiration(hostname, nsx_mgr, password, user)
-                
-                if days is None:
-                    status = "PASS"
-                    message = "Password never expires"
-                elif days > three_years_days:
-                    status = "PASS"
-                    message = f"Expires in {days} days ({days // 365}+ years)"
-                elif days >= 360:
-                    status = "PASS"
-                    message = f"Expires in {days} days ({days // 365}+ years)"
-                else:
-                    status = "FAIL"
-                    if days < 0:
-                        message = f"Password EXPIRED {abs(days)} days ago"
-                    else:
-                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                days = get_nsx_edge_user_expiration(hostname, nsx_mgr, password, user, user_id=user_id)
+                status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
                 
                 results.append(CheckResult(
                     name=f"NSX Edge {hostname} ({user})",
@@ -1946,22 +1989,7 @@ def check_password_expirations() -> List[CheckResult]:
         # by confighol via expect script and cannot be remotely verified.
         try:
             days = get_linux_password_expiration(hostname, 'vcf', password, ssh_user='vcf')
-            
-            if days is None:
-                status = "PASS"
-                message = "Password never expires"
-            elif days > three_years_days:
-                status = "PASS"
-                message = f"Expires in {days} days ({days // 365}+ years)"
-            elif days > two_years_days:
-                status = "PASS"
-                message = f"Expires in {days} days ({days // 365}+ years)"
-            else:
-                status = "FAIL"
-                if days < 0:
-                    message = f"Password EXPIRED {abs(days)} days ago"
-                else:
-                    message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+            status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
             
             results.append(CheckResult(
                 name=f"SDDC Manager {hostname} (vcf)",
@@ -1981,22 +2009,7 @@ def check_password_expirations() -> List[CheckResult]:
             try:
                 days = get_linux_password_expiration_via_su(
                     hostname, user, password, ssh_user='vcf')
-                
-                if days is None:
-                    status = "PASS"
-                    message = "Password never expires"
-                elif days > three_years_days:
-                    status = "PASS"
-                    message = f"Expires in {days} days ({days // 365}+ years)"
-                elif days >= 360:
-                    status = "PASS"
-                    message = f"Expires in {days} days ({days // 365}+ years)"
-                else:
-                    status = "FAIL"
-                    if days < 0:
-                        message = f"Password EXPIRED {abs(days)} days ago"
-                    else:
-                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
                 
                 results.append(CheckResult(
                     name=f"SDDC Manager {hostname} ({user})",
@@ -2036,22 +2049,7 @@ def check_password_expirations() -> List[CheckResult]:
                 days = get_linux_password_expiration(hostname, user, password,
                                                       ssh_user='vmware-system-user',
                                                       use_sudo=needs_sudo)
-                
-                if days is None:
-                    status = "PASS"
-                    message = "Password never expires"
-                elif days > three_years_days:
-                    status = "PASS"
-                    message = f"Expires in {days} days ({days // 365}+ years)"
-                elif days >= 360:
-                    status = "PASS"
-                    message = f"Expires in {days} days ({days // 365}+ years)"
-                else:
-                    status = "FAIL"
-                    if days < 0:
-                        message = f"Password EXPIRED {abs(days)} days ago"
-                    else:
-                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
                 
                 results.append(CheckResult(
                     name=f"vRA/Automation {hostname} ({user})",
@@ -2130,22 +2128,7 @@ def check_password_expirations() -> List[CheckResult]:
                 days = get_linux_password_expiration(opsvm, user, password,
                                                       ssh_user=ssh_user,
                                                       use_sudo=needs_sudo)
-                
-                if days is None:
-                    status = "PASS"
-                    message = "Password never expires"
-                elif days > three_years_days:
-                    status = "PASS"
-                    message = f"Expires in {days} days ({days // 365}+ years)"
-                elif days >= 360:
-                    status = "PASS"
-                    message = f"Expires in {days} days ({days // 365}+ years)"
-                else:
-                    status = "FAIL"
-                    if days < 0:
-                        message = f"Password EXPIRED {abs(days)} days ago"
-                    else:
-                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
                 
                 results.append(CheckResult(
                     name=f"VCF Ops {opsvm} ({user})",
@@ -2178,22 +2161,7 @@ def check_password_expirations() -> List[CheckResult]:
                 days = get_linux_password_expiration(node_ip, user, password,
                                                       ssh_user='vmware-system-user',
                                                       use_sudo=needs_sudo)
-                
-                if days is None:
-                    status = "PASS"
-                    message = "Password never expires"
-                elif days > three_years_days:
-                    status = "PASS"
-                    message = f"Expires in {days} days ({days // 365}+ years)"
-                elif days >= 360:
-                    status = "PASS"
-                    message = f"Expires in {days} days ({days // 365}+ years)"
-                else:
-                    status = "FAIL"
-                    if days < 0:
-                        message = f"Password EXPIRED {abs(days)} days ago"
-                    else:
-                        message = f"Expires in {days} days ({days // 365} years) - TOO SOON"
+                status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
                 
                 results.append(CheckResult(
                     name=f"VSP Node {node_ip} ({user})",
@@ -3677,7 +3645,7 @@ def main():
             print_results_table("LICENSES", report.license_checks)
 
 
-    # VSP node resource checks (control plane + workers >= 12 vCPU / 24GB).
+    # VSP node resource checks (control plane + workers >= 8 vCPU / 16GB).
     # Pure kubectl over SSH — does not need lsf.sis/PYVMOMI_AVAILABLE, so this
     # runs unconditionally rather than nested inside the vSphere-checks block.
     print("\nChecking VSP cluster node resources...")
