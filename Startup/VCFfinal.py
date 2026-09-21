@@ -1,8 +1,45 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.49 - 2026-09-08
+# Version 6.3.56 - 2026-09-21
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.56 Changes:
+# - Removed redundant [VSPMONITOR] startup health report pass at the end of VCFfinal
+#   since vcf-lab-tuner.py installs and manages the ongoing drift keeper on the cluster.
+#
+# v6.3.55 Changes:
+# - Task 7: Prioritized NSX account processing (root -> admin -> audit -> system -> service
+#   accounts) ensuring root and admin accounts are valid before dependent accounts are accessed.
+#   Silenced urllib3/requests DEBUG logging and cleaned up output formatting to match transport
+#   node style with per-manager summary grouping.
+#
+# v6.3.54 Changes:
+# - Added single-instance PID lockfile (/tmp/VCFfinal.lock) with stale-process detection
+#   and session run-once marker (/tmp/VCFfinal.done) to guarantee VCFfinal only runs once
+#   during lab startup and prevents overlapping concurrent execution loops.
+#   Added --force / force=True parameter to allow intentional manual re-runs.
+#
+# v6.3.53 Changes:
+# - Task 7: Dynamically discover and remediate password expiration for all NSX Manager
+#   system and service accounts (UIDs 0, 10000+, 11000+). Uses dual-layer remediation
+#   (Linux shadow reset via root SSH chage + REST API PUT /api/v1/node/users/{uid})
+#   to un-expire and extend validity to 730 days for all service accounts (svc-sddcmanager-*,
+#   svc-ops-*, salt-minion-*, svc-vcfa_*, vra-nsx-*, svc-li-*, svc-ni-*).
+#   Expanded Edge/VNA transport node checks to process all node accounts.
+#
+# v6.3.52 Changes:
+# - Updated all vcf-lab-tuner.py calls across Task 2c (Supervisor), Task 2e (VSP),
+#   Task 4b/5 (VCFA), and Task 11 (VSP Health Monitor) to dynamically discover and
+#   remediate Site-B components when present (--site b).
+# - Task 2c: Supervisor API cluster_proxy_config loop across all active Supervisor vCenters.
+# v6.3.51 Changes:
+# - commented out legacy VCFA microservices checks that are now covered by the vcf-lab-tuner.py script.
+# v6.3.50 Changes:
+# - Task 7: Fixed NSX Manager and Edge/VNA transport-node password expiration checks
+#   to accurately compute remaining days until expiry (password_change_frequency - last_password_change)
+#   rather than comparing password_change_frequency directly or querying non-existent API keys.
+#   Prevents Edge node accounts from being skipped when policy is 90 days but remaining time is < 60 days.
 #
 # v6.3.49 Changes:
 # - Task 5: Trigger a background `vcf-lab-tuner.py --cluster vcfa --mode remediate` pass
@@ -576,6 +613,9 @@ logging.basicConfig(
     format='[%(asctime)s] %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
 
 # Opslogs background probe tracking state
 opslogs_probe_state = {
@@ -606,6 +646,93 @@ VCFC_URL_RETRY_DELAY = 60  # Seconds between retries
 WCP_POLL_INTERVAL = 30     # seconds between polls
 WCP_MAX_POLL_TIME = 1800   # 30 minutes maximum wait
 WCP_SCRIPT_TIMEOUT = 1860  # 31 minutes (slightly more than max poll to allow script cleanup)
+
+# Single-instance run lock & session completion markers
+LOCK_FILE = '/tmp/VCFfinal.lock'
+DONE_FILE = '/tmp/VCFfinal.done'
+
+
+def _pid_alive(pid):
+    """Check if a process with the given PID is currently alive."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def acquire_lock(lsf=None):
+    """
+    Acquire mutual exclusion lock for VCFfinal.
+    Returns True if lock acquired or reclaimed from a dead PID.
+    Returns False if another live process holds the lock.
+    """
+    my_pid = os.getpid()
+    try:
+        if os.path.isfile(LOCK_FILE):
+            existing_pid = None
+            try:
+                with open(LOCK_FILE, 'r') as f:
+                    content = f.read().strip()
+                if content.isdigit():
+                    existing_pid = int(content)
+            except Exception:
+                existing_pid = None
+
+            if existing_pid and existing_pid != my_pid and _pid_alive(existing_pid):
+                msg = f'VCFfinal is already running (PID {existing_pid}) — skipping execution to avoid duplicate startup runs'
+                if lsf:
+                    lsf.write_output(msg)
+                else:
+                    print(msg)
+                return False
+            elif existing_pid and existing_pid != my_pid:
+                msg = f'VCFfinal lock file held by dead PID {existing_pid} — reclaiming stale lock'
+                if lsf:
+                    lsf.write_output(msg)
+                else:
+                    print(msg)
+    except Exception:
+        pass
+
+    try:
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(my_pid))
+        return True
+    except Exception as e:
+        if lsf:
+            lsf.write_output(f'WARNING: Could not write VCFfinal lock file {LOCK_FILE}: {e}')
+        return True
+
+
+def release_lock():
+    """Release the VCFfinal lock file."""
+    try:
+        if os.path.isfile(LOCK_FILE):
+            try:
+                with open(LOCK_FILE, 'r') as f:
+                    content = f.read().strip()
+                if content.isdigit() and int(content) == os.getpid():
+                    os.remove(LOCK_FILE)
+            except Exception:
+                os.remove(LOCK_FILE)
+    except Exception:
+        pass
+
+
+def mark_completed():
+    """Mark VCFfinal as completed for the current boot session."""
+    try:
+        with open(DONE_FILE, 'w') as f:
+            f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} PID {os.getpid()}\n')
+    except Exception:
+        pass
+
+
+def is_already_completed():
+    """Check if VCFfinal has already completed in the current boot session."""
+    return os.path.isfile(DONE_FILE)
+
 
 #==============================================================================
 # HELPER FUNCTIONS
@@ -847,21 +974,12 @@ def check_supervisor_status_api(lsf, vcenter_host, sso_domain='wld.sso'):
 # MAIN FUNCTION
 #==============================================================================
 
-def main(lsf=None, standalone=False, dry_run=False):
+def _run_vcffinal(lsf, standalone=False, dry_run=False):
     """
-    Main entry point for VCFfinal module
-    
-    :param lsf: lsfunctions module (will be imported if None)
-    :param standalone: Whether running in standalone test mode
-    :param dry_run: Whether to skip actual changes
+    Internal execution logic for VCFfinal module.
     """
     from pyVim import connect
     from pyVmomi import vim
-    
-    if lsf is None:
-        import lsfunctions as lsf
-        if not standalone:
-            lsf.init(router=False)
     
     # Verify VCF section exists (checks if VCF module was relevant)
     # We check VCFFINAL section for specific tasks
@@ -1344,6 +1462,8 @@ def main(lsf=None, standalone=False, dry_run=False):
                     env = os.environ.copy()
                     env['PYTHONUNBUFFERED'] = '1'
                     _tuner_cmd = ['python3', '-u', vcf_lab_tuner_script, '--cluster', 'supervisor', '--mode', 'remediate']
+                    if dry_run:
+                        _tuner_cmd.append('--dry-run')
                     proc = subprocess.Popen(
                         _tuner_cmd,
                         stdout=subprocess.PIPE,
@@ -1372,22 +1492,25 @@ def main(lsf=None, standalone=False, dry_run=False):
 
                     # ---- Target 3: Supervisor API cluster_proxy_config (SET or CLEAR) ----
                     # Runs after stabilizer so the vCenter API is reachable.
-                    _wld_vc_for_proxy = wcp_vcenter if wcp_vcenter else 'vc-wld01-a.site-a.vcf.lab'
-                    try:
-                        if _proxy_required:
-                            lsf.write_output('  Configuring Supervisor API proxy (Target 3)...')
-                            lsf.set_supervisor_api_proxy(
-                                _wld_vc_for_proxy, 'administrator@wld.sso',
-                                lsf.get_password(), dry_run=dry_run,
-                            )
-                        else:
-                            lsf.write_output('  Clearing Supervisor API proxy (Target 3)...')
-                            lsf.clear_supervisor_api_proxy(
-                                _wld_vc_for_proxy, 'administrator@wld.sso',
-                                lsf.get_password(), dry_run=dry_run,
-                            )
-                    except Exception as _t3_err:
-                        lsf.write_output(f'  WARNING: Supervisor API proxy step skipped: {_t3_err}')
+                    # Loops over all vCenters where active Supervisors were discovered.
+                    _target_vcs = wcp_active_vcenters if wcp_active_vcenters else ([wcp_vcenter] if wcp_vcenter else ['vc-wld01-a.site-a.vcf.lab'])
+                    for _target_vc in _target_vcs:
+                        try:
+                            _sso_user = 'administrator@wld.sso' if 'wld' in _target_vc.lower() else 'administrator@vsphere.local'
+                            if _proxy_required:
+                                lsf.write_output(f'  Configuring Supervisor API proxy on {_target_vc} (Target 3)...')
+                                lsf.set_supervisor_api_proxy(
+                                    _target_vc, _sso_user,
+                                    lsf.get_password(), dry_run=dry_run,
+                                )
+                            else:
+                                lsf.write_output(f'  Clearing Supervisor API proxy on {_target_vc} (Target 3)...')
+                                lsf.clear_supervisor_api_proxy(
+                                    _target_vc, _sso_user,
+                                    lsf.get_password(), dry_run=dry_run,
+                                )
+                        except Exception as _t3_err:
+                            lsf.write_output(f'  WARNING: Supervisor API proxy step on {_target_vc} skipped: {_t3_err}')
 
                 except Exception as wcp_err:
                     lsf.write_output(f'WARNING: Error running Supervisor lab tuner script: {wcp_err}')
@@ -2547,92 +2670,113 @@ echo "PROXY_CONFIGURED"
                 # ---- K8s Cert Renewal, CP Sizing, and VSP Pre-flight/Tuning via vcf-lab-tuner.py ----
                 _vlt_script = '/home/holuser/hol/Tools/vcf-lab-tuner.py'
                 if os.path.isfile(_vlt_script):
-                    lsf.write_output('  Running VSP stabilization pass via vcf-lab-tuner.py...')
+                    # Discover all active VSP cluster sites (Site-A: 10.1.1.142, Site-B: 10.2.1.142)
+                    _vsp_sites = []
+                    if lsf.test_tcp_port('10.1.1.142', 22, timeout=3) or lsf.test_ping('10.1.1.142'):
+                        _vsp_sites.append(('a', 'Site-A (10.1.1.142)'))
+                    if lsf.test_tcp_port('10.2.1.142', 22, timeout=3) or lsf.test_ping('10.2.1.142'):
+                        _vsp_sites.append(('b', 'Site-B (10.2.1.142)'))
+                    if not _vsp_sites:
+                        _vsp_sites.append(('a', 'Site-A (10.1.1.142)'))
+
+                    lsf.write_output(f'  Running VSP stabilization pass via vcf-lab-tuner.py on {len(_vsp_sites)} site(s)...')
                     if dashboard:
                         dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.RUNNING)
                         dashboard.generate_html()
-                    try:
-                        _vlt_cmd = [
-                            'python3', '-u', _vlt_script,
-                            '--cluster', 'vsp',
-                            '--mode', 'remediate',
-                            '--install-keeper',
-                            '--purge-legacy-keepers'
-                        ]
-                        if dry_run:
-                            _vlt_cmd.append('--dry-run')
-                        _vlt_env = os.environ.copy()
-                        _vlt_env['PYTHONUNBUFFERED'] = '1'
-                        _vlt_proc = subprocess.Popen(
-                            _vlt_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1, env=_vlt_env
-                        )
-                        for _vlt_line in _vlt_proc.stdout:
-                            _vlt_line = _vlt_line.rstrip('\n')
-                            if _vlt_line.strip():
-                                lsf.write_output(f'  {_vlt_line.strip()}')
-                        _vlt_proc.wait()
 
-                        if _vlt_proc.returncode in (0, None):
-                            if dashboard:
-                                dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.COMPLETE, 'K8s cert check complete')
-                                dashboard.generate_html()
-                        else:
-                            lsf.write_output(f'  WARNING: vcf-lab-tuner.py exited {_vlt_proc.returncode} — continuing')
-                            if dashboard:
-                                dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.FAILED, f'Exited {_vlt_proc.returncode}')
-                                dashboard.generate_html()
-
-                        # Sizing pass specifically for CP machine type tuning (gated by config.ini [VCFFINAL] set_vsp_cp_to_medium)
-                        _resize_vsp_cp = False
-                        if lsf.config.has_section('VCFFINAL') and lsf.config.has_option('VCFFINAL', 'set_vsp_cp_to_medium'):
-                            _set_vsp_cp_raw = lsf.config.get('VCFFINAL', 'set_vsp_cp_to_medium', fallback='disabled').strip().lower()
-                            if _set_vsp_cp_raw in ('enabled', 'true', '1', 'yes', 'on'):
-                                _resize_vsp_cp = True
-
-                        if _resize_vsp_cp:
-                            lsf.write_output('  Resizing VSP Control Plane to cp.medium via vcf-lab-tuner.py...')
-                            if dashboard:
-                                dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.RUNNING)
-                                dashboard.generate_html()
-                            _vlt_size_cmd = [
+                    _all_vsp_ok = True
+                    for _vsp_site_key, _vsp_site_label in _vsp_sites:
+                        lsf.write_output(f'  --- Stabilizing VSP on {_vsp_site_label} ---')
+                        try:
+                            _vlt_cmd = [
                                 'python3', '-u', _vlt_script,
                                 '--cluster', 'vsp',
+                                '--site', _vsp_site_key,
                                 '--mode', 'remediate',
-                                '--section', 'sizing',
-                                '--cp-machine-type', 'cp.medium'
+                                '--install-keeper',
+                                '--purge-legacy-keepers'
                             ]
                             if dry_run:
-                                _vlt_size_cmd.append('--dry-run')
-                            _vlt_size_proc = subprocess.Popen(
-                                _vlt_size_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                _vlt_cmd.append('--dry-run')
+                            _vlt_env = os.environ.copy()
+                            _vlt_env['PYTHONUNBUFFERED'] = '1'
+                            _vlt_proc = subprocess.Popen(
+                                _vlt_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1, env=_vlt_env
                             )
-                            for _vlt_line in _vlt_size_proc.stdout:
+                            for _vlt_line in _vlt_proc.stdout:
                                 _vlt_line = _vlt_line.rstrip('\n')
                                 if _vlt_line.strip():
-                                    lsf.write_output(f'  {_vlt_line.strip()}')
-                            _vlt_size_proc.wait()
+                                    lsf.write_output(f'    {_vlt_line.strip()}')
+                            _vlt_proc.wait()
 
-                            if _vlt_size_proc.returncode in (0, None):
-                                if dashboard:
-                                    dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.COMPLETE, 'CP machine type set to cp.medium')
-                                    dashboard.generate_html()
-                            else:
-                                lsf.write_output(f'  WARNING: vcf-lab-tuner.py sizing exited {_vlt_size_proc.returncode} — continuing')
-                                if dashboard:
-                                    dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.FAILED, f'Exited {_vlt_size_proc.returncode}')
-                                    dashboard.generate_html()
+                            if _vlt_proc.returncode not in (0, None):
+                                lsf.write_output(f'  WARNING: vcf-lab-tuner.py on {_vsp_site_label} exited {_vlt_proc.returncode} — continuing')
+                                _all_vsp_ok = False
+                        except Exception as _vlt_exc:
+                            lsf.write_output(f'  WARNING: vcf-lab-tuner.py execution failed on {_vsp_site_label}: {_vlt_exc}')
+                            _all_vsp_ok = False
+
+                    if dashboard:
+                        if _all_vsp_ok:
+                            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.COMPLETE, 'K8s cert check complete')
                         else:
-                            lsf.write_output('  VSP CP resize to cp.medium not enabled in [VCFFINAL] set_vsp_cp_to_medium — skipping')
-                            if dashboard:
-                                dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.SKIPPED, 'Disabled in config.ini')
-                                dashboard.generate_html()
-                    except Exception as _vlt_exc:
-                        lsf.write_output(f'  WARNING: vcf-lab-tuner.py execution failed: {_vlt_exc}')
+                            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.FAILED, 'One or more VSP clusters had warnings/errors')
+                        dashboard.generate_html()
+
+                    # Sizing pass specifically for CP machine type tuning (gated by config.ini [VCFFINAL] set_vsp_cp_to_medium)
+                    _resize_vsp_cp = False
+                    if lsf.config.has_section('VCFFINAL') and lsf.config.has_option('VCFFINAL', 'set_vsp_cp_to_medium'):
+                        _set_vsp_cp_raw = lsf.config.get('VCFFINAL', 'set_vsp_cp_to_medium', fallback='disabled').strip().lower()
+                        if _set_vsp_cp_raw in ('enabled', 'true', '1', 'yes', 'on'):
+                            _resize_vsp_cp = True
+
+                    if _resize_vsp_cp:
+                        lsf.write_output(f'  Resizing VSP Control Plane to cp.medium via vcf-lab-tuner.py on {len(_vsp_sites)} site(s)...')
                         if dashboard:
-                            dashboard.update_task('vcffinal', 'k8s_certs', TaskStatus.FAILED, f'Failed: {_vlt_exc}')
-                            dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.FAILED, f'Failed: {_vlt_exc}')
+                            dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.RUNNING)
+                            dashboard.generate_html()
+                        _all_size_ok = True
+                        for _vsp_site_key, _vsp_site_label in _vsp_sites:
+                            lsf.write_output(f'  --- Resizing VSP CP on {_vsp_site_label} ---')
+                            try:
+                                _vlt_size_cmd = [
+                                    'python3', '-u', _vlt_script,
+                                    '--cluster', 'vsp',
+                                    '--site', _vsp_site_key,
+                                    '--mode', 'remediate',
+                                    '--section', 'sizing',
+                                    '--cp-machine-type', 'cp.medium'
+                                ]
+                                if dry_run:
+                                    _vlt_size_cmd.append('--dry-run')
+                                _vlt_size_proc = subprocess.Popen(
+                                    _vlt_size_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1, env=_vlt_env
+                                )
+                                for _vlt_line in _vlt_size_proc.stdout:
+                                    _vlt_line = _vlt_line.rstrip('\n')
+                                    if _vlt_line.strip():
+                                        lsf.write_output(f'    {_vlt_line.strip()}')
+                                _vlt_size_proc.wait()
+
+                                if _vlt_size_proc.returncode not in (0, None):
+                                    lsf.write_output(f'  WARNING: vcf-lab-tuner.py sizing on {_vsp_site_label} exited {_vlt_size_proc.returncode} — continuing')
+                                    _all_size_ok = False
+                            except Exception as _size_exc:
+                                lsf.write_output(f'  WARNING: vcf-lab-tuner.py sizing failed on {_vsp_site_label}: {_size_exc}')
+                                _all_size_ok = False
+
+                        if dashboard:
+                            if _all_size_ok:
+                                dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.COMPLETE, 'CP machine type set to cp.medium')
+                            else:
+                                dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.FAILED, 'CP resize failed on one or more sites')
+                            dashboard.generate_html()
+                    else:
+                        lsf.write_output('  VSP CP resize to cp.medium not enabled in [VCFFINAL] set_vsp_cp_to_medium — skipping')
+                        if dashboard:
+                            dashboard.update_task('vcffinal', 'vsp_cp_resize', TaskStatus.SKIPPED, 'Disabled in config.ini')
                             dashboard.generate_html()
                 else:
                     lsf.write_output(f'  vcf-lab-tuner.py not found: {_vlt_script} — skipping')
@@ -3259,14 +3403,12 @@ echo "PROXY_CONFIGURED"
                         lsf.write_output(f'  WARNING: Could not parse component JSON: {je}')
 
                 # ---- CSI controller vCenter-auth pre-flight ----
-                # Unconditional -- deliberately NOT gated by [VSPMONITOR] enabled like the
-                # general VSP Health Monitor pass later in this module. A stale vCenter SSO
-                # password on the CSI service account leaves vsphere-csi-controller
-                # CrashLoopBackOff, which stalls FailedAttachVolume for every PVC-backed pod
-                # we're about to scale up below (first observed: ops-logs log-store/
-                # log-processor hanging the scale-up wait for its full 20-minute timeout).
-                # Must run BEFORE the scale-up, not after -- see Tools/vsp-health/
-                # vsp-health-monitor.py's check_csi_controller() for the fix itself.
+                # A stale vCenter SSO password on the CSI service account leaves
+                # vsphere-csi-controller CrashLoopBackOff, which stalls FailedAttachVolume
+                # for every PVC-backed pod we're about to scale up below (first observed:
+                # ops-logs log-store/log-processor hanging the scale-up wait for its full
+                # 20-minute timeout). Must run BEFORE the scale-up, not after -- see
+                # Tools/vsp-health/vsp-health-monitor.py's check_csi_controller() for the fix.
                 _csi_preflight_script = '/home/holuser/hol/Tools/vsp-health/vsp-health-monitor.py'
                 if os.path.isfile(_csi_preflight_script):
                     try:
@@ -4078,21 +4220,34 @@ echo "PROXY_CONFIGURED"
         try:
             password = lsf.get_password()
             
-            # Auto-detect K8s API IP from known VCF Automation IPs
+            # Auto-detect VCFA cluster sites (Site-A: 10.1.1.72/71/73/74, Site-B: 10.2.1.72/71/73/74)
+            vcfa_sites = []
             for candidate_ip in ['10.1.1.72', '10.1.1.71', '10.1.1.73', '10.1.1.74']:
-                if lsf.test_tcp_port(candidate_ip, 22, timeout=5):
+                if lsf.test_tcp_port(candidate_ip, 22, timeout=3):
+                    vcfa_sites.append(('a', candidate_ip, 'Site-A'))
                     vcfa_k8s_ip = candidate_ip
                     break
+            for candidate_ip in ['10.2.1.72', '10.2.1.71', '10.2.1.73', '10.2.1.74']:
+                if lsf.test_tcp_port(candidate_ip, 22, timeout=3):
+                    vcfa_sites.append(('b', candidate_ip, 'Site-B'))
+                    break
+
+            if not vcfa_sites:
+                has_a = any('site-a' in vm.lower() or 'auto-a' in vm.lower() for vm in vravms) or any('site-a' in u.lower() or 'auto-a' in u.lower() for u in vraurls)
+                has_b = any('site-b' in vm.lower() or 'auto-b' in vm.lower() for vm in vravms) or any('site-b' in u.lower() or 'auto-b' in u.lower() for u in vraurls)
+                if has_a or (not has_a and not has_b):
+                    vcfa_sites.append(('a', '10.1.1.72', 'Site-A'))
+                if has_b:
+                    vcfa_sites.append(('b', '10.2.1.72', 'Site-B'))
             
-            lsf.write_output(f'VCF Automation K8s API node: {vcfa_k8s_ip}')
+            lsf.write_output(f'VCF Automation K8s API node: {vcfa_k8s_ip} (found {len(vcfa_sites)} site(s))')
             
-            if not lsf.test_tcp_port(vcfa_k8s_ip, 22, timeout=10):
-                lsf.write_output('WARNING: VCF Automation K8s node not reachable via SSH')
+            _reachable_sites = [s for s in vcfa_sites if lsf.test_tcp_port(s[1], 22, timeout=5)]
+            if not _reachable_sites:
+                lsf.write_output('WARNING: No VCF Automation K8s nodes reachable via SSH')
                 vcfa_k8s_remediation_ok = False
             else:
-                _chage_hosts_raw = []
-                if vcfa_k8s_ip and vcfa_k8s_ip not in _chage_hosts_raw:
-                    _chage_hosts_raw.append(vcfa_k8s_ip)
+                _chage_hosts_raw = [s[1] for s in vcfa_sites]
                 
                 # VCF Automation hosts from vraurls
                 for _us in lsf.get_config_list('VCFFINAL', 'vraurls'):
@@ -4171,44 +4326,50 @@ echo "PROXY_CONFIGURED"
                         for _f in as_completed(_chage_futures):
                             _f.result()
 
-                # ---- Run vcf-lab-tuner.py for complete VCFA stabilization & cert check ----
+                # ---- Run vcf-lab-tuner.py for complete VCFA stabilization & cert check across sites ----
                 _vlt_script = '/home/holuser/hol/Tools/vcf-lab-tuner.py'
                 if os.path.isfile(_vlt_script):
-                    lsf.write_output('Running VCFA stabilization pass via vcf-lab-tuner.py...')
-                    try:
-                        _vcfa_cmd = [
-                            'python3', '-u', _vlt_script,
-                            '--cluster', 'vcfa',
-                            '--mode', 'remediate',
-                            '--install-keeper',
-                            '--purge-legacy-keepers'
-                        ]
-                        if dry_run:
-                            _vcfa_cmd.append('--dry-run')
-                        _vcfa_env = os.environ.copy()
-                        _vcfa_env['PYTHONUNBUFFERED'] = '1'
-                        _vcfa_proc = subprocess.Popen(
-                            _vcfa_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1, env=_vcfa_env
-                        )
-                        for _vcfa_line in _vcfa_proc.stdout:
-                            _vcfa_line = _vcfa_line.rstrip('\n')
-                            if _vcfa_line.strip():
-                                lsf.write_output(f'  {_vcfa_line.strip()}')
-                        _vcfa_proc.wait(timeout=1800)
+                    lsf.write_output(f'Running VCFA stabilization pass via vcf-lab-tuner.py on {len(vcfa_sites)} site(s)...')
+                    _all_vcfa_ok = True
+                    for _vcfa_site_key, _vcfa_site_ip, _vcfa_site_label in vcfa_sites:
+                        lsf.write_output(f'  --- Stabilizing VCFA on {_vcfa_site_label} ({_vcfa_site_ip}) ---')
+                        try:
+                            _vcfa_cmd = [
+                                'python3', '-u', _vlt_script,
+                                '--cluster', 'vcfa',
+                                '--site', _vcfa_site_key,
+                                '--mode', 'remediate',
+                                '--install-keeper',
+                                '--purge-legacy-keepers'
+                            ]
+                            if dry_run:
+                                _vcfa_cmd.append('--dry-run')
+                            _vcfa_env = os.environ.copy()
+                            _vcfa_env['PYTHONUNBUFFERED'] = '1'
+                            _vcfa_proc = subprocess.Popen(
+                                _vcfa_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1, env=_vcfa_env
+                            )
+                            for _vcfa_line in _vcfa_proc.stdout:
+                                _vcfa_line = _vcfa_line.rstrip('\n')
+                                if _vcfa_line.strip():
+                                    lsf.write_output(f'    {_vcfa_line.strip()}')
+                            _vcfa_proc.wait(timeout=1800)
 
-                        if _vcfa_proc.returncode in (0, None):
-                            vcfa_k8s_remediation_ok = True
-                        else:
-                            lsf.write_output(f'  WARNING: vcf-lab-tuner.py exited {_vcfa_proc.returncode} — continuing')
-                            vcfa_k8s_remediation_ok = False
-                    except subprocess.TimeoutExpired:
-                        _vcfa_proc.kill()
-                        lsf.write_output('  WARNING: VCFA lab tuner script timed out')
-                        vcfa_k8s_remediation_ok = False
-                    except Exception as _vcfa_exc:
-                        lsf.write_output(f'  WARNING: vcf-lab-tuner.py execution failed: {_vcfa_exc}')
-                        vcfa_k8s_remediation_ok = False
+                            if _vcfa_proc.returncode in (0, None):
+                                lsf.write_output(f'  VCFA stabilization on {_vcfa_site_label} completed successfully')
+                            else:
+                                lsf.write_output(f'  WARNING: vcf-lab-tuner.py on {_vcfa_site_label} exited {_vcfa_proc.returncode} — continuing')
+                                _all_vcfa_ok = False
+                        except subprocess.TimeoutExpired:
+                            _vcfa_proc.kill()
+                            lsf.write_output(f'  WARNING: VCFA lab tuner script on {_vcfa_site_label} timed out')
+                            _all_vcfa_ok = False
+                        except Exception as _vcfa_exc:
+                            lsf.write_output(f'  WARNING: vcf-lab-tuner.py execution failed on {_vcfa_site_label}: {_vcfa_exc}')
+                            _all_vcfa_ok = False
+
+                    vcfa_k8s_remediation_ok = _all_vcfa_ok
                 else:
                     lsf.write_output(f'  vcf-lab-tuner.py not found: {_vlt_script} — skipping')
                     vcfa_k8s_remediation_ok = False
@@ -4286,13 +4447,15 @@ echo "PROXY_CONFIGURED"
                                 _vlt_script = '/home/holuser/hol/Tools/vcf-lab-tuner.py'
                                 if os.path.isfile(_vlt_script):
                                     try:
+                                        _vcfa_site = 'b' if ('site-b' in url.lower() or '10.2.1.' in url or 'auto-b' in url.lower()) else 'a'
                                         lsf.write_output(
-                                            '  [ATTEMPT 5 REMEDIATION] Triggering background '
-                                            'vcf-lab-tuner.py remediate on VCFA...'
+                                            f'  [ATTEMPT 5 REMEDIATION] Triggering background '
+                                            f'vcf-lab-tuner.py remediate on VCFA (Site-{_vcfa_site.upper()})...'
                                         )
                                         _vcfa_bg_cmd = [
                                             'python3', '-u', _vlt_script,
                                             '--cluster', 'vcfa',
+                                            '--site', _vcfa_site,
                                             '--mode', 'remediate',
                                         ]
                                         if dry_run:
@@ -4463,15 +4626,15 @@ echo "PROXY_CONFIGURED"
         """Return days until NSX user password expires via REST API.
 
         Returns:
-            int  > 0               — days remaining until expiry
-            0                      — NSX "no expiry" sentinel in response
-            None                   — key absent from response (no expiry configured)
+            int  >= 0              — days remaining until expiry
+            None                   — password does not expire (frequency=0 or not configured)
             _NSX_EXPIRY_API_ERROR  — REST call failed; caller should update
         """
         import urllib.request as _ureq
         import ssl as _ssl
         import base64 as _b64
         import json as _json
+        import datetime as _dt
         uid = _nsx_user_id.get(username)
         if uid is None:
             return None
@@ -4486,8 +4649,19 @@ echo "PROXY_CONFIGURED"
         )
         try:
             with _ureq.urlopen(_req, timeout=10, context=_ctx) as _r:
-                return _json.loads(_r.read().decode()).get(
-                    'days_until_password_expiry')
+                data = _json.loads(_r.read().decode())
+                freq = data.get('password_change_frequency')
+                if freq is None or freq == 0 or freq > 9000:
+                    return None
+                last_change = data.get('last_password_change')
+                if last_change is not None:
+                    if last_change > 1e9:
+                        last_change_date = _dt.datetime.fromtimestamp(last_change / 1000).date()
+                        exp_date = last_change_date + _dt.timedelta(days=freq)
+                        return max(0, (exp_date - _dt.date.today()).days)
+                    else:
+                        return max(0, freq - last_change)
+                return freq
         except Exception:
             return _NSX_EXPIRY_API_ERROR
 
@@ -4498,55 +4672,164 @@ echo "PROXY_CONFIGURED"
         )
         lsf.write_vpodprogress('NSX Password Config', 'GOOD-8')
 
+        # Suppress noisy HTTP connection debug logging from urllib3/requests during API probing
+        logging.getLogger('urllib3').setLevel(logging.WARNING)
+        logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
+        logging.getLogger('requests').setLevel(logging.WARNING)
+
+        def _nsx_user_sort_key(item):
+            """
+            Sort NSX users with priority:
+            1. root (UID 0)
+            2. admin (UID 10000)
+            3. audit (UID 10002)
+            4. Other system / guest accounts (UID 10000-10999)
+            5. Service accounts (UID 11000+)
+            """
+            uname, uid = item
+            if uname == 'root' or uid == 0:
+                return (0, 0, uname)
+            if uname == 'admin' or uid == 10000:
+                return (1, 0, uname)
+            if uname == 'audit' or uid == 10002:
+                return (2, 0, uname)
+            if uid < 11000:
+                return (3, uid, uname)
+            return (4, uid, uname)
+
+        def _get_nsx_all_users(nsx_fqdn, pwd):
+            """Discover all system and service accounts on NSX Manager."""
+            users_map = {'root': 0, 'admin': 10000, 'audit': 10002}
+            res = lsf.ssh('cat /etc/passwd', f'root@{nsx_fqdn}', pwd)
+            if res.returncode == 0 and getattr(res, 'stdout', None):
+                for line in res.stdout.strip().splitlines():
+                    parts = line.strip().split(':')
+                    if len(parts) >= 3 and parts[2].isdigit():
+                        uid = int(parts[2])
+                        if uid == 0 or (10000 <= uid < 60000):
+                            users_map[parts[0]] = uid
+            else:
+                import requests as _r_req
+                import urllib3 as _r_u3
+                _r_u3.disable_warnings(_r_u3.exceptions.InsecureRequestWarning)
+                for uid in range(11000, 11015):
+                    try:
+                        r = _r_req.get(f'https://{nsx_fqdn}/api/v1/node/users/{uid}', auth=('admin', pwd), verify=False, timeout=5)
+                        if r.status_code == 200:
+                            u = r.json()
+                            if u.get('username'):
+                                users_map[u['username']] = uid
+                    except Exception:
+                        pass
+            return users_map
+
         def _process_nsx_mgr_node(entry):
             nonlocal nsx_task_failed
             nsx_host = entry.split(':')[0].strip()
+            if not nsx_host or nsx_host.startswith('#'):
+                return
             nsx_fqdn = resolve_host_fqdn(nsx_host)
             lsf.write_output(f'  -> {nsx_fqdn}')
 
             if not dry_run:
                 if not lsf.test_tcp_port(nsx_fqdn, 22, timeout=5):
-                    lsf.write_output(f'     [!] {nsx_fqdn}: SSH not reachable — skipping')
+                    lsf.write_output(f'     [!] SSH not reachable — skipping')
                     return
 
-                for user in nsx_users:
-                    uid_str = str(_nsx_user_id.get(user, '?'))
-                    current = _nsx_days_until_expiry(nsx_fqdn, password, user)
+                all_users = _get_nsx_all_users(nsx_fqdn, password)
+                sorted_users = sorted(all_users.items(), key=_nsx_user_sort_key)
 
-                    if current == _NSX_EXPIRY_API_ERROR:
-                        current_display = 'check-failed'
-                    elif current is None:
-                        current_display = 'no-expiry'
-                    elif current > nsx_expiry_threshold_days:
-                        lsf.write_output(
-                            f'     [~] {nsx_fqdn} {user} (id={uid_str}): {current}d — '
+                import requests as _mgr_req
+                import urllib3 as _mgr_urllib3
+                import datetime as _mgr_dt
+                _mgr_urllib3.disable_warnings(_mgr_urllib3.exceptions.InsecureRequestWarning)
+                _mgr_auth = ('admin', password)
+
+                summary_lines = []
+
+                for uname, uid in sorted_users:
+                    uid_str = str(uid)
+                    try:
+                        r = _mgr_req.get(
+                            f'https://{nsx_fqdn}/api/v1/node/users/{uid}',
+                            auth=_mgr_auth, verify=False, timeout=15
+                        )
+                        user_data = r.json() if r.status_code == 200 else {}
+                    except Exception:
+                        user_data = {}
+
+                    status = user_data.get('status', 'UNKNOWN')
+                    if status == 'NOT_ACTIVATED':
+                        continue
+
+                    freq = user_data.get('password_change_frequency')
+                    last_change = user_data.get('last_password_change')
+
+                    days_until = None
+                    if freq is not None and freq > 0 and freq <= 9000:
+                        if last_change is not None:
+                            if last_change > 1e9:
+                                last_change_date = _mgr_dt.datetime.fromtimestamp(last_change / 1000).date()
+                                exp_date = last_change_date + _mgr_dt.timedelta(days=freq)
+                                days_until = max(0, (exp_date - _mgr_dt.date.today()).days)
+                            else:
+                                days_until = max(0, freq - last_change)
+                        else:
+                            days_until = freq
+
+                    is_expired = (status == 'PASSWORD_EXPIRED')
+                    needs_update = (is_expired or (days_until is not None and days_until <= nsx_expiry_threshold_days))
+
+                    if not needs_update and days_until is not None:
+                        summary_lines.append(
+                            f'     [~] {uname} (id={uid_str}): {days_until}d — '
                             f'skip (> {nsx_expiry_threshold_days}d threshold)')
                         continue
-                    else:
-                        current_display = f'{current}d'
 
-                    result = lsf.ssh(
-                        f'set user {user} password-expiration {nsx_expiry_days}',
-                        f'admin@{nsx_fqdn}', password
-                    )
-                    if result.returncode == 0:
-                        lsf.write_output(
-                            f'     [+] {nsx_fqdn} {user} (id={uid_str}): '
+                    current_display = 'PASSWORD_EXPIRED' if is_expired else ('no-expiry' if days_until is None else f'{days_until}d')
+
+                    # 1. Dual-layer remediation: Linux shadow reset via SSH chage
+                    chage_cmd = f'chage -d $(date +%Y-%m-%d) -M {nsx_expiry_days} {uname}'
+                    chage_res = lsf.ssh(chage_cmd, f'root@{nsx_fqdn}', password)
+
+                    # 2. NSX REST API update
+                    api_ok = False
+                    try:
+                        presp = _mgr_req.put(
+                            f'https://{nsx_fqdn}/api/v1/node/users/{uid}',
+                            json={'password_change_frequency': nsx_expiry_days},
+                            auth=_mgr_auth, verify=False, timeout=15
+                        )
+                        if presp.status_code == 200:
+                            api_ok = True
+                    except Exception:
+                        pass
+
+                    # 3. CLI update for admin/root/audit if needed
+                    if uname in ('admin', 'root', 'audit'):
+                        lsf.ssh(
+                            f'set user {uname} password-expiration {nsx_expiry_days}',
+                            f'admin@{nsx_fqdn}', password
+                        )
+
+                    if chage_res.returncode == 0 or api_ok:
+                        summary_lines.append(
+                            f'     [+] {uname} (id={uid_str}): '
                             f'{current_display} -> {nsx_expiry_days}d  [OK]')
                     else:
-                        lsf.write_output(
-                            f'     [-] {nsx_fqdn} {user} (id={uid_str}): FAILED '
-                            f'(exit {result.returncode})')
+                        summary_lines.append(
+                            f'     [-] {uname} (id={uid_str}): FAILED')
                         nsx_task_failed = True
+
+                for line in summary_lines:
+                    lsf.write_output(line)
             else:
                 lsf.write_output(
-                    f'     [DRY-RUN] {nsx_fqdn}: Would check/set user expiry '
+                    f'     [DRY-RUN] Would check/set user expiry for all users '
                     f'(threshold: {nsx_expiry_threshold_days}d -> {nsx_expiry_days}d)')
 
-        with ThreadPoolExecutor(max_workers=max(1, len(nsx_mgr_entries))) as nsx_exec:
-            nsx_futures = [nsx_exec.submit(_process_nsx_mgr_node, entry) for entry in nsx_mgr_entries]
-            for _f in as_completed(nsx_futures):
-                _f.result()
+        for entry in nsx_mgr_entries:
+            _process_nsx_mgr_node(entry)
 
     # ---- NSX VNA/Edge transport-node password expiration ----------------
     # Transport-nodes proxy API — no SSH to edge/VNA nodes required.
@@ -4555,13 +4838,28 @@ echo "PROXY_CONFIGURED"
         if not dry_run:
             import requests as _vna_req
             import urllib3 as _vna_urllib3
+            import datetime as _vna_dt
             _vna_urllib3.disable_warnings(
                 _vna_urllib3.exceptions.InsecureRequestWarning)
             _vna_auth = ('admin', password)
-            _vna_target_users = {'admin', 'audit', 'root'}
+
+            def _vna_user_sort_key(u):
+                uname = u.get('username', '')
+                uid = u.get('userid', 99999)
+                if uname == 'root' or uid == 0:
+                    return (0, 0, uname)
+                if uname == 'admin' or uid == 10000:
+                    return (1, 0, uname)
+                if uname == 'audit' or uid == 10002:
+                    return (2, 0, uname)
+                if uid < 11000:
+                    return (3, uid, uname)
+                return (4, uid, uname)
 
             for entry in nsx_mgr_entries:
                 nsx_host = entry.split(':')[0].strip()
+                if not nsx_host or nsx_host.startswith('#'):
+                    continue
                 nsx_fqdn = resolve_host_fqdn(nsx_host)
                 lsf.write_output(f'  -> {nsx_fqdn}')
 
@@ -4607,21 +4905,40 @@ echo "PROXY_CONFIGURED"
                         nsx_task_failed = True
                         continue
 
+                    node_users.sort(key=_vna_user_sort_key)
+                    node_summary_lines = []
+
                     for user_data in node_users:
                         uname = user_data.get('username')
                         uid = user_data.get('userid')
-                        if uname not in _vna_target_users:
+                        status = user_data.get('status', 'ACTIVE')
+                        if status == 'NOT_ACTIVATED':
                             continue
-                        current = user_data.get('password_change_frequency',
-                                                'unset')
-                        # Mirror the NSX Manager threshold check (line ~4188): only PUT
-                        # when the current value is not already at/above the desired
-                        # setting, instead of unconditionally writing on every run.
-                        if isinstance(current, (int, float)) and current >= nsx_expiry_threshold_days:
-                            lsf.write_output(
-                                f'        [~] {uname} (id={uid}): {current}d — '
-                                f'skip (>= {nsx_expiry_threshold_days}d threshold)')
+
+                        # Calculate remaining days until password expiry
+                        freq = user_data.get('password_change_frequency')
+                        last_change = user_data.get('last_password_change')
+                        days_until = None
+                        if freq is not None:
+                            if freq == 0 or freq > 9000:
+                                days_until = None  # No expiry
+                            elif last_change is not None:
+                                if last_change > 1e9:
+                                    last_change_date = _vna_dt.datetime.fromtimestamp(last_change / 1000).date()
+                                    exp_date = last_change_date + _vna_dt.timedelta(days=freq)
+                                    days_until = max(0, (exp_date - _vna_dt.date.today()).days)
+                                else:
+                                    days_until = max(0, freq - last_change)
+                            else:
+                                days_until = freq
+
+                        if days_until is not None and days_until > nsx_expiry_threshold_days:
+                            node_summary_lines.append(
+                                f'        [~] {uname} (id={uid}): {days_until}d — '
+                                f'skip (> {nsx_expiry_threshold_days}d threshold)')
                             continue
+
+                        current_display = 'no-expiry' if days_until is None else f'{days_until}d'
                         user_data['password_change_frequency'] = nsx_expiry_days
                         try:
                             presp = _vna_req.put(
@@ -4630,18 +4947,21 @@ echo "PROXY_CONFIGURED"
                                 json=user_data, auth=_vna_auth,
                                 verify=False, timeout=30)
                             if presp.status_code == 200:
-                                lsf.write_output(
+                                node_summary_lines.append(
                                     f'        [+] {uname} (id={uid}): '
-                                    f'{current} -> {nsx_expiry_days}d  [OK]')
+                                    f'{current_display} -> {nsx_expiry_days}d  [OK]')
                             else:
-                                lsf.write_output(
+                                node_summary_lines.append(
                                     f'        [-] {uname} (id={uid}): FAILED '
                                     f'HTTP {presp.status_code}')
                                 nsx_task_failed = True
                         except Exception as e:
-                            lsf.write_output(
+                            node_summary_lines.append(
                                 f'        [-] {uname} (id={uid}): FAILED — {e}')
                             nsx_task_failed = True
+
+                    for line in node_summary_lines:
+                        lsf.write_output(line)
         else:
             for entry in nsx_mgr_entries:
                 nsx_host = entry.split(':')[0].strip()
@@ -4986,108 +5306,108 @@ echo "PROXY_CONFIGURED"
         lsf.labfail(f'{MODULE_NAME} failed: Supervisor Control Plane not ready or VCF Automation errors')
     
     if not dry_run:
-        # ---- Fix VCFA Microservices Scaling ----
-        # If VCFA was improperly shut down, its deployments and statefulsets may be at 0 replicas.
-        # This causes fleet-lcm to fail capability sync because it cannot authenticate against VCFA.
-        lsf.write_output('Checking VCFA microservices scaling in prelude namespace...')
-        try:
-            # Build a helper using the correct sudo -S -i bash -c pattern (required for VCF 9.1
-            # where sudo requires a password, and kubectl is only on root's PATH via login shell).
-            def _vcfa_kctl(cmd):
-                full = (
-                    f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
-                    f" vmware-system-user@10.1.1.70"
-                    f" \"echo '{password}' | sudo -S -i bash -c '{cmd}'\""
-                )
-                return subprocess.run(full, shell=True, capture_output=True, text=True, timeout=30)
+        # # ---- Fix VCFA Microservices Scaling ----
+        # # If VCFA was improperly shut down, its deployments and statefulsets may be at 0 replicas.
+        # # This causes fleet-lcm to fail capability sync because it cannot authenticate against VCFA.
+        # lsf.write_output('Checking VCFA microservices scaling in prelude namespace...')
+        # try:
+        #     # Build a helper using the correct sudo -S -i bash -c pattern (required for VCF 9.1
+        #     # where sudo requires a password, and kubectl is only on root's PATH via login shell).
+        #     def _vcfa_kctl(cmd):
+        #         full = (
+        #             f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
+        #             f" vmware-system-user@10.1.1.70"
+        #             f" \"echo '{password}' | sudo -S -i bash -c '{cmd}'\""
+        #         )
+        #         return subprocess.run(full, shell=True, capture_output=True, text=True, timeout=30)
 
-            # Safety net: delete any remaining stale system-shutdown Argo Workflows
-            # (handles the case where Task 4b VCFA SSH was unavailable at its earlier step).
-            wf_out = subprocess.run(
-                f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
-                f" vmware-system-user@10.1.1.70"
-                f" \"echo '{password}' | sudo -S -i bash -c"
-                r" 'kubectl get workflow -n vmsp-platform --no-headers 2>/dev/null | grep system-shutdown | awk \"{print \\$1}\"'\"",
-                shell=True, capture_output=True, text=True, timeout=30
-            ).stdout
-            stale = [w.strip() for w in wf_out.splitlines() if w.strip()]
-            if stale:
-                lsf.write_output(f'  Deleting {len(stale)} stale system-shutdown workflow(s) (safety net)...')
-                for i in range(0, len(stale), 10):
-                    batch = ' '.join(stale[i:i+10])
-                    _vcfa_kctl(f'kubectl delete workflow -n vmsp-platform {batch} --grace-period=0 2>/dev/null')
-                time.sleep(3)
+        #     # Safety net: delete any remaining stale system-shutdown Argo Workflows
+        #     # (handles the case where Task 4b VCFA SSH was unavailable at its earlier step).
+        #     wf_out = subprocess.run(
+        #         f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no"
+        #         f" vmware-system-user@10.1.1.70"
+        #         f" \"echo '{password}' | sudo -S -i bash -c"
+        #         r" 'kubectl get workflow -n vmsp-platform --no-headers 2>/dev/null | grep system-shutdown | awk \"{print \\$1}\"'\"",
+        #         shell=True, capture_output=True, text=True, timeout=30
+        #     ).stdout
+        #     stale = [w.strip() for w in wf_out.splitlines() if w.strip()]
+        #     if stale:
+        #         lsf.write_output(f'  Deleting {len(stale)} stale system-shutdown workflow(s) (safety net)...')
+        #         for i in range(0, len(stale), 10):
+        #             batch = ' '.join(stale[i:i+10])
+        #             _vcfa_kctl(f'kubectl delete workflow -n vmsp-platform {batch} --grace-period=0 2>/dev/null')
+        #         time.sleep(3)
 
-            # Ensure VCFA node(s) are uncordoned (do this AFTER workflow cleanup).
-            # Discover which nodes are actually SchedulingDisabled rather than
-            # hardcoding a single node name — only uncordon what is unschedulable.
-            nodes_out = _vcfa_kctl('kubectl get nodes -o json 2>/dev/null').stdout
-            if '{' in nodes_out:
-                nodes_json = '{' + nodes_out.split('{', 1)[1]
-                try:
-                    nodes_data = json.loads(nodes_json)
-                    cordoned = [
-                        n['metadata']['name'] for n in nodes_data.get('items', [])
-                        if n.get('spec', {}).get('unschedulable', False)
-                    ]
-                    if cordoned:
-                        lsf.write_output(f'  Uncordoning {len(cordoned)} node(s): {", ".join(cordoned)}')
-                        for _node_name in cordoned:
-                            _vcfa_kctl(f'kubectl uncordon {_node_name} 2>/dev/null')
-                    else:
-                        lsf.write_output('  All VCFA nodes already schedulable — SKIPPED uncordon')
-                except Exception as _node_exc:
-                    lsf.write_output(f'  WARNING: Could not parse node list ({_node_exc}) — SKIPPED uncordon')
-            else:
-                lsf.write_output('  WARNING: Could not read node list — SKIPPED uncordon')
+        #     # Ensure VCFA node(s) are uncordoned (do this AFTER workflow cleanup).
+        #     # Discover which nodes are actually SchedulingDisabled rather than
+        #     # hardcoding a single node name — only uncordon what is unschedulable.
+        #     nodes_out = _vcfa_kctl('kubectl get nodes -o json 2>/dev/null').stdout
+        #     if '{' in nodes_out:
+        #         nodes_json = '{' + nodes_out.split('{', 1)[1]
+        #         try:
+        #             nodes_data = json.loads(nodes_json)
+        #             cordoned = [
+        #                 n['metadata']['name'] for n in nodes_data.get('items', [])
+        #                 if n.get('spec', {}).get('unschedulable', False)
+        #             ]
+        #             if cordoned:
+        #                 lsf.write_output(f'  Uncordoning {len(cordoned)} node(s): {", ".join(cordoned)}')
+        #                 for _node_name in cordoned:
+        #                     _vcfa_kctl(f'kubectl uncordon {_node_name} 2>/dev/null')
+        #             else:
+        #                 lsf.write_output('  All VCFA nodes already schedulable — SKIPPED uncordon')
+        #         except Exception as _node_exc:
+        #             lsf.write_output(f'  WARNING: Could not parse node list ({_node_exc}) — SKIPPED uncordon')
+        #     else:
+        #         lsf.write_output('  WARNING: Could not read node list — SKIPPED uncordon')
 
-            # Scale critical statefulsets to 1, but only the ones currently at 0 replicas.
-            sts_out = _vcfa_kctl(
-                'kubectl get statefulset rabbitmq-ha tenant-manager vco-app '
-                '-n prelude -o json 2>/dev/null'
-            ).stdout
-            if '{' in sts_out:
-                sts_json = '{' + sts_out.split('{', 1)[1]
-                try:
-                    sts_data = json.loads(sts_json)
-                    sts_items = sts_data.get('items', [sts_data]) if 'items' in sts_data else [sts_data]
-                    for s in sts_items:
-                        s_name = s.get('metadata', {}).get('name', '')
-                        if not s_name:
-                            continue
-                        if s.get('spec', {}).get('replicas', 1) == 0:
-                            lsf.write_output(f'  Scaling VCFA statefulset {s_name} to 1 replica...')
-                            _vcfa_kctl(f'kubectl scale statefulset {s_name} -n prelude --replicas=1 2>/dev/null')
-                        else:
-                            lsf.write_output(f'  VCFA statefulset {s_name} already scaled — SKIPPED')
-                except Exception as _sts_exc:
-                    lsf.write_output(
-                        f'  WARNING: Could not parse statefulset list ({_sts_exc}) — '
-                        f'falling back to unconditional scale'
-                    )
-                    _vcfa_kctl(
-                        'kubectl scale statefulset rabbitmq-ha tenant-manager vco-app '
-                        '-n prelude --replicas=1 2>/dev/null'
-                    )
-            else:
-                lsf.write_output('  WARNING: Could not read statefulset list — falling back to unconditional scale')
-                _vcfa_kctl(
-                    'kubectl scale statefulset rabbitmq-ha tenant-manager vco-app '
-                    '-n prelude --replicas=1 2>/dev/null'
-                )
+        #     # Scale critical statefulsets to 1, but only the ones currently at 0 replicas.
+        #     sts_out = _vcfa_kctl(
+        #         'kubectl get statefulset rabbitmq-ha tenant-manager vco-app '
+        #         '-n prelude -o json 2>/dev/null'
+        #     ).stdout
+        #     if '{' in sts_out:
+        #         sts_json = '{' + sts_out.split('{', 1)[1]
+        #         try:
+        #             sts_data = json.loads(sts_json)
+        #             sts_items = sts_data.get('items', [sts_data]) if 'items' in sts_data else [sts_data]
+        #             for s in sts_items:
+        #                 s_name = s.get('metadata', {}).get('name', '')
+        #                 if not s_name:
+        #                     continue
+        #                 if s.get('spec', {}).get('replicas', 1) == 0:
+        #                     lsf.write_output(f'  Scaling VCFA statefulset {s_name} to 1 replica...')
+        #                     _vcfa_kctl(f'kubectl scale statefulset {s_name} -n prelude --replicas=1 2>/dev/null')
+        #                 else:
+        #                     lsf.write_output(f'  VCFA statefulset {s_name} already scaled — SKIPPED')
+        #         except Exception as _sts_exc:
+        #             lsf.write_output(
+        #                 f'  WARNING: Could not parse statefulset list ({_sts_exc}) — '
+        #                 f'falling back to unconditional scale'
+        #             )
+        #             _vcfa_kctl(
+        #                 'kubectl scale statefulset rabbitmq-ha tenant-manager vco-app '
+        #                 '-n prelude --replicas=1 2>/dev/null'
+        #             )
+        #     else:
+        #         lsf.write_output('  WARNING: Could not read statefulset list — falling back to unconditional scale')
+        #         _vcfa_kctl(
+        #             'kubectl scale statefulset rabbitmq-ha tenant-manager vco-app '
+        #             '-n prelude --replicas=1 2>/dev/null'
+        #         )
             
-            # Scale all 0-replica deployments to 1
-            dep_out = _vcfa_kctl('kubectl get deployments -n prelude -o json 2>/dev/null').stdout
-            if '{' in dep_out:
-                dep_out = '{' + dep_out.split('{', 1)[1]
-                data = json.loads(dep_out)
-                for d in data.get('items', []):
-                    name = d['metadata']['name']
-                    if d['spec'].get('replicas', 1) == 0:
-                        lsf.write_output(f'  Scaling VCFA deployment {name} to 1 replica...')
-                        _vcfa_kctl(f'kubectl scale deployment {name} -n prelude --replicas=1 2>/dev/null')
-        except Exception as e:
-            lsf.write_output(f'WARNING: Failed to check or scale VCFA microservices: {e}')
+        #     # Scale all 0-replica deployments to 1
+        #     dep_out = _vcfa_kctl('kubectl get deployments -n prelude -o json 2>/dev/null').stdout
+        #     if '{' in dep_out:
+        #         dep_out = '{' + dep_out.split('{', 1)[1]
+        #         data = json.loads(dep_out)
+        #         for d in data.get('items', []):
+        #             name = d['metadata']['name']
+        #             if d['spec'].get('replicas', 1) == 0:
+        #                 lsf.write_output(f'  Scaling VCFA deployment {name} to 1 replica...')
+        #                 _vcfa_kctl(f'kubectl scale deployment {name} -n prelude --replicas=1 2>/dev/null')
+        # except Exception as e:
+        #     lsf.write_output(f'WARNING: Failed to check or scale VCFA microservices: {e}')
 
         # ---- Fix Fleet-LCM Component Friendly Names ----
         # Root cause: On cold boot, vcf-fleet-build-service starts before vcf-fleet-upgrade-service
@@ -5326,43 +5646,6 @@ echo "PROXY_CONFIGURED"
             except Exception as e:
                 lsf.write_output(f'WARNING: Failed to fix fleet-lcm component friendly names: {e}')
 
-    # ---- VSP Cluster Health Monitor: startup report pass ----
-    # Runs vcf-lab-tuner.py --cluster vsp --mode report
-    _vspmon_enabled = False
-    if lsf.config.has_section('VSPMONITOR') and lsf.config.has_option('VSPMONITOR', 'enabled'):
-        _raw = lsf.config.get('VSPMONITOR', 'enabled').strip().lower()
-        _vspmon_enabled = _raw not in ('0', 'false', 'no', 'off')
-    if not _vspmon_enabled:
-        lsf.write_output('VSP health monitor not enabled in [VSPMONITOR] — skipping')
-    else:
-        vlt_script = '/home/holuser/hol/Tools/vcf-lab-tuner.py'
-        if os.path.isfile(vlt_script):
-            lsf.write_output('=' * 60)
-            lsf.write_output('VSP Cluster Health Monitor (report pass via vcf-lab-tuner.py)')
-            lsf.write_output('=' * 60)
-            try:
-                _vspm_cmd = ['python3', '-u', vlt_script, '--cluster', 'vsp', '--mode', 'report']
-                _vspm_env = os.environ.copy()
-                _vspm_env['PYTHONUNBUFFERED'] = '1'
-                _vspm_proc = subprocess.Popen(
-                    _vspm_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1, env=_vspm_env,
-                )
-                _vspm_start = time.time()
-                for _vspm_line in _vspm_proc.stdout:
-                    if time.time() - _vspm_start > 1800:  # 30 min safety cap
-                        _vspm_proc.kill()
-                        lsf.write_output('  WARNING: VSP health report timed out')
-                        break
-                    _vspm_line = _vspm_line.rstrip('\n')
-                    if _vspm_line.strip():
-                        lsf.write_output(f'  {_vspm_line.strip()}')
-                _vspm_proc.wait()
-            except Exception as _vspm_exc:
-                lsf.write_output(f'  WARNING: VSP health report step failed (non-fatal): {_vspm_exc}')
-        else:
-            lsf.write_output(f'VSP health tuner not found: {vlt_script} — skipping')
-
     # ---- Opslogs Background Probe Synchronization Gate ----
     if opslogs_probe_state.get('thread') is not None and opslogs_probe_state['thread'].is_alive():
         lsf.write_output('Waiting for opslogs background probe to complete before finishing VCFfinal...')
@@ -5384,6 +5667,41 @@ echo "PROXY_CONFIGURED"
     return not module_failed
 
 
+def main(lsf=None, standalone=False, dry_run=False, force=False):
+    """
+    Main entry point for VCFfinal module.
+    Enforces single-instance run locking and session run-once protection.
+    
+    :param lsf: lsfunctions module (will be imported if None)
+    :param standalone: Whether running in standalone test mode
+    :param dry_run: Whether to skip actual changes
+    :param force: Whether to bypass run-once / session completion guard
+    :return: True if module succeeded or skipped cleanly, False if failed
+    """
+    if lsf is None:
+        import lsfunctions as lsf
+        if not standalone:
+            lsf.init(router=False)
+    
+    # Check if VCFfinal already completed in this boot session
+    if not force and is_already_completed():
+        msg = f'VCFfinal has already completed in this session ({DONE_FILE} exists) — skipping execution. (Use --force to override)'
+        lsf.write_output(msg)
+        return True
+
+    # Acquire mutual-exclusion lock to prevent overlapping concurrent runs
+    if not acquire_lock(lsf=lsf):
+        return True
+
+    try:
+        result = _run_vcffinal(lsf=lsf, standalone=standalone, dry_run=dry_run)
+        if result and not dry_run:
+            mark_completed()
+        return result
+    finally:
+        release_lock()
+
+
 #==============================================================================
 # STANDALONE EXECUTION
 #==============================================================================
@@ -5394,6 +5712,8 @@ if __name__ == '__main__':
                         help='Run in standalone test mode')
     parser.add_argument('--dry-run', action='store_true',
                         help='Show what would be done without making changes')
+    parser.add_argument('--force', action='store_true',
+                        help='Force execution even if VCFfinal has already run this session')
     parser.add_argument('--skip-init', action='store_true',
                         help='Skip lsf.init() call')
     parser.add_argument('run_seconds', nargs='?', type=int, default=0,
@@ -5420,6 +5740,7 @@ if __name__ == '__main__':
         print(f'Running {MODULE_NAME} in standalone mode')
         print(f'Lab SKU: {lsf.lab_sku}')
         print(f'Dry run: {args.dry_run}')
+        print(f'Force run: {args.force}')
         print()
     
-    main(lsf=lsf, standalone=args.standalone, dry_run=args.dry_run)
+    main(lsf=lsf, standalone=args.standalone, dry_run=args.dry_run, force=args.force)

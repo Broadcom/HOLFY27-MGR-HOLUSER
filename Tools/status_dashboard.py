@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # status_dashboard.py - HOLFY27 Lab Startup Status Dashboard
-# Version 1.5 - 2026-06-01
+# Version 1.6 - 2026-08-30
 # Author - Burke Azbill and HOL Core Team
 # Generates an auto-refreshing HTML status page for lab startup monitoring
 
@@ -263,6 +263,8 @@ class StatusDashboard:
                  'Check and renew expiring K8s certs on VSP clusters via vsp_cert_renewer.py'),
                 ('vcf_component_urls', 'VCF Component URL Checks',
                  'Verify Fleet LCM endpoints (fleet-01a, fleet-01b) return HTTP 200/401'),
+                ('vc_b_autostart', 'Site B vCenter Autostart Services',
+                 'Verify and start autostart services on Site B vCenter (vc-mgmt-b.site-b.vcf.lab)'),
             ]),
 
             # Group 11: final.py - Final Checks

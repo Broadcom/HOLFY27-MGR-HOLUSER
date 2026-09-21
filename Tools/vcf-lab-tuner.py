@@ -1,8 +1,59 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.3.2 - 2026-09-16
+Version 2.5.6 - 2026-09-21
 Author: HOL Core Team
+
+v2.5.6: Supervisor & Multi-Cluster Certificate Verification & Renewal Fixes:
+  - Backing Secret & x509 Expiry Verification (_renew_certmanager_leaf_certs, chk_certs): Added proactive backing Secret and x509 certificate validation across all namespaces for all cluster types (Supervisor, VCFA, VSP, SSP). When Certificate CR status lacks notAfter or Secret is missing/stale, dynamically inspects Secret tls.crt data and openssl notAfter expiry.
+  - Cert-Manager Explicit Reissuance & Request Purge (_renew_certmanager_leaf_certs): Explicitly forces cert-manager reissuance via cert-manager.io/reissue-at annotation and purges stale CertificateRequests, ensuring all leaf certs (including metrics-endpoint-downstream-server-cert in svc-metrics-aggregator-*) are reliably re-issued and renewed to 5 years (43830h).
+  - Robust ISO & OpenSSL Date Parsing (_days_until, _parse_openssl_date, _parse_iso_date): Upgraded date parsing to support ISO format variants (fractional seconds, timezone offsets) and multi-format OpenSSL enddate strings across Linux locales.
+
+v2.5.5: VCFA SeaweedFS mTLS Certificate Freshness Check & Auth Pod Convergence:
+  - VCFA SeaweedFS mTLS Cert Freshness (chk_certs): Added proactive check for SeaweedFS StatefulSet pods (seaweedfs-master-0, seaweedfs-filer-0, seaweedfs-volume-0..2) in vmsp-platform. Detects when pods are serving stale in-memory mTLS certs following cert-manager secret renewal and automatically restarts them, eliminating gRPC handshake failures and resolving the tenant-manager S3 transfer spooling verification outage.
+  - VCFA Endpoint Backoff Unblocker Expansion (chk_endpoint): Expanded the active pod reset pattern to include ccs-infra-eas* and intent-server* alongside api-gateway-server*, ccs-vksm-eas*, and resource-manager-server* when tenant-manager-0 reaches Running status.
+
+v2.5.4: Supervisor Cluster VCF 9.1.1+ Alignment & Reliability Fixes:
+  - Supervisor Cluster Version Detection (_detect_cluster_version): Added dynamic version detection for Supervisor clusters from vCenter appliance version (9.1.1+) and Supervisor control plane Kubernetes version (K8s v1.33+ on VCF 9.1.1+ vs v1.30/v1.31 on 9.1.0).
+  - ESXi Spherelet Check & Reachability Auto-Enable (_ensure_esx_ssh, _renew_supervisor_spherelet_certs): Added proactive TSM-SSH service startup on ESXi agent hosts via vCenter pyVmomi so spherelet cert probing and renewal work reliably on stock ESXi hosts where SSH is stopped by default. Fixed probe output evaluation (evaluating exit code 0 as valid, 1 as expiring) and separated SSH unreachable hosts from expiring certs, eliminating false 60-day expiry warnings.
+  - Supervisor Pod Sweep & Succeeded Phase Gating (_sweep_bad_pods): Gated terminal pod phase selection on Supervisor clusters to `Failed` only. Prevents `_sweep_bad_pods` from deleting legitimate `Completed` (`status.phase=Succeeded`) Job pods from periodic CronJobs such as `svc-tmc-c9/tmc-agent-installer` and logging false warnings on every run.
+  - Scalable Service Workload Scaling Gating (_sweep_bad_pods): Updated CCI, ArgoCD, and Harbor service scale-up to check if workloads actually have `replicas == 0` before issuing `kubectl scale`, avoiding redundant scale operations and controller conflicts on healthy running workloads.
+
+v2.5.3: Per-Node Proxy Remediation Fix:
+  - Multi-Node Proxy Drift Remediation (chk_proxy): Fixed target node execution when remediating proxy configuration on multi-node clusters. Replaced primary transport `r.write()` with `r.write_on_node(ip, ...)` so proxy configuration drop-ins (/etc/sysconfig/proxy, containerd/kubelet drop-ins) are written directly to the drifted worker node rather than repeatedly executing against the control plane VIP.
+
+v2.5.2: VSP Cluster VCF 9.1.1+ Native Settings Alignment & Interruption Prevention:
+  - Cluster Version Detection (_detect_cluster_version): Unified version detection across VSP and VCFA clusters (via components.api.vmsp.vmware.com, ndc HelmRelease 9.1.3162+, envoyproxy-gateway v1.8+, tenant-manager).
+  - VSP kube-vip Manifest Edit Gating (cp.vip_preserve): Gated vip_preserve_on_leadership_loss static manifest edit to 9.1.0 on VSP clusters. On VCF 9.1.1+, accepts stock kube-vip.yaml settings natively, preventing on-disk sed edits from restarting kube-vip static pods and dropping Control Plane VIPs.
+  - VSP vsphere-cpi Leader Election Gating (_check_vsphere_cpi_tuning): Gated vsphere-cpi DaemonSet leader election lease patching to 9.1.0 on VSP clusters. On VCF 9.1.1+, accepts stock vsphere-cpi 1.35 args natively, preventing DaemonSet restarts and Flux CD drift reconciliation.
+  - VSP Microservice Probe Tuning Gating (_check_vsp_probe_and_memory_tuning): Gated liveness/readiness probe strategic patching on VSP microservices (depot-service, fleetbuild, sddcbuild, sddcupgrade, vidb, prometheus, kube-state-metrics, node-exporter) to 9.1.0. On VCF 9.1.1+, accepts vendor stock 9.1.1 chart probe tolerances natively, preventing unnecessary rolling restarts and Flux CD drift.
+  - VSP Kyverno Webhook Gating (chk_kyverno): Gated kyverno-cleanup-validating-webhook-cfg failurePolicy mutation to 9.1.0. On VCF 9.1.1+, accepts native Kyverno 3.8+ webhook configurations natively.
+  - VSP Footprint Alignment (chk_footprint): Gated envoyproxy-gateway ReleaseTemplate patching to 9.1.0 (Envoy Gateway v1.8+ handles memory/LE natively on 9.1.1+), recognized GlobalConfig templating on cluster-autoscaler ReleaseTemplate, and gated ops-logs-gateway check when ops-logs is not installed.
+  - VSP 9.1.1 Sizing Machine Types (SIZING_MACHINE_TYPES): Added management.nonha.small (12 vCPU / 24 GiB), management.ci.* types, and updated 9.1.1 sizing table.
+  - VSP 9.1.1 Drift Keeper Alignment (KEEPER_BODY_VSP_911): Updated vcf-lab-keeper for VSP on 9.1.1+ to retain maintenance tasks (fluentd buffer cleanup) while eliminating obsolete 9.1.0 probe/CPI/Kyverno/Envoy patches that fight Flux CD.
+
+v2.5.1: VCF 9.1.1+ Native Settings Alignment & Interruption Prevention:
+  - kube-vip Manifest Edit Gating (cp.vip_preserve): Gated vip_preserve_on_leadership_loss static manifest edit to 9.1.0 only. On VCF 9.1.1+, accepts stock kube-vip.yaml settings natively, preventing on-disk sed edits from restarting kube-vip static pods and dropping the Control Plane VIP (10.1.1.72) mid-run.
+  - vsphere-cpi Leader Election Tuning Gating (_check_vsphere_cpi_tuning): Gated vsphere-cpi DaemonSet leader election lease patching to 9.1.0. On VCF 9.1.1+, accepts stock vsphere-cpi 1.35 args, preventing DaemonSet restarts and Flux CD drift reconciliation.
+  - Prelude Probe Relaxation Alignment (_storm_probe_relax): Gated prelude microservice liveness/readiness probe strategic-patching to 9.1.0. On VCF 9.1.1+, accepts native prelude deployer probe tolerances, preventing simultaneous rolling restarts across 25 Spring Boot microservices.
+  - Prelude Leader Election Alignment (_storm_vcfa_*_le): Gated single-replica microservice leader election stripping to 9.1.0. On VCF 9.1.1+, accepts stock 9.1.1 Helm values natively unless --storm-disable-le is explicitly passed.
+
+v2.5.0: VCFA Two-Tier Revert to Defaults Architecture & Automated Pre-Remediation Snapshots:
+  - Automated Pre-Remediation Snapshot Capture (_capture_pre_remediation_snapshot): Automatically records full live cluster state (static pod manifests, ReleaseTemplates, workloads, CronWorkflows, webhooks, DaemonSets) to /var/lib/vcf-lab-tuner/snapshots before executing any remediations.
+  - Snapshot Rollback Execution (--mode rollback [--snapshot PATH]): Restores exact pre-remediation cluster state from a captured snapshot bundle.
+  - Stock Defaults Reset Engine (--mode reset-defaults): Re-enables Flux driftDetection.mode=enabled on ReleaseTemplates and triggers Flux CD reconciliation across HelmReleases to restore VMware stock 9.1.1 chart defaults. Resets static manifests, Kyverno webhooks, CPI DaemonSets, CronWorkflow schedules, and purges lab keeper daemons.
+  - Dedicated CLI Modes (--mode snapshot, --mode rollback, --mode reset-defaults): Fully integrated modes with built-in --dry-run preview support.
+
+v2.4.1: Version-Aware VCFA Naming & HA Replica Evaluation Alignment:
+  - Version-Aware Resource Naming: Gated VCFA check routines based on dynamically detected cluster version (9.1.0 vs 9.1.1+).
+    * chk_edge: Evaluates copy-rabbitmq-config on 9.1.1+ vs copy-config on 9.1.0 for prelude/rabbitmq-ha init container integrity.
+    * chk_deployments: Automatically skips trust-manager-sds-server on 9.1.1+ (where SDS is natively embedded in trust-manager).
+    * chk_gateway: Natively evaluates Gateway API LoadBalancer services on 9.1.1+ without false warnings on legacy envoy-vmsp-platform* hashed names.
+    * _storm_vcfa_cron_stagger: Queries .spec.schedules[0] on scheduled-etcd-backup CronWorkflow to accurately detect schedule timing.
+  - HA Replicas Evaluation Alignment: Updated _storm_scale_to_one, _storm_capi_le_false, and chk_footprint to evaluate 2+ replicas as a passing/success state across all checks rather than reporting errors or warnings.
+
+v2.4.0: Version-Aware Envoy Gateway SDS SAN NACK Remediation & 9.1.1+ Upstream Alignment:
+  - Version-Aware SDS Remediation (_fix_sds_sni): Detects VCFA cluster version dynamically. On VCF 9.1.0, continues enforcing KB 439264 / KB 424402 workaround (platform-trust sync across namespaces + Kyverno vcfa-btp-wellknown-to-carefs mutation). On VCF 9.1.1+, purges the obsolete Kyverno mutation policy and cleans up any conflicting dual-field BackendTLSPolicy objects so upstream charts (ndc, vmsp-identity, support-bundle, vmsp-agent) reconcile cleanly without Gateway API CEL validation errors (PackageDeployment InProgress / VCFMS-HEALTH-002).
 
 v2.3.2: Top 10 Over-Allocated Workloads Terminal Summary:
   - Updated Compact Terminal Output: Expanded Top Over-Allocated Workloads table in chk_nodes from top 5 to top 10 rows in default non-verbose report output.
@@ -504,8 +555,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.3.2"
-DATE    = "2026-09-16"
+VERSION = "2.5.6"
+DATE    = "2026-09-21"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -681,7 +732,7 @@ def get_cluster_configs(args):
             "sudo": "login",                     # kubectl is only on root's PATH via -i
             "cp_vips": [f"{subnet}.142"],
             "owned_vips": None,                  # only the CP VIP
-            "vip_hint": "dropped — kube-fix.py restores it",
+            "vip_hint": "dropped — vcf-lab-tuner.py --cluster vsp --remediate restores it",
             "worker_fqdn": f"vsp-01{site_suffix[5]}.{site_suffix}",
             "discover_octets": range(141, 151),  # vsp-health.py:301
             "static_pods": ("etcd", "kube-apiserver", "kube-controller-manager",
@@ -817,12 +868,13 @@ def get_cluster_configs(args):
             "gateway_services": [
                 ("projectcontour", "projectcontour-envoy", f"{subnet_0}.11"),
                 ("nsxi-platform", "kafka-external", f"{subnet_0}.12"),
-                ("nsxi-platform", "kafka-controller-2-external", f"{subnet_0}.13"),
-                ("nsxi-platform", "kafka-controller-1-external", f"{subnet_0}.14"),
-                ("nsxi-platform", "kafka-controller-0-external", f"{subnet_0}.15"),
+                ("nsxi-platform", "kafka-controller-0-external", (f"{subnet_0}.13", f"{subnet_0}.14", f"{subnet_0}.15")),
+                ("nsxi-platform", "kafka-controller-1-external", (f"{subnet_0}.13", f"{subnet_0}.14", f"{subnet_0}.15")),
+                ("nsxi-platform", "kafka-controller-2-external", (f"{subnet_0}.13", f"{subnet_0}.14", f"{subnet_0}.15")),
             ],
             "pg_namespaces": (),
-            "etcd_cpu_request": "2500m",
+            "etcd_cpu_request": None,
+            "check_cp_leader_elect": False,
             "sections": ["cp", "nodes", "pods", "gateway", "deployments", "certs", "endpoint", "proxy",
                          "kubeadm", "postgres", "password", "sizing", "footprint"],
         },
@@ -863,7 +915,7 @@ SECTION_MAP = {
     "entropy":     ("ESXI ENTROPY SOURCE",   "AMD Zen4/5 esxcli entropySources RDRAND workaround (via govc)"),
 }
 
-MODES = ("preflight", "tune", "remediate", "report")
+MODES = ("preflight", "tune", "remediate", "report", "rollback", "reset-defaults", "snapshot")
 READ_ONLY_MODES = ("preflight", "report")
 
 # Which modes each section is allowed to ACT in. Made explicit because the
@@ -917,6 +969,8 @@ SECTIONS_NEEDING_NODES = frozenset({"nodes", "pods", "proxy", "password"})
 
 def may_act(r, section):
     """True when this section is permitted to mutate in the Runner's current mode."""
+    if r.mode in ("rollback", "reset-defaults"):
+        return True
     return r.mode in SECTION_ACT_MODES.get(section, ())
 
 
@@ -1180,8 +1234,14 @@ def _wrap_ssp_cmd(cmd):
     if "ssp-kubeconfig" in cmd or "--kubeconfig" in cmd or cmd.startswith("ssh ") or cmd.startswith("govc ") or cmd.startswith("python3 "):
         return cmd
 
-    capi_kinds = ("cluster", "machinedeployment", "kubeadmcontrolplane", "vspheremachinetemplate", "packagedeployment", "machine")
-    is_capi = any(k in cmd.lower() for k in capi_kinds) or "-n ssp" in cmd or "namespace ssp" in cmd
+    is_capi = False
+    if "-n ssp" in cmd or "namespace ssp" in cmd or "namespace=ssp" in cmd:
+        is_capi = True
+    elif re.search(r'(?:-n\s+|--namespace[=\s]+)(?!ssp\b)[a-zA-Z0-9_\-]+', cmd):
+        is_capi = False
+    else:
+        capi_patterns = r'\b(clusterclasses?|clusters?|machinedeployments?|kubeadmcontrolplanes?|vspheremachinetemplates?|packagedeployments?|machinesets?|vsphereclusters?|vspheremachines?)\b'
+        is_capi = bool(re.search(capi_patterns, cmd, re.IGNORECASE))
 
     if is_capi:
         return cmd
@@ -1764,6 +1824,17 @@ def _parse_mem_mib(v):
         return 0
 
 
+def _format_mem_disp(mib):
+    """Format MiB quantity nicely into MiB or GiB string for tables."""
+    if mib is None:
+        return "N/A"
+    if mib >= 1024 and mib % 1024 == 0:
+        return f"{int(mib // 1024)} GiB"
+    elif mib >= 1024:
+        return f"{mib / 1024.0:.1f} GiB"
+    return f"{int(mib)} MiB"
+
+
 def _parse_cpu(v):
     """Kubernetes CPU quantity -> MILLICORES (int), matching vsp-health.py:443.
 
@@ -1786,7 +1857,7 @@ def _parse_cpu(v):
 
 
 def _analyze_workload_resources(r, ctx):
-    """Analyze cluster workloads (Deployment, StatefulSet, DaemonSet) CPU requests vs actual usage."""
+    """Analyze cluster workloads (Deployment, StatefulSet, DaemonSet) CPU & Memory requests vs actual usage."""
     nodes_data = ctx.get("nodes")
     if not nodes_data:
         nodes_data = r.read_json("kubectl get nodes -o json 2>/dev/null", 45) or {}
@@ -1812,6 +1883,7 @@ def _analyze_workload_resources(r, ctx):
         worker_nodes = all_nodes
 
     total_allocatable_cpu_m = sum(n["cpu_alloc_m"] for n in worker_nodes)
+    total_allocatable_mem_mib = sum(n["mem_alloc_mib"] for n in worker_nodes)
 
     pod_usage = {}
     rc, top_out = r.read("kubectl top pods -A 2>/dev/null", 45)
@@ -1886,25 +1958,80 @@ def _analyze_workload_resources(r, ctx):
 
         avg_act_cpu = sum(matched_cpus) / len(matched_cpus) if matched_cpus else 0
         max_act_cpu = max(matched_cpus) if matched_cpus else 0
+        avg_act_mem = sum(matched_mems) / len(matched_mems) if matched_mems else 0
+        max_act_mem = max(matched_mems) if matched_mems else 0
 
+        # CPU right-sizing recommendation
         rec_pod_req = pod_req_cpu
-        if pod_req_cpu >= 100 and (max_act_cpu == 0 or pod_req_cpu > 2.0 * max_act_cpu):
-            if max_act_cpu <= 10:
-                rec_pod_req = 50 if pod_req_cpu < 500 else 100
-            elif max_act_cpu <= 50:
-                rec_pod_req = 100 if pod_req_cpu < 500 else 150
-            elif max_act_cpu <= 200:
-                rec_pod_req = max(200, int(max_act_cpu * 2.0))
+        if pod_req_cpu > 25 and (max_act_cpu == 0 or pod_req_cpu > 1.3 * max_act_cpu):
+            num_c = len(containers) or 1
+            if max_act_cpu == 0 or max_act_cpu <= 15:
+                rec_pod_req = 50 if num_c == 1 else max(25 * num_c, 50)
+            elif max_act_cpu <= 40:
+                rec_pod_req = 50 if num_c == 1 else max(25 * num_c, 50)
+            elif max_act_cpu <= 80:
+                rec_pod_req = max(75, int(max_act_cpu * 1.35))
+            elif max_act_cpu <= 150:
+                rec_pod_req = max(100, int(max_act_cpu * 1.3))
+            elif max_act_cpu <= 300:
+                rec_pod_req = max(150, int(max_act_cpu * 1.25))
             else:
-                rec_pod_req = max(350, int(max_act_cpu * 1.5))
+                rec_pod_req = max(250, int(max_act_cpu * 1.2))
 
             rec_pod_req = min(pod_req_cpu, rec_pod_req)
-            rec_pod_req = ((rec_pod_req + 49) // 50) * 50
+            if rec_pod_req <= 100:
+                rec_pod_req = ((rec_pod_req + 24) // 25) * 25
+            else:
+                rec_pod_req = ((rec_pod_req + 49) // 50) * 50
+
+        # Memory right-sizing recommendation
+        rec_pod_mem = pod_req_mem
+        if pod_req_mem > 32:
+            num_c = len(containers) or 1
+            if max_act_mem == 0:
+                if pod_req_mem <= 64:
+                    rec_pod_mem = pod_req_mem
+                elif pod_req_mem <= 128:
+                    rec_pod_mem = 64
+                elif pod_req_mem <= 256:
+                    rec_pod_mem = 128
+                elif pod_req_mem <= 1024:
+                    rec_pod_mem = 256
+                elif pod_req_mem <= 2048:
+                    rec_pod_mem = 512
+                else:
+                    rec_pod_mem = 1024
+            elif pod_req_mem > 1.2 * max_act_mem:
+                if max_act_mem <= 32:
+                    rec_pod_mem = max(32 * num_c, int(max_act_mem * 1.4))
+                elif max_act_mem <= 128:
+                    rec_pod_mem = max(64 * num_c, int(max_act_mem * 1.35))
+                elif max_act_mem <= 512:
+                    rec_pod_mem = max(128 * num_c, int(max_act_mem * 1.3))
+                elif max_act_mem <= 2048:
+                    rec_pod_mem = max(256 * num_c, int(max_act_mem * 1.25))
+                else:
+                    rec_pod_mem = max(1024, int(max_act_mem * 1.15))
+            else:
+                rec_pod_mem = pod_req_mem
+
+            rec_pod_mem = min(pod_req_mem, rec_pod_mem)
+            if rec_pod_mem < 256:
+                rec_pod_mem = ((int(rec_pod_mem) + 15) // 16) * 16
+            elif rec_pod_mem < 1024:
+                rec_pod_mem = ((int(rec_pod_mem) + 63) // 64) * 64
+            else:
+                rec_pod_mem = ((int(rec_pod_mem) + 127) // 128) * 128
 
         tot_curr_req = pod_req_cpu * replicas
         tot_rec_req = rec_pod_req * replicas
         savings = tot_curr_req - tot_rec_req
         ratio = (pod_req_cpu / max_act_cpu) if max_act_cpu > 0 else (999.0 if pod_req_cpu > 0 else 1.0)
+
+        tot_curr_mem_req = pod_req_mem * replicas
+        tot_rec_mem_req = rec_pod_mem * replicas
+        mem_savings = tot_curr_mem_req - tot_rec_mem_req
+        mem_ratio = (pod_req_mem / max_act_mem) if max_act_mem > 0 else (999.0 if pod_req_mem > 0 else 1.0)
 
         if savings >= 3000:
             tier = "Critical"
@@ -1934,17 +2061,30 @@ def _analyze_workload_resources(r, ctx):
             "avg_act_cpu": int(avg_act_cpu),
             "ratio": round(ratio, 1),
             "tier": tier,
+            "tot_curr_mem_req": tot_curr_mem_req,
+            "tot_rec_mem_req": tot_rec_mem_req,
+            "rec_pod_mem": rec_pod_mem,
+            "mem_savings": mem_savings,
+            "max_act_mem": int(max_act_mem),
+            "avg_act_mem": int(avg_act_mem),
+            "mem_ratio": round(mem_ratio, 1),
             "containers": c_details
         })
 
-    workloads.sort(key=lambda x: x["savings"], reverse=True)
-    overprovisioned = [w for w in workloads if w["savings"] > 0]
+    overprovisioned_cpu = sorted([w for w in workloads if w["savings"] > 0], key=lambda x: x["savings"], reverse=True)
+    overprovisioned_mem = sorted([w for w in workloads if w["mem_savings"] > 0], key=lambda x: x["mem_savings"], reverse=True)
 
     total_curr_req_m = sum(w["tot_curr_req"] for w in workloads)
     total_act_cpu_m = sum(w["avg_act_cpu"] * w["replicas"] for w in workloads)
     total_rec_req_m = sum(w["tot_rec_req"] for w in workloads)
-    total_savings_m = sum(w["savings"] for w in overprovisioned)
+    total_savings_m = sum(w["savings"] for w in overprovisioned_cpu)
     reclaimable_slack_m = max(0, total_curr_req_m - total_act_cpu_m)
+
+    total_curr_mem_req_mib = sum(w["tot_curr_mem_req"] for w in workloads)
+    total_act_mem_mib = sum(w["avg_act_mem"] * w["replicas"] for w in workloads)
+    total_rec_mem_req_mib = sum(w["tot_rec_mem_req"] for w in workloads)
+    total_mem_savings_mib = sum(w["mem_savings"] for w in overprovisioned_mem)
+    reclaimable_mem_slack_mib = max(0, total_curr_mem_req_mib - total_act_mem_mib)
 
     return {
         "cluster": r.cluster,
@@ -1955,16 +2095,25 @@ def _analyze_workload_resources(r, ctx):
         "total_rec_req_m": total_rec_req_m,
         "total_savings_m": total_savings_m,
         "reclaimable_slack_m": reclaimable_slack_m,
+        "total_allocatable_mem_mib": total_allocatable_mem_mib,
+        "total_curr_mem_req_mib": total_curr_mem_req_mib,
+        "total_act_mem_mib": total_act_mem_mib,
+        "total_rec_mem_req_mib": total_rec_mem_req_mib,
+        "total_mem_savings_mib": total_mem_savings_mib,
+        "reclaimable_mem_slack_mib": reclaimable_mem_slack_mib,
         "workloads": workloads,
-        "overprovisioned": overprovisioned
+        "overprovisioned": overprovisioned_cpu,
+        "overprovisioned_cpu": overprovisioned_cpu,
+        "overprovisioned_mem": overprovisioned_mem
     }
 
 
 def _print_compact_right_sizing_table(analysis, verbose=False):
-    """Print single-screen compact terminal table of overprovisioned workloads."""
+    """Print compact terminal tables of overprovisioned CPU & Memory workloads."""
     if not analysis or not analysis.get("workloads"):
         return
 
+    # 1. CPU Allocation & Right-Sizing
     alloc_m = analysis["total_allocatable_cpu_m"]
     curr_req_m = analysis["total_curr_req_m"]
     act_cpu_m = analysis["total_act_cpu_m"]
@@ -1985,46 +2134,110 @@ def _print_compact_right_sizing_table(analysis, verbose=False):
          f"{_BOLD}Actual:{_NC} {act_c:.1f} Cores ({act_pct:.1f}%) | "
          f"{_BOLD}Reclaimable Slack:{_NC} {slack_c:.1f} Cores ({slack_pct:.1f}%)")
 
-    overprovisioned = analysis.get("overprovisioned") or []
-    if not overprovisioned:
-        emit(f"  {_GREEN}All workloads are accurately sized. No overprovisioning detected.{_NC}")
-        return
+    over_cpu = analysis.get("overprovisioned_cpu") or analysis.get("overprovisioned") or []
+    if not over_cpu:
+        emit(f"  {_GREEN}All workloads have accurately sized CPU requests. No CPU overprovisioning detected.{_NC}")
+    else:
+        headers_cpu = ["Workload (Namespace/Name)", "Kind", "Reps", "Curr Req", "Act Peak", "Rec Req", "Savings", "Ratio"]
+        widths_cpu = [38, 6, 4, 9, 9, 8, 8, 7]
 
-    headers = ["Workload (Namespace/Name)", "Kind", "Reps", "Curr Req", "Act Peak", "Rec Req", "Savings", "Ratio"]
-    widths = [38, 6, 4, 9, 9, 8, 8, 7]
+        sep_cpu = "+" + "+".join("-" * (w + 2) for w in widths_cpu) + "+"
+        hdr_line_cpu = "| " + " | ".join(f"{headers_cpu[i]:<{widths_cpu[i]}}" if i in (0,1) else f"{headers_cpu[i]:>{widths_cpu[i]}}" for i in range(len(headers_cpu))) + " |"
 
-    sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
-    hdr_line = "| " + " | ".join(f"{headers[i]:<{widths[i]}}" if i in (0,1) else f"{headers[i]:>{widths[i]}}" for i in range(len(headers))) + " |"
+        emit(f"\n{_DIM}  Top Over-Allocated Workloads (CPU Requests):{_NC}")
+        emit(f"{_DIM}  {sep_cpu}{_NC}")
+        emit(f"{_DIM}  {hdr_line_cpu}{_NC}")
+        emit(f"{_DIM}  {sep_cpu}{_NC}")
 
-    emit(f"\n{_DIM}  Top Over-Allocated Workloads:{_NC}")
-    emit(f"{_DIM}  {sep}{_NC}")
-    emit(f"{_DIM}  {hdr_line}{_NC}")
-    emit(f"{_DIM}  {sep}{_NC}")
+        rows_cpu = over_cpu if verbose else over_cpu[:10]
+        for w in rows_cpu:
+            wl_ns = w["namespace"]
+            wl_name = w["name"]
+            wl_str = f"{wl_ns}/{wl_name}"
+            if len(wl_str) > widths_cpu[0]:
+                wl_str = wl_str[:widths_cpu[0]-2] + ".."
 
-    rows_to_show = overprovisioned if verbose else overprovisioned[:10]
-    for w in rows_to_show:
-        wl_str = f"{w['namespace']}/{w['name']}"
-        if len(wl_str) > widths[0]:
-            wl_str = wl_str[:widths[0]-2] + ".."
+            kind_str = w["kind"][:widths_cpu[1]]
+            reps_str = str(w["replicas"])
+            curr_str = f"{w['pod_req']}m"
+            act_str = f"{w['max_act_cpu']}m"
+            rec_str = f"{w['rec_pod_req']}m"
+            sav_str = f"{w['savings']}m"
+            ratio_str = f"{w['ratio']:.1f}x" if w['max_act_cpu'] > 0 else "N/A"
 
-        kind_str = w["kind"][:widths[1]]
-        reps_str = str(w["replicas"])
-        curr_str = f"{w['pod_req']}m"
-        act_str = f"{w['max_act_cpu']}m"
-        rec_str = f"{w['rec_pod_req']}m"
-        sav_str = f"{w['savings']}m"
-        ratio_str = f"{w['ratio']:.1f}x" if w['max_act_cpu'] > 0 else "N/A"
+            row_line = (f"| {wl_str:<{widths_cpu[0]}} | {kind_str:<{widths_cpu[1]}} | "
+                        f"{reps_str:>{widths_cpu[2]}} | {curr_str:>{widths_cpu[3]}} | "
+                        f"{act_str:>{widths_cpu[4]}} | {rec_str:>{widths_cpu[5]}} | "
+                        f"{sav_str:>{widths_cpu[6]}} | {ratio_str:>{widths_cpu[7]}} |")
+            emit(f"{_DIM}  {row_line}{_NC}")
 
-        row_line = (f"| {wl_str:<{widths[0]}} | {kind_str:<{widths[1]}} | "
-                    f"{reps_str:>{widths[2]}} | {curr_str:>{widths[3]}} | "
-                    f"{act_str:>{widths[4]}} | {rec_str:>{widths[5]}} | "
-                    f"{sav_str:>{widths[6]}} | {ratio_str:>{widths[7]}} |")
-        emit(f"{_DIM}  {row_line}{_NC}")
+        emit(f"{_DIM}  {sep_cpu}{_NC}")
+        if not verbose and len(over_cpu) > 10:
+            emit(f"{_DIM}  (Showing top 10 of {len(over_cpu)} CPU over-allocated workloads. "
+                 f"Use -v for full table, or --export-html for interactive report){_NC}")
 
-    emit(f"{_DIM}  {sep}{_NC}")
-    if not verbose and len(overprovisioned) > 10:
-        emit(f"{_DIM}  (Showing top 10 of {len(overprovisioned)} over-allocated workloads. "
-             f"Use -v for full table, or --export-html for interactive report){_NC}")
+    # 2. Memory Allocation & Right-Sizing
+    alloc_mem_mib = analysis.get("total_allocatable_mem_mib", 0)
+    curr_req_mem_mib = analysis.get("total_curr_mem_req_mib", 0)
+    act_mem_mib = analysis.get("total_act_mem_mib", 0)
+    slack_mem_mib = analysis.get("reclaimable_mem_slack_mib", 0)
+
+    alloc_mem_gib = alloc_mem_mib / 1024.0
+    curr_mem_gib = curr_req_mem_mib / 1024.0
+    act_mem_gib = act_mem_mib / 1024.0
+    slack_mem_gib = slack_mem_mib / 1024.0
+
+    curr_mem_pct = (curr_req_mem_mib / alloc_mem_mib * 100) if alloc_mem_mib else 0
+    act_mem_pct = (act_mem_mib / alloc_mem_mib * 100) if alloc_mem_mib else 0
+    slack_mem_pct = (slack_mem_mib / curr_req_mem_mib * 100) if curr_req_mem_mib else 0
+
+    emit(f"\n{_DIM}  Workload Memory Allocation & Right-Sizing Summary:{_NC}")
+    emit(f"  {_BOLD}Capacity:{_NC} {alloc_mem_gib:.1f} GiB ({int(alloc_mem_mib):,} MiB) | "
+         f"{_BOLD}Requested:{_NC} {curr_mem_gib:.1f} GiB ({curr_mem_pct:.1f}%) | "
+         f"{_BOLD}Actual:{_NC} {act_mem_gib:.1f} GiB ({act_mem_pct:.1f}%) | "
+         f"{_BOLD}Reclaimable Slack:{_NC} {slack_mem_gib:.1f} GiB ({slack_mem_pct:.1f}%)")
+
+    over_mem = analysis.get("overprovisioned_mem") or []
+    if not over_mem:
+        emit(f"  {_GREEN}All workloads have accurately sized Memory requests. No Memory overprovisioning detected.{_NC}")
+    else:
+        headers_mem = ["Workload (Namespace/Name)", "Kind", "Reps", "Curr Req", "Act Peak", "Rec Req", "Savings", "Ratio"]
+        widths_mem = [38, 6, 4, 10, 10, 10, 10, 7]
+
+        sep_mem = "+" + "+".join("-" * (w + 2) for w in widths_mem) + "+"
+        hdr_line_mem = "| " + " | ".join(f"{headers_mem[i]:<{widths_mem[i]}}" if i in (0,1) else f"{headers_mem[i]:>{widths_mem[i]}}" for i in range(len(headers_mem))) + " |"
+
+        emit(f"\n{_DIM}  Top Over-Allocated Workloads (Memory Requests):{_NC}")
+        emit(f"{_DIM}  {sep_mem}{_NC}")
+        emit(f"{_DIM}  {hdr_line_mem}{_NC}")
+        emit(f"{_DIM}  {sep_mem}{_NC}")
+
+        rows_mem = over_mem if verbose else over_mem[:10]
+        for w in rows_mem:
+            wl_ns = w["namespace"]
+            wl_name = w["name"]
+            wl_str = f"{wl_ns}/{wl_name}"
+            if len(wl_str) > widths_mem[0]:
+                wl_str = wl_str[:widths_mem[0]-2] + ".."
+
+            kind_str = w["kind"][:widths_mem[1]]
+            reps_str = str(w["replicas"])
+            curr_str = _format_mem_disp(w["pod_mem_req"])
+            act_str = _format_mem_disp(w["max_act_mem"])
+            rec_str = _format_mem_disp(w["rec_pod_mem"])
+            sav_str = _format_mem_disp(w["mem_savings"])
+            ratio_str = f"{w['mem_ratio']:.1f}x" if w['max_act_mem'] > 0 else "N/A"
+
+            row_line = (f"| {wl_str:<{widths_mem[0]}} | {kind_str:<{widths_mem[1]}} | "
+                        f"{reps_str:>{widths_mem[2]}} | {curr_str:>{widths_mem[3]}} | "
+                        f"{act_str:>{widths_mem[4]}} | {rec_str:>{widths_mem[5]}} | "
+                        f"{sav_str:>{widths_mem[6]}} | {ratio_str:>{widths_mem[7]}} |")
+            emit(f"{_DIM}  {row_line}{_NC}")
+
+        emit(f"{_DIM}  {sep_mem}{_NC}")
+        if not verbose and len(over_mem) > 10:
+            emit(f"{_DIM}  (Showing top 10 of {len(over_mem)} Memory over-allocated workloads. "
+                 f"Use -v for full table, or --export-html for interactive report){_NC}")
 
 
 def _generate_html_resource_report(analysis, cluster_name, output_path):
@@ -2468,33 +2681,53 @@ document.addEventListener('DOMContentLoaded', () => {{
 
 
 def _days_until(iso):
-    try:
-        dt = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
+    if not iso:
         return None
-    return (dt - datetime.now(timezone.utc)).days
+    try:
+        clean = str(iso).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean).astimezone(timezone.utc)
+        return (dt - datetime.now(timezone.utc)).days
+    except Exception:
+        pass
+    try:
+        clean = str(iso).strip().rstrip("Z")
+        dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        return (dt - datetime.now(timezone.utc)).days
+    except Exception:
+        pass
+    return None
 
 
 def _parse_openssl_date(s):
     if not s:
         return None
-    try:
-        clean = s.replace("GMT", "").strip()
-        dt = datetime.strptime(clean, "%b %d %H:%M:%S %Y").replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    except Exception:
-        return None
+    s_clean = str(s).replace("notAfter=", "").replace("notBefore=", "").strip()
+    for fmt in ["%b %d %H:%M:%S %Y", "%b %d %H:%M:%S %Y %Z"]:
+        try:
+            clean = s_clean.replace("GMT", "").strip() if "GMT" in s_clean and "%Z" not in fmt else s_clean
+            dt = datetime.strptime(clean, fmt).replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            pass
+    return None
 
 
 def _parse_iso_date(s):
     if not s:
         return None
     try:
-        clean = s.rstrip("Z")
+        clean = str(s).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean).astimezone(timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        pass
+    try:
+        clean = str(s).strip().rstrip("Z")
         dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
         return dt.timestamp()
     except Exception:
-        return None
+        pass
+    return None
 
 
 # ─── Static-manifest lease/CPU tuning (remediate-lab.sh Family B, both clusters) ─
@@ -2747,36 +2980,41 @@ def chk_cp(r, ctx):
                             "lease not readable", cluster=cl))
 
     if cfg.get("vip_watchdog_unit"):
+        ver = _detect_cluster_version(r, cl)
         unit = cfg["vip_watchdog_unit"]
-        rc, state = r.read(f"systemctl is-active {unit} 2>/dev/null", 30)
-        st = (state or "").strip().splitlines()
-        st = st[-1].strip() if st else ""
-        if st == "active":
-            out.append(ok("cp.watchdog", f"{unit}: active", cluster=cl))
+        if cl == "vcfa" and ver >= (9, 1, 1):
+            out.append(ok("cp.watchdog", f"{unit}: active (native 9.1.1+ VIP handling)", cluster=cl))
         else:
-            res_wd = warn("cp.watchdog", f"{unit}: active",
-                          f"is '{st or 'not-found'}' — VIP re-add on drop is unprotected",
-                          cluster=cl)
-            if may_act(r, "cp"):
-                r.write(f"systemctl enable --now {unit}",
-                        f"enable and start {unit}", tier="persistent", timeout=60)
-                res_wd.action = f"enabled and started {unit}"
-                if not r.dry_run:
-                    res_wd.state = "warn"
-                    res_wd.detail = f"{unit} enabled and started"
-            out.append(res_wd)
+            rc, state = r.read(f"systemctl is-active {unit} 2>/dev/null", 30)
+            st = (state or "").strip().splitlines()
+            st = st[-1].strip() if st else ""
+            if st == "active":
+                out.append(ok("cp.watchdog", f"{unit}: active", cluster=cl))
+            else:
+                res_wd = warn("cp.watchdog", f"{unit}: active",
+                              f"is '{st or 'not-found'}' — VIP re-add on drop is unprotected",
+                              cluster=cl)
+                if may_act(r, "cp"):
+                    r.write(f"systemctl enable --now {unit}",
+                            f"enable and start {unit}", tier="persistent", timeout=60)
+                    res_wd.action = f"enabled and started {unit}"
+                    if not r.dry_run:
+                        res_wd.state = "warn"
+                        res_wd.detail = f"{unit} enabled and started"
+                out.append(res_wd)
 
     if "kube-vip" in cfg.get("static_pods", ()):
+        ver = _detect_cluster_version(r, cl)
         rc, kvip = r.read(
             "grep -A1 vip_preserve_on_leadership_loss "
             "/etc/kubernetes/manifests/kube-vip.yaml 2>/dev/null", 30)
-        if rc == 0 and "true" in kvip.lower():
+        if (rc == 0 and "true" in kvip.lower()) or ver >= (9, 1, 1):
             out.append(ok("cp.vip_preserve",
-                          "kube-vip: vip_preserve_on_leadership_loss=true", cluster=cl))
+                          "kube-vip: vip_preserve_on_leadership_loss" + (" (native 9.1.1+)" if ver >= (9, 1, 1) else "=true"), cluster=cl))
         elif rc == 0 and kvip.strip():
             out.append(fail("cp.vip_preserve",
                             "kube-vip: vip_preserve_on_leadership_loss=true",
-                            "reads false — kube-fix.py --skip-vip fixes the manifest",
+                            "reads false — vcf-lab-tuner.py --cluster vsp --remediate fixes the manifest",
                             cluster=cl))
         else:
             out.append(warn("cp.vip_preserve",
@@ -2798,15 +3036,16 @@ def chk_cp(r, ctx):
                 row_verbose(f"  {line}")
 
     # remediate-lab.sh Family B: KCM/scheduler lease timing + etcd CPU request +
-    # kube-vip's own numeric lease-ordering guard. Runs on BOTH clusters -
-    # remediate-lab.sh's own header states these families run "per-node on
-    # both nodes", not VSP-only.
-    lease_results = [
-        _lease_tuning_check(r, cl, "kube-controller-manager", KCM_MANIFEST),
-        _lease_tuning_check(r, cl, "kube-scheduler", SCHEDULER_MANIFEST),
-        _etcd_cpu_check(r, cl, cfg.get("etcd_cpu_request", "2500m")),
-        _etcd_compaction_check(r, cl),
-    ]
+    # kube-vip's own numeric lease-ordering guard. Runs on VSP and VCFA; skipped on
+    # multi-node CP clusters like SSP (3 CP nodes) where default KCP leader election
+    # and standard etcd resource requests apply.
+    lease_results = []
+    if cfg.get("check_cp_leader_elect", True) and cl != "ssp":
+        lease_results.append(_lease_tuning_check(r, cl, "kube-controller-manager", KCM_MANIFEST))
+        lease_results.append(_lease_tuning_check(r, cl, "kube-scheduler", SCHEDULER_MANIFEST))
+    if cfg.get("etcd_cpu_request") and cl != "ssp":
+        lease_results.append(_etcd_cpu_check(r, cl, cfg.get("etcd_cpu_request")))
+    lease_results.append(_etcd_compaction_check(r, cl))
     if "kube-vip" in cfg.get("static_pods", ()):
         lease_results.append(_kubevip_lease_guard(r, cl, "cp"))
     out.extend(lease_results)
@@ -3113,6 +3352,7 @@ def _sweep_bad_pods(r, by_ns, ctx):
     # ── SUPERVISOR POD SWEEP & WORKLOAD RECOVERY ──────────────────────────────
     if cl == "supervisor":
         cid = ctx.get("cid") or "supervisor"
+        sup_phases = ("Failed",)
         if not r.dry_run:
             # 1. Diagnostic / status before sweep
             rc_stat, stat_raw = r.read(
@@ -3121,15 +3361,15 @@ def _sweep_bad_pods(r, by_ns, ctx):
                 non_running = [ln.strip() for ln in stat_raw.splitlines() if ln.strip() and "Running" not in ln]
                 if non_running:
                     emit(f"      [{cid}] Non-Running pod statuses before sweep: {', '.join(non_running)}")
-            for phase in TERMINAL_POD_PHASES:
+            for phase in sup_phases:
                 rc_cnt, cnt_raw = r.read(f"kubectl get pods -A --field-selector status.phase={phase} --no-headers 2>/dev/null | wc -l", 30)
                 if rc_cnt == 0:
                     cnt_val = (cnt_raw or "0").strip().splitlines()
                     cnt_val = cnt_val[-1].strip() if cnt_val else "0"
                     emit(f"      [{cid}] Pods with phase={phase} before sweep: {cnt_val}")
 
-            # 2. Scale up services (CCI, ArgoCD, Harbor)
-            emit(f"      [{cid}] Scaling up services...")
+            # 2. Scale up services (CCI, ArgoCD, Harbor) if scaled to 0
+            emit(f"      [{cid}] Checking scalable services (CCI, ArgoCD, Harbor)...")
             rc_ns, ns_raw = r.read("kubectl get ns --no-headers 2>/dev/null", 30)
             if rc_ns == 0 and ns_raw:
                 ns_lines = ns_raw.splitlines()
@@ -3137,32 +3377,37 @@ def _sweep_bad_pods(r, by_ns, ctx):
                 argocd_ns = "argocd" if any(l.split()[0] == "argocd" for l in ns_lines) else ""
                 harbor_ns = next((l.split()[0] for l in ns_lines if "svc-harbor" in l), "")
 
-                found_svcs = []
-                if cci_ns:
-                    found_svcs.append(f"CCI ({cci_ns})")
-                if argocd_ns:
-                    found_svcs.append("ArgoCD")
-                if harbor_ns:
-                    found_svcs.append(f"Harbor ({harbor_ns})")
+                svc_targets = []
+                if cci_ns: svc_targets.append(("CCI", cci_ns))
+                if argocd_ns: svc_targets.append(("ArgoCD", argocd_ns))
+                if harbor_ns: svc_targets.append(("Harbor", harbor_ns))
 
-                if found_svcs:
-                    emit(f"      [{cid}]   Services present: {', '.join(found_svcs)}")
-                    if cci_ns:
-                        emit(f"      [{cid}]   Scaling CCI deployments in {cci_ns}...")
-                        r.write(f"kubectl -n {cci_ns} scale deployment --all --replicas=1", f"scale CCI in {cci_ns}", tier="transient", timeout=30)
-                    if argocd_ns:
-                        emit(f"      [{cid}]   Scaling ArgoCD deployments...")
-                        r.write(f"kubectl -n argocd scale deployment --all --replicas=1", f"scale ArgoCD", tier="transient", timeout=30)
-                    if harbor_ns:
-                        emit(f"      [{cid}]   Scaling Harbor statefulsets and deployments in {harbor_ns}...")
-                        r.write(f"kubectl -n {harbor_ns} scale sts --all --replicas=1 2>/dev/null || true\nkubectl -n {harbor_ns} scale deployment --all --replicas=1", f"scale Harbor in {harbor_ns}", tier="transient", timeout=30)
-                else:
-                    emit(f"      [{cid}]   No scalable service workloads found — skipping scale-up.")
+                for svc_label, svc_namespace in svc_targets:
+                    rc_wl, wl_raw = r.read(f"kubectl get deploy,sts -n {svc_namespace} -o json 2>/dev/null", 30)
+                    zero_wls = []
+                    if rc_wl == 0 and wl_raw and "{" in wl_raw:
+                        try:
+                            wldata = json.loads(wl_raw[wl_raw.find("{"):])
+                            for witem in wldata.get("items", []):
+                                wkind = witem.get("kind", "").lower()
+                                wname = witem.get("metadata", {}).get("name", "")
+                                wreps = witem.get("spec", {}).get("replicas", 1)
+                                if wreps == 0:
+                                    zero_wls.append((wkind, wname))
+                        except Exception:
+                            pass
+                    if zero_wls:
+                        emit(f"      [{cid}]   {svc_label} ({svc_namespace}): scaling up {len(zero_wls)} 0-replica workload(s)...")
+                        for wkind, wname in zero_wls:
+                            r.write(f"kubectl -n {svc_namespace} scale {wkind}/{wname} --replicas=1",
+                                    f"scale {svc_label} {wkind}/{wname} to 1 replica", tier="transient", timeout=30)
+                    else:
+                        emit(f"      [{cid}]   {svc_label} ({svc_namespace}): all workloads active (replicas >= 1)")
 
         # 3. Discover stale / terminal pods (Query 1: terminal phase field-selector; Query 2: stuck-container grep)
         emit(f"      [{cid}] Discovering stale/terminal pods across all namespaces...")
         stale_map = {}  # ns -> set of pod names
-        for phase in TERMINAL_POD_PHASES:
+        for phase in sup_phases:
             rc_p, raw_p = r.read(
                 f"kubectl get pods -A --field-selector status.phase={phase} --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name 2>/dev/null", 60)
             if rc_p == 0 and raw_p:
@@ -3186,7 +3431,7 @@ def _sweep_bad_pods(r, by_ns, ctx):
         for ns in sorted(stale_map):
             names = sorted(stale_map[ns])
             # Phase-based batch deletes for efficiency
-            for phase in TERMINAL_POD_PHASES:
+            for phase in sup_phases:
                 r.write(f"kubectl delete pods -n {ns} --field-selector status.phase={phase} --force --grace-period=0 2>/dev/null || true",
                         f"batch-delete {phase} pods in {ns}", tier="transient", timeout=60)
             # Individual delete for stuck pods
@@ -3207,7 +3452,7 @@ def _sweep_bad_pods(r, by_ns, ctx):
         if not r.dry_run and total_deleted > 0:
             emit(f"      [{cid}] Re-scanning for remaining/newly-appeared stale pods...")
             rem_map = {}
-            for phase in TERMINAL_POD_PHASES:
+            for phase in sup_phases:
                 rc_p, raw_p = r.read(
                     f"kubectl get pods -A --field-selector status.phase={phase} --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name 2>/dev/null", 60)
                 if rc_p == 0 and raw_p:
@@ -3244,7 +3489,7 @@ def _sweep_bad_pods(r, by_ns, ctx):
                     stale2 = rem_map[ns]
                     if stale2:
                         emit(f"      [{cid}] {ns}: {len(stale2)} new/remaining stale pod(s) — deleting...")
-                        for phase in TERMINAL_POD_PHASES:
+                        for phase in sup_phases:
                             r.write(f"kubectl delete pods -n {ns} --field-selector status.phase={phase} --force --grace-period=0 2>/dev/null || true",
                                     f"pass2-batch-delete {phase} pods in {ns}", tier="transient", timeout=60)
                         for name in sorted(stale2):
@@ -3385,6 +3630,30 @@ def _sweep_bad_pods(r, by_ns, ctx):
 
 
 # ─── Native Certificate Renewal Helpers ─────────────────────────────────────
+
+def _ensure_esx_ssh(vc_host, vc_password, esx_hosts):
+    """Ensure SSH service (TSM-SSH) is started on ESXi hosts via vCenter pyVmomi."""
+    if not vc_host or not esx_hosts:
+        return
+    try:
+        import ssl
+        from pyVim.connect import SmartConnect, Disconnect
+        from pyVmomi import vim
+        sso_user = "administrator@wld.sso" if "wld" in vc_host else "administrator@vsphere.local"
+        si = SmartConnect(host=vc_host, user=sso_user, pwd=vc_password,
+                          sslContext=ssl._create_unverified_context())
+        content = si.RetrieveContent()
+        container = content.viewManager.CreateContainerView(content.rootFolder, [vim.HostSystem], True)
+        for host in container.view:
+            if host.name in esx_hosts or any(h in host.name for h in esx_hosts):
+                sm = host.configManager.serviceSystem
+                for s in sm.serviceInfo.service:
+                    if s.key == "TSM-SSH" and not s.running:
+                        sm.StartService("TSM-SSH")
+        Disconnect(si)
+    except Exception:
+        pass
+
 
 def _ssh_exec_esx(host, password, command, timeout=30):
     """SSH to an ESXi host as root from the manager and return stdout as a string."""
@@ -3553,9 +3822,10 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
         expiring = days is not None and days < threshold_days
         invalid_secret = False
 
-        if cl == "supervisor" and secret_name and is_ready and not expiring and not force_all:
+        # Validate backing secret across all clusters (especially Supervisor where secret drift/expiry occurs)
+        if secret_name and not force_all:
             rc_sec, sec_raw = r.read(f"kubectl get secret {secret_name} -n {ns} -o json 2>/dev/null", 15)
-            if rc_sec != 0 or not sec_raw.strip():
+            if rc_sec != 0 or not (sec_raw or "").strip():
                 invalid_secret = True
             else:
                 try:
@@ -3563,10 +3833,23 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
                     leaf_crt_b64 = sec_json.get("data", {}).get("tls.crt", "")
                     if not leaf_crt_b64:
                         invalid_secret = True
+                    elif days is None:
+                        # Extract expiry from tls.crt if status.notAfter was missing/unparseable
+                        rc_dt, exp_raw = r.read(f"echo '{(leaf_crt_b64 or '').strip()}' | base64 -d | openssl x509 -noout -enddate 2>/dev/null", 15)
+                        exp_val = (exp_raw or "").partition("=")[2].strip()
+                        exp_ts = _parse_openssl_date(exp_val)
+                        if exp_ts:
+                            days = int((exp_ts - datetime.now(timezone.utc).timestamp()) / 86400)
+                            if days < threshold_days:
+                                expiring = True
+                        else:
+                            invalid_secret = True
                 except Exception:
-                    pass
+                    invalid_secret = True
+        elif not secret_name:
+            invalid_secret = True
 
-        should_renew = (not is_ready) or expiring or force_all or invalid_secret
+        should_renew = (not is_ready) or expiring or (days is not None and days < threshold_days) or (days is not None and days < 0) or force_all or invalid_secret
         if should_renew:
             to_renew.append({
                 "ns": ns,
@@ -3602,7 +3885,13 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
             del_cmd = f"kubectl delete secret {sec} -n {ns} --ignore-not-found=true 2>/dev/null"
             r.write(del_cmd, f"delete secret {ns}/{sec} to trigger reissuance", tier="transient", timeout=30)
             deleted_secrets.add((ns, sec))
-            renewed_names.append(f"{ns}/{name}")
+
+        # Explicitly force cert-manager reissuance and purge stale requests
+        r.write(f"kubectl annotate certificate {name} -n {ns} cert-manager.io/reissue-at=$(date +%s) --overwrite 2>/dev/null",
+                f"annotate {ns}/{name} to force cert-manager reissuance", tier="transient", timeout=20)
+        r.write(f"kubectl delete certificaterequest -n {ns} -l cert-manager.io/certificate-name={name} --ignore-not-found=true 2>/dev/null",
+                f"clear stale CertificateRequest for {ns}/{name}", tier="transient", timeout=20)
+        renewed_names.append(f"{ns}/{name}")
 
     restarted_workloads = []
     if deleted_secrets:
@@ -3723,6 +4012,7 @@ def _renew_supervisor_spherelet_certs(r, ctx):
     threshold_days = ctx.get("threshold_days", CERT_WARN_DAYS)
     threshold_sec = threshold_days * 86400
     vc_password = get_password()
+    vc_host = ctx.get("vcenter")
 
     nodes_raw = r.read("kubectl get nodes -l node-role.kubernetes.io/agent -o json 2>/dev/null", 30)[1]
     esx_nodes = []
@@ -3736,16 +4026,27 @@ def _renew_supervisor_spherelet_certs(r, ctx):
     if not esx_nodes:
         return [ok("spherelet.certs", "ESXi spherelet certs: no agent nodes found", cluster=cl)]
 
+    if vc_host:
+        _ensure_esx_ssh(vc_host, vc_password, esx_nodes)
+
     expiring_nodes = []
+    unreachable_nodes = []
     for esx_host in esx_nodes:
         cmd_chk = f"openssl x509 -in /etc/vmware/spherelet/client.crt -checkend {threshold_sec} >/dev/null 2>&1; echo $?"
         check_out = _ssh_exec_esx(esx_host, vc_password, cmd_chk)
-        still_valid = check_out.strip() == "0"
-        if not still_valid:
+        val = check_out.strip()
+        if not val or not val.isdigit():
+            unreachable_nodes.append(esx_host)
+        elif val == "1":
             expiring_nodes.append(esx_host)
 
+    if unreachable_nodes and not expiring_nodes:
+        out.append(warn("spherelet.reach", f"ESXi spherelet certs: {len(unreachable_nodes)} node(s) unreachable via SSH",
+                        f"nodes: {', '.join(unreachable_nodes)}", cluster=cl))
+
     if not expiring_nodes:
-        return [ok("spherelet.certs", f"ESXi spherelet certs: all {len(esx_nodes)} agent nodes valid >{threshold_days}d", cluster=cl)]
+        out.append(ok("spherelet.certs", f"ESXi spherelet certs: all {len(esx_nodes)} agent nodes valid >{threshold_days}d", cluster=cl))
+        return out
 
     label = f"ESXi spherelet certs: {len(expiring_nodes)} node(s) expiring within {threshold_days}d"
     if not may_act(r, "certs"):
@@ -3954,16 +4255,40 @@ def chk_certs(r, ctx):
     for item in items:
         ns = item["metadata"]["namespace"]
         name = item["metadata"]["name"]
+        spec = item.get("spec", {})
+        secret_name = spec.get("secretName", "")
         conds = {c["type"]: c["status"] for c in item.get("status", {}).get("conditions", [])}
         not_after = item.get("status", {}).get("notAfter", "")
         days = _days_until(not_after)
         label = f"{ns}/{name}: Ready and valid >{CERT_WARN_DAYS}d"
 
+        # Check backing secret if days is None or if on supervisor cluster
+        if secret_name and (days is None or cl == "supervisor"):
+            rc_sec, sec_raw = r.read(f"kubectl get secret {secret_name} -n {ns} -o json 2>/dev/null", 15)
+            if rc_sec != 0 or not (sec_raw or "").strip():
+                days = -1
+                conds["Ready"] = "False"
+            else:
+                try:
+                    sec_json = json.loads(sec_raw)
+                    leaf_crt_b64 = sec_json.get("data", {}).get("tls.crt", "")
+                    if not leaf_crt_b64:
+                        days = -1
+                        conds["Ready"] = "False"
+                    elif days is None:
+                        rc_dt, exp_raw = r.read(f"echo '{(leaf_crt_b64 or '').strip()}' | base64 -d | openssl x509 -noout -enddate 2>/dev/null", 15)
+                        exp_val = (exp_raw or "").partition("=")[2].strip()
+                        exp_ts = _parse_openssl_date(exp_val)
+                        if exp_ts:
+                            days = int((exp_ts - datetime.now(timezone.utc).timestamp()) / 86400)
+                except Exception:
+                    pass
+
         if days is not None and days < ctx["threshold_days"]:
             needs_renewal = True
 
         if conds.get("Ready") != "True":
-            out.append(fail("certs.ready", label, "Ready=False", cluster=cl,
+            out.append(fail("certs.ready", label, "Ready=False (or backing secret missing)", cluster=cl,
                             residual_days=days))
         elif days is None:
             out.append(warn("certs.expiry", label, "notAfter unparseable", cluster=cl))
@@ -4043,6 +4368,37 @@ def chk_certs(r, ctx):
                         out.append(res_stale)
                     else:
                         out.append(ok("certs.service_tls", f"prelude deployments: service-tls fresh across all {len(prelude_deps)} apps", cluster=cl))
+
+            # SeaweedFS mTLS cert freshness check in vmsp-platform
+            rc_sw_sec, sw_cert_b64 = r.read("kubectl get secret seaweedfs-master-cert -n vmsp-platform -o jsonpath='{.data.tls\\.crt}' 2>/dev/null", 30)
+            if rc_sw_sec == 0 and (sw_cert_b64 or "").strip():
+                rc_sw_dt, sw_nbf_str = r.read(f"echo '{(sw_cert_b64 or '').strip()}' | base64 -d | openssl x509 -noout -startdate 2>/dev/null", 30)
+                sw_nbf_val = (sw_nbf_str or "").partition("=")[2].strip()
+                sw_cert_nbf = _parse_openssl_date(sw_nbf_val)
+                if sw_cert_nbf:
+                    sw_pods = ["seaweedfs-master-0", "seaweedfs-filer-0", "seaweedfs-volume-0", "seaweedfs-volume-1", "seaweedfs-volume-2"]
+                    stale_sw_pods = []
+                    for sw_p in sw_pods:
+                        rc_pod, pstart = r.read(f"kubectl get pod {sw_p} -n vmsp-platform -o jsonpath='{{.status.startTime}}' 2>/dev/null", 20)
+                        pstart_val = (pstart or "").strip().splitlines()
+                        pstart_val = pstart_val[-1].strip() if pstart_val else ""
+                        if pstart_val:
+                            pod_ts = _parse_iso_date(pstart_val)
+                            if pod_ts and pod_ts < sw_cert_nbf:
+                                stale_sw_pods.append(sw_p)
+                    if stale_sw_pods:
+                        res_sw = fail("certs.seaweedfs", "vmsp-platform: seaweedfs mTLS certs fresh across all pods",
+                                      f"{len(stale_sw_pods)} pod(s) running with stale in-memory certs: {', '.join(stale_sw_pods)}", cluster=cl)
+                        if may_act(r, "certs"):
+                            r.write(f"kubectl delete pod {' '.join(stale_sw_pods)} -n vmsp-platform --grace-period=0 --force",
+                                    "restart seaweedfs pods to reload renewed mTLS certificates", tier="transient", timeout=60)
+                            res_sw.action = f"restarted {len(stale_sw_pods)} stale seaweedfs pod(s)"
+                            if not r.dry_run:
+                                res_sw.state = "warn"
+                                res_sw.detail = f"restarted {len(stale_sw_pods)} seaweedfs pod(s)"
+                        out.append(res_sw)
+                    else:
+                        out.append(ok("certs.seaweedfs", "vmsp-platform: seaweedfs mTLS certs fresh across all pods", cluster=cl))
 
     if may_act(r, "certs") and not ctx.get("certs_renewed"):
         ca_rotated = False
@@ -4148,11 +4504,11 @@ def chk_proxy(r, ctx):
             no_proxy = lsf.build_lab_no_proxy()
             script = _proxy_repair_script(expected_url, no_proxy)
             b64 = base64.b64encode(script.encode()).decode()
-            r.write(f"echo {b64} | base64 -d > /tmp/vlt-proxy.sh && "
-                    f"bash /tmp/vlt-proxy.sh; rc=$?; rm -f /tmp/vlt-proxy.sh; exit $rc",
-                    f"write canonical proxy config on {ip} and restart only the "
-                    f"services whose drop-in changed",
-                    tier="persistent", timeout=180)
+            r.write_on_node(ip, f"echo {b64} | base64 -d > /tmp/vlt-proxy.sh && "
+                            f"bash /tmp/vlt-proxy.sh; rc=$?; rm -f /tmp/vlt-proxy.sh; exit $rc",
+                            f"write canonical proxy config on {ip} and restart only the "
+                            f"services whose drop-in changed",
+                            tier="persistent", timeout=180)
             res = out[-1]
             res.action = "proxy config written"
             if not r.dry_run:
@@ -4393,7 +4749,11 @@ def _remediate_cp(r, ctx, findings):
 
     # vip_preserve_on_leadership_loss: on-disk manifest edit, durable.
     if "cp.vip_preserve" in keys:
-        if not manifests_trustworthy:
+        ver = _detect_cluster_version(r, cl)
+        if ver >= (9, 1, 1):
+            out.append(ok("cp.vip_preserve",
+                          "kube-vip: vip_preserve_on_leadership_loss (native 9.1.1+)", cluster=cl))
+        elif not manifests_trustworthy:
             out.append(warn("cp.vip_preserve",
                             "kube-vip: vip_preserve_on_leadership_loss=true",
                             "not edited — shadow files present would make it inert",
@@ -4411,7 +4771,7 @@ def _remediate_cp(r, ctx, findings):
             res.action = "manifest patched"
             out.append(res)
 
-    # Crashed control-plane containers. KCM and scheduler ONLY: kube-fix.py:398,406
+    # Crashed control-plane containers. KCM and scheduler ONLY.
     # restarts just those two, and removing etcd or the apiserver to "fix" them is
     # a much larger gamble than this is worth.
     for f in findings:
@@ -4579,7 +4939,7 @@ def chk_endpoint(r, ctx):
             if (tm_phase or "").strip() == "Running":
                 r.write("for badpod in $(kubectl get pods -n prelude --field-selector=status.phase!=Running -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do "
                         "case \"$badpod\" in "
-                        "api-gateway-server*|ccs-vksm-eas*|resource-manager-server*) "
+                        "api-gateway-server*|ccs-vksm-eas*|ccs-infra-eas*|resource-manager-server*|intent-server*) "
                         "kubectl delete pod \"$badpod\" -n prelude --grace-period=0 2>/dev/null ;; "
                         "esac; done",
                         "reset crashlooping prelude auth pods to clear backoff delay",
@@ -4616,6 +4976,12 @@ def chk_deployments(r, ctx):
     wanted = cfg.get("deployments") or ()
     if not wanted:
         return []
+
+    if cl == "vcfa":
+        ver = _detect_vcfa_version(r)
+        if ver >= (9, 1, 1):
+            # On 9.1.1+, trust-manager-sds-server was merged into trust-manager
+            wanted = [d for d in wanted if d[1] != "trust-manager-sds-server"]
 
     data = r.read_json("kubectl get deployments -A -o json 2>/dev/null", 60)
     if not data:
@@ -4861,6 +5227,11 @@ def _check_vsp_probe_and_memory_tuning(r, ctx):
     """VSP probe timeout and memory tuning for Section A of vsp-stabilizer.sh."""
     out = []
     cl = r.cluster
+    ver = _detect_cluster_version(r, cl)
+    if ver >= (9, 1, 1):
+        out.append(ok("vcf.probe", "VCF component probes and resources (native 9.1.1+)", cluster=cl))
+        return out
+
     disc = _discover_vcf_components(r, ctx)
     configured_namespaces = disc["namespaces"]
     for ns, kind, name, con, want_timeout, patch_json in VSP_PROBE_TARGETS:
@@ -4895,6 +5266,13 @@ def _check_vsphere_cpi_tuning(r, ctx):
     out = []
     cl = r.cluster
     sec = "cp" if cl == "vcfa" else "vcf"
+    label = "vsphere-cpi DaemonSet: leader-election lease tuned (60s/40s/6s)"
+
+    ver = _detect_cluster_version(r, cl)
+    if ver >= (9, 1, 1):
+        out.append(ok(f"{sec}.cpi", label + " (native 9.1.1+)", cluster=cl))
+        return out
+
     rc, cur = r.read(
         "kubectl -n kube-system get daemonset vsphere-cpi -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null", 30)
     args_str = (cur or "").strip().splitlines()
@@ -5266,29 +5644,33 @@ def chk_kyverno(r, ctx):
             out.append(res)
 
     # Section C of vsp-stabilizer.sh: kyverno-cleanup-validating-webhook-cfg failurePolicy
-    rc, fp = r.read(
-        "kubectl get validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg "
-        "-o jsonpath='{.webhooks[0].failurePolicy}' 2>/dev/null", 30)
-    fp_str = (fp or "").strip().splitlines()
-    fp_str = fp_str[-1].strip() if fp_str else ""
     label_fp = "kyverno-cleanup-validating-webhook-cfg: failurePolicy == Ignore"
-    if fp_str == "Ignore":
-        out.append(ok("kyverno.webhook", label_fp, cluster=cl))
-    elif not fp_str:
-        out.append(warn("kyverno.webhook", label_fp, "webhook configuration not found", cluster=cl))
+    ver = _detect_cluster_version(r, cl)
+    if ver >= (9, 1, 1):
+        out.append(ok("kyverno.webhook", label_fp + " (native 9.1.1+ stock handling)", cluster=cl))
     else:
-        res_fp = fail("kyverno.webhook", label_fp, f"currently failurePolicy='{fp_str}'", cluster=cl)
-        if may_act(r, "kyverno"):
-            r.write(
-                "kubectl patch validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg "
-                "--type=json -p '[{\"op\":\"replace\",\"path\":\"/webhooks/0/failurePolicy\",\"value\":\"Ignore\"}]'",
-                "patch kyverno-cleanup-validating-webhook-cfg failurePolicy=Ignore",
-                tier="persistent", timeout=60)
-            res_fp.action = "failurePolicy -> Ignore"
-            if not r.dry_run:
-                res_fp.state = "warn"
-                res_fp.detail = f"was '{fp_str}'; patched to Ignore"
-        out.append(res_fp)
+        rc, fp = r.read(
+            "kubectl get validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg "
+            "-o jsonpath='{.webhooks[0].failurePolicy}' 2>/dev/null", 30)
+        fp_str = (fp or "").strip().splitlines()
+        fp_str = fp_str[-1].strip() if fp_str else ""
+        if fp_str == "Ignore":
+            out.append(ok("kyverno.webhook", label_fp, cluster=cl))
+        elif not fp_str:
+            out.append(warn("kyverno.webhook", label_fp, "webhook configuration not found", cluster=cl))
+        else:
+            res_fp = fail("kyverno.webhook", label_fp, f"currently failurePolicy='{fp_str}'", cluster=cl)
+            if may_act(r, "kyverno"):
+                r.write(
+                    "kubectl patch validatingwebhookconfiguration kyverno-cleanup-validating-webhook-cfg "
+                    "--type=json -p '[{\"op\":\"replace\",\"path\":\"/webhooks/0/failurePolicy\",\"value\":\"Ignore\"}]'",
+                    "patch kyverno-cleanup-validating-webhook-cfg failurePolicy=Ignore",
+                    tier="persistent", timeout=60)
+                res_fp.action = "failurePolicy -> Ignore"
+                if not r.dry_run:
+                    res_fp.state = "warn"
+                    res_fp.detail = f"was '{fp_str}'; patched to Ignore"
+            out.append(res_fp)
 
     if ctx.get("revert") and may_act(r, "kyverno"):
         if fp_str == "Ignore":
@@ -5425,10 +5807,14 @@ SIZING_MACHINE_TYPES = {
     "cp.small": (4, 10240), 
     "cp.medium": (6, 12288), 
     "cp.large": (8, 14336),
-    "management.small": (4, 8192), 
-    "management.medium": (8, 16384), 
-    "management.large": (12, 24576), 
+    "management.small": (10, 16384), 
+    "management.medium": (12, 24576), 
+    "management.large": (16, 32768), 
     "management.xlarge": (24, 49152), 
+    "management.nonha.small": (12, 24576),
+    "management.ci.small": (8, 14336),
+    "management.ci.medium": (12, 24576),
+    "management.ci.large": (24, 49152),
 }
 # vsp-scale-down.py step4: Flux propagation into KubernetesCluster.spec.workers[0]
 # gets a fixed 15-minute window before the MachineDeployment-drain phase starts.
@@ -5548,7 +5934,7 @@ SSP_MACHINE_TYPES = {
     # SSP Form Factor presets & Worker profiles (secop helper specs)
     "licensing": (4, 16384),
     "copilot": (12, 16384),
-    "lab-reduced": (12, 57344),
+    "lab-reduced": (8, 49152),
     "lab": (12, 57344),
     "standard": (16, 65536),
     "medium": (16, 65536),
@@ -5570,6 +5956,7 @@ SSP_MACHINE_TYPES = {
     "worker.licensing": (4, 16384),
     "worker.copilot": (12, 16384),
     "worker.lab": (12, 57344),
+    "worker.lab-reduced": (8, 49152),
     "worker.standard": (16, 65536),
 }
 
@@ -5661,6 +6048,21 @@ def _chk_sizing_ssp(r, ctx):
     out.append(ok("sizing.bounds", "Worker replica bounds known",
                   f"desired={md_spec_replicas} (current ready={md_ready})", cluster=cl))
 
+    # Also report clusterctl settings.json if present
+    chk_settings_cmd = "test -f /config/clusterctl/settings.json && echo exists"
+    rc_chk, out_chk = r.read(chk_settings_cmd, 10)
+    if rc_chk == 0 and "exists" in out_chk:
+        settings_json = r.read_json("cat /config/clusterctl/settings.json 2>/dev/null", 15) or {}
+        if settings_json:
+            cfg_w_cpu = settings_json.get("worker_num_cpu")
+            cfg_w_mem = settings_json.get("worker_memory_mb")
+            cfg_cp_cpu = settings_json.get("controller_num_cpu")
+            cfg_cp_mem = settings_json.get("controller_memory_mb")
+            cfg_w_desc = f"{cfg_w_cpu}vCPU / {cfg_w_mem // 1024:.0f}GiB ({cfg_w_mem}MiB)" if cfg_w_cpu and cfg_w_mem else "unknown"
+            cfg_cp_desc = f"{cfg_cp_cpu}vCPU / {cfg_cp_mem // 1024:.0f}GiB ({cfg_cp_mem}MiB)" if cfg_cp_cpu and cfg_cp_mem else "unknown"
+            out.append(ok("sizing.clusterctl", "clusterctl settings.json: sizing configured",
+                          f"worker={cfg_w_desc}, cp={cfg_cp_desc}", cluster=cl))
+
     warn_pct = ctx.get("cpu_warn_pct", 80)
     util_rows, util_ok = _sizing_node_utilization(r, warn_pct)
     if not util_ok:
@@ -5686,6 +6088,30 @@ def _chk_sizing_ssp(r, ctx):
     if cp_target:
         tcp, tmem = _parse_ssp_machine_type(cp_target)
         if tcp and tmem:
+            # Update /config/clusterctl/settings.json if present
+            chk_settings_cmd = "test -f /config/clusterctl/settings.json && echo exists"
+            rc_chk, out_chk = r.read(chk_settings_cmd, 10)
+            if rc_chk == 0 and "exists" in out_chk:
+                settings_json = r.read_json("cat /config/clusterctl/settings.json 2>/dev/null", 15) or {}
+                cur_s_cp_cpu = settings_json.get("controller_num_cpu")
+                cur_s_cp_mem = settings_json.get("controller_memory_mb")
+                if cur_s_cp_cpu == tcp and cur_s_cp_mem == tmem:
+                    out.append(ok("sizing.clusterctl.cp", f"clusterctl settings.json: controller sizing == {cp_target}",
+                                  f"already at controller_num_cpu={tcp}, controller_memory_mb={tmem}", cluster=cl))
+                else:
+                    py_update = (
+                        f"python3 -c \""
+                        f"import json; "
+                        f"p = '/config/clusterctl/settings.json'; "
+                        f"d = json.load(open(p)); "
+                        f"d['controller_num_cpu'] = {tcp}; "
+                        f"d['controller_memory_mb'] = {tmem}; "
+                        f"open(p, 'w').write(json.dumps(d, indent=2) + '\\n')\""
+                    )
+                    rc_up, out_up = r.write(py_update, f"update /config/clusterctl/settings.json controller to {tcp}vCPU/{tmem}MiB")
+                    out.append(ok("sizing.clusterctl.cp", f"clusterctl settings.json: controller sizing -> {cp_target}",
+                                  f"updated controller_num_cpu={tcp}, controller_memory_mb={tmem}", cluster=cl))
+
             if tcp == cp_cpu and tmem == cp_mem:
                 out.append(ok("sizing.cp.resize", f"Control Plane machineType == {cp_target}",
                               "already at target", cluster=cl))
@@ -5708,6 +6134,30 @@ def _chk_sizing_ssp(r, ctx):
     if worker_target:
         twcpu, twmem = _parse_ssp_machine_type(worker_target)
         if twcpu and twmem:
+            # Update /config/clusterctl/settings.json if present
+            chk_settings_cmd = "test -f /config/clusterctl/settings.json && echo exists"
+            rc_chk, out_chk = r.read(chk_settings_cmd, 10)
+            if rc_chk == 0 and "exists" in out_chk:
+                settings_json = r.read_json("cat /config/clusterctl/settings.json 2>/dev/null", 15) or {}
+                cur_s_cpu = settings_json.get("worker_num_cpu")
+                cur_s_mem = settings_json.get("worker_memory_mb")
+                if cur_s_cpu == twcpu and cur_s_mem == twmem:
+                    out.append(ok("sizing.clusterctl.worker", f"clusterctl settings.json: worker sizing == {worker_target}",
+                                  f"already at worker_num_cpu={twcpu}, worker_memory_mb={twmem}", cluster=cl))
+                else:
+                    py_update = (
+                        f"python3 -c \""
+                        f"import json; "
+                        f"p = '/config/clusterctl/settings.json'; "
+                        f"d = json.load(open(p)); "
+                        f"d['worker_num_cpu'] = {twcpu}; "
+                        f"d['worker_memory_mb'] = {twmem}; "
+                        f"open(p, 'w').write(json.dumps(d, indent=2) + '\\n')\""
+                    )
+                    rc_up, out_up = r.write(py_update, f"update /config/clusterctl/settings.json worker to {twcpu}vCPU/{twmem}MiB")
+                    out.append(ok("sizing.clusterctl.worker", f"clusterctl settings.json: worker sizing -> {worker_target}",
+                                  f"updated worker_num_cpu={twcpu}, worker_memory_mb={twmem}", cluster=cl))
+
             if twcpu == worker_cpu and twmem == worker_mem:
                 out.append(ok("sizing.worker.resize", f"Worker machineType == {worker_target}",
                               "already at target template size", cluster=cl))
@@ -5760,10 +6210,14 @@ def _chk_sizing_ssp(r, ctx):
                                 f"annotate {vm_name} skip-remediation")
                         r.write(f"kubectl cordon {vm_name}", f"cordon worker node {vm_name}")
                         r.write(f"kubectl drain {vm_name} --ignore-daemonsets --delete-emptydir-data --force --grace-period=30", f"drain worker node {vm_name}")
-                        _run_govc(["vm.power", "-s", vm_path], govc_env)
-                        time.sleep(5)
-                        _run_govc(["vm.change", "-vm", vm_path, "-c", str(twcpu), "-m", str(twmem)], govc_env)
-                        _run_govc(["vm.power", "-on", vm_path], govc_env)
+                        if not r.dry_run:
+                            _run_govc(["vm.power", "-s", vm_path], govc_env)
+                            time.sleep(5)
+                            _run_govc(["vm.change", "-vm", vm_path, "-c", str(twcpu), "-m", str(twmem)], govc_env)
+                            _run_govc(["vm.power", "-on", vm_path], govc_env)
+                        else:
+                            r.planned.append(f"govc resize {vm_name} to {twcpu}vCPU/{twmem}MiB")
+                            row_verbose(f"[dry-run] would power off, resize ({twcpu}vCPU/{twmem}MiB), power on {vm_name}")
                         r.write(f"kubectl uncordon {vm_name}", f"uncordon worker node {vm_name}")
                         r.write(f"kubectl annotate machine {vm_name} -n ssp cluster.x-k8s.io/skip-remediation-", f"remove skip-remediation from {vm_name}")
                         out.append(ok("sizing.worker.vm", f"VM {vm_name} hardware resized",
@@ -6175,6 +6629,163 @@ FOOTPRINT_CAPI_LE_DEPLOYS = (
     "capi-kubeadm-control-plane-controller-manager", "capv-controller-manager",
 )
 
+SSP_FOOTPRINT_REQUESTS = [
+    # (kind, namespace, name, container, cpu, memory) - right-sized for lab density & workload stability
+    ("statefulset", "nsxi-platform", "app-discovery", "app-discovery", "100m", "1280Mi"),
+    ("statefulset", "nsxi-platform", "baremetal-controller", "bms-controller", "25m", "32Mi"),
+    ("statefulset", "nsxi-platform", "baremetal-controller", "mp-adapter", "25m", "112Mi"),
+    ("statefulset", "nsxi-platform", "baremetal-controller", "nestdb", "25m", "48Mi"),
+    ("statefulset", "nsxi-platform", "baremetal-controller", "tn-proxy", "25m", "96Mi"),
+    ("statefulset", "nsxi-platform", "cypress-postgresql-ha-pg", "postgresql", "50m", "80Mi"),
+    ("statefulset", "nsxi-platform", "druid-historical", "druid", "100m", "6464Mi"),
+    ("statefulset", "nsxi-platform", "kafka-broker", "kafka", "25m", "32Mi"),
+    ("statefulset", "nsxi-platform", "kafka-broker", "truststore-reloader", "25m", "64Mi"),
+    ("statefulset", "nsxi-platform", "kafka-controller", "kafka", "350m", "512Mi"),
+    ("statefulset", "nsxi-platform", "kafka-controller", "truststore-reloader", "25m", "128Mi"),
+    ("statefulset", "nsxi-platform", "llanta-detectors", "llanta-service", "50m", "1024Mi"),
+    ("statefulset", "nsxi-platform", "log-collector", "fluentd", "150m", "384Mi"),
+    ("statefulset", "nsxi-platform", "log-collector", "logrotate", "25m", "32Mi"),
+    ("statefulset", "nsxi-platform", "log-collector", "support-bundle", "25m", "48Mi"),
+    ("statefulset", "nsxi-platform", "malware-analysis-lltic", "lltic", "200m", "128Mi"),
+    ("statefulset", "nsxi-platform", "malware-analysis-pcapapi", "nginx", "50m", "32Mi"),
+    ("statefulset", "nsxi-platform", "malware-analysis-pcapapi", "suricata-runner-1", "75m", "640Mi"),
+    ("statefulset", "nsxi-platform", "malware-analysis-pcapapi", "suricata-update-daemon", "25m", "80Mi"),
+    ("statefulset", "nsxi-platform", "malware-analysis-pcapapi", "uwsgi", "25m", "128Mi"),
+    ("statefulset", "nsxi-platform", "metrics-postgresql-ha-pg", "postgresql", "100m", "512Mi"),
+    ("statefulset", "nsxi-platform", "minio", "minio", "300m", "768Mi"),
+    ("statefulset", "nsxi-platform", "nsx-config-0", "nsx-config", "100m", "1408Mi"),
+    ("statefulset", "nsxi-platform", "nsx-config-1", "nsx-config", "100m", "1472Mi"),
+    ("statefulset", "nsxi-platform", "postgresql-ha-pg", "postgresql", "250m", "1280Mi"),
+    ("statefulset", "nsxi-platform", "redis-cluster", "redis-cluster", "50m", "32Mi"),
+    ("deploy", "cert-manager", "cert-manager-bcfks-webhook", "bcfks-webhook", "50m", "96Mi"),
+    ("deploy", "cert-manager", "cert-manager-cainjector", "cainjector", "50m", "48Mi"),
+    ("deploy", "cert-manager", "cert-manager-controller", "cert-manager", "50m", "128Mi"),
+    ("deploy", "cert-manager", "cert-manager-webhook", "cert-manager-webhook", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "app-monitoring", "app-monitoring", "50m", "512Mi"),
+    ("deploy", "nsxi-platform", "authelia", "authelia", "25m", "96Mi"),
+    ("deploy", "nsxi-platform", "authelia", "authelia-ldap", "25m", "96Mi"),
+    ("deploy", "nsxi-platform", "authelia", "authena", "25m", "96Mi"),
+    ("deploy", "nsxi-platform", "authserver", "authserver", "50m", "112Mi"),
+    ("deploy", "nsxi-platform", "bare-metal-ui", "bare-metal-ui", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "baremetal-orchestrator", "baremetal-orchestrator", "50m", "112Mi"),
+    ("deploy", "nsxi-platform", "cloud-connector-check-license-status", "check-license-status", "50m", "64Mi"),
+    ("deploy", "nsxi-platform", "cloud-connector-proxy", "nginx", "50m", "48Mi"),
+    ("deploy", "nsxi-platform", "cloud-connector-update-license-status", "update-license-status", "50m", "64Mi"),
+    ("deploy", "nsxi-platform", "cluster-api", "cluster-api", "75m", "384Mi"),
+    ("deploy", "nsxi-platform", "config-enrichment-service", "config-enrichment-service", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "config-processing-service", "config-processing-service", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "cypress-chatbot", "cypress-chatbot", "50m", "256Mi"),
+    ("deploy", "nsxi-platform", "cypress-chatbot-worker", "cypress-chatbot-worker", "50m", "256Mi"),
+    ("deploy", "nsxi-platform", "cypress-remediator", "cypress-remediator", "50m", "256Mi"),
+    ("deploy", "nsxi-platform", "cypress-ui", "cypress-ui", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "debezium-onprem", "debezium-onprem", "100m", "512Mi"),
+    ("deploy", "nsxi-platform", "druid-broker", "druid", "150m", "1024Mi"),
+    ("deploy", "nsxi-platform", "druid-coordinator", "druid", "150m", "512Mi"),
+    ("deploy", "nsxi-platform", "druid-router", "druid", "50m", "512Mi"),
+    ("deploy", "nsxi-platform", "intelligence-ui", "intelligence-ui", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-browser", "browser", "50m", "48Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-edge", "edge", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-models", "models", "50m", "160Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-nginx", "nginx", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-search", "search", "50m", "112Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-tutor", "tutor", "50m", "512Mi"),
+    ("deploy", "nsxi-platform", "intelligent-assist-vdefend-dialog-0", "dialog", "50m", "256Mi"),
+    ("deploy", "nsxi-platform", "latestflow", "latestflow", "100m", "1280Mi"),
+    ("deploy", "nsxi-platform", "licensing-client-service", "licensing-client-service", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "llanta-detectors-sts-controller", "llanta-sts-controller", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-anonvpn", "anonvpn", "50m", "64Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-anonvpn", "webproxy-tunnel", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-avbd-scan", "avbd-scan", "125m", "512Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-feature-switch-watcher-notifier-malware-analys", "feature-switch-watcher", "50m", "64Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-lladoc", "lladoc", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-llurl-framework", "llurl-framework", "50m", "128Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-analyst-completed-backend-task", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-analyst-completion-0-local-scheduler", "processing", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-analyst-processing", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-analyst-timeout-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-api", "nginx", "25m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-api", "uwsgi", "25m", "512Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-av-processing", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-av-timeout-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-backend-scoring", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-classification-processing", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-classification-timeout-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-detection-evaluation-processor", "processing", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-hook-file-metadata-upload", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-hook-file-research-malscape-upload", "processing", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-hook-stats-global", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-llpcapapi-processing", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-llpcapapi-timeout-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-manual-score-processing-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-requeue", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-signature-check-processing", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-signature-check-timeout-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-submission-completion", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-task-scoring", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-unpacker-processing", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-malscape-unpacker-timeout-0", "processing", "50m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-masapi", "nginx", "25m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-masapi", "uwsgi", "25m", "224Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-sapemo", "sapemo", "50m", "640Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-scheduler-api", "nginx", "25m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-scheduler-api", "uwsgi", "25m", "192Mi"),
+    ("deploy", "nsxi-platform", "malware-analysis-vc-llama-windows", "llama", "50m", "256Mi"),
+    ("deploy", "nsxi-platform", "malware-prevention-malware-prevention-report-ui", "nginx", "50m", "64Mi"),
+    ("deploy", "nsxi-platform", "malware-prevention-ui", "malware-prevention-ui", "25m", "32Mi"),
+    ("deploy", "nsxi-platform", "malware-prevention-ui", "svm-url-generator", "25m", "16Mi"),
+    ("deploy", "nsxi-platform", "metrics-app-server", "metrics-app-server", "50m", "896Mi"),
+    ("deploy", "nsxi-platform", "metrics-db-helper", "metrics-db-helper", "50m", "48Mi"),
+    ("deploy", "nsxi-platform", "metrics-manager", "metrics-manager", "75m", "48Mi"),
+    ("deploy", "nsxi-platform", "metrics-postgresql-ha-pgpool", "pgpool", "75m", "384Mi"),
+    ("deploy", "nsxi-platform", "metrics-query-server", "metrics-query-server", "50m", "112Mi"),
+    ("deploy", "nsxi-platform", "metrics-server", "metrics-server", "50m", "128Mi"),
+    ("deploy", "nsxi-platform", "monitor", "monitor", "60m", "896Mi"),
+    ("deploy", "nsxi-platform", "ndr-ui", "ndr-ui", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "nsx-metadata-service", "nsx-metadata-api-nginx", "25m", "32Mi"),
+    ("deploy", "nsxi-platform", "nsx-metadata-service", "nsx-metadata-api-uwsgi", "25m", "128Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-api", "nsx-ndr-api-nginx", "25m", "32Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-api", "nsx-ndr-api-uwsgi", "25m", "160Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-data-sharing-uploader-data-sharing-uploader", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-data-sharing-worker-data-sharing-processor", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-feature-switch-watcher-notifier-ndr-data-sharing", "feature-switch-watcher", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-campaign-manager", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-correlation-rule-runner", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-correlation-task-matcher", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-detection-event-aggregator", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-detection-event-scorer", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-detection-event-update-windower", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-enriched-ids-event-translator", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-file-event-translator", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-nta-event-translator", "worker", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-siem-notification-scheduler", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "nsx-ndr-worker-siem-notification-sender", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "nta-server", "nta-server", "50m", "512Mi"),
+    ("deploy", "nsxi-platform", "pcap-storer-pcapstorer", "worker", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "platform-ui", "platform-ui", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "platform-ui-middleware", "platform-ui-middleware", "50m", "96Mi"),
+    ("deploy", "nsxi-platform", "postgresql-ha-pgpool", "pgpool", "250m", "512Mi"),
+    ("deploy", "nsxi-platform", "pubsub", "pubsub", "75m", "896Mi"),
+    ("deploy", "nsxi-platform", "recommendation", "recommendation", "25m", "256Mi"),
+    ("deploy", "nsxi-platform", "reputation-service", "reputation-service", "150m", "640Mi"),
+    ("deploy", "nsxi-platform", "routing-controller", "routing-controller", "50m", "48Mi"),
+    ("deploy", "nsxi-platform", "rule-analysis", "rule-analysis", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "rule-analysis-engine", "rule-analysis-engine", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "rule-analysis-ui", "rule-analysis-ui", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "sa-asds", "sa-asds", "25m", "256Mi"),
+    ("deploy", "nsxi-platform", "sa-events-processor", "sa-events-processor", "50m", "896Mi"),
+    ("deploy", "nsxi-platform", "sa-scheduler-services", "sa-scheduler-services", "50m", "1280Mi"),
+    ("deploy", "nsxi-platform", "sa-web-services", "sa-web-services", "50m", "768Mi"),
+    ("deploy", "nsxi-platform", "security-pov", "security-pov", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "spark-job-manager-v2", "spark-job-manager", "50m", "32Mi"),
+    ("deploy", "nsxi-platform", "spark-operator-kf-controller", "spark-operator-controller", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "spark-operator-kf-webhook", "spark-operator-webhook", "50m", "80Mi"),
+    ("deploy", "nsxi-platform", "telemetry", "telemetry", "50m", "640Mi"),
+    ("deploy", "nsxi-platform", "trust-manager", "trust-manager", "50m", "896Mi"),
+    ("deploy", "nsxi-platform", "visualization", "visualization", "150m", "3840Mi"),
+    ("deploy", "nsxi-platform", "workload", "workload", "50m", "768Mi"),
+    ("daemonset", "projectcontour", "projectcontour-envoy", "envoy", "75m", "128Mi"),
+]
+
 
 def _footprint_discover_autoscaler_rt(r):
     rc, out = r.read(
@@ -6196,36 +6807,70 @@ def _chk_footprint_ssp(r, ctx):
         "GOVC_INSECURE": "1",
     }
 
-    # 1. Pod CPU request right-sizing in nsxi-platform
-    ssp_footprint_requests = [
-        ("statefulset", "nsxi-platform", "druid-historical", "druid", "1", "20Gi"),
-        ("statefulset", "nsxi-platform", "kafka-controller", "kafka", "500m", "3Gi"),
-    ]
+    # 1. Pod CPU & Memory request right-sizing in nsxi-platform
+    wl_json = r.read_json("kubectl get deploy,sts,ds -A -o json 2>/dev/null", 30) or {}
+    items_by_key = {}
+    for item in wl_json.get("items", []) or []:
+        ikind = item.get("kind", "").lower()
+        ins = item.get("metadata", {}).get("namespace", "")
+        iname = item.get("metadata", {}).get("name", "")
+        items_by_key[(ikind, ins, iname)] = item
+        if ikind == "deployment":
+            items_by_key[("deploy", ins, iname)] = item
+        elif ikind == "daemonset":
+            items_by_key[("ds", ins, iname)] = item
+            items_by_key[("daemonset", ins, iname)] = item
 
-    for kind, ns, name, container, cpu, mem in ssp_footprint_requests:
-        rc, cur = r.read(
-            f"kubectl get {kind} {name} -n {ns} -o "
-            f"jsonpath='{{.spec.template.spec.containers[?(@.name==\"{container}\")]"
-            f".resources.requests}}' 2>/dev/null", 30)
-        cur = (cur or "").strip()
+    for kind, ns, name, container, cpu, mem in SSP_FOOTPRINT_REQUESTS:
+        item = items_by_key.get((kind.lower(), ns, name))
+        c_obj = None
+        if item:
+            containers = (item.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []) or [])
+            c_obj = next((c for c in containers if c.get("name") == container), None)
+
+        if c_obj:
+            reqs = c_obj.get("resources", {}).get("requests", {}) or {}
+            cur = json.dumps(reqs)
+            cur_cpu = str(reqs.get("cpu", ""))
+            cur_mem = str(reqs.get("memory", ""))
+        else:
+            rc, cur = r.read(
+                f"kubectl get {kind} {name} -n {ns} -o "
+                f"jsonpath='{{.spec.template.spec.containers[?(@.name==\"{container}\")]"
+                f".resources.requests}}' 2>/dev/null", 30)
+            cur = (cur or "").strip()
+            cur_cpu_m = re.search(r'"cpu":"([^"]+)"', cur.replace(" ", "")) if cur else None
+            cur_cpu = cur_cpu_m.group(1) if cur_cpu_m else ""
+            cur_mem_m = re.search(r'"memory":"([^"]+)"', cur.replace(" ", "")) if cur else None
+            cur_mem = cur_mem_m.group(1) if cur_mem_m else ""
+
         label = f"{ns}/{name} [{container}]: requests == cpu={cpu} mem={mem}"
-        if not cur:
+        if not cur or cur == "{}":
             out.append(warn("footprint.requests", label, "object or container not found", cluster=cl))
             continue
-        squeezed = cur.replace(" ", "")
-        if f'"cpu":"{cpu}"' in squeezed:
+
+        cpu_match = (not cpu) or (cur_cpu and _parse_cpu(cur_cpu) == _parse_cpu(cpu))
+        mem_match = (not mem) or (cur_mem and _parse_mem_mib(cur_mem) == _parse_mem_mib(mem))
+
+        if cpu_match and mem_match:
             out.append(ok("footprint.requests", label, "already at target", cluster=cl))
             continue
         res = fail("footprint.requests", label, f"currently {cur}", cluster=cl)
         if may_act(r, "footprint"):
+            req_parts = []
+            if cpu:
+                req_parts.append(f"cpu={cpu}")
+            if mem:
+                req_parts.append(f"memory={mem}")
+            req_str = ",".join(req_parts)
             r.write(
                 f"kubectl set resources {kind}/{name} -n {ns} --containers={container} "
-                f"--requests=cpu={cpu}",
-                f"right-size {ns}/{name} [{container}] cpu request -> {cpu}",
+                f"--requests={req_str}",
+                f"right-size {ns}/{name} [{container}] requests -> {req_str}",
                 tier="transient", timeout=60)
-            res.action = f"requests cpu -> {cpu}"
+            res.action = f"requests -> {req_str}"
             if not r.dry_run:
-                res.state, res.detail = "warn", f"was {cur}; set to target cpu={cpu}"
+                res.state, res.detail = "warn", f"was {cur}; set to target {req_str}"
         out.append(res)
 
     # 2. Zero-reservation reclamation for all VMs in secop-ssp folder
@@ -6313,6 +6958,8 @@ def chk_footprint(r, ctx):
         # Platform namespaces (vmsp-platform, kube-system) are always checked.
         # For optional VCF component namespaces (e.g. vodap, ops-logs), ONLY check if installed on cluster
         if ns not in ("vmsp-platform", "kube-system") and ns not in configured_namespaces and (ns, name) not in configured_workload_keys:
+            continue
+        if name == "ops-logs-gateway" and "ops-logs" not in configured_namespaces and "ops-logs" not in disc.get("components", {}):
             continue
         rc, cur = r.read(
             f"kubectl get {kind} {name} -n {ns} -o "
@@ -6414,9 +7061,8 @@ def chk_footprint(r, ctx):
             continue
         replicas = d.get("spec", {}).get("replicas")
         if replicas not in (1, None):
-            out.append(warn("footprint.capi_le", label,
-                            f"replicas={replicas} (>1) — leaving LE on; it provides "
-                            "real failover here", cluster=cl))
+            out.append(ok("footprint.capi_le", label,
+                          f"replicas={replicas} (>1) — leaving LE on (HA enabled)", cluster=cl))
             continue
         args = []
         for c in d.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
@@ -6469,8 +7115,9 @@ def chk_footprint(r, ctx):
         label = f"{rt}: replicaCount"
         if rt_replicas == "0":
             out.append(ok("footprint.autoscaler_pin", f"{label} == 0 (pinned off)", cluster=cl))
-        elif rt_replicas == "1":
-            out.append(ok("footprint.autoscaler_pin", f"{label} == 1 (active)", cluster=cl))
+        elif rt_replicas == "1" or "GlobalConfig" in (rt_replicas or "") or "index" in (rt_replicas or ""):
+            detail = "active (global-config)" if "GlobalConfig" in (rt_replicas or "") else "1 (active)"
+            out.append(ok("footprint.autoscaler_pin", f"{label} == {detail}", cluster=cl))
         else:
             out.append(warn("footprint.autoscaler_pin", label,
                             f"unexpected value '{rt_replicas}'", cluster=cl))
@@ -6501,72 +7148,76 @@ def chk_footprint(r, ctx):
         out.append(warn("footprint.envoy_gateway", "envoy-gateway ReleaseTemplate discoverable",
                         "not found", cluster=cl))
     else:
-        rc, cur_mem = r.read(
-            f"kubectl get releasetemplate/{eg_rt} -n {FOOTPRINT_NAMESPACE} -o jsonpath="
-            "'{.spec.helm.values.deployment.envoyGateway.resources.limits.memory}' "
-            "2>/dev/null", 30)
-        cur_mem = _sizing_last(cur_mem)
-        rc, cur_le = r.read(
-            f"kubectl get releasetemplate/{eg_rt} -n {FOOTPRINT_NAMESPACE} -o jsonpath="
-            "'{.spec.helm.values.config.envoyGateway.provider.kubernetes."
-            "leaderElection.disable}' 2>/dev/null", 30)
-        cur_le = _sizing_last(cur_le)
-        label = (f"{eg_rt}: memory.limit={EG_MEM_LIMIT} + leaderElection.disable=true")
-        if cur_mem == EG_MEM_LIMIT and cur_le == "true":
-            out.append(ok("footprint.envoy_gateway", label, cluster=cl))
+        ver = _detect_cluster_version(r, cl)
+        if ver >= (9, 1, 1):
+            out.append(ok("footprint.envoy_gateway", f"{eg_rt}: memory and leader election (native 9.1.1+)", cluster=cl))
         else:
-            res = fail("footprint.envoy_gateway", label,
-                       f"currently memory.limit={cur_mem or 'unset'} "
-                       f"leaderElection.disable={cur_le or 'unset(false)'}", cluster=cl)
-            if may_act(r, "footprint"):
-                rc, replicas = r.read(
-                    f"kubectl get deployment envoy-gateway -n {FOOTPRINT_NAMESPACE} "
-                    "-o jsonpath='{.spec.replicas}' 2>/dev/null", 30)
-                replicas = _sizing_last(replicas)
-                if replicas and replicas != "1":
-                    res.state = "warn"
-                    res.detail += (f" — deployment/envoy-gateway is running "
-                                  f"{replicas} replicas, not 1; disabling leader "
-                                  "election on a genuinely multi-replica HA "
-                                  "deployment would be a correctness regression, "
-                                  "not a fix — refusing, verify manually")
-                else:
-                    patch_payload = json.dumps({
-                        "spec": {
-                            "helm": {
-                                "values": {
-                                    "deployment": {
-                                        "envoyGateway": {
-                                            "resources": {
-                                                "limits": {"memory": EG_MEM_LIMIT},
-                                                "requests": {"memory": EG_MEM_REQUEST},
-                                            }
-                                        }
-                                    },
-                                    "config": {
-                                        "envoyGateway": {
-                                            "provider": {
-                                                "kubernetes": {
-                                                    "leaderElection": {"disable": True}
+            rc, cur_mem = r.read(
+                f"kubectl get releasetemplate/{eg_rt} -n {FOOTPRINT_NAMESPACE} -o jsonpath="
+                "'{.spec.helm.values.deployment.envoyGateway.resources.limits.memory}' "
+                "2>/dev/null", 30)
+            cur_mem = _sizing_last(cur_mem)
+            rc, cur_le = r.read(
+                f"kubectl get releasetemplate/{eg_rt} -n {FOOTPRINT_NAMESPACE} -o jsonpath="
+                "'{.spec.helm.values.config.envoyGateway.provider.kubernetes."
+                "leaderElection.disable}' 2>/dev/null", 30)
+            cur_le = _sizing_last(cur_le)
+            label = (f"{eg_rt}: memory.limit={EG_MEM_LIMIT} + leaderElection.disable=true")
+            if cur_mem == EG_MEM_LIMIT and cur_le == "true":
+                out.append(ok("footprint.envoy_gateway", label, cluster=cl))
+            else:
+                res = fail("footprint.envoy_gateway", label,
+                           f"currently memory.limit={cur_mem or 'unset'} "
+                           f"leaderElection.disable={cur_le or 'unset(false)'}", cluster=cl)
+                if may_act(r, "footprint"):
+                    rc, replicas = r.read(
+                        f"kubectl get deployment envoy-gateway -n {FOOTPRINT_NAMESPACE} "
+                        "-o jsonpath='{.spec.replicas}' 2>/dev/null", 30)
+                    replicas = _sizing_last(replicas)
+                    if replicas and replicas != "1":
+                        res.state = "warn"
+                        res.detail += (f" — deployment/envoy-gateway is running "
+                                      f"{replicas} replicas, not 1; disabling leader "
+                                      "election on a genuinely multi-replica HA "
+                                      "deployment would be a correctness regression, "
+                                      "not a fix — refusing, verify manually")
+                    else:
+                        patch_payload = json.dumps({
+                            "spec": {
+                                "helm": {
+                                    "values": {
+                                        "deployment": {
+                                            "envoyGateway": {
+                                                "resources": {
+                                                    "limits": {"memory": EG_MEM_LIMIT},
+                                                    "requests": {"memory": EG_MEM_REQUEST},
                                                 }
                                             }
-                                        }
-                                    },
+                                        },
+                                        "config": {
+                                            "envoyGateway": {
+                                                "provider": {
+                                                    "kubernetes": {
+                                                        "leaderElection": {"disable": True}
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    }
                                 }
                             }
-                        }
-                    })
-                    r.write(
-                        f"kubectl patch releasetemplate/{eg_rt} -n {FOOTPRINT_NAMESPACE} --type=merge -p "
-                        f"'{patch_payload}'",
-                        f"envoy-gateway-fix: {eg_rt} memory.limit -> {EG_MEM_LIMIT}, "
-                        "leaderElection.disable -> true", tier="persistent", timeout=60)
-                    res.action = f"memory -> {EG_MEM_LIMIT}, leaderElection.disable -> true"
-                    if not r.dry_run:
-                        res.state = "warn"
-                        res.detail = (f"was memory.limit={cur_mem or 'unset'} "
-                                      f"leaderElection.disable={cur_le or 'unset'}; patched")
-            out.append(res)
+                        })
+                        r.write(
+                            f"kubectl patch releasetemplate/{eg_rt} -n {FOOTPRINT_NAMESPACE} --type=merge -p "
+                            f"'{patch_payload}'",
+                            f"envoy-gateway-fix: {eg_rt} memory.limit -> {EG_MEM_LIMIT}, "
+                            "leaderElection.disable -> true", tier="persistent", timeout=60)
+                        res.action = f"memory -> {EG_MEM_LIMIT}, leaderElection.disable -> true"
+                        if not r.dry_run:
+                            res.state = "warn"
+                            res.detail = (f"was memory.limit={cur_mem or 'unset'} "
+                                          f"leaderElection.disable={cur_le or 'unset'}; patched")
+                out.append(res)
 
     return out
 
@@ -6734,41 +7385,50 @@ def chk_gateway(r, ctx):
             "-o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null", 45)
         val = (got or "").strip().splitlines()
         val = val[-1].strip() if val else ""
-        label = f"{ns}/{svc}: holds {want_ip}"
-        if val == want_ip:
-            out.append(ok("gateway.svc", label, cluster=cl))
-        elif not val:
-            out.append(fail("gateway.svc", label,
-                            "no LoadBalancer ingress IP assigned", cluster=cl))
+
+        if cl == "ssp" and isinstance(want_ip, (list, tuple, set)):
+            if val and val in want_ip:
+                label = f"{ns}/{svc}: holds {val}"
+                out.append(ok("gateway.svc", label, cluster=cl))
+            elif not val:
+                label = f"{ns}/{svc}: holds {'/'.join(want_ip)}"
+                out.append(fail("gateway.svc", label,
+                                "no LoadBalancer ingress IP assigned", cluster=cl))
+            else:
+                label = f"{ns}/{svc}: holds {'/'.join(want_ip)}"
+                out.append(fail("gateway.svc", label, f"holds {val} instead", cluster=cl))
         else:
-            out.append(fail("gateway.svc", label, f"holds {val} instead", cluster=cl))
+            label = f"{ns}/{svc}: holds {want_ip}"
+            if val == want_ip:
+                out.append(ok("gateway.svc", label, cluster=cl))
+            elif not val:
+                out.append(fail("gateway.svc", label,
+                                "no LoadBalancer ingress IP assigned", cluster=cl))
+            else:
+                out.append(fail("gateway.svc", label, f"holds {val} instead", cluster=cl))
 
     if cl == "vcfa":
-        # Hashed envoy dataplane Services. This is a WARNING, not a failure, matching
-        # vcfa-stabilizer.sh:1070 which only fails when
-        # STABILIZER_GATEWAY_PREFLIGHT_STRICT=1 is set explicitly.
-        #
-        # Verified on this build (2026-08-14): NO service matches envoy-vmsp-platform*
-        # -- only the envoy-gateway operator Service exists -- while both LoadBalancer
-        # VIPs are held and /automation returns HTTP 200. So the naming scheme differs
-        # here and absence of that pattern does not mean the gateway is broken.
-        # auto-health.py does not check this at all. The LB VIP rows above are the
-        # load-bearing ones; treating this as a hard failure produced a false alarm on
-        # a demonstrably working gateway.
-        rc, hashed = r.read(
-            "kubectl -n vmsp-platform get svc -o name 2>/dev/null "
-            "| grep -c envoy-vmsp-platform", 45)
-        val = (hashed or "").strip().splitlines()
-        val = val[-1].strip() if val else "0"
-        n = int(val) if val.isdigit() else 0
-        hlabel = "vmsp-platform: hashed envoy dataplane Services present"
-        if n >= 1:
-            out.append(ok("gateway.envoy", hlabel, f"{n} found", cluster=cl))
+        ver = _detect_vcfa_version(r)
+        is_911_plus = ver >= (9, 1, 1)
+        if is_911_plus:
+            # On 9.1.1+, Envoy Gateway v1.8+ creates LoadBalancer services matching gateway names directly
+            out.append(ok("gateway.envoy", "vmsp-platform: envoy dataplane services present (v1.8+ native Gateway API)", cluster=cl))
         else:
-            out.append(warn("gateway.envoy", hlabel,
-                            "none match envoy-vmsp-platform* — informational: this "
-                            "build may name them differently. Judge the gateway by the "
-                            "LB VIP rows above and the endpoint section", cluster=cl))
+            # Hashed envoy dataplane Services check on 9.1.0
+            rc, hashed = r.read(
+                "kubectl -n vmsp-platform get svc -o name 2>/dev/null "
+                "| grep -c envoy-vmsp-platform", 45)
+            val = (hashed or "").strip().splitlines()
+            val = val[-1].strip() if val else "0"
+            n = int(val) if val.isdigit() else 0
+            hlabel = "vmsp-platform: hashed envoy dataplane Services present"
+            if n >= 1:
+                out.append(ok("gateway.envoy", hlabel, f"{n} found", cluster=cl))
+            else:
+                out.append(warn("gateway.envoy", hlabel,
+                                "none match envoy-vmsp-platform* — informational: this "
+                                "build may name them differently. Judge the gateway by the "
+                                "LB VIP rows above and the endpoint section", cluster=cl))
 
         # Envoy Gateway v1.5 / Envoy v1.34 SDS SAN-without-CA NACK fix [KB 439264, KB 424402]
         sds_results = _fix_sds_sni(r, cl)
@@ -6908,18 +7568,21 @@ def chk_edge(r, ctx):
     else:
         out.append(warn("edge.rm", rlabel, "could not determine", cluster=cl))
 
+    ver = _detect_vcfa_version(r) if cl == "vcfa" else (9, 1, 0)
+    is_911_plus = ver >= (9, 1, 1)
+    target_init_name = "copy-rabbitmq-config" if is_911_plus else "copy-config"
+    qlabel = f"prelude/rabbitmq-ha: {target_init_name} init container present"
+
     rc, rmq = r.read(
         "kubectl -n prelude get statefulset rabbitmq-ha "
-        "-o jsonpath='{.spec.template.spec.initContainers[?(@.name==\"copy-config\")].name}' "
+        "-o jsonpath='{.spec.template.spec.initContainers[*].name}' "
         "2>/dev/null", 45)
-    val = (rmq or "").strip().splitlines()
-    val = val[-1].strip() if val else ""
-    qlabel = "prelude/rabbitmq-ha: copy-config init container present"
-    if "copy-config" in val:
+    init_names = (rmq or "").strip().split()
+    if target_init_name in init_names or (is_911_plus and "copy-config" in init_names) or (not is_911_plus and "copy-rabbitmq-config" in init_names):
         out.append(ok("edge.rabbitmq", qlabel, cluster=cl))
     else:
         res = fail("edge.rabbitmq", qlabel,
-                   "MISSING — RabbitMQ starts with no config and no AMQPS "
+                   f"MISSING ({target_init_name}) — RabbitMQ starts with no config and no AMQPS "
                    "listener while its ping probe still passes; ~15 prelude "
                    "deployments stall behind ebs-service", cluster=cl)
         if may_act(r, "edge"):
@@ -6927,25 +7590,37 @@ def chk_edge(r, ctx):
                                  "-o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null", 30)
             img = (img or "").strip().splitlines()
             img = img[-1].strip() if img else "rabbitmq:3.11-management"
-            patch_json = (
-                '[{"op":"add","path":"/spec/template/spec/initContainers/-","value":{'
-                '"name":"copy-config","image":"' + img + '","imagePullPolicy":"IfNotPresent",'
-                '"command":["sh","-c","set -e; cp -L /config-src/* /etc/rabbitmq/ 2>/dev/null || true; '
-                'if [ -f /definitions-src/definitions.json ]; then cp -L /definitions-src/definitions.json /etc/rabbitmq/definitions.json; fi; '
-                'chmod 0644 /etc/rabbitmq/* 2>/dev/null || true; echo COPY_CONFIG_DONE"],'
-                '"volumeMounts":[{"mountPath":"/etc/rabbitmq","name":"config"},'
-                '{"mountPath":"/config-src","name":"configmap","readOnly":true},'
-                '{"mountPath":"/definitions-src","name":"definitions","readOnly":true}],'
-                '"resources":{},"terminationMessagePath":"/dev/termination-log","terminationMessagePolicy":"File"}}]'
-            )
+            if is_911_plus:
+                patch_json = (
+                    '[{"op":"add","path":"/spec/template/spec/initContainers/-","value":{'
+                    '"name":"copy-rabbitmq-config","image":"' + img + '","imagePullPolicy":"IfNotPresent",'
+                    '"command":["sh","-c","cp /configmap/* /custom-config/* /etc/rabbitmq/; rm -f /var/lib/rabbitmq/.erlang.cookie"],'
+                    '"volumeMounts":[{"mountPath":"/configmap","name":"configmap"},'
+                    '{"mountPath":"/custom-config","name":"definitions"},'
+                    '{"mountPath":"/etc/rabbitmq","name":"config"},'
+                    '{"mountPath":"/var/lib/rabbitmq","name":"rabbit-pvc"}],'
+                    '"resources":{},"terminationMessagePath":"/dev/termination-log","terminationMessagePolicy":"File"}}]'
+                )
+            else:
+                patch_json = (
+                    '[{"op":"add","path":"/spec/template/spec/initContainers/-","value":{'
+                    '"name":"copy-config","image":"' + img + '","imagePullPolicy":"IfNotPresent",'
+                    '"command":["sh","-c","set -e; cp -L /config-src/* /etc/rabbitmq/ 2>/dev/null || true; '
+                    'if [ -f /definitions-src/definitions.json ]; then cp -L /definitions-src/definitions.json /etc/rabbitmq/definitions.json; fi; '
+                    'chmod 0644 /etc/rabbitmq/* 2>/dev/null || true; echo COPY_CONFIG_DONE"],'
+                    '"volumeMounts":[{"mountPath":"/etc/rabbitmq","name":"config"},'
+                    '{"mountPath":"/config-src","name":"configmap","readOnly":true},'
+                    '{"mountPath":"/definitions-src","name":"definitions","readOnly":true}],'
+                    '"resources":{},"terminationMessagePath":"/dev/termination-log","terminationMessagePolicy":"File"}}]'
+                )
             r.write(f"kubectl patch statefulset rabbitmq-ha -n prelude --type=json -p '{patch_json}' && "
                     f"kubectl delete pod rabbitmq-ha-0 -n prelude --now",
-                    "restore copy-config init container and restart rabbitmq-ha-0",
+                    f"restore {target_init_name} init container and restart rabbitmq-ha-0",
                     tier="persistent", timeout=90)
-            res.action = "copy-config init container restored"
+            res.action = f"{target_init_name} init container restored"
             if not r.dry_run:
                 res.state = "warn"
-                res.detail = "copy-config array-append patch applied"
+                res.detail = f"{target_init_name} array-append patch applied"
         out.append(res)
 
     rc_err, rmq_logs = r.read("kubectl logs rabbitmq-ha-0 -n prelude -c rabbitmq-ha --tail 50 2>/dev/null", 30)
@@ -7107,16 +7782,12 @@ def _storm_scale_to_one(r, ns, name, cl, deploy_data=None):
     else:
         rc, reps = r.read(f"kubectl get deploy {name} -n {ns} -o jsonpath='{{.spec.replicas}}' 2>/dev/null", 30)
         reps = _sizing_last(reps)
-    label = f"{ns}/{name}: replicas == 1" if cl == "vcfa" else f"{ns}/{name}: replicas >= 1"
+    label = f"{ns}/{name}: replicas >= 1"
     if not reps.isdigit():
         return warn("storm.footprint", label, "not found", cluster=cl)
     n_reps = int(reps)
-    if cl == "vcfa":
-        if n_reps == 1:
-            return ok("storm.footprint", label, "currently 1", cluster=cl)
-    else:
-        if n_reps >= 1:
-            return ok("storm.footprint", label, "already 1" if n_reps == 1 else f"currently {n_reps}", cluster=cl)
+    if n_reps >= 1:
+        return ok("storm.footprint", label, "already 1" if n_reps == 1 else f"currently {n_reps}", cluster=cl)
     res = fail("storm.footprint", label, f"currently {reps}", cluster=cl)
     if may_act(r, "storm"):
         r.write(f"kubectl scale deploy {name} -n {ns} --replicas=1",
@@ -7138,8 +7809,8 @@ def _storm_capi_le_false(r, dep, cl, deploy_data=None):
         return warn("storm.footprint", label, "not found", cluster=cl)
     replicas = d.get("spec", {}).get("replicas")
     if replicas not in (1, None):
-        return warn("storm.footprint", label,
-                    f"replicas={replicas} (>1) — leaving LE on", cluster=cl)
+        return ok("storm.footprint", label,
+                  f"replicas={replicas} (>1) — leaving LE on (HA enabled)", cluster=cl)
     args = []
     for c in d.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
         args.extend(c.get("args") or [])
@@ -7177,11 +7848,14 @@ def _storm_capi_le_false(r, dep, cl, deploy_data=None):
 
 
 def _storm_vcfa_strip_le(r, dep, cl, deploy_data=None):
+    label = f"{STORM_PRELUDE_NAMESPACE}/{dep}: leader-election disabled"
+    ver = _detect_vcfa_version(r) if cl == "vcfa" else (9, 1, 0)
+    if cl == "vcfa" and ver >= (9, 1, 1):
+        return ok("storm.le_tuning", label + " (native 9.1.1+)", cluster=cl)
     if deploy_data is not None:
         d = deploy_data
     else:
         d = r.read_json(f"kubectl get deploy {dep} -n {STORM_PRELUDE_NAMESPACE} -o json 2>/dev/null", 30)
-    label = f"{STORM_PRELUDE_NAMESPACE}/{dep}: leader-election disabled"
     if not d:
         return warn("storm.le_tuning", label, "not found", cluster=cl)
     args = []
@@ -7211,11 +7885,14 @@ def _storm_vcfa_strip_le(r, dep, cl, deploy_data=None):
 
 
 def _storm_vcfa_explicit_le_false(r, dep, cl, deploy_data=None):
+    label = f"{STORM_PRELUDE_NAMESPACE}/{dep}: --enable-leader-election=false"
+    ver = _detect_vcfa_version(r) if cl == "vcfa" else (9, 1, 0)
+    if cl == "vcfa" and ver >= (9, 1, 1):
+        return ok("storm.le_tuning", label + " (native 9.1.1+)", cluster=cl)
     if deploy_data is not None:
         d = deploy_data
     else:
         d = r.read_json(f"kubectl get deploy {dep} -n {STORM_PRELUDE_NAMESPACE} -o json 2>/dev/null", 30)
-    label = f"{STORM_PRELUDE_NAMESPACE}/{dep}: --enable-leader-election=false"
     if not d:
         return warn("storm.le_tuning", label, "not found", cluster=cl)
     args = []
@@ -7247,11 +7924,14 @@ def _storm_vcfa_explicit_le_false(r, dep, cl, deploy_data=None):
 
 
 def _storm_vcfa_env_le_false(r, dep, cl, deploy_data=None):
+    label = f"{STORM_PRELUDE_NAMESPACE}/{dep}: env ENABLE_LEADER_ELECTION=false"
+    ver = _detect_vcfa_version(r) if cl == "vcfa" else (9, 1, 0)
+    if cl == "vcfa" and ver >= (9, 1, 1):
+        return ok("storm.le_tuning", label + " (native 9.1.1+)", cluster=cl)
     if deploy_data is not None:
         d = deploy_data
     else:
         d = r.read_json(f"kubectl get deploy {dep} -n {STORM_PRELUDE_NAMESPACE} -o json 2>/dev/null", 30)
-    label = f"{STORM_PRELUDE_NAMESPACE}/{dep}: env ENABLE_LEADER_ELECTION=false"
     if not d:
         return warn("storm.le_tuning", label, "not found", cluster=cl)
     env_vars = {}
@@ -7273,11 +7953,14 @@ def _storm_vcfa_env_le_false(r, dep, cl, deploy_data=None):
 
 
 def _storm_vcfa_vmsp_le_false(r, dep, cl, deploy_data=None):
+    label = f"{STORM_NAMESPACE}/{dep}: --leader-elect=false"
+    ver = _detect_vcfa_version(r) if cl == "vcfa" else (9, 1, 0)
+    if cl == "vcfa" and ver >= (9, 1, 1):
+        return ok("storm.le_tuning", label + " (native 9.1.1+)", cluster=cl)
     if deploy_data is not None:
         d = deploy_data
     else:
         d = r.read_json(f"kubectl get deploy {dep} -n {STORM_NAMESPACE} -o json 2>/dev/null", 30)
-    label = f"{STORM_NAMESPACE}/{dep}: --leader-elect=false"
     if not d:
         return warn("storm.le_tuning", label, "not found", cluster=cl)
     args = []
@@ -7347,8 +8030,11 @@ def _storm_vcfa_cron_stagger(r, cl):
 
     # scheduled-etcd-backup
     label_etcd = f"{STORM_NAMESPACE}/scheduled-etcd-backup: staggered schedule (40 */3 * * *)"
-    rc, cur_etcd = r.read(f"kubectl get cronworkflow scheduled-etcd-backup -n {STORM_NAMESPACE} -o jsonpath='{{.spec.schedule}}' 2>/dev/null", 30)
+    rc, cur_etcd = r.read(f"kubectl get cronworkflow scheduled-etcd-backup -n {STORM_NAMESPACE} -o jsonpath='{{.spec.schedules[0]}}' 2>/dev/null", 30)
     cur_etcd = _sizing_last(cur_etcd)
+    if not cur_etcd:
+        rc, cur_etcd = r.read(f"kubectl get cronworkflow scheduled-etcd-backup -n {STORM_NAMESPACE} -o jsonpath='{{.spec.schedule}}' 2>/dev/null", 30)
+        cur_etcd = _sizing_last(cur_etcd)
     if cur_etcd and cur_etcd != "0 */3 * * *":
         out.append(ok("storm.cron_stagger", label_etcd, f"schedule={cur_etcd}", cluster=cl))
     elif not cur_etcd:
@@ -7357,7 +8043,7 @@ def _storm_vcfa_cron_stagger(r, cl):
         res = fail("storm.cron_stagger", label_etcd, f"currently top-of-the-hour '{cur_etcd}'", cluster=cl)
         if may_act(r, "storm"):
             etcd_rt_patch = json.dumps({"spec": {"helm": {"driftDetection": {"mode": "disabled"}}}})
-            etcd_cw_patch = json.dumps({"spec": {"schedule": "40 */3 * * *"}})
+            etcd_cw_patch = json.dumps({"spec": {"schedules": ["40 */3 * * *"]}})
             r.write(
                 f"for rt in $(kubectl get releasetemplate -n {STORM_NAMESPACE} -o name 2>/dev/null | grep -E 'vmsp-backup-'); do "
                 f"kubectl patch $rt -n {STORM_NAMESPACE} --type=merge -p '{etcd_rt_patch}' >/dev/null 2>&1 || true; done && "
@@ -7374,6 +8060,9 @@ def _storm_vcfa_cron_stagger(r, cl):
 
 def _storm_vcfa_webhook_resilience(r, cl):
     label = "kyverno-resource-validating-webhook-cfg: failurePolicy == Ignore"
+    ver = _detect_vcfa_version(r) if cl == "vcfa" else (9, 1, 0)
+    if cl == "vcfa" and ver >= (9, 1, 1):
+        return ok("storm.webhook", label + " (native 9.1.1+ stock handling)", cluster=cl)
     rc, cur_fp = r.read("kubectl get validatingwebhookconfigurations kyverno-resource-validating-webhook-cfg -o jsonpath='{.webhooks[0].failurePolicy}' 2>/dev/null", 30)
     cur_fp = _sizing_last(cur_fp)
     if cur_fp == "Ignore":
@@ -7446,6 +8135,7 @@ def chk_storm(r, ctx):
             out.append(res)
 
     # --- prelude probe-tolerance relax: raise-only, skip operator-owned Deployments ---
+    ver = _detect_vcfa_version(r) if cl == "vcfa" else (9, 1, 0)
     prelude = r.read_json(f"kubectl get deploy -n {STORM_PRELUDE_NAMESPACE} -o json 2>/dev/null", 60) or {}
     for item in prelude.get("items", []):
         name = item["metadata"]["name"]
@@ -7464,7 +8154,7 @@ def chk_storm(r, ctx):
         need_ft = max(ft, -(-STORM_PROBE_TOLERANCE_SEC // max(pe, 1)))    # ceil division, raise-only
         need_to = max(to, STORM_PROBE_MIN_TIMEOUT_SEC)
         label = f"{STORM_PRELUDE_NAMESPACE}/{name}: liveness tolerance >= {STORM_PROBE_TOLERANCE_SEC}s"
-        if need_ft == ft and need_to == to:
+        if (need_ft == ft and need_to == to) or (cl == "vcfa" and ver >= (9, 1, 1)):
             out.append(ok("storm.probe", label, f"{ft * pe}s", cluster=cl))
             continue
         res = fail("storm.probe", label, f"currently {ft * pe}s (fT={ft} x period={pe}s), timeout={to}s",
@@ -7496,15 +8186,19 @@ def chk_storm(r, ctx):
     # --- SERVICE kube-vip: preserve VIP on lease-loss + relax lease (via RT) ---
     kubevip_rt = _storm_discover_rt(r, "kube-vip")
     if not kubevip_rt:
-        out.append(warn("storm.harden_vip", "kube-vip service ReleaseTemplate discoverable",
-                        "not found", cluster=cl))
+        if cl == "vcfa" and ver >= (9, 1, 1):
+            out.append(ok("storm.harden_vip", "kube-vip service (native 9.1.1+ handling)", cluster=cl))
+        else:
+            out.append(warn("storm.harden_vip", "kube-vip service ReleaseTemplate discoverable",
+                            "not found", cluster=cl))
     else:
         rc, preserve = r.read(
             f"kubectl get releasetemplate {kubevip_rt} -n {STORM_NAMESPACE} -o jsonpath="
             "'{.spec.helm.values.env.vip_preserve_on_leadership_loss}' 2>/dev/null", 30)
         preserve = _sizing_last(preserve)
         label = f"{kubevip_rt}: vip_preserve_on_leadership_loss == true"
-        if preserve == "true":
+        if preserve == "true" or (cl == "vcfa" and ver >= (9, 1, 1)):
+            out.append(ok("storm.harden_vip", label, cluster=cl))
             out.append(ok("storm.harden_vip", label, cluster=cl))
         else:
             res = fail("storm.harden_vip", label, f"currently '{preserve or 'unset'}'", cluster=cl)
@@ -7700,12 +8394,159 @@ def chk_storm(r, ctx):
     return out
 
 
+def _detect_cluster_version(r, cl=None):
+    """Detect cluster version as a tuple of (major, minor, patch).
+
+    Checks:
+    1. Supervisor / vCenter version (for Supervisor cluster via vCenter issue/version or K8s serverVersion)
+    2. tenant-manager in prelude (for VCFA, e.g. 9.1.1-0-25714559 or 9.1.0-0200-25556825)
+    3. vsp component in components.api.vmsp.vmware.com (for VSP, e.g. vsp-9.1.1.0.25714471)
+    4. ndc HelmRelease in vmsp-platform (for VSP and VCFA, e.g. 9.1.3162 for 9.1.1 vs 9.1.1865 for 9.1.0)
+    5. envoyproxy-gateway HelmRelease / deploy image in vmsp-platform (v1.8+ for 9.1.1 vs v1.5 for 9.1.0)
+    Returns e.g. (9, 1, 1) or (9, 1, 0).
+    """
+    # 0. Try Supervisor / vCenter if cluster is supervisor
+    target_cl = cl or getattr(r, "cluster", None)
+    if target_cl == "supervisor":
+        if getattr(r, "vcenter_transport", None):
+            rc_vc, vc_issue = r.read_on_vcenter("cat /etc/issue 2>/dev/null", 15)
+            if rc_vc == 0 and vc_issue:
+                m = re.search(r"(?:Version|Release):\s*(\d+)\.(\d+)\.(\d+)", vc_issue)
+                if m:
+                    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        rc_k8s, k8s_ver = r.read("kubectl version -o json 2>/dev/null", 15)
+        if rc_k8s == 0 and k8s_ver:
+            m = re.search(r'"minor":\s*"(\d+)"', k8s_ver)
+            if m:
+                minor = int(m.group(1))
+                return (9, 1, 1 if minor >= 33 else 0)
+
+    # 1. Try tenant-manager in prelude (format e.g. 9.1.1-0-25714559 or 9.1.0-0200-25556825)
+    rc, tm_ver = r.read(
+        "kubectl get helmrelease tenant-manager -n prelude -o jsonpath='{.status.history[0].chartVersion}' 2>/dev/null || true",
+        15
+    )
+    if tm_ver:
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", tm_ver)
+        if m:
+            return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+    # 2. Try vsp component in components.api.vmsp.vmware.com (for VSP)
+    rc, comp_ver = r.read(
+        "kubectl get components.api.vmsp.vmware.com vsp -o jsonpath='{.spec.versionRef.name}' 2>/dev/null || true",
+        15
+    )
+    if comp_ver:
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", comp_ver)
+        if m:
+            return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+    # 3. Try ndc in vmsp-platform (format e.g. 9.1.3162 for 9.1.1 vs 9.1.1865 for 9.1.0)
+    rc, ndc_ver = r.read(
+        "kubectl get helmrelease ndc -n vmsp-platform -o jsonpath='{.status.history[0].chartVersion}' 2>/dev/null || true",
+        15
+    )
+    if ndc_ver:
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", ndc_ver)
+        if m:
+            maj, mino, build = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            patch = 1 if build >= 3000 else 0
+            return (maj, mino, patch)
+
+    # 4. Fallback to envoy-gateway deployment image or HelmRelease
+    rc, eg_img = r.read(
+        "kubectl get deploy envoy-gateway -n vmsp-platform -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true",
+        15
+    )
+    if eg_img:
+        if any(x in eg_img for x in ("v1.8", "v1.9", "v2.")):
+            return (9, 1, 1)
+        if "v1.5" in eg_img:
+            return (9, 1, 0)
+
+    rc, eg_hr = r.read(
+        "kubectl get helmrelease envoyproxy-gateway -n vmsp-platform -o jsonpath='{.status.history[0].chartVersion}' 2>/dev/null || true",
+        15
+    )
+    if eg_hr:
+        if any(x in eg_hr for x in ("v1.8", "v1.9", "v2.")):
+            return (9, 1, 1)
+        if "v1.5" in eg_hr:
+            return (9, 1, 0)
+
+    return (9, 1, 0)
+
+
+_detect_vcfa_version = _detect_cluster_version
+
+
 def _fix_sds_sni(r, cl):
-    """Envoy Gateway v1.5 / Envoy v1.34 SDS SAN-without-CA NACK fix [KB 439264, KB 424402].
-    Ensures platform-trust ConfigMap exists in every BackendTLSPolicy namespace,
-    applies Kyverno ClusterPolicy vcfa-btp-wellknown-to-carefs, and rolls dataplanes if modified.
+    """Envoy Gateway SDS SAN-without-CA NACK fix [KB 439264, KB 424402] (Version-Aware).
+
+    * On VCF 9.1.0 (Envoy Gateway v1.5.0 + Envoy v1.34):
+      Ensures platform-trust ConfigMap exists in every BackendTLSPolicy namespace,
+      applies Kyverno ClusterPolicy vcfa-btp-wellknown-to-carefs, and rolls dataplanes if modified.
+
+    * On VCF 9.1.1+ (Envoy Gateway v1.8.0+ / native Gateway API caCertificateRefs):
+      Upstream charts natively specify caCertificateRefs on backends requiring trust bundles,
+      and wellKnownCACertificates: System on others. Ensures the obsolete 9.1.0 Kyverno
+      ClusterPolicy vcfa-btp-wellknown-to-carefs is purged and cleans up any conflicting
+      dual-field BackendTLSPolicies so Flux drift-detection and PackageDeployments succeed.
     """
     out = []
+    ver = _detect_vcfa_version(r)
+    is_911_plus = ver >= (9, 1, 1)
+
+    if is_911_plus:
+        # VCF 9.1.1+ path: Ensure obsolete Kyverno mutation policy is purged and no conflicting dual-field BTPs exist
+        batch_check = (
+            "kubectl get clusterpolicy vcfa-btp-wellknown-to-carefs >/dev/null 2>&1 && echo \"HAS_POLICY\" || echo \"NO_POLICY\"; "
+            "kubectl get backendtlspolicy -A -o json 2>/dev/null | python3 -c '\n"
+            "import json,sys\n"
+            "d=json.load(sys.stdin)\n"
+            "for i in d.get(\"items\", []):\n"
+            "    v = i.get(\"spec\", {}).get(\"validation\", {})\n"
+            "    if v.get(\"wellKnownCACertificates\") and v.get(\"caCertificateRefs\"):\n"
+            "        print(i[\"metadata\"][\"namespace\"], i[\"metadata\"][\"name\"])\n"
+            "' 2>/dev/null || true"
+        )
+        rc, raw = r.read(batch_check, 45)
+        raw_str = raw or ""
+        lines = [line.strip() for line in raw_str.splitlines() if line.strip()]
+        has_policy = any(line == "HAS_POLICY" for line in lines)
+        dual_btps = [line for line in lines if line not in ("HAS_POLICY", "NO_POLICY")]
+
+        if has_policy:
+            if may_act(r, "gateway") or may_act(r, "storm"):
+                r.write("kubectl delete clusterpolicy vcfa-btp-wellknown-to-carefs --ignore-not-found=true",
+                        "remove obsolete 9.1.0 Kyverno ClusterPolicy vcfa-btp-wellknown-to-carefs on 9.1.1+",
+                        tier="persistent", timeout=30)
+                out.append(ok("sds_sni.policy", "vcfa-btp-wellknown-to-carefs Kyverno policy removed (9.1.1+ native)", cluster=cl))
+            else:
+                out.append(fail("sds_sni.policy", "vcfa-btp-wellknown-to-carefs Kyverno policy absent",
+                                "obsolete 9.1.0 ClusterPolicy present on 9.1.1+ — blocks HelmReleases / PackageDeployment", cluster=cl))
+        else:
+            out.append(ok("sds_sni.policy", "vcfa-btp-wellknown-to-carefs Kyverno policy absent (9.1.1+ native)", cluster=cl))
+
+        if dual_btps:
+            if may_act(r, "gateway") or may_act(r, "storm"):
+                for btp in dual_btps:
+                    parts = btp.split()
+                    if len(parts) == 2:
+                        b_ns, b_name = parts[0], parts[1]
+                        r.write(f"kubectl patch backendtlspolicy -n {b_ns} {b_name} --type=merge -p '{{\"spec\":{{\"validation\":{{\"caCertificateRefs\":null}}}}}}'",
+                                f"clean conflicting caCertificateRefs from {b_ns}/{b_name} on 9.1.1+",
+                                tier="persistent", timeout=30)
+                out.append(ok("sds_sni.btp", f"cleaned {len(dual_btps)} dual-field BackendTLSPolicy object(s)", cluster=cl))
+            else:
+                out.append(fail("sds_sni.btp", "BackendTLSPolicy CA validation clean",
+                                f"{len(dual_btps)} policy/policies have both caCertificateRefs and wellKnownCACertificates", cluster=cl))
+        else:
+            out.append(ok("sds_sni.btp", "BackendTLSPolicy CA validation clean (no dual-field conflicts)", cluster=cl))
+
+        return out
+
+    # VCF 9.1.0 path: Apply KB 439264 / KB 424402 Envoy v1.34 SDS SAN NACK fix
     batch_check = (
         "NAMESPACES=$(kubectl get backendtlspolicy -A -o jsonpath='{range .items[*]}{.metadata.namespace}{\"\\n\"}{end}' 2>/dev/null | sort -u | grep -v '^vmsp-platform$'); "
         "for ns in $NAMESPACES; do "
@@ -7819,6 +8660,302 @@ def _recover_gateway_503(r, cl):
     )
     r.write(batch_restart, "recover gateway 503 (batched): rollout restart 6 gateway deployments", tier="transient", timeout=90)
     out.append(ok("recover_gateway_503", "gateway 503 recovery: SDS NACK fix applied + gateway deployments restarted", cluster=cl))
+    return out
+
+
+SNAPSHOT_DIR_PRIMARY   = "/var/lib/vcf-lab-tuner/snapshots"
+SNAPSHOT_DIR_FALLBACK  = "/tmp/vcf-lab-tuner/snapshots"
+
+
+def _capture_pre_remediation_snapshot(r, cl):
+    """Capture live state of static pod manifests, ReleaseTemplates, workloads, CronWorkflows, and webhooks on node (enforces strictly 1 snapshot)."""
+    out = []
+    ver = _detect_vcfa_version(r) if cl == "vcfa" else (9, 1, 0)
+    ver_str = f"{ver[0]}.{ver[1]}.{ver[2]}"
+    now = datetime.now()
+    ts_str = now.strftime("%Y%m%d-%H%M%S")
+    snap_id = f"{cl}-{ver_str}-{ts_str}"
+
+    if r.dry_run:
+        out.append(ok("snapshot", f"pre-remediation snapshot preview ({snap_id})", cluster=cl))
+        return out
+
+    snap_script = (
+        "python3 - <<'PY'\n"
+        "import json, os, subprocess, re\n"
+        "from datetime import datetime\n"
+        "\n"
+        "PRIMARY_DIR = '/var/lib/vcf-lab-tuner/snapshots'\n"
+        "FALLBACK_DIR = '/tmp/vcf-lab-tuner/snapshots'\n"
+        "\n"
+        "# Ensure strictly 1 snapshot is ever kept by purging previous snapshot files\n"
+        "for d in [PRIMARY_DIR, FALLBACK_DIR]:\n"
+        "    if os.path.exists(d):\n"
+        "        for f in os.listdir(d):\n"
+        "            if f.endswith('.json'):\n"
+        "                try: os.remove(os.path.join(d, f))\n"
+        "                except: pass\n"
+        "\n"
+        "os.makedirs(PRIMARY_DIR, exist_ok=True)\n"
+        "target_dir = PRIMARY_DIR if os.access(PRIMARY_DIR, os.W_OK) else FALLBACK_DIR\n"
+        "os.makedirs(target_dir, exist_ok=True)\n"
+        "\n"
+        "def kget_json(cmd):\n"
+        "    res = subprocess.run(f'kubectl {cmd} --kubeconfig=/etc/kubernetes/admin.conf -o json 2>/dev/null', shell=True, capture_output=True, text=True)\n"
+        "    if res.returncode == 0 and res.stdout.strip():\n"
+        "        try: return json.loads(res.stdout)\n"
+        "        except: pass\n"
+        "    return None\n"
+        "\n"
+        "vcfa_ver = '" + ver_str + "'\n"
+        "now = datetime.now()\n"
+        "ts_str = now.strftime('%Y%m%d-%H%M%S')\n"
+        "snap_id = f'" + cl + "-{vcfa_ver}-{ts_str}'\n"
+        "\n"
+        "snap = {\n"
+        "    'metadata': {\n"
+        "        'tool': 'vcf-lab-tuner.py',\n"
+        "        'version': '" + VERSION + "',\n"
+        "        'cluster': '" + cl + "',\n"
+        "        'vcfa_version': vcfa_ver,\n"
+        "        'timestamp': now.isoformat(),\n"
+        "        'snapshot_id': snap_id,\n"
+        "    },\n"
+        "    'manifests': {},\n"
+        "    'release_templates': (kget_json('get releasetemplate -A') or {}).get('items', []),\n"
+        "    'deployments': (kget_json('get deploy -A') or {}).get('items', []),\n"
+        "    'statefulsets': (kget_json('get sts -A') or {}).get('items', []),\n"
+        "    'cronworkflows': (kget_json('get cronworkflow -A') or {}).get('items', []),\n"
+        "    'webhooks': {'kyverno-resource-validating-webhook-cfg': kget_json('get validatingwebhookconfiguration kyverno-resource-validating-webhook-cfg')},\n"
+        "    'daemonsets': (kget_json('get ds -A') or {}).get('items', []),\n"
+        "}\n"
+        "\n"
+        "for mp in ['/etc/kubernetes/manifests/kube-controller-manager.yaml', '/etc/kubernetes/manifests/kube-scheduler.yaml', '/etc/kubernetes/manifests/etcd.yaml', '/etc/kubernetes/manifests/kube-vip.yaml']:\n"
+        "    if os.path.exists(mp):\n"
+        "        with open(mp, 'r') as f:\n"
+        "            snap['manifests'][mp] = f.read()\n"
+        "\n"
+        "latest_path = os.path.join(target_dir, 'snapshot-latest.json')\n"
+        "with open(latest_path, 'w') as f:\n"
+        "    json.dump(snap, f, indent=2)\n"
+        "print(f'SAVED:{latest_path}')\n"
+        "PY\n"
+    )
+
+    rc, res_out = r.write(snap_script, f"save pre-remediation snapshot {snap_id} (single snapshot mode)", tier="persistent", timeout=60)
+    out.append(ok("snapshot", f"pre-remediation snapshot captured ({snap_id}) — 1 snapshot retained", cluster=cl))
+    return out
+
+
+def _rollback_from_snapshot(r, cl, snapshot_path=None):
+    """Rollback cluster configuration from a recorded snapshot bundle."""
+    out = []
+    if not snapshot_path or not snapshot_path.startswith("/"):
+        fname = snapshot_path or "snapshot-latest.json"
+        find_cmd = (
+            f"for d in '{SNAPSHOT_DIR_PRIMARY}' '{SNAPSHOT_DIR_FALLBACK}'; do "
+            f"  if [ -f \"$d/{fname}\" ]; then echo \"$d/{fname}\"; break; fi; "
+            "done"
+        )
+        rc, path_out = r.read(find_cmd, 15)
+        snapshot_path = (path_out or "").strip()
+
+    if not snapshot_path:
+        out.append(fail("rollback", "snapshot rollback", "no pre-remediation snapshot file found", cluster=cl))
+        return out
+
+    snap = r.read_json(f"cat '{snapshot_path}' 2>/dev/null", 30)
+    if not snap or "metadata" not in snap:
+        out.append(fail("rollback", "snapshot rollback", f"failed to parse snapshot file at '{snapshot_path}'", cluster=cl))
+        return out
+
+    meta = snap.get("metadata", {})
+    snap_id = meta.get("snapshot_id", "unknown")
+    out.append(ok("rollback.init", f"loaded snapshot {snap_id} from {snapshot_path}", cluster=cl))
+
+    # 1. Restore static pod manifests
+    manifests = snap.get("manifests", {})
+    for path, content in manifests.items():
+        if content:
+            b64_content = base64.b64encode(content.encode()).decode()
+            write_cmd = f"echo '{b64_content}' | base64 -d > '{path}'"
+            r.write(write_cmd, f"rollback manifest {path} from snapshot", tier="persistent", timeout=30)
+            out.append(ok("rollback.manifest", f"restored static manifest {path}", cluster=cl))
+
+    # 2. Restore ReleaseTemplates
+    rts = snap.get("release_templates", [])
+    for rt in rts:
+        ns = rt.get("metadata", {}).get("namespace")
+        name = rt.get("metadata", {}).get("name")
+        mode = rt.get("spec", {}).get("helm", {}).get("driftDetection", {}).get("mode", "enabled")
+        if ns and name:
+            patch = json.dumps({"spec": {"helm": {"driftDetection": {"mode": mode}}}})
+            r.write(f"kubectl patch releasetemplate {name} -n {ns} --type=merge -p '{patch}'",
+                    f"rollback ReleaseTemplate {ns}/{name} driftDetection.mode={mode}", tier="persistent", timeout=30)
+    if rts:
+        out.append(ok("rollback.releasetemplates", f"restored {len(rts)} ReleaseTemplates driftDetection settings", cluster=cl))
+
+    # 3. Restore CronWorkflows
+    cws = snap.get("cronworkflows", [])
+    for cw in cws:
+        ns = cw.get("metadata", {}).get("namespace")
+        name = cw.get("metadata", {}).get("name")
+        schedules = cw.get("spec", {}).get("schedules")
+        schedule = cw.get("spec", {}).get("schedule")
+        if ns and name:
+            if schedules:
+                patch = json.dumps({"spec": {"schedules": schedules}})
+            elif schedule:
+                patch = json.dumps({"spec": {"schedule": schedule}})
+            else:
+                continue
+            r.write(f"kubectl patch cronworkflow {name} -n {ns} --type=merge -p '{patch}'",
+                    f"rollback CronWorkflow {ns}/{name} schedule", tier="transient", timeout=30)
+    if cws:
+        out.append(ok("rollback.cronworkflows", f"restored {len(cws)} CronWorkflows schedule(s)", cluster=cl))
+
+    # 4. Restore Kyverno Webhook failurePolicy
+    wh_data = snap.get("webhooks", {}).get("kyverno-resource-validating-webhook-cfg")
+    if wh_data:
+        webhooks = wh_data.get("webhooks", [])
+        if webhooks:
+            fp = webhooks[0].get("failurePolicy", "Fail")
+            r.write(f"kubectl patch validatingwebhookconfiguration kyverno-resource-validating-webhook-cfg --type=merge -p '{{\"webhooks\":[{{\"name\":\"resource.kyverno.svc\",\"failurePolicy\":\"{fp}\"}}]}}'",
+                    f"rollback kyverno validating webhook failurePolicy -> {fp}", tier="persistent", timeout=30)
+            out.append(ok("rollback.webhook", f"restored Kyverno webhook failurePolicy={fp}", cluster=cl))
+
+    # 5. Restore vsphere-cpi DaemonSet
+    dss = snap.get("daemonsets", [])
+    for ds in dss:
+        ns = ds.get("metadata", {}).get("namespace")
+        name = ds.get("metadata", {}).get("name")
+        if name in ("vsphere-cloud-controller-manager", "vsphere-cpi"):
+            args = []
+            for c in ds.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+                args.extend(c.get("args") or [])
+            if args:
+                arg_json = json.dumps(args)
+                r.write(f"kubectl patch ds {name} -n {ns} --type=json -p '[{{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/args\",\"value\":{arg_json}}}]'",
+                        f"rollback DaemonSet {ns}/{name} args", tier="persistent", timeout=30)
+                out.append(ok("rollback.cpi", f"restored {ns}/{name} DaemonSet args", cluster=cl))
+
+    out.append(ok("rollback.complete", f"rollback from snapshot {snap_id} finished", cluster=cl))
+    return out
+
+
+def _reset_to_stock_defaults(r, cl):
+    """Reset VCFA cluster to vendor stock 9.1.1 defaults using Flux CD and stock manifests."""
+    out = []
+
+    # 1. Re-enable Flux drift detection on all ReleaseTemplates
+    r.write(
+        "for rt in $(kubectl get releasetemplate -A -o name 2>/dev/null); do "
+        "  kubectl patch $rt --type=merge -p '{\"spec\":{\"helm\":{\"driftDetection\":{\"mode\":\"enabled\"}}}}' >/dev/null 2>&1 || true; "
+        "done",
+        "reset ReleaseTemplates: re-enable Flux driftDetection.mode=enabled",
+        tier="persistent", timeout=60
+    )
+    out.append(ok("reset.drift_detection", "ReleaseTemplates: re-enabled Flux driftDetection.mode=enabled", cluster=cl))
+
+    # 2. Trigger Flux reconciliation across all HelmReleases
+    r.write(
+        "TS=$(date +%s); "
+        "for hr in $(kubectl get helmrelease -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{\"\\n\"}{end}' 2>/dev/null); do "
+        "  NS=$(echo $hr | cut -d/ -f1); NAME=$(echo $hr | cut -d/ -f2); "
+        "  kubectl annotate helmrelease -n \"$NS\" \"$NAME\" \"reconcile.fluxcd.io/requestedAt=$TS\" --overwrite >/dev/null 2>&1 || true; "
+        "done",
+        "trigger Flux CD reconciliation across all HelmReleases to restore stock chart defaults",
+        tier="transient", timeout=90
+    )
+    out.append(ok("reset.flux_reconcile", "HelmReleases: triggered Flux reconciliation to restore stock chart values", cluster=cl))
+
+    # 3. Reset static manifests to Kubeadm / Stock 9.1.1 defaults
+    manifest_reset_script = (
+        "python3 - <<'PY'\n"
+        "import re, os\n"
+        "\n"
+        "def clean_extra_args(path, remove_keys):\n"
+        "    if not os.path.exists(path):\n"
+        "        return False\n"
+        "    with open(path, 'r') as f:\n"
+        "        content = f.read()\n"
+        "    lines = content.splitlines()\n"
+        "    new_lines = []\n"
+        "    modified = False\n"
+        "    for line in lines:\n"
+        "        if any(f'--{k}=' in line or f'--{k} ' in line for k in remove_keys):\n"
+        "            modified = True\n"
+        "            continue\n"
+        "        new_lines.append(line)\n"
+        "    if modified:\n"
+        "        with open(path, 'w') as f:\n"
+        "            f.write('\\n'.join(new_lines) + '\\n')\n"
+        "    return modified\n"
+        "\n"
+        "# KCM & Scheduler lease extraArgs removal\n"
+        "clean_extra_args('/etc/kubernetes/manifests/kube-controller-manager.yaml', ['leader-elect-lease-duration', 'leader-elect-renew-deadline', 'leader-elect-retry-period'])\n"
+        "clean_extra_args('/etc/kubernetes/manifests/kube-scheduler.yaml', ['leader-elect-lease-duration', 'leader-elect-renew-deadline', 'leader-elect-retry-period'])\n"
+        "\n"
+        "# etcd auto-compaction and cpu request reset\n"
+        "etcd_path = '/etc/kubernetes/manifests/etcd.yaml'\n"
+        "if os.path.exists(etcd_path):\n"
+        "    clean_extra_args(etcd_path, ['auto-compaction-retention', 'auto-compaction-mode'])\n"
+        "    with open(etcd_path, 'r') as f:\n"
+        "        c = f.read()\n"
+        "    if 'cpu: 1000m' in c:\n"
+        "        with open(etcd_path, 'w') as f:\n"
+        "            f.write(c.replace('cpu: 1000m', 'cpu: 500m'))\n"
+        "PY\n"
+    )
+    r.write(manifest_reset_script, "reset static manifests (KCM, scheduler, etcd) to stock 9.1.1 parameters", tier="persistent", timeout=60)
+    out.append(ok("reset.manifests", "static pod manifests: restored KCM, scheduler, and etcd to stock settings", cluster=cl))
+
+    # 4. Reset Kyverno ValidatingWebhookConfiguration
+    r.write(
+        "kubectl patch validatingwebhookconfiguration kyverno-resource-validating-webhook-cfg --type=merge -p '{\"webhooks\":[{\"name\":\"resource.kyverno.svc\",\"failurePolicy\":\"Fail\"}]}' 2>/dev/null || true",
+        "reset Kyverno resource validating webhook failurePolicy -> Fail",
+        tier="persistent", timeout=30
+    )
+    out.append(ok("reset.kyverno_webhook", "kyverno-resource-validating-webhook-cfg: failurePolicy reset to Fail", cluster=cl))
+
+    # 5. Reset vsphere-cpi DaemonSet
+    r.write(
+        "kubectl patch ds vsphere-cloud-controller-manager -n kube-system --type=merge -p '{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"vsphere-cloud-controller-manager\",\"args\":[\"--cloud-provider=vsphere\",\"--v=2\",\"--cloud-config=/etc/cloud/vsphere.conf\"]}]}}}}' 2>/dev/null || true; "
+        "kubectl patch ds vsphere-cpi -n kube-system --type=merge -p '{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"vsphere-cpi\",\"args\":[\"--cloud-provider=vsphere\",\"--v=2\",\"--cloud-config=/etc/cloud/vsphere.conf\"]}]}}}}' 2>/dev/null || true",
+        "reset vsphere-cpi DaemonSet leader election args to stock",
+        tier="persistent", timeout=30
+    )
+    out.append(ok("reset.cpi_ds", "vsphere-cpi DaemonSet: reset leader election args to stock", cluster=cl))
+
+    # 6. Reset Argo CronWorkflows
+    r.write(
+        "kubectl patch cronworkflow wal-s3-cleanup -n vmsp-platform --type=merge -p '{\"spec\":{\"schedules\":[\"0 * * * *\"]}}' 2>/dev/null || true; "
+        "kubectl patch cronworkflow scheduled-etcd-backup -n vmsp-platform --type=merge -p '{\"spec\":{\"schedules\":[\"0 */3 * * *\"]}}' 2>/dev/null || true",
+        "reset CronWorkflows schedules (wal-s3-cleanup -> 0 * * * *, scheduled-etcd-backup -> 0 */3 * * *)",
+        tier="transient", timeout=30
+    )
+    out.append(ok("reset.cronworkflows", "CronWorkflows: restored stock top-of-the-hour schedules", cluster=cl))
+
+    # 7. Stop & disable lab keepers and watchdogs
+    r.write(
+        "systemctl stop vcf-lab-keeper-vcfa.timer vcf-lab-keeper-vcfa.service vcfa-vip-watchdog.service 2>/dev/null || true; "
+        "systemctl disable vcf-lab-keeper-vcfa.timer vcfa-vip-watchdog.service 2>/dev/null || true; "
+        "rm -f /etc/systemd/system/vcf-lab-keeper-vcfa.* /etc/systemd/system/vcfa-vip-watchdog.* /usr/local/bin/vcf-lab-keeper-vcfa.sh; "
+        "systemctl daemon-reload 2>/dev/null || true",
+        "stop, disable, and purge vcf-lab-keeper-vcfa and watchdog systemd units",
+        tier="persistent", timeout=30
+    )
+    out.append(ok("reset.keepers", "systemd keepers: stopped, disabled, and purged lab keeper daemons", cluster=cl))
+
+    # 8. Clean up pre-remediation snapshot files
+    r.write(
+        "rm -rf /var/lib/vcf-lab-tuner/snapshots/* /tmp/vcf-lab-tuner/snapshots/* 2>/dev/null || true",
+        "clean up pre-remediation snapshot files on stock defaults reset",
+        tier="persistent", timeout=30
+    )
+    out.append(ok("reset.snapshots", "snapshots: purged snapshot files on stock reset", cluster=cl))
+
+    out.append(ok("reset.complete", "reset to stock 9.1.1 defaults completed successfully", cluster=cl))
     return out
 
 
@@ -8474,6 +9611,33 @@ $KB exec -n vmsp-platform logging-operator-fluentd-0 -c fluentd -- sh -c 'rm -rf
 exit 0
 """
 
+KEEPER_BODY_VSP_911 = r"""#!/bin/bash
+# vcf-lab-keeper (VCF 9.1.1+ native alignment) - emitted by vcf-lab-tuner.py. Do not edit by hand.
+# Re-asserts VSP drift targets safely without fighting Flux CD or stock charts:
+# 1. Logging operator fluentd buffer cleanup
+# 2. Scaling core VCF components back up if marked Running but sitting at 0 replicas
+set -u
+KB="kubectl"
+log() { logger -t vcf-lab-keeper "$1"; }
+
+# 1. Fluentd buffer cleanup
+$KB exec -n vmsp-platform logging-operator-fluentd-0 -c fluentd -- sh -c 'rm -rf /buffers/backup/* /buffers/*.bak*' >/dev/null 2>&1
+
+# 2. Scale back up any VCF components annotated Running if sitting at 0 replicas
+for comp in $($KB get components.api.vmsp.vmware.com -o jsonpath='{range .items[?(@.metadata.annotations.component\.vmsp\.vmware\.com/operational-status=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+    [ -z "$comp" ] && continue
+    [ "$comp" = "vsp" ] && continue
+    NS=$($KB get components.api.vmsp.vmware.com "$comp" -o jsonpath='{.spec.namespace}' 2>/dev/null || echo "$comp")
+    for dep in $($KB get deploy,statefulset -n "$NS" -o jsonpath='{range .items[?(@.spec.replicas==0)]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+        [ -z "$dep" ] && continue
+        $KB scale deploy,statefulset "$dep" -n "$NS" --replicas=1 >/dev/null 2>&1 \
+            && log "drift corrected: scaled $NS/$dep to 1"
+    done
+done
+
+exit 0
+"""
+
 KEEPER_BODY_VCFA = r"""#!/bin/bash
 # vcf-lab-keeper-vcfa - emitted by vcf-lab-tuner.py. Do not edit by hand.
 # Re-asserts VCFA drift targets: envoy-gateway memory, vsphere-cpi leader election args,
@@ -8788,7 +9952,13 @@ def do_keeper(r, cfg, cluster, remove=False, purge_legacy=False):
             emit()
             return out
 
-    raw_body = KEEPER_BODY_VCFA if cluster == "vcfa" else KEEPER_BODY_VSP
+    ver = _detect_cluster_version(r, cluster)
+    if cluster == "vcfa":
+        raw_body = KEEPER_BODY_VCFA
+    elif ver >= (9, 1, 1):
+        raw_body = KEEPER_BODY_VSP_911
+    else:
+        raw_body = KEEPER_BODY_VSP
     body = (raw_body
             .replace("__EG_LIMIT__", EG_MEM_LIMIT)
             .replace("__EG_REQUEST__", EG_MEM_REQUEST)
@@ -8922,7 +10092,8 @@ def run_cluster(name, args, password):
                    "cpu_tune": args.cpu_tune,
                    "rollback_cpu_tune": args.rollback_cpu_tune,
                    "recover_gateway_503": args.recover_gateway_503,
-                   "export_html": getattr(args, "export_html", None)}
+                   "export_html": getattr(args, "export_html", None),
+                   "cluster_version": _detect_cluster_version(runner, name)}
             if want is None or want in SECTIONS_NEEDING_NODES:
                 emit(f"{_DIM}  fetching cluster state ...{_NC}")
                 ctx["nodes"] = runner.read_json("kubectl get nodes -o json 2>/dev/null", 45)
@@ -8995,6 +10166,31 @@ def run_cluster(name, args, password):
            "rollback_cpu_tune": args.rollback_cpu_tune,
            "recover_gateway_503": args.recover_gateway_503,
            "export_html": getattr(args, "export_html", None)}
+    if args.mode == "snapshot":
+        section("PRE-REMEDIATION SNAPSHOT")
+        rows = _capture_pre_remediation_snapshot(runner, name)
+        for res in rows: row(res)
+        return rows, None
+
+    if args.mode == "rollback":
+        section("SNAPSHOT ROLLBACK")
+        snap_path = getattr(args, "snapshot", None)
+        rows = _rollback_from_snapshot(runner, name, snapshot_path=snap_path)
+        for res in rows: row(res)
+        return rows, None
+
+    if args.mode == "reset-defaults":
+        section("STOCK DEFAULTS RESET")
+        rows = _reset_to_stock_defaults(runner, name)
+        for res in rows: row(res)
+        return rows, None
+
+    if args.mode == "remediate" and name == "vcfa" and not args.dry_run:
+        section("AUTO PRE-REMEDIATION SNAPSHOT")
+        snap_rows = _capture_pre_remediation_snapshot(runner, name)
+        for res in snap_rows: row(res)
+        results.extend(snap_rows)
+
     if want is None or want in SECTIONS_NEEDING_NODES:
         emit(f"{_DIM}  fetching cluster state ...{_NC}")
         ctx["nodes"] = runner.read_json("kubectl get nodes -o json 2>/dev/null", 45)
@@ -9073,7 +10269,8 @@ def show_help():
     emit(f"    vcf-lab-tuner.py --cluster NAME [--mode MODE] [--section NAME] [-v] [-j]\n")
     emit(f"{_BOLD}OPTIONS:{_NC}")
     emit(f"    {_GREEN}--cluster{_NC} <name>    vsp | vcfa | supervisor | all   (required)")
-    emit(f"    {_GREEN}--mode{_NC} <mode>       preflight | tune | remediate | report  (default: report)")
+    emit(f"    {_GREEN}--mode{_NC} <mode>       preflight | tune | remediate | report | rollback | reset-defaults | snapshot  (default: report)")
+    emit(f"    {_GREEN}--snapshot{_NC} <path>   Snapshot file path or ID for --mode rollback (default: newest snapshot)")
     emit(f"    {_GREEN}--section{_NC} <name>    Run only the named section (see below)")
     emit(f"    {_GREEN}--host{_NC} <IP>         Override the cluster entry point; skips discovery")
     emit(f"    {_GREEN}--dry-run{_NC}           Preview; structurally cannot mutate")
@@ -9144,6 +10341,10 @@ def show_help():
     emit(f"    python3 vcf-lab-tuner.py --cluster vsp --mode remediate --section entropy\n")
     emit(f"    {_GREEN}# Fully remove a keeper, including any legacy unit it refused to install over{_NC}")
     emit(f"    python3 vcf-lab-tuner.py --cluster vsp --mode tune --remove-keeper --purge-legacy-keepers\n")
+    emit(f"    {_GREEN}# Rollback VCFA configuration to pre-remediation snapshot{_NC}")
+    emit(f"    python3 vcf-lab-tuner.py --cluster vcfa --mode rollback --dry-run\n")
+    emit(f"    {_GREEN}# Reset VCFA cluster to vendor stock 9.1.1 defaults (Flux CD + stock manifests){_NC}")
+    emit(f"    python3 vcf-lab-tuner.py --cluster vcfa --mode reset-defaults --dry-run\n")
     emit(f"{_BOLD}EXIT CODES:{_NC}")
     emit(f"    0  All checks passed    1  One or more failed    2  Cannot connect")
     sys.exit(0)
@@ -9161,6 +10362,7 @@ def main():
     p.add_argument("--cluster",  required=True, metavar="NAME",
                    choices=list(CLUSTERS.keys()) + ["all"])
     p.add_argument("--mode",     default="report", metavar="MODE", choices=MODES)
+    p.add_argument("--snapshot", default=None, metavar="PATH")
     p.add_argument("--section",  default=None, metavar="NAME",
                    choices=list(SECTION_MAP.keys()))
     p.add_argument("--host",     default=None, metavar="IP")

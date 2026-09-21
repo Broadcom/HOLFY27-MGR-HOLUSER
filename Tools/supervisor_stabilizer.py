@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
 supervisor_stabilizer.py
-Version 2.18 - 2026-08-20
+Version 2.19 - 2026-09-21
 Author - Kevin Tebear, Burke Azbill and HOL Core Team
+
+v2.19: Supervisor Phase C Certificate Renewal & Verification Fixes:
+       - Explicitly forces cert-manager reissuance via cert-manager.io/reissue-at annotation
+         and purges stale CertificateRequests when renewing leaf certificates.
+       - Fixed multi-format OpenSSL notAfter date parsing in Phase C to prevent false expiration
+         detection or unparseable date fallbacks.
+       - Enhanced missing secret logging with explicit (expires: missing) marker to align with
+         downstream vpodchecker parsing.
 
 v2.18: Deferred Content Library synchronization when upstream depot (e.g. fleet-01a.site-a.vcf.lab)
        is not yet reachable. Proactively checks TCP port 443 before attempting cert retrieval or
@@ -447,8 +455,8 @@ import configparser
 # neither --version nor a log consumer could tell which revision emitted a line.
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2.18"
-SCRIPT_DATE    = "2026-08-20"
+SCRIPT_VERSION = "2.19"
+SCRIPT_DATE    = "2026-09-21"
 
 # ---------------------------------------------------------------------------
 # Defaults - matched to the lab in supervisor-cert-fix/README.md but every
@@ -2562,19 +2570,23 @@ for c in certs:
     leaf_data = get_sec_data(ns, sec)
     leaf_b64 = leaf_data.get("tls.crt", "")
     if not leaf_b64:
-        log_lines.append(f"CHECK  : {{ns}}/{{sec}} — MISSING SECRET (0d remaining)")
+        log_lines.append(f"CHECK  : {{ns}}/{{sec}} — MISSING SECRET (0d remaining) (expires: missing)")
         if not is_ca:
             renewed_secrets.append((ns, sec, name))
         continue
     
     end_date_raw = run(f"echo '{{leaf_b64}}' | base64 -d | openssl x509 -noout -enddate")
     m = re.search(r"notAfter=(.+)", end_date_raw)
-    exp_str = m.group(1) if m else "UNKNOWN"
+    exp_str = m.group(1).strip() if m else "UNKNOWN"
     exp_epoch = 0
-    try:
-        exp_epoch = time.mktime(time.strptime(exp_str, "%b %d %H:%M:%S %Y %Z"))
-    except Exception:
-        pass
+    for fmt in ["%b %d %H:%M:%S %Y %Z", "%b %d %H:%M:%S %Y"]:
+        try:
+            clean_str = exp_str.replace("GMT", "").strip() if "GMT" in exp_str and "%Z" not in fmt else exp_str.strip()
+            exp_epoch = time.mktime(time.strptime(clean_str, fmt))
+            if exp_epoch > 0:
+                break
+        except Exception:
+            pass
     
     days_rem = int((exp_epoch - now) / 86400) if exp_epoch else 0
     is_expiring = (exp_epoch - now) <= threshold_sec
@@ -2612,6 +2624,8 @@ if not dry_run and renewed_secrets:
         patch_json = json.dumps({{"spec": {{"duration": "43830h0m0s"}}}})
         run(f"{{K}} -n {{ns}} patch certificate {{cname}} --type=merge -p '{{patch_json}}'")
         run(f"{{K}} -n {{ns}} delete secret {{sec}} --ignore-not-found=true")
+        run(f"{{K}} -n {{ns}} annotate certificate {{cname}} cert-manager.io/reissue-at=$(date +%s) --overwrite")
+        run(f"{{K}} -n {{ns}} delete certificaterequest -l cert-manager.io/certificate-name={{cname}} --ignore-not-found=true")
     
     all_workloads = json.loads(run(K + " get deploy,ds,sts -A -o json") or "{{}}").get("items", [])
     sec_names_renewed = {{s[1] for s in renewed_secrets}}
