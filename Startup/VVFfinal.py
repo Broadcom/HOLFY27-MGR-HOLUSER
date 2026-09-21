@@ -1,11 +1,36 @@
 #!/usr/bin/env python3
 # VVFfinal.py - HOLFY27 Core VVF Final Tasks Module
-# Version 1.5 - 2026-08-18
+# Version 1.8 - 2026-08-30
 # Author - Burke Azbill and HOL Core Team
-# VVF final startup tasks: VSP platform VMs, Fleet component health, URL checks
+# VVF final startup tasks: VSP platform VMs, Fleet component health, URL checks,
+# Site B vCenter root password sync & autostart services
 #
 # Runs after VVF.py and vSphere.py complete. Skips immediately if no [VVFFINAL]
 # section is present in config.ini (safe for VCF labs).
+#
+# v1.8 Changes (2026-08-30):
+# - Task 5: Added root password and shell synchronization for Site B vCenter
+#   (vc-mgmt-b.site-b.vcf.lab). When connecting via SSH as administrator@vsphere.lab
+#   (or administrator@vsphere.local) and launching bash shell via "shell.set --enable true"
+#   and "shell", the script synchronizes root password to creds.txt via sudo chpasswd,
+#   sets root login shell to /bin/bash, disables password expiration, and checks/confirms
+#   all AUTOMATIC autostart services via vmon-cli (matching vSphere.py Task 7).
+#
+# v1.7 Changes (2026-08-30):
+# - Task 5: Enhanced Site B vCenter (vc-mgmt-b.site-b.vcf.lab) autostart services
+#   verification. Connects via SSH as administrator@vsphere.lab (with fallback to
+#   configured SSO user / administrator@vsphere.local), enables bash shell via
+#   "shell.set --enable true" and "shell", checks all services configured for
+#   AUTOMATIC starttype via vmon-cli, and starts/confirms any services not in
+#   STARTED state (matching vSphere.py Task 7). Uses persistent pexpect session
+#   with sudo privileges and robust service state polling.
+#
+# v1.6 Changes (2026-08-30):
+# - Task 5: Added Site B vCenter (vc-mgmt-b.site-b.vcf.lab) autostart services
+#   verification. Connects via SSH as administrator@vsphere.lab, enables bash shell
+#   via "shell.set --enable true" and "shell", checks all services configured for
+#   AUTOMATIC starttype via vmon-cli, and starts/confirms any services not in
+#   STARTED state (matching vSphere.py Task 7).
 #
 # v1.5 Changes:
 # - Task 3: Updated vsp_cert_renewer.py invocation to loop over Site A and Site B
@@ -35,6 +60,7 @@
 #             deployments in vcf-fleet-lcm and vmsp-platform (non-fatal)
 #   Task 3  - K8s certificate check/renewal on VSP clusters (non-fatal)
 #   Task 4  - Verify VCF component URLs ([VVFFINAL] vcfcomponenturls)
+#   Task 5  - Verify Site B vCenter autostart services (vc-mgmt-b.site-b.vcf.lab)
 
 import os
 import sys
@@ -43,6 +69,9 @@ import logging
 import time
 import ssl
 import subprocess
+import re
+import pexpect
+from typing import Optional, List, Union, Tuple, Any
 
 # Add hol directory to path
 sys.path.insert(0, '/home/holuser/hol')
@@ -140,7 +169,7 @@ def _poll_vsp_api_health(lsf, vip: str, password: str, timeout: int) -> bool:
     return False
 
 
-def _check_url_health(lsf, url: str, expected_text: str = None,
+def _check_url_health(lsf, url: str, expected_text: Optional[str] = None,
                       max_attempts: int = URL_MAX_ATTEMPTS,
                       poll_interval: int = URL_POLL_INTERVAL) -> bool:
     """
@@ -200,6 +229,168 @@ def _check_url_health(lsf, url: str, expected_text: str = None,
     return False
 
 
+def _verify_vc_b_autostart_services(lsf, hostname: str, primary_user: str, password: str,
+                                    autostart_timeout: int = 60,
+                                    check_interval: int = 10) -> Tuple[bool, str, int, int, int, int]:
+    """
+    Connect via SSH to vCenter appliance shell (appliancesh) on Site B,
+    enable bash shell via 'shell.set --enable true' and 'shell', and check that all
+    services configured for AUTOMATIC startup are in STARTED state via vmon-cli.
+    Starts and confirms any services not in STARTED state (matching vSphere.py Task 7).
+
+    :param lsf: lsfunctions module
+    :param hostname: vCenter FQDN/IP (e.g. vc-mgmt-b.site-b.vcf.lab)
+    :param primary_user: Primary SSH user (e.g. administrator@vsphere.lab)
+    :param password: SSH password (from creds.txt)
+    :param autostart_timeout: Max seconds to wait for a service to start
+    :param check_interval: Polling interval between status checks
+    :return: (success_bool, connected_user_or_error, total, started, fixed, failed)
+    """
+    candidates = [primary_user]
+    # Check if there is an explicit SSO user in config.ini vCenters for this host
+    if hasattr(lsf, 'get_config_list'):
+        vcenters = lsf.get_config_list('RESOURCES', 'vCenters')
+        for entry in vcenters:
+            if entry and not entry.strip().startswith('#') and hostname in entry:
+                parts = entry.split(':')
+                if len(parts) >= 3:
+                    cfg_user = parts[2].strip()
+                    if cfg_user and cfg_user not in candidates:
+                        candidates.append(cfg_user)
+
+    for alt in ['administrator@vsphere.local', 'root']:
+        if alt not in candidates:
+            candidates.append(alt)
+
+    child = None
+    connected_user = None
+
+    for u in candidates:
+        lsf.write_output(f'  Connecting to {hostname} as {u}...')
+        try:
+            c = pexpect.spawn(
+                f'ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 {u}@{hostname}',
+                encoding='utf-8',
+                timeout=5
+            )
+            idx = c.expect(['[Pp]assword:', pexpect.EOF, pexpect.TIMEOUT])
+            if idx != 0:
+                c.close(force=True)
+                continue
+            c.sendline(password)
+            idx = c.expect(['Command>', r'\][\#\$]', '[Pp]assword:', 'Permission denied', 'Access denied', pexpect.EOF, pexpect.TIMEOUT])
+            if idx in (0, 1):
+                child = c
+                connected_user = u
+                if idx == 0:
+                    lsf.write_output(f'  Enabling bash shell via appliancesh for {u}...')
+                    child.sendline('shell.set --enable true')
+                    child.expect('Command>', timeout=10)
+                    child.sendline('shell')
+                    child.expect(r'\][\#\$]', timeout=10)
+                lsf.write_output(f'  Connected to {hostname} shell as {connected_user}')
+                break
+            else:
+                c.close(force=True)
+        except Exception as e:
+            lsf.write_output(f'  Connection attempt for {u} failed: {e}')
+
+    if not child:
+        return False, f'Could not connect to {hostname} via SSH', 0, 0, 0, 0
+
+    autostart_total = 0
+    autostart_started = 0
+    autostart_fixed = 0
+    autostart_failed = 0
+
+    try:
+        # Synchronize root password, login shell, and expiration on Site B vCenter
+        lsf.write_output(f'  Synchronizing root password and setting /bin/bash shell on {hostname}...')
+        child.sendline('set +H')
+        child.expect(r'\][\#\$]', timeout=10)
+        child.sendline(f"echo 'root:{password}' | sudo chpasswd")
+        child.expect(r'\][\#\$]', timeout=15)
+        child.sendline('sudo usermod -s /bin/bash root')
+        child.expect(r'\][\#\$]', timeout=10)
+        child.sendline('sudo chage -M -1 -E -1 root')
+        child.expect(r'\][\#\$]', timeout=10)
+        lsf.write_output(f'  Root password and /bin/bash shell synchronized on {hostname}')
+
+        check_cmd = (
+            'for svc in $(sudo vmon-cli --list 2>/dev/null); do '
+            'info=$(sudo vmon-cli -s $svc 2>/dev/null); '
+            'starttype=$(echo "$info" | grep "Starttype:" | head -1 | sed "s/.*Starttype: //"); '
+            'if [ "$starttype" = "AUTOMATIC" ]; then '
+            'state=$(echo "$info" | grep "RunState:" | head -1 | sed "s/.*RunState: //"); '
+            'echo "SVC_AUTO:$svc:$state"; '
+            'fi; done'
+        )
+        child.sendline(check_cmd)
+        child.expect(r'\][\#\$]', timeout=120)
+
+        not_started = []
+        for line in child.before.splitlines():
+            line = line.strip()
+            if 'SVC_AUTO:' not in line or '$svc' in line:
+                continue
+            payload = line.split('SVC_AUTO:', 1)[1].strip()
+            if ':' not in payload:
+                continue
+            svc_name, svc_state = payload.split(':', 1)
+            svc_name = svc_name.strip()
+            svc_state = svc_state.strip()
+            if not re.match(r'^[a-zA-Z0-9_\-]+$', svc_name):
+                continue
+
+            autostart_total += 1
+            if svc_state == 'STARTED':
+                autostart_started += 1
+            else:
+                not_started.append((svc_name, svc_state))
+
+        if not not_started:
+            lsf.write_output(f'  All {autostart_total} autostart services on {hostname} are running')
+        else:
+            lsf.write_output(f'  Found {len(not_started)} autostart service(s) not started on {hostname}:')
+            for svc_name, svc_state in not_started:
+                lsf.write_output(f'    {svc_name}: {svc_state} - starting...')
+                child.sendline(f'sudo vmon-cli --start {svc_name}')
+                child.expect(r'\][\#\$]', timeout=30)
+
+                started = False
+                wait_start = time.time()
+                while (time.time() - wait_start) < autostart_timeout:
+                    child.sendline(f'sudo vmon-cli -s {svc_name} 2>/dev/null | grep "RunState:" | head -1 | sed "s/.*RunState: //"')
+                    child.expect(r'\][\#\$]', timeout=30)
+                    for vline in child.before.splitlines():
+                        if vline.strip() == 'STARTED':
+                            started = True
+                            break
+                    if started:
+                        break
+                    time.sleep(check_interval)
+
+                if started:
+                    lsf.write_output(f'    {svc_name}: Started successfully')
+                    autostart_started += 1
+                    autostart_fixed += 1
+                else:
+                    lsf.write_output(f'    WARNING: {svc_name} did not start within {autostart_timeout}s')
+                    autostart_failed += 1
+
+        child.sendline('exit')
+        idx = child.expect(['Command>', pexpect.EOF, pexpect.TIMEOUT], timeout=10)
+        if idx == 0:
+            child.sendline('exit')
+            child.expect([pexpect.EOF, pexpect.TIMEOUT], timeout=10)
+        child.close(force=True)
+
+        return True, connected_user, autostart_total, autostart_started, autostart_fixed, autostart_failed
+    except Exception as e:
+        child.close(force=True)
+        return False, str(e), autostart_total, autostart_started, autostart_fixed, autostart_failed
+
+
 #==============================================================================
 # MAIN FUNCTION
 #==============================================================================
@@ -229,8 +420,10 @@ def main(lsf=None, standalone=False, dry_run=False):
     lsf.write_output(f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
 
     # Dashboard setup
+    dashboard = None
+    TaskStatus: Any = None
     try:
-        from status_dashboard import StatusDashboard, TaskStatus
+        from status_dashboard import StatusDashboard, TaskStatus  # type: ignore
         dashboard = StatusDashboard(lsf.lab_sku)
         dashboard.update_task('vvffinal', 'vsp_vms', TaskStatus.RUNNING)
         dashboard.generate_html()
@@ -740,6 +933,7 @@ def main(lsf=None, standalone=False, dry_run=False):
         lsf.write_output(f'  Running cert renewer for {len(sites_to_renew)} VSP cluster(s)...')
         for site_code, site_ip in sites_to_renew:
             lsf.write_output(f'  Checking K8s certs for VSP Site {site_code.upper()} ({site_ip})...')
+            proc = None
             try:
                 cmd = [
                     sys.executable, cert_renewer,
@@ -754,8 +948,9 @@ def main(lsf=None, standalone=False, dry_run=False):
                     text=True,
                     bufsize=1
                 )
-                for line in proc.stdout:
-                    lsf.write_output(f' {line.rstrip()}')
+                if proc.stdout:
+                    for line in proc.stdout:
+                        lsf.write_output(f' {line.rstrip()}')
                 proc.wait(timeout=300)
                 if proc.returncode == 0:
                     k8s_cert_ok += 1
@@ -765,7 +960,8 @@ def main(lsf=None, standalone=False, dry_run=False):
                     lsf.write_output(
                         f'  Cert check for Site {site_code.upper()} returned code {proc.returncode} (non-fatal)')
             except subprocess.TimeoutExpired:
-                proc.kill()
+                if 'proc' in locals() and proc:
+                    proc.kill()
                 k8s_cert_failed += 1
                 lsf.write_output(f'  Cert renewer for Site {site_code.upper()} timed out (non-fatal)')
             except Exception as e:
@@ -838,7 +1034,89 @@ def main(lsf=None, standalone=False, dry_run=False):
         else:
             dashboard.update_task('vvffinal', 'vcf_component_urls', TaskStatus.COMPLETE,
                                   total=total, success=url_ok, failed=0)
+        dashboard.update_task('vvffinal', 'vc_b_autostart', TaskStatus.RUNNING)
         dashboard.generate_html()
+
+    #==========================================================================
+    # TASK 5: Site B vCenter Root Password Sync & Autostart Services
+    # Connects via SSH to vc-mgmt-b.site-b.vcf.lab as user "administrator@vsphere.lab"
+    # using the password in /home/holuser/creds.txt. Enables bash shell via:
+    #   shell.set --enable true
+    #   shell
+    # Synchronizes root password to /home/holuser/creds.txt, sets root login shell
+    # to /bin/bash, disables password expiration, and checks/confirms all services
+    # configured for AUTOMATIC startup are in STARTED state via vmon-cli, starting
+    # any that are not running (matching the logic in vSphere.py Task 7).
+    #==========================================================================
+
+    lsf.write_output('Task 5: Site B vCenter root password sync & autostart services (vc-mgmt-b.site-b.vcf.lab)')
+
+    vc_b_host = 'vc-mgmt-b.site-b.vcf.lab'
+    vc_b_user = 'administrator@vsphere.lab'
+    autostart_total = 0
+    autostart_started = 0
+    autostart_fixed = 0
+    autostart_failed = 0
+
+    AUTOSTART_START_TIMEOUT = 60   # seconds to wait for a service to start
+    AUTOSTART_CHECK_INTERVAL = 10  # seconds between status checks
+
+    if dashboard:
+        dashboard.update_task('vvffinal', 'vc_b_autostart', TaskStatus.RUNNING)
+        dashboard.generate_html()
+
+    if dry_run:
+        lsf.write_output(f'  Would check and start autostart services on {vc_b_host} via SSH ({vc_b_user})')
+        if dashboard:
+            dashboard.update_task('vvffinal', 'vc_b_autostart', TaskStatus.COMPLETE,
+                                  'Dry run mode', total=1, success=1, failed=0)
+            dashboard.generate_html()
+    else:
+        # Check if port 22 on Site B vCenter is responding
+        if not lsf.test_tcp_port(vc_b_host, 22, timeout=5):
+            lsf.write_output(f'  WARNING: Cannot reach {vc_b_host}:22 via TCP — skipping Site B autostart services check')
+            if dashboard:
+                dashboard.update_task('vvffinal', 'vc_b_autostart', TaskStatus.SKIPPED,
+                                      f'{vc_b_host}:22 unreachable')
+                dashboard.generate_html()
+        else:
+            success, user_or_err, total, started, fixed, failed = _verify_vc_b_autostart_services(
+                lsf, vc_b_host, vc_b_user, password,
+                autostart_timeout=AUTOSTART_START_TIMEOUT,
+                check_interval=AUTOSTART_CHECK_INTERVAL
+            )
+            autostart_total = total
+            autostart_started = started
+            autostart_fixed = fixed
+            autostart_failed = failed
+
+            if not success:
+                lsf.write_output(f'  WARNING: Could not query services on {vc_b_host}: {user_or_err}')
+                autostart_failed += 1
+            elif autostart_fixed > 0:
+                lsf.write_output(f'Site B vCenter autostart services check complete: {autostart_fixed} service(s) were started')
+            elif autostart_failed > 0:
+                lsf.write_output(f'Site B vCenter autostart services check complete: {autostart_failed} service(s) failed to start')
+            else:
+                lsf.write_output(f'All autostart services are running on Site B vCenter ({vc_b_host})')
+
+            if dashboard:
+                if autostart_total > 0:
+                    status = TaskStatus.COMPLETE if autostart_failed == 0 else TaskStatus.FAILED
+                    msg = ''
+                    if autostart_fixed > 0:
+                        msg = f'{autostart_fixed} service(s) required restart'
+                    if autostart_failed > 0:
+                        msg = f'{autostart_failed} service(s) failed to start'
+                    dashboard.update_task('vvffinal', 'vc_b_autostart', status,
+                                          msg,
+                                          total=autostart_total,
+                                          success=autostart_started,
+                                          failed=autostart_failed)
+                else:
+                    dashboard.update_task('vvffinal', 'vc_b_autostart', TaskStatus.FAILED,
+                                          'Could not query services')
+                dashboard.generate_html()
 
     ##=========================================================================
     ## End Core Team code
