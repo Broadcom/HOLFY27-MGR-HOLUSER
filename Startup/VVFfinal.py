@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 # VVFfinal.py - HOLFY27 Core VVF Final Tasks Module
-# Version 1.8 - 2026-08-30
+# Version 1.9 - 2026-09-22
 # Author - Burke Azbill and HOL Core Team
 # VVF final startup tasks: VSP platform VMs, Fleet component health, URL checks,
 # Site B vCenter root password sync & autostart services
 #
 # Runs after VVF.py and vSphere.py complete. Skips immediately if no [VVFFINAL]
 # section is present in config.ini (safe for VCF labs).
+#
+# v1.9 Changes (2026-09-22):
+# - Task 3: Added browser User-Agent and Accept request headers to _check_url_health()
+#   to properly validate web interfaces behind SAML SSO redirect flows (e.g. SDDC Manager).
 #
 # v1.8 Changes (2026-08-30):
 # - Task 5: Added root password and shell synchronization for Site B vCenter
@@ -193,9 +197,14 @@ def _check_url_health(lsf, url: str, expected_text: Optional[str] = None,
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
 
+    browser_headers = {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+
     for attempt in range(1, max_attempts + 1):
         try:
-            req = urllib.request.Request(url)
+            req = urllib.request.Request(url, headers=browser_headers)
             with urllib.request.urlopen(req, context=ssl_ctx, timeout=15) as resp:
                 code = resp.status
                 if code in (200, 201):

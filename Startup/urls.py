@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # urls.py - HOLFY27 Core URL Verification Module
-# Version 3.0 - January 2026
+# Version 3.1 - 2026-09-22
 # Author - Burke Azbill and HOL Core Team
 # Verifies web interface accessibility
+#
+# v3.1 Changes (2026-09-22):
+# - Added browser headers (User-Agent and Accept) to check_url_with_retries()
+#   to ensure web UIs with SAML SSO redirect flows (e.g. SDDC Manager) are
+#   properly handled as interactive browser sessions rather than unauthenticated API calls.
 
 import os
 import sys
@@ -28,6 +33,11 @@ RETRY_DELAY = 20
 REQUEST_TIMEOUT = 15
 MAX_WORKERS = 8
 
+DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+}
+
 #==============================================================================
 # URL CHECK FUNCTION
 #==============================================================================
@@ -50,6 +60,7 @@ def check_url_with_retries(url, expected_text, max_retries, retry_delay, timeout
     
     session = requests.Session()
     session.trust_env = False  # Ignore proxy environment vars
+    session.headers.update(DEFAULT_HEADERS)
     
     last_error = None
     
