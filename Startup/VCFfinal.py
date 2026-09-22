@@ -560,7 +560,7 @@
 #
 # v4.6 Changes:
 # - Task 8b: Optional Authentik + VCF integration when [VCFFINAL] authentik_vcf_integration=true
-#   (runs Tools/authentik_vcf_integration.py after Vault CA distribution).
+#   (runs Tools/authentik/authentik_vcf_integration.py after Vault CA distribution).
 # - Dynamically determine Supervisor Service namespaces to fix based on config.ini [VCFFINAL] supervisorservicedns.
 # - Added Task 2c4: Supervisor Service vSphere Pod DNS Fix Cleanup
 #   After the DNS fix, the kube-dns-lb LoadBalancer external VIP is no longer needed,
@@ -5228,7 +5228,7 @@ echo "PROXY_CONFIGURED"
             raw = lsf.config.get('VCFFINAL', 'authentik_vcf_integration', fallback='').strip().lower()
             if raw in ('1', 'true', 'yes', 'on'):
                 import importlib.util
-                ak_path = '/home/holuser/hol/Tools/authentik_vcf_integration.py'
+                ak_path = '/home/holuser/hol/Tools/authentik/authentik_vcf_integration.py'
                 if os.path.isfile(ak_path):
                     spec = importlib.util.spec_from_file_location(
                         'authentik_vcf_integration', ak_path)

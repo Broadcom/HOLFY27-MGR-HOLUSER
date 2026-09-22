@@ -3981,7 +3981,7 @@ def clear_atq():
 #   Default value: 'holodeck'  (matches the holorouter Authentik pre-config)
 #   Override:      set the AUTHENTIK_API_TOKEN environment variable.
 #
-# These functions operate independently of authentik_vcf_integration.py.
+# These functions operate independently of Tools/authentik/authentik_vcf_integration.py.
 # Both can be active simultaneously without conflict.
 #==============================================================================
 

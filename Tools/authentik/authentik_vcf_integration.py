@@ -42,14 +42,25 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-_tools_dir = str(Path(__file__).resolve().parent)
+_authentik_dir = str(Path(__file__).resolve().parent)
+_tools_dir = str(Path(__file__).resolve().parent.parent)
+if _authentik_dir not in sys.path:
+    sys.path.insert(0, _authentik_dir)
 if _tools_dir not in sys.path:
     sys.path.insert(0, _tools_dir)
-from authentik_fleet_iam import (
-    fleet_iam_post_scim_assign_and_join,
-    log_fleet_sso_realm_summary,
-    run_fleet_iam_vcf_sso,
-)
+
+try:
+    from .authentik_fleet_iam import (
+        fleet_iam_post_scim_assign_and_join,
+        log_fleet_sso_realm_summary,
+        run_fleet_iam_vcf_sso,
+    )
+except (ImportError, ValueError):
+    from authentik_fleet_iam import (
+        fleet_iam_post_scim_assign_and_join,
+        log_fleet_sso_realm_summary,
+        run_fleet_iam_vcf_sso,
+    )
 
 try:
     import urllib3
@@ -112,51 +123,282 @@ def _load_ini(path: str) -> configparser.ConfigParser:
 
 
 
-def _discover_mgmt_vc(cfg: configparser.ConfigParser) -> Tuple[str, str]:
-    """Return (fqdn, sso_user) for management vCenter."""
-    opt = 'authentik_mgmt_vc_fqdn'
-    if cfg.has_option('VCFFINAL', opt):
-        fqdn = cfg.get('VCFFINAL', opt).strip()
-        if fqdn:
-            user = 'administrator@vsphere.local'
-            if cfg.has_option('VCFFINAL', 'authentik_mgmt_vc_user'):
-                user = cfg.get('VCFFINAL', 'authentik_mgmt_vc_user').strip()
-            return fqdn, user
+class VcfTopology:
+    """Discovered VCF multi-site and multi-domain infrastructure topology."""
+    def __init__(self) -> None:
+        self.vcenters: List[Dict[str, str]] = []  # [{fqdn, site, role, user, redirect_uri}]
+        self.nsx_managers: List[Dict[str, str]] = []  # [{fqdn, site, role}]
+        self.ops_instances: List[Dict[str, str]] = []  # [{fqdn, site}]
+        self.auto_instances: List[Dict[str, str]] = []  # [{fqdn, site}]
+        self.mgmt_vc_fqdn: str = 'vc-mgmt-a.site-a.vcf.lab'
+        self.ops_fqdn: str = 'ops-a.site-a.vcf.lab'
+        self.redirect_urls: List[str] = []
+        self.app_tiles: List[Dict[str, Any]] = []
+        self.has_site_a: bool = True
+        self.has_site_b: bool = False
+
+
+def _normalize_host_fqdn(host: str) -> str:
+    h = host.strip().lower()
+    if '.' in h:
+        return h
+    if 'site-b' in h or '-b' in h or h.endswith('b'):
+        return f"{h}.site-b.vcf.lab"
+    return f"{h}.site-a.vcf.lab"
+
+
+def _detect_site(host: str) -> str:
+    h = host.lower().strip()
+    if 'site-b' in h or '.site-b.' in h or h.endswith('.site-b.vcf.lab'):
+        return 'site-b'
+    short_host = h.split('.')[0]
+    if short_host.endswith('-b') or short_host.endswith('_b') or short_host.endswith('01b') or short_host.endswith('02b'):
+        return 'site-b'
+    return 'site-a'
+
+
+def discover_vcf_topology(cfg: configparser.ConfigParser) -> VcfTopology:
+    """Discover all vCenters, NSX Managers, Ops, and VCFA instances across Site A and Site B."""
+    topo = VcfTopology()
+    tenant = 'CUSTOMER'
+
+    # 1. Discover vCenters
+    seen_vcs: set[str] = set()
+
+    def _add_vc(host: str, typ: str = '', user: str = '') -> None:
+        fqdn = _normalize_host_fqdn(host)
+        if fqdn in seen_vcs:
+            return
+        seen_vcs.add(fqdn)
+        site = _detect_site(fqdn)
+        role = 'mgmt' if ('mgmt' in fqdn or 'vc-mgmt' in fqdn or typ.upper() == 'MGMT') else 'wld'
+        if not user:
+            user = 'administrator@vsphere.local' if role == 'mgmt' else 'administrator@wld.sso'
+        redirect_uri = f"https://{fqdn}/federation/t/{tenant}/auth/response/oauth2"
+        topo.vcenters.append({
+            'fqdn': fqdn,
+            'site': site,
+            'role': role,
+            'user': user,
+            'redirect_uri': redirect_uri,
+        })
+        if redirect_uri not in topo.redirect_urls:
+            topo.redirect_urls.append(redirect_uri)
+
+    # Config overrides
+    if cfg.has_option('VCFFINAL', 'authentik_mgmt_vc_fqdn'):
+        _add_vc(cfg.get('VCFFINAL', 'authentik_mgmt_vc_fqdn').strip(), 'MGMT',
+                cfg.get('VCFFINAL', 'authentik_mgmt_vc_user', fallback='administrator@vsphere.local').strip())
+    if cfg.has_option('VCFFINAL', 'authentik_wld_vc_fqdn'):
+        _add_vc(cfg.get('VCFFINAL', 'authentik_wld_vc_fqdn').strip(), 'WLD',
+                cfg.get('VCFFINAL', 'authentik_wld_vc_user', fallback='administrator@wld.sso').strip())
+
     if cfg.has_section('RESOURCES') and cfg.has_option('RESOURCES', 'vCenters'):
         for line in cfg.get('RESOURCES', 'vCenters').splitlines():
             line = line.split('#', 1)[0].strip()
-            if not line or line.startswith('#'):
+            if not line:
                 continue
             parts = [p.strip() for p in line.split(':')]
             if len(parts) >= 3:
-                host, typ, user = parts[0], parts[1].upper(), parts[2]
-                if typ == 'MGMT' or 'mgmt' in host.lower() or 'vc-mgmt' in host.lower():
-                    return host, user
-        for line in cfg.get('RESOURCES', 'vCenters').splitlines():
+                _add_vc(parts[0], parts[1], parts[2])
+            elif len(parts) >= 1 and parts[0]:
+                _add_vc(parts[0])
+
+    if cfg.has_section('VCF') and cfg.has_option('VCF', 'vcfvCenter'):
+        for line in cfg.get('VCF', 'vcfvCenter').splitlines():
             line = line.split('#', 1)[0].strip()
-            if not line or line.startswith('#'):
-                continue
-            parts = [p.strip() for p in line.split(':')]
-            if len(parts) >= 3:
-                return parts[0], parts[2]
-            if len(parts) >= 1 and parts[0]:
-                return parts[0], 'administrator@vsphere.local'
-    return 'vc-mgmt-a.site-a.vcf.lab', 'administrator@vsphere.local'
+            if line:
+                _add_vc(line)
 
+    if not topo.vcenters:
+        _add_vc('vc-mgmt-a.site-a.vcf.lab', 'MGMT', 'administrator@vsphere.local')
 
-def _discover_ops_fqdn(cfg: configparser.ConfigParser) -> str:
+    # Primary mgmt vCenter
+    primary_mgmt = next((v for v in topo.vcenters if v['role'] == 'mgmt' and v['site'] == 'site-a'), topo.vcenters[0])
+    topo.mgmt_vc_fqdn = primary_mgmt['fqdn']
+
+    # 2. Discover NSX Managers
+    seen_nsx: set[str] = set()
+
+    def _add_nsx(host: str) -> None:
+        fqdn = _normalize_host_fqdn(host)
+        if fqdn in seen_nsx:
+            return
+        seen_nsx.add(fqdn)
+        site = _detect_site(fqdn)
+        role = 'wld' if 'wld' in fqdn else 'mgmt'
+        topo.nsx_managers.append({'fqdn': fqdn, 'site': site, 'role': role})
+
+    if cfg.has_section('VCF') and cfg.has_option('VCF', 'vcfnsxmgr'):
+        for line in cfg.get('VCF', 'vcfnsxmgr').splitlines():
+            line = line.split('#', 1)[0].strip()
+            if line:
+                _add_nsx(line)
+    if not topo.nsx_managers:
+        _add_nsx('nsx-mgmt-01a.site-a.vcf.lab')
+
+    # 3. Discover VCF Operations
+    seen_ops: set[str] = set()
+
+    def _add_ops(host: str) -> None:
+        fqdn = _normalize_host_fqdn(host)
+        if fqdn in seen_ops:
+            return
+        seen_ops.add(fqdn)
+        site = _detect_site(fqdn)
+        topo.ops_instances.append({'fqdn': fqdn, 'site': site})
+
     if cfg.has_option('VCFFINAL', 'authentik_ops_fqdn'):
-        v = cfg.get('VCFFINAL', 'authentik_ops_fqdn').strip()
-        if v:
-            return v
+        _add_ops(cfg.get('VCFFINAL', 'authentik_ops_fqdn').strip())
+
     if cfg.has_section('VCF') and cfg.has_option('VCF', 'urls'):
         for line in cfg.get('VCF', 'urls').splitlines():
             line = line.split('#', 1)[0].strip()
             if 'ops-' in line.lower():
                 m = re.search(r'https?://([^/,;\s]+)', line)
                 if m:
-                    return m.group(1)
-    return 'ops-a.site-a.vcf.lab'
+                    _add_ops(m.group(1))
+
+    if cfg.has_section('RESOURCES') and cfg.has_option('RESOURCES', 'URLS'):
+        for line in cfg.get('RESOURCES', 'URLS').splitlines():
+            line = line.split('#', 1)[0].strip()
+            if 'ops-' in line.lower():
+                m = re.search(r'https?://([^/,;\s]+)', line)
+                if m:
+                    _add_ops(m.group(1))
+
+    if not topo.ops_instances:
+        _add_ops('ops-a.site-a.vcf.lab')
+
+    primary_ops = next((o for o in topo.ops_instances if o['site'] == 'site-a'), topo.ops_instances[0])
+    topo.ops_fqdn = primary_ops['fqdn']
+
+    # 4. Discover VCF Automation
+    seen_auto: set[str] = set()
+
+    def _add_auto(host: str) -> None:
+        fqdn = _normalize_host_fqdn(host)
+        if fqdn in seen_auto:
+            return
+        seen_auto.add(fqdn)
+        site = _detect_site(fqdn)
+        topo.auto_instances.append({'fqdn': fqdn, 'site': site})
+
+    if cfg.has_section('VCFFINAL') and cfg.has_option('VCFFINAL', 'vravms'):
+        for line in cfg.get('VCFFINAL', 'vravms').splitlines():
+            line = line.split('#', 1)[0].strip()
+            if 'auto-b' in line.lower():
+                _add_auto('auto-b.site-b.vcf.lab')
+            elif 'auto' in line.lower():
+                _add_auto('auto-a.site-a.vcf.lab')
+
+    if cfg.has_section('RESOURCES') and cfg.has_option('RESOURCES', 'URLS'):
+        for line in cfg.get('RESOURCES', 'URLS').splitlines():
+            line = line.split('#', 1)[0].strip()
+            if 'auto-b' in line.lower():
+                _add_auto('auto-b.site-b.vcf.lab')
+            elif 'auto-a' in line.lower():
+                _add_auto('auto-a.site-a.vcf.lab')
+
+    if not topo.auto_instances:
+        _add_auto('auto-a.site-a.vcf.lab')
+
+    # Detect active sites
+    all_sites = {vc['site'] for vc in topo.vcenters} | {n['site'] for n in topo.nsx_managers} | {o['site'] for o in topo.ops_instances}
+    topo.has_site_a = 'site-a' in all_sites or True
+    topo.has_site_b = 'site-b' in all_sites
+
+    # 5. Generate Application Tiles for Authentik Portal
+    # Primary Mgmt vCenter (slug 'vcf')
+    topo.app_tiles.append({
+        'name': 'vCenter (mgmt)',
+        'slug': 'vcf',
+        'meta_launch_url': f"https://{primary_mgmt['fqdn']}/ui/",
+        'meta_description': f"Launch Management vCenter ({primary_mgmt['fqdn']})",
+        'group': 'VCF',
+        'meta_publisher': 'VMware',
+        'icon_name': 'VCF-VSPHERE-9.webp',
+        'group_bindings': ['prod-admins', 'prod-readonly'],
+    })
+
+    # Additional vCenters
+    for vc in topo.vcenters:
+        if vc['fqdn'] == primary_mgmt['fqdn']:
+            continue
+        short_name = vc['fqdn'].split('.')[0]
+        label = f"vCenter ({vc['role']} {vc['site']})"
+        bindings = ['prod-admins', 'prod-readonly'] if vc['role'] == 'mgmt' else ['dev-admins', 'dev-readonly']
+        topo.app_tiles.append({
+            'name': label,
+            'slug': f"vc-{short_name}",
+            'meta_launch_url': f"https://{vc['fqdn']}/ui/",
+            'meta_description': f"Launch vCenter Server ({vc['fqdn']})",
+            'group': 'VCF',
+            'meta_publisher': 'VMware',
+            'icon_name': 'VCF-VSPHERE-9.webp',
+            'group_bindings': bindings,
+        })
+
+    # NSX Managers
+    for nsx in topo.nsx_managers:
+        short_name = nsx['fqdn'].split('.')[0]
+        label = f"NSX ({nsx['role']} {nsx['site']})" if len(topo.nsx_managers) > 1 else 'NSX (mgmt)'
+        bindings = ['prod-admins', 'prod-readonly'] if nsx['role'] == 'mgmt' else ['dev-admins', 'dev-readonly']
+        topo.app_tiles.append({
+            'name': label,
+            'slug': f"nsx-{short_name}",
+            'meta_launch_url': f"https://{nsx['fqdn']}/login.jsp",
+            'meta_description': f"Launch NSX Manager ({nsx['fqdn']})",
+            'group': 'VCF',
+            'meta_publisher': 'VMware',
+            'icon_name': 'NSX-9.webp',
+            'group_bindings': bindings,
+        })
+
+    # Ops instances
+    for ops in topo.ops_instances:
+        short_name = ops['fqdn'].split('.')[0]
+        label = 'VCF Operations' if len(topo.ops_instances) == 1 else f"VCF Operations ({ops['site']})"
+        topo.app_tiles.append({
+            'name': label,
+            'slug': 'ops' if ops['site'] == 'site-a' else f"ops-{ops['site']}",
+            'meta_launch_url': f"https://{ops['fqdn']}/ui/login.action?vcf=1",
+            'meta_description': f"Launch VCF Operations ({ops['fqdn']})",
+            'group': 'VCF',
+            'meta_publisher': 'VMware',
+            'icon_name': 'VCF-Ops-9.webp',
+            'group_bindings': ['prod-admins', 'prod-readonly'],
+        })
+
+    # VCFA instances
+    for auto in topo.auto_instances:
+        short_name = auto['fqdn'].split('.')[0]
+        label = 'VCF Automation (Provider)' if len(topo.auto_instances) == 1 else f"VCF Automation ({auto['site']})"
+        topo.app_tiles.append({
+            'name': label,
+            'slug': 'auto' if auto['site'] == 'site-a' else f"auto-{auto['site']}",
+            'meta_launch_url': f"https://{auto['fqdn']}/login/?service=provider",
+            'meta_description': f"Launch VCF Automation ({auto['fqdn']})",
+            'group': 'VCF',
+            'meta_publisher': 'VMware',
+            'icon_name': 'VCF-Auto-9.png',
+            'group_bindings': ['prod-admins'],
+        })
+
+    return topo
+
+
+def _discover_mgmt_vc(cfg: configparser.ConfigParser) -> Tuple[str, str]:
+    """Return (fqdn, sso_user) for management vCenter (backward compatibility wrapper)."""
+    topo = discover_vcf_topology(cfg)
+    primary = next((v for v in topo.vcenters if v['role'] == 'mgmt'), topo.vcenters[0])
+    return primary['fqdn'], primary['user']
+
+
+def _discover_ops_fqdn(cfg: configparser.ConfigParser) -> str:
+    """Return primary Ops FQDN (backward compatibility wrapper)."""
+    topo = discover_vcf_topology(cfg)
+    return topo.ops_fqdn
 
 
 def _ops_token(ops_base: str, password: str, verify_tls: bool) -> str:
@@ -239,6 +481,72 @@ def ensure_authentik_storage_patch(creds_path: str, write: Callable[[str], None]
     )
     subprocess.run(wait_cmd, shell=True, capture_output=True, text=True, timeout=300)
     _log(write, '  Authentik storage patch applied and deployments restarted.')
+    return True
+
+
+def configure_holorouter_ldap_routing(creds_path: str, write: Callable[[str], None], dry_run: bool) -> bool:
+    """
+    Ensure the LDAP Outpost Kubernetes service on Holorouter is set to NodePort (ports 30389, 30636)
+    and set up iptables NAT REDIRECT rules on Holorouter for standard ports 389 and 636.
+    """
+    _log(write, 'Authentik integration: Configuring Holorouter LDAP Service & Port Routing (389 / 636)')
+    if dry_run:
+        _log(write, '  DRY-RUN: would patch LDAP Outpost k8s service to NodePort and configure iptables rules on holorouter.')
+        return True
+
+    get_svc_cmd = (
+        f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
+        f'{ROUTER_SSH} "kubectl get svc -n default -o jsonpath=\'{{range .items[*]}}{{.metadata.name}}{{\\"\\n\\"}}{{end}}\'"'
+    )
+    r = subprocess.run(get_svc_cmd, shell=True, capture_output=True, text=True, timeout=30)
+    svc_name = None
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if 'ak-outpost-' in line and 'ldap' in line:
+            svc_name = line
+            break
+
+    if not svc_name:
+        _log(write, '  WARNING: Could not find ak-outpost-*ldap* Kubernetes service on router. Using fallback name.')
+        svc_name = 'ak-outpost-authentik-ldap-outpost'
+
+    patch_payload = json.dumps({
+        'spec': {
+            'type': 'NodePort',
+            'ports': [
+                {'name': 'ldap', 'port': 389, 'nodePort': 30389},
+                {'name': 'ldaps', 'port': 636, 'nodePort': 30636},
+                {'name': 'metrics', 'port': 9300, 'nodePort': 30930},
+            ]
+        }
+    })
+
+    patch_cmd = (
+        f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
+        f'{ROUTER_SSH} "kubectl patch svc {svc_name} -n default -p \'{patch_payload}\'"'
+    )
+    r_patch = subprocess.run(patch_cmd, shell=True, capture_output=True, text=True, timeout=30)
+    if r_patch.returncode == 0:
+        _log(write, f'  Patched Kubernetes service {svc_name} to NodePort (30389 / 30636).')
+    else:
+        _log(write, f'  WARNING: Failed to patch service {svc_name}: {r_patch.stderr[:300]}')
+
+    iptables_script = (
+        "iptables -t nat -C PREROUTING -p tcp --dport 389 -j REDIRECT --to-ports 30389 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 389 -j REDIRECT --to-ports 30389; "
+        "iptables -t nat -C OUTPUT -p tcp --dport 389 -j REDIRECT --to-ports 30389 2>/dev/null || iptables -t nat -A OUTPUT -p tcp --dport 389 -j REDIRECT --to-ports 30389; "
+        "iptables -t nat -C PREROUTING -p tcp --dport 636 -j REDIRECT --to-ports 30636 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 636 -j REDIRECT --to-ports 30636; "
+        "iptables -t nat -C OUTPUT -p tcp --dport 636 -j REDIRECT --to-ports 30636 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 636 -j REDIRECT --to-ports 30636"
+    )
+    iptables_cmd = (
+        f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
+        f'{ROUTER_SSH} "{iptables_script}"'
+    )
+    r_ipt = subprocess.run(iptables_cmd, shell=True, capture_output=True, text=True, timeout=30)
+    if r_ipt.returncode == 0:
+        _log(write, '  Holorouter iptables NAT rules configured for LDAP ports 389 -> 30389 and 636 -> 30636.')
+    else:
+        _log(write, f'  WARNING: Failed to configure iptables NAT rules: {r_ipt.stderr[:300]}')
+
     return True
 
 
@@ -839,18 +1147,53 @@ class AuthentikApi:
                 _log(self.write, f'  WARNING: error looking up group {name!r}: {e}')
         return pks
 
+    def ensure_oauth2_redirect_uris(
+        self,
+        provider_pk: Any,
+        redirect_urls: List[str],
+        dry_run: bool,
+    ) -> bool:
+        """Ensure the OAuth2 provider has all required redirect URIs. Additive & idempotent."""
+        if dry_run or not redirect_urls or not self._sess:
+            return True
+        try:
+            detail = self._oauth2_provider_detail(provider_pk)
+        except Exception as e:
+            _log(self.write, f'  WARNING: could not read OAuth2 provider pk={provider_pk} for redirect_uris check: {e}')
+            return False
+        current_uris = detail.get('redirect_uris') or []
+        existing_urls = {u.get('url') if isinstance(u, dict) else str(u) for u in current_uris}
+        missing_urls = [u for u in redirect_urls if u not in existing_urls]
+        if not missing_urls:
+            _log(self.write, f'  Authentik OAuth2: all {len(redirect_urls)} redirect URI(s) present on provider pk={provider_pk}.')
+            return True
+
+        merged_uris = list(current_uris)
+        for u in missing_urls:
+            merged_uris.append({'url': u, 'matching_mode': 'strict'})
+
+        code, body = self.patch_json(f'providers/oauth2/{int(provider_pk)}/', {'redirect_uris': merged_uris})
+        if code in (200, 201):
+            _log(self.write, f'  Authentik OAuth2: added {len(missing_urls)} missing redirect URI(s) to provider pk={provider_pk}.')
+            return True
+        _log(self.write, f'  WARNING: OAuth2 redirect_uris PATCH HTTP {code}: {_redact(body)!s}')
+        return False
+
     def ensure_oauth_application(
         self,
         app_name: str,
         app_slug: str,
-        redirect_url: str,
+        redirect_url: Any,  # Union[str, List[str]]
         oauth_name: str,
         signing_key_pk: str,
         auth_flow_slug: str,
         invalidation_flow_slug: str,
         dry_run: bool,
     ) -> Tuple[Optional[int], Optional[str], Optional[str]]:
-        """Return (provider_pk, client_id, client_secret)."""
+        """Return (provider_pk, client_id, client_secret). Supports single or multiple redirect URIs."""
+        redirect_urls = [redirect_url] if isinstance(redirect_url, str) else list(redirect_url)
+        primary_redirect = redirect_urls[0] if redirect_urls else ''
+
         flows = self.get_json('flows/instances/?slug=' + auth_flow_slug)
         results = flows.get('results') or []
         if not results:
@@ -870,13 +1213,16 @@ class AuthentikApi:
                 cid = prov_obj.get('client_id')
                 csec = prov_obj.get('client_secret')
                 _log(self.write, f'  Reusing Authentik application {app_slug!r} provider pk={prov}')
+                self.ensure_oauth2_redirect_uris(prov, redirect_urls, dry_run)
                 return int(prov), str(cid), str(csec or '')
             # Matching app row without provider — try to attach an existing OAuth2 provider by name.
             for p in self.paginate_list('providers/oauth2'):
                 if p.get('name') == oauth_name:
-                    return self._reuse_oauth2_provider_and_ensure_app(
+                    res = self._reuse_oauth2_provider_and_ensure_app(
                         p['pk'], app_name, app_slug, dry_run,
                     )
+                    self.ensure_oauth2_redirect_uris(p['pk'], redirect_urls, dry_run)
+                    return res
         except Exception:
             pass
 
@@ -889,13 +1235,16 @@ class AuthentikApi:
                     cid = prov_obj.get('client_id')
                     csec = prov_obj.get('client_secret')
                     _log(self.write, f'  Reusing Authentik application {app_slug!r} provider pk={prov}')
+                    self.ensure_oauth2_redirect_uris(prov, redirect_urls, dry_run)
                     return int(prov), str(cid), str(csec or '')
                 # Matching app row without provider — try to attach an existing OAuth2 provider by name.
                 for p in self.paginate_list('providers/oauth2'):
                     if p.get('name') == oauth_name:
-                        return self._reuse_oauth2_provider_and_ensure_app(
+                        res = self._reuse_oauth2_provider_and_ensure_app(
                             p['pk'], app_name, app_slug, dry_run,
                         )
+                        self.ensure_oauth2_redirect_uris(p['pk'], redirect_urls, dry_run)
+                        return res
                 break
 
         for p in self.paginate_list('providers/oauth2'):
@@ -904,14 +1253,17 @@ class AuthentikApi:
                     self.write,
                     f'  Reusing existing OAuth2 provider name={oauth_name!r} pk={p.get("pk")} (no matching application yet)',
                 )
-                return self._reuse_oauth2_provider_and_ensure_app(p['pk'], app_name, app_slug, dry_run)
+                res = self._reuse_oauth2_provider_and_ensure_app(p['pk'], app_name, app_slug, dry_run)
+                self.ensure_oauth2_redirect_uris(p['pk'], redirect_urls, dry_run)
+                return res
 
+        redirect_objs = [{'url': u, 'matching_mode': 'strict'} for u in redirect_urls]
         body = {
             'name': oauth_name,
             'authorization_flow': auth_flow,
             'invalidation_flow': inv_flow,
             'client_type': 'confidential',
-            'redirect_uris': [{'url': redirect_url, 'matching_mode': 'strict'}],
+            'redirect_uris': redirect_objs,
             'signing_key': signing_key_pk,
             'sub_mode': 'hashed_user_id',
             'include_claims_in_id_token': True,
@@ -945,7 +1297,9 @@ class AuthentikApi:
                 for p in self.paginate_list('providers/oauth2'):
                     if p.get('name') == oauth_name:
                         _log(self.write, f'  OAuth2 provider {oauth_name!r} already exists — reusing pk={p.get("pk")}')
-                        return self._reuse_oauth2_provider_and_ensure_app(p['pk'], app_name, app_slug, dry_run)
+                        res = self._reuse_oauth2_provider_and_ensure_app(p['pk'], app_name, app_slug, dry_run)
+                        self.ensure_oauth2_redirect_uris(p['pk'], redirect_urls, dry_run)
+                        return res
         raise RuntimeError(f'OAuth2 provider create failed HTTP {code}: {data}')
 
     def ensure_application_group_bindings(self, app_slug: str, group_names: List[str], dry_run: bool) -> bool:
@@ -1242,6 +1596,120 @@ class AuthentikApi:
         _log(self.write, f'  Authentik user {username!r} created (pk={data.get("pk")}).')
         return True
 
+    def ensure_ldap_provider(
+        self,
+        name: str,
+        base_dn: str,
+        auth_flow_slug: str,
+        invalidation_flow_slug: str,
+        dry_run: bool,
+    ) -> Optional[int]:
+        """Create or reuse an Authentik LDAP Provider. Returns provider pk."""
+        if dry_run:
+            _log(self.write, f'  DRY-RUN would ensure LDAP Provider {name!r} base_dn={base_dn!r}')
+            return None
+
+        try:
+            for p in self.paginate_list('providers/ldap'):
+                if p.get('name') == name or p.get('base_dn') == base_dn:
+                    _log(self.write, f'  Reusing Authentik LDAP provider name={p.get("name")!r} pk={p.get("pk")}')
+                    return p['pk']
+        except Exception as e:
+            _log(self.write, f'  WARNING: error fetching LDAP providers: {e}')
+
+        flows = self.get_json('flows/instances/?slug=' + auth_flow_slug)
+        auth_flow = (flows.get('results') or [{}])[0].get('pk')
+        inv = self.get_json('flows/instances/?slug=' + invalidation_flow_slug)
+        inv_flow = (inv.get('results') or [{}])[0].get('pk')
+
+        if not auth_flow or not inv_flow:
+            _log(self.write, '  ERROR: Could not resolve authorization or invalidation flow for LDAP Provider')
+            return None
+
+        body = {
+            'name': name,
+            'base_dn': base_dn,
+            'authorization_flow': auth_flow,
+            'invalidation_flow': inv_flow,
+            'search_mode': 'direct',
+            'bind_mode': 'direct',
+            'tls_server_name': 'auth.vcf.lab',
+            'uid_start_number': 2000,
+            'gid_start_number': 4000,
+            'mfa_support': False,
+        }
+        code, data = self.post_json('providers/ldap/', body)
+        if code in (200, 201):
+            pk = data['pk']
+            _log(self.write, f'  Created LDAP Provider pk={pk} name={name!r}')
+            return pk
+        _log(self.write, f'  WARNING: Failed to create LDAP Provider HTTP {code}: {data}')
+        return None
+
+    def ensure_ldap_outpost(
+        self,
+        name: str,
+        ldap_provider_pk: int,
+        dry_run: bool,
+    ) -> Optional[str]:
+        """Create or update Authentik LDAP Outpost linking to LDAP Provider. Returns outpost pk (UUID)."""
+        if dry_run:
+            _log(self.write, f'  DRY-RUN would ensure LDAP Outpost {name!r} provider={ldap_provider_pk}')
+            return None
+
+        svc_conn_uuid = None
+        try:
+            conns = self.get_json('outposts/service_connections/all/')
+            for c in conns.get('results') or []:
+                if c.get('local') or 'kubernetes' in c.get('meta_model_name', '').lower():
+                    svc_conn_uuid = c.get('pk')
+                    break
+        except Exception as e:
+            _log(self.write, f'  WARNING: could not resolve K8s service connection for Outpost: {e}')
+
+        existing_outpost = None
+        for o in self.paginate_list('outposts/instances'):
+            if o.get('type') == 'ldap' or name.lower() in (o.get('name') or '').lower():
+                existing_outpost = o
+                break
+
+        if existing_outpost:
+            opk = existing_outpost['pk']
+            providers = [int(p) for p in (existing_outpost.get('providers') or [])]
+            if ldap_provider_pk not in providers:
+                providers.append(ldap_provider_pk)
+                code, body = self.patch_json(f'outposts/instances/{opk}/', {'providers': providers})
+                if code in (200, 201):
+                    _log(self.write, f'  Updated LDAP Outpost pk={opk} with provider pk={ldap_provider_pk}.')
+                else:
+                    _log(self.write, f'  WARNING: Failed to patch LDAP Outpost HTTP {code}: {body}')
+            else:
+                _log(self.write, f'  Reusing LDAP Outpost pk={opk} name={existing_outpost.get("name")!r}')
+            return opk
+
+        body = {
+            'name': name,
+            'type': 'ldap',
+            'providers': [ldap_provider_pk],
+            'service_connection': svc_conn_uuid,
+            'config': {
+                'authentik_host': 'https://auth.vcf.lab',
+                'authentik_host_insecure': True,
+                'authentik_host_browser': 'https://auth.vcf.lab',
+                'kubernetes_namespace': 'default',
+                'kubernetes_service_type': 'NodePort',
+                'log_level': 'info',
+                'object_naming_template': 'ak-outpost-%(name)s',
+            },
+        }
+        code, data = self.post_json('outposts/instances/', body)
+        if code in (200, 201):
+            opk = data['pk']
+            _log(self.write, f'  Created LDAP Outpost pk={opk} name={name!r}')
+            return opk
+        _log(self.write, f'  WARNING: Failed to create LDAP Outpost HTTP {code}: {data}')
+        return None
+
 
 def force_vcf_scim_group_memberships(
     ak: AuthentikApi,
@@ -1257,7 +1725,7 @@ def force_vcf_scim_group_memberships(
     to add members to that group. This function forces the group memberships.
     """
     import requests
-    _log(write, '  Enforcing SCIM group memberships directly on VCF due to Authentik patch bug...')
+    _log(write, f'  Enforcing SCIM group memberships directly on VCF ({scim_url}) due to Authentik patch bug...')
     
     headers = {'Authorization': f'Bearer {scim_tok}', 'Accept': 'application/scim+json'}
     try:
@@ -1268,6 +1736,7 @@ def force_vcf_scim_group_memberships(
         return
         
     vc_group_by_ext_id = {str(g.get('externalId')): str(g.get('id')) for g in vc_groups if g.get('externalId')}
+    vc_group_by_name = {(g.get('displayName') or '').lower(): str(g.get('id')) for g in vc_groups if g.get('displayName')}
     vc_group_names = {str(g.get('id')): g.get('displayName') for g in vc_groups}
     
     try:
@@ -1280,6 +1749,9 @@ def force_vcf_scim_group_memberships(
     vc_user_id_by_username = {(u.get('userName') or '').lower(): str(u.get('id')) for u in vc_users}
     
     ak_users = ak.paginate_list('core/users')
+    ak_groups = ak.paginate_list('core/groups')
+    ak_group_name_by_pk = {str(g.get('pk')): (g.get('name') or '').lower() for g in ak_groups if g.get('pk')}
+
     members_to_add_by_vc_group = {}
     
     for u in ak_users:
@@ -1294,8 +1766,11 @@ def force_vcf_scim_group_memberships(
         ak_group_pks = u.get('groups', [])
         for g_pk in ak_group_pks:
             vc_group_id = vc_group_by_ext_id.get(str(g_pk))
+            if not vc_group_id:
+                gname = ak_group_name_by_pk.get(str(g_pk))
+                if gname:
+                    vc_group_id = vc_group_by_name.get(gname)
             if vc_group_id:
-                # Deduplicate just in case
                 if vc_user_id not in members_to_add_by_vc_group.get(vc_group_id, []):
                     members_to_add_by_vc_group.setdefault(vc_group_id, []).append(vc_user_id)
                 
@@ -1330,7 +1805,7 @@ def force_vcf_scim_group_memberships(
             gname = vc_group_names.get(vc_group_id, vc_group_id)
             _log(write, f'  WARNING: Failed to patch memberships for group {gname}: {e}')
             
-    _log(write, f'  Enforced memberships for {success_count} VCF SCIM groups.')
+    _log(write, f'  Enforced memberships for {success_count} VCF SCIM groups on {scim_url}.')
 
 
 OPS_LOGIN = '/ui/login.action'
@@ -1583,26 +2058,73 @@ def run_authentik_vcf_integration(
     creds_path = os.environ.get('HOL_CREDS_PATH', CREDS_DEFAULT)
     password = lsf.get_password() if (lsf and hasattr(lsf, 'get_password')) else _read_password(creds_path)
 
-    # ── Environment discovery ────────────────────────────────────────────────
-    mgmt_vc, _vc_user = _discover_mgmt_vc(cfg)
-    ops_fqdn = _discover_ops_fqdn(cfg)
+    # ── Environment & Multi-Site Topology Discovery ──────────────────────────
+    topo = discover_vcf_topology(cfg)
+    mgmt_vc = topo.mgmt_vc_fqdn
+    ops_fqdn = topo.ops_fqdn
     vc_base = f'https://{mgmt_vc}'
     ops_base = f'https://{ops_fqdn}'
     verify_tls = False
 
     issuer_base = 'https://auth.vcf.lab'
+    if cfg.has_section('AUTHENTIK') and cfg.has_option('AUTHENTIK', 'authentik_base_url'):
+        issuer_base = cfg.get('AUTHENTIK', 'authentik_base_url').strip()
+
     app_slug = 'vcf'
     app_name = 'vCenter (mgmt)'
     tenant = 'CUSTOMER'
     scim_domain = 'vcf.lab'
 
-    redirect_url = f'{vc_base}/federation/t/{tenant}/auth/response/oauth2'
+    redirect_urls = topo.redirect_urls if topo.redirect_urls else [f'{vc_base}/federation/t/{tenant}/auth/response/oauth2']
     discovery_url = f'{issuer_base}/application/o/{app_slug}/.well-known/openid-configuration'
     scim_url = f'{vc_base}/usergroup/scim/v2'
     issuer_host = urlparse(issuer_base).hostname or 'auth.vcf.lab'
 
+    # ── Config Toggles Discovery ─────────────────────────────────────────────
+    sso_site_a = cfg.getboolean('VCFFINAL', 'authentik_sso_site_a', fallback=True)
+    sso_site_b = cfg.getboolean('VCFFINAL', 'authentik_sso_site_b', fallback=True)
+
+    join_mgmt_vc = cfg.getboolean('VCFFINAL', 'authentik_join_mgmt_vc', fallback=True)
+    join_wld_vc = cfg.getboolean('VCFFINAL', 'authentik_join_wld_vc', fallback=True)
+    join_nsx = cfg.getboolean('VCFFINAL', 'authentik_join_nsx', fallback=True)
+    join_nsx_mgmt = cfg.getboolean('VCFFINAL', 'authentik_join_nsx_mgmt', fallback=join_nsx)
+    join_nsx_wld = cfg.getboolean('VCFFINAL', 'authentik_join_nsx_wld', fallback=join_nsx)
+    join_ops = cfg.getboolean('VCFFINAL', 'authentik_join_ops', fallback=True)
+    join_auto = cfg.getboolean('VCFFINAL', 'authentik_join_auto', fallback=True)
+
+    step_prereqs = cfg.getboolean('VCFFINAL', 'authentik_step_prereqs', fallback=True)
+    step_oauth = cfg.getboolean('VCFFINAL', 'authentik_step_oauth', fallback=True)
+    step_users_groups = cfg.getboolean('VCFFINAL', 'authentik_step_users_groups', fallback=True)
+    step_fleet_idp = cfg.getboolean('VCFFINAL', 'authentik_step_fleet_idp', fallback=True)
+    step_scim = cfg.getboolean('VCFFINAL', 'authentik_step_scim', fallback=True)
+    step_roles = cfg.getboolean('VCFFINAL', 'authentik_step_roles', fallback=True)
+    step_join_sso = cfg.getboolean('VCFFINAL', 'authentik_step_join_sso', fallback=True)
+
+    ldap_enabled = False
+    if cfg.has_section('AUTHENTIK') and cfg.has_option('AUTHENTIK', 'authentik_ldap_enabled'):
+        ldap_enabled = cfg.getboolean('AUTHENTIK', 'authentik_ldap_enabled')
+    elif cfg.has_section('VCFFINAL') and cfg.has_option('VCFFINAL', 'authentik_ldap_enabled'):
+        ldap_enabled = cfg.getboolean('VCFFINAL', 'authentik_ldap_enabled')
+
+    ldap_base_dn = 'dc=vcf,dc=lab'
+    if cfg.has_section('AUTHENTIK') and cfg.has_option('AUTHENTIK', 'authentik_ldap_base_dn'):
+        ldap_base_dn = cfg.get('AUTHENTIK', 'authentik_ldap_base_dn').strip()
+
+    ldap_provider_name = 'VCF LDAP'
+    if cfg.has_section('AUTHENTIK') and cfg.has_option('AUTHENTIK', 'authentik_ldap_provider_name'):
+        ldap_provider_name = cfg.get('AUTHENTIK', 'authentik_ldap_provider_name').strip()
+
+    ldap_outpost_name = 'authentik LDAP Outpost'
+    if cfg.has_section('AUTHENTIK') and cfg.has_option('AUTHENTIK', 'authentik_ldap_outpost_name'):
+        ldap_outpost_name = cfg.get('AUTHENTIK', 'authentik_ldap_outpost_name').strip()
+
+    ldap_router_proxy = True
+    if cfg.has_section('AUTHENTIK') and cfg.has_option('AUTHENTIK', 'authentik_ldap_router_proxy'):
+        ldap_router_proxy = cfg.getboolean('AUTHENTIK', 'authentik_ldap_router_proxy')
+
     # ── Authentik API token + signing key (auto-discovered) ──────────────────
     ak_token = os.environ.get('AUTHENTIK_API_TOKEN', 'holodeck')
+    signing_key = ''
     if requests:
         try:
             kr = requests.get(
@@ -1648,6 +2170,8 @@ def run_authentik_vcf_integration(
     lab_user_emails: List[str] = ['prod-admin@vcf.lab', 'dev-admin@vcf.lab']
 
     _log(write, '=== Authentik + VCF integration ===')
+    _log(write, f'Discovered topology: {len(topo.vcenters)} vCenter(s), {len(topo.nsx_managers)} NSX Manager(s), {len(topo.ops_instances)} Ops, {len(topo.auto_instances)} VCFA')
+    _log(write, f'Redirect URIs ({len(redirect_urls)}): {", ".join(redirect_urls)}')
     ok = True
 
     # ── Step 1: CoreDNS forwarder patch on holorouter ────────────────────────
@@ -1658,237 +2182,211 @@ def run_authentik_vcf_integration(
         ok = False
 
     # ── Step 2: VCF SSO UI Prerequisites ─────────────────────────────────────
-    # Run UI Prerequisites via Playwright if available
-    submit_sso_prerequisites_ui(ops_fqdn, password, write, dry_run)
-
-    # Note: Vault CA trust check is currently bypassed.
-    # ensure_ops_vault_ca_trust(ops_fqdn, creds_path, write, dry_run)
+    if step_prereqs:
+        submit_sso_prerequisites_ui(ops_fqdn, password, write, dry_run)
+    else:
+        _log(write, '  Authentik integration: Step 2 — VCF SSO UI Prerequisites skipped (step_prereqs disabled).')
 
     if requests is None:
         _log(write, 'ERROR: Python requests module missing — install requests.')
         return False
 
-    # ── Step 3-4: Authentik OAuth2 provider + application + OIDC scopes ──────
     ak = AuthentikApi(f'{issuer_base}/api/v3', ak_token, write, verify_tls=verify_tls)
-    
-    icon_path = os.path.join(_tools_dir, 'holorouter', 'VCF-VSPHERE-9.webp')
-    icon_name = 'VCF-VSPHERE-9.webp'
-    if not dry_run and os.path.isfile(icon_path):
-        _log(write, f'  Uploading icon {icon_name} to Authentik...')
-        code, data = ak.upload_file(icon_path, icon_name, 'image/webp')
-        if code in (200, 201):
-            _log(write, f'  Icon {icon_name} uploaded successfully.')
-        elif code == 400 and isinstance(data, dict) and 'already' in json.dumps(data).lower():
-            _log(write, f'  Icon {icon_name} already exists.')
-        else:
-            _log(write, f'  WARNING: Icon upload failed HTTP {code}: {data}')
-            
-    try:
-        prov_pk, client_id, client_secret = ak.ensure_oauth_application(
-            app_name=app_name,
-            app_slug=app_slug,
-            redirect_url=redirect_url,
-            oauth_name=oauth_provider_name,
-            signing_key_pk=signing_key,
-            auth_flow_slug='default-provider-authorization-explicit-consent',
+
+    # ── Optional LDAP Provider & Outpost Setup ────────────────────────────────
+    if ldap_enabled:
+        _log(write, 'Authentik integration: Step LDAP — Authentik LDAP Provider & Outpost Setup')
+        ldap_prov_pk = ak.ensure_ldap_provider(
+            name=ldap_provider_name,
+            base_dn=ldap_base_dn,
+            auth_flow_slug='default-provider-authorization-implicit-consent',
             invalidation_flow_slug='default-provider-invalidation-flow',
             dry_run=dry_run,
         )
-    except Exception as e:
-        _log(write, f'Authentik OAuth/Application FAILED: {e}')
-        return False
+        if ldap_prov_pk is not None:
+            ak.ensure_ldap_outpost(
+                name=ldap_outpost_name,
+                ldap_provider_pk=ldap_prov_pk,
+                dry_run=dry_run,
+            )
+        if ldap_router_proxy:
+            configure_holorouter_ldap_routing(creds_path, write, dry_run)
 
-    if prov_pk is not None and not dry_run:
-        app_patch = {
-            'name': app_name,
-            'slug': 'vcf',
-            'meta_launch_url': f'https://{mgmt_vc}/ui/',
-            'meta_description': 'Launch Management vCenter',
-            'meta_publisher': 'VMware',
-            'group': 'VCF',
-            'open_in_new_tab': True
-        }
-        if os.path.isfile(icon_path):
-            app_patch['meta_icon'] = icon_name
+    # ── Step 3-4: Authentik OAuth2 provider + application + OIDC scopes ──────
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    prov_pk: Optional[int] = None
 
-        code, data = ak.patch_json(f'core/applications/{app_slug}/', app_patch)
-        if code in (200, 201):
-            _log(write, f'  Updated application {app_slug!r} metadata (name, icon, description, etc.).')
-        else:
-            _log(write, f'  WARNING: Failed to update application metadata HTTP {code}: {data}')
-            
-        ak.ensure_application_group_bindings(app_slug, ['prod-admins', 'prod-readonly'], dry_run)
+    if step_oauth:
+        try:
+            prov_pk, client_id, client_secret = ak.ensure_oauth_application(
+                app_name=app_name,
+                app_slug=app_slug,
+                redirect_url=redirect_urls,
+                oauth_name=oauth_provider_name,
+                signing_key_pk=signing_key,
+                auth_flow_slug='default-provider-authorization-explicit-consent',
+                invalidation_flow_slug='default-provider-invalidation-flow',
+                dry_run=dry_run,
+            )
+        except Exception as e:
+            _log(write, f'Authentik OAuth/Application FAILED: {e}')
+            return False
 
-        # Add additional UI applications
-        extra_apps = [
-            {
-                'name': 'VCF Automation (Provider)',
-                'slug': 'auto',
-                'meta_launch_url': 'https://auto-a.site-a.vcf.lab/login/?service=provider',
-                'meta_description': 'Launch VCF Automation (Provider)',
-                'group': 'VCF',
-                'meta_publisher': 'VMware',
-                'icon_name': 'VCF-Auto-9.png',
-                'group_bindings': ['prod-admins']
-            },
-            {
-                'name': 'NSX (mgmt)',
-                'slug': 'nsx-mgmt',
-                'meta_launch_url': 'https://nsx-mgmt-a.site-a.vcf.lab/login.jsp',
-                'meta_description': 'Launch Management NSX Manager',
-                'group': 'VCF',
-                'meta_publisher': 'VMware',
-                'icon_name': 'NSX-9.webp',
-                'group_bindings': ['prod-admins', 'prod-readonly']
-            },
-            {
-                'name': 'VCF Operations',
-                'slug': 'ops',
-                'meta_launch_url': 'https://ops-a.site-a.vcf.lab/ui/login.action?vcf=1',
-                'meta_description': 'Launch VCF Operations',
-                'group': 'VCF',
-                'meta_publisher': 'VMware',
-                'icon_name': 'VCF-Ops-9.webp',
-                'group_bindings': ['prod-admins', 'prod-readonly']
-            }
-        ]
+        if prov_pk is not None and not dry_run:
+            # Upload icons and create/update portal launch tiles for ALL discovered components
+            for tile in topo.app_tiles:
+                tile_icon_name = tile.get('icon_name', '')
+                tile_icon_path = os.path.join(_tools_dir, 'holorouter', tile_icon_name)
+                if os.path.isfile(tile_icon_path):
+                    mime = 'image/webp' if tile_icon_name.endswith('.webp') else 'image/png'
+                    c_up, d_up = ak.upload_file(tile_icon_path, tile_icon_name, mime)
+                    if c_up in (200, 201):
+                        _log(write, f'  Icon {tile_icon_name} uploaded successfully.')
 
-        for ea in extra_apps:
-            ea_icon_path = os.path.join(_tools_dir, 'holorouter', ea['icon_name'])
-            if os.path.isfile(ea_icon_path):
-                mime = 'image/webp' if ea['icon_name'].endswith('.webp') else 'image/png'
-                c, d = ak.upload_file(ea_icon_path, ea['icon_name'], mime)
-                if c in (200, 201):
-                    _log(write, f"  Icon {ea['icon_name']} uploaded successfully.")
-                elif c == 400 and isinstance(d, dict) and 'already' in json.dumps(d).lower():
-                    pass
+                patch_body = {
+                    'name': tile['name'],
+                    'meta_launch_url': tile['meta_launch_url'],
+                    'meta_description': tile['meta_description'],
+                    'meta_publisher': tile.get('meta_publisher', 'VMware'),
+                    'group': tile.get('group', 'VCF'),
+                    'open_in_new_tab': True,
+                }
+                if os.path.isfile(tile_icon_path):
+                    patch_body['meta_icon'] = tile_icon_name
+
+                c_app, d_app = ak.patch_json(f"core/applications/{tile['slug']}/", patch_body)
+                if c_app in (200, 201):
+                    _log(write, f"  Updated application {tile['slug']!r} metadata.")
+                elif c_app == 404:
+                    create_body = patch_body.copy()
+                    create_body['slug'] = tile['slug']
+                    c_c, d_c = ak.post_json('core/applications/', create_body)
+                    if c_c in (200, 201):
+                        _log(write, f"  Created application {tile['slug']!r}.")
+                    else:
+                        _log(write, f"  WARNING: Failed to create application {tile['slug']} HTTP {c_c}: {d_c}")
                 else:
-                    _log(write, f"  WARNING: Icon upload failed for {ea['icon_name']} HTTP {c}: {d}")
+                    _log(write, f"  WARNING: Failed to update application {tile['slug']} HTTP {c_app}: {d_app}")
 
-            ea_patch = {
-                'name': ea['name'],
-                'meta_launch_url': ea['meta_launch_url'],
-                'meta_description': ea['meta_description'],
-                'meta_publisher': ea['meta_publisher'],
-                'group': ea['group'],
-                'open_in_new_tab': True
-            }
-            if os.path.isfile(ea_icon_path):
-                ea_patch['meta_icon'] = ea['icon_name']
+                if 'group_bindings' in tile:
+                    ak.ensure_application_group_bindings(tile['slug'], tile['group_bindings'], dry_run)
 
-            c, d = ak.patch_json(f"core/applications/{ea['slug']}/", ea_patch)
-            if c in (200, 201):
-                _log(write, f"  Updated application {ea['slug']!r}.")
-            elif c == 404:
-                ea_create = ea_patch.copy()
-                ea_create['slug'] = ea['slug']
-                c2, d2 = ak.post_json('core/applications/', ea_create)
-                if c2 in (200, 201):
-                    _log(write, f"  Created application {ea['slug']!r}.")
-                else:
-                    _log(write, f"  WARNING: Failed to create application {ea['slug']} HTTP {c2}: {d2}")
-            else:
-                _log(write, f"  WARNING: Failed to update application {ea['slug']} HTTP {c}: {d}")
-                
-            if 'group_bindings' in ea:
-                ak.ensure_application_group_bindings(ea['slug'], ea['group_bindings'], dry_run)
-                
-        ak.align_oauth2_sub_mode_for_fleet_iam(prov_pk, cfg, dry_run)
-        if not ak.ensure_oauth2_provider_scopes(prov_pk, oauth_scope_names, dry_run):
-            ok = False
+            ak.align_oauth2_sub_mode_for_fleet_iam(prov_pk, cfg, dry_run)
+            if not ak.ensure_oauth2_provider_scopes(prov_pk, oauth_scope_names, dry_run):
+                ok = False
+    else:
+        _log(write, '  Authentik integration: Steps 3-4 — OAuth2 Application skipped (step_oauth disabled).')
 
-    if dry_run or not client_secret:
-        _log(write, 'Dry-run or reused provider without secret — skipping downstream steps.')
+    if dry_run:
+        _log(write, 'Dry-run — skipping downstream steps.')
         return ok
 
     # ── Step 5: Authentik groups + lab users ─────────────────────────────────
-    all_groups = list(dict.fromkeys(
-        scim_filter_groups + vcf_admin_groups + sddc_admin_groups + viewer_groups + sddc_viewer_groups
-    ))
-    group_pk_by_name: Dict[str, Any] = {}
-    for gname in all_groups:
-        gpk = ak.ensure_group(gname, dry_run)
-        if gpk is not None:
-            group_pk_by_name[gname] = gpk
+    if step_users_groups:
+        all_groups = list(dict.fromkeys(
+            scim_filter_groups + vcf_admin_groups + sddc_admin_groups + viewer_groups + sddc_viewer_groups
+        ))
+        group_pk_by_name: Dict[str, Any] = {}
+        for gname in all_groups:
+            gpk = ak.ensure_group(gname, dry_run)
+            if gpk is not None:
+                group_pk_by_name[gname] = gpk
 
-    for email in lab_user_emails:
-        local = email.split('@')[0].lower()
-        gname = 'prod-admins' if local.startswith('prod') else 'dev-admins'
-        gpk = group_pk_by_name.get(gname)
-        if not gpk:
-            _log(write, f'  WARNING: missing group pk for {gname!r} — skip user {email!r}')
-            ok = False
-            continue
-        if not ak.ensure_user_username(email, local.replace('-', ' ').title(), email, gpk, dry_run):
-            ok = False
+        for email in lab_user_emails:
+            local = email.split('@')[0].lower()
+            gname = 'prod-admins' if local.startswith('prod') else 'dev-admins'
+            gpk = group_pk_by_name.get(gname)
+            if not gpk:
+                _log(write, f'  WARNING: missing group pk for {gname!r} — skip user {email!r}')
+                ok = False
+                continue
+            if not ak.ensure_user_username(email, local.replace('-', ' ').title(), email, gpk, dry_run):
+                ok = False
+    else:
+        _log(write, '  Authentik integration: Step 5 — Users & Groups skipped (step_users_groups disabled).')
 
     # ── Steps 6-9: Fleet IAM SSO realm, IdP, SCIM, role assignment, Join SSO ─
-    _log(write, 'Fleet IAM: VCF Operations suite-api (SSO realm, OIDC+SCIM IdP, SCIM token).')
-    otok: Optional[str] = None
+    if step_fleet_idp and client_id and client_secret:
+        for ops_inst in topo.ops_instances:
+            site = ops_inst['site']
+            ops_host = ops_inst['fqdn']
+            if site == 'site-a' and not sso_site_a:
+                _log(write, f'  Fleet IAM: Site A Ops {ops_host} skipped (sso_site_a disabled).')
+                continue
+            if site == 'site-b' and not sso_site_b:
+                _log(write, f'  Fleet IAM: Site B Ops {ops_host} skipped (sso_site_b disabled).')
+                continue
 
-    try:
-        otok = _ops_token(ops_base, password, verify_tls)
-        fleet_ok, fleet_scim_tok, realm_id, vidb_rid = run_fleet_iam_vcf_sso(
-            ops_base, otok, mgmt_vc, issuer_host, discovery_url,
-            client_id, client_secret, scim_domain, idp_fleet_name,
-            directory_fleet_name, write, verify_tls, dry_run,
-        )
-        if not fleet_ok or not fleet_scim_tok or not realm_id or not vidb_rid:
-            ok = False
-        else:
-            scim_linked, scim_pk = ak.ensure_scim_backchannel(
-                app_slug, scim_url, fleet_scim_tok, scim_provider_name, dry_run,
-                filter_group_names=scim_filter_groups,
-                user_mapping_names=scim_user_mapping_names,
-                group_mapping_names=scim_group_mapping_names,
-            )
-            if not scim_linked:
-                ok = False
-            else:
-                def _sync() -> bool:
-                    if dry_run or scim_pk is None:
-                        return True
-                    ok_sync = ak.trigger_scim_provider_sync(scim_pk, filter_group_names=scim_filter_groups)
-                    force_vcf_scim_group_memberships(ak, scim_url, fleet_scim_tok, write, verify_tls)
-                    return ok_sync
+            site_mgmt_vc = next((vc['fqdn'] for vc in topo.vcenters if vc['site'] == site and vc['role'] == 'mgmt'), topo.mgmt_vc_fqdn)
+            site_scim_url = f'https://{site_mgmt_vc}/usergroup/scim/v2'
+            site_scim_name = f'VCF SCIM ({site})' if len(topo.ops_instances) > 1 else 'VCF SCIM'
 
-                if not fleet_iam_post_scim_assign_and_join(
-                    ops_base, otok, vidb_rid, realm_id, _sync, write, verify_tls,
-                    join_nsx=True,
-                    group_names=vcf_admin_groups,
-                    vcf_role='vcf_administrator',
-                    viewer_group_names=viewer_groups,
-                    vcf_viewer_role='vcf_viewer',
-                    sddc_admin_group_names=sddc_admin_groups,
-                    vcf_sddc_role='sddc_admin',
-                    sddc_viewer_group_names=sddc_viewer_groups,
-                    vcf_sddc_viewer_role='sddc_viewer',
-                ):
-                    ok = False
+            ops_target_base = f'https://{ops_host}'
+            _log(write, f'Fleet IAM: VCF Operations suite-api on {ops_host} (SSO realm, OIDC+SCIM IdP for {site_mgmt_vc}).')
+            otok: Optional[str] = None
 
-                # Automatically disable vCenter IDP selection prompt for seamless login
-                # Tested on 2026-05-11 but this didn't work. Even restarting all services on vCenter after config did not help.
-                # The Login Method drop-down remains visible.
-                # if not dry_run:
-                #     _log(write, '  Disabling IDP selection prompt on vCenter (sso-config.sh -set_idp_selection_flag false)...')
-                #     sso_cfg_cmd = (
-                #         f'sshpass -f {creds_path} ssh -o StrictHostKeyChecking=accept-new '
-                #         f'root@{mgmt_vc} "/opt/vmware/bin/sso-config.sh -set_idp_selection_flag -t vsphere.local false"'
-                #     )
-                #     r_sso = subprocess.run(sso_cfg_cmd, shell=True, capture_output=True, text=True, timeout=120)
-                #     if r_sso.returncode == 0:
-                #         _log(write, '  vCenter IDP selection prompt disabled successfully.')
-                #     else:
-                #         _log(write, f'  WARNING: Failed to disable IDP selection prompt: {r_sso.stderr[:200]}')
-    except Exception as e:
-        _log(write, f'Fleet IAM / SCIM / Join SSO FAILED: {e}')
-        ok = False
-    finally:
-        if otok:
             try:
-                log_fleet_sso_realm_summary(ops_base, otok, write, verify_tls)
-            except Exception:
-                pass
+                otok = _ops_token(ops_target_base, password, verify_tls)
+                fleet_ok, fleet_scim_tok, realm_id, vidb_rid = run_fleet_iam_vcf_sso(
+                    ops_target_base, otok, site_mgmt_vc, issuer_host, discovery_url,
+                    client_id, client_secret, scim_domain, idp_fleet_name,
+                    directory_fleet_name, write, verify_tls, dry_run,
+                )
+                if not fleet_ok or not fleet_scim_tok or not realm_id or not vidb_rid:
+                    ok = False
+                else:
+                    scim_linked = True
+                    scim_pk = None
+                    if step_scim:
+                        scim_linked, scim_pk = ak.ensure_scim_backchannel(
+                            app_slug, site_scim_url, fleet_scim_tok, site_scim_name, dry_run,
+                            filter_group_names=scim_filter_groups,
+                            user_mapping_names=scim_user_mapping_names,
+                            group_mapping_names=scim_group_mapping_names,
+                        )
+                    if not scim_linked:
+                        ok = False
+                    else:
+                        def _sync() -> bool:
+                            if dry_run or scim_pk is None:
+                                return True
+                            ok_sync = ak.trigger_scim_provider_sync(scim_pk, filter_group_names=scim_filter_groups)
+                            force_vcf_scim_group_memberships(ak, site_scim_url, fleet_scim_tok, write, verify_tls)
+                            return ok_sync
+
+                        if not fleet_iam_post_scim_assign_and_join(
+                            ops_target_base, otok, vidb_rid, realm_id, _sync, write, verify_tls,
+                            join_nsx=join_nsx,
+                            group_names=vcf_admin_groups,
+                            vcf_role='vcf_administrator',
+                            viewer_group_names=viewer_groups,
+                            vcf_viewer_role='vcf_viewer',
+                            sddc_admin_group_names=sddc_admin_groups,
+                            vcf_sddc_role='sddc_admin',
+                            sddc_viewer_group_names=sddc_viewer_groups,
+                            vcf_sddc_viewer_role='sddc_viewer',
+                            join_mgmt_vc=join_mgmt_vc,
+                            join_wld_vc=join_wld_vc,
+                            join_nsx_mgmt=join_nsx_mgmt,
+                            join_nsx_wld=join_nsx_wld,
+                            join_ops=join_ops,
+                            join_auto=join_auto,
+                            step_roles=step_roles,
+                            step_join_sso=step_join_sso,
+                        ):
+                            ok = False
+            except Exception as e:
+                _log(write, f'Fleet IAM / SCIM / Join SSO FAILED for {ops_host}: {e}')
+                ok = False
+            finally:
+                if otok:
+                    try:
+                        log_fleet_sso_realm_summary(ops_target_base, otok, write, verify_tls)
+                    except Exception:
+                        pass
+    else:
+        _log(write, '  Authentik integration: Steps 6-9 — Fleet IAM SSO Realm skipped or OAuth2 app missing.')
 
     _log(write, '=== Authentik + VCF integration finished ===')
     return ok
