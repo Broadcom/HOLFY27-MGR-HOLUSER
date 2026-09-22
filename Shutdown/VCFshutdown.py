@@ -1,9 +1,90 @@
 #!/usr/bin/env python3
-# VCFshutdown.py - HOLFY27 Core VCF Shutdown Module
-# Version 3.8 - 2026-06-22
-# Author - Burke Azbill and HOL Core Team
+# VCFshutdown.py - HOL-2740 Core VCF Shutdown Module
+# Version 3.11 - 2026-07-31
+# Author - Burke Azbill and HOL Core Team (HOL-2740 customizations by Nick Robbins)
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 3.11 Changes (2026-07-31) - HOL-2740 fork:
+# - discover_supervisor_vms(): added 'vcf_avi' to skip_patterns. Confirmed
+#   live against a real shutdown run that v3.10's fix (removing
+#   vcf_Avi-.* from [SHUTDOWN] vm_patterns) was incomplete: Phase 4's
+#   *dynamic discovery* step is a separate catch-all with its own
+#   skip_patterns list, which never excluded Avi SEs either — so it found
+#   and shut them down anyway (via "Dynamic discovery", not the static
+#   pattern loop), defeating the deferral to Phase 17c. Same live run
+#   confirmed Phase 3c itself works correctly: 1 SupervisorControlPlaneVM
+#   shut down cleanly via direct ESXi in 156s, after which all 6
+#   workload-cluster-* TKC node VMs shut down with normal (7-103s) gaps —
+#   no repower, no 5-minute timeouts. Phase 3b's cluster-pause step
+#   separately logged "No clusters API response (may not have TKG
+#   installed)" (0 clusters paused) despite TKC clusters clearly existing —
+#   its SSH/kubectl-via-decryptK8Pwd.py path is failing silently
+#   (stderr redirected to /dev/null); not yet root-caused, lower priority
+#   since Phase 3c alone was sufficient to fix the repower race.
+#
+# v 3.10 Changes (2026-07-31) - HOL-2740 fork:
+# - Added Phase 3c (shutdown_supervisor_cp_vms()): explicitly powers off
+#   SupervisorControlPlaneVM(s) via a direct ESXi connection (vCenter API
+#   returns NoPermission for this VM type — same workaround pattern as
+#   Phase 4b's ESXi fallback, but always direct since there's no vCenter
+#   path to try). Runs after Phase 3b, before Phase 4. v3.9's Phase 3b
+#   (cluster pause) stops CAPI reconciliation without requiring this, but
+#   two independent Confluence sources describe the blessed order as
+#   requiring Supervisor CP VMs to actually be powered off before TKC/VKS
+#   worker VMs — pause alone wasn't confirmed sufficient by either source.
+#   This phase completes that documented order instead of relying on pause
+#   as a substitute for it.
+# - Fixed Avi Service Engine shutdown ordering — no new phase needed.
+#   Root cause: Supervisor's own API server VIP is fronted by an Avi
+#   Service Engine in this environment, but vcf_Avi-.* (the SE pattern) was
+#   shut down early, as part of Phase 4's static vm_patterns list, before
+#   Supervisor/TKC VMs were even touched. config.ini already had a second,
+#   correctly-timed mechanism for this that was being silently shadowed:
+#   [VC] vcfpostedgevms / Phase 17c, which runs after vCenter shutdown and
+#   was designed for exactly this ("gracefully shut down after vCenter" per
+#   its own config comment) — it just never got a chance to act, since
+#   Phase 4 always found and shut down those VMs first. Fix: removed
+#   vcf_Avi-.* from vm_patterns in config.ini; Phase 17c now handles it,
+#   comfortably after Phase 3c/4 (Supervisor CP + TKC/VKS VMs) are down.
+#   No VCFshutdown.py code changes were needed for this half of the fix.
+# - CLI epilog phase list: also fixed pre-existing staleness unrelated to
+#   this change — was missing 4b entirely and still listed 19b (renamed to
+#   4b back in v3.0).
+#
+# v 3.9 Changes (2026-07-31) - HOL-2740 fork:
+# - Re-enabled Phase 3b, moved from before Phase 3 to AFTER it (matches the
+#   blessed VCF shutdown order: stop WCP, then pause clusters, then power off
+#   VMs). Root cause of the original disable-and-forget: stopping WCP on
+#   vCenter (Phase 3) only stops vCenter's side of Supervisor management —
+#   the CAPI/machine-controller reconciliation loop that manages TKC worker
+#   node desired-replica-count runs inside the Supervisor Control Plane VMs
+#   and is unaffected. Without a pause step, Phase 4's graceful power-off of
+#   kubernetes-cluster-* VMs raced that controller: it saw a worker VM go
+#   down and immediately powered it back on, burning the full guest-shutdown
+#   timeout per VM (7 VMs x 5 min) before Phase 4 gave up and hard-powered it
+#   off anyway. Matches shutdown_helpers.py's own '4' budget comment
+#   ("actual 62-392s, vm-7737 variable") — that variance was this race.
+# - shutdown_supervisor_workloads() renamed to pause_supervisor_clusters()
+#   and changed from `kubectl delete cluster` to
+#   `kubectl patch cluster ... --type merge -p '{"spec":{"paused":true}}'`.
+#   Deleting the Cluster CR is more destructive than needed and isn't what
+#   any blessed-order reference actually recommends; pausing halts CAPI
+#   reconciliation without tearing anything down, so Phase 4's own graceful
+#   VM shutdown (already written) does the actual power-off cleanly.
+#   NOTE: nothing currently un-pauses these clusters on next lab boot — the
+#   HOLFY27-MGR-HOLUSER startup framework (Kubernetes.py/VCFfinal.py) has no
+#   unpause step as of this writing. Confirm/add one before relying on this
+#   in production; paused reconciliation left indefinitely won't stop VMs
+#   from booting but will freeze CAPI self-healing for that cluster.
+# - Phase 19c: skip_vm_patterns used substring matching (`'manager' in
+#   vm_name_lower`), which incidentally matched sddcmanager-a/-b as well as
+#   the intended `manager` automation VM. If SDDC Manager (Phase 16) ever
+#   fails to shut down cleanly, this final straggler audit was silently
+#   treating it as protected infrastructure instead of flagging it, leaving
+#   it to be hard-killed by ESXi host power-off in Phase 20 instead of
+#   getting a graceful attempt. Skip check is now exact/prefix-based so it
+#   only matches the lab's own automation VMs.
 #
 # v 3.8 Changes (2026-06-22):
 # - Phase 2b: Added TCP pre-check on port 5480 per VSP VIP before invoking
@@ -264,8 +345,9 @@ PHASE 1:   Fleet Operations (VCF Operations Suite shutdown via API)
 PHASE 1b:  VCF Automation VM shutdown via vCenter (always; SSH K8s cleanup first)
 PHASE 2:   Connect to vCenters (while still available)
 PHASE 2b:  VSP Cluster Graceful Shutdown via vcf_services_runtime_shutdown.sh
-PHASE 3b:  Graceful Supervisor Workload Shutdown — DISABLED (WCP manages this in Phase 3)
 PHASE 3:   Stop WCP (Workload Control Plane) services
+PHASE 3b:  Pause Supervisor Clusters (kubectl patch cluster ... paused=true)
+PHASE 3c:  Shutdown Supervisor Control Plane VM(s) (direct ESXi connection)
 PHASE 4:   Shutdown Workload VMs (Tanzu, K8s) + Dynamic Discovery
 PHASE 4b:  Shutdown VSP Platform VMs (vCenter primary; ESXi direct fallback)
 PHASE 5:   Shutdown Workload Domain NSX Edges
@@ -329,7 +411,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 MODULE_NAME = 'VCFshutdown'
-MODULE_VERSION = '2.9'
+MODULE_VERSION = '2.12'
 MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 9.x compliant)'
 
 # Status file for console display
@@ -466,24 +548,30 @@ def shutdown_vms_by_names(lsf, vm_names: list, dry_run: bool = False,
 
 
 
-def shutdown_supervisor_workloads(lsf, vc_fqdn: str, password: str,
-                                  sso_user: str = 'administrator@wld.sso',
-                                  dry_run: bool = False) -> bool:
+def pause_supervisor_clusters(lsf, vc_fqdn: str, password: str,
+                              sso_user: str = 'administrator@wld.sso',
+                              dry_run: bool = False) -> bool:
     """
-    Dynamically discover and gracefully shut down Supervisor workloads
-    (VKS/TKG clusters, Supervisor Service VMs) before stopping WCP.
+    Dynamically discover TKG/VKS clusters on a Supervisor and pause their
+    CAPI reconciliation, run AFTER WCP is stopped and BEFORE Phase 4 attempts
+    to gracefully power off the TKC/VKS worker VMs.
 
-    Shutdown order:
-      1. Discover SCP password via decryptK8Pwd.py
-      2. Delete TKG/VKS clusters (gracefully removes worker and control-plane VMs)
-      3. Wait for workload VMs to power off
+    Stopping WCP on vCenter only stops vCenter's side of Supervisor
+    management. The CAPI/machine-controller reconciliation loop that
+    actually manages TKC worker node desired-replica-count runs inside the
+    Supervisor Control Plane VMs and is unaffected by that. Without this
+    pause, Phase 4's graceful power-off races that controller: it sees a
+    worker VM go down and immediately powers it back on, burning the full
+    guest-shutdown timeout per VM before Phase 4 gives up and hard-powers it
+    off anyway. Pausing (not deleting) the Cluster object halts reconciliation
+    without tearing anything down, so Phase 4's shutdown actually sticks.
 
     :param lsf: lsfunctions module reference
     :param vc_fqdn: Workload vCenter FQDN
     :param password: Lab password (creds.txt)
     :param sso_user: SSO user for vCenter API (default: administrator@wld.sso)
     :param dry_run: Preview mode
-    :return: True if shutdown completed (or partially completed)
+    :return: True if the discovery/pause step completed (or partially completed)
     """
     import subprocess
     import tempfile
@@ -512,7 +600,7 @@ def shutdown_supervisor_workloads(lsf, vc_fqdn: str, password: str,
         return False
 
     if not scp_ip or not scp_password:
-        vcf_write(lsf, '  Could not obtain SCP credentials - skipping workload shutdown')
+        vcf_write(lsf, '  Could not obtain SCP credentials - skipping cluster pause')
         return False
 
     vcf_write(lsf, f'  SCP VIP: {scp_ip}')
@@ -543,10 +631,10 @@ def shutdown_supervisor_workloads(lsf, vc_fqdn: str, password: str,
         finally:
             os.unlink(pwfile)
 
-    # Step 1: Discover and delete TKG/VKS clusters
+    # Step 2: Discover TKG/VKS clusters and pause CAPI reconciliation
     vcf_write(lsf, '  Discovering TKG/VKS clusters...')
     clusters_result = scp_kubectl('kubectl get clusters -A -o json 2>/dev/null')
-    clusters_deleted = 0
+    clusters_paused = 0
 
     if clusters_result.returncode == 0 and clusters_result.stdout:
         try:
@@ -563,24 +651,30 @@ def shutdown_supervisor_workloads(lsf, vc_fqdn: str, password: str,
                     ns = cluster['metadata']['namespace']
                     name = cluster['metadata']['name']
                     phase = cluster.get('status', {}).get('phase', 'unknown')
-                    vcf_write(lsf, f'    {ns}/{name}: phase={phase}')
+                    already_paused = cluster.get('spec', {}).get('paused', False)
+                    vcf_write(lsf, f'    {ns}/{name}: phase={phase}, paused={already_paused}')
+
+                    if already_paused:
+                        vcf_write(lsf, f'    {name} already paused - skipping')
+                        clusters_paused += 1
+                        continue
 
                     if not dry_run:
-                        vcf_write(lsf, f'    Deleting cluster {ns}/{name}...')
-                        del_result = scp_kubectl(
-                            f'kubectl delete cluster {name} -n {ns} --timeout=120s 2>&1'
+                        vcf_write(lsf, f'    Pausing cluster {ns}/{name}...')
+                        patch_result = scp_kubectl(
+                            f'kubectl patch cluster {name} -n {ns} --type merge '
+                            f'-p \'{{"spec":{{"paused":true}}}}\' 2>&1'
                         )
-                        if del_result.returncode == 0:
-                            vcf_write(lsf, f'    Cluster {name} deleted successfully')
-                            clusters_deleted += 1
+                        if patch_result.returncode == 0:
+                            vcf_write(lsf, f'    Cluster {name} paused successfully')
+                            clusters_paused += 1
                         else:
-                            stderr = del_result.stderr.strip()[:200] if del_result.stderr else ''
-                            stdout = del_result.stdout.strip()[:200] if del_result.stdout else ''
-                            vcf_write(lsf, f'    Cluster delete returned: {stdout} {stderr}')
-                            vcf_write(lsf, f'    VMs will be caught by Phase 4/19c')
-                            clusters_deleted += 1
+                            stderr = patch_result.stderr.strip()[:200] if patch_result.stderr else ''
+                            stdout = patch_result.stdout.strip()[:200] if patch_result.stdout else ''
+                            vcf_write(lsf, f'    Cluster pause returned: {stdout} {stderr}')
+                            vcf_write(lsf, f'    WARNING: {name} worker VMs may auto-repower in Phase 4')
                     else:
-                        vcf_write(lsf, f'    Would delete cluster {ns}/{name}')
+                        vcf_write(lsf, f'    Would pause cluster {ns}/{name}')
             else:
                 vcf_write(lsf, '  No TKG/VKS clusters found')
         except (json.JSONDecodeError, ValueError) as e:
@@ -588,12 +682,7 @@ def shutdown_supervisor_workloads(lsf, vc_fqdn: str, password: str,
     else:
         vcf_write(lsf, '  No clusters API response (may not have TKG installed)')
 
-    vcf_write(lsf, f'  Supervisor workload shutdown: {clusters_deleted} cluster(s) deleted')
-
-    # Step 3: Wait briefly for VMs to drain
-    if clusters_deleted > 0 and not dry_run:
-        vcf_write(lsf, '  Waiting 30s for workload VMs to begin powering off...')
-        time.sleep(30)
+    vcf_write(lsf, f'  Supervisor cluster pause: {clusters_paused} cluster(s) paused')
 
     return True
 
@@ -622,6 +711,13 @@ def discover_supervisor_vms(lsf, vc_fqdn: str, password: str,
         'nsx-',
         'vc-',
         'sddcmanager',
+        'vcf_avi',  # Avi Controllers/SEs — handled in Phase 4's vm_patterns
+                    # (Controllers) / Phase 17c's vcfpostedgevms (SEs, after
+                    # Supervisor/TKC are down). Confirmed live (2026-07-31):
+                    # removing vcf_Avi-.* from vm_patterns alone was NOT
+                    # enough — this dynamic-discovery catch-all found and
+                    # shut down the SEs anyway since it had no skip entry
+                    # for them, defeating the Phase 17c deferral.
     ]
 
     workload_vms = []
@@ -679,6 +775,100 @@ def shutdown_wcp_service(lsf, vc_fqdn: str, password: str) -> bool:
     except Exception as e:
         vcf_write(lsf, f'Error stopping WCP on {vc_fqdn}: {e}')
         return False
+
+
+def shutdown_supervisor_cp_vms(lsf, mgmt_hosts: list, dry_run: bool = False) -> int:
+    """
+    Power off SupervisorControlPlaneVM(s) via a direct ESXi connection.
+
+    vCenter's API refuses guest-shutdown/power-off operations on these VMs
+    with NoPermission -- they're WCP-managed and vCenter's governance layer
+    blocks manual intervention through itself (the same protection vCLS VMs
+    get). Confluence and an internal engineering investigation both confirm
+    the workaround: connect directly to the ESXi host, bypassing vCenter's
+    vpxd permission layer entirely, and power off from there -- the same
+    thing a host-UI power-off does. Modeled on Phase 4b's vCenter-primary/
+    ESXi-fallback pattern, but always goes direct; there's no vCenter path
+    to even try for this VM type.
+
+    Must run AFTER Phase 3 (WCP stop) and BEFORE Phase 4 (TKC/VKS worker VM
+    shutdown): per the blessed shutdown order, Supervisor CP VMs host the
+    CAPI controllers that manage TKC/VKS worker desired-replica-count, so
+    they need to be down before Phase 4 can safely power off worker VMs
+    without racing that reconciliation loop. Phase 3b's cluster-pause step
+    provides the same protection independently; this phase completes the
+    documented order rather than relying on pause alone.
+
+    :param lsf: lsfunctions module reference
+    :param mgmt_hosts: [VCF] vcfmgmtcluster ESXi host entries
+    :param dry_run: Preview mode
+    :return: Number of VMs shut down
+    """
+    from pyVim import connect
+    import concurrent.futures as _cf
+
+    pattern = r'^SupervisorControlPlaneVM.*$'
+
+    if dry_run:
+        vcf_write(lsf, f'Would connect directly to ESXi and shutdown VMs matching: {pattern}')
+        return 0
+
+    if not mgmt_hosts:
+        vcf_write(lsf, 'No ESXi hosts configured - cannot reach Supervisor CP VMs directly')
+        return 0
+
+    saved_sis = list(lsf.sis)
+    saved_sisvc = dict(lsf.sisvc)
+    lsf.sis.clear()
+    lsf.sisvc.clear()
+    shut_count = 0
+    try:
+        vcf_write(lsf, f'Connecting directly to {len(mgmt_hosts)} ESXi host(s)...')
+        lsf.connect_vcenters(mgmt_hosts)
+
+        vms = lsf.get_vm_match(pattern)
+        if not vms:
+            vcf_write(lsf, '  No Supervisor Control Plane VM(s) found (already off, or not this build)')
+            return 0
+
+        vms_to_shutdown = [vm for vm in vms if lsf.is_vm_powered_on(vm)]
+        already_off = len(vms) - len(vms_to_shutdown)
+        if already_off:
+            vcf_write(lsf, f'  {already_off} Supervisor CP VM(s) already powered off')
+        if not vms_to_shutdown:
+            return 0
+
+        vcf_write(lsf, f'Shutting down {len(vms_to_shutdown)} Supervisor CP VM(s) in parallel...')
+
+        def _shutdown_cp_vm(vm):
+            try:
+                lsf.shutdown_vm_gracefully(vm)
+                return (vm.name, True, None)
+            except Exception as e:
+                return (vm.name, False, str(e))
+
+        with _cf.ThreadPoolExecutor(max_workers=min(10, len(vms_to_shutdown))) as executor:
+            futures = [executor.submit(_shutdown_cp_vm, vm) for vm in vms_to_shutdown]
+            for future in _cf.as_completed(futures):
+                vm_name, success, err = future.result()
+                if success:
+                    shut_count += 1
+                    vcf_write(lsf, f'  {vm_name}: shut down')
+                else:
+                    vcf_write(lsf, f'  WARNING: Failed to shut down {vm_name}: {err}')
+
+        return shut_count
+    finally:
+        for si in lsf.sis:
+            try:
+                connect.Disconnect(si)
+            except Exception:
+                pass
+        lsf.sis.clear()
+        lsf.sisvc.clear()
+        lsf.sis.extend(saved_sis)
+        lsf.sisvc.update(saved_sisvc)
+        vcf_write(lsf, 'vCenter sessions restored for subsequent phases')
 
 
 def check_vsan_esa(lsf, host: str, username: str, password: str) -> bool:
@@ -1466,64 +1656,6 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
             vcf_write(lsf, 'Continuing with next phase...')
 
     #==========================================================================
-
-    # Phase 3b disabled (v3.1): WCP manages Supervisor workload shutdown via the
-    # WCP Stop in Phase 3. Re-enable by removing the `and False` guard below.
-    #==========================================================================
-
-    # if should_run('3b') and False:  # noqa: SIM210
-    #     try:
-    #         _vcf_phase_entry(lsf, '3b', dry_run, mgmt_hosts, eta)
-    #         vcf_write(lsf, '='*60)
-    #         vcf_write(lsf, 'PHASE 3b: Graceful Supervisor Workload Shutdown')
-    #         vcf_write(lsf, '='*60)
-    #         update_shutdown_status(3, 'Supervisor Workload Shutdown', dry_run)
-
-    #         wcp_vcenters_3b = []
-    #         if lsf.config.has_option('VCFFINAL', 'tanzucontrol'):
-    #             tanzu_raw = lsf.config.get('VCFFINAL', 'tanzucontrol')
-    #             seen_vcenters = set()
-    #             for entry in tanzu_raw.split('\n'):
-    #                 entry = entry.strip()
-    #                 if entry and not entry.startswith('#'):
-    #                     if ':' in entry:
-    #                         parts = entry.split(':')
-    #                         if len(parts) >= 2:
-    #                             vc = parts[1].strip()
-    #                             if vc and vc not in seen_vcenters:
-    #                                 wcp_vcenters_3b.append(vc)
-    #                                 seen_vcenters.add(vc)
-
-    #         if wcp_vcenters_3b:
-    #             vcf_write(lsf, f'Found {len(wcp_vcenters_3b)} vCenter(s) with Supervisor workloads')
-
-    #             # Detect SSO domain from vCenters config
-    #             sso_user_map = {}
-    #             if lsf.config.has_option('RESOURCES', 'vCenters'):
-    #                 for vc_line in lsf.config.get('RESOURCES', 'vCenters').split('\n'):
-    #                     vc_line = vc_line.strip()
-    #                     if vc_line and not vc_line.startswith('#'):
-    #                         parts = vc_line.split(':')
-    #                         if len(parts) >= 3:
-    #                             sso_user_map[parts[0].strip()] = parts[2].strip()
-
-    #             for vc in wcp_vcenters_3b:
-    #                 if lsf.test_tcp_port(vc, 443, timeout=10):
-    #                     sso_user = sso_user_map.get(vc, 'administrator@wld.sso')
-    #                     vcf_write(lsf, f'Shutting down Supervisor workloads on {vc} (user={sso_user})')
-    #                     shutdown_supervisor_workloads(lsf, vc, password,
-    #                                                  sso_user=sso_user,
-    #                                                  dry_run=dry_run)
-    #                 else:
-    #                     vcf_write(lsf, f'{vc} not reachable - cannot shut down Supervisor workloads')
-    #         else:
-    #             vcf_write(lsf, 'No Supervisor/WCP vCenters configured - skipping')
-
-    #     except Exception as _phase_err:
-    #         vcf_write(lsf, f'ERROR in Phase 3b: {_phase_err}')
-    #         vcf_write(lsf, 'Continuing with next phase...')
-
-    #==========================================================================  
     # TASK 3: Stop WCP on vCenters
     #==========================================================================
     if should_run('3'):
@@ -1577,6 +1709,89 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
 
         except Exception as _phase_err:
             vcf_write(lsf, f'ERROR in Phase 3: {_phase_err}')
+            vcf_write(lsf, 'Continuing with next phase...')
+
+    #==========================================================================
+    # TASK 3b: Pause Supervisor Clusters (after WCP stop, before VM shutdown)
+    # Stopping WCP (Phase 3) does not stop the Supervisor's own CAPI
+    # reconciliation loop. Without this pause, Phase 4's graceful power-off
+    # of kubernetes-cluster-* VMs races that controller: it sees a worker VM
+    # go down and immediately powers it back on, burning the full
+    # guest-shutdown timeout per VM before Phase 4 gives up and hard-powers
+    # it off anyway. See pause_supervisor_clusters() for details.
+    #==========================================================================
+    if should_run('3b'):
+        try:
+            _vcf_phase_entry(lsf, '3b', dry_run, mgmt_hosts, eta)
+            vcf_write(lsf, '='*60)
+            vcf_write(lsf, 'PHASE 3b: Pause Supervisor Clusters')
+            vcf_write(lsf, '='*60)
+            update_shutdown_status(3, 'Pause Supervisor Clusters', dry_run)
+
+            wcp_vcenters_3b = []
+            if lsf.config.has_option('VCFFINAL', 'tanzucontrol'):
+                tanzu_raw = lsf.config.get('VCFFINAL', 'tanzucontrol')
+                seen_vcenters = set()
+                for entry in tanzu_raw.split('\n'):
+                    entry = entry.strip()
+                    if entry and not entry.startswith('#'):
+                        if ':' in entry:
+                            parts = entry.split(':')
+                            if len(parts) >= 2:
+                                vc = parts[1].strip()
+                                if vc and vc not in seen_vcenters:
+                                    wcp_vcenters_3b.append(vc)
+                                    seen_vcenters.add(vc)
+
+            if wcp_vcenters_3b:
+                vcf_write(lsf, f'Found {len(wcp_vcenters_3b)} vCenter(s) with Supervisor workloads')
+
+                # Detect SSO domain from vCenters config
+                sso_user_map = {}
+                if lsf.config.has_option('RESOURCES', 'vCenters'):
+                    for vc_line in lsf.config.get('RESOURCES', 'vCenters').split('\n'):
+                        vc_line = vc_line.strip()
+                        if vc_line and not vc_line.startswith('#'):
+                            parts = vc_line.split(':')
+                            if len(parts) >= 3:
+                                sso_user_map[parts[0].strip()] = parts[2].strip()
+
+                for vc in wcp_vcenters_3b:
+                    if lsf.test_tcp_port(vc, 443, timeout=10):
+                        sso_user = sso_user_map.get(vc, 'administrator@wld.sso')
+                        vcf_write(lsf, f'Pausing Supervisor clusters on {vc} (user={sso_user})')
+                        pause_supervisor_clusters(lsf, vc, password,
+                                                   sso_user=sso_user,
+                                                   dry_run=dry_run)
+                    else:
+                        vcf_write(lsf, f'{vc} not reachable - cannot pause Supervisor clusters')
+            else:
+                vcf_write(lsf, 'No Supervisor/WCP vCenters configured - skipping')
+
+        except Exception as _phase_err:
+            vcf_write(lsf, f'ERROR in Phase 3b: {_phase_err}')
+            vcf_write(lsf, 'Continuing with next phase...')
+
+    #==========================================================================
+    # TASK 3c: Shutdown Supervisor Control Plane VM(s)
+    # Completes the blessed order (WCP stop -> Supervisor CP VMs off -> TKC
+    # VMs off) rather than relying solely on Phase 3b's cluster-pause step.
+    # Must run before Phase 4 shuts down the TKC/VKS worker VMs.
+    #==========================================================================
+    if should_run('3c'):
+        try:
+            _vcf_phase_entry(lsf, '3c', dry_run, mgmt_hosts, eta)
+            vcf_write(lsf, '='*60)
+            vcf_write(lsf, 'PHASE 3c: Shutdown Supervisor Control Plane VM(s)')
+            vcf_write(lsf, '='*60)
+            update_shutdown_status(3, 'Shutdown Supervisor CP VMs', dry_run)
+
+            cp_count = shutdown_supervisor_cp_vms(lsf, mgmt_hosts, dry_run)
+            if not dry_run:
+                vcf_write(lsf, f'Supervisor CP VM shutdown complete: {cp_count} VM(s) processed')
+
+        except Exception as _phase_err:
+            vcf_write(lsf, f'ERROR in Phase 3c: {_phase_err}')
             vcf_write(lsf, 'Continuing with next phase...')
 
     #==========================================================================
@@ -1850,7 +2065,7 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
         except Exception as _phase_err:
             vcf_write(lsf, f'ERROR in Phase 4b: {_phase_err}')
             vcf_write(lsf, 'Continuing with next phase...')
-    
+
     #==========================================================================
     # TASK 5: Shutdown Workload Domain NSX Edges
     # Filter: Only edges with "wld" in their name (workload domain)
@@ -2824,9 +3039,11 @@ def main(lsf=None, standalone=False, dry_run=False, phase=None,
                     skipped_count = 0
 
                     # ── Classify: straggler vs infrastructure ─────────────────────
+                    # startswith (not `pat in vm_name_lower`) so 'manager' only
+                    # matches the automation VM itself, not e.g. sddcmanager-a/-b.
                     for vm in still_on:
                         vm_name_lower = vm.name.lower()
-                        should_skip = any(pat in vm_name_lower for pat in skip_vm_patterns)
+                        should_skip = any(vm_name_lower.startswith(pat) for pat in skip_vm_patterns)
                         if should_skip:
                             vcf_write(lsf, f'  {vm.name}: Skipping (infrastructure VM)')
                             skipped_count += 1
@@ -2956,9 +3173,11 @@ Phase IDs for --phase:
   1b    VCF Automation VM fallback (if Fleet API failed)
   2     Connect to vCenters
   2b    VSP Cluster Graceful Shutdown (vcf_services_runtime_shutdown.sh per site VIP)
-  3b    Graceful Supervisor Workload Shutdown (VKS, Harbor)
   3     Stop Workload Control Plane (WCP)
+  3b    Pause Supervisor Clusters (kubectl patch cluster ... paused=true)
+  3c    Shutdown Supervisor Control Plane VM(s) (direct ESXi connection)
   4     Shutdown Workload VMs (Tanzu, K8s) + Dynamic Discovery
+  4b    Shutdown VSP Platform VMs (vCenter primary; ESXi direct fallback)
   5     Shutdown Workload Domain NSX Edges
   6     Shutdown Workload Domain NSX Manager
   7     Shutdown Workload vCenters
@@ -2976,7 +3195,6 @@ Phase IDs for --phase:
   17c   Shutdown Post-Edge VMs (optional)
   18    Set Host Advanced Settings
   19    vSAN Elevator Operations
-  19b   Shutdown VSP Platform VMs
   19c   Pre-ESXi Shutdown Audit
   20    Shutdown ESXi Hosts
 
