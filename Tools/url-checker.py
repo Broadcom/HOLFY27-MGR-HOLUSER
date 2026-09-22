@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 # url-checker.py - HOLFY27 Standalone URL Checker
-# Version 1.0 - February 2026
+# Version 1.1 - 2026-09-22
 # Author - Burke Azbill and HOL Core Team
 # Standalone URL checker that allows testing URLs similar to labstartup
 # without running the full labstartup process or adding config entries.
+#
+# v1.1 Changes (2026-09-22):
+# - Added browser headers (User-Agent and Accept) to simulate browser navigation
+#   and handle web applications using SAML SSO redirects (e.g. SDDC Manager).
 
 import sys
 import argparse
@@ -13,7 +17,12 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-SCRIPT_VERSION = '1.0'
+SCRIPT_VERSION = '1.1'
+
+DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+}
 
 
 def log(msg):
@@ -24,6 +33,7 @@ def log(msg):
 def check_url(url, expected_text=None, max_retries=1, retry_delay=5, timeout=15):
     session = requests.Session()
     session.trust_env = False
+    session.headers.update(DEFAULT_HEADERS)
 
     last_error = None
 
