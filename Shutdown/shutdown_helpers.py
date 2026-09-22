@@ -1,8 +1,36 @@
 #!/usr/bin/env python3
-# shutdown_helpers.py - HOLFY27 Shutdown shared utilities
-# Version 1.6 - 2026-05-14
-# Author - Burke Azbill and HOL Core Team
+# shutdown_helpers.py - HOL-2740 Shutdown shared utilities
+# Version 1.8 - 2026-07-31
+# Author - Burke Azbill and HOL Core Team (HOL-2740 customizations by Nick Robbins)
 # Phase expansion, approximate ETA tracking, vSphere session connect/disconnect, heartbeat helper.
+#
+# v 1.8 Changes (2026-07-31) - HOL-2740 fork:
+# - CANONICAL_PHASE_ORDER: added '3c' (Supervisor CP VMs, after '3b'/before
+#   '4'). See VCFshutdown.py v3.10 — completes the blessed shutdown order
+#   (Supervisor CP VMs down before TKC/VKS workers) instead of relying on
+#   Phase 3b's cluster-pause alone.
+# - NEED_VCENTER_CONNECT_PHASES: added '3c'.
+# - DEFAULT_PHASE_BUDGET_SEC: added '3c' (120s), an unverified estimate
+#   pending real-run calibration. '19c' comment updated — its historical
+#   SupervisorCPVM straggler bottleneck should no longer occur now that
+#   Phase 3c handles it proactively. '17c' budget bumped 30s -> 90s: Avi
+#   Service Engines (vcf_Avi-.*) now actually get shut down there for real
+#   (see below) instead of arriving already-off.
+# - Fixed Avi Service Engine shutdown ordering WITHOUT a new phase:
+#   vcf_Avi-.* was removed from [SHUTDOWN] vm_patterns (Phase 4), which had
+#   been racing ahead of and shadowing the pre-existing
+#   [VCF] vcfpostedgevms / Phase 17c mechanism — already designed to shut
+#   these down "after vCenter" (see its config.ini comment), just never
+#   actually reached because Phase 4 always got there first. No code change
+#   needed once unblocked; Phase 17c already runs comfortably after
+#   Supervisor/TKC (Phase 3c/4) are down.
+#
+# v 1.7 Changes (2026-07-31) - HOL-2740 fork:
+# - CANONICAL_PHASE_ORDER: moved '3b' to after '3' (see VCFshutdown.py v3.9 —
+#   pausing Supervisor clusters only makes sense once WCP is stopped).
+# - DEFAULT_PHASE_BUDGET_SEC: '3b' re-budgeted from 0 (disabled placeholder)
+#   to 30s now that it's re-enabled; '4' comment updated to explain the prior
+#   variance was the pre-pause auto-repower race, not intrinsic VM slowness.
 #
 # v 1.6 Changes (2026-05-14):
 # - Recalibrated three persistently mis-budgeted phases based on 10-run sample
@@ -89,8 +117,16 @@ import time
 from typing import Callable, FrozenSet, List, Optional, Sequence, Set
 
 # Canonical VCF shutdown order (must match VCFshutdown.py phase blocks)
+# NOTE (HOL-2740 v3.9): 3b moved to AFTER 3 — pausing Supervisor clusters only
+# makes sense once WCP is stopped; see VCFshutdown.py pause_supervisor_clusters().
+# NOTE (HOL-2740 v3.10): added 3c (Supervisor CP VMs, direct ESXi, after 3b
+# and before 4) — see VCFshutdown.py shutdown_supervisor_cp_vms(). Avi SE
+# ordering (also fixed in v3.10) needed no new phase: removing vcf_Avi-.*
+# from [SHUTDOWN] vm_patterns let the pre-existing Phase 17c
+# ([VCF] vcfpostedgevms) mechanism, which already ran after vCenter, catch
+# them instead of Phase 4 shutting them down early.
 CANONICAL_PHASE_ORDER: Sequence[str] = (
-    '1', '1b', '2', '2b', '3b', '3', '4', '4b', '5', '6', '7',
+    '1', '1b', '2', '2b', '3', '3b', '3c', '4', '4b', '5', '6', '7',
     '8', '9', '10', '11', '12', '13',
     '14', '15', '16', '17', '17b', '17c',
     '18', '19', '19c', '20',
@@ -99,8 +135,11 @@ CANONICAL_PHASE_ORDER: Sequence[str] = (
 ALL_VALID_PHASES: FrozenSet[str] = frozenset(CANONICAL_PHASE_ORDER)
 
 # Phases that need vCenter API inventory ([RESOURCES] vCenters / Phase 2 style connect)
+# 3c manages its own direct-ESXi connection internally (like 4b), but is
+# still listed here so a selective `--phase 3c` run establishes a baseline
+# vCenter session first, consistent with how 3b/4b are handled.
 NEED_VCENTER_CONNECT_PHASES: FrozenSet[str] = frozenset({
-    '3b', '3', '4', '4b', '5', '6', '7',
+    '3b', '3', '3c', '4', '4b', '5', '6', '7',
     '8', '9', '10', '11', '12', '13',
     '14', '15', '16', '17',
 })
@@ -119,9 +158,14 @@ DEFAULT_PHASE_BUDGET_SEC: dict[str, int] = {
     '1b':   120,  # VCF Automation VM (auto-platform-a) via vCenter; actual 100-116s
     '2':     10,  # vCenter connect; 0s when already connected from Phase 1b
     '2b':     0,  # VSP Component Service annotation (placeholder — never executes)
-    '3b':     0,  # Supervisor workload shutdown (disabled in v3.1 — WCP manages this)
     '3':     30,  # WCP service stop; actual 7s
-    '4':     90,  # Workload VM shutdown + dynamic discovery; actual 62-392s (vm-7737 variable)
+    '3b':    30,  # Pause Supervisor clusters (re-enabled v3.9); SSH + kubectl patch, no VM waits
+    '3c':   120,  # Supervisor CP VM(s) via direct ESXi (new v3.10); unverified estimate —
+                  # 19c's old bottleneck was ~101-115s for this same VM caught as a straggler,
+                  # using that as a starting point; recalibrate after first real run(s)
+    '4':     90,  # Workload VM shutdown + dynamic discovery; should stabilize now that
+                  # 3b/3c stop CAPI reconciliation first (previously 62-392s, vm-7737 variable,
+                  # from racing Supervisor's auto-repower — see VCFshutdown.py v3.9 changelog)
     '4b':   180,  # VSP Platform VMs (7 VMs parallel via vCenter); actual 101-131s
     '5':    100,  # WLD NSX Edges (sequential); actual 82s
     '6':    150,  # WLD NSX Manager; actual 90-101s
@@ -137,10 +181,16 @@ DEFAULT_PHASE_BUDGET_SEC: dict[str, int] = {
     '16':    60,  # SDDC Manager; actual 50s
     '17':   360,  # Mgmt vCenter (longest single-VM shutdown); actual 314-317s
     '17b':    5,  # Switch to direct ESXi sessions; actual ~0s
-    '17c':   30,  # Post-edge VMs (parallel); auto-platform-a already off; only license-a ~16s
+    '17c':   90,  # Post-edge VMs (parallel); auto-platform-a already off, but vcf_Avi-.*
+                  # (Avi SEs) now actually gets shut down for real here as of v3.10 —
+                  # previously already-off by this point (Phase 4's vm_patterns raced
+                  # ahead of it). Prior 30s budget assumed only license-a (~16s);
+                  # bumped as a rough placeholder until recalibrated from a real run
     '18':    15,  # ESXi host advanced settings; actual 4s
     '19':  2700,  # vSAN OSA elevator (dynamically overridden to 5s for ESA)
-    '19c':  150,  # Pre-ESXi audit / stragglers (parallel); bottleneck ~101-115s (SupervisorCPVM)
+    '19c':  150,  # Pre-ESXi audit / stragglers (parallel); historical bottleneck ~101-115s was
+                  # SupervisorCPVM straggling here — now shut down proactively in Phase 3c
+                  # (v3.10), so 19c should trend lower; budget left as-is until confirmed
     '20':     5,  # ESXi host shutdown commands; almost always no-op (shutdown_hosts=false)
 }
 

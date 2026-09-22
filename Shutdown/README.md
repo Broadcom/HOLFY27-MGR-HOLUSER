@@ -194,8 +194,9 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 | Phase 1b | VCF Automation VM fallback | Only if Fleet API failed |
 | Phase 2 | Connect to vCenters | vCenters first (while available) |
 | Phase 2b | Scale Down VCF Components | K8s workloads on VSP |
-| Phase 3b | Supervisor workload drain | VKS/Harbor etc. before WCP stop |
 | Phase 3 | Stop WCP | Workload Control Plane services |
+| Phase 3b | Pause Supervisor clusters | `kubectl patch cluster ... paused=true`, after WCP stop, before VM shutdown (see HOL-2740 fork notes below) |
+| Phase 3c | Shutdown Supervisor CP VM(s) | Direct ESXi connection (vCenter API returns NoPermission); see HOL-2740 fork notes below |
 | Phase 4 | Workload VMs | Tanzu, K8s, Supervisor VMs |
 | Phase 4b | VSP Platform VMs | Shutdown VSP VMs via vCenter; falls back to direct ESXi if not found |
 | Phase 5 | Workload NSX Edges | Workload domain NSX Edges |
@@ -212,7 +213,7 @@ Per [VCF 9.0 Management Domain Shutdown](https://techdocs.broadcom.com/us/en/vmw
 | Phase 16 | SDDC Manager | SDDC Manager |
 | Phase 17 | Mgmt vCenter | Management domain vCenter |
 | Phase 17b | Connect to ESXi | Direct ESXi connections (vCenters now down) |
-| Phase 17c | Post-Edge VMs | Optional patterns from `[VCF] vcfpostedgevms` |
+| Phase 17c | Post-Edge VMs | Optional patterns from `[VCF] vcfpostedgevms` — includes Avi Service Engines (see HOL-2740 fork notes below) |
 | Phase 18 | Host Settings | Set ESXi advanced settings |
 | Phase 19 | vSAN Elevator | Enable elevator, poll until flush complete, disable (OSA only) |
 | Phase 19c | Pre-ESXi Audit | Find and shutdown straggler VMs |
@@ -445,6 +446,92 @@ Shutdown logs are written to:
 ### SSH host key errors
 
 The scripts use `StrictHostKeyChecking=no` and `UserKnownHostsFile=/dev/null` to handle host key changes common in lab environments.
+
+## HOL-2740 fork notes (2026-07-31)
+
+This copy is customized from the upstream HOLFY27 scripts (originally at
+`~/hol/Shutdown` on `manager`, a checkout of `Broadcom/HOLFY27-MGR-HOLUSER`).
+Four fixes applied here, not (yet) upstream (full investigation writeup, including
+Confluence sources and outstanding items, at
+`~/sanitized_gitstuff/claude_projects/hol/vks-shutdown-order/vks-supervisor-avi-shutdown-order.md`):
+
+1. **Phase 3b re-enabled and moved after Phase 3.** Upstream had it disabled
+   (`and False` guard) and positioned *before* the WCP stop, with a comment
+   claiming WCP handles Supervisor workload shutdown on its own. It doesn't:
+   stopping WCP only stops vCenter's side of Supervisor management, not the
+   CAPI reconciliation loop running on the Supervisor Control Plane VMs.
+   Without a pause step, Phase 4's graceful shutdown of `kubernetes-cluster-*`
+   worker VMs raced that controller — it powered them back on before the
+   guest shutdown could complete, burning the full timeout per VM (7 VMs x 5
+   min) before falling back to a hard power-off anyway. The re-enabled Phase
+   3b now runs `kubectl patch cluster <name> -n <ns> --type merge -p
+   '{"spec":{"paused":true}}'` (not `delete`, which the disabled original
+   used) immediately after WCP stops, so Phase 4's shutdown actually sticks.
+   Confirmed against internal engineering docs and matches
+   `shutdown_helpers.py`'s own historical timing note that Phase 4 varied
+   62-392s run to run ("vm-7737 variable") — that variance was this race.
+
+   **Startup counterpart removed (2026-08-20) — known gap.** A startup-side
+   shim (`adjustomatic.unpause_vks_clusters()`, called from `Startup/VCF.py`'s
+   CUSTOM section) used to undo this pause on every lab boot. That shim's
+   call site and its function definition were both deleted outright when the
+   avi-config playbook steps were moved into that same CUSTOM section slot
+   (see `Startup/VCF.py`'s v3.13 changelog entry and
+   `avi_hol_files/2x71_podsetup/adjustomatic.py`). Phase 3b above was
+   deliberately left enabled. Net effect: as of this change, VKS clusters
+   paused by Phase 3b during shutdown **stay paused indefinitely** on the
+   next boot — nothing in the upstream HOLFY27-MGR-HOLUSER startup framework
+   or this repo's overrides clears `spec.paused` anymore. Confirmed accepted
+   as a known gap at the time of removal, not an oversight — revisit if VKS
+   CAPI self-healing turns out to matter across a shutdown/startup cycle.
+
+2. **Phase 19c straggler-skip pattern fixed.** The final pre-ESXi-shutdown
+   audit used substring matching (`'manager' in vm_name_lower`) to avoid
+   flagging the lab's own automation VMs (`manager`, `console`, `router`) as
+   stragglers. That substring also matched `sddcmanager-a`/`-b` — if SDDC
+   Manager ever failed to shut down cleanly in Phase 16, this audit would
+   silently treat it as protected infrastructure instead of catching it,
+   leaving it to be hard-killed by ESXi host power-off instead of getting a
+   graceful attempt. Changed to prefix matching (`startswith`) so it only
+   matches the automation VMs it was meant to protect.
+
+3. **Phase 3c added: Supervisor Control Plane VM(s) now explicitly powered
+   off.** Previously these VMs were never targeted — vCenter's API returns
+   `NoPermission` on them (WCP-managed, same protection vCLS VMs get), so
+   Phase 4 explicitly excluded them and they'd only get caught, if at all,
+   by Phase 19c's straggler audit right before ESXi hosts power off. Two
+   independent Confluence sources describe the blessed order as requiring
+   Supervisor CP VMs to actually be powered off before TKC/VKS worker VMs —
+   Phase 3b's pause alone wasn't confirmed sufficient by either source.
+   Phase 3c connects directly to ESXi (bypassing vCenter's permission layer,
+   same as a host-UI power-off) and shuts them down there, after Phase 3b
+   and before Phase 4.
+
+4. **Avi Service Engines now shut down after Supervisor/TKC, not before —
+   no new phase needed.** Supervisor's own API server VIP is fronted by an
+   Avi Service Engine in this environment. Previously `vcf_Avi-.*` (the SE
+   VM pattern) lived in `[SHUTDOWN] vm_patterns` alongside Avi Controllers
+   (`alb-.-node0`) and ran as part of Phase 4's *static* pattern list —
+   before Supervisor CP VMs (Phase 3c) or the TKC/VKS worker VMs (Phase 4's
+   own dynamic discovery) were even touched. `config.ini` already had a
+   second, correctly-timed mechanism for this that was being silently
+   shadowed: `[VCF] vcfpostedgevms` / Phase 17c, which runs after vCenter
+   shutdown and was explicitly designed for exactly this case ("gracefully
+   shut down after vCenter" per its own comment) — it just never got the
+   chance to act, since Phase 4 always found and shut down those VMs first.
+   Fix: removed `vcf_Avi-.*` from `vm_patterns`; Phase 17c now handles it
+   for real, comfortably after Phase 3c/4. No `VCFshutdown.py` code changes
+   were needed for this half of the fix, only the `config.ini` edit. Avi
+   Controllers stay in Phase 4's `vm_patterns` unchanged — they're
+   control-plane only, not in the API VIP data path, so there's no ordering
+   constraint against Supervisor for them.
+
+   **Follow-up, found via a live run's `shutdown.log`:** this was incomplete.
+   Phase 4's separate *dynamic discovery* step (`discover_supervisor_vms()`)
+   has its own `skip_patterns` list that also never excluded Avi SEs, so it
+   found and shut them down anyway. Fixed in v3.11 by adding `'vcf_avi'` to
+   that list too. Full detail, including the live-run evidence, in
+   `~/sanitized_gitstuff/claude_projects/hol/vks-shutdown-order/vks-supervisor-avi-shutdown-order.md`.
 
 ## Support
 

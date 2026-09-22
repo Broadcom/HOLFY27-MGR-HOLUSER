@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-# Shutdown.py - HOLFY27 Lab Shutdown Orchestration
-# Version 2.6 - 2026-06-01
-# Author - Burke Azbill and HOL Core Team
+# Shutdown.py - HOL-2740 Lab Shutdown Orchestration
+# Version 2.8 - 2026-07-31
+# Author - Burke Azbill and HOL Core Team (HOL-2740 customizations by Nick Robbins)
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # Main shutdown script for graceful lab environment shutdown
+#
+# v 2.8 Changes (2026-07-31) - HOL-2740 fork:
+# - CLI epilog: added Phase 3c (Supervisor CP VMs); also fixed pre-existing
+#   staleness (missing 4b, stale 19b) while touching this block. See
+#   VCFshutdown.py v3.10. (Avi Service Engine ordering was also fixed in
+#   v3.10, via a config.ini change, not a new phase — no epilog change
+#   needed for that half.)
+#
+# v 2.7 Changes (2026-07-31) - HOL-2740 fork:
+# - CLI epilog: reordered Phase 3/3b to match VCFshutdown.py v3.9 (WCP stop
+#   now runs before the cluster-pause step, not after).
 #
 # v 2.6 Changes (2026-06-01):
 # - Added run_vvf_shutdown() helper that imports VVFshutdown and routes VVF labs
@@ -113,8 +124,8 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 SCRIPT_NAME = 'Shutdown'
-SCRIPT_VERSION = '2.6'
-SCRIPT_DESCRIPTION = 'HOLFY27 Lab Shutdown Orchestration'
+SCRIPT_VERSION = '2.8'
+SCRIPT_DESCRIPTION = 'HOL-2740 Lab Shutdown Orchestration'
 
 # Log files
 SHUTDOWN_LOG = '/home/holuser/hol/shutdown.log'
@@ -222,13 +233,27 @@ def print_phase_header(lsf, phase_num, phase_name: str, dry_run: bool = False):
 def import_shutdown_module(module_name: str, lsf):
     """
     Dynamically import and run a shutdown module
-    
+
+    Resolves module_name relative to this file's own directory rather than
+    a hardcoded path -- a prior hardcoded '/home/holuser/hol/Shutdown/'
+    silently loaded a stale, unsynced copy there (VCFshutdown.py v3.8, from
+    2026-06-22) regardless of which checkout this script itself was run
+    from, even when the current repo checkout right next to it had a
+    current version. That stale copy predated Phase 3b (Supervisor cluster
+    pause) and Phase 3c (Supervisor CP VM shutdown) entirely, so both
+    silently never ran -- no error, since should_run() just cleanly
+    evaluated the code path that doesn't exist in that older file. Found by
+    comparing a --dry-run's actual phase output against this file's own
+    module directly, which produced Phase 3b/3c and the stale path's
+    subprocess run did not.
+
     :param module_name: Name of the module (without .py)
     :param lsf: lsfunctions module
     :return: Module or None if not found
     """
-    module_path = f'/home/holuser/hol/Shutdown/{module_name}.py'
-    
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    module_path = os.path.join(module_dir, f'{module_name}.py')
+
     if not os.path.isfile(module_path):
         write_shutdown_output(f'Shutdown module not found: {module_name}')
         return None
@@ -661,9 +686,11 @@ VCF Shutdown Phases (for --phase / --phases):
     1b    VCF Automation VM fallback (if Fleet API failed)
     2     Connect to vCenters
     2b    VSP Cluster Graceful Shutdown (vcf_services_runtime_shutdown.sh per site VIP)
-    3b    Graceful Supervisor Workload Shutdown (VKS, Harbor, etc.)
     3     Stop Workload Control Plane (WCP)
+    3b    Pause Supervisor Clusters (kubectl patch cluster ... paused=true)
+    3c    Shutdown Supervisor Control Plane VM(s) (direct ESXi connection)
     4     Shutdown Workload VMs (Tanzu, K8s) + Dynamic Discovery
+    4b    Shutdown VSP Platform VMs (vCenter primary; ESXi direct fallback)
     5     Shutdown Workload Domain NSX Edges
     6     Shutdown Workload Domain NSX Manager
     7     Shutdown Workload vCenters
@@ -681,7 +708,6 @@ VCF Shutdown Phases (for --phase / --phases):
     17c   Shutdown Post-Edge VMs (License Servers, etc.)
     18    Set Host Advanced Settings
     19    vSAN Elevator Operations
-    19b   Shutdown VSP Platform VMs
     19c   Pre-ESXi Shutdown Audit
     20    Shutdown ESXi Hosts
 
