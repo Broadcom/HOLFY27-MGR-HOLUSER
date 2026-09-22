@@ -469,45 +469,96 @@ def join_default_sso_components(
     sso_realm_id: str,
     vidb_resource_id: str,
     write: Optional[Callable[[str], None]],
-    join_nsx: bool = False,
+    join_nsx: bool = True,
+    join_mgmt_vc: bool = True,
+    join_wld_vc: bool = True,
+    join_nsx_mgmt: bool = True,
+    join_nsx_wld: bool = True,
+    join_ops: bool = True,
+    join_auto: bool = True,
 ) -> bool:
+    """Join all eligible Management and Workload components (vCenters, NSX Managers, Ops, VCFA) to SSO."""
     ok = True
+
+    # First attempt: Query all component auth sources dynamically via Fleet IAM query API
+    code_query, body_query = client.post_json('/suite-api/api/fleet-management/iam/components/auth-sources/query', {})
+    joined_cids: set[str] = set()
+
+    if code_query == 200 and isinstance(body_query, dict) and 'iamComponentAuthSources' in body_query:
+        for c in body_query['iamComponentAuthSources']:
+            cid = c.get('vcfComponentId')
+            ctype = (c.get('componentType') or '').upper()
+            cname = c.get('resourceName') or c.get('componentName') or (cid[:8] if cid else 'UNKNOWN')
+            status = c.get('status')
+
+            # Determine whether this component should be joined based on toggles
+            is_wld = 'wld' in cname.lower() or 'workload' in cname.lower()
+            if ctype == 'VCENTER':
+                if is_wld and not join_wld_vc:
+                    _log(write, f'  Fleet IAM: Join SSO vCenter {cname} skipped (join_wld_vc disabled).')
+                    continue
+                if not is_wld and not join_mgmt_vc:
+                    _log(write, f'  Fleet IAM: Join SSO vCenter {cname} skipped (join_mgmt_vc disabled).')
+                    continue
+            elif ctype == 'NSX_MANAGER':
+                if not join_nsx:
+                    continue
+                if is_wld and not join_nsx_wld:
+                    _log(write, f'  Fleet IAM: Join SSO NSX Manager {cname} skipped (join_nsx_wld disabled).')
+                    continue
+                if not is_wld and not join_nsx_mgmt:
+                    _log(write, f'  Fleet IAM: Join SSO NSX Manager {cname} skipped (join_nsx_mgmt disabled).')
+                    continue
+            elif ctype == 'VCF_OPERATIONS':
+                if not join_ops:
+                    _log(write, f'  Fleet IAM: Join SSO VCF Operations {cname} skipped (join_ops disabled).')
+                    continue
+            elif ctype == 'VCF_AUTOMATION':
+                if not join_auto:
+                    _log(write, f'  Fleet IAM: Join SSO VCF Automation {cname} skipped (join_auto disabled).')
+                    continue
+
+            if status == 'CONFIGURED':
+                _log(write, f'  Fleet IAM: Join SSO component {ctype} ({cname}) already configured — skip.')
+                if cid:
+                    joined_cids.add(cid)
+                continue
+
+            if cid:
+                code, body = client.join_sso_vcf_component(sso_realm_id, cid)
+                joined_cids.add(cid)
+            else:
+                code, body = client.join_sso_management_component(sso_realm_id, ctype)
+
+            if code in (200, 201, 204):
+                _log(write, f'  Fleet IAM: Join SSO component {ctype} ({cname}) OK (HTTP {code}).')
+            elif code == 409 or (isinstance(body, dict) and 'already' in json.dumps(body).lower()):
+                _log(write, f'  Fleet IAM: Join SSO component {ctype} ({cname}) already configured — skip.')
+            else:
+                _log(write, f'  Fleet IAM: Join SSO component {ctype} ({cname}) HTTP {code}: {str(body)[:400]}')
+                ok = False
+
+    # Fallback joins if specific standard management components were not covered by query
     try:
         vcid = client.get_eligible_vcenter_component_id(vidb_resource_id)
+        if vcid and vcid not in joined_cids and join_mgmt_vc:
+            code, body = client.join_sso_vcf_component(sso_realm_id, vcid)
+            if code in (200, 201, 204):
+                _log(write, f'  Fleet IAM: Join SSO VCENTER ({vcid[:8]}) OK.')
+            elif code == 409 or (isinstance(body, dict) and 'already' in json.dumps(body).lower()):
+                _log(write, f'  Fleet IAM: Join SSO VCENTER ({vcid[:8]}) already configured.')
     except Exception as e:
-        _log(write, f'  Fleet IAM: could not resolve vCenter component id: {e}')
-        return False
-    for label, fn, args in [
-        ('VCENTER', client.join_sso_vcf_component, (sso_realm_id, vcid)),
-        ('VCF_OPERATIONS', client.join_sso_management_component, (sso_realm_id, 'VCF_OPERATIONS')),
-        ('VCF_AUTOMATION', client.join_sso_management_component, (sso_realm_id, 'VCF_AUTOMATION')),
-    ]:
-        code, body = fn(*args)
+        _log(write, f'  Fleet IAM fallback vCenter lookup warning: {e}')
+
+    if join_ops and 'VCF_OPERATIONS' not in joined_cids:
+        code, body = client.join_sso_management_component(sso_realm_id, 'VCF_OPERATIONS')
         if code in (200, 201, 204):
-            _log(write, f'  Fleet IAM: Join SSO {label} OK (HTTP {code}).')
-        elif code == 409 or (isinstance(body, dict) and 'already' in json.dumps(body).lower()):
-            _log(write, f'  Fleet IAM: Join SSO {label} already configured — skip.')
-        else:
-            _log(write, f'  Fleet IAM: Join SSO {label} HTTP {code}: {str(body)[:500]}')
-            ok = False
-    if join_nsx:
-        code_query, body_query = client.post_json('/suite-api/api/fleet-management/iam/components/auth-sources/query', {})
-        if code_query == 200 and 'iamComponentAuthSources' in body_query:
-            for c in body_query['iamComponentAuthSources']:
-                cid = c.get('vcfComponentId')
-                cname = c.get('componentType', cid[:8] if cid else 'UNKNOWN')
-                if not cid or cid == vcid:
-                    continue
-                if c.get('status') == 'CONFIGURED':
-                    _log(write, f'  Fleet IAM: Join SSO additional component {cname} ({cid[:8]}) already configured — skip.')
-                    continue
-                code, body = client.join_sso_vcf_component(sso_realm_id, cid)
-                if code in (200, 201, 204):
-                    _log(write, f'  Fleet IAM: Join SSO additional component {cname} ({cid[:8]}) OK.')
-                elif code == 409 or (isinstance(body, dict) and 'already' in json.dumps(body).lower()):
-                    _log(write, f'  Fleet IAM: Join SSO additional component {cname} ({cid[:8]}) already configured — skip.')
-                else:
-                    _log(write, f'  Fleet IAM: Join SSO component {cname} ({cid[:8]}) HTTP {code}: {str(body)[:400]}')
+            _log(write, '  Fleet IAM: Join SSO VCF_OPERATIONS OK.')
+    if join_auto and 'VCF_AUTOMATION' not in joined_cids:
+        code, body = client.join_sso_management_component(sso_realm_id, 'VCF_AUTOMATION')
+        if code in (200, 201, 204):
+            _log(write, '  Fleet IAM: Join SSO VCF_AUTOMATION OK.')
+
     return ok
 
 
@@ -540,7 +591,7 @@ def log_fleet_sso_realm_summary(
                     write,
                     '  Fleet IAM diagnostic: no idpId — SSO Overview will look empty. '
                     'Prerequisites checkboxes alone do not create an IdP; run '
-                    'Tools/authentik_vcf_integration.py (Fleet IAM) or POST '
+                    'Tools/authentik/authentik_vcf_integration.py (Fleet IAM) or POST '
                     '.../identity-providers. If configure failed with '
                     'idp.pem.certificate.chains.max.exceeded, update Tools (PEM array fix). '
                     'OIDC discovery must return JSON from the ops appliance: '
@@ -651,50 +702,79 @@ def fleet_iam_post_scim_assign_and_join(
     authentik_scim_sync: Callable[[], bool],
     write: Optional[Callable[[str], None]],
     verify_tls: bool,
-    join_nsx: bool,
-    group_names: List[str],
-    vcf_role: str,
+    join_nsx: bool = True,
+    group_names: Optional[List[str]] = None,
+    vcf_role: str = 'vcf_administrator',
     viewer_group_names: Optional[List[str]] = None,
     vcf_viewer_role: str = 'vcf_viewer',
     sddc_admin_group_names: Optional[List[str]] = None,
     vcf_sddc_role: str = 'sddc_admin',
     sddc_viewer_group_names: Optional[List[str]] = None,
     vcf_sddc_viewer_role: str = 'sddc_viewer',
+    join_mgmt_vc: bool = True,
+    join_wld_vc: bool = True,
+    join_nsx_mgmt: bool = True,
+    join_nsx_wld: bool = True,
+    join_ops: bool = True,
+    join_auto: bool = True,
+    step_roles: bool = True,
+    step_join_sso: bool = True,
 ) -> bool:
     """After Authentik SCIM provider exists: run sync, assign roles, join SSO."""
     client = FleetIamClient(ops_base, ops_token, write, verify_tls)
     sync_ok = authentik_scim_sync()
     if not sync_ok:
         _log(write, '  WARNING: Authentik SCIM sync trigger reported failure — continuing with Join SSO.')
-    assign_ok = assign_vcf_admin_to_groups(client, sso_realm_id, group_names, vcf_role, write)
-    if viewer_group_names:
-        # Viewer groups should already be SCIM-synced by the time admin groups completed; use short wait.
-        viewer_ok = assign_vcf_admin_to_groups(
-            client, sso_realm_id, viewer_group_names, vcf_viewer_role, write, wait_timeout_sec=60,
+
+    assign_ok = True
+    if step_roles:
+        if group_names:
+            admin_ok = assign_vcf_admin_to_groups(client, sso_realm_id, group_names, vcf_role, write)
+            if not admin_ok:
+                assign_ok = False
+        if viewer_group_names:
+            viewer_ok = assign_vcf_admin_to_groups(
+                client, sso_realm_id, viewer_group_names, vcf_viewer_role, write, wait_timeout_sec=60,
+            )
+            if not viewer_ok:
+                _log(write, f'  WARNING: {vcf_viewer_role!r} assignment to viewer groups incomplete.')
+                assign_ok = False
+        if sddc_admin_group_names:
+            sddc_ok = assign_vcf_admin_to_groups(
+                client, sso_realm_id, sddc_admin_group_names, vcf_sddc_role, write, wait_timeout_sec=60,
+            )
+            if not sddc_ok:
+                _log(write, f'  WARNING: {vcf_sddc_role!r} assignment to SDDC admin groups incomplete.')
+                assign_ok = False
+        if sddc_viewer_group_names:
+            sddc_viewer_ok = assign_vcf_admin_to_groups(
+                client, sso_realm_id, sddc_viewer_group_names, vcf_sddc_viewer_role, write, wait_timeout_sec=60,
+            )
+            if not sddc_viewer_ok:
+                _log(write, f'  WARNING: {vcf_sddc_viewer_role!r} assignment to SDDC viewer groups incomplete.')
+                assign_ok = False
+        if not assign_ok:
+            _log(
+                write,
+                '  WARNING: VCF role assignment to SCIM groups incomplete (groups may sync later). '
+                'Re-run this script after Authentik→Fleet SCIM sync, or trigger sync in Authentik UI.',
+            )
+    else:
+        _log(write, '  Fleet IAM: Role assignment step skipped per configuration.')
+
+    join_ok = True
+    if step_join_sso:
+        join_ok = join_default_sso_components(
+            client, sso_realm_id, vidb_resource_id, write,
+            join_nsx=join_nsx,
+            join_mgmt_vc=join_mgmt_vc,
+            join_wld_vc=join_wld_vc,
+            join_nsx_mgmt=join_nsx_mgmt,
+            join_nsx_wld=join_nsx_wld,
+            join_ops=join_ops,
+            join_auto=join_auto,
         )
-        if not viewer_ok:
-            _log(write, f'  WARNING: {vcf_viewer_role!r} assignment to viewer groups incomplete.')
-            assign_ok = False
-    if sddc_admin_group_names:
-        sddc_ok = assign_vcf_admin_to_groups(
-            client, sso_realm_id, sddc_admin_group_names, vcf_sddc_role, write, wait_timeout_sec=60,
-        )
-        if not sddc_ok:
-            _log(write, f'  WARNING: {vcf_sddc_role!r} assignment to SDDC admin groups incomplete.')
-            assign_ok = False
-    if sddc_viewer_group_names:
-        sddc_viewer_ok = assign_vcf_admin_to_groups(
-            client, sso_realm_id, sddc_viewer_group_names, vcf_sddc_viewer_role, write, wait_timeout_sec=60,
-        )
-        if not sddc_viewer_ok:
-            _log(write, f'  WARNING: {vcf_sddc_viewer_role!r} assignment to SDDC viewer groups incomplete.')
-            assign_ok = False
-    join_ok = join_default_sso_components(client, sso_realm_id, vidb_resource_id, write, join_nsx=join_nsx)
-    if not assign_ok:
-        _log(
-            write,
-            '  WARNING: VCF role assignment to SCIM groups incomplete (groups may sync later). '
-            'Re-run this script after Authentik→Fleet SCIM sync, or trigger sync in Authentik UI.',
-        )
-    # Join SSO is what enables federated login on vCenter / Ops / VCFA; role bind is best-effort.
+    else:
+        _log(write, '  Fleet IAM: Component Join SSO step skipped per configuration.')
+
     return join_ok
