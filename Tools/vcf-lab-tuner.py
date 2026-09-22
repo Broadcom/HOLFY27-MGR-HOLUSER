@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.5.6 - 2026-09-21
+Version 2.5.7 - 2026-09-22
 Author: HOL Core Team
+
+v2.5.7: VCFA Cluster VCF 9.1.1+ Alignment, Leader Election & Keeper Upgrades:
+  - VCFA Drift Keeper 9.1.1+ Alignment (KEEPER_BODY_VCFA_911): Added dedicated 9.1.1+ drift keeper for VCFA to eliminate obsolete 9.1.0 leader election stripping, ReleaseTemplate driftDetection disablement, vsphere-cpi args, and Kyverno webhook mutations that fight Flux CD and corrupt HelmRelease reconciliation (e.g. vksm-stack).
+  - ValueFrom Conflict Prevention (_storm_vcfa_env_le_false, KEEPER_BODY_VCFA): Added valueFrom detection for ENABLE_LEADER_ELECTION environment variables. Prevents setting duplicate `value: "false"` on deployments utilizing ConfigMap key references, avoiding Kubernetes schema validation failures ("may not be specified when value is not empty").
+  - VCFA CAPI & Cron Stagger 9.1.1+ Gating (_storm_capi_le_false, _storm_vcfa_cron_stagger): Gated CAPI leader election ReleaseTemplate patching to 9.1.0 and ensured CronWorkflow staggering on 9.1.1+ only patches CronWorkflows directly without disabling Flux driftDetection on ReleaseTemplates.
 
 v2.5.6: Supervisor & Multi-Cluster Certificate Verification & Renewal Fixes:
   - Backing Secret & x509 Expiry Verification (_renew_certmanager_leaf_certs, chk_certs): Added proactive backing Secret and x509 certificate validation across all namespaces for all cluster types (Supervisor, VCFA, VSP, SSP). When Certificate CR status lacks notAfter or Secret is missing/stale, dynamically inspects Secret tls.crt data and openssl notAfter expiry.
@@ -555,8 +560,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.5.6"
-DATE    = "2026-09-21"
+VERSION = "2.5.7"
+DATE    = "2026-09-22"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -7800,11 +7805,14 @@ def _storm_scale_to_one(r, ns, name, cl, deploy_data=None):
 
 
 def _storm_capi_le_false(r, dep, cl, deploy_data=None):
+    label = f"{STORM_NAMESPACE}/{dep}: --leader-elect=false"
+    ver = _detect_vcfa_version(r) if cl == "vcfa" else (9, 1, 0)
+    if cl == "vcfa" and ver >= (9, 1, 1):
+        return ok("storm.footprint", label + " (native 9.1.1+)", cluster=cl)
     if deploy_data is not None:
         d = deploy_data
     else:
         d = r.read_json(f"kubectl get deploy {dep} -n {STORM_NAMESPACE} -o json 2>/dev/null", 30)
-    label = f"{STORM_NAMESPACE}/{dep}: --leader-elect=false"
     if not d:
         return warn("storm.footprint", label, "not found", cluster=cl)
     replicas = d.get("spec", {}).get("replicas")
@@ -7935,9 +7943,15 @@ def _storm_vcfa_env_le_false(r, dep, cl, deploy_data=None):
     if not d:
         return warn("storm.le_tuning", label, "not found", cluster=cl)
     env_vars = {}
+    has_value_from = False
     for c in d.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
         for e in c.get("env") or []:
-            env_vars[e.get("name")] = e.get("value")
+            if e.get("name") == "ENABLE_LEADER_ELECTION":
+                if "valueFrom" in e:
+                    has_value_from = True
+                env_vars[e.get("name")] = e.get("value")
+    if has_value_from:
+        return ok("storm.le_tuning", label + " (managed via ConfigMap/valueFrom)", cluster=cl)
     if env_vars.get("ENABLE_LEADER_ELECTION") == "false":
         return ok("storm.le_tuning", label, cluster=cl)
     res = fail("storm.le_tuning", label, f"currently {env_vars.get('ENABLE_LEADER_ELECTION', 'unset')}", cluster=cl)
@@ -8003,6 +8017,9 @@ def _storm_vcfa_vmsp_le_false(r, dep, cl, deploy_data=None):
 
 def _storm_vcfa_cron_stagger(r, cl):
     out = []
+    ver = _detect_vcfa_version(r) if cl == "vcfa" else (9, 1, 0)
+    is_911_plus = (cl == "vcfa" and ver >= (9, 1, 1))
+
     # wal-s3-cleanup
     label_wal = f"{STORM_NAMESPACE}/wal-s3-cleanup: staggered schedule (25 * * * *)"
     rc, cur_wal = r.read(f"kubectl get cronworkflow wal-s3-cleanup -n {STORM_NAMESPACE} -o jsonpath='{{.spec.schedules[0]}}' 2>/dev/null", 30)
@@ -8014,15 +8031,21 @@ def _storm_vcfa_cron_stagger(r, cl):
     else:
         res = fail("storm.cron_stagger", label_wal, f"currently top-of-the-hour '{cur_wal}'", cluster=cl)
         if may_act(r, "storm"):
-            wal_rt_val = {"spec": {"helm": {"driftDetection": {"mode": "disabled"}, "values": {"walCleanup": {"schedule": "25 * * * *"}}}}}
-            wal_rt_patch = json.dumps(wal_rt_val)
             wal_cw_patch = json.dumps({"spec": {"schedules": ["25 * * * *"]}})
-            r.write(
-                f"for rt in $(kubectl get releasetemplate -n {STORM_NAMESPACE} -o name 2>/dev/null | grep -E 'vmsp-backup-'); do "
-                f"kubectl patch $rt -n {STORM_NAMESPACE} --type=merge -p '{wal_rt_patch}' >/dev/null 2>&1 || true; done && "
-                f"kubectl patch cronworkflow wal-s3-cleanup -n {STORM_NAMESPACE} --type=merge -p '{wal_cw_patch}'",
-                f"storm cron-stagger: wal-s3-cleanup schedule -> 25 * * * *",
-                tier="transient", timeout=60)
+            if is_911_plus:
+                r.write(
+                    f"kubectl patch cronworkflow wal-s3-cleanup -n {STORM_NAMESPACE} --type=merge -p '{wal_cw_patch}'",
+                    f"storm cron-stagger: wal-s3-cleanup schedule -> 25 * * * *",
+                    tier="transient", timeout=60)
+            else:
+                wal_rt_val = {"spec": {"helm": {"driftDetection": {"mode": "disabled"}, "values": {"walCleanup": {"schedule": "25 * * * *"}}}}}
+                wal_rt_patch = json.dumps(wal_rt_val)
+                r.write(
+                    f"for rt in $(kubectl get releasetemplate -n {STORM_NAMESPACE} -o name 2>/dev/null | grep -E 'vmsp-backup-'); do "
+                    f"kubectl patch $rt -n {STORM_NAMESPACE} --type=merge -p '{wal_rt_patch}' >/dev/null 2>&1 || true; done && "
+                    f"kubectl patch cronworkflow wal-s3-cleanup -n {STORM_NAMESPACE} --type=merge -p '{wal_cw_patch}'",
+                    f"storm cron-stagger: wal-s3-cleanup schedule -> 25 * * * *",
+                    tier="transient", timeout=60)
             res.action = "schedule -> 25 * * * *"
             if not r.dry_run:
                 res.state, res.detail = "warn", "staggered schedule to 25 * * * *"
@@ -8042,14 +8065,20 @@ def _storm_vcfa_cron_stagger(r, cl):
     else:
         res = fail("storm.cron_stagger", label_etcd, f"currently top-of-the-hour '{cur_etcd}'", cluster=cl)
         if may_act(r, "storm"):
-            etcd_rt_patch = json.dumps({"spec": {"helm": {"driftDetection": {"mode": "disabled"}}}})
             etcd_cw_patch = json.dumps({"spec": {"schedules": ["40 */3 * * *"]}})
-            r.write(
-                f"for rt in $(kubectl get releasetemplate -n {STORM_NAMESPACE} -o name 2>/dev/null | grep -E 'vmsp-backup-'); do "
-                f"kubectl patch $rt -n {STORM_NAMESPACE} --type=merge -p '{etcd_rt_patch}' >/dev/null 2>&1 || true; done && "
-                f"kubectl patch cronworkflow scheduled-etcd-backup -n {STORM_NAMESPACE} --type=merge -p '{etcd_cw_patch}'",
-                f"storm cron-stagger: scheduled-etcd-backup schedule -> 40 */3 * * *",
-                tier="transient", timeout=60)
+            if is_911_plus:
+                r.write(
+                    f"kubectl patch cronworkflow scheduled-etcd-backup -n {STORM_NAMESPACE} --type=merge -p '{etcd_cw_patch}'",
+                    f"storm cron-stagger: scheduled-etcd-backup schedule -> 40 */3 * * *",
+                    tier="transient", timeout=60)
+            else:
+                etcd_rt_patch = json.dumps({"spec": {"helm": {"driftDetection": {"mode": "disabled"}}}})
+                r.write(
+                    f"for rt in $(kubectl get releasetemplate -n {STORM_NAMESPACE} -o name 2>/dev/null | grep -E 'vmsp-backup-'); do "
+                    f"kubectl patch $rt -n {STORM_NAMESPACE} --type=merge -p '{etcd_rt_patch}' >/dev/null 2>&1 || true; done && "
+                    f"kubectl patch cronworkflow scheduled-etcd-backup -n {STORM_NAMESPACE} --type=merge -p '{etcd_cw_patch}'",
+                    f"storm cron-stagger: scheduled-etcd-backup schedule -> 40 */3 * * *",
+                    tier="transient", timeout=60)
             res.action = "schedule -> 40 */3 * * *"
             if not r.dry_run:
                 res.state, res.detail = "warn", "staggered schedule to 40 */3 * * *"
@@ -9778,7 +9807,8 @@ fi
 
 for edep in policy-engine-server policy-insights-server cluster-service-server cluster-object-service-server; do
     EVAL=$($KB -n prelude get deploy "$edep" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENABLE_LEADER_ELECTION")].value}' 2>/dev/null || echo "")
-    if [ "$EVAL" != "false" ]; then
+    EVF=$($KB -n prelude get deploy "$edep" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENABLE_LEADER_ELECTION")].valueFrom}' 2>/dev/null || echo "")
+    if [ -z "$EVF" ] && [ "$EVAL" != "false" ]; then
         $KB set env deploy/"$edep" -n prelude ENABLE_LEADER_ELECTION=false >/dev/null 2>&1 \
             && log "drift corrected: ENABLE_LEADER_ELECTION=false set on prelude/$edep"
     fi
@@ -9842,6 +9872,55 @@ for rtname in ndc vmsp-identity vmsp-backup kyverno-1 cluster-api-installer; do
         fi
     done
 done
+
+exit 0
+"""
+
+KEEPER_BODY_VCFA_911 = r"""#!/bin/bash
+# vcf-lab-keeper-vcfa (VCF 9.1.1+ native alignment) - emitted by vcf-lab-tuner.py. Do not edit by hand.
+# Re-asserts VCFA drift targets safely without fighting Flux CD or stock charts:
+# 1. Logging operator fluentd buffer cleanup
+# 2. Cleanup runaway support-bundle jobs
+# 3. Cleanup stale system-shutdown Argo workflows
+# 4. Stagger CronWorkflows in vmsp-platform
+set -u
+KB="kubectl"
+log() { logger -t vcf-lab-keeper-vcfa "$1"; }
+
+# 1. Clean up logging-operator-fluentd buffer volume drift if overflowed
+FL_READY=$($KB get pod logging-operator-fluentd-0 -n vmsp-platform -o jsonpath='{.status.containerStatuses[?(@.name=="fluentd")].ready}' 2>/dev/null || echo "")
+if [ "$FL_READY" = "false" ]; then
+    $KB exec -n vmsp-platform logging-operator-fluentd-0 -c fluentd -- rm -rf /buffers/backup >/dev/null 2>&1 \
+        && log "drift corrected: purged stale /buffers/backup on logging-operator-fluentd-0"
+fi
+$KB exec -n vmsp-platform logging-operator-fluentd-0 -c fluentd -- sh -c 'rm -rf /buffers/backup/* /buffers/*.bak*' >/dev/null 2>&1
+
+# 2. Cleanup runaway support-bundle jobs
+SB_COUNT=$($KB -n vmsp-platform get jobs -l app.kubernetes.io/name=support-bundle-cluster-info-dump --no-headers 2>/dev/null | wc -l)
+if [ "$SB_COUNT" -gt 3 ]; then
+    $KB -n vmsp-platform delete jobs -l app.kubernetes.io/name=support-bundle-cluster-info-dump --cascade=foreground >/dev/null 2>&1 \
+        && log "drift corrected: deleted $SB_COUNT runaway support-bundle jobs"
+fi
+
+# 3. Cleanup stale system-shutdown Argo workflows
+ARGO_COUNT=$($KB -n vmsp-platform get workflow --no-headers 2>/dev/null | grep -c system-shutdown || true)
+if [ "$ARGO_COUNT" -gt 0 ]; then
+    $KB -n vmsp-platform delete workflow -l workflows.argoproj.io/workflow-template=system-shutdown --grace-period=0 >/dev/null 2>&1 \
+        && log "drift corrected: deleted $ARGO_COUNT stale system-shutdown workflow(s)"
+fi
+
+# 4. Stagger CronWorkflows in vmsp-platform
+WALSCHED=$($KB get cronworkflow wal-s3-cleanup -n vmsp-platform -o jsonpath='{.spec.schedules[0]}' 2>/dev/null || echo "")
+if [ -n "$WALSCHED" ] && [ "$WALSCHED" = "0 * * * *" ]; then
+    $KB patch cronworkflow wal-s3-cleanup -n vmsp-platform --type=merge -p '{"spec":{"schedules":["25 * * * *"]}}' >/dev/null 2>&1 \
+        && log "drift corrected: staggered wal-s3-cleanup schedule to 25 * * * *"
+fi
+
+ETCDSCHED=$($KB get cronworkflow scheduled-etcd-backup -n vmsp-platform -o jsonpath='{.spec.schedule}' 2>/dev/null || echo "")
+if [ -n "$ETCDSCHED" ] && [ "$ETCDSCHED" = "0 */3 * * *" ]; then
+    $KB patch cronworkflow scheduled-etcd-backup -n vmsp-platform --type=merge -p '{"spec":{"schedule":"40 */3 * * *"}}' >/dev/null 2>&1 \
+        && log "drift corrected: staggered scheduled-etcd-backup schedule to 40 */3 * * *"
+fi
 
 exit 0
 """
@@ -9954,7 +10033,10 @@ def do_keeper(r, cfg, cluster, remove=False, purge_legacy=False):
 
     ver = _detect_cluster_version(r, cluster)
     if cluster == "vcfa":
-        raw_body = KEEPER_BODY_VCFA
+        if ver >= (9, 1, 1):
+            raw_body = KEEPER_BODY_VCFA_911
+        else:
+            raw_body = KEEPER_BODY_VCFA
     elif ver >= (9, 1, 1):
         raw_body = KEEPER_BODY_VSP_911
     else:
