@@ -1,8 +1,10 @@
 # lsfunctions.py - HOLFY27 Core Functions Library
-# Version 3.25 - 2026-09-01
+# Version 3.26 - 2026-09-22
 # Author - Burke Azbill and HOL Core Team
 # Based on original startup work by Bill Call, Doug Baer, and the previous HOL Core Team
 # Enhanced with LabType support, NFS router communication, Ansible, and tdns-mgr integration
+# v3.26: Updated test_url() to include standard browser User-Agent and Accept headers
+#        and explicit allow_redirects=True to support web UIs with SSO redirect flows (e.g. SDDC Manager).
 # v3.25: Added set_console_docker_proxy() and clear_console_docker_proxy() to configure
 #        or clear the systemd Docker daemon HTTP/HTTPS proxy drop-in on the console VM.
 # v3.24: Added get_cloudinfo() (reads /tmp/cloudinfo.txt written by labstartup.sh)
@@ -2261,8 +2263,12 @@ def test_url(url, **kwargs):
     try:
         session = requests.Session()
         session.trust_env = False  # Ignore proxy environment vars
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        })
         
-        response = session.get(url, verify=verify_ssl, timeout=timeout, proxies=None)
+        response = session.get(url, verify=verify_ssl, timeout=timeout, proxies=None, allow_redirects=True)
         
         if response.status_code != 200:
             # Authenticated API endpoints (CCI, Fleet LCM) reject unauthenticated
