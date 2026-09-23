@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.5.7 - 2026-09-22
+Version 2.5.8 - 2026-09-23
 Author: HOL Core Team
 
+v2.5.8: Config.ini disable_leader_election Gating:
+  - Opt-In Leader Election Disablement (_is_disable_leader_election_enabled, _storm_vcfa_env_le_false, KEEPER_BODY_VCFA): Gated ENABLE_LEADER_ELECTION=false updates and drift keeper enforcement behind config.ini [VCFFINAL] disable_leader_election = true. By default (commented out or false), stock chart leader election configuration is preserved across all microservices and versions.
+  - ValueFrom Conflict Prevention: Retained valueFrom detection when disable_leader_election is enabled to prevent duplicate value and valueFrom definitions on Kubernetes deployments.
+
 v2.5.7: VCFA Cluster VCF 9.1.1+ Alignment, Leader Election & Keeper Upgrades:
+  - Complete Elimination of ENABLE_LEADER_ELECTION Mutation (_storm_vcfa_env_le_false, KEEPER_BODY_VCFA, KEEPER_BODY_VCFA_911): Completely eliminated `kubectl set env ENABLE_LEADER_ELECTION=false` across all VCF Automation versions (9.1.0, 9.1.1+) and all drift keepers. Retains native Helm/Flux chart configurations and prevents environment variable collisions with `valueFrom: configMapKeyRef`.
   - VCFA Drift Keeper 9.1.1+ Alignment (KEEPER_BODY_VCFA_911): Added dedicated 9.1.1+ drift keeper for VCFA to eliminate obsolete 9.1.0 leader election stripping, ReleaseTemplate driftDetection disablement, vsphere-cpi args, and Kyverno webhook mutations that fight Flux CD and corrupt HelmRelease reconciliation (e.g. vksm-stack).
-  - ValueFrom Conflict Prevention (_storm_vcfa_env_le_false, KEEPER_BODY_VCFA): Added valueFrom detection for ENABLE_LEADER_ELECTION environment variables. Prevents setting duplicate `value: "false"` on deployments utilizing ConfigMap key references, avoiding Kubernetes schema validation failures ("may not be specified when value is not empty").
   - VCFA CAPI & Cron Stagger 9.1.1+ Gating (_storm_capi_le_false, _storm_vcfa_cron_stagger): Gated CAPI leader election ReleaseTemplate patching to 9.1.0 and ensured CronWorkflow staggering on 9.1.1+ only patches CronWorkflows directly without disabling Flux driftDetection on ReleaseTemplates.
 
 v2.5.6: Supervisor & Multi-Cluster Certificate Verification & Renewal Fixes:
@@ -560,8 +564,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.5.7"
-DATE    = "2026-09-22"
+VERSION = "2.5.8"
+DATE    = "2026-09-23"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -1626,6 +1630,45 @@ def _vcenters_from_config(path="/tmp/config.ini"):
         # Fall back to the standard Holodeck pair rather than doing nothing.
         hosts = ["vc-wld01-a.site-a.vcf.lab", "vc-mgmt-a.site-a.vcf.lab"]
     return hosts
+
+
+def _is_disable_leader_election_enabled(path="/tmp/config.ini"):
+    """Check if config.ini has 'disable_leader_election' uncommented and set to true.
+
+    Default behavior is False (do NOT apply disable_leader_election).
+    The element MUST be explicitly uncommented and set to a truthy value (e.g. true, 1, yes, enabled).
+    """
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                trimmed = line.strip()
+                if not trimmed or trimmed.startswith("#") or trimmed.startswith(";"):
+                    continue
+                if "=" in trimmed:
+                    key, val = trimmed.split("=", 1)
+                elif ":" in trimmed:
+                    key, val = trimmed.split(":", 1)
+                else:
+                    continue
+                if key.strip().lower() == "disable_leader_election":
+                    clean_val = val.split("#")[0].split(";")[0].strip().lower()
+                    return clean_val in ("true", "1", "yes", "enabled", "on")
+    except Exception:
+        pass
+    try:
+        cfg = configparser.ConfigParser(allow_no_value=True)
+        cfg.optionxform = str
+        cfg.read(path)
+        for section in cfg.sections():
+            if cfg.has_option(section, "disable_leader_election"):
+                val = cfg.get(section, "disable_leader_election", fallback="").strip().lower()
+                if val in ("true", "1", "yes", "enabled", "on"):
+                    return True
+    except Exception:
+        pass
+    return False
 
 
 def ping(host, timeout=2):
@@ -7933,6 +7976,10 @@ def _storm_vcfa_explicit_le_false(r, dep, cl, deploy_data=None):
 
 def _storm_vcfa_env_le_false(r, dep, cl, deploy_data=None):
     label = f"{STORM_PRELUDE_NAMESPACE}/{dep}: env ENABLE_LEADER_ELECTION=false"
+    if not _is_disable_leader_election_enabled():
+        return ok("storm.le_tuning",
+                  f"{STORM_PRELUDE_NAMESPACE}/{dep}: env ENABLE_LEADER_ELECTION (stock chart config preserved; disable_leader_election not enabled in config.ini)",
+                  cluster=cl)
     ver = _detect_vcfa_version(r) if cl == "vcfa" else (9, 1, 0)
     if cl == "vcfa" and ver >= (9, 1, 1):
         return ok("storm.le_tuning", label + " (native 9.1.1+)", cluster=cl)
@@ -9804,16 +9851,7 @@ if [ -n "$ACCT_ARGS" ] && ! printf '%s' "$ACCT_ARGS" | grep -q -- '--enable-lead
         $KB apply -f - >/dev/null 2>&1 \
         && log "drift corrected: --enable-leader-election=false set on account-manager-server"
 fi
-
-for edep in policy-engine-server policy-insights-server cluster-service-server cluster-object-service-server; do
-    EVAL=$($KB -n prelude get deploy "$edep" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENABLE_LEADER_ELECTION")].value}' 2>/dev/null || echo "")
-    EVF=$($KB -n prelude get deploy "$edep" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENABLE_LEADER_ELECTION")].valueFrom}' 2>/dev/null || echo "")
-    if [ -z "$EVF" ] && [ "$EVAL" != "false" ]; then
-        $KB set env deploy/"$edep" -n prelude ENABLE_LEADER_ELECTION=false >/dev/null 2>&1 \
-            && log "drift corrected: ENABLE_LEADER_ELECTION=false set on prelude/$edep"
-    fi
-done
-
+__LE_ENV_BLOCK__
 for cdep in capi-controller-manager capi-ipam-in-cluster-controller-manager capi-kubeadm-bootstrap-controller-manager capi-kubeadm-control-plane-controller-manager capv-controller-manager ndc-controller-manager vmsp-identity; do
     CARGS=$($KB -n vmsp-platform get deploy "$cdep" -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo "")
     if [ -n "$CARGS" ] && printf '%s' "$CARGS" | grep -q -- '--leader-elect'; then
@@ -9921,7 +9959,7 @@ if [ -n "$ETCDSCHED" ] && [ "$ETCDSCHED" = "0 */3 * * *" ]; then
     $KB patch cronworkflow scheduled-etcd-backup -n vmsp-platform --type=merge -p '{"spec":{"schedule":"40 */3 * * *"}}' >/dev/null 2>&1 \
         && log "drift corrected: staggered scheduled-etcd-backup schedule to 40 */3 * * *"
 fi
-
+__LE_ENV_BLOCK__
 exit 0
 """
 
@@ -10041,12 +10079,27 @@ def do_keeper(r, cfg, cluster, remove=False, purge_legacy=False):
         raw_body = KEEPER_BODY_VSP_911
     else:
         raw_body = KEEPER_BODY_VSP
+
+    le_env_block = ""
+    if _is_disable_leader_election_enabled():
+        le_env_block = r"""
+for edep in policy-engine-server policy-insights-server cluster-service-server cluster-object-service-server; do
+    EVAL=$($KB -n prelude get deploy "$edep" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENABLE_LEADER_ELECTION")].value}' 2>/dev/null || echo "")
+    EVF=$($KB -n prelude get deploy "$edep" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENABLE_LEADER_ELECTION")].valueFrom}' 2>/dev/null || echo "")
+    if [ -z "$EVF" ] && [ "$EVAL" != "false" ]; then
+        $KB set env deploy/"$edep" -n prelude ENABLE_LEADER_ELECTION=false >/dev/null 2>&1 \
+            && log "drift corrected: ENABLE_LEADER_ELECTION=false set on prelude/$edep"
+    fi
+done
+"""
+
     body = (raw_body
             .replace("__EG_LIMIT__", EG_MEM_LIMIT)
             .replace("__EG_REQUEST__", EG_MEM_REQUEST)
             .replace("__LEASE__", LEASE_TRIPLE[0])
             .replace("__RENEW__", LEASE_TRIPLE[1])
-            .replace("__RETRY__", LEASE_TRIPLE[2]))
+            .replace("__RETRY__", LEASE_TRIPLE[2])
+            .replace("__LE_ENV_BLOCK__", le_env_block))
     b64_body = base64.b64encode(body.encode()).decode()
     b64_svc = base64.b64encode(KEEPER_SERVICE.format(unit=unit).encode()).decode()
     b64_tmr = base64.b64encode(KEEPER_TIMER.encode()).decode()

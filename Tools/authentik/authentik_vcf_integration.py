@@ -318,7 +318,7 @@ def discover_vcf_topology(cfg: configparser.ConfigParser) -> VcfTopology:
         'group': 'VCF',
         'meta_publisher': 'VMware',
         'icon_name': 'VCF-VSPHERE-9.webp',
-        'group_bindings': ['prod-admins', 'prod-readonly'],
+        'group_bindings': ['prod-admins', 'prod-readonly', 'dev-admins', 'dev-readonly'],
     })
 
     # Additional vCenters
@@ -326,8 +326,7 @@ def discover_vcf_topology(cfg: configparser.ConfigParser) -> VcfTopology:
         if vc['fqdn'] == primary_mgmt['fqdn']:
             continue
         short_name = vc['fqdn'].split('.')[0]
-        label = f"vCenter ({vc['role']} {vc['site']})"
-        bindings = ['prod-admins', 'prod-readonly'] if vc['role'] == 'mgmt' else ['dev-admins', 'dev-readonly']
+        label = f"vCenter ({vc['role']} {vc['site']})" if len(topo.vcenters) > 1 else f"vCenter ({vc['role']})"
         topo.app_tiles.append({
             'name': label,
             'slug': f"vc-{short_name}",
@@ -336,14 +335,13 @@ def discover_vcf_topology(cfg: configparser.ConfigParser) -> VcfTopology:
             'group': 'VCF',
             'meta_publisher': 'VMware',
             'icon_name': 'VCF-VSPHERE-9.webp',
-            'group_bindings': bindings,
+            'group_bindings': ['prod-admins', 'prod-readonly', 'dev-admins', 'dev-readonly'],
         })
 
     # NSX Managers
     for nsx in topo.nsx_managers:
         short_name = nsx['fqdn'].split('.')[0]
         label = f"NSX ({nsx['role']} {nsx['site']})" if len(topo.nsx_managers) > 1 else 'NSX (mgmt)'
-        bindings = ['prod-admins', 'prod-readonly'] if nsx['role'] == 'mgmt' else ['dev-admins', 'dev-readonly']
         topo.app_tiles.append({
             'name': label,
             'slug': f"nsx-{short_name}",
@@ -352,7 +350,7 @@ def discover_vcf_topology(cfg: configparser.ConfigParser) -> VcfTopology:
             'group': 'VCF',
             'meta_publisher': 'VMware',
             'icon_name': 'NSX-9.webp',
-            'group_bindings': bindings,
+            'group_bindings': ['prod-admins', 'prod-readonly', 'dev-admins', 'dev-readonly'],
         })
 
     # Ops instances
@@ -367,7 +365,7 @@ def discover_vcf_topology(cfg: configparser.ConfigParser) -> VcfTopology:
             'group': 'VCF',
             'meta_publisher': 'VMware',
             'icon_name': 'VCF-Ops-9.webp',
-            'group_bindings': ['prod-admins', 'prod-readonly'],
+            'group_bindings': ['prod-admins', 'prod-readonly', 'dev-admins', 'dev-readonly'],
         })
 
     # VCFA instances
@@ -382,7 +380,7 @@ def discover_vcf_topology(cfg: configparser.ConfigParser) -> VcfTopology:
             'group': 'VCF',
             'meta_publisher': 'VMware',
             'icon_name': 'VCF-Auto-9.png',
-            'group_bindings': ['prod-admins'],
+            'group_bindings': ['prod-admins', 'dev-admins'],
         })
 
     return topo
