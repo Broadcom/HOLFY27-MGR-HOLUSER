@@ -3,6 +3,8 @@
 vcf-lab-tuner.py
 Version 2.5.8 - 2026-09-23
 Author: HOL Core Team
+v 2.5.9: SSP Workload Kubeconfig Cache TTL & Cluster Re-installation Resilience:
+  - Resilient SSP Workload Kubeconfig Caching: Added 300s TTL check to _wrap_ssp_cmd preamble on ssp-i, ensuring cached /tmp/.ssp-wlkc automatically refreshes from the ssp-kubeconfig secret if stale, expired, or after SSP cluster re-installation.
 
 v2.5.8: Config.ini disable_leader_election Gating:
   - Opt-In Leader Election Disablement (_is_disable_leader_election_enabled, _storm_vcfa_env_le_false, KEEPER_BODY_VCFA): Gated ENABLE_LEADER_ELECTION=false updates and drift keeper enforcement behind config.ini [VCFFINAL] disable_leader_election = true. By default (commented out or false), stock chart leader election configuration is preserved across all microservices and versions.
@@ -564,7 +566,7 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.5.8"
+VERSION = "2.5.9"
 DATE    = "2026-09-23"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
@@ -1255,7 +1257,12 @@ def _wrap_ssp_cmd(cmd):
     if is_capi:
         return cmd
 
-    preamble = 'WLKC=/tmp/.ssp-wlkc; [ -s "$WLKC" ] || (kubectl -n ssp get secret ssp-kubeconfig -o jsonpath="{.data.value}" 2>/dev/null | base64 -d > "$WLKC"); '
+    preamble = (
+        'WLKC=/tmp/.ssp-wlkc; '
+        'if [ ! -s "$WLKC" ] || [ $(($(date +%s) - $(stat -c %Y "$WLKC" 2>/dev/null || echo 0))) -ge 300 ]; then '
+        'kubectl -n ssp get secret ssp-kubeconfig -o jsonpath="{.data.value}" 2>/dev/null | base64 -d > "$WLKC" 2>/dev/null && chmod 600 "$WLKC"; '
+        'fi; '
+    )
     wrapped_cmd = re.sub(r'\bkubectl\b', r'kubectl --kubeconfig="$WLKC"', cmd)
     return preamble + wrapped_cmd
 
