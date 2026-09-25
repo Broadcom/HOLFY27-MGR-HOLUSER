@@ -27,43 +27,46 @@ The integration provides federated authentication, user/group provisioning, and 
 
 ```mermaid
 flowchart TD
+    accTitle: Authentik & VCF System Architecture
+    accDescr: High-level topology diagram showing Authentik Identity Provider, Holorouter Gateway, Site A, and Site B infrastructure data flows.
+
     subgraph authGroup [Authentik Identity Provider]
-        AK_OIDC[OAuth2 Provider: VCF OIDC<br/>Redirect URIs: vc-mgmt-a, vc-wld01-a, vc-mgmt-b]
-        AK_SCIM[SCIM Provider: VCF SCIM<br/>User/Group Backchannel Sync]
-        AK_LDAP[LDAP Provider: dc=vcf,dc=lab<br/>LDAP Outpost: NodePort 30389/30636]
-        AK_TILES[Portal Application Tiles<br/>Mgmt/WLD vCenter, NSX, Ops, VCFA]
+        AK_OIDC["OAuth2 Provider: VCF OIDC<br/>Redirect URIs: vc-mgmt-a, vc-wld01-a, vc-mgmt-b"]
+        AK_SCIM["SCIM Provider: VCF SCIM<br/>User/Group Backchannel Sync"]
+        AK_LDAP["LDAP Provider: dc=vcf,dc=lab<br/>LDAP Outpost: NodePort 30389/30636"]
+        AK_TILES["Portal Application Tiles<br/>Mgmt/WLD vCenter, NSX, Ops, VCFA"]
     end
 
     subgraph routerGroup [Holorouter Gateway]
-        HR_NGINX[NGINX & IPTables Port Forwarder<br/>HTTP/HTTPS 80/443 | LDAP 389/636]
-        HR_K8S[K8s Cluster<br/>authentik-server, authentik-worker, ak-outpost-ldap]
+        HR_NGINX["NGINX & IPTables Port Forwarder<br/>HTTP/HTTPS 80/443 | LDAP 389/636"]
+        HR_K8S["K8s Cluster<br/>authentik-server, authentik-worker, ak-outpost-ldap"]
     end
 
     subgraph siteAGroup [Site A Infrastructure]
-        OPS_A[VCF Operations: ops-a.site-a.vcf.lab<br/>Fleet IAM / SSO Realm]
-        VC_MGMT_A[Mgmt vCenter: vc-mgmt-a<br/>Embedded VIDB]
-        VC_WLD_A[Workload vCenter: vc-wld01-a]
-        NSX_A[NSX Managers: nsx-mgmt-01a, nsx-wld01-01a]
-        AUTO_A[VCF Automation: auto-a]
+        OPS_A["VCF Operations: ops-a.site-a.vcf.lab<br/>Fleet IAM / SSO Realm"]
+        VC_MGMT_A["Mgmt vCenter: vc-mgmt-a<br/>Embedded VIDB"]
+        VC_WLD_A["Workload vCenter: vc-wld01-a"]
+        NSX_A["NSX Managers: nsx-mgmt-01a, nsx-wld01-01a"]
+        AUTO_A["VCF Automation: auto-a"]
     end
 
     subgraph siteBGroup [Site B Infrastructure]
-        OPS_B[VCF Operations: ops-b.site-b.vcf.lab]
-        VC_MGMT_B[Mgmt vCenter: vc-mgmt-b]
-        NSX_B[NSX Managers: nsx-mgmt-01b]
+        OPS_B["VCF Operations: ops-b.site-b.vcf.lab"]
+        VC_MGMT_B["Mgmt vCenter: vc-mgmt-b"]
+        NSX_B["NSX Managers: nsx-mgmt-01b"]
     end
 
-    HR_NGINX -->|TCP 389/636| AK_LDAP
-    AK_OIDC -->|OIDC Auth Flow| VC_MGMT_A
-    AK_OIDC -->|OIDC Auth Flow| VC_WLD_A
-    AK_OIDC -->|OIDC Auth Flow| VC_MGMT_B
-    AK_SCIM -->|SCIM v2 Sync| VC_MGMT_A
-    OPS_A -->|SSO Realm Join| VC_MGMT_A
-    OPS_A -->|SSO Realm Join| VC_WLD_A
-    OPS_A -->|SSO Realm Join| NSX_A
-    OPS_A -->|SSO Realm Join| AUTO_A
-    OPS_B -->|SSO Realm Join| VC_MGMT_B
-    OPS_B -->|SSO Realm Join| NSX_B
+    HR_NGINX -->|"TCP 389/636"| AK_LDAP
+    AK_OIDC -->|"OIDC Auth Flow"| VC_MGMT_A
+    AK_OIDC -->|"OIDC Auth Flow"| VC_WLD_A
+    AK_OIDC -->|"OIDC Auth Flow"| VC_MGMT_B
+    AK_SCIM -->|"SCIM v2 Sync"| VC_MGMT_A
+    OPS_A -->|"SSO Realm Join"| VC_MGMT_A
+    OPS_A -->|"SSO Realm Join"| VC_WLD_A
+    OPS_A -->|"SSO Realm Join"| NSX_A
+    OPS_A -->|"SSO Realm Join"| AUTO_A
+    OPS_B -->|"SSO Realm Join"| VC_MGMT_B
+    OPS_B -->|"SSO Realm Join"| NSX_B
 ```
 
 ---
@@ -72,6 +75,8 @@ flowchart TD
 
 ```mermaid
 sequenceDiagram
+    accTitle: Authentik VCF Integration Sequence Flow
+    accDescr: Sequence flow detailing multi-step automated integration between VCF Operations, vCenter, Holorouter, and Authentik.
     autonumber
     participant Init as VCFfinal.py / CLI
     participant Script as authentik_vcf_integration.py
