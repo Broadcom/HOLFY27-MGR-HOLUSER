@@ -1,12 +1,10 @@
 # vcf-lab-tuner.py — Design & Reference
 
-**Version 3.9.7 — 2026-09-23**
+**Version 3.9.8 — 2026-09-25**
 **Author:** Burke Azbill and HOL Core Team
 **Status:** `vcf-lab-tuner.py` **v2.5.8**. All four clusters supported (VSP, VCFA, SSP, Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh` **and** `vcfa-stabilizer.sh`, enabling legacy scripts to be safely retired. **Full native certificate renewal engine (v2.0.0)**, dynamic component discovery & SSP cluster parity (v2.1.0), **VCFA single-node leader election hardening, Argo CronWorkflow staggering, Kyverno webhook resilience, and enhanced drift keeper (v2.2.0)**, **cluster-agnostic workload CPU request right-sizing analysis with interactive HTML dashboard export (v2.3.0)**, **expanded top 10 over-allocated workloads terminal summary (v2.3.2)**, **version-aware SDS NACK remediation & 9.1.1+ upstream alignment (v2.4.0)**, **version-aware VCFA resource naming & HA replica evaluation alignment (v2.4.1)**, **two-tier revert to defaults architecture with automated single pre-remediation snapshot retention (v2.5.0)**, **VCF 9.1.1+ native settings alignment & interruption prevention across VCFA & VSP (v2.5.1/v2.5.2)**, **multi-node proxy drift peer node execution fix (v2.5.3)**, **Supervisor cluster VCF 9.1.1+ alignment, ESXi spherelet SSH reachability auto-enable, and pod sweep gating (v2.5.4)**, **VCFA SeaweedFS mTLS certificate freshness check & auth pod backoff recovery (v2.5.5)**, **Supervisor & multi-cluster backing secret & x509 certificate renewal fixes (v2.5.6)**, **VCFA 9.1.1+ native upstream alignment & dedicated 9.1.1+ keeper profiles eliminating obsolete mutations (v2.5.7)**, **config.ini disable_leader_election opt-in gating preventing HelmRelease / vksm-stack upgrade collisions (v2.5.8)**, and **resilient SSP workload kubeconfig cache TTL refresh (v2.5.9)**. Remediation implemented for every section, keeper management working, deprecation banners applied, and offline unit test suite passing. Validated live on DevPod.
 
 ---
-
-
 
 ## Table of Contents
 
@@ -14,12 +12,12 @@
 2. [The four clusters](#2-the-four-clusters)
 3. [Run locations and hop chains](#3-run-locations-and-hop-chains)
 4. [CLI reference](#4-cli-reference)
-  - [4a. Every flag, in detail](#4a-every-flag-in-detail)
-  - [4b. What each mode is for](#4b-what-each-mode-is-for)
-  - [4c. Sections, by cluster](#4c-sections-by-cluster)
-  - [4c-bis. Coverage audit against the legacy readers](#4c-bis-coverage-audit-against-the-legacy-readers)
-  - [4d. Recommended placement](#4d-recommended-placement)
-  - [4e. Report usage — the vsp-health / auto-health equivalents](#4e-report-usage--the-vsp-healthpy--auto-healthpy-equivalents)
+   - [4a. Every flag, in detail](#4a-every-flag-in-detail)
+   - [4b. What each mode is for](#4b-what-each-mode-is-for)
+   - [4c. Sections, by cluster](#4c-sections-by-cluster)
+   - [4c-bis. Coverage audit against the legacy readers](#4c-bis-coverage-audit-against-the-legacy-readers)
+   - [4d. Recommended placement](#4d-recommended-placement)
+   - [4e. Report usage — the `vsp-health.py` / `auto-health.py` equivalents](#4e-report-usage--the-vsp-healthpy--auto-healthpy-equivalents)
 5. [Mode × cluster capability matrix](#5-mode--cluster-capability-matrix)
 6. [Check provenance](#6-check-provenance)
 7. [One-shot vs recurring, and the keeper](#7-one-shot-vs-recurring-and-the-keeper)
@@ -34,15 +32,13 @@
 16. [Per-source-script command reference](#16-per-source-script-command-reference)
 17. [Response to the remediate-lab parity report](#17-response-to-the-remediate-lab-parity-report)
 18. [Version History](#18-version-history)
+19. [End State](#19-end-state)
 
 ---
-
-
 
 ## 1. Why this exists
 
 Fifteen scripts (~28,300 lines) overlap heavily. The concrete damage documented in the analysis:
-
 
 | Problem                            | Example                                                                                                                         |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
@@ -53,7 +49,6 @@ Fifteen scripts (~28,300 lines) overlap heavily. The concrete damage documented 
 | Silent no-ops                      | `confighol`'s sizing patch wrote a field no controller reads; its Supervisor proxy never applied at all (both fixed 2026-08-14) |
 | Unsafe "safe" mode                 | `supervisor_stabilizer.py --dry-run` restarted services (fixed 2026-08-14)                                                      |
 | Irreconcilable policy              | Two pod-sweepers: unthresholded force-delete vs damped-and-capped                                                               |
-
 
 The goal is **not** fewer lines. It is *one place* where each check lives, *one* definition of each
 policy constant, and a `--dry-run` that is structurally incapable of mutating.
@@ -67,14 +62,11 @@ policy constant, and a `--dry-run` that is structurally incapable of mutating.
 
 ---
 
-
-
 ## 2. The four clusters
 
 Cluster targeting must be **explicit and parameterized**, never implied by a filename. Note
 `vmsp-platform` exists in *both* the VSP fleet and VCFA clusters with different contents — any log line
 naming a namespace without its cluster is ambiguous.
-
 
 | `--cluster`  | Target                                                                                              | Reached via                                                               | Namespaces                                                                                                                                                        |
 | ------------ | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -83,7 +75,6 @@ naming a namespace without its cluster is ambiguous.
 | `supervisor` | vSphere Supervisor (WCP/SCP) + its vCenter. CP discovered per-vCenter via `decryptK8Pwd.py`         | manager → vCenter → SCP (two hops as `root`)                              | `kube-system`, `vmware-system-cert-manager`, `svc-cci-ns-*`, `svc-tkg-*`, `vmware-system-*`                                                                       |
 | `ssp`        | Security Services Platform (SSP 5.2 / `ssp-i`), CP VIP `10.1.0.10`, owned VIPs `.10`/`.21`, UI `.11` | direct SSH from manager (`sysadmin` + `sudo`, auto-routing via `_wrap_ssp_cmd`) | `nsxi-platform`, `metallb-system`, `projectcontour`, `cert-manager`, `kube-system`                                                                                |
 | `all`        | every reachable cluster above                                                                       | —                                                                         | —                                                                                                                                                                 |
-
 
 The registry is defined dynamically via `get_cluster_configs(args)`:
 
@@ -140,8 +131,6 @@ cluster and exit `0`, matching existing behaviour (`confighol-9.1.py:5435`, `vsp
 
 ---
 
-
-
 ## 3. Run locations and hop chains
 
 The script always **runs on the manager VM**. It never needs to be copied to a node.
@@ -167,14 +156,11 @@ sequenceDiagram
     MGR-->>OP: rows + RESULT summary + exit code
 ```
 
-
-
 Why manager-side and not on a node: VSP/VCFA control-plane nodes are CAPI cattle and get
 rolling-replaced (`vsp-health-monitor.py:127-140` records `vsp-01a-txhml → vsp-01a-x8z9d`). Anything
 installed on a node must be re-installable and must not hold state the tool depends on.
 
 `sudo` differs per target and must stay in the transport layer, not leak into checks:
-
 
 | Target        | Invocation                                                                                                                                                                                                                                                                                                  | Source                          |
 | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
@@ -184,12 +170,9 @@ installed on a node must be re-installable and must not hold state the tool depe
 | vCenter → SCP | base64 pw file on the vCenter hop, `bash -s < file`                                                                                                                                                                                                                                                         | `supervisor_stabilizer.py:1666` |
 | ESXi          | direct `root` SSH (auto-enabling `TSM-SSH` service via vCenter pyVmomi when stopped)                                                                                                                                                                                                                        | `supervisor_stabilizer.py:2614` |
 
-
 > `kubectl` on a VSP node requires a **login** shell (`sudo -S -i`) because it is only on root's PATH
 > there. On the VCFA node `sudo -S` alone is used. Getting this wrong produces `command not found`
 > that reads like a broken cluster.
-
-
 
 ### ⚠ Payload shipping: `sudo -i` re-parses, so never let an outer shell see a `$`
 
@@ -222,8 +205,6 @@ time the pipe is created, so the inner `bash` reading from the pipe does not con
 Implemented in `DirectTransport._wrap()`.
 
 ---
-
-
 
 ## 4. CLI reference
 
@@ -277,7 +258,6 @@ typos in scripted use.
 
 ### 4a. Every flag, in detail
 
-
 | Flag                                                      | Values / default                                                                                                                                           | Notes                                                                                                                                                                                                               |
 | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--cluster`                                               | `vsp` \| `vcfa` \| `supervisor` \| `ssp` \| `all` — **required**                                                                                           | `all` visits each reachable cluster in turn; an absent cluster is reported and skipped, not an error                                                                                                                |
@@ -319,7 +299,6 @@ typos in scripted use.
 
 ### 4b. What each mode is for
 
-
 | Mode             | Mutates?            | Use it when                                                                                                                                                                                            |
 | ---------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `report`         | No                  | You want the full picture. This is the `vsp-health.py` / `auto-health.py` experience                                                                                                                   |
@@ -330,12 +309,10 @@ typos in scripted use.
 | `rollback`       | Yes                 | Restore exact pre-remediation cluster state from a recorded snapshot bundle (`snapshot-latest.json` or specified `--snapshot PATH`)                                                                   |
 | `reset-defaults` | Yes                 | Return cluster to stock VMware 9.1.1 defaults via Flux CD reconciliation, manifest reset (KCM/scheduler/etcd), Kyverno failurePolicy reset (`Fail`), CPI DS reset, CronWorkflow reset, and keeper purge |
 
-
 `preflight` and `report` differ only in verbosity of intent: both are read-only and
 `Runner.write()` raises in either, so neither can mutate even if a future section tries.
 
 ### 4c. Sections, by cluster
-
 
 | Section       | `vsp` | `vcfa` | `supervisor` | `ssp` | Remediates in                                                                                                                                |
 | ------------- | ----- | ------ | ------------ | ----- | -------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -366,7 +343,6 @@ typos in scripted use.
 | `contentlib`  |       |        | ✓            |       | `tune`, `remediate` — Subscribed content library trust store and synchronization                                                             |
 | `webhooks`    |       |        | ✓            |       | `tune`, `remediate` — ValidatingWebhookConfiguration caBundle synchronization via `cert-manager.io/inject-ca-from`                          |
 
-
 Every mode also prints the **Node Capacity vs Resource Requests Allocation** table in the `nodes`
 section — the same `+---+` grid `vsp-health.py` and `auto-health.py` render, with identical columns and
 `N/A (Untolerated Taint)` handling for control-plane/NoSchedule nodes. It is diagnostic context rather
@@ -375,8 +351,6 @@ because it is the fastest way to see *why* pods are Pending.
 
 ---
 
-
-
 ## 4c-bis. Coverage audit against the legacy readers
 
 The honest answer to "what is being lost". v1.0.0 claimed *complete* on the basis of parity across the
@@ -384,7 +358,6 @@ sections it had chosen to port — which was circular. The audit below is agains
 `SECTION_MAP` in each legacy tool.
 
 ### `vsp-health.py` — 14 sections
-
 
 | Legacy section | Covered by | Notes                                                                            |
 | -------------- | ---------- | -------------------------------------------------------------------------------- |
@@ -403,11 +376,9 @@ sections it had chosen to port — which was circular. The audit below is agains
 | `kubeadm`      | `kubeadm`  | Delegates renewal to `vsp_cert_renewer.py`                                       |
 | `password`     | `password` | Repairs **both** `-M` and the last-change date                                   |
 
-
 **14/14 covered.**
 
 ### `auto-health.py` — 11 sections
-
 
 | Legacy section | Covered by    | Notes                                                                 |
 | -------------- | ------------- | --------------------------------------------------------------------- |
@@ -423,7 +394,6 @@ sections it had chosen to port — which was circular. The audit below is agains
 | `edge`         | `edge`        | support-bundle runaway, RM self-dial deadlock, RabbitMQ `copy-config` |
 | `etcd`         | `etcd`        | Fragmentation, with a threshold-gated defrag                          |
 
-
 **11/11 covered.**
 
 ### `vsp-scale-down.py` — full port (new in v1.2.0)
@@ -434,7 +404,6 @@ pass (triggered by the user noticing the word "sizing" appeared nowhere in the a
 being *documented* as if it were a section) found it had been claimed as ported when it never was.
 Full functional parity now exists as the `sizing` section:
 
-
 | Legacy capability (`vsp-scale-down.py`)                                     | Covered by                                                              | Notes                                                                                                                                                                                                                       |
 | --------------------------------------------------------------------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | CP machine-type resize (`step2b`)                                           | `sizing`, `--cp-machine-type`                                           | Patches `PackageDeployment/vmsp-platform` `spec.values.cluster.machineType` — never the KCP/CAPI objects directly                                                                                                           |
@@ -444,7 +413,6 @@ Full functional parity now exists as the `sizing` section:
 | Node utilization before/after                                               | `sizing` (always-on report rows) + `sizing.util.after` rows post-action | Per-node `kubectl top nodes` rows instead of the source script's own ASCII delta table — same information, this tool's row-per-item style                                                                                   |
 | Final-state verification                                                    | `sizing.verify`                                                         | Cluster phase + pending-pod count                                                                                                                                                                                           |
 | **New, not in the source script**: read-only reporting with no target given | `sizing` in `report`/`preflight` mode                                   | `vsp-scale-down.py` required a target just to display current state; this tool always reports it                                                                                                                            |
-
 
 **Deliberate divergences**, documented so nobody is surprised in an incident:
 
@@ -458,8 +426,6 @@ always reads `/home/holuser/creds.txt`, same as every other section.
 timed-out/failed resize step renders as a `warn`/`fail` `CheckResult` and folds into the normal
 `RESULT: n/N checks passed` summary rather than a distinct exit code.
 
-
-
 ### `vsp-health-monitor.py` — the 20 remediating checks
 
 Covered: `kvip_manifest`, `cp_pod_crash`, `crashloop_pods`, `postgres`, `salt_stack`, `vodap`,
@@ -467,7 +433,6 @@ Covered: `kvip_manifest`, `cp_pod_crash`, `crashloop_pods`, `postgres`, `salt_st
 `cert_renewal`, `vip`, `gateway`, `node_flap`.
 
 **Not yet carried over** — recorded rather than quietly dropped:
-
 
 | Monitor check        | Status                                                                                                                                                                      |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -477,9 +442,6 @@ Covered: `kvip_manifest`, `cp_pod_crash`, `crashloop_pods`, `postgres`, `salt_st
 | `walg_hang`          | Intentionally omitted — it replaces a real binary with an `exit 0` stub and `pkill -9`s in-flight restores. Too aggressive to enable by default without an explicit opt-in  |
 | `leaderelect_tuning` | Handled by the **emitted keeper**, which is the right layer (~10-min Flux revert needs 60s reassertion)                                                                     |
 
-
-
-
 ### `remediate-lab.sh` — audited in full (new in v1.2.0)
 
 `remediate-lab.sh` (Ben Sier's "REVIEW DRAFT", never intended to run against a live lab
@@ -488,18 +450,13 @@ found two safe, mechanically-simple lever groups worth porting now, and a third 
 CAPI/VM lifecycle actions — that is deliberately **not** ported this round. See
 [§16](#16-per-source-script-command-reference) for the complete, line-by-line mapping; the summary:
 
-
 | Group                                                                                                                                                                                                                                                                     | Covered by                      | Why / why not                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | VSP fleet non-disruptive kubectl actions (`--right-size-requests`, `--reduce-ha`, `--safe-to-evict`, `--disable-capi-le`, `--disable/enable-autoscaler`)                                                                                                                  | **New** `footprint` **section** | Idempotent kubectl patches, at most a rolling pod restart. Safe to automate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | VCFA CPU-storm mitigation companion (`vcfa-storm-mitigation.sh`, embedded at `remediate-lab.sh:191-739`)                                                                                                                                                                  | **New** `storm` **section**     | Same risk profile — idempotent patches, "observed zero-downtime" per the source script's own notes. The two disruptive opt-in levers (`disable-le`, `logging`) are ported too, but stay opt-in behind `--storm-disable-le`/`--storm-logging`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | VSP-fleet CAPI/VM-lifecycle actions: `--cp-resize`/`--worker-resize` (govc VM hardware resize, bypassing CAPI), `--consolidate` (cordon/drain/delete a node), `--pause`/`--unpause`, `--kube-vip-cluster-patch` (CP VM replace), `--entropy-fix` (ESXi RDRAND workaround) | **Not ported**                  | These depend on `node_preflight`/`wait_cp_ready`'s incident-driven safety logic — the script's own header exists specifically to not repeat a prior incident where polling only the kube-vip VIP during a CP reboot left a cluster permanently PAUSED. That logic (poll the *real* node IP against its *local* apiserver, require consecutive clean reads, distinguish a genuine outage from pre-existing chronic CrashLoopBackOff) is safety-critical and was not carried forward faithfully enough to trust unattended. `sizing`'s PackageDeployment-based CAPI resize is the GitOps-correct way to change CP/worker machine type today; operators who need the raw VM-hardware-level resize, node consolidation, or the ESXi entropy workaround should keep using `remediate-lab.sh` directly for those specific actions until this is revisited |
 
-
-
-
 ### Why a report shows more checks than the legacy tool
-
 
 | Invocation                                                    | Checks   |
 | ------------------------------------------------------------- | -------- |
@@ -511,14 +468,11 @@ CAPI/VM lifecycle actions — that is deliberately **not** ported this round. Se
 | *(no legacy equivalent)* `--cluster ssp --mode report`        | **~95**  |
 | `--cluster all --mode report`                                 | **~441** |
 
-
 Two reasons, and only one is extra coverage: `report` emits a row **per certificate** (per-item
 detail, matching `vsp-health.py`), while `preflight` collapses the healthy bulk into one row so the
 verdict stays readable. So a lower `preflight` count is a presentation choice, not missing checks.
 
 ---
-
-
 
 ## 4d. Recommended placement
 
@@ -542,10 +496,6 @@ flowchart TD
         OP -->|"--mode preflight -j"| T6["CI / pre-change gate"]
     end
 ```
-
-
-
-
 
 ### At template capture — `confighol-9.1.py`
 
@@ -591,8 +541,6 @@ cmd = ['python3', '-u', f'{TOOLS}/vcf-lab-tuner.py',
        '--cluster', 'supervisor', '--mode', 'remediate', '--section', 'services']
 ```
 
-
-
 ### At boot — `Startup/VVFfinal.py`
 
 VVF labs have no VCFA and no Supervisor, so scope the call rather than letting two clusters report
@@ -603,10 +551,7 @@ cmd = ['python3', '-u', f'{TOOLS}/vcf-lab-tuner.py', '--cluster', 'vsp',
        '--mode', 'remediate']
 ```
 
-
-
 ### Cadence summary
-
 
 | When             | Call                                                       | Cadence            |
 | ---------------- | ---------------------------------------------------------- | ------------------ |
@@ -616,10 +561,7 @@ cmd = ['python3', '-u', f'{TOOLS}/vcf-lab-tuner.py', '--cluster', 'vsp',
 | Steady state     | the emitted keeper                                         | Every 60s, on-node |
 | On demand        | `--mode report` / `--mode preflight`                       | Operator / CI      |
 
-
 ---
-
-
 
 ## 4e. Report usage — the `vsp-health.py` / `auto-health.py` equivalents
 
@@ -647,16 +589,12 @@ python3 Tools/vcf-lab-tuner.py --cluster vcfa --mode report --section endpoint
 python3 Tools/vcf-lab-tuner.py --cluster supervisor --mode report
 ```
 
-
-
 ### Everything, everywhere
 
 ```bash
 # All three clusters in one pass. Absent clusters are reported, not errors.
 python3 Tools/vcf-lab-tuner.py --cluster all --mode report
 ```
-
-
 
 ### Verdict + exit code, for scripting
 
@@ -665,8 +603,6 @@ python3 Tools/vcf-lab-tuner.py --cluster all --mode report
 python3 Tools/vcf-lab-tuner.py --cluster all --mode preflight
 echo "verdict: $?"
 ```
-
-
 
 ### Machine-readable
 
@@ -702,8 +638,6 @@ JSON shape:
 }
 ```
 
-
-
 ### Previewing a repair without performing it
 
 ```bash
@@ -713,8 +647,6 @@ python3 Tools/vcf-lab-tuner.py --cluster vsp --mode remediate --dry-run -v
 # Same, one subsystem
 python3 Tools/vcf-lab-tuner.py --cluster vsp --mode remediate --section postgres --dry-run -v
 ```
-
-
 
 ### Common operator recipes
 
@@ -741,8 +673,6 @@ python3 Tools/vcf-lab-tuner.py --cluster all --mode report --section certs
 python3 Tools/vcf-lab-tuner.py --cluster vsp --mode tune --install-keeper --dry-run
 ```
 
-
-
 ### Offline self-test
 
 ```bash
@@ -751,8 +681,6 @@ python3 Tools/test-vcf-lab-tuner.py
 ```
 
 ---
-
-
 
 ## 5. Mode × cluster capability matrix
 
@@ -763,7 +691,6 @@ python3 Tools/test-vcf-lab-tuner.py
 > that were never built under those names — some of that scope landed inside other sections (e.g. the
 > keeper), some is a documented, currently-open gap (§15). **§4c is the section list that is kept in
 > sync with the actual** `SECTION_MAP` **in the code; this table has been rewritten to match it.**
-
 
 | Section       | Cluster(s)                  | P   | T   | R   | Notes                                                                                                                                                                             |
 | ------------- | --------------------------- | --- | --- | --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -794,19 +721,15 @@ python3 Tools/test-vcf-lab-tuner.py
 | `contentlib`  | supervisor                  | ✓   | ✓   | ✓   | Subscribed content library trust store and synchronization                                                                                                                        |
 | `webhooks`    | supervisor                  | ✓   | ✓   | ✓   | `caBundle` ↔ its own `cert-manager.io/inject-ca-from` CA, not a hardcoded secret name                                                                                             |
 
-
 Sections absent from a cluster are skipped silently; `--section X --cluster Y` where `X` is not in
 `Y`'s list is a usage **error**, not a silent no-op.
 
 ---
 
-
-
 ## 6. Check provenance
 
 Every ported check records where it came from. This table is the port checklist — and the record of
 which behaviour was chosen when two sources disagreed.
-
 
 | Section                | Ported from                                                                                                            | Conflict resolution                                                                                                                                                                                                                                               |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -831,17 +754,11 @@ which behaviour was chosen when two sources disagreed.
 | `webhooks`             | `supervisor_stabilizer.py:2330`, `vsp-health-monitor.py:2398`                                                          | **Generalize the stabilizer's** (name+service matching, sync-to-secret)                                                                                                                                                                                           |
 | `passwords`            | `confighol:5369` (`999`) vs `VCFfinal:3986` / monitor (`730`)                                                          | Pick one; document it. Also extend `-d $(date +%F)` — a stale change-date is what produced the 2026 expiry reports                                                                                                                                                |
 
-
-
-
 ---
-
-
 
 ## 7. One-shot vs recurring, and the keeper
 
 **Cadence is dictated by what reverts the change**, not by intent. Full evidence in the report's §6.
-
 
 | Tier                     | Layer                                                        | Revert                        | Mode                            |
 | ------------------------ | ------------------------------------------------------------ | ----------------------------- | ------------------------------- |
@@ -856,9 +773,6 @@ which behaviour was chosen when two sources disagreed.
 | ✅ One-shot per node life | On-disk static manifests, `/etc/shadow`, proxy files         | lost on CAPI node replace     | `tune`                          |
 | 🔁 Every run             | Pod/container lifecycle, defrag, buffer purges               | inherently transient          | `remediate`                     |
 
-
-
-
 ### Why the keeper is a separate artifact
 
 `vsp-health-monitor.py:298` measures one full pass at **212 seconds** (`cert_renewal` alone is 118s). A
@@ -871,8 +785,6 @@ flowchart LR
     T["vcf-lab-tuner.py<br/>--install-keeper"] -->|"writes + enables"| U["On-Node Keeper Units:<br/>• vcf-lab-keeper (VSP)<br/>• vcf-lab-keeper-vcfa (VCFA)<br/>• vcf-lab-keeper-ssp (SSP)<br/>OnBootSec=2min OnUnitActiveSec=60s"]
     U -->|"re-asserts every 60s"| L["Live objects & drift<br/>(probes, memory, buffers, 0-replica recovery)"]
 ```
-
-
 
 **Requirements on the emitted keeper:**
 
@@ -888,6 +800,7 @@ flowchart LR
 ### Cluster-Specific Keeper Implementations
 
 #### VSP Fleet Cluster Keeper (`vcf-lab-keeper`)
+
 - **VCF 9.1.0 Profile (`KEEPER_BODY_VSP`)**:
   - **Probe and Memory Relaxations**: Re-asserts dilated liveness probe settings and memory limits for 9 critical VSP services (`depot-service`, `fleetbuild`, `envoy-gateway`, `vidb-service`, `sddcbuild`, `sddcupgrade`, `prometheus`, `kube-state-metrics`, `node-exporter`).
   - **vsphere-cpi DaemonSet Leader Election**: Enforces `--leader-elect-lease-duration=60s`, `--leader-elect-renew-deadline=40s`, and `--leader-elect-retry-period=6s` arguments.
@@ -898,6 +811,7 @@ flowchart LR
   - Retains essential maintenance tasks: fluentd buffer volume cleanup and VCF component replica restoration.
 
 #### VCFA Appliance Cluster Keeper (`vcf-lab-keeper-vcfa`)
+
 - **VCF 9.1.0 Profile (`KEEPER_BODY_VCFA`)**:
   - **1. Envoy Gateway Memory Limit**: Maintains 4Gi memory limit on `envoy-gateway` in `vmsp-platform`.
   - **2. Runaway Support-Bundle Job Cleanup**: Purges completed or failed `support-bundle-*` jobs if accumulated count exceeds 3.
@@ -922,16 +836,13 @@ flowchart LR
   - Preserves opt-in `ENABLE_LEADER_ELECTION=false` injection loop via `__LE_ENV_BLOCK__` only when `disable_leader_election = true` is set in `/tmp/config.ini`.
 
 #### SSP Platform Cluster Keeper (`vcf-lab-keeper-ssp`)
+
 - Manages on-node keeper maintenance on `ssp-i`, replacing legacy `ssp-reserve-keeper` units.
 - Ensures workload cluster readiness, MetalLB VIP bindings, and CAPI reconciliation integrity.
 
 ---
 
-
-
 ## 8. Integration
-
-
 
 ### `confighol-9.1.py` — template prep (one-shot, durable only)
 
@@ -975,8 +886,6 @@ exists only in `holodeck/defaultconfig.ini:636`, so the recurring layer never in
 - Remove the commented-out SKU gate at `VCFfinal.py:4319` or make it real — right now it reads as
 conditional but runs unconditionally.
 
-
-
 ### Manual
 
 ```bash
@@ -995,8 +904,6 @@ python3 Tools/vcf-lab-tuner.py --cluster all --mode preflight --json > health.js
 ```
 
 ---
-
-
 
 ## 9. Internal architecture
 
@@ -1017,8 +924,6 @@ flowchart TD
     DISP --> JSON["--json document"]
     DISP --> LEGACY["legacy CHECK:/SKIP: lines"]
 ```
-
-
 
 ### `Transport Adapters` & Command Routing
 
@@ -1079,10 +984,7 @@ class CheckResult:
     action: str | None = None          # what remediate did / would do
 ```
 
-
-
 ### Policy constants — one definition each
-
 
 | Constant                                                   | Replaces                                                           |
 | ---------------------------------------------------------- | ------------------------------------------------------------------ |
@@ -1093,10 +995,7 @@ class CheckResult:
 | `PASSWORD_MAX_DAYS`                                        | `999` vs `730`                                                     |
 | proxy values                                               | import from `lsfunctions` — never re-hardcode (`vsp-health.py:95`) |
 
-
 ---
-
-
 
 ## 10. Output contracts that must not break
 
@@ -1105,7 +1004,6 @@ class CheckResult:
 
 Preserve exactly:
 
-
 | Token                               | Consumer                                           |
 | ----------------------------------- | -------------------------------------------------- |
 | `CHECK :` / `SKIP :` (that spacing) | `vpodchecker.py:3157`, `:3175`                     |
@@ -1113,14 +1011,11 @@ Preserve exactly:
 | `— … <N>d …` residual               | `vpodchecker.py` residual-days parse               |
 | `ERROR :` / `RENEWED:`              | `vsp-health-monitor.py:2260`                       |
 
-
 Implementation: emit these from a `render_legacy(result)` function driven by `CheckResult`, so the
 strings live in one place and `residual_days=None` renders correctly instead of needing a fake `0d`.
 When `vpodchecker.py` is migrated to `--json`, delete that function — not the tags one by one.
 
 ---
-
-
 
 ## 11. Style contract
 
@@ -1149,7 +1044,6 @@ literals in rendered output. `row_warn` counts as pass.
 
 **Explicitly do not inherit:**
 
-
 | Defect                                                             | Where                                                                                 |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
 | Body over-indented 4 extra spaces; 38 trailing-whitespace lines    | `vsp-health.py:1456+`                                                                 |
@@ -1163,7 +1057,6 @@ literals in rendered output. `row_warn` counts as pass.
 | Passwords via `sshpass -p` on a `shell=True` line                  | `supervisor_stabilizer.py:1239` — use `sshpass -f` with a `chmod 600` file everywhere |
 | Fixed temp filenames (concurrent runs clobber)                     | `supervisor_stabilizer.py:1673` — use pid+ms                                          |
 
-
 Generate the help section list **from** `SECTION_MAP` (add a description field) so the two cannot drift.
 
 ### Concurrency
@@ -1173,8 +1066,6 @@ lock. Refuse (exit 1) on contention unless `FORCE_RUN=1`. Two of the four legacy
 lock at all, and `vcfa-stabilizer.sh --preflight` bypassed its own while writing static manifests (F12).
 
 ---
-
-
 
 ## 12. Agent instructions & design approach
 
@@ -1193,8 +1084,6 @@ This section provides authoritative design guidelines, architectural patterns, a
   - Socket directory `/tmp/.vlt-ssh-<pid>` MUST be initialized with strict `0700` permissions (`os.makedirs(..., mode=0o700)` and `os.chmod(..., 0o700)`).
   - Clean teardown MUST be enforced via `atexit.register(cleanup)` and `signal` handlers (SIGINT, SIGTERM). On termination, issue `ssh -o ControlPath=<sock> -O exit dummy-target` to gracefully close active control sockets before removing directory trees.
 
-
-
 ### B. Standardized ASCII 16-Color ANSI Output & Display Compatibility
 
 - **Palette Alignment**: Truecolor / 24-bit RGB escape sequences (such as `\033[38;2;0;176;255m`) MUST NOT be used. They break or render illegibly on serial consoles, tmux/screen sessions, and standard terminal emulators.
@@ -1209,8 +1098,6 @@ This section provides authoritative design guidelines, architectural patterns, a
   - `render_legacy()` output (`CHECK  :` and `SKIP   :` formatting for `vpodchecker.py`) MUST remain bit-for-bit identical.
   - Machine-readable `--json` schema output MUST remain strictly valid JSON without embedded ANSI control codes.
 
-
-
 ### C. Command & Probe Batching
 
 - **Eliminate Round-Trip Loops**: Never iterate over remote items using individual sequential SSH commands.
@@ -1220,19 +1107,14 @@ This section provides authoritative design guidelines, architectural patterns, a
   - **SDS SAN NACK Auto-Fix (**`_fix_sds_sni`**)**: Consolidate namespace discovery, ConfigMap copy checks, and Kyverno policy evaluations into a single remote execution block.
   - **Gateway 503 & CPU Tuning**: Group rollout restart commands (`kubectl rollout restart deploy/a deploy/b ...`) and multi-resource patches into single atomic execution payloads using `&&`.
 
-
-
 ### D. Dynamic Polling & Convergence Tuning
 
 - **Poll Interval Reduction**: Set default polling intervals in convergence loops (`_sizing_poll`, rollout waits) to `5s` (configurable via `--poll-interval`), down from 20s/15s.
 - **Early Exit**: Evaluate convergence conditions at the start of each loop iteration to allow immediate return when steady-state is achieved.
 
-
-
 ### E. Broadcom Knowledge Base (KB) Article Catalog & Traceability
 
 `vcf-lab-tuner.py` incorporates official Broadcom KB article fixes and operational procedures across check handlers, descriptors, docstrings, and help screens:
-
 
 | Broadcom KB   | Target Area / Component      | Root Cause & Integrated Remediation in `vcf-lab-tuner.py`                                                                                      |
 | ------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1255,10 +1137,7 @@ This section provides authoritative design guidelines, architectural patterns, a
 | **KB 313904** | Admission Webhooks           | `ValidatingWebhookConfiguration` `cert-manager` `cainjector` CA bundle synchronization (`chk_webhooks`).                                       |
 | **KB 368062** | Admission Webhooks           | Admission webhook `caBundle` x509 unknown authority auto-repair (`chk_webhooks`).                                                              |
 
-
 ---
-
-
 
 ## 13. Migration and deprecation
 
@@ -1277,7 +1156,6 @@ Disposition below reflects **actual verified coverage as of v1.2.0** (each row r
 current code, not the original Phase-2 design intent) — see [§16](#16-per-source-script-command-reference)
 for the full command-by-command mapping behind every "gaps remain" note.
 
-
 | Script                           | Disposition                                                                                                                                                                                                                                                                                                                                                         | Equivalent                                                                                          |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | `vsp-health.py`                  | Deprecated (superseded by vcf-lab-tuner.py `--cluster vsp`)                                                                                                                                                                                                                                                                                                         | `--cluster vsp --mode report`                                                                       |
@@ -1295,9 +1173,6 @@ for the full command-by-command mapping behind every "gaps remain" note.
 | `confighol-9.1.py`               | Keep — becomes a caller                                                                                                                                                                                                                                                                                                                                             | n/a                                                                                                 |
 | `vcfapwcheck.sh` / `vcfapass.sh` | Keep — confirmed narrow, pre-kubectl, no natural equivalent (they unblock SSH auth itself, before any section-based tool can even connect); fix the hardcoded `auto-a-8fpl5` hostname                                                                                                                                                                               | n/a                                                                                                 |
 
-
-
-
 `remediate-lab.sh` remains the most valuable file in the set for its dated post-mortems — the shadow
 static-pod incident that made every manifest edit inert for 2.5 months (`:1261`), the
 `$AUTOA_IP`/`$AUTOA_VIP` distinction (`:1094`), transient instant-`Forbidden` from kubectl (`:1129`) —
@@ -1305,8 +1180,6 @@ institutional memory that has already been copied verbatim into the relevant `ch
 the parts that were ported.
 
 ---
-
-
 
 ## 14. Validation plan
 
@@ -1364,26 +1237,27 @@ cross-script locking.
 - **Safety & Mode Gate Enforcement**: Verifies that read-only modes (`preflight`, `report`) and `--dry-run` executions refuse all mutating writes, and that repair sections do not execute during `--mode tune`.
 - **Dual-Field & Lockstep Patching**: Ensures complex logic (such as patching both `machineType` and `size` in `PackageDeployment` for sizing operations, or temporarily enabling `cluster-autoscaler` during replica bound updates) functions as expected.
 
-
-
 #### How to Use `test-vcf-lab-tuner.py` Properly
 
 1. **Execution**: Run the script directly using Python 3:
+
   ```bash
    python3 Tools/test-vcf-lab-tuner.py
   ```
-2. **When to Run**:
-  - **Pre-Commit**: Always execute the test suite prior to committing modifications to `vcf-lab-tuner.py`.
-  - **New Feature Verification**: Add new test cases to `test-vcf-lab-tuner.py` whenever adding or modifying checks, flags, or remediation logic in `vcf-lab-tuner.py`.
-  - **Regression Testing**: Verify that previous fixes (e.g., autoscaler taint exemptions, damped pod restart thresholds, static pod exclusions) continue to pass.
-3. **Interpreting Results**:
-  - The test suite outputs individual `PASS` / `FAIL` labels for each assertion.
-  - Upon completion, it prints the summary count (e.g., `==== 63 passed, 0 failed ====`).
-  - If any assertion fails, the script exits with status code `1`, blocking CI/validation pipelines.
+
+1. **When to Run**:
+
+- **Pre-Commit**: Always execute the test suite prior to committing modifications to `vcf-lab-tuner.py`.
+- **New Feature Verification**: Add new test cases to `test-vcf-lab-tuner.py` whenever adding or modifying checks, flags, or remediation logic in `vcf-lab-tuner.py`.
+- **Regression Testing**: Verify that previous fixes (e.g., autoscaler taint exemptions, damped pod restart thresholds, static pod exclusions) continue to pass.
+
+1. **Interpreting Results**:
+
+- The test suite outputs individual `PASS` / `FAIL` labels for each assertion.
+- Upon completion, it prints the summary count (e.g., `==== 63 passed, 0 failed ====`).
+- If any assertion fails, the script exits with status code `1`, blocking CI/validation pipelines.
 
 ---
-
-
 
 ## 15. Changelog
 
@@ -1392,6 +1266,7 @@ cross-script locking.
 ### Config.ini Opt-In Gating for Leader Election Disablement & SSP Kubeconfig Cache Resilience
 
 #### Newly Added Capabilities & Technical Details (WHAT & WHY)
+
 - **`config.ini` `disable_leader_election` Opt-In Gating (`_is_disable_leader_election_enabled`, `_storm_vcfa_env_le_false`, `do_keeper`)**:
   - *WHAT*: Gated `ENABLE_LEADER_ELECTION=false` environment variable injection and drift keeper enforcement behind an explicit `/tmp/config.ini` configuration: `[VCFFINAL] disable_leader_election = true`. By default (when commented out or absent), stock Helm/Flux chart leader election settings are preserved across all microservices and versions.
   - *WHY*: Blind injection of `ENABLE_LEADER_ELECTION=false` via `kubectl set env` clashed with Helm chart `valueFrom: configMapKeyRef` definitions, creating dual-field manifest validation errors that blocked Flux CD HelmRelease upgrades (such as `vksm-stack`) during SDDC Manager component upgrades. Gating this behind an opt-in toggle preserves clean upstream chart lifecycle while providing an escape hatch if needed.
@@ -1410,6 +1285,7 @@ cross-script locking.
 ### Supervisor & Multi-Cluster Certificate Verification & Renewal Fixes
 
 #### Newly Added Capabilities & Technical Details (WHAT & WHY)
+
 - **Backing Secret & x509 Expiry Verification (`_renew_certmanager_leaf_certs`, `chk_certs`)**:
   - *WHAT*: Added proactive backing Secret and x509 certificate validation across all namespaces for all cluster types (Supervisor, VCFA, VSP, SSP). When Certificate CR status lacks `notAfter` or Secret is missing/stale, dynamically inspects Secret `tls.crt` data and OpenSSL `notAfter` expiry.
   - *WHY*: When a Certificate CR status has cached `Ready=True` but the backing Secret was deleted, corrupted, or has no `tls.crt`, standard status inspections previously failed to identify that the secret was missing. On Supervisor clusters (such as `metrics-endpoint-downstream-server-cert` in `svc-metrics-aggregator-*`), this caused certificates to report `EXPIRED (expires: unknown)` or fail to regenerate without explicit Secret validation.
@@ -1425,6 +1301,7 @@ cross-script locking.
 ### VCFA SeaweedFS mTLS Certificate Freshness Check & Auth Pod Convergence
 
 #### Newly Added Capabilities & Technical Details (WHAT & WHY)
+
 - **SeaweedFS In-Memory mTLS Certificate Freshness Check (`chk_certs`)**:
   - *WHAT*: Proactively checks the `seaweedfs-master-cert` Secret `notBefore` timestamp against running pod start times for all SeaweedFS pods (`seaweedfs-master-0`, `seaweedfs-filer-0`, `seaweedfs-volume-0..2`) in `vmsp-platform`. Automatically force-restarts any SeaweedFS pod whose `startTime` precedes the renewed certificate timestamp.
   - *WHY*: When cert-manager automatically renews `seaweedfs-master-cert`, SeaweedFS (Go runtime) does not dynamically reload the new mTLS certificate from disk without a process restart. This causes mTLS gRPC handshakes to fail between filer and master, preventing `tenant-manager-0` (VCD Cell) from verifying the `/opt/vmware/vcloud-director/data/transfer` S3 transfer spooling area and sending `tenant-manager-0` into a continuous crash loop.
@@ -1437,6 +1314,7 @@ cross-script locking.
 ### Supervisor Cluster VCF 9.1.1+ Alignment, ESXi Spherelet SSH Reachability Auto-Enable, and Pod Sweep Gating
 
 #### Newly Added Capabilities & Technical Details (WHAT & WHY)
+
 - **Supervisor Cluster Version Detection (`_detect_cluster_version`)**:
   - *WHAT*: Dynamically identifies Supervisor cluster version (tuple `(9, 1, 1)` or `(9, 1, 0)`) by querying vCenter appliance version banner (`cat /etc/issue`) and Supervisor Control Plane Kubernetes version (K8s v1.33+ on VCF 9.1.1+ vs v1.30/v1.31 on 9.1.0).
   - *WHY*: Enables version-aware logic on Supervisor clusters just as on VSP and VCFA.
@@ -1457,6 +1335,7 @@ cross-script locking.
 Implemented a complete revert-to-defaults architecture allowing lab administrators to capture baseline cluster states, execute targeted snapshot rollbacks, or restore stock VMware 9.1.1 chart and manifest settings.
 
 #### Newly Added Capabilities & Technical Details (WHAT & WHY)
+
 - **Automated Single Pre-Remediation Snapshot Capture (`_capture_pre_remediation_snapshot`)**:
   - *WHAT*: Automatically records full live cluster state (static pod manifests, ReleaseTemplates, workloads, CronWorkflows, webhooks, DaemonSets) to `/var/lib/vcf-lab-tuner/snapshots/` before executing any remediations on `vcfa`. Purges previous snapshot files on each capture to strictly retain 1 snapshot file (`snapshot-latest.json`).
   - *WHY*: Guarantees a clean pre-remediation restore point without stale snapshot file accumulation.
@@ -1476,6 +1355,7 @@ Implemented a complete revert-to-defaults architecture allowing lab administrato
 Gated VCFA check routines based on dynamically detected cluster version (9.1.0 vs 9.1.1+) and updated replica evaluation rules.
 
 #### Newly Added Capabilities & Technical Details (WHAT & WHY)
+
 - **Version-Aware Resource Naming**:
   - *WHAT*: `chk_edge` evaluates `copy-rabbitmq-config` on 9.1.1+ vs `copy-config` on 9.1.0; `chk_deployments` automatically skips `trust-manager-sds-server` on 9.1.1+; `chk_gateway` evaluates Gateway API LoadBalancer services on 9.1.1+ without false warnings on legacy `envoy-vmsp-platform*` hashed names; `_storm_vcfa_cron_stagger` queries `.spec.schedules[0]`.
   - *WHY*: Eliminates false-positive error reports caused by upstream chart resource name changes between VCF 9.1.0 and 9.1.1+.
@@ -1490,6 +1370,7 @@ Gated VCFA check routines based on dynamically detected cluster version (9.1.0 v
 Dynamically adapts Envoy Gateway SDS NACK remediations based on VCFA cluster version.
 
 #### Newly Added Capabilities & Technical Details (WHAT & WHY)
+
 - **Version-Aware SDS Remediation (`_fix_sds_sni`)**:
   - *WHAT*: On VCF 9.1.0, continues enforcing KB 439264 / KB 424402 workaround (`platform-trust` sync across namespaces + Kyverno `vcfa-btp-wellknown-to-carefs` mutation). On VCF 9.1.1+, purges the obsolete Kyverno mutation policy and cleans up any conflicting dual-field `BackendTLSPolicy` objects (`ndc-backendtlspolicy`, `vmsp-identity-backendtlspolicy`).
   - *WHY*: Upstream VCF 9.1.1+ charts natively fix Envoy Gateway SDS NACK. Retaining the legacy Kyverno mutation on 9.1.1+ caused invalid dual-field (`wellKnownCACertificates` + `caCertificateRefs`) `BackendTLSPolicy` CRDs that failed Kubernetes CEL validation, locking package deployments in `InProgress` (`VCFMS-HEALTH-002`).
@@ -1501,6 +1382,7 @@ Dynamically adapts Envoy Gateway SDS NACK remediations based on VCFA cluster ver
 Updated `_print_compact_right_sizing_table` in `chk_nodes` across all cluster types (`ssp`, `vsp`, `vcfa`, `supervisor`).
 
 #### Newly Added Capabilities & Technical Details (WHAT & WHY)
+
 - **Top 10 Over-Allocated Workloads Display**:
   - *WHAT*: Expanded the default non-verbose terminal output table from 5 rows to 10 rows when rendering top over-allocated workloads.
   - *WHY*: Provides deeper visibility into top resource-intensive workloads directly in terminal reports without requiring `-v` verbose mode.
@@ -1512,6 +1394,7 @@ Updated `_print_compact_right_sizing_table` in `chk_nodes` across all cluster ty
 Updated the node readiness check formatting (`chk_nodes`) across all cluster types (`ssp`, `vsp`, `vcfa`, `supervisor`).
 
 #### Newly Added Capabilities & Technical Details (WHAT & WHY)
+
 - **Three-Column Node Readiness Terminal Display (`_print_3col_nodes`)**:
   - *WHAT*: Formats ready node check status lines into three side-by-side columns:
     - **Column 1**: Controller node(s)
@@ -1526,6 +1409,7 @@ Updated the node readiness check formatting (`chk_nodes`) across all cluster typ
 Introduced cluster-wide workload CPU request right-sizing analysis to the `nodes` section across all supported cluster types (`ssp`, `vsp`, `vcfa`, `supervisor`). Output is provided as both a single-screen compact terminal summary and a self-contained, interactive HTML dashboard.
 
 #### Newly Added Capabilities & Technical Details (WHAT & WHY)
+
 - **Cluster-Agnostic Workload CPU Right-Sizing Engine (`_analyze_workload_resources`)**:
   - *WHAT*: Automatically queries `kubectl get deploy,sts,ds -A -o json` and `kubectl top pods -A` across any cluster to calculate per-workload CPU requests, limits, replicas, and live pod utilization. Computes lab-optimized right-sized CPU request recommendations using a multi-tiered sizing algorithm (handling ultra-low, light, moderate, and heavy consumer profiles).
   - *WHY*: Default enterprise production templates reserve excessive static CPU capacity (e.g. 6.0 cores for a single Druid node), forcing Kubernetes schedulers to scale out nodes for static reservation rather than actual utilization.
@@ -1836,13 +1720,11 @@ readiness, and fluentd buffer purging. Found live: **8,099 abandoned fluentd bac
 Three scripts marked, conservatively — comments only, nothing deleted, no behaviour changed,
 idempotent, each naming its equivalent command:
 
-
 | Script              | Equivalent                                          |
 | ------------------- | --------------------------------------------------- |
 | `kube-fix.py`       | `--cluster vsp --mode remediate --section cp`       |
 | `salt-stabilize.py` | `--cluster vsp --mode remediate --section postgres` |
 | `vodap-fix.py`      | `--cluster vsp --mode remediate --section vodap`    |
-
 
 The banner script **refused to mark** `vodap-fix.py` until the `vodap` section actually existed — a
 banner pointing at a replacement that cannot do the job is worse than no banner. Deliberately unmarked:
@@ -1872,13 +1754,11 @@ section, plus an offline test suite.
 `tune` and `remediate` are not interchangeable, and which sections act in which was previously
 implicit in each handler. Now one table:
 
-
 | Mode        | Meaning                                                                                                        | Sections                                     |
 | ----------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
 | `tune`      | Durable **configuration**. What `confighol` applies at template prep. Safe on a healthy lab, restarts nothing. | `cp`, `proxy`, `certs`, `kubeadm`            |
 | `remediate` | **Repair** of something currently broken. May restart.                                                         | + `postgres`, `nodes`, `pods`, `deployments` |
 | neither     | Detect-only by design                                                                                          | `endpoint`                                   |
-
 
 `Runner.write()` also gained a tier gate: in `tune` mode a `transient` action is **skipped**, not
 executed. So the template-prep path can apply the kube-vip manifest setting while declining to
@@ -1886,7 +1766,6 @@ executed. So the template-prep path can apply the kube-vip manifest setting whil
 surprise.
 
 ### Remediation per section
-
 
 | Section             | Action                                                                                                                                             |
 | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1896,7 +1775,6 @@ surprise.
 | `deployments`       | `rollout restart` when available < desired; for `replicas==0` restores the **recorded** `vcf.lab/original-replicas` and otherwise refuses to guess |
 | `endpoint`          | Detect-only                                                                                                                                        |
 
-
 Two decisions worth keeping:
 
 - **The shadow sweep runs before any manifest edit.** `remediate-lab.sh:1261` records seven stale
@@ -1905,8 +1783,6 @@ apiserver stuck at 250m while its manifest said 1000m — misdiagnosed for weeks
 restart does not clear it. Editing without sweeping reports success and changes nothing.
 - **Only** `kube-controller-manager` **and** `kube-scheduler` **are auto-restarted.** `kube-fix.py:398,406`
 restarts exactly those two; removing etcd or the apiserver to "fix" them is a far larger gamble.
-
-
 
 ### Validation: offline test suite
 
@@ -1964,13 +1840,11 @@ latent-vs-broken distinction built in.
 
 ### Remediation now implemented for three sections
 
-
 | Section    | Behaviour                                                                                                                                                                                                                                                                         |
 | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `postgres` | pgdata permission correction across all spilo namespaces; restart only not-ready pods                                                                                                                                                                                             |
 | `pods`     | Damped sweep: `restartCount >= 5`, worst-first, capped at 15/pass, skipping static pods (kubelet owns those) and gateway/CSI pods (ordered handling). `--aggressive` opts into the unthresholded legacy behaviour. A capped pass **says so** rather than reading as "all handled" |
 | `nodes`    | Uncordon — but never a node tainted `ToBeDeletedByClusterAutoscaler`, which is being drained on purpose                                                                                                                                                                           |
-
 
 Validated live: damped default selected **0** pods for deletion against a VCFA cluster whose only bad
 pod was `logging-operator-fluentd-0 NotReady(1/2)` — correctly declining, since deleting a pod whose
@@ -1983,14 +1857,12 @@ deliberately unapplied.
 **1.2 — 2026-08-14** — `vcf-lab-tuner.py` **v0.2.0**: VCFA ported read-only, keeper implemented, three
 parity gaps closed.
 
-
 | State             | Scope                                                                   |
 | ----------------- | ----------------------------------------------------------------------- |
 | `vsp`, read-only  | `cp`, `nodes`, `pods`, `certs`, `proxy`, `kubeadm`                      |
 | `vcfa`, read-only | `cp`, `nodes`, `pods`, `deployments`, `certs`, `endpoint`               |
 | mutating          | `--install-keeper` / `--remove-keeper` only (requires `--mode tune`)    |
 | not ported        | `supervisor` (needs the vCenter-hop transport); per-section remediation |
-
 
 `--install-keeper` **implements the F2 fix and it is validated live.** Run against the VSP CP — where
 `vsp-fleet-depot-keeper.timer` is currently enabled — it correctly **refuses**, names the colliding unit
@@ -2031,12 +1903,10 @@ legacy `CHECK:`/`SKIP:` render contract.
 Section coverage is deliberately **read-only and VSP-only** so parity could be established before any
 mutating path is trusted:
 
-
 | State             | Scope                                                            |
 | ----------------- | ---------------------------------------------------------------- |
 | Ported, read-only | `vsp`: `cp`, `nodes`, `pods`, `certs`, `proxy`, `kubeadm`        |
 | Not ported        | all other sections; `vcfa` and `supervisor`; every mutating mode |
-
 
 An unported section emits a WARN row naming the legacy tool that still owns it — it never silently
 reports success.
@@ -2070,8 +1940,6 @@ fixes are prerequisites, not part of this design.
 
 ---
 
-
-
 ## 16. Per-source-script command reference
 
 Every legacy script the team knows by name, with its full command surface mapped to the
@@ -2087,7 +1955,6 @@ equivalent) · **N/A** (narrow, single-purpose script with no natural section-ba
 
 ### `vsp-health.py` → `--cluster vsp`
 
-
 | Legacy                                                                                   | What it does                                                                | Equivalent                                                                                                                                       | Status                                                                                                                                                                                                                                                                                |
 | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `python3 vsp-health.py`                                                                  | Full read-only health check, all 14 sections                                | `vcf-lab-tuner.py --cluster vsp --mode preflight` (or default `--mode report`)                                                                   | ported                                                                                                                                                                                                                                                                                |
@@ -2100,11 +1967,7 @@ equivalent) · **N/A** (narrow, single-purpose script with no natural section-ba
 | Dual-site behavior (checks Site B `10.2.1.142` too, if reachable)                        | Report both sites in one run                                                | *(unclear)*                                                                                                                                      | **needs verification** — `cp_vips` lists both site VIPs as *candidates*, tried in order until one answers; whether this tool reports both sites independently in one invocation like legacy does, or only the first that answers, should be confirmed live before calling this parity |
 | *(no legacy equivalent)*                                                                 | —                                                                           | `--mode {tune,remediate}`, `--dry-run`, `--aggressive`, `--install-keeper`/`--remove-keeper`, `--threshold-days`, `sizing`, `footprint` sections | New capability — `vsp-health.py` has no remediation at all                                                                                                                                                                                                                            |
 
-
-
-
 ### `auto-health.py` → `--cluster vcfa`
-
 
 | Legacy                                                            | What it does                                                                            | Equivalent                                                                                                                                                                                 | Status                                                                                                                                                                     |
 | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -2116,15 +1979,11 @@ equivalent) · **N/A** (narrow, single-purpose script with no natural section-ba
 | `-v, --verbose` / `-j, --json`                                    | Same as `vsp-health.py`                                                                 | Same                                                                                                                                                                                       | ported                                                                                                                                                                     |
 | *(no legacy equivalent)*                                          | —                                                                                       | `--section postgres` (pgdata perms — never checked by `auto-health.py` at all), `--section kubeadm` (v1.2.0: cert-renewal delegation now reachable), `--section storm`, all mutating modes | New coverage                                                                                                                                                               |
 
-
-
-
 ### `vsp-scale-down.py` → `--cluster vsp --section sizing`
 
 Full mapping is in [§4c-bis](#4c-bis-coverage-audit-against-the-legacy-readers) — this is the section
 that was documented as ported for months before actually being built; see the v1.2.0 changelog entry
 for the full story. Quick reference:
-
 
 | Legacy flag                                                                  | Equivalent                                                                                 |
 | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
@@ -2139,7 +1998,6 @@ for the full story. Quick reference:
 | `--resize-timeout` / `--scale-timeout` / `--poll-interval` (minutes/seconds) | Same flags, same defaults                                                                  |
 | `--cpu-warn-pct`                                                             | `--cpu-warn-pct`                                                                           |
 | `--password-file` / `--creds-file` / getpass prompt                          | *(none — single credential source,* `/home/holuser/creds.txt`*, like every other section)* |
-
 
 All of the above require `--cluster vsp --section sizing --mode remediate`.
 
@@ -2156,7 +2014,6 @@ Supported across all 4 cluster types (`vsp`, `vcfa`, `supervisor`, `ssp`). `--th
 
 ### `vsp-stabilizer.sh` → `--cluster vsp` (100% Functional Parity)
 
-
 | Legacy                                                                | What it does                                                                                                      | Equivalent                                    | Status                                                                                                                     |
 | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | (no args)                                                             | Install/refresh the `vsp-fleet-depot-keeper.timer` (11 probe/resource targets) + apply lease/etcd/kube-vip tuning | `--cluster vsp --mode tune --install-keeper`  | **ported** — `vcf-lab-keeper` (with version-aware profiles for 9.1.0 vs 9.1.1+) + `chk_cp`/`chk_storm`                     |
@@ -2168,13 +2025,9 @@ Supported across all 4 cluster types (`vsp`, `vcfa`, `supervisor`, `ssp`). `--th
 | `--remove`                                                            | Uninstall the legacy keeper                                                                                       | `--purge-legacy-keepers` / `--remove-keeper`  | **ported** — `--purge-legacy-keepers` purges legacy `vsp-fleet-depot-keeper` and `vcf-lab-keeper*` units                   |
 | `--vsp-cp IP`                                                         | Target override                                                                                                   | `--host IP`                                   | **ported**                                                                                                                 |
 
-
-
-
 ### `vcfa-stabilizer.sh` → `--cluster vcfa` (100% Functional Parity)
 
 100% of the operational and incident remediations from `vcfa-stabilizer.sh` are ported into `vcf-lab-tuner.py`.
-
 
 | Legacy                                                                                               | What it does                                                                                                                                                                        | Equivalent                                                | Status                                                                                                                                                             |
 | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -2198,11 +2051,7 @@ Supported across all 4 cluster types (`vsp`, `vcfa`, `supervisor`, `ssp`). `--th
 | postgres pgdata permission fix (log-scan-triggered, 2 hardcoded pod names)                           | Spilo PGDATA 0700 permissions                                                                                                                       | `chk_postgres`                                            | **ported, improved** — proactive permission check across all spilo pods                                                                                            |
 | `--preflight` / `--fix-post-boot` / `--fix-overload` / `--verify` / `--status`                       | Phase-scoped run modes                                                                                                                              | `--mode preflight` / `--mode remediate` / `--mode report` | **ported**                                                                                                                                                         |
 
-
-
-
 ### `supervisor_stabilizer.py` → `--cluster supervisor` (100% Functional Parity)
-
 
 | Legacy                                                                                                                   | What it does                                                                                                                                                 | Equivalent                                                   | Status                                                                                                                                                              |
 | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -2218,9 +2067,6 @@ Supported across all 4 cluster types (`vsp`, `vcfa`, `supervisor`, `ssp`). `--th
 | Phase 4 — vCenter namespace-management REST poll (`config_status`/`kubernetes_status`)                                   | REST API readiness polling                                                                                                                                   | `chk_endpoint` (`_poll_supervisor_wcp_status`)               | **ported**                                                                                                                                                          |
 | `--supervisor-ip IP`                                                                                                     | Skip discovery                                                                                                                                               | `--host IP`                                                  | **ported**                                                                                                                                                          |
 | `--dry-run` / `--threshold-days`                                                                                         | Safety and time window flags                                                                                                                                 | Same flags                                                   | **ported**                                                                                                                                                          |
-
-
-
 
 ### `kube-fix.py` → `--cluster vsp --mode remediate --section cp` (deprecated, banner applied)
 
@@ -2259,8 +2105,7 @@ valid, so it stays a standalone pre-flight step in the toolchain.
 ### `remediate-lab.sh` (+ embedded `vcfa-storm-mitigation.sh`) → `--section footprint` / `--section storm`, partial
 
 Full detail is in [§4c-bis](#4c-bis-coverage-audit-against-the-legacy-readers)'s dedicated subsection
-and the [§12](#12-migration-and-deprecation) migration table. Summary:
-
+and the [§13](#13-migration-and-deprecation) migration table. Summary:
 
 | Legacy group                                                                                                                       | Equivalent                                                                                                                                    | Status                                                                                                                                                      |
 | ---------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -2283,12 +2128,7 @@ and the [§12](#12-migration-and-deprecation) migration table. Summary:
 | `--kcp-patch` (print-only KubeadmControlPlane-equivalent hint)                                                                     | folded into the `cp.lease_tuning` finding's own `detail` text                                                                                 | **ported (v1.3.0)**, as inline detail rather than a standalone print action                                                                                 |
 | `--status` (combined VSP+VCFA drift report)                                                                                        | `--cluster all --mode report` (differently organized)                                                                                         | **partial**                                                                                                                                                 |
 
-
-
-
 ---
-
-
 
 ## 17. Response to the remediate-lab parity report
 
@@ -2374,9 +2214,13 @@ response to a parity percentage.
 
 ---
 
-
-
 ## 18. Version History
+
+**v3.9.8 / v2.5.10 additions (2026-09-25)**: Table of Contents Alignment, Section Numbering Fix & Missing End State Integration:
+
+- **Table of Contents Synchronization**: Corrected top-level list numbering (1 through 19) in the Table of Contents, properly indented sub-bullet points 4a through 4e under Section 4, and re-indexed all top-level section headers (`## 1.` through `## 19.`).
+- **Section 19 (End State) Integration**: Added missing `19. [End State](#19-end-state)` section entry to the Table of Contents and ensured full section header alignment.
+- **Cross-Reference Audit**: Re-aligned all internal Markdown section anchor links and cross-references (e.g. `[§13](#13-migration-and-deprecation)`) throughout the specification document.
 
 **v2.5.8 / v2.5.9 additions (2026-09-23)**: `config.ini` Opt-In Gating for Leader Election Disablement & SSP Kubeconfig Cache Resilience:
 
@@ -2571,3 +2415,271 @@ incident-specific fixes still do NOT have a `vcf-lab-tuner.py` equivalent.
 One parameterized tool that replaces the pre-flight / tuning / remediation / reporting logic currently
 spread across 15 scripts and three Kubernetes clusters. Callable from `confighol-9.1.py` at template
 prep, from `VCFfinal.py` / `VVFfinal.py` at boot, and by hand for any single check.
+
+## 19. End State
+
+Here is the detailed report of the mutating `kubectl` configuration commands generated and executed by `vcf-lab-tuner.py` when running in `--mode remediate` (with no section filters specified) across each of the four cluster targets.
+
+---
+
+### 1. `vsp` (VCF Services Runtime / Fleet Cluster — VIP `10.1.1.142`)
+
+When remediating the `vsp` cluster, the script iterates through 17 sections (`cp`, `nodes`, `pods`, `vcf`, `postgres`, `redis`, `salt`, `certs`, `argo`, `kyverno`, `vodap`, `proxy`, `kubeadm`, `password`, `sizing`, `footprint`, `entropy`) and executes the following mutating `kubectl` commands as needed:
+
+- **Stale Kube-VIP Lease Lock Cleanup (`cp`)**:
+
+  ```bash
+  kubectl -n kube-system delete lease plndr-cp-lock
+  kubectl -n kube-system patch lease plndr-cp-lock --type=merge -p '{"spec":{"holderIdentity":"..."}}'
+  ```
+
+- **Node Readiness (`nodes`)**:
+
+  ```bash
+  kubectl uncordon <node_name>
+  ```
+
+- **Stuck / Failed Pod Purge & Core Workload Scale-Up (`pods`)**:
+
+  ```bash
+  kubectl delete pods -n <namespace> --field-selector status.phase=Failed --force --grace-period=0
+  kubectl delete pod <pod_name> -n <namespace> --grace-period=0 --force
+  kubectl -n <namespace> scale deployment/<name> --replicas=1
+  ```
+
+- **VCF Component Controller Unpause & Scale (`vcf`)**:
+
+  ```bash
+  kubectl annotate components.api.vmsp.vmware.com <comp_name> components.api.vmsp.vmware.com/pause-
+  kubectl scale <kind> <name> -n <namespace> --replicas=<target>
+  ```
+
+- **Patroni / Spilo PostgreSQL Permissions & Restarts (`postgres`)**:
+
+  ```bash
+  kubectl exec <pod_name> -n <namespace> -c walg -- chmod 700 /var/lib/postgresql/data
+  kubectl delete pod <pod_name> -n <namespace> --grace-period=30
+  ```
+
+  *(Applies across `salt-raas`, `vcf-fleet-lcm`, `vcf-sddc-lcm`, and `vidb-external` namespaces)*
+- **Service Recovery (`redis`, `salt`)**:
+
+  ```bash
+  kubectl -n salt-raas rollout restart deployment redis
+  kubectl -n <namespace> rollout restart deployment <salt-master|salt-raas>
+  ```
+
+- **Certificate Renewal & Reissuance (`certs`)**:
+
+  ```bash
+  kubectl patch certificate <cert_name> -n <namespace> --type=merge -p '{"spec":{"duration":"87600h0m0s"}}'
+  kubectl delete secret <secret_name> -n <namespace> --ignore-not-found=true
+  kubectl annotate certificate <name> -n <namespace> cert-manager.io/reissue-at=$(date +%s) --overwrite
+  kubectl delete certificaterequest -n <namespace> -l cert-manager.io/certificate-name=<name> --ignore-not-found=true
+  kubectl rollout restart deployment/cert-manager-cainjector -n vmsp-platform
+  kubectl rollout restart deployment/kyverno-background-controller -n vmsp-policies
+  kubectl rollout restart deployment/<name> -n <namespace>
+  ```
+
+- **Stale Shutdown Workflow Cleanup (`argo`)**:
+
+  ```bash
+  kubectl get workflow -n vmsp-platform --no-headers | grep system-shutdown | awk '{print $1}' | xargs -r kubectl delete workflow -n vmsp-platform --grace-period=0
+  ```
+
+- **Policy Controller Recovery (`kyverno`)**:
+
+  ```bash
+  kubectl delete updaterequests.kyverno.io --all -n vmsp-policies
+  kubectl delete pod -n vmsp-policies -l app.kubernetes.io/component=background-controller --grace-period=0
+  ```
+
+- **Observability Recovery & Maintenance (`vodap`)**:
+
+  ```bash
+  kubectl rollout restart statefulset/chi-vcf-obs-vcf-obs-0-0 -n vodap
+  kubectl -n vodap exec <fluentd-pod> -c fluentd -- rm -rf /fluentd/log/buffer/*
+  kubectl scale deploy <name> -n vodap --replicas=1
+  kubectl patch deploy <dep> -n vodap --type=merge -p '{"spec":{"template":{"metadata":{"annotations":{"cluster-autoscaler.kubernetes.io/safe-to-evict":"true"}}}}}'
+  ```
+
+- **Resource Request Right-Sizing (`footprint`)**:
+
+  ```bash
+  kubectl set resources <kind>/<name> -n <namespace> --containers=<container> --requests=cpu=<cpu>,memory=<mem>
+  ```
+
+  *(Right-sizes oversized CPU/memory requests in `vmsp-platform`, `vcf-fleet-lcm`, `vcf-sddc-lcm`, `vidb-external`, `vodap`, `ops-logs`, and `salt-raas` down to lab-optimized targets like `200m` CPU / `1Gi` RAM)*
+  
+- **CSR Approvals (`kubeadm`)**:
+
+  ```bash
+  kubectl certificate approve <csr_name>
+  ```
+
+---
+
+### 2. `supervisor` (vSphere Supervisor / WCP Cluster)
+
+When remediating a `supervisor` cluster, the script executes via the vCenter SSH hop across 6 sections (`services`, `contentlib`, `nodes`, `pods`, `certs`, `webhooks`):
+
+- **Node Readiness (`nodes`)**:
+
+  ```bash
+  kubectl uncordon <node_name>
+  ```
+
+- **Evicted / Stale Pod Sweep (`pods`)**:
+
+  ```bash
+  kubectl delete pod <pod_name> -n <namespace> --grace-period=0 --force
+  ```
+
+- **Admission Webhook CA Bundle Synchronization (`webhooks`)** *(Addresses KB 313904 / KB 368062)*:
+
+  ```bash
+  kubectl patch validatingwebhookconfiguration <name> --type=json -p '[{"op":"replace","path":"/webhooks/<index>/clientConfig/caBundle","value":"<CA_B64>"}]'
+  kubectl -n vmware-system-cert-manager rollout restart deploy cert-manager-cainjector
+  ```
+
+  *(Syncs stale `caBundle` entries on storage quota and CNS validating webhooks so PVC and pod creation do not fail with `x509: certificate signed by unknown authority`)*
+
+---
+
+### 3. `vcfa` (VCF Automation Cluster — VIP `10.1.1.70` / `10.1.1.72`)
+
+When remediating the `vcfa` cluster, the script executes across 13 sections (`argo`, `nodes`, `cp`, `etcd`, `postgres`, `pods`, `storm`, `edge`, `certs`, `gateway`, `deployments`, `endpoint`, `kubeadm`):
+
+- **Stale Argo Shutdown Workflows (`argo`)**:
+
+  ```bash
+  kubectl get workflow -n vmsp-platform --no-headers | grep system-shutdown | awk '{print $1}' | xargs -r kubectl delete workflow -n vmsp-platform --grace-period=0
+  ```
+
+  *(Deletes leftover `system-shutdown-*` Argo Workflows that block node scheduling and force prelude deployments to 0 replicas)*
+
+- **Node Readiness & Kube-VIP Lock Reset (`nodes`, `cp`)**:
+
+  ```bash
+  kubectl uncordon <node_name>
+  kubectl -n kube-system delete lease plndr-cp-lock && sleep 5 && kubectl -n kube-system patch lease plndr-cp-lock ...
+  ```
+
+- **Prelude PostgreSQL Data Directory Repair (`postgres`)**:
+
+  ```bash
+  kubectl exec <pod_name> -n prelude -c walg -- chmod 700 /var/lib/postgresql/data
+  kubectl delete pod <pod_name> -n prelude --grace-period=30
+  ```
+
+- **Envoy / Kyverno CPU Storm Mitigation (`storm`)**:
+
+  ```bash
+  kubectl patch envoyproxy <cr> -n vmsp-platform --type=merge -p '{...}'
+  ```
+
+- **Prelude gRPC Self-Dial Deadlock Unblock & Service Scale (`edge`)**:
+
+  ```bash
+  kubectl patch service resource-manager-grpc -n prelude -p '{"spec":{"publishNotReadyAddresses":true}}'
+  kubectl delete pod -n prelude -l app=resource-manager-server --grace-period=0
+  kubectl patch statefulset rabbitmq-ha -n prelude --type=json -p '...'
+  kubectl scale <kind>/<name> -n prelude --replicas=1
+  ```
+
+- **Gateway & Kyverno Policy Repair (`gateway`)**:
+
+  ```bash
+  kubectl delete clusterpolicy vcfa-btp-wellknown-to-carefs --ignore-not-found=true
+  kubectl patch backendtlspolicy -n <namespace> <name> --type=merge -p '{"spec":{"validation":{"caCertificateRefs":null}}}'
+  kubectl apply -f -
+  ```
+
+- **Core Microservice Scale-Up & Restart (`deployments`)**:
+
+  ```bash
+  kubectl scale deployment <name> -n <namespace> --replicas=1
+  kubectl delete pod -n <namespace> -l app=<name> --field-selector status.phase!=Running --grace-period=0
+  kubectl rollout restart deployment <name> -n <namespace>
+  ```
+
+  *(Ensures critical microservices in `vmsp-platform`, `vmsp-policies`, and `prelude` are scaled to 1 and healthy)*
+
+- **Certificate Renewal (`certs`, `kubeadm`)**:
+
+  ```bash
+  kubectl patch certificate <name> -n <namespace> --type=merge -p '{"spec":{"duration":"87600h0m0s"}}'
+  kubectl delete secret <secret> -n <namespace> --ignore-not-found=true
+  kubectl rollout restart deployment/<name> -n prelude
+  kubectl delete pod <seaweedfs_pods> -n vmsp-platform --grace-period=0 --force
+  kubectl certificate approve <csr_name>
+  ```
+
+---
+
+### 4. `ssp` (Security Services Platform / CAPI Cluster — VIP `10.1.0.10`)
+
+When remediating the `ssp` cluster (managed via `sysadmin@ssp-i`), the script executes across 11 sections (`cp`, `nodes`, `pods`, `gateway`, `deployments`, `certs`, `endpoint`, `proxy`, `sizing`, `footprint`, `entropy`):
+
+- **Node Uncordon & Pod Purging (`nodes`, `pods`)**:
+
+  ```bash
+  kubectl uncordon <node_name>
+  kubectl delete pods -n <namespace> --field-selector status.phase=Failed --force --grace-period=0
+  ```
+
+- **Core Microservice Scale-Up (`deployments`)**:
+
+  ```bash
+  kubectl scale deployment <name> -n <namespace> --replicas=1
+  kubectl delete pod -n <namespace> -l app=<name> --field-selector status.phase!=Running --grace-period=0
+  kubectl rollout restart deployment <name> -n <namespace>
+  ```
+
+  *(Enforces scale=1 on `platform-ui`, `metrics-server`, `site-service`, `authserver`, `ssp-metallb-controller`, `projectcontour-contour`, and `cert-manager-*`)*
+
+- **Certificate Lifecycle (`certs`)**:
+
+  ```bash
+  kubectl patch certificate <name> -n <namespace> --type=merge -p '{"spec":{"duration":"87600h0m0s"}}'
+  kubectl delete secret <secret> -n <namespace> --ignore-not-found=true
+  kubectl annotate certificate <name> -n <namespace> cert-manager.io/reissue-at=$(date +%s) --overwrite
+  kubectl rollout restart deployment/cert-manager-cainjector -n cert-manager
+  ```
+
+- **Cluster API (CAPI) Machine Sizing & Rolling Replacement (`sizing`)**:
+
+  ```bash
+  kubectl apply -f - -n ssp <<'EOF'
+  <VSphereMachineTemplate YAML>
+  EOF
+  kubectl patch kubeadmcontrolplane <kcp_name> -n ssp --type=merge -p '{"spec":{"machineTemplate":{"infrastructureRef":{"name":"<new_cp_vmt>"}}}}'
+  kubectl patch machinedeployment <md_name> -n ssp --type=merge -p '{"spec":{"template":{"spec":{"infrastructureRef":{"name":"<new_worker_vmt>"}}}}}'
+  kubectl annotate machine <vm_name> -n ssp cluster.x-k8s.io/skip-remediation="ssp-rightsize" --overwrite
+  kubectl cordon <vm_name>
+  kubectl drain <vm_name> --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+  kubectl uncordon <vm_name>
+  kubectl annotate machine <vm_name> -n ssp cluster.x-k8s.io/skip-remediation-
+  kubectl patch machinedeployment <md_name> -n ssp --type=merge -p '{"spec":{"replicas":<target_replicas>}}'
+  ```
+
+  *(Creates new `VSphereMachineTemplate` objects and updates `KubeadmControlPlane` / `MachineDeployment` objects in namespace `ssp` to right-size Control Plane and Worker VM CPU/memory capacity)*
+
+- **Workload Resource Right-Sizing (`footprint`)**:
+
+  ```bash
+  kubectl set resources <kind>/<name> -n nsxi-platform --containers=<container> --requests=cpu=<cpu>,memory=<mem>
+  ```
+
+  *(Right-sizes `nsxi-platform` workloads like `app-discovery`, `druid-historical`, and `kafka-controller`)*
+
+---
+
+### Summary Table
+
+| Target Cluster | Key Focus Areas of `kubectl` Mutations |
+| --- | --- |
+| **`vsp`** | Kube-VIP lease reset, Patroni DB permissions, cert reissuance (10-yr extension), Kyverno/Argo cleanup, Observability/Clickhouse restarts, and full `footprint` resource request right-sizing (`200m` CPU targets). |
+| **`supervisor`** | Admission webhook `caBundle` synchronization (KB 313904 / KB 368062) to unblock PVC/pod creation, `cert-manager-cainjector` rollout restart, node uncordoning, and evicted pod purging. |
+| **`vcfa`** | Stale Argo shutdown workflow purging, Envoy CPU storm patching, Prelude gRPC self-dial unblocking, RabbitMQ HA fixes, Kyverno policy repairs, and microservice scale-up/restarts. |
+| **`ssp`** | CAPI `VSphereMachineTemplate` creation and rolling `KubeadmControlPlane` / `MachineDeployment` node migration, `nsxi-platform` footprint right-sizing, cert-manager renewals, and service scaling. |
