@@ -5655,14 +5655,14 @@ echo "PROXY_CONFIGURED"
         lsf.write_output('Waiting for opslogs background probe to complete before finishing VCFfinal...')
         while opslogs_probe_state['thread'].is_alive():
             elapsed = time.time() - opslogs_probe_state['start_time']
-            if elapsed > 1200:  # 20 minutes timeout cap
-                fail_msg = 'VCF Component URL opslogs not accessible after 20 minutes of probing (timeout exceeded)'
+            if elapsed > 2820:  # 47 minutes timeout cap
+                fail_msg = 'VCF Component URL opslogs not accessible after 47 minutes of probing (timeout exceeded)'
                 lsf.write_output(f'  [FAILED] {fail_msg}')
                 lsf.labfail(fail_msg)
             time.sleep(5)
 
     if opslogs_probe_state.get('failed'):
-        fail_msg = opslogs_probe_state.get('error') or 'VCF Component URL opslogs probe failed after 20 minutes'
+        fail_msg = opslogs_probe_state.get('error') or 'VCF Component URL opslogs probe failed after 47 minutes'
         lsf.labfail(fail_msg)
     elif opslogs_probe_state.get('success'):
         lsf.write_output('opslogs background probe completed successfully.')
