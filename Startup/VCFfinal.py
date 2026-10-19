@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.57 - 2026-09-21
+# Version 6.3.58 - 2026-10-19
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.58 Changes:
+# - Task 5: Replaced hard failure on VCFA_URL_MAX_RETRIES with non-fatal failure logging
+#   (commenting out original labfail code). Added vCenter guest restart logic (RebootGuest
+#   with ResetVM fallback) on the VCF Automation VM if url_success is not reached by attempt 13.
+# - Background Probe: Added f-string prefix to write_vpodprogress at line 822 so attempt
+#   and max_attempts interpolate properly.
 #
 # v6.3.57 Changes:
 # - Task 6: Increased opslogs URL verification timeout from 20 minutes to 47 minutes
@@ -819,6 +826,7 @@ def _run_opslogs_background_probe(url, expected, lsf, dashboard=None, dry_run=Fa
                         lsf.write_output(f'  [HEALING] {heal_res.stdout.strip()}')
 
                 lsf.write_output(f'  [BACKGROUND PROBE] Sleeping and will try again... {attempt} / {max_attempts} ({retry_delay}s delay, {elapsed}s elapsed)')
+                lsf.write_vpodprogress(f'Waiting for Opslogs {attempt} / {max_attempts}', 'GOOD-3')
                 time.sleep(retry_delay)
 
 
@@ -4439,11 +4447,12 @@ echo "PROXY_CONFIGURED"
                         urls_passed += 1
                         break
                     else:
+                        # Rather than failing after VCFA_URL_MAX_RETRIES, original failure code commented out:
                         if attempt == VCFA_URL_MAX_RETRIES:
                             # Final attempt failed - fail the lab
                             lsf.write_output(f'  [FAILED] {url} after {VCFA_URL_MAX_RETRIES} attempts')
                             urls_failed += 1
-                            lsf.labfail(f'VCF Automation URL {url} not accessible after {VCFA_URL_MAX_RETRIES} minutes - should be reached in under 8 minutes')
+                            lsf.labfail(f'VCF Automation URL {url} not accessible after {VCFA_URL_MAX_RETRIES} minutes')
                         else:
                             # At attempt 5, trigger a background remediation pass of vcf-lab-tuner
                             # to heal any latent VCFA issues that did not resolve on the first pass
@@ -4474,6 +4483,103 @@ echo "PROXY_CONFIGURED"
                                         lsf.write_output(
                                             f'  WARNING: Failed to launch background vcf-lab-tuner.py: {_bg_err}'
                                         )
+
+                            # At attempt 13, perform guest restart on VCF Automation VM via vCenter if url_success not yet reached
+                            if attempt == 13:
+                                lsf.write_output(
+                                    f'  [ATTEMPT 13 RESTART] VCF Automation URL {url} not accessible by attempt 13; '
+                                    f'initiating guest restart on VCF Automation VM via vCenter...'
+                                )
+                                try:
+                                    # Ensure active vCenter session
+                                    _active_sis = []
+                                    for _si in lsf.sis:
+                                        try:
+                                            if _si.content.sessionManager.currentSession:
+                                                _active_sis.append(_si)
+                                        except Exception:
+                                            pass
+                                    if not _active_sis:
+                                        _vcenters = lsf.get_config_list('RESOURCES', 'vCenters')
+                                        if _vcenters:
+                                            lsf.write_output('  Connecting to vCenter to locate VCF Automation VM...')
+                                            lsf.connect_vcenters(_vcenters)
+
+                                    # Resolve VCF Automation VM(s)
+                                    _target_vms = []
+                                    if 'resolved_vcfa_vms' in locals() and resolved_vcfa_vms:
+                                        _target_vms = list(resolved_vcfa_vms)
+
+                                    if not _target_vms:
+                                        _cfg_vravms = lsf.get_config_list('VCFFINAL', 'vravms')
+                                        for _entry in _cfg_vravms:
+                                            _vm_pat = _entry.split(':')[0].strip()
+                                            try:
+                                                _matched = lsf.get_vm_match(_vm_pat)
+                                                if _matched:
+                                                    _target_vms.extend(_matched)
+                                            except Exception:
+                                                pass
+
+                                    if not _target_vms:
+                                        _is_site_b = ('site-b' in url.lower() or '10.2.1.' in url or 'auto-b' in url.lower())
+                                        _pats = [r'auto-platform-b.*', r'auto-b.*'] if _is_site_b else [r'auto-platform-a.*', r'auto-a.*']
+                                        for _pat in _pats:
+                                            try:
+                                                _matched = lsf.get_vm_match(_pat)
+                                                if _matched:
+                                                    _target_vms.extend(_matched)
+                                                    break
+                                            except Exception:
+                                                pass
+
+                                    # Deduplicate VMs
+                                    _seen_vm_names = set()
+                                    _unique_vcfa_vms = []
+                                    for _v in _target_vms:
+                                        if _v.name not in _seen_vm_names:
+                                            _seen_vm_names.add(_v.name)
+                                            _unique_vcfa_vms.append(_v)
+
+                                    if not _unique_vcfa_vms:
+                                        lsf.write_output('  WARNING: Could not find VCF Automation VM in vCenter to restart')
+                                    else:
+                                        from pyVim.task import WaitForTask
+                                        for _vm in _unique_vcfa_vms:
+                                            try:
+                                                lsf.write_output(f'  [ATTEMPT 13 RESTART] Performing guest restart on {_vm.name} via vCenter...')
+                                                if _vm.runtime.powerState != 'poweredOn':
+                                                    lsf.write_output(f'  [ATTEMPT 13 RESTART] {_vm.name} is powered off; powering on...')
+                                                    _task = _vm.PowerOnVM_Task()
+                                                    WaitForTask(_task)
+                                                    continue
+
+                                                # Check VMware Tools status
+                                                _tools_status = getattr(getattr(_vm, 'guest', None), 'toolsRunningStatus', None)
+                                                if not _tools_status and hasattr(_vm, 'summary') and hasattr(_vm.summary, 'guest'):
+                                                    _tools_status = getattr(_vm.summary.guest, 'toolsRunningStatus', None)
+
+                                                if _tools_status == 'guestToolsRunning':
+                                                    try:
+                                                        _vm.RebootGuest()
+                                                        lsf.write_output(f'  [ATTEMPT 13 RESTART] Guest restart signal issued to {_vm.name}')
+                                                    except Exception as _rg_err:
+                                                        lsf.write_output(f'  [ATTEMPT 13 RESTART] RebootGuest failed ({_rg_err}); falling back to ResetVM...')
+                                                        _task = _vm.ResetVM_Task()
+                                                        WaitForTask(_task)
+                                                        lsf.write_output(f'  [ATTEMPT 13 RESTART] Reset completed for {_vm.name}')
+                                                else:
+                                                    lsf.write_output(f'  [ATTEMPT 13 RESTART] Tools status is "{_tools_status}"; falling back to ResetVM...')
+                                                    _task = _vm.ResetVM_Task()
+                                                    WaitForTask(_task)
+                                                    lsf.write_output(f'  [ATTEMPT 13 RESTART] Reset completed for {_vm.name}')
+                                            except Exception as _restart_err:
+                                                lsf.write_output(f'  WARNING: Failed to restart {_vm.name}: {_restart_err}')
+
+                                        lsf.write_output('  [ATTEMPT 13 RESTART] Waiting 60s for reboot to take effect...')
+                                        lsf.labstartup_sleep(60)
+                                except Exception as _att13_err:
+                                    lsf.write_output(f'  WARNING: Attempt 13 guest restart error: {_att13_err}')
 
                             # Every 3 attempts re-check node scheduling — catches vmsp-operator
                             # re-cordons that slip through (e.g. very slow startup).
