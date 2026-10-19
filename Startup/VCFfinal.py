@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.56 - 2026-09-21
+# Version 6.3.57 - 2026-09-21
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation)
+#
+# v6.3.57 Changes:
+# - Task 6: Increased opslogs URL verification timeout from 20 minutes to 47 minutes
+#   to accommodate the new 30-minute grace period for the log-processor pod to become Ready.
 #
 # v6.3.56 Changes:
 # - Removed redundant [VSPMONITOR] startup health report pass at the end of VCFfinal
@@ -751,9 +755,9 @@ def _run_opslogs_background_probe(url, expected, lsf, dashboard=None, dry_run=Fa
         opslogs_probe_state['success'] = True
         return
 
-    retry_delay = 30  # 30s polling interval
-    max_wait_seconds = 1200  # 20 minutes hard timeout cap
-    max_attempts = int(max_wait_seconds / retry_delay)  # 40 attempts
+    retry_delay = 60  # 30s polling interval
+    max_wait_seconds = 2820  # 47 minutes hard timeout cap
+    max_attempts = int(max_wait_seconds / retry_delay)  # 47 attempts
 
     start_url_time = time.time()
     opslogs_probe_state['start_time'] = start_url_time
