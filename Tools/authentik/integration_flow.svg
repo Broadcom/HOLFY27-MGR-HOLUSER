@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 820" width="1060" height="820">
+  <acctitle>Authentik VCF Integration Sequence Flow</acctitle>
+  <accdescr>Sequence diagram detailing multi-step automated integration between VCF Operations, vCenter, Holorouter, and Authentik.</accdescr>
+  <defs>
+    <style type="text/css">
+      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap");
+      text { font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+      .hdr-title { font-size: 16px; font-weight: 700; fill: #ffffff; }
+      .hdr-sub { font-size: 12px; font-weight: 500; fill: #94a3b8; }
+      .part-title { font-size: 12px; font-weight: 700; fill: #ffffff; text-anchor: middle; }
+      .part-sub { font-size: 10px; font-weight: 500; fill: #cbd5e1; text-anchor: middle; }
+      .step-badge { font-size: 10px; font-weight: 700; fill: #ffffff; text-anchor: middle; }
+      .step-text { font-size: 11px; font-weight: 600; fill: #0f172a; }
+      .step-desc { font-size: 10px; font-weight: 500; fill: #475569; }
+    </style>
+    <marker id="sq-arrow" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 3.5 L 0 7 z" fill="#2563eb"/>
+    </marker>
+    <marker id="sq-arrow-dash" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 3.5 L 0 7 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1060" height="820" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1" data-role="background"/>
+  
+  <!-- Canvas Header -->
+  <rect x="0" y="0" width="1060" height="52" rx="12" fill="#0f172a" data-role="background"/>
+  <rect x="0" y="40" width="1060" height="12" fill="#0f172a" data-role="background"/>
+  <text x="24" y="32" class="hdr-title">End-to-End Authentik + VCF 9.1 Integration Workflow</text>
+  <text x="1036" y="32" class="hdr-sub" text-anchor="end">Automated Orchestration Steps</text>
+
+  <!-- Lifeline 1: CLI / VCFfinal -->
+  <rect x="24" y="66" width="132" height="42" rx="6" fill="#475569" data-role="container"/>
+  <text x="90" y="83" class="part-title">VCFfinal.py / CLI</text>
+  <text x="90" y="97" class="part-sub">Trigger &amp; Options</text>
+  <line x1="90" y1="108" x2="90" y2="760" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4,4" data-role="decoration"/>
+  <rect x="24" y="760" width="132" height="34" rx="6" fill="#475569" data-role="container"/>
+  <text x="90" y="781" class="part-title">VCFfinal.py / CLI</text>
+
+  <!-- Lifeline 2: Script Orchestrator -->
+  <rect x="196" y="66" width="140" height="42" rx="6" fill="#2563eb" data-role="container"/>
+  <text x="266" y="83" class="part-title">authentik_vcf_integration</text>
+  <text x="266" y="97" class="part-sub">Main Orchestrator</text>
+  <line x1="266" y1="108" x2="266" y2="760" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4,4" data-role="decoration"/>
+  <rect x="196" y="760" width="140" height="34" rx="6" fill="#2563eb" data-role="container"/>
+  <text x="266" y="781" class="part-title">authentik_vcf_integration</text>
+
+  <!-- Lifeline 3: Authentik API -->
+  <rect x="376" y="66" width="132" height="42" rx="6" fill="#7c3aed" data-role="container"/>
+  <text x="442" y="83" class="part-title">Authentik API</text>
+  <text x="442" y="97" class="part-sub">auth.vcf.lab</text>
+  <line x1="442" y1="108" x2="442" y2="760" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4,4" data-role="decoration"/>
+  <rect x="376" y="760" width="132" height="34" rx="6" fill="#7c3aed" data-role="container"/>
+  <text x="442" y="781" class="part-title">Authentik API</text>
+
+  <!-- Lifeline 4: vCenter VIDB -->
+  <rect x="548" y="66" width="132" height="42" rx="6" fill="#059669" data-role="container"/>
+  <text x="614" y="83" class="part-title">vCenter VIDB &amp; SSO</text>
+  <text x="614" y="97" class="part-sub">vc-mgmt-a / vc-wld01-a</text>
+  <line x1="614" y1="108" x2="614" y2="760" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4,4" data-role="decoration"/>
+  <rect x="548" y="760" width="132" height="34" rx="6" fill="#059669" data-role="container"/>
+  <text x="614" y="781" class="part-title">vCenter VIDB &amp; SSO</text>
+
+  <!-- Lifeline 5: VCF Ops Fleet LCM -->
+  <rect x="720" y="66" width="132" height="42" rx="6" fill="#d97706" data-role="container"/>
+  <text x="786" y="83" class="part-title">VCF Operations</text>
+  <text x="786" y="97" class="part-sub">ops-a.site-a.vcf.lab</text>
+  <line x1="786" y1="108" x2="786" y2="760" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4,4" data-role="decoration"/>
+  <rect x="720" y="760" width="132" height="34" rx="6" fill="#d97706" data-role="container"/>
+  <text x="786" y="781" class="part-title">VCF Operations</text>
+
+  <!-- Lifeline 6: Holorouter / Squid -->
+  <rect x="892" y="66" width="132" height="42" rx="6" fill="#0284c7" data-role="container"/>
+  <text x="958" y="83" class="part-title">Holorouter / Squid</text>
+  <text x="958" y="97" class="part-sub">10.1.1.1 Proxy &amp; DNS</text>
+  <line x1="958" y1="108" x2="958" y2="760" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4,4" data-role="decoration"/>
+  <rect x="892" y="760" width="132" height="34" rx="6" fill="#0284c7" data-role="container"/>
+  <text x="958" y="781" class="part-title">Holorouter / Squid</text>
+
+  <!-- Steps -->
+  <!-- Step 1 -->
+  <rect x="66.5" y="130.5" width="20" height="20" rx="10" fill="#2563eb" data-role="decoration"/>
+  <text x="76.5" y="144.5" class="step-badge">1</text>
+  <text x="124" y="138" class="step-text">Invoke Integration Script</text>
+  <text x="124" y="150" class="step-desc">Pass flags (--domain, --admin-password)</text>
+  <line x1="90" y1="140" x2="266" y2="140" stroke="#2563eb" stroke-width="2" marker-end="url(#sq-arrow)" data-role="edge"/>
+
+  <!-- Step 2 -->
+  <rect x="245.4" y="177.8" width="20" height="20" rx="10" fill="#7c3aed" data-role="decoration"/>
+  <text x="255.4" y="191.8" class="step-badge">2</text>
+  <text x="300" y="188" class="step-text">Create OAuth2 Provider &amp; Application</text>
+  <text x="300" y="200" class="step-desc">Set encryption_key: null, issuer_mode: per_provider</text>
+  <line x1="266" y1="190" x2="442" y2="190" stroke="#7c3aed" stroke-width="2" marker-end="url(#sq-arrow)" data-role="edge"/>
+
+  <!-- Step 3 -->
+  <rect x="247" y="230" width="20" height="20" rx="10" fill="#7c3aed" data-role="decoration"/>
+  <text x="257" y="244" class="step-badge">3</text>
+  <text x="300" y="238" class="step-text">Configure SCIM Mapping &amp; Scope Mappings</text>
+  <text x="300" y="250" class="step-desc">Attach email, openid, profile, SCIM User &amp; Group PKs</text>
+  <line x1="266" y1="240" x2="442" y2="240" stroke="#7c3aed" stroke-width="2" marker-end="url(#sq-arrow)" data-role="edge"/>
+
+  <!-- Step 4 -->
+  <rect x="448" y="280" width="20" height="20" rx="10" fill="#64748b" data-role="decoration"/>
+  <text x="458" y="294" class="step-badge">4</text>
+  <text x="476" y="288" class="step-text">Return Client Credentials &amp; Tokens</text>
+  <text x="476" y="300" class="step-desc">Client ID, Secret, bearer tokens</text>
+  <line x1="442" y1="290" x2="266" y2="290" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4,4" marker-end="url(#sq-arrow-dash)" data-role="edge"/>
+
+  <!-- Step 5 -->
+  <rect x="247" y="330.5" width="20" height="20" rx="10" fill="#059669" data-role="decoration"/>
+  <text x="257" y="344.5" class="step-badge">5</text>
+  <text x="300" y="338" class="step-text">Register OIDC Provider on vCenter VIDB</text>
+  <text x="300" y="350" class="step-desc">POST /identity/api/v1/providers (sub_mode: hashed)</text>
+  <line x1="266" y1="340" x2="614" y2="340" stroke="#059669" stroke-width="2" marker-end="url(#sq-arrow)" data-role="edge"/>
+
+  <!-- Step 6 -->
+  <rect x="247" y="379.5" width="20" height="20" rx="10" fill="#059669" data-role="decoration"/>
+  <text x="257" y="393.5" class="step-badge">6</text>
+  <text x="300" y="388" class="step-text">Register SCIM Service in vCenter</text>
+  <text x="300" y="400" class="step-desc">POST /usergroup/scim/v2 endpoint</text>
+  <line x1="266" y1="390" x2="614" y2="390" stroke="#059669" stroke-width="2" marker-end="url(#sq-arrow)" data-role="edge"/>
+
+  <!-- Step 7 -->
+  <rect x="420" y="427.8" width="20" height="20" rx="10" fill="#7c3aed" data-role="decoration"/>
+  <text x="430" y="441.8" class="step-badge">7</text>
+  <text x="476" y="438" class="step-text">Trigger Initial SCIM Sync Push</text>
+  <text x="476" y="450" class="step-desc">Authentik pushes users/groups to vCenter SCIM</text>
+  <line x1="442" y1="440" x2="614" y2="440" stroke="#7c3aed" stroke-width="2" marker-end="url(#sq-arrow)" data-role="edge"/>
+
+  <!-- Step 8 -->
+  <rect x="249" y="479.5" width="20" height="20" rx="10" fill="#d97706" data-role="decoration"/>
+  <text x="259" y="493.5" class="step-badge">8</text>
+  <text x="300" y="488" class="step-text">Configure VCF Operations OAuth2</text>
+  <text x="300" y="500" class="step-desc">PUT /suite-api/api/auth/providers/oauth2</text>
+  <line x1="266" y1="490" x2="786" y2="490" stroke="#d97706" stroke-width="2" marker-end="url(#sq-arrow)" data-role="edge"/>
+
+  <!-- Step 9 -->
+  <rect x="249" y="527.8" width="20" height="20" rx="10" fill="#d97706" data-role="decoration"/>
+  <text x="259" y="541.8" class="step-badge">9</text>
+  <text x="300" y="538" class="step-text">Assign Fleet IAM Roles</text>
+  <text x="300" y="550" class="step-desc">Bind Authentik Admins group to vcf_administrator</text>
+  <line x1="266" y1="540" x2="786" y2="540" stroke="#d97706" stroke-width="2" marker-end="url(#sq-arrow)" data-role="edge"/>
+
+  <!-- Step 10 -->
+  <rect x="249" y="579.5" width="20" height="20" rx="10" fill="#0284c7" data-role="decoration"/>
+  <text x="259" y="593.5" class="step-badge">10</text>
+  <text x="300" y="588" class="step-text">Configure Squid Proxy ACL</text>
+  <text x="300" y="600" class="step-desc">Allow vcf.lab domains for JWKS fetching</text>
+  <line x1="266" y1="590" x2="958" y2="590" stroke="#0284c7" stroke-width="2" marker-end="url(#sq-arrow)" data-role="edge"/>
+
+  <!-- Step 11 -->
+  <rect x="248.7" y="629.5" width="20" height="20" rx="10" fill="#059669" data-role="decoration"/>
+  <text x="258.7" y="643.5" class="step-badge">11</text>
+  <text x="300" y="638" class="step-text">Restart vc-ws1a-broker &amp; Validate SSO</text>
+  <text x="300" y="650" class="step-desc">Clear cached JWKS &amp; reload OIDC client configurations</text>
+  <line x1="266" y1="640" x2="614" y2="640" stroke="#059669" stroke-width="2" marker-end="url(#sq-arrow)" data-role="edge"/>
+
+  <!-- Step 12 -->
+  <rect x="66.5" y="677.8" width="20" height="20" rx="10" fill="#2563eb" data-role="decoration"/>
+  <text x="76.5" y="691.8" class="step-badge">12</text>
+  <text x="124" y="688" class="step-text">Return Integration Status &amp; Summary</text>
+  <text x="124" y="700" class="step-desc">Report success, endpoints, and credentials</text>
+  <line x1="266" y1="690" x2="90" y2="690" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="4,4" marker-end="url(#sq-arrow-dash)" data-role="edge"/>
+</svg>

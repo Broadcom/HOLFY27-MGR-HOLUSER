@@ -69,6 +69,8 @@ flowchart TD
     OPS_B -->|"SSO Realm Join"| NSX_B
 ```
 
+![System Architecture & Data Flow Diagram](./system_architecture.svg)
+
 ---
 
 ## End-to-End Integration Flow
@@ -125,6 +127,8 @@ sequenceDiagram
         Script->>Ops: Query eligible components & Join vCenters, NSX, Ops, VCFA to SSO
     end
 ```
+
+![End-to-End Integration Flow Diagram](./integration_flow.svg)
 
 ---
 
@@ -227,8 +231,107 @@ python3 Tools/authentik/authentik_vcf_integration.py
 Specify a custom `config.ini` file path:
 
 ```bash
-python3 Tools/authentik/authentik_vcf_integration.py --config /path/to/custom_config.ini
+python3 Tools/authentik/authentik_vcf_integration.py --config /tmp/authentik_config.ini
 ```
+
+The following content already exists in the [defaultconfig.ini](https://github.com/Broadcom/HOLFY27-MGR-HOLUSER/blob/main/holodeck/defaultconfig.ini) with all the other sections and values. The Authentik specific sections and configuration elements have been placed below for each access to create your own authentik_config.ini for a manual run if desired.
+
+```ini
+#==============================================================================
+# [VCFFINAL] - Final VCF startup tasks (Tanzu, VCF Automation, VCF Components)
+# Startup: Startup/VCFfinal.py (runs after VCF.py completes)
+# Shutdown: Shutdown/VCFshutdown.py reads several keys from this section:
+#   - tanzucontrol  -> Phase 3 (stop WCP), Phase 4 (Supervisor VM shutdown + dynamic discovery)
+#   - vravms        -> Phase 1b (VCF Automation fallback when Fleet API down)
+#   - vcfcomponents -> Phase 2b (scale down K8s workloads on VSP)
+#==============================================================================
+
+[VCFFINAL]
+
+# Authentik + VCF SSO (OIDC + SCIM via Fleet IAM). See Tools/authentik/authentik_vcf_integration.py.
+# Startup: VCFfinal.py Task 8b. A single toggle drives the full end-to-end workflow:
+#   - VCF SSO UI Prerequisites (via Playwright)
+#   - Authentik OAuth2 provider (VCF OIDC) + application (VCF)
+#   - OIDC scope mappings (email, openid, profile)
+#   - Authentik groups + lab users
+#   - Fleet IAM: SSO realm, OIDC+SCIM IdP, SCIM bearer token
+#   - Authentik SCIM provider (VCF SCIM) with property mappings + group filters
+#   - Fleet IAM role assignments: prod-admins→vcf_administrator, prod-readonly→vcf_viewer, dev-admins→sddc_admin, dev-readonly→sddc_viewer
+#   - Fleet IAM: Join SSO (vCenter, VCF Operations, VCF Automation)
+# All steps are idempotent — safe to re-run.
+# authentik_vcf_integration = true
+
+# Master & Site Enablement Toggles
+# authentik_sso_site_a = true
+# authentik_sso_site_b = true
+
+# Granular Component Join Toggles (controls which components join SSO)
+# authentik_join_mgmt_vc = true
+# authentik_join_wld_vc = true
+# authentik_join_nsx = true
+# authentik_join_nsx_mgmt = true
+# authentik_join_nsx_wld = true
+# authentik_join_ops = true
+# authentik_join_auto = true
+
+# Granular Workflow Step Toggles (allows disabling specific steps for attendee lab exercises)
+# authentik_step_prereqs = true
+# authentik_step_oauth = true
+# authentik_step_users_groups = true
+# authentik_step_fleet_idp = true
+# authentik_step_scim = true
+# authentik_step_roles = true
+# authentik_step_join_sso = true
+
+#==============================================================================
+# [AUTHENTIK] - Authentik identity provider user and group provisioning
+# Runs during Startup/prelim.py Task 12 (early startup, pre-VCF).
+# All operations are idempotent — safe to re-run on every boot.
+# This section is independent of [VCFFINAL] authentik_vcf_integration.
+# Read by: Startup/prelim.py Task 12
+#==============================================================================
+
+[AUTHENTIK]
+
+# Authentik base URL
+# Override only if your deployment uses a non-standard hostname.
+# Default: https://auth.vcf.lab
+# authentik_base_url = https://auth.vcf.lab
+
+# Groups to create in Authentik (one per line).
+# Format: groupname
+# Groups listed here are created even if no users are assigned to them.
+# Groups referenced in authentik_users are also auto-created as needed.
+# Read by: Startup/prelim.py Task 12
+# authentik_groups = dev-team
+#   ops-team
+#   lab-viewers
+#   approvers
+
+# Users to create in Authentik (one per line).
+# Format: username:Display Name:email:group1,group2,...
+#   - username     : Authentik login name (no spaces)
+#   - Display Name : Human-readable full name (may contain spaces)
+#   - email        : User's email address (used as unique identity key)
+#   - groups       : Comma-separated list of group names to add the user to
+#                    Groups are created automatically if they don't exist.
+# Password: all users are assigned the lab password from /home/holuser/creds.txt.
+# Idempotent: if a user with the same email already exists, creation is skipped.
+# Read by: Startup/prelim.py Task 12
+# authentik_users = alice:Alice Smith:alice@vcf.lab:dev-team,lab-viewers
+#   bob:Bob Jones:bob@vcf.lab:ops-team
+#   charlie:Charlie Brown:charlie@vcf.lab:dev-team,approvers
+#   dana:Dana White:dana@vcf.lab:lab-viewers
+
+# Authentik LDAP Provider & Outpost Configuration
+# Enable LDAP Provider + LDAP Outpost deployment and Holorouter port routing (389 / 636)
+# authentik_ldap_enabled = false
+# authentik_ldap_base_dn = dc=vcf,dc=lab
+# authentik_ldap_provider_name = VCF LDAP
+# authentik_ldap_outpost_name = authentik LDAP Outpost
+# authentik_ldap_router_proxy = true
+```
+
 
 ### Example 4: Environment Overrides
 
