@@ -237,9 +237,26 @@ class ValidationReport:
     k8s_cert_checks: List[CheckResult] = field(default_factory=list)
     component_version_checks: List[CheckResult] = field(default_factory=list)
     overall_status: str = "PASS"
+    summary: Dict[str, int] = field(default_factory=dict)
     
     def to_dict(self) -> Dict:
-        return asdict(self)
+        d = asdict(self)
+        all_checks = (
+            self.ssl_checks + self.license_checks + self.ntp_checks +
+            self.vm_config_checks + self.vm_resource_checks +
+            self.password_expiration_checks + self.fleet_password_policy_checks +
+            self.firefox_ca_checks + self.drs_isolation_checks +
+            self.k8s_cert_checks + self.component_version_checks
+        )
+        d["summary"] = {
+            "total_checks": len(all_checks),
+            "passed_checks": sum(1 for c in all_checks if c.status == "PASS"),
+            "fixed_checks": sum(1 for c in all_checks if c.status == "FIXED"),
+            "warned_checks": sum(1 for c in all_checks if c.status == "WARN"),
+            "failed_checks": sum(1 for c in all_checks if c.status == "FAIL"),
+            "skipped_checks": sum(1 for c in all_checks if c.status == "SKIPPED"),
+        }
+        return d
     
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2, default=str)
@@ -452,28 +469,93 @@ def check_ssl_certificates(urls: List[str], min_exp_date: datetime.date) -> List
 def get_ntp_config(esx_host) -> Dict[str, Any]:
     """Get NTP configuration for an ESXi host"""
     ntp_data = {
-        "hostname": esx_host.name,
+        "hostname": getattr(esx_host, 'name', 'unknown'),
         "running": False,
         "policy": "",
         "server": ""
     }
     
     try:
-        for service in esx_host.config.service.service:
-            if service.key == 'ntpd':
-                ntp_data["running"] = service.running
-                ntp_data["policy"] = service.policy
-                if esx_host.config.dateTimeInfo.ntpConfig.server:
-                    ntp_data["server"] = esx_host.config.dateTimeInfo.ntpConfig.server[0]
-                break
+        ss = getattr(esx_host.configManager, 'serviceSystem', None) if hasattr(esx_host, 'configManager') else None
+        if ss and hasattr(ss, 'serviceInfo') and ss.serviceInfo:
+            for service in ss.serviceInfo.service:
+                if service.key == 'ntpd':
+                    ntp_data["running"] = service.running
+                    ntp_data["policy"] = service.policy
+                    break
+        elif getattr(esx_host, 'config', None) and getattr(esx_host.config, 'service', None):
+            for service in esx_host.config.service.service:
+                if service.key == 'ntpd':
+                    ntp_data["running"] = service.running
+                    ntp_data["policy"] = service.policy
+                    break
+
+        dts = getattr(esx_host.configManager, 'dateTimeSystem', None) if hasattr(esx_host, 'configManager') else None
+        if dts and hasattr(dts, 'dateTimeInfo') and dts.dateTimeInfo and dts.dateTimeInfo.ntpConfig:
+            if dts.dateTimeInfo.ntpConfig.server:
+                ntp_data["server"] = dts.dateTimeInfo.ntpConfig.server[0]
+        elif getattr(esx_host, 'config', None) and getattr(esx_host.config, 'dateTimeInfo', None):
+            if esx_host.config.dateTimeInfo.ntpConfig and esx_host.config.dateTimeInfo.ntpConfig.server:
+                ntp_data["server"] = esx_host.config.dateTimeInfo.ntpConfig.server[0]
     except Exception:
         pass
     
     return ntp_data
 
 
-def check_ntp_configuration(hosts: List) -> List[CheckResult]:
-    """Check NTP configuration on all ESXi hosts"""
+def configure_esx_ntp(host, ntp_server: str = "10.1.1.1") -> List[str]:
+    """Configure NTP server to 10.1.1.1 and start/enable ntpd service on ESXi."""
+    fixes = []
+    try:
+        dts = getattr(host.configManager, 'dateTimeSystem', None) if hasattr(host, 'configManager') else None
+        ss = getattr(host.configManager, 'serviceSystem', None) if hasattr(host, 'configManager') else None
+        if dts:
+            curr_servers = list(dts.dateTimeInfo.ntpConfig.server or []) if (dts.dateTimeInfo and dts.dateTimeInfo.ntpConfig) else []
+            if curr_servers != [ntp_server]:
+                ntp_spec = vim.host.DateTimeConfig(
+                    ntpConfig=vim.host.NtpConfig(server=[ntp_server])
+                )
+                dts.UpdateDateTimeConfig(ntp_spec)
+                fixes.append(f"NTP server set to {ntp_server}")
+        if ss:
+            ntpd_policy = None
+            ntpd_running = False
+            for s in ss.serviceInfo.service:
+                if s.key == 'ntpd':
+                    ntpd_policy = s.policy
+                    ntpd_running = s.running
+                    break
+            if ntpd_policy != 'on':
+                ss.UpdateServicePolicy(id='ntpd', policy='on')
+                fixes.append("policy set to 'on'")
+            if not ntpd_running:
+                try:
+                    ss.StartService(id='ntpd')
+                    fixes.append("ntpd service started")
+                except Exception:
+                    try:
+                        ss.RestartService(id='ntpd')
+                        fixes.append("ntpd service restarted")
+                    except Exception:
+                        pass
+            elif fixes:
+                # If server changed while ntpd was running, restart ntpd to apply
+                try:
+                    ss.RestartService(id='ntpd')
+                    fixes.append("ntpd service restarted")
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"Failed to configure NTP on {getattr(host, 'name', 'unknown')}: {e}")
+    return fixes
+
+
+def check_ntp_configuration(hosts: List, fix_issues: bool = True) -> List[CheckResult]:
+    """Check and optionally fix NTP configuration on all ESXi hosts.
+    
+    When fix_issues is True, all ESXi hosts must match and be set to 10.1.1.1,
+    with policy 'on' and ntpd running.
+    """
     results = []
     
     for host in hosts:
@@ -485,11 +567,22 @@ def check_ntp_configuration(hosts: List) -> List[CheckResult]:
         if ntp_config["policy"] != "on":
             issues.append(f"NTPD policy is '{ntp_config['policy']}' (should be 'on')")
         if not ntp_config["server"]:
-            issues.append("No NTP server configured")
+            issues.append("No NTP server configured (should be 10.1.1.1)")
+        elif ntp_config["server"] != "10.1.1.1":
+            issues.append(f"NTP server is '{ntp_config['server']}' (should be '10.1.1.1')")
         
         if issues:
-            status = "WARN"
-            message = "; ".join(issues)
+            if fix_issues:
+                fixes = configure_esx_ntp(host, "10.1.1.1")
+                if fixes:
+                    status = "FIXED"
+                    message = f"Fixed: {', '.join(fixes)}"
+                else:
+                    status = "FAIL"
+                    message = "; ".join(issues)
+            else:
+                status = "WARN"
+                message = "; ".join(issues)
         else:
             status = "PASS"
             message = f"NTP configured correctly (server: {ntp_config['server']})"
@@ -1217,15 +1310,18 @@ def generate_html_report(report: ValidationReport) -> str:
         .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
         h1 {{ color: #1e293b; }}
         h2 {{ color: #334155; border-bottom: 2px solid #e2e8f0; padding-bottom: 0.5rem; }}
-        .status-pass {{ color: #16a34a; }}
-        .status-fail {{ color: #dc2626; }}
-        .status-warn {{ color: #ca8a04; }}
-        .status-fixed {{ color: #2563eb; }}
+        .status-pass {{ color: #16a34a; font-weight: 600; }}
+        .status-fail {{ color: #dc2626; font-weight: 600; }}
+        .status-warn {{ color: #ca8a04; font-weight: 600; }}
+        .status-fixed {{ color: #2563eb; font-weight: 600; }}
+        .status-skipped {{ color: #64748b; font-style: italic; }}
         table {{ width: 100%; border-collapse: collapse; margin: 1rem 0; }}
         th, td {{ padding: 0.75rem; text-align: left; border-bottom: 1px solid #e2e8f0; }}
         th {{ background: #f8fafc; font-weight: 600; }}
         .overall-pass {{ background: #dcfce7; color: #166534; padding: 1rem; border-radius: 8px; }}
         .overall-fail {{ background: #fee2e2; color: #991b1b; padding: 1rem; border-radius: 8px; }}
+        .summary-box {{ display: flex; flex-wrap: wrap; gap: 1rem; margin: 1rem 0; }}
+        .summary-card {{ padding: 0.75rem 1.25rem; border-radius: 6px; background: #f8fafc; border: 1px solid #e2e8f0; font-size: 0.95rem; }}
     </style>
 </head>
 <body>
@@ -1234,11 +1330,24 @@ def generate_html_report(report: ValidationReport) -> str:
         <p>Generated: {report.timestamp}</p>
         <p>Lab license expiration window: {report.min_exp_date} to {report.max_exp_date}</p>
         
-        <div class="overall-{'pass' if report.overall_status == 'PASS' else 'fail'}">
+        <div class="overall-{'pass' if report.overall_status in ('PASS', 'FIXED') else 'fail'}">
             <strong>Overall Status: {report.overall_status}</strong>
         </div>
 '''
     
+    # Add summary statistics box
+    s = report.to_dict().get("summary", {})
+    if s:
+        html += f'''
+        <div class="summary-box">
+            <div class="summary-card"><strong>Total Checks:</strong> {s.get("total_checks", 0)}</div>
+            <div class="summary-card" style="color:#166534;"><strong>Passed:</strong> {s.get("passed_checks", 0)}</div>
+            <div class="summary-card" style="color:#2563eb;"><strong>Fixed:</strong> {s.get("fixed_checks", 0)}</div>
+            <div class="summary-card" style="color:#ca8a04;"><strong>Warned:</strong> {s.get("warned_checks", 0)}</div>
+            <div class="summary-card" style="color:#dc2626;"><strong>Failed:</strong> {s.get("failed_checks", 0)}</div>
+        </div>
+'''
+
     # Add sections for each check type
     # Component versions gets its own dedicated multi-column table
     if report.component_version_checks:
@@ -1251,6 +1360,10 @@ def generate_html_report(report: ValidationReport) -> str:
         ('VM Configuration', report.vm_config_checks),
         ('VM Resources', report.vm_resource_checks),
         ('Password Expiration Checks', report.password_expiration_checks),
+        ('VCF Fleet Password Policies', report.fleet_password_policy_checks),
+        ('Firefox Trusted Private CAs', report.firefox_ca_checks),
+        ('DRS Host Isolation', report.drs_isolation_checks),
+        ('Kubernetes Certificates', report.k8s_cert_checks),
     ]
 
     for title, checks in sections:
@@ -1756,7 +1869,107 @@ def _eval_password_expiration(days: Optional[int], threshold_days: int = 90, not
         return "FAIL", f"Expires in {days} days - TOO SOON (<= {threshold_days} days){suffix}"
 
 
-def check_password_expirations() -> List[CheckResult]:
+def remediate_password_expiration(account_type: str, hostname: str, username: str,
+                                   password: str, user_id: Optional[int] = None,
+                                   managing_nsx_mgr: Optional[str] = None,
+                                   node_id: Optional[str] = None) -> bool:
+    """Remediate password expiration by extending it to 999 days / no-expiry."""
+    if not lsf:
+        return False
+
+    try:
+        if account_type == 'linux_ssh':
+            cmd = f"chage -d $(date +%Y-%m-%d) -M 999 {username}"
+            res = lsf.ssh(cmd, f"root@{hostname}", password)
+            return getattr(res, 'returncode', 1) == 0
+        elif account_type == 'linux_sudo':
+            cmd = f"echo '{password}' | sudo -S chage -d $(date +%Y-%m-%d) -M 999 {username}"
+            res = lsf.ssh(cmd, f"vmware-system-user@{hostname}", password)
+            return getattr(res, 'returncode', 1) == 0
+        elif account_type == 'sddc_manager':
+            if username == 'vcf':
+                cmd = f"chage -d $(date +%Y-%m-%d) -M 999 vcf"
+                res = lsf.ssh(cmd, f"vcf@{hostname}", password)
+                return getattr(res, 'returncode', 1) == 0
+            else:
+                expect_script = (
+                    f"#!/usr/bin/expect -f\n"
+                    f"set timeout 30\n"
+                    f"spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null vcf@{hostname}\n"
+                    f"expect \"Password:\"\n"
+                    f"send \"{password}\\r\"\n"
+                    f"expect \"$ \"\n"
+                    f"send \"su - root\\r\"\n"
+                    f"expect \"Password:\"\n"
+                    f"send \"{password}\\r\"\n"
+                    f"expect \"# \"\n"
+                    f"send \"chage -d $(date +%Y-%m-%d) -M 999 {username}\\r\"\n"
+                    f"expect \"# \"\n"
+                    f"send \"exit\\r\"\n"
+                    f"expect \"$ \"\n"
+                    f"send \"exit\\r\"\n"
+                    f"expect eof\n"
+                )
+                p = subprocess.run(["expect", "-c", expect_script], capture_output=True, timeout=35)
+                return p.returncode == 0
+        elif account_type == 'nsx_manager':
+            import requests, urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            ok = False
+            if user_id is not None:
+                try:
+                    resp = requests.put(
+                        f'https://{hostname}/api/v1/node/users/{user_id}',
+                        auth=('admin', password),
+                        json={'password_change_frequency': 999},
+                        verify=False, timeout=15
+                    )
+                    if resp.status_code == 200:
+                        ok = True
+                except Exception:
+                    pass
+            try:
+                cmd = f"chage -d $(date +%Y-%m-%d) -M 999 {username}"
+                res = lsf.ssh(cmd, f"root@{hostname}", password)
+                if getattr(res, 'returncode', 1) == 0:
+                    ok = True
+            except Exception:
+                pass
+            return ok
+        elif account_type == 'nsx_edge':
+            import requests, urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            ok = False
+            if managing_nsx_mgr and node_id and user_id is not None:
+                try:
+                    resp = requests.put(
+                        f'https://{managing_nsx_mgr}/api/v1/transport-nodes/{node_id}/node/users/{user_id}',
+                        auth=('admin', password),
+                        json={'password_change_frequency': 999},
+                        verify=False, timeout=15
+                    )
+                    if resp.status_code == 200:
+                        ok = True
+                except Exception:
+                    pass
+            try:
+                cmd = f"chage -d $(date +%Y-%m-%d) -M 999 {username}"
+                res = lsf.ssh(cmd, f"root@{hostname}", password)
+                if getattr(res, 'returncode', 1) == 0:
+                    ok = True
+            except Exception:
+                pass
+            return ok
+        elif account_type == 'vsp':
+            cmd = f"echo '{password}' | sudo -S chage -d $(date +%Y-%m-%d) -M 999 {username}"
+            res = lsf.ssh(cmd, f"vmware-system-user@{hostname}", password)
+            return getattr(res, 'returncode', 1) == 0
+    except Exception as e:
+        print(f"Failed to remediate password for {username}@{hostname}: {e}")
+    return False
+
+
+def check_password_expirations(fix_issues: bool = True) -> List[CheckResult]:
     """
     Check password expiration for all known user accounts.
     
@@ -1770,7 +1983,8 @@ def check_password_expirations() -> List[CheckResult]:
     
     Status:
     - PASS: No expiration or > 90 days
-    - FAIL: Expired or expires in <= 90 days
+    - FIXED: Was expiring within <= 90 days, successfully extended to 999 days
+    - FAIL: Expired or expires in <= 90 days (when fix_issues is False or remediation failed)
     - WARN: Could not check
     """
     results = []
@@ -1800,6 +2014,9 @@ def check_password_expirations() -> List[CheckResult]:
         try:
             days = get_linux_password_expiration(hostname, 'root', password)
             status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
+            if status == "FAIL" and fix_issues:
+                if remediate_password_expiration('linux_ssh', hostname, 'root', password):
+                    status, message = "FIXED", "Fixed: Password extended to 999 days"
             
             results.append(CheckResult(
                 name=f"ESXi {hostname} (root)",
@@ -1833,6 +2050,9 @@ def check_password_expirations() -> List[CheckResult]:
         try:
             days = get_linux_password_expiration(hostname, 'root', password)
             status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
+            if status == "FAIL" and fix_issues:
+                if remediate_password_expiration('linux_ssh', hostname, 'root', password):
+                    status, message = "FIXED", "Fixed: Password extended to 999 days"
             
             results.append(CheckResult(
                 name=f"vCenter {hostname} (root)",
@@ -1855,6 +2075,9 @@ def check_password_expirations() -> List[CheckResult]:
         try:
             days = get_vcenter_user_expiration(hostname, vcuser, password, 'root')
             status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days, note="REST API")
+            if status == "FAIL" and fix_issues:
+                if remediate_password_expiration('linux_ssh', hostname, 'root', password):
+                    status, message = "FIXED", "Fixed: Password extended to 999 days (REST API)"
             
             results.append(CheckResult(
                 name=f"vCenter {hostname} (root via REST)",
@@ -1900,6 +2123,9 @@ def check_password_expirations() -> List[CheckResult]:
             try:
                 days = get_nsx_user_expiration(hostname, 'admin', password, user, user_id=user_id)
                 status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
+                if status == "FAIL" and fix_issues:
+                    if remediate_password_expiration('nsx_manager', hostname, user, password, user_id=user_id):
+                        status, message = "FIXED", "Fixed: Password extended to 999 days"
                 
                 results.append(CheckResult(
                     name=f"NSX {hostname} ({user})",
@@ -1938,6 +2164,7 @@ def check_password_expirations() -> List[CheckResult]:
             continue
         
         edge_users_map = {'root': 0, 'admin': 10000, 'audit': 10002}
+        node_id_val = None
         try:
             import requests as _er
             import urllib3 as _eur
@@ -1947,8 +2174,8 @@ def check_password_expirations() -> List[CheckResult]:
             if tn_resp.status_code == 200:
                 for node_item in tn_resp.json().get('results', []):
                     if node_item.get('display_name', '') == hostname:
-                        node_id = node_item.get('node_id', node_item.get('id'))
-                        uurl = f'https://{nsx_mgr}/api/v1/transport-nodes/{node_id}/node/users'
+                        node_id_val = node_item.get('node_id', node_item.get('id'))
+                        uurl = f'https://{nsx_mgr}/api/v1/transport-nodes/{node_id_val}/node/users'
                         uresp = _er.get(uurl, auth=('admin', password), verify=False, timeout=15)
                         if uresp.status_code == 200:
                             for uentry in uresp.json().get('results', []):
@@ -1963,6 +2190,9 @@ def check_password_expirations() -> List[CheckResult]:
             try:
                 days = get_nsx_edge_user_expiration(hostname, nsx_mgr, password, user, user_id=user_id)
                 status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
+                if status == "FAIL" and fix_issues:
+                    if remediate_password_expiration('nsx_edge', hostname, user, password, user_id=user_id, managing_nsx_mgr=nsx_mgr, node_id=node_id_val):
+                        status, message = "FIXED", "Fixed: Password extended to 999 days"
                 
                 results.append(CheckResult(
                     name=f"NSX Edge {hostname} ({user})",
@@ -1990,6 +2220,9 @@ def check_password_expirations() -> List[CheckResult]:
         try:
             days = get_linux_password_expiration(hostname, 'vcf', password, ssh_user='vcf')
             status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
+            if status == "FAIL" and fix_issues:
+                if remediate_password_expiration('sddc_manager', hostname, 'vcf', password):
+                    status, message = "FIXED", "Fixed: Password extended to 999 days"
             
             results.append(CheckResult(
                 name=f"SDDC Manager {hostname} (vcf)",
@@ -2010,6 +2243,9 @@ def check_password_expirations() -> List[CheckResult]:
                 days = get_linux_password_expiration_via_su(
                     hostname, user, password, ssh_user='vcf')
                 status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
+                if status == "FAIL" and fix_issues:
+                    if remediate_password_expiration('sddc_manager', hostname, user, password):
+                        status, message = "FIXED", "Fixed: Password extended to 999 days"
                 
                 results.append(CheckResult(
                     name=f"SDDC Manager {hostname} ({user})",
@@ -2050,6 +2286,9 @@ def check_password_expirations() -> List[CheckResult]:
                                                       ssh_user='vmware-system-user',
                                                       use_sudo=needs_sudo)
                 status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
+                if status == "FAIL" and fix_issues:
+                    if remediate_password_expiration('linux_sudo', hostname, user, password):
+                        status, message = "FIXED", "Fixed: Password extended to 999 days"
                 
                 results.append(CheckResult(
                     name=f"vRA/Automation {hostname} ({user})",
@@ -2129,6 +2368,10 @@ def check_password_expirations() -> List[CheckResult]:
                                                       ssh_user=ssh_user,
                                                       use_sudo=needs_sudo)
                 status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
+                if status == "FAIL" and fix_issues:
+                    acc_type = 'linux_ssh' if user == 'root' and ssh_user == 'root' else 'linux_sudo'
+                    if remediate_password_expiration(acc_type, opsvm, user, password):
+                        status, message = "FIXED", "Fixed: Password extended to 999 days"
                 
                 results.append(CheckResult(
                     name=f"VCF Ops {opsvm} ({user})",
@@ -2162,6 +2405,9 @@ def check_password_expirations() -> List[CheckResult]:
                                                       ssh_user='vmware-system-user',
                                                       use_sudo=needs_sudo)
                 status, message = _eval_password_expiration(days, threshold_days=expiry_threshold_days)
+                if status == "FAIL" and fix_issues:
+                    if remediate_password_expiration('vsp', node_ip, user, password):
+                        status, message = "FIXED", "Fixed: Password extended to 999 days"
                 
                 results.append(CheckResult(
                     name=f"VSP Node {node_ip} ({user})",
@@ -2937,250 +3183,157 @@ def check_auto_platform_isolation() -> List[CheckResult]:
 # KUBERNETES CERTIFICATE CHECKS
 #==============================================================================
 
-def check_k8s_certificates() -> List[CheckResult]:
-    """Check Kubernetes certificate expiration across VCFA, VSP, and Supervisor.
+def check_k8s_certificates(fix_issues: bool = True) -> List[CheckResult]:
+    """Check Kubernetes certificate expiration across VSP, VCFA, Supervisor, and SSP.
 
-    Calls two external scripts in dry-run mode and parses their structured
-    CHECK/SKIP output lines into CheckResult objects grouped by cluster label.
-
-    Subprocess A — vsp_cert_renewer.py --dry-run --cluster all --no-timestamps
-        Checks kubeadm CP certs, kubelet serving certs, cert-manager leaf
-        certs, and Antrea TLS across all VSP and VCFA clusters.
-        Emits lines: [LABEL] CHECK  : <cert> — EXPIRES: ... — RESIDUAL: <N>d
-                     [LABEL] SKIP   : ...
-
-    Subprocess B — supervisor_stabilizer.py --auto --dry-run (cert phases only)
-        Checks SCP cert-manager certs (storage-quota, proxy) and spherelet certs.
-        Emits lines: [LABEL] CHECK  : <cert> — EXPIRES in <N>d
-                     [LABEL] SKIP   : <cert> — valid for <N>d
-
-    Groups results by label prefix:
-        [VSP]  → "VSP Kubernetes"
-        [VCFA] → "VCFA Kubernetes"
-        others (e.g. [vc-wld01-a]) → "Supervisor Kubernetes"
-
-    :return: List[CheckResult] — one entry per cert found. Empty if scripts
-             are not installed or not reachable.
+    Consumes structured JSON output from vcf-lab-tuner.py.
+    When fix_issues is True (default mode when --report-only is omitted), automatically
+    executes remediation for expiring, invalid, or CA-drifted certificates via
+    vcf-lab-tuner.py --mode remediate --section certs, marking renewed items as FIXED.
+    When fix_issues is False (--report-only mode), runs strictly in report mode without mutations.
     """
     results = []
-    tools_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
+    tools_dir = os.path.dirname(os.path.abspath(__file__))
+    tuner_script = os.path.join(tools_dir, 'vcf-lab-tuner.py')
 
-    # ── Detect VCFA presence via vravms in config.ini ─────────────────────────
-    has_vravms = False
+    if not os.path.isfile(tuner_script):
+        return [CheckResult(
+            name='Kubernetes Certificates',
+            status='SKIPPED',
+            message=f'vcf-lab-tuner.py not found at {tuner_script}'
+        )]
+
+    # Determine clusters to check
+    # 1. VSP (Site A and optionally Site B)
+    vsp_targets = [('vsp', 'a', 'VSP Kubernetes')]
+    if lsf and hasattr(lsf, 'test_tcp_port') and lsf.test_tcp_port('10.2.1.142', 22, timeout=2):
+        vsp_targets.append(('vsp', 'b', 'VSP Kubernetes (Site B)'))
+
+    # 2. VCFA
+    has_vcfa = False
     if lsf and hasattr(lsf, 'config'):
         for section in ['VCFFINAL', 'VCF', 'RESOURCES']:
-            if lsf.config.has_section(section) and lsf.config.has_option(section, 'vravms'):
-                lines = lsf.config.get(section, 'vravms').split('\n')
-                for line in lines:
-                    if line.strip() and not line.strip().startswith('#'):
-                        has_vravms = True
-                        break
-            if has_vravms:
+            if lsf.config.has_section(section) and (
+                lsf.config.has_option(section, 'vravms') or 
+                lsf.config.has_option(section, 'vraurls')
+            ):
+                has_vcfa = True
                 break
+    if not has_vcfa and lsf and hasattr(lsf, 'test_tcp_port') and (
+        lsf.test_tcp_port('10.1.1.72', 22, timeout=2) or lsf.test_tcp_port('10.1.1.73', 22, timeout=2)
+    ):
+        has_vcfa = True
 
-    # ── Regex patterns for both scripts ───────────────────────────────────────
-    # vsp_cert_renewer.py patterns:
-    #   [LABEL]  CHECK  : <name> — EXPIRES: <date> — RESIDUAL: <N>d
-    #   [LABEL]  SKIP   : ... valid for ... (RESIDUAL <N>d)
-    _re_vcr_label   = re.compile(r'\[([A-Z0-9_-]+)\]')
-    _re_vcr_check   = re.compile(
-        r'CHECK\s+:\s+(.+?)\s+[—\-]+\s+EXPIRES:\s+(.+?)\s+[—\-]+\s+RESIDUAL:\s+(\d+)d',
-        re.IGNORECASE)
-    _re_vcr_skip    = re.compile(r'SKIP\s+:', re.IGNORECASE)
-    _re_vcr_error   = re.compile(r'ERROR\s+:', re.IGNORECASE)
-    # supervisor_stabilizer.py patterns:
-    #   [LABEL] CHECK  : <ns>/<secret> — EXPIRES in <N>d (expires: <date>)
-    #   [LABEL] SKIP   : <ns>/<secret> — valid for <N>d (expires: <date>)
-    #   [LABEL] CHECK  : <host> client.crt — expires: <date> (within <N>d threshold)
-    #   [LABEL] SKIP   : <host> client.crt — VALID (expires: <date>)
-    _re_ss_check    = re.compile(
-        r'CHECK\s+:\s+(.+?)\s+[—\-]+\s+.*?(\d+)d', re.IGNORECASE)
-    _re_ss_skip     = re.compile(
-        r'SKIP\s+:\s+(.+?)\s+[—\-]+\s+.*?(\d+)d', re.IGNORECASE)
+    # 3. SSP
+    has_ssp = False
+    if lsf and hasattr(lsf, 'config') and lsf.config.has_section('SSP'):
+        has_ssp = True
 
-    def _label_to_env(label: str) -> str:
-        """Map a cluster label string to a human-readable environment name."""
-        u = label.upper()
-        if u == 'VSP':
-            return 'VSP Kubernetes'
-        if u == 'VCFA':
-            return 'VCFA Kubernetes'
-        return 'Supervisor Kubernetes'
-
-    # ── Subprocess A: vsp_cert_renewer.py ─────────────────────────────────────
-    renewer = os.path.join(tools_dir, 'vsp_cert_renewer.py')
-    if os.path.isfile(renewer):
-        renewer_cluster = 'all' if has_vravms else 'vsp'
-        if not has_vravms:
-            results.append(CheckResult(
-                name='VCFA Kubernetes',
-                status='SKIPPED',
-                message='vravms not defined in config.ini'))
-
-        sites = ['a']
-        if lsf and hasattr(lsf, 'test_tcp_port') and lsf.test_tcp_port('10.2.1.142', 22, timeout=2):
-            sites.append('b')
-
-        for site in sites:
-            cmd_a = [
-                'python3', '-u', renewer,
-                '--dry-run',
-                '--cluster', renewer_cluster,
-                '--site', site,
-                '--no-timestamps',
-            ]
-            try:
-                proc_a = subprocess.run(
-                    cmd_a,
-                    capture_output=True, text=True, timeout=300,
-                )
-                for line in (proc_a.stdout + proc_a.stderr).splitlines():
-                    # Extract label from [LABEL] prefix inside the message
-                    lm = _re_vcr_label.search(line)
-                    label = lm.group(1) if lm else 'VSP'
-                    env = _label_to_env(label)
-                    if len(sites) > 1:
-                        env = f"{env} (Site {site.upper()})"
-
-                    # CHECK line — cert is expiring / was renewed
-                    cm = _re_vcr_check.search(line)
-                    if cm:
-                        cert_name = cm.group(1).strip()
-                        expires   = cm.group(2).strip()
-                        residual  = int(cm.group(3))
-                        if residual <= 0:
-                            status, msg = 'FAIL', f'EXPIRED (expires: {expires})'
-                        elif residual <= 60:
-                            status, msg = 'WARN', (
-                                f'Expires in {residual}d (expires: {expires})')
-                        else:
-                            status, msg = 'PASS', (
-                                f'Valid — {residual}d remaining (expires: {expires})')
-                        results.append(CheckResult(
-                            name=f'{env}: {cert_name}',
-                            status=status, message=msg,
-                            details={'label': label, 'residual_days': residual,
-                                     'expires': expires, 'site': site}))
-                        continue
-
-                    # SKIP line — cert is valid, no renewal needed
-                    if _re_vcr_skip.search(line) and _re_vcr_label.search(line):
-                        after_skip = re.sub(
-                            r'^.*?SKIP\s*:\s*', '', line, flags=re.IGNORECASE).strip()
-                        rm = re.search(r'RESIDUAL\s+(\d+)d', after_skip, re.IGNORECASE)
-                        rd = int(rm.group(1)) if rm else None
-                        msg = (f'Valid — {rd}d remaining' if rd else 'Valid') + \
-                              (f' ({after_skip[:80]})' if after_skip else '')
-                        results.append(CheckResult(
-                            name=f'{env}: {after_skip[:60]}',
-                            status='PASS', message=msg,
-                            details={'label': label, 'site': site}))
-                        continue
-
-                    # ERROR line
-                    if _re_vcr_error.search(line) and _re_vcr_label.search(line):
-                        after_err = re.sub(
-                            r'^.*?ERROR\s*:\s*', '', line, flags=re.IGNORECASE).strip()
-                        results.append(CheckResult(
-                            name=f'{env}: ERROR',
-                            status='FAIL', message=after_err[:120],
-                            details={'label': label, 'site': site}))
-
-            except subprocess.TimeoutExpired:
-                results.append(CheckResult(
-                    name=f'K8s Cert Check (VSP/VCFA Site {site.upper()})',
-                    status='WARN',
-                    message='vsp_cert_renewer.py timed out after 300s'))
-            except Exception as exc:
-                results.append(CheckResult(
-                    name=f'K8s Cert Check (VSP/VCFA Site {site.upper()})',
-                    status='WARN',
-                    message=f'Could not run vsp_cert_renewer.py: {exc}'))
+    cluster_queue = []
+    for cl, site, env_name in vsp_targets:
+        cluster_queue.append({'cluster': cl, 'site': site, 'env_name': env_name})
+    if has_vcfa:
+        cluster_queue.append({'cluster': 'vcfa', 'site': 'a', 'env_name': 'VCFA Kubernetes'})
     else:
         results.append(CheckResult(
-            name='K8s Cert Check (VSP/VCFA)',
+            name='VCFA Kubernetes',
             status='SKIPPED',
-            message=f'vsp_cert_renewer.py not found at {renewer}'))
+            message='VCFA not configured or reachable'
+        ))
+    cluster_queue.append({'cluster': 'supervisor', 'site': 'a', 'env_name': 'Supervisor Kubernetes'})
+    if has_ssp:
+        cluster_queue.append({'cluster': 'ssp', 'site': 'a', 'env_name': 'SSP Kubernetes'})
 
-    # ── Subprocess B: supervisor_stabilizer.py (cert phases only) ─────────────
-    stabilizer = os.path.join(tools_dir, 'supervisor_stabilizer.py')
-    if os.path.isfile(stabilizer):
-        cmd_b = [
-            'python3', '-u', stabilizer,
-            '--auto',
-            '--dry-run',
-            '--skip-vcenter-proxy',
-            '--skip-vcenter-services',
-            '--skip-content-lib',
-            '--skip-supervisor-poll',
-        ]
+    for target in cluster_queue:
+        cl = target['cluster']
+        site = target['site']
+        env_name = target['env_name']
+
+        cmd_report = ['python3', '-u', tuner_script, '--cluster', cl, '--mode', 'report', '--section', 'certs', '--json']
+        if site == 'b':
+            cmd_report.extend(['--site', 'b'])
+
         try:
-            proc_b = subprocess.run(
-                cmd_b,
-                capture_output=True, text=True, timeout=300,
-            )
-            for line in (proc_b.stdout + proc_b.stderr).splitlines():
-                # supervisor_stabilizer labels appear as [label] inside the msg,
-                # typically like [vc-wld01-a] or a cluster ID.
-                lm = re.search(r'\[([a-z0-9_\-\.]+)\]', line, re.IGNORECASE)
-                label = lm.group(1) if lm else 'supervisor'
-                env = _label_to_env(label)
+            proc = subprocess.run(cmd_report, capture_output=True, text=True, timeout=120)
+            data = None
+            if proc.stdout:
+                try:
+                    data = json.loads(proc.stdout)
+                except Exception:
+                    pass
 
-                # CHECK line (cert expiring)
-                cm = _re_ss_check.search(line)
-                if cm and 'CHECK' in line.upper():
-                    cert_name = cm.group(1).strip()
-                    residual  = int(cm.group(2))
-                    exp_m = re.search(r'expires?[:\s]+([^\(]+)', line, re.IGNORECASE)
-                    expires = exp_m.group(1).strip() if exp_m else 'unknown'
-                    if residual <= 0:
-                        status, msg = 'FAIL', f'EXPIRED (expires: {expires})'
-                    elif residual <= 60:
-                        status, msg = 'WARN', (
-                            f'Expires in {residual}d (expires: {expires})')
-                    else:
-                        status, msg = 'PASS', (
-                            f'Valid — {residual}d remaining (expires: {expires})')
-                    results.append(CheckResult(
-                        name=f'{env}: {cert_name}',
-                        status=status, message=msg,
-                        details={'label': label, 'residual_days': residual}))
-                    continue
+            if not data or not isinstance(data, dict):
+                results.append(CheckResult(
+                    name=f'{env_name}: cert check',
+                    status='WARN',
+                    message=f'Could not parse vcf-lab-tuner output: {proc.stderr[:100] if proc.stderr else "empty output"}'
+                ))
+                continue
 
-                # SKIP line (cert valid)
-                sm = _re_ss_skip.search(line)
-                if sm and 'SKIP' in line.upper():
-                    cert_name = sm.group(1).strip()
-                    residual  = int(sm.group(2))
-                    exp_m = re.search(r'expires?[:\s]+([^\(]+)', line, re.IGNORECASE)
-                    expires = exp_m.group(1).strip() if exp_m else 'unknown'
-                    results.append(CheckResult(
-                        name=f'{env}: {cert_name}',
-                        status='PASS',
-                        message=f'Valid — {residual}d remaining (expires: {expires})',
-                        details={'label': label, 'residual_days': residual}))
+            items = data.get('results', [])
+            needs_remediation = any(item.get('state') in ('warn', 'fail') for item in items)
+            remediated_names = set()
+
+            if needs_remediation and fix_issues:
+                cmd_rem = ['python3', '-u', tuner_script, '--cluster', cl, '--mode', 'remediate', '--section', 'certs', '--json']
+                if site == 'b':
+                    cmd_rem.extend(['--site', 'b'])
+                subprocess.run(cmd_rem, capture_output=True, text=True, timeout=180)
+
+                # Re-run report to verify new state
+                proc_post = subprocess.run(cmd_report, capture_output=True, text=True, timeout=120)
+                if proc_post.stdout:
+                    try:
+                        post_data = json.loads(proc_post.stdout)
+                        if post_data and isinstance(post_data, dict):
+                            prev_failing = {
+                                it.get('label', '').split(':')[0].strip()
+                                for it in items if it.get('state') in ('warn', 'fail')
+                            }
+                            items = post_data.get('results', [])
+                            remediated_names = prev_failing
+                    except Exception:
+                        pass
+
+            for item in items:
+                raw_label = item.get('label', '')
+                cert_name = raw_label.split(':')[0].strip() if ':' in raw_label else raw_label.strip()
+                state = item.get('state', 'pass')
+                res_days = item.get('residual_days')
+                detail = item.get('detail', '')
+
+                if cert_name in remediated_names and state == 'pass':
+                    status = 'FIXED'
+                    msg = f"Fixed: Renewed certificate via vcf-lab-tuner (valid for {res_days}d)" if res_days else "Fixed: Renewed certificate via vcf-lab-tuner"
+                elif state == 'pass':
+                    status = 'PASS'
+                    msg = f"Valid — {res_days}d remaining" if res_days is not None else (f"Valid ({detail})" if detail else "Valid")
+                elif state == 'warn':
+                    status = 'WARN'
+                    msg = f"Expires in {res_days}d — {detail}" if res_days is not None else f"Warning: {detail}"
+                else:
+                    status = 'FAIL'
+                    msg = f"EXPIRED or INVALID — {detail}" if detail else "Invalid or expired certificate"
+
+                results.append(CheckResult(
+                    name=f'{env_name}: {cert_name}',
+                    status=status,
+                    message=msg,
+                    details={'cluster': cl, 'site': site, 'residual_days': res_days, 'detail': detail}
+                ))
 
         except subprocess.TimeoutExpired:
             results.append(CheckResult(
-                name='K8s Cert Check (Supervisor)',
+                name=f'{env_name}: cert check',
                 status='WARN',
-                message='supervisor_stabilizer.py timed out after 300s'))
+                message=f'vcf-lab-tuner.py timed out for cluster {cl}'
+            ))
         except Exception as exc:
             results.append(CheckResult(
-                name='K8s Cert Check (Supervisor)',
+                name=f'{env_name}: cert check',
                 status='WARN',
-                message=f'Could not run supervisor_stabilizer.py: {exc}'))
-    else:
-        results.append(CheckResult(
-            name='K8s Cert Check (Supervisor)',
-            status='SKIPPED',
-            message=f'supervisor_stabilizer.py not found at {stabilizer}'))
-
-    if not results:
-        results.append(CheckResult(
-            name='K8s Certificates',
-            status='SKIPPED',
-            message='No Kubernetes cert check tools found'))
+                message=f'Error running vcf-lab-tuner.py: {exc}'
+            ))
 
     return results
 
@@ -3605,7 +3758,7 @@ def main():
             print("\nChecking NTP configuration...")
             try:
                 hosts = lsf.get_all_hosts()
-                report.ntp_checks = check_ntp_configuration(hosts)
+                report.ntp_checks = check_ntp_configuration(hosts, fix_issues)
                 print_results_table("NTP CONFIGURATION", report.ntp_checks)
             except Exception as e:
                 print(f"NTP check failed: {e}")
@@ -3658,7 +3811,7 @@ def main():
     # Password expiration checks
     print("\nChecking password expirations...")
     try:
-        report.password_expiration_checks = check_password_expirations()
+        report.password_expiration_checks = check_password_expirations(fix_issues)
         print_results_table("PASSWORD EXPIRATIONS", report.password_expiration_checks)
     except Exception as e:
         print(f"Password expiration check failed: {e}")
@@ -3682,7 +3835,7 @@ def main():
     # Kubernetes certificate expirations (VCFA, VSP, Supervisor)
     print("\nChecking Kubernetes certificate expirations...")
     try:
-        report.k8s_cert_checks = check_k8s_certificates()
+        report.k8s_cert_checks = check_k8s_certificates(fix_issues)
         print_results_table("KUBERNETES CERTIFICATES", report.k8s_cert_checks)
     except Exception as e:
         print(f"K8s cert check failed: {e}")
