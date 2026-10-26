@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.5.8 - 2026-09-23
+Version 2.6.0 - 2026-10-26
 Author: HOL Core Team
-v 2.5.9: SSP Workload Kubeconfig Cache TTL & Cluster Re-installation Resilience:
+v2.6.0: Upstream Issuer CA Signature Verification & Multi-Cluster Parity:
+  - CA Cryptographic Signature Verification (_verify_cert_signed_by_ca, _get_issuer_ca_pem, _renew_certmanager_leaf_certs, chk_certs): Added proactive upstream CA cryptographic verification (`openssl verify -CAfile`) across all Certificate resources and backing secrets. Dynamically resolves ClusterIssuer and Issuer signing CAs across namespaces, detects leaf certificates signed by non-current/rotated CAs (such as metrics-endpoint-downstream-server-cert following metrics-aggregator-ca rotation), and automatically triggers cert-manager reissuance, request purging, and mounting workload rollouts.
+
+v2.5.9: SSP Workload Kubeconfig Cache TTL & Cluster Re-installation Resilience:
   - Resilient SSP Workload Kubeconfig Caching: Added 300s TTL check to _wrap_ssp_cmd preamble on ssp-i, ensuring cached /tmp/.ssp-wlkc automatically refreshes from the ssp-kubeconfig secret if stale, expired, or after SSP cluster re-installation.
 
 v2.5.8: Config.ini disable_leader_election Gating:
@@ -566,8 +569,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.5.9"
-DATE    = "2026-09-23"
+VERSION = "2.6.0"
+DATE    = "2026-10-26"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -3838,6 +3841,144 @@ def _renew_certmanager_ca(r, ctx):
     return rotated
 
 
+def _verify_cert_signed_by_ca(leaf_pem: str, ca_pem: str) -> bool:
+    """Verify that leaf_pem is cryptographically signed by ca_pem using openssl."""
+    if not leaf_pem or not ca_pem:
+        return True
+    f_ca_name = None
+    f_leaf_name = None
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False) as f_ca, \
+             tempfile.NamedTemporaryFile("w", delete=False) as f_leaf:
+            f_ca.write(ca_pem)
+            f_ca.flush()
+            f_leaf.write(leaf_pem)
+            f_leaf.flush()
+            f_ca_name = f_ca.name
+            f_leaf_name = f_leaf.name
+
+        proc = subprocess.run(
+            ["openssl", "verify", "-CAfile", f_ca_name, f_leaf_name],
+            capture_output=True, text=True, timeout=10
+        )
+        return proc.returncode == 0 and ": OK" in (proc.stdout or "")
+    except Exception:
+        return True
+    finally:
+        if f_ca_name:
+            try:
+                os.unlink(f_ca_name)
+            except Exception:
+                pass
+        if f_leaf_name:
+            try:
+                os.unlink(f_leaf_name)
+            except Exception:
+                pass
+
+
+def _get_issuer_ca_pem(r, ctx, ikind, iname, cert_ns):
+    """Retrieve the CA certificate PEM for a given cert-manager Issuer or ClusterIssuer."""
+    if not iname:
+        return None
+
+    ikind = ikind or "Issuer"
+
+    if "_cissuers" not in ctx:
+        ci_data = r.read_json("kubectl get clusterissuers -o json 2>/dev/null", 20) or {}
+        ctx["_cissuers"] = {
+            item.get("metadata", {}).get("name", ""): item
+            for item in ci_data.get("items", [])
+            if item.get("metadata", {}).get("name")
+        }
+
+    if "_issuers" not in ctx:
+        iss_data = r.read_json("kubectl get issuers -A -o json 2>/dev/null", 20) or {}
+        ctx["_issuers"] = {
+            (item.get("metadata", {}).get("namespace", ""), item.get("metadata", {}).get("name", "")): item
+            for item in iss_data.get("items", [])
+            if item.get("metadata", {}).get("name")
+        }
+
+    ctx.setdefault("_ca_pem_cache", {})
+    ctx.setdefault("_secret_cache", {})
+
+    ca_sec_name = None
+    ns_candidates = []
+
+    if ikind == "ClusterIssuer":
+        ci = ctx["_cissuers"].get(iname)
+        if not ci:
+            return None
+        ca_spec = ci.get("spec", {}).get("ca")
+        if not ca_spec or not isinstance(ca_spec, dict):
+            return None
+        ca_sec_name = ca_spec.get("secretName")
+        if not ca_sec_name:
+            return None
+
+        cl = getattr(r, "cluster", "")
+        primary_ns = (
+            "vmware-system-cert-manager" if cl == "supervisor"
+            else ("vmsp-platform" if cl == "vsp" else "cert-manager")
+        )
+        for cand in [primary_ns, "vmware-system-cert-manager", "vmsp-platform", "cert-manager", "prelude", "kube-system", "default"]:
+            if cand and cand not in ns_candidates:
+                ns_candidates.append(cand)
+
+    elif ikind == "Issuer":
+        iss = ctx["_issuers"].get((cert_ns, iname))
+        if not iss:
+            return None
+        ca_spec = iss.get("spec", {}).get("ca")
+        if not ca_spec or not isinstance(ca_spec, dict):
+            return None
+        ca_sec_name = ca_spec.get("secretName")
+        if not ca_sec_name:
+            return None
+        ns_candidates = [cert_ns]
+
+    else:
+        return None
+
+    # Check cache first across candidate namespaces
+    for c_ns in ns_candidates:
+        sec_key = (c_ns, ca_sec_name)
+        if sec_key in ctx["_ca_pem_cache"]:
+            return ctx["_ca_pem_cache"][sec_key]
+
+    # Query candidate namespaces
+    for c_ns in ns_candidates:
+        sec_key = (c_ns, ca_sec_name)
+        sec_data = ctx["_secret_cache"].get(sec_key)
+        if sec_data is None:
+            rc, sec_raw = r.read(f"kubectl get secret {ca_sec_name} -n {c_ns} -o json 2>/dev/null", 15)
+            if rc == 0 and (sec_raw or "").strip():
+                try:
+                    sec_data = json.loads(sec_raw).get("data", {})
+                    ctx["_secret_cache"][sec_key] = sec_data
+                except Exception:
+                    sec_data = {}
+            else:
+                sec_data = {}
+
+        if sec_data:
+            tls_b64 = sec_data.get("tls.crt", "")
+            ca_b64 = sec_data.get("ca.crt", "")
+            pem_parts = []
+            if tls_b64:
+                pem_parts.append(base64.b64decode(tls_b64).decode("utf-8", errors="ignore"))
+            if ca_b64 and ca_b64 != tls_b64:
+                pem_parts.append(base64.b64decode(ca_b64).decode("utf-8", errors="ignore"))
+            if pem_parts:
+                ca_pem = "\n".join(pem_parts)
+                ctx["_ca_pem_cache"][sec_key] = ca_pem
+                return ca_pem
+
+    ctx["_ca_pem_cache"][(ns_candidates[0], ca_sec_name)] = None
+    return None
+
+
 def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
     """Native cert-manager leaf certificate renewal and workload rollout restarter.
     
@@ -3877,18 +4018,34 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
         expiring = days is not None and days < threshold_days
         invalid_secret = False
 
-        # Validate backing secret across all clusters (especially Supervisor where secret drift/expiry occurs)
+        iref = spec.get("issuerRef", {})
+        ikind = iref.get("kind") or "Issuer"
+        iname = iref.get("name", "")
+
+        # Validate backing secret and upstream CA signature across all clusters
         if secret_name and not force_all:
-            rc_sec, sec_raw = r.read(f"kubectl get secret {secret_name} -n {ns} -o json 2>/dev/null", 15)
-            if rc_sec != 0 or not (sec_raw or "").strip():
-                invalid_secret = True
-            else:
-                try:
-                    sec_json = json.loads(sec_raw)
-                    leaf_crt_b64 = sec_json.get("data", {}).get("tls.crt", "")
-                    if not leaf_crt_b64:
+            sec_key = (ns, secret_name)
+            sec_data = ctx.setdefault("_secret_cache", {}).get(sec_key)
+            if sec_data is None:
+                rc_sec, sec_raw = r.read(f"kubectl get secret {secret_name} -n {ns} -o json 2>/dev/null", 15)
+                if rc_sec != 0 or not (sec_raw or "").strip():
+                    invalid_secret = True
+                    sec_data = {}
+                else:
+                    try:
+                        sec_json = json.loads(sec_raw)
+                        sec_data = sec_json.get("data", {})
+                        ctx["_secret_cache"][sec_key] = sec_data
+                    except Exception:
                         invalid_secret = True
-                    elif days is None:
+                        sec_data = {}
+
+            if sec_data:
+                leaf_crt_b64 = sec_data.get("tls.crt", "")
+                if not leaf_crt_b64:
+                    invalid_secret = True
+                else:
+                    if days is None:
                         # Extract expiry from tls.crt if status.notAfter was missing/unparseable
                         rc_dt, exp_raw = r.read(f"echo '{(leaf_crt_b64 or '').strip()}' | base64 -d | openssl x509 -noout -enddate 2>/dev/null", 15)
                         exp_val = (exp_raw or "").partition("=")[2].strip()
@@ -3899,8 +4056,14 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
                                 expiring = True
                         else:
                             invalid_secret = True
-                except Exception:
-                    invalid_secret = True
+
+                    # Verify cryptographic signature against signing CA
+                    if not is_ca:
+                        ca_pem = _get_issuer_ca_pem(r, ctx, ikind, iname, ns)
+                        if ca_pem:
+                            leaf_pem = base64.b64decode(leaf_crt_b64).decode("utf-8", errors="ignore")
+                            if not _verify_cert_signed_by_ca(leaf_pem, ca_pem):
+                                invalid_secret = True
         elif not secret_name:
             invalid_secret = True
 
@@ -3940,6 +4103,8 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
             del_cmd = f"kubectl delete secret {sec} -n {ns} --ignore-not-found=true 2>/dev/null"
             r.write(del_cmd, f"delete secret {ns}/{sec} to trigger reissuance", tier="transient", timeout=30)
             deleted_secrets.add((ns, sec))
+            if "_secret_cache" in ctx:
+                ctx["_secret_cache"].pop((ns, sec), None)
 
         # Explicitly force cert-manager reissuance and purge stale requests
         r.write(f"kubectl annotate certificate {name} -n {ns} cert-manager.io/reissue-at=$(date +%s) --overwrite 2>/dev/null",
@@ -3986,7 +4151,7 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
                 r.write(roll_cmd, f"rollout restart {w_ns}/{w_kind}/{w_name} to mount renewed cert secret", tier="transient", timeout=30)
                 restarted_workloads.append(f"{w_ns}/{w_kind.lower()}/{w_name}")
 
-        cainjector_ns = "vmsp-platform" if cl == "vsp" else "vmware-system-cert-manager"
+        cainjector_ns = "vmsp-platform" if cl == "vsp" else ("vmware-system-cert-manager" if cl == "supervisor" else "cert-manager")
         r.write(f"kubectl rollout restart deployment/cert-manager-cainjector -n {cainjector_ns} 2>/dev/null || true",
                 f"rollout restart cert-manager-cainjector in {cainjector_ns}", tier="transient", timeout=30)
 
@@ -4317,32 +4482,62 @@ def chk_certs(r, ctx):
         days = _days_until(not_after)
         label = f"{ns}/{name}: Ready and valid >{CERT_WARN_DAYS}d"
 
-        # Check backing secret if days is None or if on supervisor cluster
+        is_ca = bool(spec.get("isCA"))
+        iref = spec.get("issuerRef", {})
+        ikind = iref.get("kind") or "Issuer"
+        iname = iref.get("name", "")
+        ca_invalid = False
+
+        # Check backing secret and CA validity if days is None or if on supervisor cluster
         if secret_name and (days is None or cl == "supervisor"):
-            rc_sec, sec_raw = r.read(f"kubectl get secret {secret_name} -n {ns} -o json 2>/dev/null", 15)
-            if rc_sec != 0 or not (sec_raw or "").strip():
-                days = -1
-                conds["Ready"] = "False"
-            else:
-                try:
-                    sec_json = json.loads(sec_raw)
-                    leaf_crt_b64 = sec_json.get("data", {}).get("tls.crt", "")
-                    if not leaf_crt_b64:
+            sec_key = (ns, secret_name)
+            sec_data = ctx.setdefault("_secret_cache", {}).get(sec_key)
+            if sec_data is None:
+                rc_sec, sec_raw = r.read(f"kubectl get secret {secret_name} -n {ns} -o json 2>/dev/null", 15)
+                if rc_sec != 0 or not (sec_raw or "").strip():
+                    days = -1
+                    conds["Ready"] = "False"
+                    sec_data = {}
+                else:
+                    try:
+                        sec_json = json.loads(sec_raw)
+                        sec_data = sec_json.get("data", {})
+                        ctx["_secret_cache"][sec_key] = sec_data
+                    except Exception:
                         days = -1
                         conds["Ready"] = "False"
-                    elif days is None:
+                        sec_data = {}
+
+            if sec_data:
+                leaf_crt_b64 = sec_data.get("tls.crt", "")
+                if not leaf_crt_b64:
+                    days = -1
+                    conds["Ready"] = "False"
+                else:
+                    if days is None:
                         rc_dt, exp_raw = r.read(f"echo '{(leaf_crt_b64 or '').strip()}' | base64 -d | openssl x509 -noout -enddate 2>/dev/null", 15)
                         exp_val = (exp_raw or "").partition("=")[2].strip()
                         exp_ts = _parse_openssl_date(exp_val)
                         if exp_ts:
                             days = int((exp_ts - datetime.now(timezone.utc).timestamp()) / 86400)
-                except Exception:
-                    pass
+
+                    # Cryptographic signature verification against signing CA
+                    if not is_ca:
+                        ca_pem = _get_issuer_ca_pem(r, ctx, ikind, iname, ns)
+                        if ca_pem:
+                            leaf_pem = base64.b64decode(leaf_crt_b64).decode("utf-8", errors="ignore")
+                            if not _verify_cert_signed_by_ca(leaf_pem, ca_pem):
+                                ca_invalid = True
+                                days = 0
+                                conds["Ready"] = "False"
 
         if days is not None and days < ctx["threshold_days"]:
             needs_renewal = True
 
-        if conds.get("Ready") != "True":
+        if ca_invalid:
+            out.append(fail("certs.ca", label, "INVALID (signed by non-current CA) ⚠", cluster=cl,
+                            residual_days=0))
+        elif conds.get("Ready") != "True":
             out.append(fail("certs.ready", label, "Ready=False (or backing secret missing)", cluster=cl,
                             residual_days=days))
         elif days is None:
@@ -4357,26 +4552,13 @@ def chk_certs(r, ctx):
             healthy += 1
             if ctx["verbose"]:
                 row_verbose(f"  {ns}/{name}: {days}d remaining")
+            if r.mode == "report":
+                out.append(ok("certs.item",
+                              f"{ns}/{name}: Ready",
+                              f"expires in {days}d", cluster=cl, residual_days=days))
 
     if healthy:
-        if r.mode == "report":
-            # report is the diagnostic view: emit a row PER certificate, matching
-            # vsp-health.py, which lists each one. This is most of why a report
-            # shows many more checks than a preflight - it is per-item detail, not
-            # extra coverage.
-            for item in items:
-                conds = {c["type"]: c["status"]
-                         for c in item.get("status", {}).get("conditions", [])}
-                if conds.get("Ready") != "True":
-                    continue
-                days = _days_until(item.get("status", {}).get("notAfter", ""))
-                if days is None or days < CERT_WARN_DAYS:
-                    continue
-                out.append(ok("certs.item",
-                              f"{item['metadata']['namespace']}/"
-                              f"{item['metadata']['name']}: Ready",
-                              f"expires in {days}d", cluster=cl, residual_days=days))
-        else:
+        if r.mode != "report":
             # preflight/tune/remediate want a verdict, so collapse the healthy bulk
             # rather than inflating the denominator (auto-health.py:776 does this).
             out.append(ok("certs.bulk",
