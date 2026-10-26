@@ -3901,7 +3901,13 @@ def _get_issuer_ca_pem(r, ctx, ikind, iname, cert_ns):
         }
 
     ctx.setdefault("_ca_pem_cache", {})
-    ctx.setdefault("_secret_cache", {})
+    if "_secret_cache" not in ctx or not ctx["_secret_cache"]:
+        sec_bulk = r.read_json("kubectl get secrets -A -o json 2>/dev/null", 45) or {}
+        ctx["_secret_cache"] = {
+            (s.get("metadata", {}).get("namespace", ""), s.get("metadata", {}).get("name", "")): s.get("data", {})
+            for s in sec_bulk.get("items", [])
+            if s.get("metadata", {}).get("name")
+        }
 
     ca_sec_name = None
     ns_candidates = []
@@ -3910,6 +3916,8 @@ def _get_issuer_ca_pem(r, ctx, ikind, iname, cert_ns):
         ci = ctx["_cissuers"].get(iname)
         if not ci:
             return None
+        if ci.get("spec", {}).get("selfSigned") is not None:
+            return "__self_signed__"
         ca_spec = ci.get("spec", {}).get("ca")
         if not ca_spec or not isinstance(ca_spec, dict):
             return None
@@ -3930,6 +3938,8 @@ def _get_issuer_ca_pem(r, ctx, ikind, iname, cert_ns):
         iss = ctx["_issuers"].get((cert_ns, iname))
         if not iss:
             return None
+        if iss.get("spec", {}).get("selfSigned") is not None:
+            return "__self_signed__"
         ca_spec = iss.get("spec", {}).get("ca")
         if not ca_spec or not isinstance(ca_spec, dict):
             return None
@@ -3992,6 +4002,14 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
     if not data:
         return [warn("certs.renew", "cert-manager Certificates: renewable",
                      "no Certificate CRDs found or kubectl failed", cluster=cl)]
+
+    if "_secret_cache" not in ctx or not ctx["_secret_cache"]:
+        sec_bulk = r.read_json("kubectl get secrets -A -o json 2>/dev/null", 45) or {}
+        ctx["_secret_cache"] = {
+            (s.get("metadata", {}).get("namespace", ""), s.get("metadata", {}).get("name", "")): s.get("data", {})
+            for s in sec_bulk.get("items", [])
+            if s.get("metadata", {}).get("name")
+        }
 
     items = data.get("items", [])
     to_renew = []
@@ -4057,10 +4075,14 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
                         else:
                             invalid_secret = True
 
-                    # Verify cryptographic signature against signing CA
+                    # Verify cryptographic signature against signing CA or self-signature
                     if not is_ca:
                         ca_pem = _get_issuer_ca_pem(r, ctx, ikind, iname, ns)
-                        if ca_pem:
+                        if ca_pem == "__self_signed__":
+                            leaf_pem = base64.b64decode(leaf_crt_b64).decode("utf-8", errors="ignore")
+                            if not _verify_cert_signed_by_ca(leaf_pem, leaf_pem):
+                                invalid_secret = True
+                        elif ca_pem:
                             leaf_pem = base64.b64decode(leaf_crt_b64).decode("utf-8", errors="ignore")
                             if not _verify_cert_signed_by_ca(leaf_pem, ca_pem):
                                 invalid_secret = True
@@ -4469,6 +4491,14 @@ def chk_certs(r, ctx):
         return [warn("certs", "cert-manager Certificates: readable",
                      "no Certificate CRDs or kubectl failed", cluster=cl)]
 
+    if "_secret_cache" not in ctx or not ctx["_secret_cache"]:
+        sec_bulk = r.read_json("kubectl get secrets -A -o json 2>/dev/null", 45) or {}
+        ctx["_secret_cache"] = {
+            (s.get("metadata", {}).get("namespace", ""), s.get("metadata", {}).get("name", "")): s.get("data", {})
+            for s in sec_bulk.get("items", [])
+            if s.get("metadata", {}).get("name")
+        }
+
     items = data.get("items", [])
     healthy = 0
     needs_renewal = False
@@ -4488,8 +4518,8 @@ def chk_certs(r, ctx):
         iname = iref.get("name", "")
         ca_invalid = False
 
-        # Check backing secret and CA validity if days is None or if on supervisor cluster
-        if secret_name and (days is None or cl == "supervisor"):
+        # Check backing secret and CA validity across all clusters
+        if secret_name:
             sec_key = (ns, secret_name)
             sec_data = ctx.setdefault("_secret_cache", {}).get(sec_key)
             if sec_data is None:
@@ -4521,15 +4551,24 @@ def chk_certs(r, ctx):
                         if exp_ts:
                             days = int((exp_ts - datetime.now(timezone.utc).timestamp()) / 86400)
 
-                    # Cryptographic signature verification against signing CA
+                    # Cryptographic signature verification against signing CA or self-signature
                     if not is_ca:
                         ca_pem = _get_issuer_ca_pem(r, ctx, ikind, iname, ns)
-                        if ca_pem:
+                        if ca_pem == "__self_signed__":
+                            leaf_pem = base64.b64decode(leaf_crt_b64).decode("utf-8", errors="ignore")
+                            if not _verify_cert_signed_by_ca(leaf_pem, leaf_pem):
+                                ca_invalid = True
+                                days = 0
+                                conds["Ready"] = "False"
+                        elif ca_pem:
                             leaf_pem = base64.b64decode(leaf_crt_b64).decode("utf-8", errors="ignore")
                             if not _verify_cert_signed_by_ca(leaf_pem, ca_pem):
                                 ca_invalid = True
                                 days = 0
                                 conds["Ready"] = "False"
+        elif not secret_name:
+            days = -1
+            conds["Ready"] = "False"
 
         if days is not None and days < ctx["threshold_days"]:
             needs_renewal = True
