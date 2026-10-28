@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # vpodchecker.py - HOLFY27 Lab Validation Tool
-# Version 2.8.12 - 2026-09-21
+# Version 2.8.13 - 2026-09-21
 # Author - Burke Azbill and HOL Core Team
 # Modernized for HOLFY27 architecture with enhanced checks and reporting
 #
 # CHANGELOG:
+# v2.8.13 - 2026-10-28:
+#   - Updated to set permissions on the JSON and HTML reports to 664 and owner to holuser:holuser.
 # v2.8.12 - 2026-09-21:
 #   - Skipped VM Templates (vm.config.template) in check_vm_configuration() and
 #     add_vm_config_extra_option() to prevent unsupported reconfig faults (e.g. on ubuntu-24-04-gold).
@@ -3872,6 +3874,11 @@ def main():
         with open(json_file, 'w') as f:
             f.write(report.to_json())
         print(f"JSON report written to: {json_file}")
+        try:
+            os.chmod(json_file, 0o664)
+            os.chown(json_file, 1000, 1000)
+        except Exception:
+            pass
 
     if args.html is not None:
         ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -3880,6 +3887,11 @@ def main():
         with open(html_file, 'w') as f:
             f.write(html)
         print(f"HTML report written to: {html_file}")
+        try:
+            os.chmod(html_file, 0o664)
+            os.chown(html_file, 1000, 1000)
+        except Exception:
+            pass
     
     if lsf and PYVMOMI_AVAILABLE:
         for si in lsf.sis:
