@@ -438,7 +438,7 @@ Covered: `kvip_manifest`, `cp_pod_crash`, `crashloop_pods`, `postgres`, `salt_st
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `host_contention`    | Not ported. A load-based gate that disables remediation for a cycle. Worth adding                                                                                           |
 | `vsp_size`           | Intentionally omitted — it patches `ComponentVersion...resources.cpu`, which report finding F1 shows is a resource envelope, not the CP VM size. `machineType` is the lever |
-| `csi_controller`     | Not ported. Resets the CSI vCenter SSO credential via `dir-cli`                                                                                                             |
+| `csi_controller`     | **Ported** to `chk_edge` (`_remediate_vsphere_csi`). Realigns vCenter SSO credentials via `dir-cli`, enforces `--password-never-expires`, and clears stale leases |
 | `walg_hang`          | Intentionally omitted — it replaces a real binary with an `exit 0` stub and `pkill -9`s in-flight restores. Too aggressive to enable by default without an explicit opt-in  |
 | `leaderelect_tuning` | Handled by the **emitted keeper**, which is the right layer (~10-min Flux revert needs 60s reassertion)                                                                     |
 

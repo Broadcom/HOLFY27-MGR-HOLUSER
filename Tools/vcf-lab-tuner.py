@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.6.0 - 2026-10-26
+Version 2.6.1 - 2026-10-30
 Author: HOL Core Team
+v2.6.1: vSphere CSI Controller Credential Recovery & SSO Expiration Hardening:
+  - CSI Credential Recovery (_remediate_vsphere_csi, chk_edge): Implemented missing vSphere CSI controller credential remediation in chk_edge for VCFA and VSP clusters [KB 435491, KB 326114]. Discovers credentials from vsphere-config-secret and vsphere-cloud-secret, diagnoses authentication failures and expired SSO passwords via dir-cli on management vCenter, realigns the password, enforces --password-never-expires, clears stale leader election leases, and bounces CSI pods to restore container storage operations.
+  - Robust Site Config Resolution (resolve_site_config): Added dictionary support to resolve_site_config so passing ctx dictionaries correctly resolves site_suffix and subnet prefix.
+
 v2.6.0: Upstream Issuer CA Signature Verification & Multi-Cluster Parity:
   - CA Cryptographic Signature Verification (_verify_cert_signed_by_ca, _get_issuer_ca_pem, _renew_certmanager_leaf_certs, chk_certs): Added proactive upstream CA cryptographic verification (`openssl verify -CAfile`) across all Certificate resources and backing secrets. Dynamically resolves ClusterIssuer and Issuer signing CAs across namespaces, detects leaf certificates signed by non-current/rotated CAs (such as metrics-endpoint-downstream-server-cert following metrics-aggregator-ca rotation), and automatically triggers cert-manager reissuance, request purging, and mounting workload rollouts.
 
@@ -547,6 +551,7 @@ import json
 import os
 import re
 import atexit
+import shlex
 import shutil
 import signal
 import socket
@@ -569,8 +574,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.6.0"
-DATE    = "2026-10-26"
+VERSION = "2.6.1"
+DATE    = "2026-10-30"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -714,10 +719,16 @@ def resolve_site_config(args):
     site = "a"
     if hasattr(args, "site") and args.site:
         site = args.site.lower()
+    elif isinstance(args, dict) and args.get("site"):
+        site = str(args["site"]).lower()
     elif hasattr(args, "host") and args.host:
         if "site-b" in args.host.lower() or args.host.endswith("b"):
             site = "b"
         elif args.host.startswith("10.2.1."):
+            site = "b"
+    elif isinstance(args, dict) and args.get("host"):
+        h = str(args["host"]).lower()
+        if "site-b" in h or h.endswith("b") or h.startswith("10.2.1."):
             site = "b"
             
     if site == "b":
@@ -921,7 +932,7 @@ SECTION_MAP = {
     "kyverno":     ("KYVERNO POLICIES",      "UpdateRequest backlog + controllers"),
     "password":    ("PASSWORD EXPIRATION",   "node account expiry vs policy"),
     "gateway":     ("GATEWAY DATAPLANE",     "LB VIPs + envoy dataplane services [KB 439264, KB 424402]"),
-    "edge":        ("KNOWN EDGE CASES",      "support-bundle, RM deadlock, RabbitMQ [KB 440167, KB 392417, KB 435491]"),
+    "edge":        ("KNOWN EDGE CASES",      "CSI drift/expiry, support-bundle, RM deadlock, RabbitMQ [KB 440167, KB 392417, KB 435491]"),
     "etcd":        ("ETCD FRAGMENTATION",    "dbSize slack (informational; KB 327477)"),
     "sizing":      ("CLUSTER SIZING",        "CP/worker machine type, replica bounds, autoscaler, node utilization"),
     "footprint":   ("FOOTPRINT & HA",        "oversized requests, HA counts, safe-to-evict, CAPI LE, autoscaler pin [KB 417831]"),
@@ -6872,22 +6883,105 @@ def chk_sizing(r, ctx):
 # it lives behind --mode remediate rather than something --mode tune's
 # template-prep pass would ever apply on its own.
 FOOTPRINT_NAMESPACE = "vmsp-platform"
-FOOTPRINT_REQUESTS = [
-    # (kind, namespace, name, container, cpu, memory) - remediate-lab.sh:2708-2719
-    ("statefulset", "vodap", "chi-vcf-obs-vcf-obs-0-0", "clickhouse", "250m", "1Gi"),
-    ("statefulset", "ops-logs", "log-store", "opensearch", "250m", "8Gi"),
-    ("statefulset", "ops-logs", "log-processor", "vcf-ops-logs", "250m", "2Gi"),
-    ("deploy", "vmsp-platform", "ops-logs-gateway", "envoy", "200m", "256Mi"),
-    ("deploy", "vodap", "vcf-obs-esx-collector-service",
-     "vcf-obs-esx-collector-service", "200m", "1536Mi"),
-    ("deploy", "vodap", "vcf-obs-vc-collector-service",
-     "vcf-obs-vc-collector-service", "200m", "1Gi"),
-    ("deploy", "vodap", "vcf-obs-data-query-service",
-     "vcf-obs-data-query-service", "200m", "1Gi"),
-    ("deploy", "vodap", "vcf-obs-collector-controller-service",
-     "vcf-obs-collector-controller-service", "200m", "1Gi"),
-    ("deploy", "vodap", "vcf-obs-netops-collector-service",
-     "vcf-obs-netops-collector-service", "200m", "1Gi"),
+VSP_FOOTPRINT_REQUESTS = [
+    # (kind, namespace, name, container, cpu, memory) - right-sized for nested/lab hardware density
+    # ── Observability Data Platform (vodap) ───────────────────────────────────
+    ("deploy", "vodap", "vcf-obs-esx-collector-service-standard", "vcf-obs-esx-collector-service-standard", "50m", "512Mi"),
+    ("deploy", "vodap", "vcf-obs-esx-collector-service-verbose", "vcf-obs-esx-collector-service-verbose", "50m", "512Mi"),
+    ("deploy", "vodap", "vcf-obs-esx-collector-service-esxitop", "vcf-obs-esx-collector-service-esxitop", "50m", "1Gi"),
+    ("deploy", "vodap", "vcf-obs-vc-collector-service-standard", "vcf-obs-vc-collector-service-standard", "50m", "512Mi"),
+    ("deploy", "vodap", "vcf-obs-vc-collector-service-verbose", "vcf-obs-vc-collector-service-verbose", "50m", "512Mi"),
+    ("deploy", "vodap", "vcf-obs-esx-collector-service", "vcf-obs-esx-collector-service", "50m", "640Mi"),
+    ("deploy", "vodap", "vcf-obs-vc-collector-service", "vcf-obs-vc-collector-service", "50m", "1Gi"),
+    ("deploy", "vodap", "vcf-obs-data-query-service", "vcf-obs-data-query-service", "100m", "640Mi"),
+    ("deploy", "vodap", "vcf-obs-collector-controller-service", "vcf-obs-collector-controller-service", "50m", "1Gi"),
+    ("deploy", "vodap", "vcf-obs-netops-collector-service", "vcf-obs-netops-collector-service", "100m", "576Mi"),
+    ("statefulset", "vodap", "chi-vcf-obs-vcf-obs-0-0", "clickhouse", "150m", "512Mi"),
+    ("statefulset", "vodap", "chi-vcf-obs-vcf-obs-0-0", "clickhouse-log", "25m", "32Mi"),
+    ("statefulset", "vodap", "chk-vcf-obs-keeper-keeper-0-0", "clickhouse-keeper", "50m", "64Mi"),
+    ("statefulset", "vodap", "chk-vcf-obs-keeper-keeper-0-1", "clickhouse-keeper", "50m", "64Mi"),
+    ("statefulset", "vodap", "chk-vcf-obs-keeper-keeper-0-2", "clickhouse-keeper", "50m", "64Mi"),
+
+    # ── Operations Logs (ops-logs) ───────────────────────────────────────────
+    ("statefulset", "ops-logs", "log-store", "opensearch", "250m", "7Gi"),
+    ("statefulset", "ops-logs", "log-processor", "vcf-ops-logs", "200m", "2Gi"),
+    ("statefulset", "ops-logs", "log-processor", "ui-server", "50m", "128Mi"),
+
+    # ── Salt & Salt-RAAS (salt, salt-raas) ───────────────────────────────────
+    ("deploy", "salt-raas", "raas", "raas", "150m", "832Mi"),
+    ("deploy", "salt-raas", "redis", "redis", "50m", "64Mi"),
+    ("deploy", "salt", "salt-master", "salt-master", "200m", "896Mi"),
+    ("deploy", "salt", "salt-minion", "salt-minion", "50m", "96Mi"),
+
+    # ── Telemetry (telemetry) ─────────────────────────────────────────────────
+    ("deploy", "telemetry", "telemetry-acceptor", "telemetry-acceptor", "50m", "512Mi"),
+
+    # ── VCF Fleet Depot (vcf-fleet-depot) ─────────────────────────────────────
+    ("deploy", "vcf-fleet-depot", "depot-service", "download-service", "50m", "288Mi"),
+    ("deploy", "vcf-fleet-depot", "depot-service", "file-server", "50m", "288Mi"),
+    ("deploy", "vcf-fleet-depot", "depot-service", "proxy-forwarder", "50m", "160Mi"),
+    ("deploy", "vcf-fleet-depot", "distribution-service", "distribution-service", "50m", "64Mi"),
+
+    # ── VCF Fleet LCM & SDDC LCM (vcf-fleet-lcm, vcf-sddc-lcm) ───────────────
+    ("deploy", "vcf-fleet-lcm", "vcf-fleet-upgrade-service-fleetupgrade", "fleetupgrade", "50m", "896Mi"),
+    ("deploy", "vcf-fleet-lcm", "vcf-fleet-build-service-fleetbuild", "fleetbuild", "100m", "896Mi"),
+    ("deploy", "vcf-sddc-lcm", "vcf-sddc-upgrade-service-sddcupgrade", "sddcupgrade", "75m", "896Mi"),
+    ("deploy", "vcf-sddc-lcm", "vcf-sddc-build-service-sddcbuild", "sddcbuild", "150m", "1024Mi"),
+
+    # ── VIDB External (vidb-external) ─────────────────────────────────────────
+    ("deploy", "vidb-external", "vidb-service", "vidb-service", "300m", "1536Mi"),
+
+    # ── VMSP Platform & Ingress Services (vmsp-platform) ──────────────────────
+    ("statefulset", "vmsp-platform", "zot-1", "zot", "50m", "384Mi"),
+    ("deploy", "vmsp-platform", "vmsp-gateway", "envoy", "50m", "256Mi"),
+    ("deploy", "vmsp-platform", "vmsp-gateway", "shutdown-manager", "25m", "32Mi"),
+    ("deploy", "vmsp-platform", "ops-logs-gateway", "envoy", "75m", "128Mi"),
+    ("deploy", "vmsp-platform", "ops-logs-gateway", "shutdown-manager", "25m", "32Mi"),
+    ("deploy", "vmsp-platform", "helm-controller", "manager", "50m", "128Mi"),
+    ("deploy", "vmsp-platform", "strimzi-cluster-operator", "strimzi-cluster-operator", "50m", "320Mi"),
+    ("deploy", "vmsp-platform", "synthetic-checker", "kube-rbac-proxy", "25m", "35Mi"),
+    ("deploy", "vmsp-platform", "synthetic-checker", "synthetic-checker", "50m", "96Mi"),
+    ("deploy", "vmsp-platform", "hooks-server-synthetic-checker", "kube-rbac-proxy", "25m", "35Mi"),
+    ("deploy", "vmsp-platform", "hooks-server-synthetic-checker", "synthetic-checker", "50m", "96Mi"),
+    ("deploy", "vmsp-platform", "support-bundle", "operator", "25m", "64Mi"),
+    ("deploy", "vmsp-platform", "support-bundle", "support-data-server", "50m", "64Mi"),
+    ("deploy", "vmsp-platform", "argo-workflows-workflow-controller", "controller", "50m", "96Mi"),
+    ("deploy", "vmsp-platform", "envoy-gateway", "envoy-gateway", "50m", "208Mi"),
+    ("deploy", "vmsp-platform", "vmsp-identity", "vmsp-identity", "50m", "64Mi"),
+    ("statefulset", "vmsp-platform", "prometheus-kube-prometheus-stack-prometheus", "prometheus", "150m", "832Mi"),
+    ("daemonset", "vmsp-platform", "logging-operator-filelogs-fluentbit", "fluent-bit", "50m", "32Mi"),
+    ("daemonset", "vmsp-platform", "logging-operator-fluentbit", "fluent-bit", "50m", "48Mi"),
+    ("daemonset", "vmsp-platform", "logging-operator-systemlogs-fluentbit", "fluent-bit", "50m", "32Mi"),
+
+    # ── VMSP Metrics Store (vmsp-metrics-store) ──────────────────────────────
+    ("deploy", "vmsp-metrics-store", "clickhouse-operator-altinity-clickhouse-operator", "altinity-clickhouse-operator", "50m", "72Mi"),
+    ("deploy", "vmsp-metrics-store", "clickhouse-operator-altinity-clickhouse-operator", "metrics-exporter", "50m", "72Mi"),
+    ("deploy", "vmsp-metrics-store", "vsp-metrics-store-operator", "vsp-metrics-store-operator", "50m", "112Mi"),
+
+    # ── Kyverno Policies (vmsp-policies) ──────────────────────────────────────
+    ("deploy", "vmsp-policies", "kyverno-admission-controller", "kyverno", "50m", "112Mi"),
+    ("deploy", "vmsp-policies", "kyverno-background-controller", "controller", "50m", "144Mi"),
+
+    # ── Kube System (kube-system) ─────────────────────────────────────────────
+    ("deploy", "kube-system", "coredns", "coredns", "50m", "32Mi"),
+    ("deploy", "kube-system", "vsphere-csi-controller", "csi-attacher", "25m", "65Mi"),
+    ("deploy", "kube-system", "vsphere-csi-controller", "csi-resizer", "25m", "65Mi"),
+    ("deploy", "kube-system", "vsphere-csi-controller", "vsphere-csi-controller", "25m", "65Mi"),
+    ("deploy", "kube-system", "vsphere-csi-controller", "liveness-probe", "25m", "54Mi"),
+    ("deploy", "kube-system", "vsphere-csi-controller", "vsphere-syncer", "25m", "65Mi"),
+    ("deploy", "kube-system", "vsphere-csi-controller", "csi-provisioner", "25m", "65Mi"),
+    ("daemonset", "kube-system", "vsphere-csi-node", "node-driver-registrar", "25m", "50Mi"),
+    ("daemonset", "kube-system", "vsphere-csi-node", "vsphere-csi-node", "25m", "50Mi"),
+    ("daemonset", "kube-system", "vsphere-csi-node", "liveness-probe", "25m", "50Mi"),
+]
+FOOTPRINT_REQUESTS = VSP_FOOTPRINT_REQUESTS
+
+VSP_FOOTPRINT_POSTGRES = [
+    # (namespace, name, postgres_cpu, postgres_mem, walg_cpu, walg_mem)
+    ("vcf-fleet-lcm", "vcf-fleet-lcm-db", "100m", "384Mi", "25m", "64Mi"),
+    ("vcf-sddc-lcm", "vcf-sddc-lcm-db", "100m", "384Mi", "25m", "64Mi"),
+    ("salt-raas", "pgdatabase", "100m", "384Mi", "25m", "64Mi"),
+    ("vidb-external", "vidb-postgres-instance", "100m", "384Mi", "25m", "64Mi"),
 ]
 FOOTPRINT_HA_DEPLOYS = [
     ("kube-system", "coredns"),
@@ -7230,25 +7324,59 @@ def chk_footprint(r, ctx):
     configured_namespaces = disc["namespaces"]
     configured_workload_keys = {(ns, name) for ns, _, name, _ in disc["workloads"]}
 
-    for kind, ns, name, container, cpu, mem in FOOTPRINT_REQUESTS:
+    wl_json = r.read_json("kubectl get deploy,sts,ds -A -o json 2>/dev/null", 45) or {}
+    items_by_key = {}
+    for item in wl_json.get("items", []) or []:
+        ikind = item.get("kind", "").lower()
+        ins = item.get("metadata", {}).get("namespace", "")
+        iname = item.get("metadata", {}).get("name", "")
+        items_by_key[(ikind, ins, iname)] = item
+        if ikind == "deployment":
+            items_by_key[("deploy", ins, iname)] = item
+        elif ikind == "daemonset":
+            items_by_key[("ds", ins, iname)] = item
+            items_by_key[("daemonset", ins, iname)] = item
+
+    for kind, ns, name, container, cpu, mem in VSP_FOOTPRINT_REQUESTS:
         # Platform namespaces (vmsp-platform, kube-system) are always checked.
         # For optional VCF component namespaces (e.g. vodap, ops-logs), ONLY check if installed on cluster
         if ns not in ("vmsp-platform", "kube-system") and ns not in configured_namespaces and (ns, name) not in configured_workload_keys:
             continue
         if name == "ops-logs-gateway" and "ops-logs" not in configured_namespaces and "ops-logs" not in disc.get("components", {}):
             continue
-        rc, cur = r.read(
-            f"kubectl get {kind} {name} -n {ns} -o "
-            f"jsonpath='{{.spec.template.spec.containers[?(@.name==\"{container}\")]"
-            f".resources.requests}}' 2>/dev/null", 30)
-        cur = (cur or "").strip()
+
+        item = items_by_key.get((kind.lower(), ns, name))
+        c_obj = None
+        if item:
+            containers = (item.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []) or [])
+            c_obj = next((c for c in containers if c.get("name") == container), None)
+
+        if c_obj:
+            reqs = c_obj.get("resources", {}).get("requests", {}) or {}
+            cur = json.dumps(reqs)
+            cur_cpu = str(reqs.get("cpu", ""))
+            cur_mem = str(reqs.get("memory", ""))
+        else:
+            rc, cur = r.read(
+                f"kubectl get {kind} {name} -n {ns} -o "
+                f"jsonpath='{{.spec.template.spec.containers[?(@.name==\"{container}\")]"
+                f".resources.requests}}' 2>/dev/null", 30)
+            cur = (cur or "").strip()
+            cur_cpu_m = re.search(r'"cpu":"([^"]+)"', cur.replace(" ", "")) if cur else None
+            cur_cpu = cur_cpu_m.group(1) if cur_cpu_m else ""
+            cur_mem_m = re.search(r'"memory":"([^"]+)"', cur.replace(" ", "")) if cur else None
+            cur_mem = cur_mem_m.group(1) if cur_mem_m else ""
+
         label = f"{ns}/{name} [{container}]: requests == cpu={cpu} mem={mem}"
-        if not cur:
+        if not cur or cur == "{}":
             out.append(warn("footprint.requests", label,
                             "object or container not found", cluster=cl))
             continue
-        squeezed = cur.replace(" ", "")
-        if f'"cpu":"{cpu}"' in squeezed and f'"memory":"{mem}"' in squeezed:
+
+        cpu_match = (not cpu) or (cur_cpu and _parse_cpu(cur_cpu) == _parse_cpu(cpu))
+        mem_match = (not mem) or (cur_mem and _parse_mem_mib(cur_mem) == _parse_mem_mib(mem))
+
+        if cpu_match and mem_match:
             out.append(ok("footprint.requests", label, "already at target", cluster=cl))
             continue
         res = fail("footprint.requests", label, f"currently {cur}", cluster=cl)
@@ -7259,6 +7387,13 @@ def chk_footprint(r, ctx):
                     f"'[{{\"op\":\"replace\",\"path\":\"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu\",\"value\":\"{cpu}\"}},{{\"op\":\"replace\",\"path\":\"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory\",\"value\":\"{mem}\"}}]'",
                     f"patch EnvoyProxy CR {name}-config requests -> cpu={cpu} mem={mem}",
                     tier="persistent", timeout=60)
+            elif name == "vmsp-gateway":
+                c_idx = "0" if container == "envoy" else "1"
+                r.write(
+                    f"kubectl patch envoyproxy vmsp-gateway-config -n {ns} --type=json -p "
+                    f"'[{{\"op\":\"replace\",\"path\":\"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/{c_idx}/resources/requests/cpu\",\"value\":\"{cpu}\"}},{{\"op\":\"replace\",\"path\":\"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/{c_idx}/resources/requests/memory\",\"value\":\"{mem}\"}}]'",
+                    f"patch EnvoyProxy CR vmsp-gateway-config container {container} requests -> cpu={cpu} mem={mem}",
+                    tier="persistent", timeout=60)
             r.write(
                 f"kubectl set resources {kind}/{name} -n {ns} --containers={container} "
                 f"--requests=cpu={cpu},memory={mem}",
@@ -7267,6 +7402,79 @@ def chk_footprint(r, ctx):
             res.action = f"requests -> cpu={cpu} mem={mem}"
             if not r.dry_run:
                 res.state, res.detail = "warn", f"was {cur}; set to target"
+        out.append(res)
+
+    pg_json = r.read_json("kubectl get postgresql -A -o json 2>/dev/null", 30) or {}
+    pg_by_key = {}
+    for pg in pg_json.get("items", []) or []:
+        ins = pg.get("metadata", {}).get("namespace", "")
+        iname = pg.get("metadata", {}).get("name", "")
+        pg_by_key[(ins, iname)] = pg
+
+    for ns, name, pg_cpu, pg_mem, walg_cpu, walg_mem in VSP_FOOTPRINT_POSTGRES:
+        if ns not in configured_namespaces and ns not in ("vmsp-platform", "kube-system"):
+            continue
+        pg = pg_by_key.get((ns, name))
+        label = f"postgresql {ns}/{name}: requests == postgres={pg_cpu}/{pg_mem} walg={walg_cpu}/{walg_mem}"
+        if not pg:
+            continue
+        spec = pg.get("spec", {}) or {}
+        cur_reqs = spec.get("resources", {}).get("requests", {}) or {}
+        cur_pg_cpu = str(cur_reqs.get("cpu", ""))
+        cur_pg_mem = str(cur_reqs.get("memory", ""))
+        sidecars = spec.get("sidecars", []) or []
+        walg_sc = next((sc for sc in sidecars if sc.get("name") == "walg"), None)
+        walg_reqs = (walg_sc.get("resources", {}).get("requests", {}) or {}) if walg_sc else {}
+        cur_walg_cpu = str(walg_reqs.get("cpu", ""))
+        cur_walg_mem = str(walg_reqs.get("memory", ""))
+
+        pg_cpu_match = (not pg_cpu) or (cur_pg_cpu and _parse_cpu(cur_pg_cpu) == _parse_cpu(pg_cpu))
+        pg_mem_match = (not pg_mem) or (cur_pg_mem and _parse_mem_mib(cur_pg_mem) == _parse_mem_mib(pg_mem))
+        walg_cpu_match = (not walg_cpu) or (cur_walg_cpu and _parse_cpu(cur_walg_cpu) == _parse_cpu(walg_cpu))
+        walg_mem_match = (not walg_mem) or (cur_walg_mem and _parse_mem_mib(cur_walg_mem) == _parse_mem_mib(walg_mem))
+
+        if pg_cpu_match and pg_mem_match and walg_cpu_match and walg_mem_match:
+            out.append(ok("footprint.postgres", label, "already at target", cluster=cl))
+            continue
+
+        detail = f"currently postgres=cpu:{cur_pg_cpu}/mem:{cur_pg_mem} walg=cpu:{cur_walg_cpu}/mem:{cur_walg_mem}"
+        res = fail("footprint.postgres", label, detail, cluster=cl)
+        if may_act(r, "footprint"):
+            new_sidecars = []
+            for sc in sidecars:
+                sc_copy = copy.deepcopy(sc)
+                if sc_copy.get("name") == "walg":
+                    sc_res = sc_copy.setdefault("resources", {})
+                    sc_res.setdefault("limits", {"cpu": "1000m", "memory": "768Mi"})
+                    sc_res["requests"] = {"cpu": walg_cpu, "memory": walg_mem}
+                new_sidecars.append(sc_copy)
+            patch_data = {
+                "spec": {
+                    "resources": {
+                        "requests": {"cpu": pg_cpu, "memory": pg_mem}
+                    },
+                    "sidecars": new_sidecars
+                }
+            }
+            patch_json_str = json.dumps(patch_data)
+            r.write(
+                f"kubectl patch postgresql {name} -n {ns} --type=merge -p '{patch_json_str}'",
+                f"patch postgresql {ns}/{name} requests -> postgres={pg_cpu}/{pg_mem} walg={walg_cpu}/{walg_mem}",
+                tier="persistent", timeout=60)
+            r.write(
+                f"kubectl set resources statefulset/{name} -n {ns} --containers=postgres "
+                f"--requests=cpu={pg_cpu},memory={pg_mem} 2>/dev/null || true",
+                f"right-size statefulset/{name} [postgres] requests -> cpu={pg_cpu} mem={pg_mem}",
+                tier="transient", timeout=30)
+            if walg_sc:
+                r.write(
+                    f"kubectl set resources statefulset/{name} -n {ns} --containers=walg "
+                    f"--requests=cpu={walg_cpu},memory={walg_mem} 2>/dev/null || true",
+                    f"right-size statefulset/{name} [walg] requests -> cpu={walg_cpu} mem={walg_mem}",
+                    tier="transient", timeout=30)
+            res.action = f"requests -> postgres={pg_cpu}/{pg_mem} walg={walg_cpu}/{walg_mem}"
+            if not r.dry_run:
+                res.state, res.detail = "warn", f"was {detail}; set to target"
         out.append(res)
 
     for ns, name in FOOTPRINT_HA_DEPLOYS:
@@ -7722,10 +7930,183 @@ def chk_gateway(r, ctx):
     return out
 
 
+def _remediate_vsphere_csi(r, ctx):
+    """Diagnose vsphere-csi-controller vCenter SSO login failures and realign via dir-cli.
+
+    Ported from vcfa-stabilizer.sh & vsp-health-monitor.py [KB 435491, KB 326114]:
+      1. Inspects vsphere-csi-controller pod in kube-system.
+      2. If failing with 'Cannot complete login due to an incorrect user name or password',
+         extracts the service account name and target password from vsphere-config-secret
+         and vsphere-cloud-secret.
+      3. Connects to the management vCenter via VCenterTransport:
+         - Resets SSO password to match the K8s secrets via dir-cli password reset.
+         - Hardens the account with --password-never-expires via dir-cli user modify.
+         - Unlocks the account if locked out.
+      4. Clears stale CSI leader election leases and force-restarts CSI controller/node pods.
+    """
+    out = []
+    cl = r.cluster
+    site_suffix, subnet = resolve_site_config(ctx)
+    vc_host = f"vc-mgmt-a.{site_suffix}"
+    admin_pw = get_password()
+
+    # 1. Check if CSI controller pod exists
+    rc, csi_pod = r.read(
+        "kubectl get pod -n kube-system -l app=vsphere-csi-controller "
+        "-o jsonpath='{.items[0].metadata.name}' 2>/dev/null", 30)
+    pod_name = (csi_pod or "").strip()
+    if not pod_name:
+        return out
+
+    # Check pod status and container readiness
+    rc_stat, stat_raw = r.read(
+        f"kubectl get pod {pod_name} -n kube-system -o jsonpath='"
+        f"{{.status.phase}} {{range .status.containerStatuses[*]}}{{.ready}} {{.state.waiting.reason}} {{end}}' 2>/dev/null", 30)
+    stat_text = (stat_raw or "").strip()
+
+    # Check logs for auth failure
+    rc_log, logs = r.read(
+        f"kubectl logs -n kube-system {pod_name} -c vsphere-csi-controller --tail=30 2>/dev/null", 30)
+    log_text = logs or ""
+    auth_failed = ("Cannot complete login due to an incorrect user name or password" in log_text or
+                   "ServerFaultCode: Cannot complete login" in log_text or
+                   "failed to login to vc" in log_text)
+    if not auth_failed:
+        rc_prev, prev_logs = r.read(
+            f"kubectl logs -n kube-system {pod_name} -c vsphere-csi-controller --previous --tail=30 2>/dev/null", 30)
+        prev_text = prev_logs or ""
+        if ("Cannot complete login due to an incorrect user name or password" in prev_text or
+            "ServerFaultCode: Cannot complete login" in prev_text or
+            "failed to login to vc" in prev_text):
+            auth_failed = True
+
+    # 2. Extract credentials from vsphere-config-secret & vsphere-cloud-secret
+    rc_conf, conf_b64 = r.read(
+        "kubectl get secret vsphere-config-secret -n kube-system "
+        "-o jsonpath='{.data.csi-vsphere\\.conf}' 2>/dev/null", 30)
+    csi_account = None
+    csi_conf_pass = None
+    if conf_b64 and conf_b64.strip():
+        try:
+            conf_text = base64.b64decode(conf_b64.strip()).decode('utf-8', errors='ignore')
+            for line in conf_text.splitlines():
+                line = line.strip()
+                if line.startswith("user") and "=" in line:
+                    csi_account = line.split("=", 1)[1].strip().strip('"').split("@")[0]
+                elif line.startswith("password") and "=" in line:
+                    csi_conf_pass = line.split("=", 1)[1].strip().strip('"')
+        except Exception:
+            pass
+
+    # Check vsphere-cloud-secret for the preferred password
+    rc_cloud, cloud_b64 = r.read(
+        f"kubectl get secret vsphere-cloud-secret -n kube-system "
+        f"-o jsonpath='{{.data.{vc_host}\\.password}}' 2>/dev/null", 30)
+    target_pass = csi_conf_pass
+    if cloud_b64 and cloud_b64.strip():
+        try:
+            cloud_pass = base64.b64decode(cloud_b64.strip()).decode('utf-8', errors='ignore')
+            if cloud_pass:
+                target_pass = cloud_pass
+        except Exception:
+            pass
+
+    label = "vSphere CSI controller: authenticated to vCenter"
+    if not csi_account or not target_pass:
+        if auth_failed or "CrashLoopBackOff" in stat_text or "Error" in stat_text:
+            out.append(fail("edge.csi", label,
+                            f"{pod_name} login failing, but service account credentials unparseable from secrets",
+                            cluster=cl))
+        else:
+            out.append(ok("edge.csi", label, f"{pod_name} healthy", cluster=cl))
+        return out
+
+    # 3. Check vCenter SSO account status via dir-cli
+    vc = VCenterTransport(vc_host, admin_pw)
+    find_cmd = (
+        f"/usr/lib/vmware-vmafd/bin/dir-cli user find-by-name --account {csi_account} "
+        f"--login administrator@vsphere.local --password {shlex.quote(admin_pw)} --level 2"
+    )
+    rc_find, sso_out = vc.exec(find_cmd, timeout=30)
+    sso_info = sso_out or ""
+
+    is_expired = "Password expired: TRUE" in sso_info
+    never_expires = "Password never expires: TRUE" in sso_info
+    is_locked = "Account locked: TRUE" in sso_info
+
+    needs_remediation = auth_failed or is_expired or is_locked or (not never_expires)
+
+    if not needs_remediation:
+        out.append(ok("edge.csi", label, f"{pod_name} healthy ({csi_account}@vsphere.local password never expires)", cluster=cl))
+        return out
+
+    reasons = []
+    if auth_failed:
+        reasons.append("CSI controller pod login failing")
+    if is_expired:
+        reasons.append("SSO password expired")
+    if is_locked:
+        reasons.append("SSO account locked")
+    if not never_expires:
+        reasons.append("SSO password-never-expires not set")
+    issue_desc = ", ".join(reasons)
+
+    res = fail("edge.csi", label,
+               f"{csi_account}@vsphere.local on {vc_host}: {issue_desc}",
+               cluster=cl)
+
+    if may_act(r, "edge"):
+        if r.dry_run:
+            res.action = f"would realign {csi_account} password via dir-cli on {vc_host}, set never-expires, and restart CSI pods"
+        else:
+            actions_taken = []
+            # A. Reset SSO password to match K8s secret if expired or failing login
+            if auth_failed or is_expired:
+                reset_cmd = (
+                    f"/usr/lib/vmware-vmafd/bin/dir-cli password reset --account {csi_account} "
+                    f"--new {shlex.quote(target_pass)} --login administrator@vsphere.local "
+                    f"--password {shlex.quote(admin_pw)}"
+                )
+                rc_reset, out_reset = vc.exec(reset_cmd, timeout=45)
+                actions_taken.append("password reset")
+
+            # B. Ensure password never expires and unlock account
+            modify_cmd = (
+                f"/usr/lib/vmware-vmafd/bin/dir-cli user modify --account {csi_account} "
+                f"--password-never-expires --account-unlocked --login administrator@vsphere.local "
+                f"--password {shlex.quote(admin_pw)}"
+            )
+            vc.exec(modify_cmd, timeout=30)
+            actions_taken.append("password-never-expires set")
+
+            # C. Clear stale CSI leader election leases [KB 435491]
+            r.write(
+                "kubectl delete lease external-attacher-leader-csi-vsphere-vmware-com "
+                "external-resizer-csi-vsphere-vmware-com -n kube-system 2>/dev/null || true",
+                "clear stale CSI leader election leases", tier="transient", timeout=30)
+
+            # D. Force-restart CSI controller and node pods if login failed or reset
+            if auth_failed or is_expired:
+                r.write(
+                    "kubectl delete pod -n kube-system -l app=vsphere-csi-controller --grace-period=0 --force 2>/dev/null; "
+                    "kubectl delete pod -n kube-system -l app=vsphere-csi-node --grace-period=0 --force 2>/dev/null",
+                    "restart CSI controller and node pods to reload credentials", tier="transient", timeout=60)
+                actions_taken.append("CSI pods restarted")
+
+            res.state = "warn"
+            res.detail = f"remediated {csi_account} on {vc_host} ({', '.join(actions_taken)})"
+            res.action = f"dir-cli reset/modify on {vc_host}; cleared stale leases & restarted CSI pods"
+
+    out.append(res)
+    return out
+
+
 def chk_edge(r, ctx):
     """Known edge cases with specific, documented signatures.
 
     Each of these was a real incident whose symptom pointed somewhere unhelpful:
+      * vSphere CSI controller credential drift & password expiry - login fails,
+        volumes cannot attach, registry/Argo deadlock.
       * support-bundle CronJob runaway - 30 GHz+ of CPU, UI unresponsive.
       * resource-manager self-dial gRPC deadlock - the pod is Running and its
         probe passes, but it never listens on :7710/:7777.
@@ -7738,6 +8119,10 @@ def chk_edge(r, ctx):
     """
     out = []
     cl = r.cluster
+
+    # 0. vSphere CSI controller credential drift & password expiry recovery [KB 435491, KB 326114]
+    if cl in ("vcfa", "vsp"):
+        out.extend(_remediate_vsphere_csi(r, ctx))
 
     rc, jobs = r.read(
         "kubectl -n vmsp-platform get jobs "
@@ -9833,7 +10218,7 @@ KB="kubectl"
 log() { logger -t vcf-lab-keeper "$1"; }
 
 PROBE_TARGETS='
-vcf-fleet-depot deployment/depot-service download-service 10 {"spec":{"template":{"spec":{"containers":[{"name":"download-service","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"startupProbe":{"timeoutSeconds":10,"failureThreshold":60},"resources":{"limits":{"memory":"2Gi"},"requests":{"cpu":"300m","memory":"512Mi"}}},{"name":"file-server","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15}},{"name":"proxy-forwarder","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":15,"failureThreshold":8,"periodSeconds":15},"startupProbe":{"timeoutSeconds":10,"failureThreshold":60,"periodSeconds":10}}]}}}}
+vcf-fleet-depot deployment/depot-service download-service 10 {"spec":{"template":{"spec":{"containers":[{"name":"download-service","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"startupProbe":{"timeoutSeconds":10,"failureThreshold":60},"resources":{"limits":{"memory":"2Gi"},"requests":{"cpu":"50m","memory":"288Mi"}}},{"name":"file-server","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15}},{"name":"proxy-forwarder","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":15,"failureThreshold":8,"periodSeconds":15},"startupProbe":{"timeoutSeconds":10,"failureThreshold":60,"periodSeconds":10}}]}}}}
 vcf-fleet-lcm deployment/vcf-fleet-build-service-fleetbuild fleetbuild 15 {"spec":{"template":{"spec":{"containers":[{"name":"fleetbuild","livenessProbe":{"timeoutSeconds":15,"failureThreshold":8,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":15,"failureThreshold":8,"periodSeconds":15},"startupProbe":{"timeoutSeconds":10,"failureThreshold":60,"periodSeconds":10}}]}}}}
 vidb-external deployment/vidb-service vidb-service 10 {"spec":{"template":{"spec":{"containers":[{"name":"vidb-service","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":10}}]}}}}
 vcf-sddc-lcm deployment/vcf-sddc-build-service-sddcbuild sddcbuild 15 {"spec":{"template":{"spec":{"containers":[{"name":"sddcbuild","livenessProbe":{"timeoutSeconds":15,"failureThreshold":8,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":15,"failureThreshold":8,"periodSeconds":15},"startupProbe":{"timeoutSeconds":10,"failureThreshold":60,"periodSeconds":10}}]}}}}
@@ -9895,10 +10280,19 @@ for dep in ndc-controller-manager vmsp-identity; do
 done
 
 LOGGW=$($KB -n vmsp-platform get deploy ops-logs-gateway -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}' 2>/dev/null)
-if [ -n "$LOGGW" ] && [ "$LOGGW" != "200m" ]; then
-    $KB patch envoyproxy ops-logs-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu","value":"200m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory","value":"256Mi"}]' >/dev/null 2>&1
-    $KB -n vmsp-platform set resources deploy/ops-logs-gateway -c envoy --requests=cpu=200m,memory=256Mi >/dev/null 2>&1 \
-        && log "drift corrected: ops-logs-gateway requests -> cpu=200m,mem=256Mi (was $LOGGW)"
+if [ -n "$LOGGW" ] && [ "$LOGGW" != "75m" ]; then
+    $KB patch envoyproxy ops-logs-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu","value":"75m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory","value":"128Mi"}]' >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/ops-logs-gateway -c envoy --requests=cpu=75m,memory=128Mi >/dev/null 2>&1 \
+        && log "drift corrected: ops-logs-gateway requests -> cpu=75m,mem=128Mi (was $LOGGW)"
+fi
+
+VMSPGW=$($KB -n vmsp-platform get deploy vmsp-gateway -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}' 2>/dev/null)
+if [ -n "$VMSPGW" ] && [ "$VMSPGW" != "50m" ]; then
+    $KB patch envoyproxy vmsp-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu","value":"50m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory","value":"256Mi"}]' >/dev/null 2>&1
+    $KB patch envoyproxy vmsp-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/1/resources/requests/cpu","value":"25m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/1/resources/requests/memory","value":"32Mi"}]' >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/vmsp-gateway -c envoy --requests=cpu=50m,memory=256Mi >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/vmsp-gateway -c shutdown-manager --requests=cpu=25m,memory=32Mi >/dev/null 2>&1 \
+        && log "drift corrected: vmsp-gateway requests -> cpu=50m/25m (was $VMSPGW)"
 fi
 
 EGBG=$($KB -n vmsp-platform get releasetemplate -o name 2>/dev/null | grep -i envoyproxy-gateway | head -1)
@@ -9909,6 +10303,85 @@ if [ -n "$EGBG" ]; then
             && log "drift corrected: $EGBG ReleaseTemplate patched"
     fi
 fi
+
+# VSP workload right-sizing enforcement
+VSP_RIGHTSIZE_TARGETS='
+vodap deployment/vcf-obs-esx-collector-service-standard vcf-obs-esx-collector-service-standard 50m 512Mi
+vodap deployment/vcf-obs-esx-collector-service-verbose vcf-obs-esx-collector-service-verbose 50m 512Mi
+vodap deployment/vcf-obs-esx-collector-service-esxitop vcf-obs-esx-collector-service-esxitop 50m 1Gi
+vodap deployment/vcf-obs-vc-collector-service-standard vcf-obs-vc-collector-service-standard 50m 512Mi
+vodap deployment/vcf-obs-vc-collector-service-verbose vcf-obs-vc-collector-service-verbose 50m 512Mi
+vodap deployment/vcf-obs-esx-collector-service vcf-obs-esx-collector-service 50m 640Mi
+vodap deployment/vcf-obs-vc-collector-service vcf-obs-vc-collector-service 50m 1Gi
+vodap deployment/vcf-obs-data-query-service vcf-obs-data-query-service 100m 640Mi
+vodap deployment/vcf-obs-collector-controller-service vcf-obs-collector-controller-service 50m 1Gi
+vodap deployment/vcf-obs-netops-collector-service vcf-obs-netops-collector-service 100m 576Mi
+vodap statefulset/chi-vcf-obs-vcf-obs-0-0 clickhouse 150m 512Mi
+salt-raas deployment/raas raas 150m 832Mi
+salt-raas deployment/redis redis 50m 64Mi
+salt deployment/salt-master salt-master 200m 896Mi
+salt deployment/salt-minion salt-minion 50m 96Mi
+telemetry deployment/telemetry-acceptor telemetry-acceptor 50m 512Mi
+vcf-fleet-depot deployment/depot-service download-service 50m 288Mi
+vcf-fleet-depot deployment/depot-service file-server 50m 288Mi
+vcf-fleet-depot deployment/depot-service proxy-forwarder 50m 160Mi
+vcf-fleet-depot deployment/distribution-service distribution-service 50m 64Mi
+vcf-fleet-lcm deployment/vcf-fleet-upgrade-service-fleetupgrade fleetupgrade 50m 896Mi
+vcf-fleet-lcm deployment/vcf-fleet-build-service-fleetbuild fleetbuild 100m 896Mi
+vcf-sddc-lcm deployment/vcf-sddc-upgrade-service-sddcupgrade sddcupgrade 75m 896Mi
+vcf-sddc-lcm deployment/vcf-sddc-build-service-sddcbuild sddcbuild 150m 1024Mi
+vidb-external deployment/vidb-service vidb-service 300m 1536Mi
+vmsp-platform statefulset/zot-1 zot 50m 384Mi
+vmsp-platform deployment/vmsp-gateway envoy 50m 256Mi
+vmsp-platform deployment/helm-controller manager 50m 128Mi
+vmsp-platform deployment/strimzi-cluster-operator strimzi-cluster-operator 50m 320Mi
+vmsp-platform deployment/synthetic-checker kube-rbac-proxy 25m 35Mi
+vmsp-platform deployment/synthetic-checker synthetic-checker 50m 96Mi
+vmsp-platform deployment/hooks-server-synthetic-checker kube-rbac-proxy 25m 35Mi
+vmsp-platform deployment/hooks-server-synthetic-checker synthetic-checker 50m 96Mi
+vmsp-platform deployment/support-bundle operator 25m 64Mi
+vmsp-platform deployment/support-bundle support-data-server 50m 64Mi
+vmsp-platform deployment/argo-workflows-workflow-controller controller 50m 96Mi
+vmsp-platform deployment/envoy-gateway envoy-gateway 50m 208Mi
+vmsp-platform deployment/vmsp-identity vmsp-identity 50m 64Mi
+vmsp-platform statefulset/prometheus-kube-prometheus-stack-prometheus prometheus 150m 832Mi
+vmsp-platform daemonset/logging-operator-filelogs-fluentbit fluent-bit 50m 32Mi
+vmsp-platform daemonset/logging-operator-fluentbit fluent-bit 50m 48Mi
+vmsp-platform daemonset/logging-operator-systemlogs-fluentbit fluent-bit 50m 32Mi
+vmsp-metrics-store deployment/clickhouse-operator-altinity-clickhouse-operator altinity-clickhouse-operator 50m 72Mi
+vmsp-metrics-store deployment/clickhouse-operator-altinity-clickhouse-operator metrics-exporter 50m 72Mi
+vmsp-metrics-store deployment/vsp-metrics-store-operator vsp-metrics-store-operator 50m 112Mi
+vmsp-policies deployment/kyverno-admission-controller kyverno 50m 112Mi
+vmsp-policies deployment/kyverno-background-controller controller 50m 144Mi
+kube-system deployment/coredns coredns 50m 32Mi
+kube-system deployment/vsphere-csi-controller csi-attacher 25m 65Mi
+kube-system deployment/vsphere-csi-controller csi-resizer 25m 65Mi
+kube-system deployment/vsphere-csi-controller vsphere-csi-controller 25m 65Mi
+kube-system deployment/vsphere-csi-controller liveness-probe 25m 54Mi
+kube-system deployment/vsphere-csi-controller vsphere-syncer 25m 65Mi
+kube-system deployment/vsphere-csi-controller csi-provisioner 25m 65Mi
+kube-system daemonset/vsphere-csi-node node-driver-registrar 25m 50Mi
+kube-system daemonset/vsphere-csi-node vsphere-csi-node 25m 50Mi
+kube-system daemonset/vsphere-csi-node liveness-probe 25m 50Mi
+'
+printf '%s\n' "$VSP_RIGHTSIZE_TARGETS" | while read -r NS REF CON CPU MEM; do
+    [ -z "$NS" ] && continue
+    CUR=$($KB -n "$NS" get "$REF" -o jsonpath="{.spec.template.spec.containers[?(@.name==\"$CON\")].resources.requests.cpu}" 2>/dev/null || echo "")
+    if [ -n "$CUR" ] && [ "$CUR" != "$CPU" ]; then
+        $KB -n "$NS" set resources "$REF" -c "$CON" --requests="cpu=${CPU},memory=${MEM}" >/dev/null 2>&1 \
+            && log "drift corrected: $NS/$REF [$CON] requests -> cpu=${CPU},mem=${MEM} (was ${CUR})"
+    fi
+done
+
+for pg in vcf-fleet-lcm/vcf-fleet-lcm-db vcf-sddc-lcm/vcf-sddc-lcm-db salt-raas/pgdatabase vidb-external/vidb-postgres-instance; do
+    ns="${pg%/*}"
+    name="${pg#*/}"
+    PG_CPU=$($KB -n "$ns" get postgresql "$name" -o jsonpath='{.spec.resources.requests.cpu}' 2>/dev/null || echo "")
+    if [ -n "$PG_CPU" ] && [ "$PG_CPU" != "100m" ]; then
+        $KB patch postgresql "$name" -n "$ns" --type=merge -p '{"spec":{"resources":{"requests":{"cpu":"100m","memory":"384Mi"}}}}' >/dev/null 2>&1 \
+            && log "drift corrected: postgresql $ns/$name requests -> 100m/384Mi"
+    fi
+done
 
 $KB exec -n vmsp-platform logging-operator-fluentd-0 -c fluentd -- sh -c 'rm -rf /buffers/backup/* /buffers/*.bak*' >/dev/null 2>&1
 
@@ -9927,6 +10400,23 @@ log() { logger -t vcf-lab-keeper "$1"; }
 # 1. Fluentd buffer cleanup
 $KB exec -n vmsp-platform logging-operator-fluentd-0 -c fluentd -- sh -c 'rm -rf /buffers/backup/* /buffers/*.bak*' >/dev/null 2>&1
 
+# 1b. Gateways (ops-logs-gateway and vmsp-gateway)
+LOGGW=$($KB -n vmsp-platform get deploy ops-logs-gateway -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}' 2>/dev/null)
+if [ -n "$LOGGW" ] && [ "$LOGGW" != "75m" ]; then
+    $KB patch envoyproxy ops-logs-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu","value":"75m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory","value":"128Mi"}]' >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/ops-logs-gateway -c envoy --requests=cpu=75m,memory=128Mi >/dev/null 2>&1 \
+        && log "drift corrected: ops-logs-gateway requests -> cpu=75m,mem=128Mi (was $LOGGW)"
+fi
+
+VMSPGW=$($KB -n vmsp-platform get deploy vmsp-gateway -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}' 2>/dev/null)
+if [ -n "$VMSPGW" ] && [ "$VMSPGW" != "50m" ]; then
+    $KB patch envoyproxy vmsp-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu","value":"50m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory","value":"256Mi"}]' >/dev/null 2>&1
+    $KB patch envoyproxy vmsp-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/1/resources/requests/cpu","value":"25m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/1/resources/requests/memory","value":"32Mi"}]' >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/vmsp-gateway -c envoy --requests=cpu=50m,memory=256Mi >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/vmsp-gateway -c shutdown-manager --requests=cpu=25m,memory=32Mi >/dev/null 2>&1 \
+        && log "drift corrected: vmsp-gateway requests -> cpu=50m/25m (was $VMSPGW)"
+fi
+
 # 2. Scale back up any VCF components annotated Running if sitting at 0 replicas
 for comp in $($KB get components.api.vmsp.vmware.com -o jsonpath='{range .items[?(@.metadata.annotations.component\.vmsp\.vmware\.com/operational-status=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
     [ -z "$comp" ] && continue
@@ -9937,6 +10427,85 @@ for comp in $($KB get components.api.vmsp.vmware.com -o jsonpath='{range .items[
         $KB scale deploy,statefulset "$dep" -n "$NS" --replicas=1 >/dev/null 2>&1 \
             && log "drift corrected: scaled $NS/$dep to 1"
     done
+done
+
+# 3. VSP workload right-sizing enforcement
+VSP_RIGHTSIZE_TARGETS='
+vodap deployment/vcf-obs-esx-collector-service-standard vcf-obs-esx-collector-service-standard 50m 512Mi
+vodap deployment/vcf-obs-esx-collector-service-verbose vcf-obs-esx-collector-service-verbose 50m 512Mi
+vodap deployment/vcf-obs-esx-collector-service-esxitop vcf-obs-esx-collector-service-esxitop 50m 1Gi
+vodap deployment/vcf-obs-vc-collector-service-standard vcf-obs-vc-collector-service-standard 50m 512Mi
+vodap deployment/vcf-obs-vc-collector-service-verbose vcf-obs-vc-collector-service-verbose 50m 512Mi
+vodap deployment/vcf-obs-esx-collector-service vcf-obs-esx-collector-service 50m 640Mi
+vodap deployment/vcf-obs-vc-collector-service vcf-obs-vc-collector-service 50m 1Gi
+vodap deployment/vcf-obs-data-query-service vcf-obs-data-query-service 100m 640Mi
+vodap deployment/vcf-obs-collector-controller-service vcf-obs-collector-controller-service 50m 1Gi
+vodap deployment/vcf-obs-netops-collector-service vcf-obs-netops-collector-service 100m 576Mi
+vodap statefulset/chi-vcf-obs-vcf-obs-0-0 clickhouse 150m 512Mi
+salt-raas deployment/raas raas 150m 832Mi
+salt-raas deployment/redis redis 50m 64Mi
+salt deployment/salt-master salt-master 200m 896Mi
+salt deployment/salt-minion salt-minion 50m 96Mi
+telemetry deployment/telemetry-acceptor telemetry-acceptor 50m 512Mi
+vcf-fleet-depot deployment/depot-service download-service 50m 288Mi
+vcf-fleet-depot deployment/depot-service file-server 50m 288Mi
+vcf-fleet-depot deployment/depot-service proxy-forwarder 50m 160Mi
+vcf-fleet-depot deployment/distribution-service distribution-service 50m 64Mi
+vcf-fleet-lcm deployment/vcf-fleet-upgrade-service-fleetupgrade fleetupgrade 50m 896Mi
+vcf-fleet-lcm deployment/vcf-fleet-build-service-fleetbuild fleetbuild 100m 896Mi
+vcf-sddc-lcm deployment/vcf-sddc-upgrade-service-sddcupgrade sddcupgrade 75m 896Mi
+vcf-sddc-lcm deployment/vcf-sddc-build-service-sddcbuild sddcbuild 150m 1024Mi
+vidb-external deployment/vidb-service vidb-service 300m 1536Mi
+vmsp-platform statefulset/zot-1 zot 50m 384Mi
+vmsp-platform deployment/vmsp-gateway envoy 50m 256Mi
+vmsp-platform deployment/helm-controller manager 50m 128Mi
+vmsp-platform deployment/strimzi-cluster-operator strimzi-cluster-operator 50m 320Mi
+vmsp-platform deployment/synthetic-checker kube-rbac-proxy 25m 35Mi
+vmsp-platform deployment/synthetic-checker synthetic-checker 50m 96Mi
+vmsp-platform deployment/hooks-server-synthetic-checker kube-rbac-proxy 25m 35Mi
+vmsp-platform deployment/hooks-server-synthetic-checker synthetic-checker 50m 96Mi
+vmsp-platform deployment/support-bundle operator 25m 64Mi
+vmsp-platform deployment/support-bundle support-data-server 50m 64Mi
+vmsp-platform deployment/argo-workflows-workflow-controller controller 50m 96Mi
+vmsp-platform deployment/envoy-gateway envoy-gateway 50m 208Mi
+vmsp-platform deployment/vmsp-identity vmsp-identity 50m 64Mi
+vmsp-platform statefulset/prometheus-kube-prometheus-stack-prometheus prometheus 150m 832Mi
+vmsp-platform daemonset/logging-operator-filelogs-fluentbit fluent-bit 50m 32Mi
+vmsp-platform daemonset/logging-operator-fluentbit fluent-bit 50m 48Mi
+vmsp-platform daemonset/logging-operator-systemlogs-fluentbit fluent-bit 50m 32Mi
+vmsp-metrics-store deployment/clickhouse-operator-altinity-clickhouse-operator altinity-clickhouse-operator 50m 72Mi
+vmsp-metrics-store deployment/clickhouse-operator-altinity-clickhouse-operator metrics-exporter 50m 72Mi
+vmsp-metrics-store deployment/vsp-metrics-store-operator vsp-metrics-store-operator 50m 112Mi
+vmsp-policies deployment/kyverno-admission-controller kyverno 50m 112Mi
+vmsp-policies deployment/kyverno-background-controller controller 50m 144Mi
+kube-system deployment/coredns coredns 50m 32Mi
+kube-system deployment/vsphere-csi-controller csi-attacher 25m 65Mi
+kube-system deployment/vsphere-csi-controller csi-resizer 25m 65Mi
+kube-system deployment/vsphere-csi-controller vsphere-csi-controller 25m 65Mi
+kube-system deployment/vsphere-csi-controller liveness-probe 25m 54Mi
+kube-system deployment/vsphere-csi-controller vsphere-syncer 25m 65Mi
+kube-system deployment/vsphere-csi-controller csi-provisioner 25m 65Mi
+kube-system daemonset/vsphere-csi-node node-driver-registrar 25m 50Mi
+kube-system daemonset/vsphere-csi-node vsphere-csi-node 25m 50Mi
+kube-system daemonset/vsphere-csi-node liveness-probe 25m 50Mi
+'
+printf '%s\n' "$VSP_RIGHTSIZE_TARGETS" | while read -r NS REF CON CPU MEM; do
+    [ -z "$NS" ] && continue
+    CUR=$($KB -n "$NS" get "$REF" -o jsonpath="{.spec.template.spec.containers[?(@.name==\"$CON\")].resources.requests.cpu}" 2>/dev/null || echo "")
+    if [ -n "$CUR" ] && [ "$CUR" != "$CPU" ]; then
+        $KB -n "$NS" set resources "$REF" -c "$CON" --requests="cpu=${CPU},memory=${MEM}" >/dev/null 2>&1 \
+            && log "drift corrected: $NS/$REF [$CON] requests -> cpu=${CPU},mem=${MEM} (was ${CUR})"
+    fi
+done
+
+for pg in vcf-fleet-lcm/vcf-fleet-lcm-db vcf-sddc-lcm/vcf-sddc-lcm-db salt-raas/pgdatabase vidb-external/vidb-postgres-instance; do
+    ns="${pg%/*}"
+    name="${pg#*/}"
+    PG_CPU=$($KB -n "$ns" get postgresql "$name" -o jsonpath='{.spec.resources.requests.cpu}' 2>/dev/null || echo "")
+    if [ -n "$PG_CPU" ] && [ "$PG_CPU" != "100m" ]; then
+        $KB patch postgresql "$name" -n "$ns" --type=merge -p '{"spec":{"resources":{"requests":{"cpu":"100m","memory":"384Mi"}}}}' >/dev/null 2>&1 \
+            && log "drift corrected: postgresql $ns/$name requests -> 100m/384Mi"
+    fi
 done
 
 exit 0
