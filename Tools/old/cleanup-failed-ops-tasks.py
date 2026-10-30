@@ -2,8 +2,8 @@
 # ==============================================================================
 # Script: cleanup-failed-ops-tasks
 # Author: HOL Development Team
-# Date: 2026-07-24
-# Version: 1.2
+# Date: 2026-10-30
+# Version: 1.3
 # Description: Identifies and purges non-running failed tasks and subtasks in 
 #              VCF Operations Lifecycle (Fleet LCM) and SDDC Manager.
 #              Defaults to dry-run mode. Run with --purge to execute deletions.
@@ -49,7 +49,18 @@ def run_vsp_kubectl_pyvmomi(cmd_str, password):
         fm = si.content.guestOperationsManager.fileManager
         ctx = ssl._create_unverified_context()
 
-        vm = si.content.searchIndex.FindByDnsName(None, 'vsp-01a-txhml', True)
+        # Dynamically discover active VSP control plane VM
+        container = si.content.viewManager.CreateContainerView(si.content.rootFolder, [vim.VirtualMachine], True)
+        vm = None
+        for v in container.view:
+            if v.name.startswith('vsp-') and v.runtime.powerState == 'poweredOn':
+                vm = v
+                break
+        container.Destroy()
+        if not vm:
+            Disconnect(si)
+            return "pyVmomi error: No poweredOn VSP control plane VM found"
+
         creds = vim.vm.guest.NamePasswordAuthentication(username='vmware-system-user', password=password)
 
         script_body = f'''import pty, os, time, subprocess, sys
@@ -165,65 +176,98 @@ UPDATE upgrade_plan_execution SET status = 'COMPLETED' WHERE status != 'COMPLETE
 """
     sql_b64 = base64.b64encode(purge_sql.encode()).decode()
 
-    # Execute SQL via pyVmomi Guest Operations directly to guarantee clean execution
+    # Discover DB master pod
+    master_pod = run_vsp_kubectl("get pod -n vcf-fleet-lcm -l spilo-role=master -o jsonpath='{.items[0].metadata.name}'", password)
+    if not master_pod or "error" in master_pod.lower() or not master_pod.strip():
+        master_pod = "vcf-fleet-lcm-db-0"
+    else:
+        master_pod = master_pod.strip().split()[-1]
+
+    # Primary path: Execute via SSH to VSP cluster
+    db_purged = False
     try:
-        from pyVim.connect import SmartConnect, Disconnect
-        from pyVmomi import vim
+        import lsfunctions as lsf
+        cmd_sql = f"echo '{password}' | sudo -S bash -c 'echo {sql_b64} | base64 -d | kubectl --kubeconfig /etc/kubernetes/admin.conf exec -i -n vcf-fleet-lcm {master_pod} -c postgres -- psql -U postgres -d vcffleetlcmdb'"
+        vsp_hosts = ['10.1.1.142', '10.1.1.143', 'vsp-01a.site-a.vcf.lab', 'fleet-01a.site-a.vcf.lab']
+        for host in vsp_hosts:
+            res = lsf.ssh(cmd_sql, f'vmware-system-user@{host}', password, options='StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3')
+            if res.returncode == 0:
+                log(f"  DB Purge Result:\n{res.stdout.strip()}", GREEN)
+                db_purged = True
+                break
+    except Exception as e:
+        log(f"  SSH DB purge attempt: {e}", YELLOW)
 
-        si = SmartConnect(host='vc-mgmt-a.site-a.vcf.lab', user='administrator@vsphere.local', pwd=password, sslContext=ssl._create_unverified_context())
-        pm = si.content.guestOperationsManager.processManager
-        fm = si.content.guestOperationsManager.fileManager
-        ctx = ssl._create_unverified_context()
+    # Fallback path: pyVmomi Guest Operations if SSH was unavailable
+    if not db_purged:
+        try:
+            from pyVim.connect import SmartConnect, Disconnect
+            from pyVmomi import vim
 
-        vm = si.content.searchIndex.FindByDnsName(None, 'vsp-01a-txhml', True)
-        creds = vim.vm.guest.NamePasswordAuthentication(username='vmware-system-user', password=password)
+            si = SmartConnect(host='vc-mgmt-a.site-a.vcf.lab', user='administrator@vsphere.local', pwd=password, sslContext=ssl._create_unverified_context())
+            pm = si.content.guestOperationsManager.processManager
+            fm = si.content.guestOperationsManager.fileManager
+            ctx = ssl._create_unverified_context()
 
-        script_body = r'''import pty, os, time, subprocess, sys, traceback, base64
+            container = si.content.viewManager.CreateContainerView(si.content.rootFolder, [vim.VirtualMachine], True)
+            vm = None
+            for v in container.view:
+                if v.name.startswith('vsp-') and v.runtime.powerState == 'poweredOn':
+                    vm = v
+                    break
+            container.Destroy()
+
+            if not vm:
+                Disconnect(si)
+                log("  Error executing Fleet DB purge: No active VSP Control Plane VM found", RED)
+                return
+
+            creds = vim.vm.guest.NamePasswordAuthentication(username='vmware-system-user', password=password)
+
+            script_body = f'''import pty, os, time, subprocess, sys, traceback, base64
 
 password = sys.argv[1]
 sql_b64 = sys.argv[2]
 
 try:
     sql = base64.b64decode(sql_b64).decode()
-    cmd = ['sudo', '-S', 'kubectl', '--kubeconfig', '/etc/kubernetes/admin.conf', 'exec', '-i', '-n', 'vcf-fleet-lcm', 'vcf-fleet-lcm-db-1', '-c', 'postgres', '--', 'psql', '-U', 'postgres', '-d', 'vcffleetlcmdb']
+    cmd = ['sudo', '-S', 'kubectl', '--kubeconfig', '/etc/kubernetes/admin.conf', 'exec', '-i', '-n', 'vcf-fleet-lcm', '{master_pod}', '-c', 'postgres', '--', 'psql', '-U', 'postgres', '-d', 'vcffleetlcmdb']
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    out, err = proc.communicate(input=f"{password}\n" + sql)
+    out, err = proc.communicate(input=f"{{password}}\\n" + sql)
     with open('/tmp/sql_purge_res.txt', 'w') as f:
-        f.write('OUT:\n' + str(out) + '\nERR:\n' + str(err))
+        f.write('OUT:\\n' + str(out) + '\\nERR:\\n' + str(err))
 except Exception:
     with open('/tmp/sql_purge_res.txt', 'w') as f:
-        f.write('EXC:\n' + traceback.format_exc())
+        f.write('EXC:\\n' + traceback.format_exc())
 '''
 
-        py_bytes = script_body.encode('utf-8')
-        url_py = fm.InitiateFileTransferToGuest(vm, creds, '/tmp/run_sql_purge.py', vim.vm.guest.FileManager.FileAttributes(), len(py_bytes), True)
-        req_py = urllib.request.Request(url_py, data=py_bytes, method='PUT')
-        urllib.request.urlopen(req_py, context=ctx)
+            py_bytes = script_body.encode('utf-8')
+            url_py = fm.InitiateFileTransferToGuest(vm, creds, '/tmp/run_sql_purge.py', vim.vm.guest.FileManager.FileAttributes(), len(py_bytes), True)
+            req_py = urllib.request.Request(url_py, data=py_bytes, method='PUT')
+            urllib.request.urlopen(req_py, context=ctx)
 
-        spec = vim.vm.guest.ProcessManager.ProgramSpec(
-            programPath='/bin/bash',
-            arguments=f'-c "python3 /tmp/run_sql_purge.py \'{password}\' \'{sql_b64}\' > /tmp/out_sql_purge.log 2>&1"'
-        )
-        pid = pm.StartProgramInGuest(vm, creds, spec)
-        time.sleep(5)
+            spec = vim.vm.guest.ProcessManager.ProgramSpec(
+                programPath='/bin/bash',
+                arguments=f'-c "python3 /tmp/run_sql_purge.py \'{password}\' \'{sql_b64}\' > /tmp/out_sql_purge.log 2>&1"'
+            )
+            pid = pm.StartProgramInGuest(vm, creds, spec)
+            time.sleep(5)
 
-        file_url2 = fm.InitiateFileTransferFromGuest(vm, creds, '/tmp/sql_purge_res.txt')
-        content2 = urllib.request.urlopen(file_url2.url, context=ctx).read().decode()
-        log(f"  DB Purge Result:\n{content2}", GREEN)
+            file_url2 = fm.InitiateFileTransferFromGuest(vm, creds, '/tmp/sql_purge_res.txt')
+            content2 = urllib.request.urlopen(file_url2.url, context=ctx).read().decode()
+            log(f"  DB Purge Result:\n{content2}", GREEN)
+            Disconnect(si)
+            db_purged = True
+        except Exception as e:
+            log(f"  Error executing Fleet DB purge via pyVmomi: {e}", RED)
 
-        restart_script = f'''
-cat /tmp/pass.txt | sudo -S kubectl --kubeconfig /etc/kubernetes/admin.conf delete workflows -n vmsp-platform -l 'workflows.argoproj.io/phase=Failed' --ignore-not-found
-cat /tmp/pass.txt | sudo -S kubectl --kubeconfig /etc/kubernetes/admin.conf rollout restart deployment/vcf-fleet-build-service-fleetbuild deployment/vcf-fleet-upgrade-service-fleetupgrade -n vcf-fleet-lcm
-'''
-        spec_restart = vim.vm.guest.ProcessManager.ProgramSpec(
-            programPath='/bin/bash',
-            arguments=f'-c "{restart_script}"'
-        )
-        pm.StartProgramInGuest(vm, creds, spec_restart)
-        Disconnect(si)
+    # Clean failed workflows and rollout restart build & upgrade microservices
+    try:
+        run_vsp_kubectl("delete workflows -n vmsp-platform -l workflows.argoproj.io/phase=Failed --ignore-not-found", password)
+        run_vsp_kubectl("rollout restart deployment/vcf-fleet-build-service-fleetbuild deployment/vcf-fleet-upgrade-service-fleetupgrade -n vcf-fleet-lcm", password)
         log("  Fleet build & upgrade services restarted successfully.", GREEN)
     except Exception as e:
-        log(f"  Error executing Fleet DB purge: {e}", RED)
+        log(f"  Warning restarting Fleet services: {e}", YELLOW)
 
 def identify_sddc_manager_tasks(sddc_host, password):
     log(f"\n[{sddc_host}] Authenticating to SDDC Manager...", CYAN)
