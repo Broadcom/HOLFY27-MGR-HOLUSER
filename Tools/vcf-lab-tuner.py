@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.5.8 - 2026-09-23
+Version 2.7.0 - 2026-10-30
 Author: HOL Core Team
-v 2.5.9: SSP Workload Kubeconfig Cache TTL & Cluster Re-installation Resilience:
+v2.7.0: Comprehensive Multi-Cluster vCenter SSO Service Account & Secret Inspection (VSP, Supervisor, VCFA, SSP):
+  - Multi-Cluster Secret & Service Account Inspection (_chk_vcenter_sso_service_accounts, _chk_supervisor_vcenter_service_accounts, _test_vcenter_auth, _harden_vcenter_sso_service_accounts):
+    * VSP: Proactively discovers and validates vCenter service account credentials from K8s secrets (vcf-sddc-lcm/vcf-iam-vcenter-admin, vmsp-platform/vsp-01a-vcenter-admin-secret, vmsp-platform/vsp-01a-vcenter-main-secret, vmsp-platform/vcenter-main-secret, vmsp-platform/vsp-01a-vsphere-secret, and kube-system/vsphere-config-secret). Validates live REST authentication against vCenter cis/session API, detects expired/drifted passwords, resets them via dir-cli to match secrets, sets --password-never-expires, and reloads dependent services (vcf-sddc-build-service, vsphere-csi-controller).
+    * Supervisor: In chk_services, inspects the Supervisor's CSI secret (vmware-system-csi/vsphere-config-secret) and tests login against workload vCenter (wld.sso). Inspects and hardens all wcp-*-user and svc-* service accounts on vCenter SSO, enforcing --password-never-expires to prevent WCP/Supervisor 90-day expiration failures.
+    * VCFA: Validates CSI secrets (kube-system/vsphere-config-secret, vsphere-cloud-secret) and vmsp-platform secrets, resetting drifted/expired accounts and setting --password-never-expires. Added "password" section to VCFA's default section pipeline.
+    * SSP: Inspects CAPI/CAPV VSphereCluster identityRef secrets and namespace credentials against management vCenter SSO, realigning passwords and setting --password-never-expires.
+    * Universal Hardening: Sweeps all vCenter service accounts (svc-*, wcp-*, nsxt_*) across management and workload vCenters and sets --password-never-expires to permanently eliminate 90-day expiration outages across all lab builds.
+
+v2.6.1: vSphere CSI Controller Credential Recovery & SSO Expiration Hardening:
+  - CSI Credential Recovery (_remediate_vsphere_csi, chk_edge): Implemented missing vSphere CSI controller credential remediation in chk_edge for VCFA and VSP clusters [KB 435491, KB 326114]. Discovers credentials from vsphere-config-secret and vsphere-cloud-secret, diagnoses authentication failures and expired SSO passwords via dir-cli on management vCenter, realigns the password, enforces --password-never-expires, clears stale leader election leases, and bounces CSI pods to restore container storage operations.
+  - Robust Site Config Resolution (resolve_site_config): Added dictionary support to resolve_site_config so passing ctx dictionaries correctly resolves site_suffix and subnet prefix.
+
+v2.6.0: Upstream Issuer CA Signature Verification & Multi-Cluster Parity:
+  - CA Cryptographic Signature Verification (_verify_cert_signed_by_ca, _get_issuer_ca_pem, _renew_certmanager_leaf_certs, chk_certs): Added proactive upstream CA cryptographic verification (`openssl verify -CAfile`) across all Certificate resources and backing secrets. Dynamically resolves ClusterIssuer and Issuer signing CAs across namespaces, detects leaf certificates signed by non-current/rotated CAs (such as metrics-endpoint-downstream-server-cert following metrics-aggregator-ca rotation), and automatically triggers cert-manager reissuance, request purging, and mounting workload rollouts.
+
+v2.5.9: SSP Workload Kubeconfig Cache TTL & Cluster Re-installation Resilience:
   - Resilient SSP Workload Kubeconfig Caching: Added 300s TTL check to _wrap_ssp_cmd preamble on ssp-i, ensuring cached /tmp/.ssp-wlkc automatically refreshes from the ssp-kubeconfig secret if stale, expired, or after SSP cluster re-installation.
 
 v2.5.8: Config.ini disable_leader_election Gating:
@@ -544,6 +559,7 @@ import json
 import os
 import re
 import atexit
+import shlex
 import shutil
 import signal
 import socket
@@ -552,6 +568,8 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import urllib.request
+import ssl
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -566,8 +584,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.5.9"
-DATE    = "2026-09-23"
+VERSION = "2.7.0"
+DATE    = "2026-10-30"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -711,10 +729,16 @@ def resolve_site_config(args):
     site = "a"
     if hasattr(args, "site") and args.site:
         site = args.site.lower()
+    elif isinstance(args, dict) and args.get("site"):
+        site = str(args["site"]).lower()
     elif hasattr(args, "host") and args.host:
         if "site-b" in args.host.lower() or args.host.endswith("b"):
             site = "b"
         elif args.host.startswith("10.2.1."):
+            site = "b"
+    elif isinstance(args, dict) and args.get("host"):
+        h = str(args["host"]).lower()
+        if "site-b" in h or h.endswith("b") or h.startswith("10.2.1."):
             site = "b"
             
     if site == "b":
@@ -823,10 +847,10 @@ def get_cluster_configs(args):
             # supported --cluster vcfa, but nothing in this tool called it, so a VCFA
             # kubeadm cert nearing expiry had no delegation path at all.
             # Re-ordered execution flow: sweeps and pre-flight cleanup run first (argo, nodes, cp, etcd, postgres, pods),
-            # followed by storm mitigations, edge cases (0-replica scale-up & RM unblock), certs, and gateway (SDS BTP fix),
+            # followed by storm mitigations, edge cases (0-replica scale-up & RM unblock), password/SSO hardening, certs, and gateway (SDS BTP fix),
             # ensuring dependencies are healthy before deployments and endpoints are validated.
             "sections": ["argo", "nodes", "cp", "etcd", "postgres", "pods", "storm",
-                         "edge", "certs", "gateway", "deployments", "endpoint", "kubeadm"],
+                         "edge", "password", "certs", "gateway", "deployments", "endpoint", "kubeadm"],
         },
         "supervisor": {
             "label": "SUPERVISOR",
@@ -916,9 +940,9 @@ SECTION_MAP = {
     "salt":        ("SALT STACK",            "pod readiness + salt-master log signatures"),
     "argo":        ("ARGO WORKFLOWS",        "stale system-shutdown + power-off marker"),
     "kyverno":     ("KYVERNO POLICIES",      "UpdateRequest backlog + controllers"),
-    "password":    ("PASSWORD EXPIRATION",   "node account expiry vs policy"),
+    "password":    ("PASSWORD EXPIRATION",   "node and vCenter service account expiry vs policy"),
     "gateway":     ("GATEWAY DATAPLANE",     "LB VIPs + envoy dataplane services [KB 439264, KB 424402]"),
-    "edge":        ("KNOWN EDGE CASES",      "support-bundle, RM deadlock, RabbitMQ [KB 440167, KB 392417, KB 435491]"),
+    "edge":        ("KNOWN EDGE CASES",      "CSI drift/expiry, support-bundle, RM deadlock, RabbitMQ [KB 440167, KB 392417, KB 435491]"),
     "etcd":        ("ETCD FRAGMENTATION",    "dbSize slack (informational; KB 327477)"),
     "sizing":      ("CLUSTER SIZING",        "CP/worker machine type, replica bounds, autoscaler, node utilization"),
     "footprint":   ("FOOTPRINT & HA",        "oversized requests, HA counts, safe-to-evict, CAPI LE, autoscaler pin [KB 417831]"),
@@ -3838,6 +3862,154 @@ def _renew_certmanager_ca(r, ctx):
     return rotated
 
 
+def _verify_cert_signed_by_ca(leaf_pem: str, ca_pem: str) -> bool:
+    """Verify that leaf_pem is cryptographically signed by ca_pem using openssl."""
+    if not leaf_pem or not ca_pem:
+        return True
+    f_ca_name = None
+    f_leaf_name = None
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False) as f_ca, \
+             tempfile.NamedTemporaryFile("w", delete=False) as f_leaf:
+            f_ca.write(ca_pem)
+            f_ca.flush()
+            f_leaf.write(leaf_pem)
+            f_leaf.flush()
+            f_ca_name = f_ca.name
+            f_leaf_name = f_leaf.name
+
+        proc = subprocess.run(
+            ["openssl", "verify", "-CAfile", f_ca_name, f_leaf_name],
+            capture_output=True, text=True, timeout=10
+        )
+        return proc.returncode == 0 and ": OK" in (proc.stdout or "")
+    except Exception:
+        return True
+    finally:
+        if f_ca_name:
+            try:
+                os.unlink(f_ca_name)
+            except Exception:
+                pass
+        if f_leaf_name:
+            try:
+                os.unlink(f_leaf_name)
+            except Exception:
+                pass
+
+
+def _get_issuer_ca_pem(r, ctx, ikind, iname, cert_ns):
+    """Retrieve the CA certificate PEM for a given cert-manager Issuer or ClusterIssuer."""
+    if not iname:
+        return None
+
+    ikind = ikind or "Issuer"
+
+    if "_cissuers" not in ctx:
+        ci_data = r.read_json("kubectl get clusterissuers -o json 2>/dev/null", 20) or {}
+        ctx["_cissuers"] = {
+            item.get("metadata", {}).get("name", ""): item
+            for item in ci_data.get("items", [])
+            if item.get("metadata", {}).get("name")
+        }
+
+    if "_issuers" not in ctx:
+        iss_data = r.read_json("kubectl get issuers -A -o json 2>/dev/null", 20) or {}
+        ctx["_issuers"] = {
+            (item.get("metadata", {}).get("namespace", ""), item.get("metadata", {}).get("name", "")): item
+            for item in iss_data.get("items", [])
+            if item.get("metadata", {}).get("name")
+        }
+
+    ctx.setdefault("_ca_pem_cache", {})
+    if "_secret_cache" not in ctx or not ctx["_secret_cache"]:
+        sec_bulk = r.read_json("kubectl get secrets -A -o json 2>/dev/null", 45) or {}
+        ctx["_secret_cache"] = {
+            (s.get("metadata", {}).get("namespace", ""), s.get("metadata", {}).get("name", "")): s.get("data", {})
+            for s in sec_bulk.get("items", [])
+            if s.get("metadata", {}).get("name")
+        }
+
+    ca_sec_name = None
+    ns_candidates = []
+
+    if ikind == "ClusterIssuer":
+        ci = ctx["_cissuers"].get(iname)
+        if not ci:
+            return None
+        if ci.get("spec", {}).get("selfSigned") is not None:
+            return "__self_signed__"
+        ca_spec = ci.get("spec", {}).get("ca")
+        if not ca_spec or not isinstance(ca_spec, dict):
+            return None
+        ca_sec_name = ca_spec.get("secretName")
+        if not ca_sec_name:
+            return None
+
+        cl = getattr(r, "cluster", "")
+        primary_ns = (
+            "vmware-system-cert-manager" if cl == "supervisor"
+            else ("vmsp-platform" if cl == "vsp" else "cert-manager")
+        )
+        for cand in [primary_ns, "vmware-system-cert-manager", "vmsp-platform", "cert-manager", "prelude", "kube-system", "default"]:
+            if cand and cand not in ns_candidates:
+                ns_candidates.append(cand)
+
+    elif ikind == "Issuer":
+        iss = ctx["_issuers"].get((cert_ns, iname))
+        if not iss:
+            return None
+        if iss.get("spec", {}).get("selfSigned") is not None:
+            return "__self_signed__"
+        ca_spec = iss.get("spec", {}).get("ca")
+        if not ca_spec or not isinstance(ca_spec, dict):
+            return None
+        ca_sec_name = ca_spec.get("secretName")
+        if not ca_sec_name:
+            return None
+        ns_candidates = [cert_ns]
+
+    else:
+        return None
+
+    # Check cache first across candidate namespaces
+    for c_ns in ns_candidates:
+        sec_key = (c_ns, ca_sec_name)
+        if sec_key in ctx["_ca_pem_cache"]:
+            return ctx["_ca_pem_cache"][sec_key]
+
+    # Query candidate namespaces
+    for c_ns in ns_candidates:
+        sec_key = (c_ns, ca_sec_name)
+        sec_data = ctx["_secret_cache"].get(sec_key)
+        if sec_data is None:
+            rc, sec_raw = r.read(f"kubectl get secret {ca_sec_name} -n {c_ns} -o json 2>/dev/null", 15)
+            if rc == 0 and (sec_raw or "").strip():
+                try:
+                    sec_data = json.loads(sec_raw).get("data", {})
+                    ctx["_secret_cache"][sec_key] = sec_data
+                except Exception:
+                    sec_data = {}
+            else:
+                sec_data = {}
+
+        if sec_data:
+            tls_b64 = sec_data.get("tls.crt", "")
+            ca_b64 = sec_data.get("ca.crt", "")
+            pem_parts = []
+            if tls_b64:
+                pem_parts.append(base64.b64decode(tls_b64).decode("utf-8", errors="ignore"))
+            if ca_b64 and ca_b64 != tls_b64:
+                pem_parts.append(base64.b64decode(ca_b64).decode("utf-8", errors="ignore"))
+            if pem_parts:
+                ca_pem = "\n".join(pem_parts)
+                ctx["_ca_pem_cache"][sec_key] = ca_pem
+                return ca_pem
+
+    ctx["_ca_pem_cache"][(ns_candidates[0], ca_sec_name)] = None
+    return None
+
+
 def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
     """Native cert-manager leaf certificate renewal and workload rollout restarter.
     
@@ -3851,6 +4023,14 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
     if not data:
         return [warn("certs.renew", "cert-manager Certificates: renewable",
                      "no Certificate CRDs found or kubectl failed", cluster=cl)]
+
+    if "_secret_cache" not in ctx or not ctx["_secret_cache"]:
+        sec_bulk = r.read_json("kubectl get secrets -A -o json 2>/dev/null", 45) or {}
+        ctx["_secret_cache"] = {
+            (s.get("metadata", {}).get("namespace", ""), s.get("metadata", {}).get("name", "")): s.get("data", {})
+            for s in sec_bulk.get("items", [])
+            if s.get("metadata", {}).get("name")
+        }
 
     items = data.get("items", [])
     to_renew = []
@@ -3877,18 +4057,34 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
         expiring = days is not None and days < threshold_days
         invalid_secret = False
 
-        # Validate backing secret across all clusters (especially Supervisor where secret drift/expiry occurs)
+        iref = spec.get("issuerRef", {})
+        ikind = iref.get("kind") or "Issuer"
+        iname = iref.get("name", "")
+
+        # Validate backing secret and upstream CA signature across all clusters
         if secret_name and not force_all:
-            rc_sec, sec_raw = r.read(f"kubectl get secret {secret_name} -n {ns} -o json 2>/dev/null", 15)
-            if rc_sec != 0 or not (sec_raw or "").strip():
-                invalid_secret = True
-            else:
-                try:
-                    sec_json = json.loads(sec_raw)
-                    leaf_crt_b64 = sec_json.get("data", {}).get("tls.crt", "")
-                    if not leaf_crt_b64:
+            sec_key = (ns, secret_name)
+            sec_data = ctx.setdefault("_secret_cache", {}).get(sec_key)
+            if sec_data is None:
+                rc_sec, sec_raw = r.read(f"kubectl get secret {secret_name} -n {ns} -o json 2>/dev/null", 15)
+                if rc_sec != 0 or not (sec_raw or "").strip():
+                    invalid_secret = True
+                    sec_data = {}
+                else:
+                    try:
+                        sec_json = json.loads(sec_raw)
+                        sec_data = sec_json.get("data", {})
+                        ctx["_secret_cache"][sec_key] = sec_data
+                    except Exception:
                         invalid_secret = True
-                    elif days is None:
+                        sec_data = {}
+
+            if sec_data:
+                leaf_crt_b64 = sec_data.get("tls.crt", "")
+                if not leaf_crt_b64:
+                    invalid_secret = True
+                else:
+                    if days is None:
                         # Extract expiry from tls.crt if status.notAfter was missing/unparseable
                         rc_dt, exp_raw = r.read(f"echo '{(leaf_crt_b64 or '').strip()}' | base64 -d | openssl x509 -noout -enddate 2>/dev/null", 15)
                         exp_val = (exp_raw or "").partition("=")[2].strip()
@@ -3899,8 +4095,18 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
                                 expiring = True
                         else:
                             invalid_secret = True
-                except Exception:
-                    invalid_secret = True
+
+                    # Verify cryptographic signature against signing CA or self-signature
+                    if not is_ca:
+                        ca_pem = _get_issuer_ca_pem(r, ctx, ikind, iname, ns)
+                        if ca_pem == "__self_signed__":
+                            leaf_pem = base64.b64decode(leaf_crt_b64).decode("utf-8", errors="ignore")
+                            if not _verify_cert_signed_by_ca(leaf_pem, leaf_pem):
+                                invalid_secret = True
+                        elif ca_pem:
+                            leaf_pem = base64.b64decode(leaf_crt_b64).decode("utf-8", errors="ignore")
+                            if not _verify_cert_signed_by_ca(leaf_pem, ca_pem):
+                                invalid_secret = True
         elif not secret_name:
             invalid_secret = True
 
@@ -3940,6 +4146,8 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
             del_cmd = f"kubectl delete secret {sec} -n {ns} --ignore-not-found=true 2>/dev/null"
             r.write(del_cmd, f"delete secret {ns}/{sec} to trigger reissuance", tier="transient", timeout=30)
             deleted_secrets.add((ns, sec))
+            if "_secret_cache" in ctx:
+                ctx["_secret_cache"].pop((ns, sec), None)
 
         # Explicitly force cert-manager reissuance and purge stale requests
         r.write(f"kubectl annotate certificate {name} -n {ns} cert-manager.io/reissue-at=$(date +%s) --overwrite 2>/dev/null",
@@ -3986,7 +4194,7 @@ def _renew_certmanager_leaf_certs(r, ctx, force_all=False):
                 r.write(roll_cmd, f"rollout restart {w_ns}/{w_kind}/{w_name} to mount renewed cert secret", tier="transient", timeout=30)
                 restarted_workloads.append(f"{w_ns}/{w_kind.lower()}/{w_name}")
 
-        cainjector_ns = "vmsp-platform" if cl == "vsp" else "vmware-system-cert-manager"
+        cainjector_ns = "vmsp-platform" if cl == "vsp" else ("vmware-system-cert-manager" if cl == "supervisor" else "cert-manager")
         r.write(f"kubectl rollout restart deployment/cert-manager-cainjector -n {cainjector_ns} 2>/dev/null || true",
                 f"rollout restart cert-manager-cainjector in {cainjector_ns}", tier="transient", timeout=30)
 
@@ -4304,6 +4512,14 @@ def chk_certs(r, ctx):
         return [warn("certs", "cert-manager Certificates: readable",
                      "no Certificate CRDs or kubectl failed", cluster=cl)]
 
+    if "_secret_cache" not in ctx or not ctx["_secret_cache"]:
+        sec_bulk = r.read_json("kubectl get secrets -A -o json 2>/dev/null", 45) or {}
+        ctx["_secret_cache"] = {
+            (s.get("metadata", {}).get("namespace", ""), s.get("metadata", {}).get("name", "")): s.get("data", {})
+            for s in sec_bulk.get("items", [])
+            if s.get("metadata", {}).get("name")
+        }
+
     items = data.get("items", [])
     healthy = 0
     needs_renewal = False
@@ -4317,32 +4533,71 @@ def chk_certs(r, ctx):
         days = _days_until(not_after)
         label = f"{ns}/{name}: Ready and valid >{CERT_WARN_DAYS}d"
 
-        # Check backing secret if days is None or if on supervisor cluster
-        if secret_name and (days is None or cl == "supervisor"):
-            rc_sec, sec_raw = r.read(f"kubectl get secret {secret_name} -n {ns} -o json 2>/dev/null", 15)
-            if rc_sec != 0 or not (sec_raw or "").strip():
-                days = -1
-                conds["Ready"] = "False"
-            else:
-                try:
-                    sec_json = json.loads(sec_raw)
-                    leaf_crt_b64 = sec_json.get("data", {}).get("tls.crt", "")
-                    if not leaf_crt_b64:
+        is_ca = bool(spec.get("isCA"))
+        iref = spec.get("issuerRef", {})
+        ikind = iref.get("kind") or "Issuer"
+        iname = iref.get("name", "")
+        ca_invalid = False
+
+        # Check backing secret and CA validity across all clusters
+        if secret_name:
+            sec_key = (ns, secret_name)
+            sec_data = ctx.setdefault("_secret_cache", {}).get(sec_key)
+            if sec_data is None:
+                rc_sec, sec_raw = r.read(f"kubectl get secret {secret_name} -n {ns} -o json 2>/dev/null", 15)
+                if rc_sec != 0 or not (sec_raw or "").strip():
+                    days = -1
+                    conds["Ready"] = "False"
+                    sec_data = {}
+                else:
+                    try:
+                        sec_json = json.loads(sec_raw)
+                        sec_data = sec_json.get("data", {})
+                        ctx["_secret_cache"][sec_key] = sec_data
+                    except Exception:
                         days = -1
                         conds["Ready"] = "False"
-                    elif days is None:
+                        sec_data = {}
+
+            if sec_data:
+                leaf_crt_b64 = sec_data.get("tls.crt", "")
+                if not leaf_crt_b64:
+                    days = -1
+                    conds["Ready"] = "False"
+                else:
+                    if days is None:
                         rc_dt, exp_raw = r.read(f"echo '{(leaf_crt_b64 or '').strip()}' | base64 -d | openssl x509 -noout -enddate 2>/dev/null", 15)
                         exp_val = (exp_raw or "").partition("=")[2].strip()
                         exp_ts = _parse_openssl_date(exp_val)
                         if exp_ts:
                             days = int((exp_ts - datetime.now(timezone.utc).timestamp()) / 86400)
-                except Exception:
-                    pass
+
+                    # Cryptographic signature verification against signing CA or self-signature
+                    if not is_ca:
+                        ca_pem = _get_issuer_ca_pem(r, ctx, ikind, iname, ns)
+                        if ca_pem == "__self_signed__":
+                            leaf_pem = base64.b64decode(leaf_crt_b64).decode("utf-8", errors="ignore")
+                            if not _verify_cert_signed_by_ca(leaf_pem, leaf_pem):
+                                ca_invalid = True
+                                days = 0
+                                conds["Ready"] = "False"
+                        elif ca_pem:
+                            leaf_pem = base64.b64decode(leaf_crt_b64).decode("utf-8", errors="ignore")
+                            if not _verify_cert_signed_by_ca(leaf_pem, ca_pem):
+                                ca_invalid = True
+                                days = 0
+                                conds["Ready"] = "False"
+        elif not secret_name:
+            days = -1
+            conds["Ready"] = "False"
 
         if days is not None and days < ctx["threshold_days"]:
             needs_renewal = True
 
-        if conds.get("Ready") != "True":
+        if ca_invalid:
+            out.append(fail("certs.ca", label, "INVALID (signed by non-current CA) ⚠", cluster=cl,
+                            residual_days=0))
+        elif conds.get("Ready") != "True":
             out.append(fail("certs.ready", label, "Ready=False (or backing secret missing)", cluster=cl,
                             residual_days=days))
         elif days is None:
@@ -4357,26 +4612,13 @@ def chk_certs(r, ctx):
             healthy += 1
             if ctx["verbose"]:
                 row_verbose(f"  {ns}/{name}: {days}d remaining")
+            if r.mode == "report":
+                out.append(ok("certs.item",
+                              f"{ns}/{name}: Ready",
+                              f"expires in {days}d", cluster=cl, residual_days=days))
 
     if healthy:
-        if r.mode == "report":
-            # report is the diagnostic view: emit a row PER certificate, matching
-            # vsp-health.py, which lists each one. This is most of why a report
-            # shows many more checks than a preflight - it is per-item detail, not
-            # extra coverage.
-            for item in items:
-                conds = {c["type"]: c["status"]
-                         for c in item.get("status", {}).get("conditions", [])}
-                if conds.get("Ready") != "True":
-                    continue
-                days = _days_until(item.get("status", {}).get("notAfter", ""))
-                if days is None or days < CERT_WARN_DAYS:
-                    continue
-                out.append(ok("certs.item",
-                              f"{item['metadata']['namespace']}/"
-                              f"{item['metadata']['name']}: Ready",
-                              f"expires in {days}d", cluster=cl, residual_days=days))
-        else:
+        if r.mode != "report":
             # preflight/tune/remediate want a verdict, so collapse the healthy bulk
             # rather than inflating the denominator (auto-health.py:776 does this).
             out.append(ok("certs.bulk",
@@ -5741,8 +5983,294 @@ def chk_kyverno(r, ctx):
     return out
 
 
+def _test_vcenter_auth(vc_host, user_upn, password):
+    """Test live authentication against vCenter cis/session REST API."""
+    try:
+        url = f"https://{vc_host}/rest/com/vmware/cis/session"
+        req = urllib.request.Request(url, method="POST")
+        creds = base64.b64encode(f"{user_upn}:{password}".encode()).decode()
+        req.add_header("Authorization", f"Basic {creds}")
+        ctx_ssl = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, context=ctx_ssl, timeout=5) as resp:
+            return resp.status == 200, resp.status
+    except urllib.error.HTTPError as e:
+        return False, e.code
+    except Exception as e:
+        return False, str(e)
+
+
+def _harden_vcenter_sso_service_accounts(vc_host, sso_domain, admin_pw):
+    """Audit all service accounts on vCenter and enforce password-never-expires."""
+    vc = VCenterTransport(vc_host, admin_pw)
+    script = f'''
+for acct in $(/usr/lib/vmware-vmafd/bin/dir-cli svcaccount list --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} 2>/dev/null | awk -F'. ' '/^[0-9]+\\./ {{print $2}}' | grep -E '^(svc-|wcp-|nsxt_)'); do
+    res=$(/usr/lib/vmware-vmafd/bin/dir-cli user find-by-name --account "$acct" --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} --level 2 2>/dev/null)
+    if echo "$res" | grep -q 'Password never expires: FALSE'; then
+        /usr/lib/vmware-vmafd/bin/dir-cli user modify --account "$acct" --password-never-expires --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} >/dev/null 2>&1
+        echo "MODIFIED:$acct"
+    elif echo "$res" | grep -q 'Password expired: TRUE'; then
+        echo "EXPIRED:$acct"
+    else
+        echo "OK:$acct"
+    fi
+done
+'''
+    rc, out = vc.exec(script, timeout=60)
+    modified, expired, ok_accts = [], [], []
+    if out:
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("MODIFIED:"):
+                modified.append(line.split(":", 1)[1].strip())
+            elif line.startswith("EXPIRED:"):
+                expired.append(line.split(":", 1)[1].strip())
+            elif line.startswith("OK:"):
+                ok_accts.append(line.split(":", 1)[1].strip())
+    return modified, expired, ok_accts
+
+
+def _chk_vcenter_sso_service_accounts(r, ctx):
+    """Audit and remediate vCenter SSO service account credentials and K8s secrets."""
+    out = []
+    cl = r.cluster
+    site_suffix, subnet = resolve_site_config(ctx)
+    admin_pw = get_password()
+    mgmt_vc = f"vc-mgmt-a.{site_suffix}"
+    wld_vc = f"vc-wld01-a.{site_suffix}"
+
+    targets = []
+    # (ns, secret_name, user_key, pass_key, default_vc_host, default_domain, label, rollout_dep, restart_csi)
+    if cl == "vsp":
+        targets = [
+            ("vcf-sddc-lcm", "vcf-iam-vcenter-admin", "clientId", "clientSecret", mgmt_vc, "vsphere.local", "VSP vCenter IAM (SDDC LCM)", ("vcf-sddc-lcm", "vcf-sddc-build-service-sddcbuild"), False),
+            ("vmsp-platform", "vsp-01a-vcenter-admin-secret", "vCenterUsername", "vCenterPassword", mgmt_vc, "vsphere.local", "VSP vCenter Admin secret", None, False),
+            ("vmsp-platform", "vsp-01a-vcenter-main-secret", "vCenterUsername", "vCenterPassword", mgmt_vc, "vsphere.local", "VSP vCenter Main secret", None, False),
+            ("vmsp-platform", "vsp-01a-vsphere-secret", "username", "password", mgmt_vc, "vsphere.local", "VSP vSphere secret", None, False),
+            ("kube-system", "vsphere-config-secret", "csi-vsphere.conf", "csi-vsphere.conf", mgmt_vc, "vsphere.local", "VSP CSI controller secret", None, True),
+        ]
+    elif cl == "vcfa":
+        targets = [
+            ("kube-system", "vsphere-config-secret", "csi-vsphere.conf", "csi-vsphere.conf", mgmt_vc, "vsphere.local", "VCFA CSI controller secret", None, True),
+            ("vmsp-platform", "vcenter-main-secret", "vCenterUsername", "vCenterPassword", mgmt_vc, "vsphere.local", "VCFA vCenter Main secret", None, False),
+            ("vmsp-platform", "vsp-01a-vcenter-main-secret", "vCenterUsername", "vCenterPassword", mgmt_vc, "vsphere.local", "VCFA vCenter Main secret", None, False),
+        ]
+    elif cl == "ssp":
+        rc_sec, raw_sec = r.read("kubectl -n ssp get secrets -o json 2>/dev/null", 30)
+        if rc_sec == 0 and raw_sec and "{" in raw_sec:
+            try:
+                sec_data = json.loads(raw_sec[raw_sec.find("{"):])
+                for sitem in sec_data.get("items", []):
+                    sname = sitem.get("metadata", {}).get("name", "")
+                    skeys = sitem.get("data", {}).keys()
+                    if "username" in skeys and "password" in skeys:
+                        targets.append(("ssp", sname, "username", "password", mgmt_vc, "vsphere.local", f"SSP {sname} secret", None, False))
+            except Exception:
+                pass
+
+    seen_accounts = set()
+    for ns, sname, ukey, pkey, def_host, def_domain, slabel, restart_dep, restart_csi in targets:
+        rc, out_raw = r.read(f"kubectl get secret {sname} -n {ns} -o json 2>/dev/null", 30)
+        if rc != 0 or not out_raw or "{" not in out_raw:
+            continue
+        try:
+            s_obj = json.loads(out_raw[out_raw.find("{"):])
+            data = s_obj.get("data", {})
+        except Exception:
+            continue
+
+        raw_user = ""
+        raw_pass = ""
+        vc_target = def_host
+
+        if ukey == "csi-vsphere.conf":
+            b64_c = data.get("csi-vsphere.conf") or ""
+            if b64_c:
+                try:
+                    c_text = base64.b64decode(b64_c).decode("utf-8", errors="ignore")
+                    for line in c_text.splitlines():
+                        line = line.strip()
+                        if line.startswith("user") and "=" in line:
+                            raw_user = line.split("=", 1)[1].strip().strip('"')
+                        elif line.startswith("password") and "=" in line:
+                            raw_pass = line.split("=", 1)[1].strip().strip('"')
+                        elif line.startswith("[VirtualCenter") and '"' in line:
+                            vc_target = line.split('"')[1]
+                except Exception:
+                    pass
+            rc_cs, cs_raw = r.read(f"kubectl get secret vsphere-cloud-secret -n {ns} -o json 2>/dev/null", 30)
+            if rc_cs == 0 and cs_raw and "{" in cs_raw:
+                try:
+                    cs_obj = json.loads(cs_raw[cs_raw.find("{"):])
+                    for k, v in cs_obj.get("data", {}).items():
+                        if "password" in k.lower():
+                            cand = base64.b64decode(v).decode("utf-8", errors="ignore")
+                            if cand:
+                                raw_pass = cand
+                except Exception:
+                    pass
+        else:
+            u_b64 = data.get(ukey, "")
+            p_b64 = data.get(pkey, "")
+            if u_b64 and p_b64:
+                try:
+                    raw_user = base64.b64decode(u_b64).decode("utf-8", errors="ignore")
+                    raw_pass = base64.b64decode(p_b64).decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+
+        if not raw_user or not raw_pass:
+            continue
+
+        acct = raw_user.split("@")[0]
+        domain = raw_user.split("@")[1] if "@" in raw_user else def_domain
+        user_upn = f"{acct}@{domain}"
+        if (vc_target, domain, acct) in seen_accounts:
+            continue
+        seen_accounts.add((vc_target, domain, acct))
+
+        row_label = f"{slabel} ({acct}@{domain} on {vc_target})"
+        auth_ok, code = _test_vcenter_auth(vc_target, user_upn, raw_pass)
+
+        vc_trans = VCenterTransport(vc_target, admin_pw)
+        rc_f, f_out = vc_trans.exec(
+            f"/usr/lib/vmware-vmafd/bin/dir-cli user find-by-name --account {acct} "
+            f"--login administrator@{domain} --password {shlex.quote(admin_pw)} --level 2", 30)
+        sso_info = f_out or ""
+        is_expired = "Password expired: TRUE" in sso_info
+        never_expires = "Password never expires: TRUE" in sso_info
+
+        if auth_ok and never_expires and not is_expired:
+            out.append(ok("password.sso", row_label, "authenticated (never expires)", cluster=cl))
+            continue
+
+        reasons = []
+        if not auth_ok: reasons.append(f"auth failed (HTTP {code})")
+        if is_expired: reasons.append("SSO password expired")
+        if not never_expires: reasons.append("password-never-expires not set")
+
+        row = fail("password.sso", row_label, ", ".join(reasons), cluster=cl)
+        if may_act(r, "password") or may_act(r, "edge"):
+            if r.dry_run:
+                row.action = f"would realign password via dir-cli on {vc_target} and set never-expires"
+            else:
+                actions = []
+                if not auth_ok or is_expired:
+                    vc_trans.exec(
+                        f"/usr/lib/vmware-vmafd/bin/dir-cli password reset --account {acct} "
+                        f"--new {shlex.quote(raw_pass)} --login administrator@{domain} "
+                        f"--password {shlex.quote(admin_pw)}", 45)
+                    actions.append("password reset")
+
+                if not never_expires or is_expired:
+                    vc_trans.exec(
+                        f"/usr/lib/vmware-vmafd/bin/dir-cli user modify --account {acct} "
+                        f"--password-never-expires --account-unlocked --login administrator@{domain} "
+                        f"--password {shlex.quote(admin_pw)}", 30)
+                    actions.append("password-never-expires set")
+
+                if restart_dep and (not auth_ok or is_expired):
+                    r.write(f"kubectl rollout restart deployment/{restart_dep[1]} -n {restart_dep[0]}",
+                            f"restart {restart_dep[1]} to reload vCenter credentials", tier="transient", timeout=60)
+                    actions.append(f"restarted {restart_dep[1]}")
+
+                if restart_csi and (not auth_ok or is_expired):
+                    r.write("kubectl delete lease external-attacher-leader-csi-vsphere-vmware-com "
+                            "external-resizer-csi-vsphere-vmware-com -n kube-system 2>/dev/null || true",
+                            "clear stale CSI leader election leases", tier="transient", timeout=30)
+                    r.write(f"kubectl delete pod -n {ns} -l app=vsphere-csi-controller --grace-period=0 --force 2>/dev/null; "
+                            f"kubectl delete pod -n {ns} -l app=vsphere-csi-node --grace-period=0 --force 2>/dev/null",
+                            "restart CSI controller and node pods to reload credentials", tier="transient", timeout=60)
+                    actions.append("restarted CSI pods")
+
+                row.state = "warn"
+                row.detail = f"remediated ({', '.join(actions)})"
+                row.action = f"realigned and hardened on {vc_target}"
+        out.append(row)
+
+    # Universal hardening across vCenters
+    for target_vc, target_dom in [(mgmt_vc, "vsphere.local"), (wld_vc, "wld.sso")]:
+        mod, exp, oks = _harden_vcenter_sso_service_accounts(target_vc, target_dom, admin_pw)
+        vlabel = f"{target_vc} ({target_dom}) service accounts: password-never-expires enforced"
+        if exp:
+            out.append(warn("password.sso_audit", vlabel, f"{len(oks)} active; {len(exp)} orphaned account(s) expired: {', '.join(exp[:3])}", cluster=cl))
+        elif mod:
+            out.append(ok("password.sso_audit", vlabel, f"hardened {len(mod)} account(s); {len(oks)} up-to-date", cluster=cl))
+        else:
+            out.append(ok("password.sso_audit", vlabel, f"all {len(oks)} accounts up-to-date (never expires)", cluster=cl))
+
+    return out
+
+
+def _chk_supervisor_vcenter_service_accounts(r, ctx):
+    """Inspect Supervisor CSI secret and harden WCP/Supervisor service accounts on vCenter."""
+    out = []
+    cl = r.cluster
+    vc = ctx.get("vcenter")
+    site_suffix, subnet = resolve_site_config(ctx)
+    admin_pw = get_password()
+    target_vc = vc or f"vc-wld01-a.{site_suffix}"
+    domain = "wld.sso" if "wld" in target_vc else "vsphere.local"
+
+    # 1. Universal hardening of wcp-* and svc-* service accounts on target vCenter
+    mod, exp, oks = _harden_vcenter_sso_service_accounts(target_vc, domain, admin_pw)
+    vlabel = f"{target_vc} ({domain}) WCP service accounts: password-never-expires enforced"
+    if exp:
+        out.append(warn("services.sso_audit", vlabel, f"{len(oks)} active; {len(exp)} expired account(s): {', '.join(exp[:3])}", cluster=cl))
+    elif mod:
+        out.append(ok("services.sso_audit", vlabel, f"hardened {len(mod)} account(s); {len(oks)} up-to-date", cluster=cl))
+    else:
+        out.append(ok("services.sso_audit", vlabel, f"all {len(oks)} accounts up-to-date (never expires)", cluster=cl))
+
+    # 2. Inspect vmware-system-csi/vsphere-config-secret on the Supervisor control plane
+    rc, raw_conf = r.read("kubectl get secret vsphere-config-secret -n vmware-system-csi -o jsonpath='{.data.vsphere-cloud-provider\\.conf}' 2>/dev/null", 30)
+    if rc == 0 and raw_conf and raw_conf.strip():
+        try:
+            c_text = base64.b64decode(raw_conf.strip()).decode("utf-8", errors="ignore")
+            csi_user = None
+            csi_pass = None
+            for line in c_text.splitlines():
+                line = line.strip()
+                if line.startswith("user") and "=" in line:
+                    csi_user = line.split("=", 1)[1].strip().strip('"')
+                elif line.startswith("password") and "=" in line:
+                    csi_pass = line.split("=", 1)[1].strip().strip('"')
+
+            if csi_user and csi_pass:
+                acct = csi_user.split("@")[0]
+                dom = csi_user.split("@")[1] if "@" in csi_user else domain
+                csi_label = f"Supervisor CSI secret ({acct}@{dom} on {target_vc})"
+                auth_ok, code = _test_vcenter_auth(target_vc, csi_user, csi_pass)
+                if auth_ok:
+                    out.append(ok("services.csi_auth", csi_label, "authenticated (never expires)", cluster=cl))
+                else:
+                    row = fail("services.csi_auth", csi_label, f"authentication failed (HTTP {code})", cluster=cl)
+                    if may_act(r, "services"):
+                        if r.dry_run:
+                            row.action = f"would realign {acct} password via dir-cli on {target_vc} and set never-expires"
+                        else:
+                            vc_trans = VCenterTransport(target_vc, admin_pw)
+                            vc_trans.exec(
+                                f"/usr/lib/vmware-vmafd/bin/dir-cli password reset --account {acct} "
+                                f"--new {shlex.quote(csi_pass)} --login administrator@{dom} "
+                                f"--password {shlex.quote(admin_pw)}", 45)
+                            vc_trans.exec(
+                                f"/usr/lib/vmware-vmafd/bin/dir-cli user modify --account {acct} "
+                                f"--password-never-expires --account-unlocked --login administrator@{dom} "
+                                f"--password {shlex.quote(admin_pw)}", 30)
+                            r.write("kubectl delete pod -n vmware-system-csi -l app=vsphere-csi-controller --grace-period=0 --force 2>/dev/null || true",
+                                    "restart Supervisor CSI controller pod", tier="transient", timeout=60)
+                            row.state = "warn"
+                            row.detail = f"realigned and hardened {acct} on {target_vc}"
+                            row.action = "password reset + never-expires set; restarted CSI pod"
+                    out.append(row)
+        except Exception:
+            pass
+
+    return out
+
+
 def chk_password(r, ctx):
-    """Node account password expiry.
+    """Node account password expiry and vCenter SSO service account password validation.
 
     `never` is healthy. Otherwise anything inside 60 days is drift. The repair sets
     -M 730 AND -d today: without refreshing the last-change date the expiry is
@@ -5781,58 +6309,63 @@ def chk_password(r, ctx):
                     if not r.dry_run:
                         res_row.state, res_row.detail = "warn", "extended password aging to max"
                 out.append(res_row)
+        out.extend(_chk_vcenter_sso_service_accounts(r, ctx))
         return out
+
     data = ctx.get("nodes")
     if not data:
-        return [warn("password", "node password expiry: within policy",
-                     "node list unavailable", cluster=cl)]
-    ips = [a["address"] for item in data.get("items", [])
-           for a in item.get("status", {}).get("addresses", [])
-           if a.get("type") == "InternalIP"]
+        out.append(warn("password", "node password expiry: within policy",
+                        "node list unavailable", cluster=cl))
+    else:
+        ips = [a["address"] for item in data.get("items", [])
+               for a in item.get("status", {}).get("addresses", [])
+               if a.get("type") == "InternalIP"]
 
-    for ip in ips:
-        for user in PASSWORD_USERS:
-            # Anchor to the start of the line and stop at the first match.
-            # `grep -i 'Password expires'` also matches "Number of days of warning
-            # before password expires : 7", so a loose match plus last-line
-            # selection yields "7" and every node reads as unparseable.
-            rc, res = r.read_on(
-                ip, f"chage -l {user} 2>/dev/null | "
-                    "awk -F: '/^Password expires/{print $2; exit}'", 45)
-            val = (res or "").strip().splitlines()
-            val = val[-1].strip() if val else ""
-            label = f"{ip} {user}: password not expiring within {PASSWORD_WARN_DAYS}d"
-            if not val:
-                out.append(warn("password", label, "not readable", cluster=cl))
-                continue
-            if "never" in val.lower():
-                out.append(ok("password", label, "never", cluster=cl))
-                continue
-            days = None
-            try:
-                exp = datetime.strptime(val.strip(), "%b %d, %Y")
-                days = (exp - datetime.now()).days
-            except ValueError:
-                pass
-            if days is None:
-                out.append(warn("password", label, f"unparsed: {val}", cluster=cl))
-            elif days > PASSWORD_WARN_DAYS:
-                out.append(ok("password", label, f"{days}d", cluster=cl,
-                              residual_days=days))
-            else:
-                res_row = fail("password", label, f"{days}d remaining", cluster=cl,
-                               residual_days=days)
-                if may_act(r, "password"):
-                    r.write_on_node(
-                        ip, f"chage -d $(date +%Y-%m-%d) -M {PASSWORD_MAX_DAYS} {user}",
-                        f"reset {user} last-change date and set -M "
-                        f"{PASSWORD_MAX_DAYS} on {ip}",
-                        tier="persistent", timeout=60)
-                    res_row.action = f"chage -M {PASSWORD_MAX_DAYS}"
-                    if not r.dry_run:
-                        res_row.state = "warn"
-                        res_row.detail = f"was {days}d; extended"
-                out.append(res_row)
+        for ip in ips:
+            for user in PASSWORD_USERS:
+                # Anchor to the start of the line and stop at the first match.
+                # `grep -i 'Password expires'` also matches "Number of days of warning
+                # before password expires : 7", so a loose match plus last-line
+                # selection yields "7" and every node reads as unparseable.
+                rc, res = r.read_on(
+                    ip, f"chage -l {user} 2>/dev/null | "
+                        "awk -F: '/^Password expires/{print $2; exit}'", 45)
+                val = (res or "").strip().splitlines()
+                val = val[-1].strip() if val else ""
+                label = f"{ip} {user}: password not expiring within {PASSWORD_WARN_DAYS}d"
+                if not val:
+                    out.append(warn("password", label, "not readable", cluster=cl))
+                    continue
+                if "never" in val.lower():
+                    out.append(ok("password", label, "never", cluster=cl))
+                    continue
+                days = None
+                try:
+                    exp = datetime.strptime(val.strip(), "%b %d, %Y")
+                    days = (exp - datetime.now()).days
+                except ValueError:
+                    pass
+                if days is None:
+                    out.append(warn("password", label, f"unparsed: {val}", cluster=cl))
+                elif days > PASSWORD_WARN_DAYS:
+                    out.append(ok("password", label, f"{days}d", cluster=cl,
+                                  residual_days=days))
+                else:
+                    res_row = fail("password", label, f"{days}d remaining", cluster=cl,
+                                   residual_days=days)
+                    if may_act(r, "password"):
+                        r.write_on_node(
+                            ip, f"chage -d $(date +%Y-%m-%d) -M {PASSWORD_MAX_DAYS} {user}",
+                            f"reset {user} last-change date and set -M "
+                            f"{PASSWORD_MAX_DAYS} on {ip}",
+                            tier="persistent", timeout=60)
+                        res_row.action = f"chage -M {PASSWORD_MAX_DAYS}"
+                        if not r.dry_run:
+                            res_row.state = "warn"
+                            res_row.detail = f"was {days}d; extended"
+                    out.append(res_row)
+
+    out.extend(_chk_vcenter_sso_service_accounts(r, ctx))
     return out
 
 
@@ -6651,22 +7184,105 @@ def chk_sizing(r, ctx):
 # it lives behind --mode remediate rather than something --mode tune's
 # template-prep pass would ever apply on its own.
 FOOTPRINT_NAMESPACE = "vmsp-platform"
-FOOTPRINT_REQUESTS = [
-    # (kind, namespace, name, container, cpu, memory) - remediate-lab.sh:2708-2719
-    ("statefulset", "vodap", "chi-vcf-obs-vcf-obs-0-0", "clickhouse", "250m", "1Gi"),
-    ("statefulset", "ops-logs", "log-store", "opensearch", "250m", "8Gi"),
-    ("statefulset", "ops-logs", "log-processor", "vcf-ops-logs", "250m", "2Gi"),
-    ("deploy", "vmsp-platform", "ops-logs-gateway", "envoy", "200m", "256Mi"),
-    ("deploy", "vodap", "vcf-obs-esx-collector-service",
-     "vcf-obs-esx-collector-service", "200m", "1536Mi"),
-    ("deploy", "vodap", "vcf-obs-vc-collector-service",
-     "vcf-obs-vc-collector-service", "200m", "1Gi"),
-    ("deploy", "vodap", "vcf-obs-data-query-service",
-     "vcf-obs-data-query-service", "200m", "1Gi"),
-    ("deploy", "vodap", "vcf-obs-collector-controller-service",
-     "vcf-obs-collector-controller-service", "200m", "1Gi"),
-    ("deploy", "vodap", "vcf-obs-netops-collector-service",
-     "vcf-obs-netops-collector-service", "200m", "1Gi"),
+VSP_FOOTPRINT_REQUESTS = [
+    # (kind, namespace, name, container, cpu, memory) - right-sized for nested/lab hardware density
+    # ── Observability Data Platform (vodap) ───────────────────────────────────
+    ("deploy", "vodap", "vcf-obs-esx-collector-service-standard", "vcf-obs-esx-collector-service-standard", "50m", "512Mi"),
+    ("deploy", "vodap", "vcf-obs-esx-collector-service-verbose", "vcf-obs-esx-collector-service-verbose", "50m", "512Mi"),
+    ("deploy", "vodap", "vcf-obs-esx-collector-service-esxitop", "vcf-obs-esx-collector-service-esxitop", "50m", "1Gi"),
+    ("deploy", "vodap", "vcf-obs-vc-collector-service-standard", "vcf-obs-vc-collector-service-standard", "50m", "512Mi"),
+    ("deploy", "vodap", "vcf-obs-vc-collector-service-verbose", "vcf-obs-vc-collector-service-verbose", "50m", "512Mi"),
+    ("deploy", "vodap", "vcf-obs-esx-collector-service", "vcf-obs-esx-collector-service", "50m", "640Mi"),
+    ("deploy", "vodap", "vcf-obs-vc-collector-service", "vcf-obs-vc-collector-service", "50m", "1Gi"),
+    ("deploy", "vodap", "vcf-obs-data-query-service", "vcf-obs-data-query-service", "100m", "640Mi"),
+    ("deploy", "vodap", "vcf-obs-collector-controller-service", "vcf-obs-collector-controller-service", "50m", "1Gi"),
+    ("deploy", "vodap", "vcf-obs-netops-collector-service", "vcf-obs-netops-collector-service", "100m", "576Mi"),
+    ("statefulset", "vodap", "chi-vcf-obs-vcf-obs-0-0", "clickhouse", "150m", "512Mi"),
+    ("statefulset", "vodap", "chi-vcf-obs-vcf-obs-0-0", "clickhouse-log", "25m", "32Mi"),
+    ("statefulset", "vodap", "chk-vcf-obs-keeper-keeper-0-0", "clickhouse-keeper", "50m", "64Mi"),
+    ("statefulset", "vodap", "chk-vcf-obs-keeper-keeper-0-1", "clickhouse-keeper", "50m", "64Mi"),
+    ("statefulset", "vodap", "chk-vcf-obs-keeper-keeper-0-2", "clickhouse-keeper", "50m", "64Mi"),
+
+    # ── Operations Logs (ops-logs) ───────────────────────────────────────────
+    ("statefulset", "ops-logs", "log-store", "opensearch", "250m", "7Gi"),
+    ("statefulset", "ops-logs", "log-processor", "vcf-ops-logs", "200m", "2Gi"),
+    ("statefulset", "ops-logs", "log-processor", "ui-server", "50m", "128Mi"),
+
+    # ── Salt & Salt-RAAS (salt, salt-raas) ───────────────────────────────────
+    ("deploy", "salt-raas", "raas", "raas", "150m", "832Mi"),
+    ("deploy", "salt-raas", "redis", "redis", "50m", "64Mi"),
+    ("deploy", "salt", "salt-master", "salt-master", "200m", "896Mi"),
+    ("deploy", "salt", "salt-minion", "salt-minion", "50m", "96Mi"),
+
+    # ── Telemetry (telemetry) ─────────────────────────────────────────────────
+    ("deploy", "telemetry", "telemetry-acceptor", "telemetry-acceptor", "50m", "512Mi"),
+
+    # ── VCF Fleet Depot (vcf-fleet-depot) ─────────────────────────────────────
+    ("deploy", "vcf-fleet-depot", "depot-service", "download-service", "50m", "288Mi"),
+    ("deploy", "vcf-fleet-depot", "depot-service", "file-server", "50m", "288Mi"),
+    ("deploy", "vcf-fleet-depot", "depot-service", "proxy-forwarder", "50m", "160Mi"),
+    ("deploy", "vcf-fleet-depot", "distribution-service", "distribution-service", "50m", "64Mi"),
+
+    # ── VCF Fleet LCM & SDDC LCM (vcf-fleet-lcm, vcf-sddc-lcm) ───────────────
+    ("deploy", "vcf-fleet-lcm", "vcf-fleet-upgrade-service-fleetupgrade", "fleetupgrade", "50m", "896Mi"),
+    ("deploy", "vcf-fleet-lcm", "vcf-fleet-build-service-fleetbuild", "fleetbuild", "100m", "896Mi"),
+    ("deploy", "vcf-sddc-lcm", "vcf-sddc-upgrade-service-sddcupgrade", "sddcupgrade", "75m", "896Mi"),
+    ("deploy", "vcf-sddc-lcm", "vcf-sddc-build-service-sddcbuild", "sddcbuild", "150m", "1024Mi"),
+
+    # ── VIDB External (vidb-external) ─────────────────────────────────────────
+    ("deploy", "vidb-external", "vidb-service", "vidb-service", "300m", "1536Mi"),
+
+    # ── VMSP Platform & Ingress Services (vmsp-platform) ──────────────────────
+    ("statefulset", "vmsp-platform", "zot-1", "zot", "50m", "384Mi"),
+    ("deploy", "vmsp-platform", "vmsp-gateway", "envoy", "50m", "256Mi"),
+    ("deploy", "vmsp-platform", "vmsp-gateway", "shutdown-manager", "25m", "32Mi"),
+    ("deploy", "vmsp-platform", "ops-logs-gateway", "envoy", "75m", "128Mi"),
+    ("deploy", "vmsp-platform", "ops-logs-gateway", "shutdown-manager", "25m", "32Mi"),
+    ("deploy", "vmsp-platform", "helm-controller", "manager", "50m", "128Mi"),
+    ("deploy", "vmsp-platform", "strimzi-cluster-operator", "strimzi-cluster-operator", "50m", "320Mi"),
+    ("deploy", "vmsp-platform", "synthetic-checker", "kube-rbac-proxy", "25m", "35Mi"),
+    ("deploy", "vmsp-platform", "synthetic-checker", "synthetic-checker", "50m", "96Mi"),
+    ("deploy", "vmsp-platform", "hooks-server-synthetic-checker", "kube-rbac-proxy", "25m", "35Mi"),
+    ("deploy", "vmsp-platform", "hooks-server-synthetic-checker", "synthetic-checker", "50m", "96Mi"),
+    ("deploy", "vmsp-platform", "support-bundle", "operator", "25m", "64Mi"),
+    ("deploy", "vmsp-platform", "support-bundle", "support-data-server", "50m", "64Mi"),
+    ("deploy", "vmsp-platform", "argo-workflows-workflow-controller", "controller", "50m", "96Mi"),
+    ("deploy", "vmsp-platform", "envoy-gateway", "envoy-gateway", "50m", "208Mi"),
+    ("deploy", "vmsp-platform", "vmsp-identity", "vmsp-identity", "50m", "64Mi"),
+    ("statefulset", "vmsp-platform", "prometheus-kube-prometheus-stack-prometheus", "prometheus", "150m", "832Mi"),
+    ("daemonset", "vmsp-platform", "logging-operator-filelogs-fluentbit", "fluent-bit", "50m", "32Mi"),
+    ("daemonset", "vmsp-platform", "logging-operator-fluentbit", "fluent-bit", "50m", "48Mi"),
+    ("daemonset", "vmsp-platform", "logging-operator-systemlogs-fluentbit", "fluent-bit", "50m", "32Mi"),
+
+    # ── VMSP Metrics Store (vmsp-metrics-store) ──────────────────────────────
+    ("deploy", "vmsp-metrics-store", "clickhouse-operator-altinity-clickhouse-operator", "altinity-clickhouse-operator", "50m", "72Mi"),
+    ("deploy", "vmsp-metrics-store", "clickhouse-operator-altinity-clickhouse-operator", "metrics-exporter", "50m", "72Mi"),
+    ("deploy", "vmsp-metrics-store", "vsp-metrics-store-operator", "vsp-metrics-store-operator", "50m", "112Mi"),
+
+    # ── Kyverno Policies (vmsp-policies) ──────────────────────────────────────
+    ("deploy", "vmsp-policies", "kyverno-admission-controller", "kyverno", "50m", "112Mi"),
+    ("deploy", "vmsp-policies", "kyverno-background-controller", "controller", "50m", "144Mi"),
+
+    # ── Kube System (kube-system) ─────────────────────────────────────────────
+    ("deploy", "kube-system", "coredns", "coredns", "50m", "32Mi"),
+    ("deploy", "kube-system", "vsphere-csi-controller", "csi-attacher", "25m", "65Mi"),
+    ("deploy", "kube-system", "vsphere-csi-controller", "csi-resizer", "25m", "65Mi"),
+    ("deploy", "kube-system", "vsphere-csi-controller", "vsphere-csi-controller", "25m", "65Mi"),
+    ("deploy", "kube-system", "vsphere-csi-controller", "liveness-probe", "25m", "54Mi"),
+    ("deploy", "kube-system", "vsphere-csi-controller", "vsphere-syncer", "25m", "65Mi"),
+    ("deploy", "kube-system", "vsphere-csi-controller", "csi-provisioner", "25m", "65Mi"),
+    ("daemonset", "kube-system", "vsphere-csi-node", "node-driver-registrar", "25m", "50Mi"),
+    ("daemonset", "kube-system", "vsphere-csi-node", "vsphere-csi-node", "25m", "50Mi"),
+    ("daemonset", "kube-system", "vsphere-csi-node", "liveness-probe", "25m", "50Mi"),
+]
+FOOTPRINT_REQUESTS = VSP_FOOTPRINT_REQUESTS
+
+VSP_FOOTPRINT_POSTGRES = [
+    # (namespace, name, postgres_cpu, postgres_mem, walg_cpu, walg_mem)
+    ("vcf-fleet-lcm", "vcf-fleet-lcm-db", "100m", "384Mi", "25m", "64Mi"),
+    ("vcf-sddc-lcm", "vcf-sddc-lcm-db", "100m", "384Mi", "25m", "64Mi"),
+    ("salt-raas", "pgdatabase", "100m", "384Mi", "25m", "64Mi"),
+    ("vidb-external", "vidb-postgres-instance", "100m", "384Mi", "25m", "64Mi"),
 ]
 FOOTPRINT_HA_DEPLOYS = [
     ("kube-system", "coredns"),
@@ -7009,25 +7625,59 @@ def chk_footprint(r, ctx):
     configured_namespaces = disc["namespaces"]
     configured_workload_keys = {(ns, name) for ns, _, name, _ in disc["workloads"]}
 
-    for kind, ns, name, container, cpu, mem in FOOTPRINT_REQUESTS:
+    wl_json = r.read_json("kubectl get deploy,sts,ds -A -o json 2>/dev/null", 45) or {}
+    items_by_key = {}
+    for item in wl_json.get("items", []) or []:
+        ikind = item.get("kind", "").lower()
+        ins = item.get("metadata", {}).get("namespace", "")
+        iname = item.get("metadata", {}).get("name", "")
+        items_by_key[(ikind, ins, iname)] = item
+        if ikind == "deployment":
+            items_by_key[("deploy", ins, iname)] = item
+        elif ikind == "daemonset":
+            items_by_key[("ds", ins, iname)] = item
+            items_by_key[("daemonset", ins, iname)] = item
+
+    for kind, ns, name, container, cpu, mem in VSP_FOOTPRINT_REQUESTS:
         # Platform namespaces (vmsp-platform, kube-system) are always checked.
         # For optional VCF component namespaces (e.g. vodap, ops-logs), ONLY check if installed on cluster
         if ns not in ("vmsp-platform", "kube-system") and ns not in configured_namespaces and (ns, name) not in configured_workload_keys:
             continue
         if name == "ops-logs-gateway" and "ops-logs" not in configured_namespaces and "ops-logs" not in disc.get("components", {}):
             continue
-        rc, cur = r.read(
-            f"kubectl get {kind} {name} -n {ns} -o "
-            f"jsonpath='{{.spec.template.spec.containers[?(@.name==\"{container}\")]"
-            f".resources.requests}}' 2>/dev/null", 30)
-        cur = (cur or "").strip()
+
+        item = items_by_key.get((kind.lower(), ns, name))
+        c_obj = None
+        if item:
+            containers = (item.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []) or [])
+            c_obj = next((c for c in containers if c.get("name") == container), None)
+
+        if c_obj:
+            reqs = c_obj.get("resources", {}).get("requests", {}) or {}
+            cur = json.dumps(reqs)
+            cur_cpu = str(reqs.get("cpu", ""))
+            cur_mem = str(reqs.get("memory", ""))
+        else:
+            rc, cur = r.read(
+                f"kubectl get {kind} {name} -n {ns} -o "
+                f"jsonpath='{{.spec.template.spec.containers[?(@.name==\"{container}\")]"
+                f".resources.requests}}' 2>/dev/null", 30)
+            cur = (cur or "").strip()
+            cur_cpu_m = re.search(r'"cpu":"([^"]+)"', cur.replace(" ", "")) if cur else None
+            cur_cpu = cur_cpu_m.group(1) if cur_cpu_m else ""
+            cur_mem_m = re.search(r'"memory":"([^"]+)"', cur.replace(" ", "")) if cur else None
+            cur_mem = cur_mem_m.group(1) if cur_mem_m else ""
+
         label = f"{ns}/{name} [{container}]: requests == cpu={cpu} mem={mem}"
-        if not cur:
+        if not cur or cur == "{}":
             out.append(warn("footprint.requests", label,
                             "object or container not found", cluster=cl))
             continue
-        squeezed = cur.replace(" ", "")
-        if f'"cpu":"{cpu}"' in squeezed and f'"memory":"{mem}"' in squeezed:
+
+        cpu_match = (not cpu) or (cur_cpu and _parse_cpu(cur_cpu) == _parse_cpu(cpu))
+        mem_match = (not mem) or (cur_mem and _parse_mem_mib(cur_mem) == _parse_mem_mib(mem))
+
+        if cpu_match and mem_match:
             out.append(ok("footprint.requests", label, "already at target", cluster=cl))
             continue
         res = fail("footprint.requests", label, f"currently {cur}", cluster=cl)
@@ -7038,6 +7688,13 @@ def chk_footprint(r, ctx):
                     f"'[{{\"op\":\"replace\",\"path\":\"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu\",\"value\":\"{cpu}\"}},{{\"op\":\"replace\",\"path\":\"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory\",\"value\":\"{mem}\"}}]'",
                     f"patch EnvoyProxy CR {name}-config requests -> cpu={cpu} mem={mem}",
                     tier="persistent", timeout=60)
+            elif name == "vmsp-gateway":
+                c_idx = "0" if container == "envoy" else "1"
+                r.write(
+                    f"kubectl patch envoyproxy vmsp-gateway-config -n {ns} --type=json -p "
+                    f"'[{{\"op\":\"replace\",\"path\":\"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/{c_idx}/resources/requests/cpu\",\"value\":\"{cpu}\"}},{{\"op\":\"replace\",\"path\":\"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/{c_idx}/resources/requests/memory\",\"value\":\"{mem}\"}}]'",
+                    f"patch EnvoyProxy CR vmsp-gateway-config container {container} requests -> cpu={cpu} mem={mem}",
+                    tier="persistent", timeout=60)
             r.write(
                 f"kubectl set resources {kind}/{name} -n {ns} --containers={container} "
                 f"--requests=cpu={cpu},memory={mem}",
@@ -7046,6 +7703,79 @@ def chk_footprint(r, ctx):
             res.action = f"requests -> cpu={cpu} mem={mem}"
             if not r.dry_run:
                 res.state, res.detail = "warn", f"was {cur}; set to target"
+        out.append(res)
+
+    pg_json = r.read_json("kubectl get postgresql -A -o json 2>/dev/null", 30) or {}
+    pg_by_key = {}
+    for pg in pg_json.get("items", []) or []:
+        ins = pg.get("metadata", {}).get("namespace", "")
+        iname = pg.get("metadata", {}).get("name", "")
+        pg_by_key[(ins, iname)] = pg
+
+    for ns, name, pg_cpu, pg_mem, walg_cpu, walg_mem in VSP_FOOTPRINT_POSTGRES:
+        if ns not in configured_namespaces and ns not in ("vmsp-platform", "kube-system"):
+            continue
+        pg = pg_by_key.get((ns, name))
+        label = f"postgresql {ns}/{name}: requests == postgres={pg_cpu}/{pg_mem} walg={walg_cpu}/{walg_mem}"
+        if not pg:
+            continue
+        spec = pg.get("spec", {}) or {}
+        cur_reqs = spec.get("resources", {}).get("requests", {}) or {}
+        cur_pg_cpu = str(cur_reqs.get("cpu", ""))
+        cur_pg_mem = str(cur_reqs.get("memory", ""))
+        sidecars = spec.get("sidecars", []) or []
+        walg_sc = next((sc for sc in sidecars if sc.get("name") == "walg"), None)
+        walg_reqs = (walg_sc.get("resources", {}).get("requests", {}) or {}) if walg_sc else {}
+        cur_walg_cpu = str(walg_reqs.get("cpu", ""))
+        cur_walg_mem = str(walg_reqs.get("memory", ""))
+
+        pg_cpu_match = (not pg_cpu) or (cur_pg_cpu and _parse_cpu(cur_pg_cpu) == _parse_cpu(pg_cpu))
+        pg_mem_match = (not pg_mem) or (cur_pg_mem and _parse_mem_mib(cur_pg_mem) == _parse_mem_mib(pg_mem))
+        walg_cpu_match = (not walg_cpu) or (cur_walg_cpu and _parse_cpu(cur_walg_cpu) == _parse_cpu(walg_cpu))
+        walg_mem_match = (not walg_mem) or (cur_walg_mem and _parse_mem_mib(cur_walg_mem) == _parse_mem_mib(walg_mem))
+
+        if pg_cpu_match and pg_mem_match and walg_cpu_match and walg_mem_match:
+            out.append(ok("footprint.postgres", label, "already at target", cluster=cl))
+            continue
+
+        detail = f"currently postgres=cpu:{cur_pg_cpu}/mem:{cur_pg_mem} walg=cpu:{cur_walg_cpu}/mem:{cur_walg_mem}"
+        res = fail("footprint.postgres", label, detail, cluster=cl)
+        if may_act(r, "footprint"):
+            new_sidecars = []
+            for sc in sidecars:
+                sc_copy = copy.deepcopy(sc)
+                if sc_copy.get("name") == "walg":
+                    sc_res = sc_copy.setdefault("resources", {})
+                    sc_res.setdefault("limits", {"cpu": "1000m", "memory": "768Mi"})
+                    sc_res["requests"] = {"cpu": walg_cpu, "memory": walg_mem}
+                new_sidecars.append(sc_copy)
+            patch_data = {
+                "spec": {
+                    "resources": {
+                        "requests": {"cpu": pg_cpu, "memory": pg_mem}
+                    },
+                    "sidecars": new_sidecars
+                }
+            }
+            patch_json_str = json.dumps(patch_data)
+            r.write(
+                f"kubectl patch postgresql {name} -n {ns} --type=merge -p '{patch_json_str}'",
+                f"patch postgresql {ns}/{name} requests -> postgres={pg_cpu}/{pg_mem} walg={walg_cpu}/{walg_mem}",
+                tier="persistent", timeout=60)
+            r.write(
+                f"kubectl set resources statefulset/{name} -n {ns} --containers=postgres "
+                f"--requests=cpu={pg_cpu},memory={pg_mem} 2>/dev/null || true",
+                f"right-size statefulset/{name} [postgres] requests -> cpu={pg_cpu} mem={pg_mem}",
+                tier="transient", timeout=30)
+            if walg_sc:
+                r.write(
+                    f"kubectl set resources statefulset/{name} -n {ns} --containers=walg "
+                    f"--requests=cpu={walg_cpu},memory={walg_mem} 2>/dev/null || true",
+                    f"right-size statefulset/{name} [walg] requests -> cpu={walg_cpu} mem={walg_mem}",
+                    tier="transient", timeout=30)
+            res.action = f"requests -> postgres={pg_cpu}/{pg_mem} walg={walg_cpu}/{walg_mem}"
+            if not r.dry_run:
+                res.state, res.detail = "warn", f"was {detail}; set to target"
         out.append(res)
 
     for ns, name in FOOTPRINT_HA_DEPLOYS:
@@ -7501,10 +8231,183 @@ def chk_gateway(r, ctx):
     return out
 
 
+def _remediate_vsphere_csi(r, ctx):
+    """Diagnose vsphere-csi-controller vCenter SSO login failures and realign via dir-cli.
+
+    Ported from vcfa-stabilizer.sh & vsp-health-monitor.py [KB 435491, KB 326114]:
+      1. Inspects vsphere-csi-controller pod in kube-system.
+      2. If failing with 'Cannot complete login due to an incorrect user name or password',
+         extracts the service account name and target password from vsphere-config-secret
+         and vsphere-cloud-secret.
+      3. Connects to the management vCenter via VCenterTransport:
+         - Resets SSO password to match the K8s secrets via dir-cli password reset.
+         - Hardens the account with --password-never-expires via dir-cli user modify.
+         - Unlocks the account if locked out.
+      4. Clears stale CSI leader election leases and force-restarts CSI controller/node pods.
+    """
+    out = []
+    cl = r.cluster
+    site_suffix, subnet = resolve_site_config(ctx)
+    vc_host = f"vc-mgmt-a.{site_suffix}"
+    admin_pw = get_password()
+
+    # 1. Check if CSI controller pod exists
+    rc, csi_pod = r.read(
+        "kubectl get pod -n kube-system -l app=vsphere-csi-controller "
+        "-o jsonpath='{.items[0].metadata.name}' 2>/dev/null", 30)
+    pod_name = (csi_pod or "").strip()
+    if not pod_name:
+        return out
+
+    # Check pod status and container readiness
+    rc_stat, stat_raw = r.read(
+        f"kubectl get pod {pod_name} -n kube-system -o jsonpath='"
+        f"{{.status.phase}} {{range .status.containerStatuses[*]}}{{.ready}} {{.state.waiting.reason}} {{end}}' 2>/dev/null", 30)
+    stat_text = (stat_raw or "").strip()
+
+    # Check logs for auth failure
+    rc_log, logs = r.read(
+        f"kubectl logs -n kube-system {pod_name} -c vsphere-csi-controller --tail=30 2>/dev/null", 30)
+    log_text = logs or ""
+    auth_failed = ("Cannot complete login due to an incorrect user name or password" in log_text or
+                   "ServerFaultCode: Cannot complete login" in log_text or
+                   "failed to login to vc" in log_text)
+    if not auth_failed:
+        rc_prev, prev_logs = r.read(
+            f"kubectl logs -n kube-system {pod_name} -c vsphere-csi-controller --previous --tail=30 2>/dev/null", 30)
+        prev_text = prev_logs or ""
+        if ("Cannot complete login due to an incorrect user name or password" in prev_text or
+            "ServerFaultCode: Cannot complete login" in prev_text or
+            "failed to login to vc" in prev_text):
+            auth_failed = True
+
+    # 2. Extract credentials from vsphere-config-secret & vsphere-cloud-secret
+    rc_conf, conf_b64 = r.read(
+        "kubectl get secret vsphere-config-secret -n kube-system "
+        "-o jsonpath='{.data.csi-vsphere\\.conf}' 2>/dev/null", 30)
+    csi_account = None
+    csi_conf_pass = None
+    if conf_b64 and conf_b64.strip():
+        try:
+            conf_text = base64.b64decode(conf_b64.strip()).decode('utf-8', errors='ignore')
+            for line in conf_text.splitlines():
+                line = line.strip()
+                if line.startswith("user") and "=" in line:
+                    csi_account = line.split("=", 1)[1].strip().strip('"').split("@")[0]
+                elif line.startswith("password") and "=" in line:
+                    csi_conf_pass = line.split("=", 1)[1].strip().strip('"')
+        except Exception:
+            pass
+
+    # Check vsphere-cloud-secret for the preferred password
+    rc_cloud, cloud_b64 = r.read(
+        f"kubectl get secret vsphere-cloud-secret -n kube-system "
+        f"-o jsonpath='{{.data.{vc_host}\\.password}}' 2>/dev/null", 30)
+    target_pass = csi_conf_pass
+    if cloud_b64 and cloud_b64.strip():
+        try:
+            cloud_pass = base64.b64decode(cloud_b64.strip()).decode('utf-8', errors='ignore')
+            if cloud_pass:
+                target_pass = cloud_pass
+        except Exception:
+            pass
+
+    label = "vSphere CSI controller: authenticated to vCenter"
+    if not csi_account or not target_pass:
+        if auth_failed or "CrashLoopBackOff" in stat_text or "Error" in stat_text:
+            out.append(fail("edge.csi", label,
+                            f"{pod_name} login failing, but service account credentials unparseable from secrets",
+                            cluster=cl))
+        else:
+            out.append(ok("edge.csi", label, f"{pod_name} healthy", cluster=cl))
+        return out
+
+    # 3. Check vCenter SSO account status via dir-cli
+    vc = VCenterTransport(vc_host, admin_pw)
+    find_cmd = (
+        f"/usr/lib/vmware-vmafd/bin/dir-cli user find-by-name --account {csi_account} "
+        f"--login administrator@vsphere.local --password {shlex.quote(admin_pw)} --level 2"
+    )
+    rc_find, sso_out = vc.exec(find_cmd, timeout=30)
+    sso_info = sso_out or ""
+
+    is_expired = "Password expired: TRUE" in sso_info
+    never_expires = "Password never expires: TRUE" in sso_info
+    is_locked = "Account locked: TRUE" in sso_info
+
+    needs_remediation = auth_failed or is_expired or is_locked or (not never_expires)
+
+    if not needs_remediation:
+        out.append(ok("edge.csi", label, f"{pod_name} healthy ({csi_account}@vsphere.local password never expires)", cluster=cl))
+        return out
+
+    reasons = []
+    if auth_failed:
+        reasons.append("CSI controller pod login failing")
+    if is_expired:
+        reasons.append("SSO password expired")
+    if is_locked:
+        reasons.append("SSO account locked")
+    if not never_expires:
+        reasons.append("SSO password-never-expires not set")
+    issue_desc = ", ".join(reasons)
+
+    res = fail("edge.csi", label,
+               f"{csi_account}@vsphere.local on {vc_host}: {issue_desc}",
+               cluster=cl)
+
+    if may_act(r, "edge"):
+        if r.dry_run:
+            res.action = f"would realign {csi_account} password via dir-cli on {vc_host}, set never-expires, and restart CSI pods"
+        else:
+            actions_taken = []
+            # A. Reset SSO password to match K8s secret if expired or failing login
+            if auth_failed or is_expired:
+                reset_cmd = (
+                    f"/usr/lib/vmware-vmafd/bin/dir-cli password reset --account {csi_account} "
+                    f"--new {shlex.quote(target_pass)} --login administrator@vsphere.local "
+                    f"--password {shlex.quote(admin_pw)}"
+                )
+                rc_reset, out_reset = vc.exec(reset_cmd, timeout=45)
+                actions_taken.append("password reset")
+
+            # B. Ensure password never expires and unlock account
+            modify_cmd = (
+                f"/usr/lib/vmware-vmafd/bin/dir-cli user modify --account {csi_account} "
+                f"--password-never-expires --account-unlocked --login administrator@vsphere.local "
+                f"--password {shlex.quote(admin_pw)}"
+            )
+            vc.exec(modify_cmd, timeout=30)
+            actions_taken.append("password-never-expires set")
+
+            # C. Clear stale CSI leader election leases [KB 435491]
+            r.write(
+                "kubectl delete lease external-attacher-leader-csi-vsphere-vmware-com "
+                "external-resizer-csi-vsphere-vmware-com -n kube-system 2>/dev/null || true",
+                "clear stale CSI leader election leases", tier="transient", timeout=30)
+
+            # D. Force-restart CSI controller and node pods if login failed or reset
+            if auth_failed or is_expired:
+                r.write(
+                    "kubectl delete pod -n kube-system -l app=vsphere-csi-controller --grace-period=0 --force 2>/dev/null; "
+                    "kubectl delete pod -n kube-system -l app=vsphere-csi-node --grace-period=0 --force 2>/dev/null",
+                    "restart CSI controller and node pods to reload credentials", tier="transient", timeout=60)
+                actions_taken.append("CSI pods restarted")
+
+            res.state = "warn"
+            res.detail = f"remediated {csi_account} on {vc_host} ({', '.join(actions_taken)})"
+            res.action = f"dir-cli reset/modify on {vc_host}; cleared stale leases & restarted CSI pods"
+
+    out.append(res)
+    return out
+
+
 def chk_edge(r, ctx):
     """Known edge cases with specific, documented signatures.
 
     Each of these was a real incident whose symptom pointed somewhere unhelpful:
+      * vSphere CSI controller credential drift & password expiry - login fails,
+        volumes cannot attach, registry/Argo deadlock.
       * support-bundle CronJob runaway - 30 GHz+ of CPU, UI unresponsive.
       * resource-manager self-dial gRPC deadlock - the pod is Running and its
         probe passes, but it never listens on :7710/:7777.
@@ -7517,6 +8420,10 @@ def chk_edge(r, ctx):
     """
     out = []
     cl = r.cluster
+
+    # 0. vSphere CSI controller credential drift & password expiry recovery [KB 435491, KB 326114]
+    if cl in ("vcfa", "vsp"):
+        out.extend(_remediate_vsphere_csi(r, ctx))
 
     rc, jobs = r.read(
         "kubectl -n vmsp-platform get jobs "
@@ -9091,6 +9998,8 @@ def chk_services(r, ctx):
                 res_row.state = "warn"
                 res_row.detail = f"was '{state}'; start issued"
         out.append(res_row)
+
+    out.extend(_chk_supervisor_vcenter_service_accounts(r, ctx))
     return out
 
 
@@ -9612,7 +10521,7 @@ KB="kubectl"
 log() { logger -t vcf-lab-keeper "$1"; }
 
 PROBE_TARGETS='
-vcf-fleet-depot deployment/depot-service download-service 10 {"spec":{"template":{"spec":{"containers":[{"name":"download-service","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"startupProbe":{"timeoutSeconds":10,"failureThreshold":60},"resources":{"limits":{"memory":"2Gi"},"requests":{"cpu":"300m","memory":"512Mi"}}},{"name":"file-server","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15}},{"name":"proxy-forwarder","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":15,"failureThreshold":8,"periodSeconds":15},"startupProbe":{"timeoutSeconds":10,"failureThreshold":60,"periodSeconds":10}}]}}}}
+vcf-fleet-depot deployment/depot-service download-service 10 {"spec":{"template":{"spec":{"containers":[{"name":"download-service","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"startupProbe":{"timeoutSeconds":10,"failureThreshold":60},"resources":{"limits":{"memory":"2Gi"},"requests":{"cpu":"50m","memory":"288Mi"}}},{"name":"file-server","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15}},{"name":"proxy-forwarder","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":15,"failureThreshold":8,"periodSeconds":15},"startupProbe":{"timeoutSeconds":10,"failureThreshold":60,"periodSeconds":10}}]}}}}
 vcf-fleet-lcm deployment/vcf-fleet-build-service-fleetbuild fleetbuild 15 {"spec":{"template":{"spec":{"containers":[{"name":"fleetbuild","livenessProbe":{"timeoutSeconds":15,"failureThreshold":8,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":15,"failureThreshold":8,"periodSeconds":15},"startupProbe":{"timeoutSeconds":10,"failureThreshold":60,"periodSeconds":10}}]}}}}
 vidb-external deployment/vidb-service vidb-service 10 {"spec":{"template":{"spec":{"containers":[{"name":"vidb-service","livenessProbe":{"timeoutSeconds":10,"failureThreshold":6,"periodSeconds":10}}]}}}}
 vcf-sddc-lcm deployment/vcf-sddc-build-service-sddcbuild sddcbuild 15 {"spec":{"template":{"spec":{"containers":[{"name":"sddcbuild","livenessProbe":{"timeoutSeconds":15,"failureThreshold":8,"periodSeconds":15},"readinessProbe":{"timeoutSeconds":15,"failureThreshold":8,"periodSeconds":15},"startupProbe":{"timeoutSeconds":10,"failureThreshold":60,"periodSeconds":10}}]}}}}
@@ -9674,10 +10583,19 @@ for dep in ndc-controller-manager vmsp-identity; do
 done
 
 LOGGW=$($KB -n vmsp-platform get deploy ops-logs-gateway -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}' 2>/dev/null)
-if [ -n "$LOGGW" ] && [ "$LOGGW" != "200m" ]; then
-    $KB patch envoyproxy ops-logs-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu","value":"200m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory","value":"256Mi"}]' >/dev/null 2>&1
-    $KB -n vmsp-platform set resources deploy/ops-logs-gateway -c envoy --requests=cpu=200m,memory=256Mi >/dev/null 2>&1 \
-        && log "drift corrected: ops-logs-gateway requests -> cpu=200m,mem=256Mi (was $LOGGW)"
+if [ -n "$LOGGW" ] && [ "$LOGGW" != "75m" ]; then
+    $KB patch envoyproxy ops-logs-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu","value":"75m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory","value":"128Mi"}]' >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/ops-logs-gateway -c envoy --requests=cpu=75m,memory=128Mi >/dev/null 2>&1 \
+        && log "drift corrected: ops-logs-gateway requests -> cpu=75m,mem=128Mi (was $LOGGW)"
+fi
+
+VMSPGW=$($KB -n vmsp-platform get deploy vmsp-gateway -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}' 2>/dev/null)
+if [ -n "$VMSPGW" ] && [ "$VMSPGW" != "50m" ]; then
+    $KB patch envoyproxy vmsp-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu","value":"50m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory","value":"256Mi"}]' >/dev/null 2>&1
+    $KB patch envoyproxy vmsp-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/1/resources/requests/cpu","value":"25m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/1/resources/requests/memory","value":"32Mi"}]' >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/vmsp-gateway -c envoy --requests=cpu=50m,memory=256Mi >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/vmsp-gateway -c shutdown-manager --requests=cpu=25m,memory=32Mi >/dev/null 2>&1 \
+        && log "drift corrected: vmsp-gateway requests -> cpu=50m/25m (was $VMSPGW)"
 fi
 
 EGBG=$($KB -n vmsp-platform get releasetemplate -o name 2>/dev/null | grep -i envoyproxy-gateway | head -1)
@@ -9688,6 +10606,85 @@ if [ -n "$EGBG" ]; then
             && log "drift corrected: $EGBG ReleaseTemplate patched"
     fi
 fi
+
+# VSP workload right-sizing enforcement
+VSP_RIGHTSIZE_TARGETS='
+vodap deployment/vcf-obs-esx-collector-service-standard vcf-obs-esx-collector-service-standard 50m 512Mi
+vodap deployment/vcf-obs-esx-collector-service-verbose vcf-obs-esx-collector-service-verbose 50m 512Mi
+vodap deployment/vcf-obs-esx-collector-service-esxitop vcf-obs-esx-collector-service-esxitop 50m 1Gi
+vodap deployment/vcf-obs-vc-collector-service-standard vcf-obs-vc-collector-service-standard 50m 512Mi
+vodap deployment/vcf-obs-vc-collector-service-verbose vcf-obs-vc-collector-service-verbose 50m 512Mi
+vodap deployment/vcf-obs-esx-collector-service vcf-obs-esx-collector-service 50m 640Mi
+vodap deployment/vcf-obs-vc-collector-service vcf-obs-vc-collector-service 50m 1Gi
+vodap deployment/vcf-obs-data-query-service vcf-obs-data-query-service 100m 640Mi
+vodap deployment/vcf-obs-collector-controller-service vcf-obs-collector-controller-service 50m 1Gi
+vodap deployment/vcf-obs-netops-collector-service vcf-obs-netops-collector-service 100m 576Mi
+vodap statefulset/chi-vcf-obs-vcf-obs-0-0 clickhouse 150m 512Mi
+salt-raas deployment/raas raas 150m 832Mi
+salt-raas deployment/redis redis 50m 64Mi
+salt deployment/salt-master salt-master 200m 896Mi
+salt deployment/salt-minion salt-minion 50m 96Mi
+telemetry deployment/telemetry-acceptor telemetry-acceptor 50m 512Mi
+vcf-fleet-depot deployment/depot-service download-service 50m 288Mi
+vcf-fleet-depot deployment/depot-service file-server 50m 288Mi
+vcf-fleet-depot deployment/depot-service proxy-forwarder 50m 160Mi
+vcf-fleet-depot deployment/distribution-service distribution-service 50m 64Mi
+vcf-fleet-lcm deployment/vcf-fleet-upgrade-service-fleetupgrade fleetupgrade 50m 896Mi
+vcf-fleet-lcm deployment/vcf-fleet-build-service-fleetbuild fleetbuild 100m 896Mi
+vcf-sddc-lcm deployment/vcf-sddc-upgrade-service-sddcupgrade sddcupgrade 75m 896Mi
+vcf-sddc-lcm deployment/vcf-sddc-build-service-sddcbuild sddcbuild 150m 1024Mi
+vidb-external deployment/vidb-service vidb-service 300m 1536Mi
+vmsp-platform statefulset/zot-1 zot 50m 384Mi
+vmsp-platform deployment/vmsp-gateway envoy 50m 256Mi
+vmsp-platform deployment/helm-controller manager 50m 128Mi
+vmsp-platform deployment/strimzi-cluster-operator strimzi-cluster-operator 50m 320Mi
+vmsp-platform deployment/synthetic-checker kube-rbac-proxy 25m 35Mi
+vmsp-platform deployment/synthetic-checker synthetic-checker 50m 96Mi
+vmsp-platform deployment/hooks-server-synthetic-checker kube-rbac-proxy 25m 35Mi
+vmsp-platform deployment/hooks-server-synthetic-checker synthetic-checker 50m 96Mi
+vmsp-platform deployment/support-bundle operator 25m 64Mi
+vmsp-platform deployment/support-bundle support-data-server 50m 64Mi
+vmsp-platform deployment/argo-workflows-workflow-controller controller 50m 96Mi
+vmsp-platform deployment/envoy-gateway envoy-gateway 50m 208Mi
+vmsp-platform deployment/vmsp-identity vmsp-identity 50m 64Mi
+vmsp-platform statefulset/prometheus-kube-prometheus-stack-prometheus prometheus 150m 832Mi
+vmsp-platform daemonset/logging-operator-filelogs-fluentbit fluent-bit 50m 32Mi
+vmsp-platform daemonset/logging-operator-fluentbit fluent-bit 50m 48Mi
+vmsp-platform daemonset/logging-operator-systemlogs-fluentbit fluent-bit 50m 32Mi
+vmsp-metrics-store deployment/clickhouse-operator-altinity-clickhouse-operator altinity-clickhouse-operator 50m 72Mi
+vmsp-metrics-store deployment/clickhouse-operator-altinity-clickhouse-operator metrics-exporter 50m 72Mi
+vmsp-metrics-store deployment/vsp-metrics-store-operator vsp-metrics-store-operator 50m 112Mi
+vmsp-policies deployment/kyverno-admission-controller kyverno 50m 112Mi
+vmsp-policies deployment/kyverno-background-controller controller 50m 144Mi
+kube-system deployment/coredns coredns 50m 32Mi
+kube-system deployment/vsphere-csi-controller csi-attacher 25m 65Mi
+kube-system deployment/vsphere-csi-controller csi-resizer 25m 65Mi
+kube-system deployment/vsphere-csi-controller vsphere-csi-controller 25m 65Mi
+kube-system deployment/vsphere-csi-controller liveness-probe 25m 54Mi
+kube-system deployment/vsphere-csi-controller vsphere-syncer 25m 65Mi
+kube-system deployment/vsphere-csi-controller csi-provisioner 25m 65Mi
+kube-system daemonset/vsphere-csi-node node-driver-registrar 25m 50Mi
+kube-system daemonset/vsphere-csi-node vsphere-csi-node 25m 50Mi
+kube-system daemonset/vsphere-csi-node liveness-probe 25m 50Mi
+'
+printf '%s\n' "$VSP_RIGHTSIZE_TARGETS" | while read -r NS REF CON CPU MEM; do
+    [ -z "$NS" ] && continue
+    CUR=$($KB -n "$NS" get "$REF" -o jsonpath="{.spec.template.spec.containers[?(@.name==\"$CON\")].resources.requests.cpu}" 2>/dev/null || echo "")
+    if [ -n "$CUR" ] && [ "$CUR" != "$CPU" ]; then
+        $KB -n "$NS" set resources "$REF" -c "$CON" --requests="cpu=${CPU},memory=${MEM}" >/dev/null 2>&1 \
+            && log "drift corrected: $NS/$REF [$CON] requests -> cpu=${CPU},mem=${MEM} (was ${CUR})"
+    fi
+done
+
+for pg in vcf-fleet-lcm/vcf-fleet-lcm-db vcf-sddc-lcm/vcf-sddc-lcm-db salt-raas/pgdatabase vidb-external/vidb-postgres-instance; do
+    ns="${pg%/*}"
+    name="${pg#*/}"
+    PG_CPU=$($KB -n "$ns" get postgresql "$name" -o jsonpath='{.spec.resources.requests.cpu}' 2>/dev/null || echo "")
+    if [ -n "$PG_CPU" ] && [ "$PG_CPU" != "100m" ]; then
+        $KB patch postgresql "$name" -n "$ns" --type=merge -p '{"spec":{"resources":{"requests":{"cpu":"100m","memory":"384Mi"}}}}' >/dev/null 2>&1 \
+            && log "drift corrected: postgresql $ns/$name requests -> 100m/384Mi"
+    fi
+done
 
 $KB exec -n vmsp-platform logging-operator-fluentd-0 -c fluentd -- sh -c 'rm -rf /buffers/backup/* /buffers/*.bak*' >/dev/null 2>&1
 
@@ -9706,6 +10703,23 @@ log() { logger -t vcf-lab-keeper "$1"; }
 # 1. Fluentd buffer cleanup
 $KB exec -n vmsp-platform logging-operator-fluentd-0 -c fluentd -- sh -c 'rm -rf /buffers/backup/* /buffers/*.bak*' >/dev/null 2>&1
 
+# 1b. Gateways (ops-logs-gateway and vmsp-gateway)
+LOGGW=$($KB -n vmsp-platform get deploy ops-logs-gateway -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}' 2>/dev/null)
+if [ -n "$LOGGW" ] && [ "$LOGGW" != "75m" ]; then
+    $KB patch envoyproxy ops-logs-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu","value":"75m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory","value":"128Mi"}]' >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/ops-logs-gateway -c envoy --requests=cpu=75m,memory=128Mi >/dev/null 2>&1 \
+        && log "drift corrected: ops-logs-gateway requests -> cpu=75m,mem=128Mi (was $LOGGW)"
+fi
+
+VMSPGW=$($KB -n vmsp-platform get deploy vmsp-gateway -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}' 2>/dev/null)
+if [ -n "$VMSPGW" ] && [ "$VMSPGW" != "50m" ]; then
+    $KB patch envoyproxy vmsp-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/cpu","value":"50m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/0/resources/requests/memory","value":"256Mi"}]' >/dev/null 2>&1
+    $KB patch envoyproxy vmsp-gateway-config -n vmsp-platform --type=json -p '[{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/1/resources/requests/cpu","value":"25m"},{"op":"replace","path":"/spec/provider/kubernetes/envoyDeployment/patch/value/spec/template/spec/containers/1/resources/requests/memory","value":"32Mi"}]' >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/vmsp-gateway -c envoy --requests=cpu=50m,memory=256Mi >/dev/null 2>&1
+    $KB -n vmsp-platform set resources deploy/vmsp-gateway -c shutdown-manager --requests=cpu=25m,memory=32Mi >/dev/null 2>&1 \
+        && log "drift corrected: vmsp-gateway requests -> cpu=50m/25m (was $VMSPGW)"
+fi
+
 # 2. Scale back up any VCF components annotated Running if sitting at 0 replicas
 for comp in $($KB get components.api.vmsp.vmware.com -o jsonpath='{range .items[?(@.metadata.annotations.component\.vmsp\.vmware\.com/operational-status=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
     [ -z "$comp" ] && continue
@@ -9716,6 +10730,85 @@ for comp in $($KB get components.api.vmsp.vmware.com -o jsonpath='{range .items[
         $KB scale deploy,statefulset "$dep" -n "$NS" --replicas=1 >/dev/null 2>&1 \
             && log "drift corrected: scaled $NS/$dep to 1"
     done
+done
+
+# 3. VSP workload right-sizing enforcement
+VSP_RIGHTSIZE_TARGETS='
+vodap deployment/vcf-obs-esx-collector-service-standard vcf-obs-esx-collector-service-standard 50m 512Mi
+vodap deployment/vcf-obs-esx-collector-service-verbose vcf-obs-esx-collector-service-verbose 50m 512Mi
+vodap deployment/vcf-obs-esx-collector-service-esxitop vcf-obs-esx-collector-service-esxitop 50m 1Gi
+vodap deployment/vcf-obs-vc-collector-service-standard vcf-obs-vc-collector-service-standard 50m 512Mi
+vodap deployment/vcf-obs-vc-collector-service-verbose vcf-obs-vc-collector-service-verbose 50m 512Mi
+vodap deployment/vcf-obs-esx-collector-service vcf-obs-esx-collector-service 50m 640Mi
+vodap deployment/vcf-obs-vc-collector-service vcf-obs-vc-collector-service 50m 1Gi
+vodap deployment/vcf-obs-data-query-service vcf-obs-data-query-service 100m 640Mi
+vodap deployment/vcf-obs-collector-controller-service vcf-obs-collector-controller-service 50m 1Gi
+vodap deployment/vcf-obs-netops-collector-service vcf-obs-netops-collector-service 100m 576Mi
+vodap statefulset/chi-vcf-obs-vcf-obs-0-0 clickhouse 150m 512Mi
+salt-raas deployment/raas raas 150m 832Mi
+salt-raas deployment/redis redis 50m 64Mi
+salt deployment/salt-master salt-master 200m 896Mi
+salt deployment/salt-minion salt-minion 50m 96Mi
+telemetry deployment/telemetry-acceptor telemetry-acceptor 50m 512Mi
+vcf-fleet-depot deployment/depot-service download-service 50m 288Mi
+vcf-fleet-depot deployment/depot-service file-server 50m 288Mi
+vcf-fleet-depot deployment/depot-service proxy-forwarder 50m 160Mi
+vcf-fleet-depot deployment/distribution-service distribution-service 50m 64Mi
+vcf-fleet-lcm deployment/vcf-fleet-upgrade-service-fleetupgrade fleetupgrade 50m 896Mi
+vcf-fleet-lcm deployment/vcf-fleet-build-service-fleetbuild fleetbuild 100m 896Mi
+vcf-sddc-lcm deployment/vcf-sddc-upgrade-service-sddcupgrade sddcupgrade 75m 896Mi
+vcf-sddc-lcm deployment/vcf-sddc-build-service-sddcbuild sddcbuild 150m 1024Mi
+vidb-external deployment/vidb-service vidb-service 300m 1536Mi
+vmsp-platform statefulset/zot-1 zot 50m 384Mi
+vmsp-platform deployment/vmsp-gateway envoy 50m 256Mi
+vmsp-platform deployment/helm-controller manager 50m 128Mi
+vmsp-platform deployment/strimzi-cluster-operator strimzi-cluster-operator 50m 320Mi
+vmsp-platform deployment/synthetic-checker kube-rbac-proxy 25m 35Mi
+vmsp-platform deployment/synthetic-checker synthetic-checker 50m 96Mi
+vmsp-platform deployment/hooks-server-synthetic-checker kube-rbac-proxy 25m 35Mi
+vmsp-platform deployment/hooks-server-synthetic-checker synthetic-checker 50m 96Mi
+vmsp-platform deployment/support-bundle operator 25m 64Mi
+vmsp-platform deployment/support-bundle support-data-server 50m 64Mi
+vmsp-platform deployment/argo-workflows-workflow-controller controller 50m 96Mi
+vmsp-platform deployment/envoy-gateway envoy-gateway 50m 208Mi
+vmsp-platform deployment/vmsp-identity vmsp-identity 50m 64Mi
+vmsp-platform statefulset/prometheus-kube-prometheus-stack-prometheus prometheus 150m 832Mi
+vmsp-platform daemonset/logging-operator-filelogs-fluentbit fluent-bit 50m 32Mi
+vmsp-platform daemonset/logging-operator-fluentbit fluent-bit 50m 48Mi
+vmsp-platform daemonset/logging-operator-systemlogs-fluentbit fluent-bit 50m 32Mi
+vmsp-metrics-store deployment/clickhouse-operator-altinity-clickhouse-operator altinity-clickhouse-operator 50m 72Mi
+vmsp-metrics-store deployment/clickhouse-operator-altinity-clickhouse-operator metrics-exporter 50m 72Mi
+vmsp-metrics-store deployment/vsp-metrics-store-operator vsp-metrics-store-operator 50m 112Mi
+vmsp-policies deployment/kyverno-admission-controller kyverno 50m 112Mi
+vmsp-policies deployment/kyverno-background-controller controller 50m 144Mi
+kube-system deployment/coredns coredns 50m 32Mi
+kube-system deployment/vsphere-csi-controller csi-attacher 25m 65Mi
+kube-system deployment/vsphere-csi-controller csi-resizer 25m 65Mi
+kube-system deployment/vsphere-csi-controller vsphere-csi-controller 25m 65Mi
+kube-system deployment/vsphere-csi-controller liveness-probe 25m 54Mi
+kube-system deployment/vsphere-csi-controller vsphere-syncer 25m 65Mi
+kube-system deployment/vsphere-csi-controller csi-provisioner 25m 65Mi
+kube-system daemonset/vsphere-csi-node node-driver-registrar 25m 50Mi
+kube-system daemonset/vsphere-csi-node vsphere-csi-node 25m 50Mi
+kube-system daemonset/vsphere-csi-node liveness-probe 25m 50Mi
+'
+printf '%s\n' "$VSP_RIGHTSIZE_TARGETS" | while read -r NS REF CON CPU MEM; do
+    [ -z "$NS" ] && continue
+    CUR=$($KB -n "$NS" get "$REF" -o jsonpath="{.spec.template.spec.containers[?(@.name==\"$CON\")].resources.requests.cpu}" 2>/dev/null || echo "")
+    if [ -n "$CUR" ] && [ "$CUR" != "$CPU" ]; then
+        $KB -n "$NS" set resources "$REF" -c "$CON" --requests="cpu=${CPU},memory=${MEM}" >/dev/null 2>&1 \
+            && log "drift corrected: $NS/$REF [$CON] requests -> cpu=${CPU},mem=${MEM} (was ${CUR})"
+    fi
+done
+
+for pg in vcf-fleet-lcm/vcf-fleet-lcm-db vcf-sddc-lcm/vcf-sddc-lcm-db salt-raas/pgdatabase vidb-external/vidb-postgres-instance; do
+    ns="${pg%/*}"
+    name="${pg#*/}"
+    PG_CPU=$($KB -n "$ns" get postgresql "$name" -o jsonpath='{.spec.resources.requests.cpu}' 2>/dev/null || echo "")
+    if [ -n "$PG_CPU" ] && [ "$PG_CPU" != "100m" ]; then
+        $KB patch postgresql "$name" -n "$ns" --type=merge -p '{"spec":{"resources":{"requests":{"cpu":"100m","memory":"384Mi"}}}}' >/dev/null 2>&1 \
+            && log "drift corrected: postgresql $ns/$name requests -> 100m/384Mi"
+    fi
 done
 
 exit 0
