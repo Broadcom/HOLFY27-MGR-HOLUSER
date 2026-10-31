@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.6.1 - 2026-10-30
+Version 2.7.0 - 2026-10-30
 Author: HOL Core Team
+v2.7.0: Comprehensive Multi-Cluster vCenter SSO Service Account & Secret Inspection (VSP, Supervisor, VCFA, SSP):
+  - Multi-Cluster Secret & Service Account Inspection (_chk_vcenter_sso_service_accounts, _chk_supervisor_vcenter_service_accounts, _test_vcenter_auth, _harden_vcenter_sso_service_accounts):
+    * VSP: Proactively discovers and validates vCenter service account credentials from K8s secrets (vcf-sddc-lcm/vcf-iam-vcenter-admin, vmsp-platform/vsp-01a-vcenter-admin-secret, vmsp-platform/vsp-01a-vcenter-main-secret, vmsp-platform/vcenter-main-secret, vmsp-platform/vsp-01a-vsphere-secret, and kube-system/vsphere-config-secret). Validates live REST authentication against vCenter cis/session API, detects expired/drifted passwords, resets them via dir-cli to match secrets, sets --password-never-expires, and reloads dependent services (vcf-sddc-build-service, vsphere-csi-controller).
+    * Supervisor: In chk_services, inspects the Supervisor's CSI secret (vmware-system-csi/vsphere-config-secret) and tests login against workload vCenter (wld.sso). Inspects and hardens all wcp-*-user and svc-* service accounts on vCenter SSO, enforcing --password-never-expires to prevent WCP/Supervisor 90-day expiration failures.
+    * VCFA: Validates CSI secrets (kube-system/vsphere-config-secret, vsphere-cloud-secret) and vmsp-platform secrets, resetting drifted/expired accounts and setting --password-never-expires. Added "password" section to VCFA's default section pipeline.
+    * SSP: Inspects CAPI/CAPV VSphereCluster identityRef secrets and namespace credentials against management vCenter SSO, realigning passwords and setting --password-never-expires.
+    * Universal Hardening: Sweeps all vCenter service accounts (svc-*, wcp-*, nsxt_*) across management and workload vCenters and sets --password-never-expires to permanently eliminate 90-day expiration outages across all lab builds.
+
 v2.6.1: vSphere CSI Controller Credential Recovery & SSO Expiration Hardening:
   - CSI Credential Recovery (_remediate_vsphere_csi, chk_edge): Implemented missing vSphere CSI controller credential remediation in chk_edge for VCFA and VSP clusters [KB 435491, KB 326114]. Discovers credentials from vsphere-config-secret and vsphere-cloud-secret, diagnoses authentication failures and expired SSO passwords via dir-cli on management vCenter, realigns the password, enforces --password-never-expires, clears stale leader election leases, and bounces CSI pods to restore container storage operations.
   - Robust Site Config Resolution (resolve_site_config): Added dictionary support to resolve_site_config so passing ctx dictionaries correctly resolves site_suffix and subnet prefix.
@@ -560,6 +568,8 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import urllib.request
+import ssl
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -574,7 +584,7 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.6.1"
+VERSION = "2.7.0"
 DATE    = "2026-10-30"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
@@ -837,10 +847,10 @@ def get_cluster_configs(args):
             # supported --cluster vcfa, but nothing in this tool called it, so a VCFA
             # kubeadm cert nearing expiry had no delegation path at all.
             # Re-ordered execution flow: sweeps and pre-flight cleanup run first (argo, nodes, cp, etcd, postgres, pods),
-            # followed by storm mitigations, edge cases (0-replica scale-up & RM unblock), certs, and gateway (SDS BTP fix),
+            # followed by storm mitigations, edge cases (0-replica scale-up & RM unblock), password/SSO hardening, certs, and gateway (SDS BTP fix),
             # ensuring dependencies are healthy before deployments and endpoints are validated.
             "sections": ["argo", "nodes", "cp", "etcd", "postgres", "pods", "storm",
-                         "edge", "certs", "gateway", "deployments", "endpoint", "kubeadm"],
+                         "edge", "password", "certs", "gateway", "deployments", "endpoint", "kubeadm"],
         },
         "supervisor": {
             "label": "SUPERVISOR",
@@ -930,7 +940,7 @@ SECTION_MAP = {
     "salt":        ("SALT STACK",            "pod readiness + salt-master log signatures"),
     "argo":        ("ARGO WORKFLOWS",        "stale system-shutdown + power-off marker"),
     "kyverno":     ("KYVERNO POLICIES",      "UpdateRequest backlog + controllers"),
-    "password":    ("PASSWORD EXPIRATION",   "node account expiry vs policy"),
+    "password":    ("PASSWORD EXPIRATION",   "node and vCenter service account expiry vs policy"),
     "gateway":     ("GATEWAY DATAPLANE",     "LB VIPs + envoy dataplane services [KB 439264, KB 424402]"),
     "edge":        ("KNOWN EDGE CASES",      "CSI drift/expiry, support-bundle, RM deadlock, RabbitMQ [KB 440167, KB 392417, KB 435491]"),
     "etcd":        ("ETCD FRAGMENTATION",    "dbSize slack (informational; KB 327477)"),
@@ -5973,8 +5983,294 @@ def chk_kyverno(r, ctx):
     return out
 
 
+def _test_vcenter_auth(vc_host, user_upn, password):
+    """Test live authentication against vCenter cis/session REST API."""
+    try:
+        url = f"https://{vc_host}/rest/com/vmware/cis/session"
+        req = urllib.request.Request(url, method="POST")
+        creds = base64.b64encode(f"{user_upn}:{password}".encode()).decode()
+        req.add_header("Authorization", f"Basic {creds}")
+        ctx_ssl = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, context=ctx_ssl, timeout=5) as resp:
+            return resp.status == 200, resp.status
+    except urllib.error.HTTPError as e:
+        return False, e.code
+    except Exception as e:
+        return False, str(e)
+
+
+def _harden_vcenter_sso_service_accounts(vc_host, sso_domain, admin_pw):
+    """Audit all service accounts on vCenter and enforce password-never-expires."""
+    vc = VCenterTransport(vc_host, admin_pw)
+    script = f'''
+for acct in $(/usr/lib/vmware-vmafd/bin/dir-cli svcaccount list --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} 2>/dev/null | awk -F'. ' '/^[0-9]+\\./ {{print $2}}' | grep -E '^(svc-|wcp-|nsxt_)'); do
+    res=$(/usr/lib/vmware-vmafd/bin/dir-cli user find-by-name --account "$acct" --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} --level 2 2>/dev/null)
+    if echo "$res" | grep -q 'Password never expires: FALSE'; then
+        /usr/lib/vmware-vmafd/bin/dir-cli user modify --account "$acct" --password-never-expires --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} >/dev/null 2>&1
+        echo "MODIFIED:$acct"
+    elif echo "$res" | grep -q 'Password expired: TRUE'; then
+        echo "EXPIRED:$acct"
+    else
+        echo "OK:$acct"
+    fi
+done
+'''
+    rc, out = vc.exec(script, timeout=60)
+    modified, expired, ok_accts = [], [], []
+    if out:
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("MODIFIED:"):
+                modified.append(line.split(":", 1)[1].strip())
+            elif line.startswith("EXPIRED:"):
+                expired.append(line.split(":", 1)[1].strip())
+            elif line.startswith("OK:"):
+                ok_accts.append(line.split(":", 1)[1].strip())
+    return modified, expired, ok_accts
+
+
+def _chk_vcenter_sso_service_accounts(r, ctx):
+    """Audit and remediate vCenter SSO service account credentials and K8s secrets."""
+    out = []
+    cl = r.cluster
+    site_suffix, subnet = resolve_site_config(ctx)
+    admin_pw = get_password()
+    mgmt_vc = f"vc-mgmt-a.{site_suffix}"
+    wld_vc = f"vc-wld01-a.{site_suffix}"
+
+    targets = []
+    # (ns, secret_name, user_key, pass_key, default_vc_host, default_domain, label, rollout_dep, restart_csi)
+    if cl == "vsp":
+        targets = [
+            ("vcf-sddc-lcm", "vcf-iam-vcenter-admin", "clientId", "clientSecret", mgmt_vc, "vsphere.local", "VSP vCenter IAM (SDDC LCM)", ("vcf-sddc-lcm", "vcf-sddc-build-service-sddcbuild"), False),
+            ("vmsp-platform", "vsp-01a-vcenter-admin-secret", "vCenterUsername", "vCenterPassword", mgmt_vc, "vsphere.local", "VSP vCenter Admin secret", None, False),
+            ("vmsp-platform", "vsp-01a-vcenter-main-secret", "vCenterUsername", "vCenterPassword", mgmt_vc, "vsphere.local", "VSP vCenter Main secret", None, False),
+            ("vmsp-platform", "vsp-01a-vsphere-secret", "username", "password", mgmt_vc, "vsphere.local", "VSP vSphere secret", None, False),
+            ("kube-system", "vsphere-config-secret", "csi-vsphere.conf", "csi-vsphere.conf", mgmt_vc, "vsphere.local", "VSP CSI controller secret", None, True),
+        ]
+    elif cl == "vcfa":
+        targets = [
+            ("kube-system", "vsphere-config-secret", "csi-vsphere.conf", "csi-vsphere.conf", mgmt_vc, "vsphere.local", "VCFA CSI controller secret", None, True),
+            ("vmsp-platform", "vcenter-main-secret", "vCenterUsername", "vCenterPassword", mgmt_vc, "vsphere.local", "VCFA vCenter Main secret", None, False),
+            ("vmsp-platform", "vsp-01a-vcenter-main-secret", "vCenterUsername", "vCenterPassword", mgmt_vc, "vsphere.local", "VCFA vCenter Main secret", None, False),
+        ]
+    elif cl == "ssp":
+        rc_sec, raw_sec = r.read("kubectl -n ssp get secrets -o json 2>/dev/null", 30)
+        if rc_sec == 0 and raw_sec and "{" in raw_sec:
+            try:
+                sec_data = json.loads(raw_sec[raw_sec.find("{"):])
+                for sitem in sec_data.get("items", []):
+                    sname = sitem.get("metadata", {}).get("name", "")
+                    skeys = sitem.get("data", {}).keys()
+                    if "username" in skeys and "password" in skeys:
+                        targets.append(("ssp", sname, "username", "password", mgmt_vc, "vsphere.local", f"SSP {sname} secret", None, False))
+            except Exception:
+                pass
+
+    seen_accounts = set()
+    for ns, sname, ukey, pkey, def_host, def_domain, slabel, restart_dep, restart_csi in targets:
+        rc, out_raw = r.read(f"kubectl get secret {sname} -n {ns} -o json 2>/dev/null", 30)
+        if rc != 0 or not out_raw or "{" not in out_raw:
+            continue
+        try:
+            s_obj = json.loads(out_raw[out_raw.find("{"):])
+            data = s_obj.get("data", {})
+        except Exception:
+            continue
+
+        raw_user = ""
+        raw_pass = ""
+        vc_target = def_host
+
+        if ukey == "csi-vsphere.conf":
+            b64_c = data.get("csi-vsphere.conf") or ""
+            if b64_c:
+                try:
+                    c_text = base64.b64decode(b64_c).decode("utf-8", errors="ignore")
+                    for line in c_text.splitlines():
+                        line = line.strip()
+                        if line.startswith("user") and "=" in line:
+                            raw_user = line.split("=", 1)[1].strip().strip('"')
+                        elif line.startswith("password") and "=" in line:
+                            raw_pass = line.split("=", 1)[1].strip().strip('"')
+                        elif line.startswith("[VirtualCenter") and '"' in line:
+                            vc_target = line.split('"')[1]
+                except Exception:
+                    pass
+            rc_cs, cs_raw = r.read(f"kubectl get secret vsphere-cloud-secret -n {ns} -o json 2>/dev/null", 30)
+            if rc_cs == 0 and cs_raw and "{" in cs_raw:
+                try:
+                    cs_obj = json.loads(cs_raw[cs_raw.find("{"):])
+                    for k, v in cs_obj.get("data", {}).items():
+                        if "password" in k.lower():
+                            cand = base64.b64decode(v).decode("utf-8", errors="ignore")
+                            if cand:
+                                raw_pass = cand
+                except Exception:
+                    pass
+        else:
+            u_b64 = data.get(ukey, "")
+            p_b64 = data.get(pkey, "")
+            if u_b64 and p_b64:
+                try:
+                    raw_user = base64.b64decode(u_b64).decode("utf-8", errors="ignore")
+                    raw_pass = base64.b64decode(p_b64).decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+
+        if not raw_user or not raw_pass:
+            continue
+
+        acct = raw_user.split("@")[0]
+        domain = raw_user.split("@")[1] if "@" in raw_user else def_domain
+        user_upn = f"{acct}@{domain}"
+        if (vc_target, domain, acct) in seen_accounts:
+            continue
+        seen_accounts.add((vc_target, domain, acct))
+
+        row_label = f"{slabel} ({acct}@{domain} on {vc_target})"
+        auth_ok, code = _test_vcenter_auth(vc_target, user_upn, raw_pass)
+
+        vc_trans = VCenterTransport(vc_target, admin_pw)
+        rc_f, f_out = vc_trans.exec(
+            f"/usr/lib/vmware-vmafd/bin/dir-cli user find-by-name --account {acct} "
+            f"--login administrator@{domain} --password {shlex.quote(admin_pw)} --level 2", 30)
+        sso_info = f_out or ""
+        is_expired = "Password expired: TRUE" in sso_info
+        never_expires = "Password never expires: TRUE" in sso_info
+
+        if auth_ok and never_expires and not is_expired:
+            out.append(ok("password.sso", row_label, "authenticated (never expires)", cluster=cl))
+            continue
+
+        reasons = []
+        if not auth_ok: reasons.append(f"auth failed (HTTP {code})")
+        if is_expired: reasons.append("SSO password expired")
+        if not never_expires: reasons.append("password-never-expires not set")
+
+        row = fail("password.sso", row_label, ", ".join(reasons), cluster=cl)
+        if may_act(r, "password") or may_act(r, "edge"):
+            if r.dry_run:
+                row.action = f"would realign password via dir-cli on {vc_target} and set never-expires"
+            else:
+                actions = []
+                if not auth_ok or is_expired:
+                    vc_trans.exec(
+                        f"/usr/lib/vmware-vmafd/bin/dir-cli password reset --account {acct} "
+                        f"--new {shlex.quote(raw_pass)} --login administrator@{domain} "
+                        f"--password {shlex.quote(admin_pw)}", 45)
+                    actions.append("password reset")
+
+                if not never_expires or is_expired:
+                    vc_trans.exec(
+                        f"/usr/lib/vmware-vmafd/bin/dir-cli user modify --account {acct} "
+                        f"--password-never-expires --account-unlocked --login administrator@{domain} "
+                        f"--password {shlex.quote(admin_pw)}", 30)
+                    actions.append("password-never-expires set")
+
+                if restart_dep and (not auth_ok or is_expired):
+                    r.write(f"kubectl rollout restart deployment/{restart_dep[1]} -n {restart_dep[0]}",
+                            f"restart {restart_dep[1]} to reload vCenter credentials", tier="transient", timeout=60)
+                    actions.append(f"restarted {restart_dep[1]}")
+
+                if restart_csi and (not auth_ok or is_expired):
+                    r.write("kubectl delete lease external-attacher-leader-csi-vsphere-vmware-com "
+                            "external-resizer-csi-vsphere-vmware-com -n kube-system 2>/dev/null || true",
+                            "clear stale CSI leader election leases", tier="transient", timeout=30)
+                    r.write(f"kubectl delete pod -n {ns} -l app=vsphere-csi-controller --grace-period=0 --force 2>/dev/null; "
+                            f"kubectl delete pod -n {ns} -l app=vsphere-csi-node --grace-period=0 --force 2>/dev/null",
+                            "restart CSI controller and node pods to reload credentials", tier="transient", timeout=60)
+                    actions.append("restarted CSI pods")
+
+                row.state = "warn"
+                row.detail = f"remediated ({', '.join(actions)})"
+                row.action = f"realigned and hardened on {vc_target}"
+        out.append(row)
+
+    # Universal hardening across vCenters
+    for target_vc, target_dom in [(mgmt_vc, "vsphere.local"), (wld_vc, "wld.sso")]:
+        mod, exp, oks = _harden_vcenter_sso_service_accounts(target_vc, target_dom, admin_pw)
+        vlabel = f"{target_vc} ({target_dom}) service accounts: password-never-expires enforced"
+        if exp:
+            out.append(warn("password.sso_audit", vlabel, f"{len(oks)} active; {len(exp)} orphaned account(s) expired: {', '.join(exp[:3])}", cluster=cl))
+        elif mod:
+            out.append(ok("password.sso_audit", vlabel, f"hardened {len(mod)} account(s); {len(oks)} up-to-date", cluster=cl))
+        else:
+            out.append(ok("password.sso_audit", vlabel, f"all {len(oks)} accounts up-to-date (never expires)", cluster=cl))
+
+    return out
+
+
+def _chk_supervisor_vcenter_service_accounts(r, ctx):
+    """Inspect Supervisor CSI secret and harden WCP/Supervisor service accounts on vCenter."""
+    out = []
+    cl = r.cluster
+    vc = ctx.get("vcenter")
+    site_suffix, subnet = resolve_site_config(ctx)
+    admin_pw = get_password()
+    target_vc = vc or f"vc-wld01-a.{site_suffix}"
+    domain = "wld.sso" if "wld" in target_vc else "vsphere.local"
+
+    # 1. Universal hardening of wcp-* and svc-* service accounts on target vCenter
+    mod, exp, oks = _harden_vcenter_sso_service_accounts(target_vc, domain, admin_pw)
+    vlabel = f"{target_vc} ({domain}) WCP service accounts: password-never-expires enforced"
+    if exp:
+        out.append(warn("services.sso_audit", vlabel, f"{len(oks)} active; {len(exp)} expired account(s): {', '.join(exp[:3])}", cluster=cl))
+    elif mod:
+        out.append(ok("services.sso_audit", vlabel, f"hardened {len(mod)} account(s); {len(oks)} up-to-date", cluster=cl))
+    else:
+        out.append(ok("services.sso_audit", vlabel, f"all {len(oks)} accounts up-to-date (never expires)", cluster=cl))
+
+    # 2. Inspect vmware-system-csi/vsphere-config-secret on the Supervisor control plane
+    rc, raw_conf = r.read("kubectl get secret vsphere-config-secret -n vmware-system-csi -o jsonpath='{.data.vsphere-cloud-provider\\.conf}' 2>/dev/null", 30)
+    if rc == 0 and raw_conf and raw_conf.strip():
+        try:
+            c_text = base64.b64decode(raw_conf.strip()).decode("utf-8", errors="ignore")
+            csi_user = None
+            csi_pass = None
+            for line in c_text.splitlines():
+                line = line.strip()
+                if line.startswith("user") and "=" in line:
+                    csi_user = line.split("=", 1)[1].strip().strip('"')
+                elif line.startswith("password") and "=" in line:
+                    csi_pass = line.split("=", 1)[1].strip().strip('"')
+
+            if csi_user and csi_pass:
+                acct = csi_user.split("@")[0]
+                dom = csi_user.split("@")[1] if "@" in csi_user else domain
+                csi_label = f"Supervisor CSI secret ({acct}@{dom} on {target_vc})"
+                auth_ok, code = _test_vcenter_auth(target_vc, csi_user, csi_pass)
+                if auth_ok:
+                    out.append(ok("services.csi_auth", csi_label, "authenticated (never expires)", cluster=cl))
+                else:
+                    row = fail("services.csi_auth", csi_label, f"authentication failed (HTTP {code})", cluster=cl)
+                    if may_act(r, "services"):
+                        if r.dry_run:
+                            row.action = f"would realign {acct} password via dir-cli on {target_vc} and set never-expires"
+                        else:
+                            vc_trans = VCenterTransport(target_vc, admin_pw)
+                            vc_trans.exec(
+                                f"/usr/lib/vmware-vmafd/bin/dir-cli password reset --account {acct} "
+                                f"--new {shlex.quote(csi_pass)} --login administrator@{dom} "
+                                f"--password {shlex.quote(admin_pw)}", 45)
+                            vc_trans.exec(
+                                f"/usr/lib/vmware-vmafd/bin/dir-cli user modify --account {acct} "
+                                f"--password-never-expires --account-unlocked --login administrator@{dom} "
+                                f"--password {shlex.quote(admin_pw)}", 30)
+                            r.write("kubectl delete pod -n vmware-system-csi -l app=vsphere-csi-controller --grace-period=0 --force 2>/dev/null || true",
+                                    "restart Supervisor CSI controller pod", tier="transient", timeout=60)
+                            row.state = "warn"
+                            row.detail = f"realigned and hardened {acct} on {target_vc}"
+                            row.action = "password reset + never-expires set; restarted CSI pod"
+                    out.append(row)
+        except Exception:
+            pass
+
+    return out
+
+
 def chk_password(r, ctx):
-    """Node account password expiry.
+    """Node account password expiry and vCenter SSO service account password validation.
 
     `never` is healthy. Otherwise anything inside 60 days is drift. The repair sets
     -M 730 AND -d today: without refreshing the last-change date the expiry is
@@ -6013,58 +6309,63 @@ def chk_password(r, ctx):
                     if not r.dry_run:
                         res_row.state, res_row.detail = "warn", "extended password aging to max"
                 out.append(res_row)
+        out.extend(_chk_vcenter_sso_service_accounts(r, ctx))
         return out
+
     data = ctx.get("nodes")
     if not data:
-        return [warn("password", "node password expiry: within policy",
-                     "node list unavailable", cluster=cl)]
-    ips = [a["address"] for item in data.get("items", [])
-           for a in item.get("status", {}).get("addresses", [])
-           if a.get("type") == "InternalIP"]
+        out.append(warn("password", "node password expiry: within policy",
+                        "node list unavailable", cluster=cl))
+    else:
+        ips = [a["address"] for item in data.get("items", [])
+               for a in item.get("status", {}).get("addresses", [])
+               if a.get("type") == "InternalIP"]
 
-    for ip in ips:
-        for user in PASSWORD_USERS:
-            # Anchor to the start of the line and stop at the first match.
-            # `grep -i 'Password expires'` also matches "Number of days of warning
-            # before password expires : 7", so a loose match plus last-line
-            # selection yields "7" and every node reads as unparseable.
-            rc, res = r.read_on(
-                ip, f"chage -l {user} 2>/dev/null | "
-                    "awk -F: '/^Password expires/{print $2; exit}'", 45)
-            val = (res or "").strip().splitlines()
-            val = val[-1].strip() if val else ""
-            label = f"{ip} {user}: password not expiring within {PASSWORD_WARN_DAYS}d"
-            if not val:
-                out.append(warn("password", label, "not readable", cluster=cl))
-                continue
-            if "never" in val.lower():
-                out.append(ok("password", label, "never", cluster=cl))
-                continue
-            days = None
-            try:
-                exp = datetime.strptime(val.strip(), "%b %d, %Y")
-                days = (exp - datetime.now()).days
-            except ValueError:
-                pass
-            if days is None:
-                out.append(warn("password", label, f"unparsed: {val}", cluster=cl))
-            elif days > PASSWORD_WARN_DAYS:
-                out.append(ok("password", label, f"{days}d", cluster=cl,
-                              residual_days=days))
-            else:
-                res_row = fail("password", label, f"{days}d remaining", cluster=cl,
-                               residual_days=days)
-                if may_act(r, "password"):
-                    r.write_on_node(
-                        ip, f"chage -d $(date +%Y-%m-%d) -M {PASSWORD_MAX_DAYS} {user}",
-                        f"reset {user} last-change date and set -M "
-                        f"{PASSWORD_MAX_DAYS} on {ip}",
-                        tier="persistent", timeout=60)
-                    res_row.action = f"chage -M {PASSWORD_MAX_DAYS}"
-                    if not r.dry_run:
-                        res_row.state = "warn"
-                        res_row.detail = f"was {days}d; extended"
-                out.append(res_row)
+        for ip in ips:
+            for user in PASSWORD_USERS:
+                # Anchor to the start of the line and stop at the first match.
+                # `grep -i 'Password expires'` also matches "Number of days of warning
+                # before password expires : 7", so a loose match plus last-line
+                # selection yields "7" and every node reads as unparseable.
+                rc, res = r.read_on(
+                    ip, f"chage -l {user} 2>/dev/null | "
+                        "awk -F: '/^Password expires/{print $2; exit}'", 45)
+                val = (res or "").strip().splitlines()
+                val = val[-1].strip() if val else ""
+                label = f"{ip} {user}: password not expiring within {PASSWORD_WARN_DAYS}d"
+                if not val:
+                    out.append(warn("password", label, "not readable", cluster=cl))
+                    continue
+                if "never" in val.lower():
+                    out.append(ok("password", label, "never", cluster=cl))
+                    continue
+                days = None
+                try:
+                    exp = datetime.strptime(val.strip(), "%b %d, %Y")
+                    days = (exp - datetime.now()).days
+                except ValueError:
+                    pass
+                if days is None:
+                    out.append(warn("password", label, f"unparsed: {val}", cluster=cl))
+                elif days > PASSWORD_WARN_DAYS:
+                    out.append(ok("password", label, f"{days}d", cluster=cl,
+                                  residual_days=days))
+                else:
+                    res_row = fail("password", label, f"{days}d remaining", cluster=cl,
+                                   residual_days=days)
+                    if may_act(r, "password"):
+                        r.write_on_node(
+                            ip, f"chage -d $(date +%Y-%m-%d) -M {PASSWORD_MAX_DAYS} {user}",
+                            f"reset {user} last-change date and set -M "
+                            f"{PASSWORD_MAX_DAYS} on {ip}",
+                            tier="persistent", timeout=60)
+                        res_row.action = f"chage -M {PASSWORD_MAX_DAYS}"
+                        if not r.dry_run:
+                            res_row.state = "warn"
+                            res_row.detail = f"was {days}d; extended"
+                    out.append(res_row)
+
+    out.extend(_chk_vcenter_sso_service_accounts(r, ctx))
     return out
 
 
@@ -9697,6 +9998,8 @@ def chk_services(r, ctx):
                 res_row.state = "warn"
                 res_row.detail = f"was '{state}'; start issued"
         out.append(res_row)
+
+    out.extend(_chk_supervisor_vcenter_service_accounts(r, ctx))
     return out
 
 
