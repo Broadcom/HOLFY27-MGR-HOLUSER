@@ -1,8 +1,8 @@
 # vcf-lab-tuner.py — Design & Reference
 
-**Version 3.9.8 — 2026-09-25**
+**Version 4.0.0 — 2026-10-30**
 **Author:** Burke Azbill and HOL Core Team
-**Status:** `vcf-lab-tuner.py` **v2.5.8**. All four clusters supported (VSP, VCFA, SSP, Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh` **and** `vcfa-stabilizer.sh`, enabling legacy scripts to be safely retired. **Full native certificate renewal engine (v2.0.0)**, dynamic component discovery & SSP cluster parity (v2.1.0), **VCFA single-node leader election hardening, Argo CronWorkflow staggering, Kyverno webhook resilience, and enhanced drift keeper (v2.2.0)**, **cluster-agnostic workload CPU request right-sizing analysis with interactive HTML dashboard export (v2.3.0)**, **expanded top 10 over-allocated workloads terminal summary (v2.3.2)**, **version-aware SDS NACK remediation & 9.1.1+ upstream alignment (v2.4.0)**, **version-aware VCFA resource naming & HA replica evaluation alignment (v2.4.1)**, **two-tier revert to defaults architecture with automated single pre-remediation snapshot retention (v2.5.0)**, **VCF 9.1.1+ native settings alignment & interruption prevention across VCFA & VSP (v2.5.1/v2.5.2)**, **multi-node proxy drift peer node execution fix (v2.5.3)**, **Supervisor cluster VCF 9.1.1+ alignment, ESXi spherelet SSH reachability auto-enable, and pod sweep gating (v2.5.4)**, **VCFA SeaweedFS mTLS certificate freshness check & auth pod backoff recovery (v2.5.5)**, **Supervisor & multi-cluster backing secret & x509 certificate renewal fixes (v2.5.6)**, **VCFA 9.1.1+ native upstream alignment & dedicated 9.1.1+ keeper profiles eliminating obsolete mutations (v2.5.7)**, **config.ini disable_leader_election opt-in gating preventing HelmRelease / vksm-stack upgrade collisions (v2.5.8)**, and **resilient SSP workload kubeconfig cache TTL refresh (v2.5.9)**. Remediation implemented for every section, keeper management working, deprecation banners applied, and offline unit test suite passing. Validated live on DevPod.
+**Status:** `vcf-lab-tuner.py` **v2.7.0**. All four clusters supported (VSP, VCFA, SSP, Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh` **and** `vcfa-stabilizer.sh`, enabling legacy scripts to be safely retired. **Full native certificate renewal engine (v2.0.0)**, dynamic component discovery & SSP cluster parity (v2.1.0), **VCFA single-node leader election hardening, Argo CronWorkflow staggering, Kyverno webhook resilience, and enhanced drift keeper (v2.2.0)**, **cluster-agnostic workload CPU request right-sizing analysis with interactive HTML dashboard export (v2.3.0)**, **expanded top 10 over-allocated workloads terminal summary (v2.3.2)**, **version-aware SDS NACK remediation & 9.1.1+ upstream alignment (v2.4.0)**, **version-aware VCFA resource naming & HA replica evaluation alignment (v2.4.1)**, **two-tier revert to defaults architecture with automated single pre-remediation snapshot retention (v2.5.0)**, **VCF 9.1.1+ native settings alignment & interruption prevention across VCFA & VSP (v2.5.1/v2.5.2)**, **multi-node proxy drift peer node execution fix (v2.5.3)**, **Supervisor cluster VCF 9.1.1+ alignment, ESXi spherelet SSH reachability auto-enable, and pod sweep gating (v2.5.4)**, **VCFA SeaweedFS mTLS certificate freshness check & auth pod backoff recovery (v2.5.5)**, **Supervisor & multi-cluster backing secret & x509 certificate renewal fixes (v2.5.6)**, **VCFA 9.1.1+ native upstream alignment & dedicated 9.1.1+ keeper profiles eliminating obsolete mutations (v2.5.7)**, **config.ini disable_leader_election opt-in gating preventing HelmRelease / vksm-stack upgrade collisions (v2.5.8)**, **resilient SSP workload kubeconfig cache TTL refresh (v2.5.9)**, **upstream Issuer CA cryptographic signature verification & multi-cluster parity (v2.6.0)**, and **comprehensive multi-cluster vCenter SSO service account & Kubernetes secret inspection across VSP, Supervisor, VCFA, and SSP (v2.7.0)**. Remediation implemented for every section, keeper management working, deprecation banners applied, and offline unit test suite passing. Validated live on DevPod.
 
 ---
 
@@ -438,7 +438,7 @@ Covered: `kvip_manifest`, `cp_pod_crash`, `crashloop_pods`, `postgres`, `salt_st
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `host_contention`    | Not ported. A load-based gate that disables remediation for a cycle. Worth adding                                                                                           |
 | `vsp_size`           | Intentionally omitted — it patches `ComponentVersion...resources.cpu`, which report finding F1 shows is a resource envelope, not the CP VM size. `machineType` is the lever |
-| `csi_controller`     | Not ported. Resets the CSI vCenter SSO credential via `dir-cli`                                                                                                             |
+| `csi_controller`     | **Ported** to `chk_edge` (`_remediate_vsphere_csi`). Realigns vCenter SSO credentials via `dir-cli`, enforces `--password-never-expires`, and clears stale leases |
 | `walg_hang`          | Intentionally omitted — it replaces a real binary with an `exit 0` stub and `pkill -9`s in-flight restores. Too aggressive to enable by default without an explicit opt-in  |
 | `leaderelect_tuning` | Handled by the **emitted keeper**, which is the right layer (~10-min Flux revert needs 60s reassertion)                                                                     |
 
@@ -1260,6 +1260,37 @@ cross-script locking.
 ---
 
 ## 15. Changelog
+
+**4.0.0 — 2026-10-30** — `vcf-lab-tuner.md` v4.0.0 / `vcf-lab-tuner.py` **v2.7.0**.
+
+### Comprehensive Multi-Cluster vCenter SSO Service Account & Secret Inspection (VSP, Supervisor, VCFA, SSP)
+
+#### Newly Added Capabilities & Technical Details (WHAT & WHY)
+
+- **Multi-Cluster vCenter SSO Service Account & Secret Inspection (`_chk_vcenter_sso_service_accounts`, `_test_vcenter_auth`, `_harden_vcenter_sso_service_accounts`)**:
+  - *WHAT*: Implemented end-to-end vCenter service account credential discovery, live REST session validation (`POST /rest/com/vmware/cis/session`), and automated SSO password realignment across all Kubernetes clusters (`vsp`, `vcfa`, `supervisor`, `ssp`).
+  - *WHY*: In VCF 9.x, internal Kubernetes microservices and CSI drivers authenticate to vCenter using unique SSO service accounts (`svc-vcfsp-vc-*`, `svc-vcf-sddc-lcm-*`, `wcp-*-user`, `svc-sddcmanager-*`). Because vCenter enforces a default 90-day password expiration policy, these service accounts expire over time (or drift during upgrades), causing cascading failures such as CSI CrashLoopBackOff, local container registry (`zot`) volume attachment stalls, Argo workflow mutex deadlocks, and SDDC build service VM power-off failures.
+- **Universal vCenter Service Account Expiration Hardening (`_harden_vcenter_sso_service_accounts`)**:
+  - *WHAT*: Fast remote audit across all discovered vCenters (`vc-mgmt-a` and `vc-wld01-a` across sites). Automatically identifies all service accounts returned by `dir-cli svcaccount list` (`svc-*`, `wcp-*`, `nsxt_*`) and sets `Password never expires: TRUE` via `dir-cli user modify --password-never-expires`.
+  - *WHY*: Eliminates the root cause of service account expiration across all lab environments. Accounts no longer expire after 90 days, permanently preventing post-startup and graceful shutdown failures.
+- **Cluster-Specific Secret Coverage**:
+  - *VSP*: Validates and realigns `vcf-sddc-lcm/vcf-iam-vcenter-admin` (`svc-vcf-sddc-lcm-VCENTER-*`), `vmsp-platform/vsp-01a-vcenter-admin-secret` (`svc-vcfsp-vc-admin-*`), `vmsp-platform/vsp-01a-vcenter-main-secret`, `vmsp-platform/vsp-01a-vsphere-secret`, and `kube-system/vsphere-config-secret` (CSI driver). Automatically rollout-restarts dependent services (`vcf-sddc-build-service`) when credentials are recovered.
+  - *Supervisor*: In `chk_services`, inspects `vmware-system-csi/vsphere-config-secret` on the Supervisor cluster, tests authentication against the workload vCenter (`wld.sso`), and hardens all 14 `wcp-*-user` service accounts (`wcp-storage-user`, `wcp-mobilityop-user`, `wcp-vmop-user`, `wcp-authproxy-user`, etc.).
+  - *VCFA*: Validates `kube-system/vsphere-config-secret` and `vsphere-cloud-secret` in `chk_edge` and `chk_password`, clearing stale CSI leader election leases and restarting CSI pods upon credential recovery. Added `password` section to VCFA's default section pipeline.
+  - *SSP*: Discovers CAPI/CAPV `VSphereCluster` identityRef credentials and namespace secrets, verifying authentication against management vCenter SSO and enforcing `--password-never-expires`.
+
+**3.9.9 — 2026-10-26** — `vcf-lab-tuner.md` v3.9.9 / `vcf-lab-tuner.py` **v2.6.0**.
+
+### Upstream Issuer CA Cryptographic Signature Verification & Multi-Cluster Parity
+
+#### Newly Added Capabilities & Technical Details (WHAT & WHY)
+
+- **Issuer & ClusterIssuer CA Cryptographic Signature Verification (`_verify_cert_signed_by_ca`, `_get_issuer_ca_pem`)**:
+  - *WHAT*: Added proactive cryptographic signature verification (`openssl verify -CAfile`) across all cert-manager leaf certificates and backing secrets. Dynamically resolves ClusterIssuer and Issuer signing CAs across namespaces (e.g. `vmware-system-cert-manager`, `vmsp-platform`, `cert-manager`, `prelude`), retrieves CA certificate material, and verifies that leaf certificates are cryptographically signed by the active issuer CA.
+  - *WHY*: When an upstream CA is rotated (e.g. `metrics-aggregator-ca-secret` rotated on Supervisor), cert-manager does not automatically reissue downstream leaf certificates whose validity window (e.g. 1-year duration) has not yet reached `renewBefore`. Consequently, leaf certificates remain valid by date but are signed by an expired or non-current CA. Standard checks looking only at `notAfter` date calculations previously skipped these certificates, causing downstream mTLS handshakes and strict verification tools (`supervisor_stabilizer.py` / `vpodchecker.py`) to report `INVALID (signed by non-current CA)` or `EXPIRED (expires: unknown)`.
+- **Automatic Multi-Cluster CA Signature Drift Remediation (`_renew_certmanager_leaf_certs`, `chk_certs`)**:
+  - *WHAT*: Integrated CA signature verification into both `chk_certs` (flagging signature mismatches as `INVALID (signed by non-current CA)`) and `_renew_certmanager_leaf_certs` (flagging `invalid_secret = True` and queueing for reissuance).
+  - *WHY*: Ensures `vcf-lab-tuner.py --cluster supervisor --mode remediate` (executed during lab startup Task 2c) automatically detects when leaf certificates have diverged from rotated CAs, forces cert-manager reissuance via `reissue-at` annotation, clears stale `certificaterequest` objects, and performs rolling restarts of mounting workloads.
 
 **3.9.7 — 2026-09-23** — `vcf-lab-tuner.md` v3.9.7 / `vcf-lab-tuner.py` **v2.5.8** / **v2.5.9**.
 

@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 680" width="1060" height="680">
+  <acctitle>Authentik VCF 9.1 SSO and SCIM Architecture</acctitle>
+  <accdescr>High-level system topology diagram showing Holorouter Authentik IdP stack, Site A Management Domain, and Site B Workload Domain integration components.</accdescr>
+  <defs>
+    <style type="text/css">
+      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap");
+      text { font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+      .hdr-title { font-size: 16px; font-weight: 700; fill: #ffffff; }
+      .hdr-sub { font-size: 12px; font-weight: 500; fill: #94a3b8; }
+      .grp-title { font-size: 13px; font-weight: 700; fill: #1e293b; }
+      .grp-sub { font-size: 11px; font-weight: 500; fill: #64748b; }
+      .node-title { font-size: 12px; font-weight: 700; fill: #0f172a; }
+      .node-sub { font-size: 10px; font-weight: 500; fill: #475569; }
+    </style>
+    <marker id="sq-arrow" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 3.5 L 0 7 z" fill="#2563eb"/>
+    </marker>
+    <marker id="sq-arrow-green" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 3.5 L 0 7 z" fill="#16a34a"/>
+    </marker>
+    <marker id="sq-arrow-purple" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 3.5 L 0 7 z" fill="#7c3aed"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1060" height="680" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1" data-graph-role="background" x="0" y="0"/>
+  
+  <!-- Canvas Header -->
+  <rect x="0" y="0" width="1060" height="52" rx="12" fill="#0f172a" data-graph-role="background"/>
+  <rect x="0" y="40" width="1060" height="12" fill="#0f172a" data-graph-role="background"/>
+  <text x="24" y="32" class="hdr-title">Authentik + VCF 9.1 Unified SSO &amp; SCIM Architecture</text>
+  <text x="1036" y="32" class="hdr-sub" text-anchor="end">Holodeck Lab Multi-Site Identity Federation</text>
+
+  <!-- Container 1: Holorouter Gateway & IdP Stack -->
+  <rect x="24" y="68" width="316" height="586" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5" data-graph-role="container"/>
+  <rect x="24" y="68" width="316" height="34" rx="8" fill="#f1f5f9" data-graph-role="decoration"/>
+  <rect x="24" y="94" width="316" height="8" fill="#f1f5f9" data-graph-role="decoration"/>
+  <text x="36" y="90" class="grp-title">Holorouter Gateway &amp; IdP Stack</text>
+
+  <!-- Holorouter Nodes -->
+  <rect x="52" y="112" width="272" height="46" rx="6" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5" data-graph-role="node"/>
+  <text x="64" y="131" class="node-title">NGINX &amp; IPTables Port Forwarder</text>
+  <text x="64" y="146" class="node-sub">HTTP 80/443 | LDAP 389/636 (DNAT to Authentik)</text>
+
+  <!-- Authentik Stack Sub-container -->
+  <rect x="52" y="172" width="272" height="268" rx="6" fill="#f8fafc" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,4" data-graph-role="container"/>
+  <text x="64" y="190" class="grp-sub">Authentik Kubernetes pods</text>
+
+  <rect x="64" y="200" width="255" height="44" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5" data-graph-role="node"/>
+  <text x="76" y="219" class="node-title">Authentik Server (Web / API / OIDC)</text>
+  <text x="76" y="234" class="node-sub">Port 9000/9443 | Issuer: /application/o/vcf/</text>
+
+  <rect x="64" y="266" width="255" height="44" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5" data-graph-role="node"/>
+  <text x="76" y="285" class="node-title">Authentik Worker (Tasks &amp; SCIM Engine)</text>
+  <text x="76" y="300" class="node-sub">SCIM Outgoing Sync &amp; Background Services</text>
+
+  <rect x="64" y="322" width="118" height="44" rx="6" fill="#ffffff" stroke="#64748b" stroke-width="1" data-graph-role="node"/>
+  <text x="74" y="341" class="node-title">PostgreSQL 15</text>
+  <text x="74" y="356" class="node-sub">Identity DB (5432)</text>
+
+  <rect x="194" y="322" width="118" height="44" rx="6" fill="#ffffff" stroke="#64748b" stroke-width="1" data-graph-role="node"/>
+  <text x="204" y="341" class="node-title">Redis 7</text>
+  <text x="204" y="356" class="node-sub">Cache &amp; WS (6379)</text>
+
+  <rect x="64" y="378" width="255" height="60" rx="6" fill="#ffffff" stroke="#7c3aed" stroke-width="1.5" data-graph-role="node"/>
+  <text x="76" y="397" class="node-title">Authentik Outpost (Embedded LDAP)</text>
+  <text x="76" y="412" class="node-sub">Base DN: dc=vcf,dc=lab | Port 3389/6636</text>
+  <text x="76" y="427" class="node-sub">Service Account &amp; Group Mappings</text>
+
+  <rect x="52" y="464" width="272" height="46" rx="6" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5" data-graph-role="node"/>
+  <text x="64" y="483" class="node-title">Squid Forward Proxy (Port 3128)</text>
+  <text x="64" y="498" class="node-sub">ACL Bypass configured for vcf.lab JWKS fetches</text>
+
+  <rect x="52" y="524" width="272" height="46" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5" data-graph-role="node"/>
+  <text x="64" y="543" class="node-title">Vault PKI Root CA (Port 32000)</text>
+  <text x="64" y="558" class="node-sub">Signed TLS Certs for *.site-a.vcf.lab &amp; auth.vcf.lab</text>
+
+
+  <!-- Container 2: Site A Management Domain -->
+  <rect x="367.3" y="66.2" width="332" height="586" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5" data-graph-role="container"/>
+  <rect x="364" y="68" width="332" height="34" rx="8" fill="#f1f5f9" data-graph-role="decoration"/>
+  <rect x="364" y="94" width="332" height="8" fill="#f1f5f9" data-graph-role="decoration"/>
+  <text x="376" y="90" class="grp-title">Management Domain (Site A)</text>
+
+  <!-- User Browser Node -->
+  <rect x="380" y="112" width="300" height="46" rx="6" fill="#f8fafc" stroke="#475569" stroke-width="1.5" data-graph-role="node"/>
+  <text x="392" y="131" class="node-title">Admin / User Browser</text>
+  <text x="392" y="146" class="node-sub">Accesses VCF Ops, vCenter, SDDC Mgr via OIDC SSO</text>
+
+  <!-- vCenter Mgmt Container -->
+  <rect x="380" y="172" width="300" height="110" rx="6" fill="#f8fafc" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,4" data-graph-role="container"/>
+  <text x="392" y="190" class="grp-sub">vCenter Management (vc-mgmt-a.site-a.vcf.lab)</text>
+
+  <rect x="392" y="202" width="132" height="66" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5" data-graph-role="node"/>
+  <text x="402" y="222" class="node-title">WS1B / VIDB Broker</text>
+  <text x="402" y="237" class="node-sub">OIDC IdP Integration</text>
+  <text x="402" y="252" class="node-sub">sub_mode: hashed</text>
+
+  <rect x="536" y="202" width="132" height="66" rx="6" fill="#ffffff" stroke="#16a34a" stroke-width="1.5" data-graph-role="node"/>
+  <text x="546" y="222" class="node-title">SCIM Endpoint</text>
+  <text x="546" y="237" class="node-sub">/usergroup/scim/v2</text>
+  <text x="546" y="252" class="node-sub">User &amp; Group Provisioning</text>
+
+  <!-- VCF Operations Container -->
+  <rect x="375" y="298" width="320" height="110" rx="6" fill="#f8fafc" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,4" data-graph-role="container"/>
+  <text x="387" y="316" class="grp-sub">VCF Operations (ops-a.site-a.vcf.lab)</text>
+
+  <rect x="385.5" y="328" width="138" height="66" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5" data-graph-role="node"/>
+  <text x="395.5" y="348" class="node-title">Fleet LCM / Suite API</text>
+  <text x="398.4" y="363" class="node-sub">OAuth2 Provider Spec</text>
+  <text x="402" y="378" class="node-sub">/suite-api/api/</text>
+
+  <rect x="533.3" y="328" width="150" height="66" rx="6" fill="#ffffff" stroke="#7c3aed" stroke-width="1.5" data-graph-role="node"/>
+  <text x="537.5" y="347.5" class="node-title">Access Control Service</text>
+  <text x="566.5" y="364.7" class="node-sub">Role Mapping</text>
+  <text x="556" y="378.8" class="node-sub">vcf_administrator</text>
+
+  <!-- SDDC Manager Node -->
+  <rect x="380" y="424" width="300" height="46" rx="6" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5" data-graph-role="node"/>
+  <text x="392" y="443" class="node-title">SDDC Manager (sddcmanager-a.site-a.vcf.lab)</text>
+  <text x="392" y="458" class="node-sub">API /v1/tokens Auth &amp; Resource Management</text>
+
+  <!-- DNS & ADCS Node -->
+  <rect x="380" y="484" width="300" height="46" rx="6" fill="#ffffff" stroke="#16a34a" stroke-width="1.5" data-graph-role="node"/>
+  <text x="392" y="503" class="node-title">Technitium DNS &amp; ADCS Proxy (ca.vcf.lab)</text>
+  <text x="392" y="518" class="node-sub">vcf.lab DNS Zone &amp; Certsrv Proxy to Vault</text>
+
+
+  <!-- Container 3: Site B Workload Domain -->
+  <rect x="719.5" y="68" width="316" height="586" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5" data-graph-role="container"/>
+  <rect x="720" y="68" width="316" height="34" rx="8" fill="#f1f5f9" data-graph-role="decoration"/>
+  <rect x="720" y="94" width="316" height="8" fill="#f1f5f9" data-graph-role="decoration"/>
+  <text x="732" y="90" class="grp-title">Workload Domain </text>
+
+  <!-- vCenter WLD Container -->
+  <rect x="736" y="172" width="284" height="110" rx="6" fill="#f8fafc" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,4" data-graph-role="container"/>
+  <text x="748" y="190" class="grp-sub">vCenter Workload (vc-wld01-a.site-a.vcf.lab)</text>
+
+  <rect x="748" y="202" width="124" height="66" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5" data-graph-role="node"/>
+  <text x="758" y="222" class="node-title">WLD VIDB Broker</text>
+  <text x="758" y="237" class="node-sub">OIDC Integration</text>
+
+  <rect x="884" y="202" width="124" height="66" rx="6" fill="#ffffff" stroke="#16a34a" stroke-width="1.5" data-graph-role="node"/>
+  <text x="894" y="222" class="node-title">WLD SCIM Sync</text>
+  <text x="894" y="237" class="node-sub">User Provisioning</text>
+
+  <!-- VCF Automation Container -->
+  <rect x="387" y="538.6" width="284" height="110" rx="6" fill="#f8fafc" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,4" data-graph-role="container"/>
+  <text x="399" y="556.6" class="grp-sub">VCF Automation (auto-a.site-a.vcf.lab)</text>
+
+  <rect x="400" y="569.4" width="124" height="66" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5" data-graph-role="node"/>
+  <text x="410" y="589.4" class="node-title">Fleet IAM Realm</text>
+  <text x="412.1" y="610.7" class="node-sub">SSO Provider Spec</text>
+
+  <rect x="533" y="567.5" width="130" height="66" rx="6" fill="#ffffff" stroke="#7c3aed" stroke-width="1.5" data-graph-role="node"/>
+  <text x="543" y="587.5" class="node-title">K8s Auth Controller</text>
+  <text x="566.5" y="610.7" class="node-sub">Cluster RBAC</text>
+
+  <!-- Workload ESXi & NSX Container -->
+  <rect x="733" y="312.2" width="284" height="106" rx="6" fill="#f8fafc" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,4" data-graph-role="container"/>
+  <text x="745" y="330.2" class="grp-sub">Workload Infrastructure</text>
+
+  <rect x="742" y="346" width="124" height="62" rx="6" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5" data-graph-role="node"/>
+  <text x="752" y="366" class="node-title">NSX Manager</text>
+  <text x="755" y="385.2" class="node-sub">nsx-wld01-01a</text>
+
+  <rect x="880" y="346" width="124" height="62" rx="6" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5" data-graph-role="node"/>
+  <text x="890" y="366" class="node-title">ESXi Clusters</text>
+  <text x="890.9" y="385.1" class="node-sub">esx-01a .. esx-08a</text>
+
+  <!-- Connectors & Data Flow Paths -->
+  <!-- Path 1: User Browser -> NGINX Port Forwarder -->
+  <path d="M 380 135 L 324 135" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#sq-arrow)" data-graph-role="edge"/>
+
+  <!-- Path 2: NGINX -> Authentik Server -->
+  <path d="M 188 158 L 188 200" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#sq-arrow)" data-graph-role="edge"/>
+
+  <!-- Path 3: Authentik Server -> WS1B VIDB (Site A) -->
+  <path d="M 320 222 L 392 222" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#sq-arrow)" data-graph-role="edge"/>
+
+  <!-- Path 4: Authentik Worker -> SCIM Endpoint (Site A): route right at y=274 -->
+  <path d="M 320 284 L 602 284 L 602 268" fill="none" stroke="#16a34a" stroke-width="2" marker-end="url(#sq-arrow-green)" data-graph-role="edge" transform="translate(0, -2)"/>
+
+  <!-- Path 5: WS1B VIDB -> Squid Proxy (JWKS fetch): route right gap x=530 up to y=165, right to x=708, up to y=100, left to x=34, down to y=477 -->
+  <path d="M 524 220 L 530 220 L 530 165 L 708 165 L 708 100 L 34 100 L 34 477 L 52 477" fill="none" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="4,4" marker-end="url(#sq-arrow)" data-graph-role="edge"/>
+
+  <!-- Path 6: Authentik Worker -> WLD SCIM : route right at y=284 -->
+  <path d="M 320 290 L 946 290 L 946 268" fill="none" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="4,4" marker-end="url(#sq-arrow-green)" data-graph-role="edge"/>
+
+  <!-- Path 7: Authentik Server -> VCF Ops Fleet LCM: route out left edge of Server via x=42 -->
+  <path d="M 64 222 L 42 222 L 42 371 L 392 371" fill="none" stroke="#7c3aed" stroke-width="2" marker-end="url(#sq-arrow-purple)" data-graph-role="edge"/>
+</svg>
