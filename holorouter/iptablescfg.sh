@@ -137,6 +137,10 @@ do
    iptables -A FORWARD -d "$ip" -j ACCEPT
 done
 
+# New VLP Agent Testing
+iptables -A FORWARD -p tcp -d 35.227.38.171 --dport 443 -j ACCEPT
+iptables -A FORWARD -p udp -d 35.227.38.171 --dport 443 -j ACCEPT
+
 ### LAB-SPECIFIC RULES
 
 # (add your rules here)
