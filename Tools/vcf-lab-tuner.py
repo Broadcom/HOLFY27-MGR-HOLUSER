@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.7.0 - 2026-10-30
+Version 2.7.1 - 2026-10-30
 Author: HOL Core Team
+v2.7.1: Update so that kubectl operations on supervisor run as full admin instead of the limited supervisor-admin
 v2.7.0: Comprehensive Multi-Cluster vCenter SSO Service Account & Secret Inspection (VSP, Supervisor, VCFA, SSP):
   - Multi-Cluster Secret & Service Account Inspection (_chk_vcenter_sso_service_accounts, _chk_supervisor_vcenter_service_accounts, _test_vcenter_auth, _harden_vcenter_sso_service_accounts):
     * VSP: Proactively discovers and validates vCenter service account credentials from K8s secrets (vcf-sddc-lcm/vcf-iam-vcenter-admin, vmsp-platform/vsp-01a-vcenter-admin-secret, vmsp-platform/vsp-01a-vcenter-main-secret, vmsp-platform/vcenter-main-secret, vmsp-platform/vsp-01a-vsphere-secret, and kube-system/vsphere-config-secret). Validates live REST authentication against vCenter cis/session API, detects expired/drifted passwords, resets them via dir-cli to match secrets, sets --password-never-expires, and reloads dependent services (vcf-sddc-build-service, vsphere-csi-controller).
@@ -1356,7 +1357,7 @@ class VCenterHopTransport:
             f"-o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 "
             f"-o ControlMaster=auto -o ControlPath={inner_dir}/cm-%C -o ControlPersist=300s "
             f"-o ServerAliveInterval=15 -o ServerAliveCountMax=4 "
-            f"root@{self.scp_ip} 'echo {cmd_b64} | base64 -d | bash'; "
+            f"root@{self.scp_ip} 'export KUBECONFIG=/etc/kubernetes/admin.conf; echo {cmd_b64} | base64 -d | bash'; "
             f"rc=$?; rm -f {pwf}; exit $rc"
         )
         return self.vc.exec(hop, timeout=timeout)
