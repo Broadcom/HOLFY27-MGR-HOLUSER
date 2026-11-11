@@ -1,8 +1,8 @@
 # vcf-lab-tuner.py — Design & Reference
 
-**Version 4.0.0 — 2026-10-30**
+**Version 4.0.5 — 2026-11-11**
 **Author:** Burke Azbill and HOL Core Team
-**Status:** `vcf-lab-tuner.py` **v2.7.0**. All four clusters supported (VSP, VCFA, SSP, Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh` **and** `vcfa-stabilizer.sh`, enabling legacy scripts to be safely retired. **Full native certificate renewal engine (v2.0.0)**, dynamic component discovery & SSP cluster parity (v2.1.0), **VCFA single-node leader election hardening, Argo CronWorkflow staggering, Kyverno webhook resilience, and enhanced drift keeper (v2.2.0)**, **cluster-agnostic workload CPU request right-sizing analysis with interactive HTML dashboard export (v2.3.0)**, **expanded top 10 over-allocated workloads terminal summary (v2.3.2)**, **version-aware SDS NACK remediation & 9.1.1+ upstream alignment (v2.4.0)**, **version-aware VCFA resource naming & HA replica evaluation alignment (v2.4.1)**, **two-tier revert to defaults architecture with automated single pre-remediation snapshot retention (v2.5.0)**, **VCF 9.1.1+ native settings alignment & interruption prevention across VCFA & VSP (v2.5.1/v2.5.2)**, **multi-node proxy drift peer node execution fix (v2.5.3)**, **Supervisor cluster VCF 9.1.1+ alignment, ESXi spherelet SSH reachability auto-enable, and pod sweep gating (v2.5.4)**, **VCFA SeaweedFS mTLS certificate freshness check & auth pod backoff recovery (v2.5.5)**, **Supervisor & multi-cluster backing secret & x509 certificate renewal fixes (v2.5.6)**, **VCFA 9.1.1+ native upstream alignment & dedicated 9.1.1+ keeper profiles eliminating obsolete mutations (v2.5.7)**, **config.ini disable_leader_election opt-in gating preventing HelmRelease / vksm-stack upgrade collisions (v2.5.8)**, **resilient SSP workload kubeconfig cache TTL refresh (v2.5.9)**, **upstream Issuer CA cryptographic signature verification & multi-cluster parity (v2.6.0)**, and **comprehensive multi-cluster vCenter SSO service account & Kubernetes secret inspection across VSP, Supervisor, VCFA, and SSP (v2.7.0)**. Remediation implemented for every section, keeper management working, deprecation banners applied, and offline unit test suite passing. Validated live on DevPod.
+**Status:** `vcf-lab-tuner.py` **v2.7.6**. All four clusters supported (VSP, VCFA, SSP, Supervisor). **Achieved 100% functional parity with** `vsp-stabilizer.sh` **and** `vcfa-stabilizer.sh`, enabling legacy scripts to be safely retired. **Full native certificate renewal engine (v2.0.0)**, dynamic component discovery & SSP cluster parity (v2.1.0), **VCFA single-node leader election hardening, Argo CronWorkflow staggering, Kyverno webhook resilience, and enhanced drift keeper (v2.2.0)**, **cluster-agnostic workload CPU request right-sizing analysis with interactive HTML dashboard export (v2.3.0)**, **expanded top 10 over-allocated workloads terminal summary (v2.3.2)**, **version-aware SDS NACK remediation & 9.1.1+ upstream alignment (v2.4.0)**, **version-aware VCFA resource naming & HA replica evaluation alignment (v2.4.1)**, **two-tier revert to defaults architecture with automated single pre-remediation snapshot retention (v2.5.0)**, **VCF 9.1.1+ native settings alignment & interruption prevention across VCFA & VSP (v2.5.1/v2.5.2)**, **multi-node proxy drift peer node execution fix (v2.5.3)**, **Supervisor cluster VCF 9.1.1+ alignment, ESXi spherelet SSH reachability auto-enable, and pod sweep gating (v2.5.4)**, **VCFA SeaweedFS mTLS certificate freshness check & auth pod backoff recovery (v2.5.5)**, **Supervisor & multi-cluster backing secret & x509 certificate renewal fixes (v2.5.6)**, **VCFA 9.1.1+ native upstream alignment & dedicated 9.1.1+ keeper profiles eliminating obsolete mutations (v2.5.7)**, **config.ini disable_leader_election opt-in gating preventing HelmRelease / vksm-stack upgrade collisions (v2.5.8)**, **resilient SSP workload kubeconfig cache TTL refresh (v2.5.9)**, **upstream Issuer CA cryptographic signature verification & multi-cluster parity (v2.6.0)**, **comprehensive multi-cluster vCenter SSO service account & Kubernetes secret inspection across VSP, Supervisor, VCFA, and SSP (v2.7.0)**, **full vCenter service account discovery with per-account outcomes (v2.7.2)**, **verified SSP operator password recovery from its Kubernetes secret (v2.7.3)**, and **fallback recovery from `vsphere-config-secret` (v2.7.4)**, and **failing checks for unresolved expired accounts (v2.7.5)**, and **graceful zero exit after every completed run (v2.7.6)**. Remediation implemented for every section, keeper management working, deprecation banners applied, and offline unit test suite passing. Validated live on DevPod.
 
 ---
 
@@ -153,7 +153,7 @@ sequenceDiagram
     MGR->>VC: ssh root (hop 1)
     VC->>SCP: ssh root (hop 2, via decryptK8Pwd.py)
     MGR->>ESX: ssh root (spherelet certs only)
-    MGR-->>OP: rows + RESULT summary + exit code
+    MGR-->>OP: rows + RESULT summary (process exits 0)
 ```
 
 Why manager-side and not on a node: VSP/VCFA control-plane nodes are CAPI cattle and get
@@ -302,7 +302,7 @@ typos in scripted use.
 | Mode             | Mutates?            | Use it when                                                                                                                                                                                            |
 | ---------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `report`         | No                  | You want the full picture. This is the `vsp-health.py` / `auto-health.py` experience                                                                                                                   |
-| `preflight`      | No                  | You want a verdict and an exit code — CI, a gate before an upgrade, a pre-change check                                                                                                                |
+| `preflight`      | No                  | You want a read-only verdict in the result rows or JSON before an upgrade or other change                                                                                                             |
 | `tune`           | Durable config only | Template prep, or re-asserting configuration on a healthy lab. **Never restarts anything**                                                                                                             |
 | `remediate`      | Yes                 | Something is broken now and you want it fixed                                                                                                                                                          |
 | `snapshot`       | No (writes file)    | Explicitly capture pre-remediation live cluster state bundle. Purges older snapshots to strictly retain 1 file (`snapshot-latest.json`)                                                               |
@@ -422,9 +422,9 @@ interaction anywhere, so instead every target flag requires `--section sizing` e
 `--dry-run` is the preview mechanism, exactly like every other section.
 - **Single credential source.** No `--password-file`/`--creds-file`/`VC_PASSWORD` override — this tool
 always reads `/home/holuser/creds.txt`, same as every other section.
-- **Exit codes stay within this tool's 0/1/2 scheme**, not the source script's 0/1/2/3. A
-timed-out/failed resize step renders as a `warn`/`fail` `CheckResult` and folds into the normal
-`RESULT: n/N checks passed` summary rather than a distinct exit code.
+- **Completed runs exit `0`.** A timed-out or failed resize step renders as a `warn`/`fail`
+`CheckResult` and appears in the normal `RESULT: n/N checks passed` summary. Invalid
+command-line arguments exit `2` before a run starts.
 
 ### `vsp-health-monitor.py` — the 20 remediating checks
 
@@ -596,12 +596,11 @@ python3 Tools/vcf-lab-tuner.py --cluster supervisor --mode report
 python3 Tools/vcf-lab-tuner.py --cluster all --mode report
 ```
 
-### Verdict + exit code, for scripting
+### Verdict for scripting
 
 ```bash
-# 0 = all passed, 1 = something failed, 2 = cannot connect
+# Completed runs exit 0; inspect the result rows or --json for failures.
 python3 Tools/vcf-lab-tuner.py --cluster all --mode preflight
-echo "verdict: $?"
 ```
 
 ### Machine-readable
@@ -1261,6 +1260,28 @@ cross-script locking.
 
 ## 15. Changelog
 
+**4.0.5 — 2026-11-11** — `vcf-lab-tuner.md` v4.0.5 / `vcf-lab-tuner.py` **v2.7.6**.
+
+- Completed runs now exit `0` in every mode, including runs with failed checks or unreachable clusters. The terminal retains red X and green check rows; JSON retains `checks_failed` and `healthy` for callers that need a verdict. Invalid command-line arguments still exit `2` before a run begins.
+
+**4.0.4 — 2026-11-11** — `vcf-lab-tuner.md` v4.0.4 / `vcf-lab-tuner.py` **v2.7.5**.
+
+- An unresolved expired account, failed lookup, or failed hardening produces a red failing check. Accounts with a known secret are reset and verified; accounts without a known password source are reported for intervention rather than reset to an arbitrary password.
+
+**4.0.3 — 2026-11-11** — `vcf-lab-tuner.md` v4.0.3 / `vcf-lab-tuner.py` **v2.7.4**.
+
+- Uses `ssp/vsphere-config-secret` as a fallback source for the SSP operator's vCenter credential when the `ssp` secret is unavailable. The embedded vSphere config provides both the account name and password.
+
+**4.0.2 — 2026-11-11** — `vcf-lab-tuner.md` v4.0.2 / `vcf-lab-tuner.py` **v2.7.3**.
+
+- The SSP password check reads the `ssp` secret directly, even when bulk secret discovery fails, and uses its credential to reset an expired `ssp-op-*` SSO account.
+- A remediation is reported as successful only after the stored credential authenticates and vCenter confirms that the password is unexpired and set to never expire.
+
+**4.0.1 — 2026-11-11** — `vcf-lab-tuner.md` v4.0.1 / `vcf-lab-tuner.py` **v2.7.2**.
+
+- Checks every account returned by `dir-cli svcaccount list`, without a name-prefix filter, and lists each account's hardening or failure status beneath its vCenter summary.
+- Aligns the Python header and runtime `VERSION`/`DATE` constants with this release.
+
 **4.0.0 — 2026-10-30** — `vcf-lab-tuner.md` v4.0.0 / `vcf-lab-tuner.py` **v2.7.0**.
 
 ### Comprehensive Multi-Cluster vCenter SSO Service Account & Secret Inspection (VSP, Supervisor, VCFA, SSP)
@@ -1271,7 +1292,7 @@ cross-script locking.
   - *WHAT*: Implemented end-to-end vCenter service account credential discovery, live REST session validation (`POST /rest/com/vmware/cis/session`), and automated SSO password realignment across all Kubernetes clusters (`vsp`, `vcfa`, `supervisor`, `ssp`).
   - *WHY*: In VCF 9.x, internal Kubernetes microservices and CSI drivers authenticate to vCenter using unique SSO service accounts (`svc-vcfsp-vc-*`, `svc-vcf-sddc-lcm-*`, `wcp-*-user`, `svc-sddcmanager-*`). Because vCenter enforces a default 90-day password expiration policy, these service accounts expire over time (or drift during upgrades), causing cascading failures such as CSI CrashLoopBackOff, local container registry (`zot`) volume attachment stalls, Argo workflow mutex deadlocks, and SDDC build service VM power-off failures.
 - **Universal vCenter Service Account Expiration Hardening (`_harden_vcenter_sso_service_accounts`)**:
-  - *WHAT*: Fast remote audit across all discovered vCenters (`vc-mgmt-a` and `vc-wld01-a` across sites). Automatically identifies all service accounts returned by `dir-cli svcaccount list` (`svc-*`, `wcp-*`, `nsxt_*`) and sets `Password never expires: TRUE` via `dir-cli user modify --password-never-expires`.
+  - *WHAT*: Fast remote audit across all discovered vCenters (`vc-mgmt-a` and `vc-wld01-a` across sites). Checks every service account returned by `dir-cli svcaccount list`, regardless of name, and sets `Password never expires: TRUE` via `dir-cli user modify --password-never-expires`. The password section lists each account and its outcome beneath the vCenter summary; lookup, update, and verification failures are reported separately.
   - *WHY*: Eliminates the root cause of service account expiration across all lab environments. Accounts no longer expire after 90 days, permanently preventing post-startup and graceful shutdown failures.
 - **Cluster-Specific Secret Coverage**:
   - *VSP*: Validates and realigns `vcf-sddc-lcm/vcf-iam-vcenter-admin` (`svc-vcf-sddc-lcm-VCENTER-*`), `vmsp-platform/vsp-01a-vcenter-admin-secret` (`svc-vcfsp-vc-admin-*`), `vmsp-platform/vsp-01a-vcenter-main-secret`, `vmsp-platform/vsp-01a-vsphere-secret`, and `kube-system/vsphere-config-secret` (CSI driver). Automatically rollout-restarts dependent services (`vcf-sddc-build-service`) when credentials are recovered.
@@ -1915,7 +1936,7 @@ and its state, explains the 60-second fight, and prints the exact removal comman
   `0 CP / N Worker` because the node list was never fetched reads as a finding rather than as
    missing data.
 
-Also verified: exit codes `0`/`1`/`2` under real conditions; all four usage gates error correctly
+Historical validation before v2.7.6 verified exit codes `0`/`1`/`2` under real conditions; all four usage gates error correctly
 (keeper in read-only mode, mutually exclusive keeper flags, section-not-valid-for-cluster, bad flag);
 `--json` still parses standalone with the new sections.
 
@@ -1949,8 +1970,7 @@ reports `kube-apiserver: Running`, which the legacy `cp` section omits.
 - **F4 regression test**: `Runner.write()` raises in `preflight`/`report`; under `--dry-run` the
 transport is provably not reached while intent is recorded in `runner.planned`; the `futile` tier is
 refused outright.
-- **Exit codes**: `0` healthy, `2` unreachable, `2` on a bad flag (deliberately *not* `auto-health.py`'s
-help-and-exit-0 behaviour).
+- **Exit codes**: Current releases exit `0` after a completed run, including check failures and unreachable targets. Invalid command-line arguments exit `2` before a run starts.
 - `--json`: parses standalone, labelled keys, carries `residual_days`.
 
 Known parity gap: the pods section lacks the CP-vs-Worker breakdown `vsp-health.py` v2.9.0 added.
