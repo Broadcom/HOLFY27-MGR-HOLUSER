@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.7.2 - 2026-11-11
+Version 2.7.6 - 2026-11-11
 Author: HOL Core Team
+v2.7.6: Keep red failure rows and JSON health status, but exit zero after every completed run so findings never stop the startup pipeline.
+v2.7.5: Treat unresolved expired or failed vCenter service-account checks as failures so remediation cannot report a healthy exit while an account still needs repair.
+v2.7.4: Use SSP vsphere-config-secret as a fallback source for the operator's vCenter password when the ssp secret is unavailable.
+v2.7.3: Recover expired SSP operator SSO passwords from the configured SSP secret and verify the reset before reporting success.
 v2.7.2: Audit every vCenter SSO service account returned by dir-cli, enforce password-never-expires, and list each account's outcome under the vCenter summary.
 v2.7.1: Update so that kubectl operations on supervisor run as full admin instead of the limited supervisor-admin
 v2.7.0: Comprehensive Multi-Cluster vCenter SSO Service Account & Secret Inspection (VSP, Supervisor, VCFA, SSP):
@@ -548,9 +552,8 @@ keeper management only under --mode tune. Both honour --dry-run, which cannot
 reach the transport at all.
 
 Exit codes:
-  0  All checks passed
-  1  One or more checks failed
-  2  Cannot connect to the target cluster
+  0  Completed run, including runs with failed checks or unreachable clusters
+  2  Invalid command-line arguments (the run did not start)
 """
 
 import argparse
@@ -586,7 +589,7 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.7.2"
+VERSION = "2.7.6"
 DATE    = "2026-11-11"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
@@ -1629,8 +1632,9 @@ def get_password():
             with open(CREDS_FILE) as fh:
                 _cached_password = fh.readline().strip()
         except OSError as exc:
-            emit(f"{_RED}ERROR:{_NC} Cannot read {CREDS_FILE}: {exc}", stderr=True)
-            sys.exit(2)
+            raise OSError(f"Cannot read {CREDS_FILE}: {exc}") from exc
+        if not _cached_password:
+            raise OSError(f"No password found in {CREDS_FILE}")
     return _cached_password
 
 
@@ -6068,7 +6072,7 @@ def _sso_audit_result(key, label, cluster, audit):
         counts += f"; {len(expired)} expired"
     if failed:
         counts += f"; {len(failed)} failed"
-    result = warn(key, label, counts, cluster=cluster) if expired or failed else ok(key, label, counts, cluster=cluster)
+    result = fail(key, label, counts, cluster=cluster) if expired or failed else ok(key, label, counts, cluster=cluster)
     result.items = ([f"{acct}: hardened (never expires)" for acct in modified]
                     + [f"{acct}: up-to-date (never expires)" for acct in up_to_date]
                     + [f"{acct}: expired; password reset needed" for acct in expired]
@@ -6102,6 +6106,12 @@ def _chk_vcenter_sso_service_accounts(r, ctx):
             ("vmsp-platform", "vsp-01a-vcenter-main-secret", "vCenterUsername", "vCenterPassword", mgmt_vc, "vsphere.local", "VCFA vCenter Main secret", None, False),
         ]
     elif cl == "ssp":
+        # Read the operator credential directly even if bulk secret discovery is
+        # unavailable during startup. It is the source for expired ssp-op-* users.
+        targets = [("ssp", "ssp", "username", "password", mgmt_vc,
+                    "vsphere.local", "SSP ssp secret", None, False),
+                   ("ssp", "vsphere-config-secret", "data", "data", mgmt_vc,
+                    "vsphere.local", "SSP vSphere config secret", None, False)]
         rc_sec, raw_sec = r.read("kubectl -n ssp get secrets -o json 2>/dev/null", 30)
         if rc_sec == 0 and raw_sec and "{" in raw_sec:
             try:
@@ -6109,7 +6119,7 @@ def _chk_vcenter_sso_service_accounts(r, ctx):
                 for sitem in sec_data.get("items", []):
                     sname = sitem.get("metadata", {}).get("name", "")
                     skeys = sitem.get("data", {}).keys()
-                    if "username" in skeys and "password" in skeys:
+                    if sname != "ssp" and "username" in skeys and "password" in skeys:
                         targets.append(("ssp", sname, "username", "password", mgmt_vc, "vsphere.local", f"SSP {sname} secret", None, False))
             except Exception:
                 pass
@@ -6129,7 +6139,19 @@ def _chk_vcenter_sso_service_accounts(r, ctx):
         raw_pass = ""
         vc_target = def_host
 
-        if ukey == "csi-vsphere.conf":
+        if ukey == "data" and pkey == "data":
+            try:
+                config_text = base64.b64decode(data.get("data", "")).decode("utf-8")
+                user_match = re.search(r'^\s*user\s*=\s*"([^"]+)"', config_text, re.MULTILINE)
+                pass_match = re.search(r'^\s*password\s*=\s*"([^"]+)"', config_text, re.MULTILINE)
+                if user_match and pass_match:
+                    raw_user, raw_pass = user_match.group(1), pass_match.group(1)
+                vc_match = re.search(r'^\s*\[VirtualCenter\s+"([^"]+)"\]', config_text, re.MULTILINE)
+                if vc_match:
+                    vc_target = vc_match.group(1)
+            except (ValueError, UnicodeError):
+                pass
+        elif ukey == "csi-vsphere.conf":
             b64_c = data.get("csi-vsphere.conf") or ""
             if b64_c:
                 try:
@@ -6201,19 +6223,46 @@ def _chk_vcenter_sso_service_accounts(r, ctx):
                 row.action = f"would realign password via dir-cli on {vc_target} and set never-expires"
             else:
                 actions = []
+                repair_errors = []
                 if not auth_ok or is_expired:
-                    vc_trans.exec(
+                    reset_rc, _ = vc_trans.exec(
                         f"/usr/lib/vmware-vmafd/bin/dir-cli password reset --account {acct} "
                         f"--new {shlex.quote(raw_pass)} --login administrator@{domain} "
                         f"--password {shlex.quote(admin_pw)}", 45)
-                    actions.append("password reset")
+                    if reset_rc == 0:
+                        actions.append("password reset")
+                    else:
+                        repair_errors.append(f"password reset failed (exit {reset_rc})")
 
-                if not never_expires or is_expired:
-                    vc_trans.exec(
+                if not never_expires:
+                    modify_rc, _ = vc_trans.exec(
                         f"/usr/lib/vmware-vmafd/bin/dir-cli user modify --account {acct} "
-                        f"--password-never-expires --account-unlocked --login administrator@{domain} "
+                        f"--password-never-expires --login administrator@{domain} "
                         f"--password {shlex.quote(admin_pw)}", 30)
-                    actions.append("password-never-expires set")
+                    if modify_rc == 0:
+                        actions.append("password-never-expires set")
+                    else:
+                        repair_errors.append(f"never-expires update failed (exit {modify_rc})")
+
+                verify_rc, verify_out = vc_trans.exec(
+                    f"/usr/lib/vmware-vmafd/bin/dir-cli user find-by-name --account {acct} "
+                    f"--login administrator@{domain} --password {shlex.quote(admin_pw)} --level 2", 30)
+                verified_auth, verify_code = _test_vcenter_auth(vc_target, user_upn, raw_pass)
+                verified = (verify_rc == 0 and verified_auth
+                            and "Password expired: FALSE" in verify_out
+                            and "Password never expires: TRUE" in verify_out)
+                if not verified:
+                    if not verified_auth:
+                        repair_errors.append(f"authentication still failed (HTTP {verify_code})")
+                    if verify_rc != 0 or "Password expired: TRUE" in verify_out:
+                        repair_errors.append("SSO password still expired or unreadable")
+                    if "Password never expires: TRUE" not in verify_out:
+                        repair_errors.append("never-expires not verified")
+
+                if repair_errors:
+                    row.detail = "; ".join(repair_errors)
+                    out.append(row)
+                    continue
 
                 if restart_dep and (not auth_ok or is_expired):
                     r.write(f"kubectl rollout restart deployment/{restart_dep[1]} -n {restart_dep[0]}",
@@ -11395,12 +11444,13 @@ def run_cluster(name, args, password):
         host, tried = resolve_entry_point(cfg, args.host, password)
         if not host:
             section(f"{cfg['label']} — UNREACHABLE")
-            emit(f"\n{_RED}ERROR:{_NC} Cannot SSH to any {cfg['label']} candidate "
-                 f"as {cfg['user']}.")
+            res = fail(f"{name}.unreachable", f"{cfg['label']}: reachable",
+                       f"cannot SSH to any candidate as {cfg['user']}", cluster=name)
+            row(res)
             emit(f"  Tried: {', '.join(tried) if tried else '(none)'}")
             emit(f"  Specify one directly: python3 vcf-lab-tuner.py "
                  f"--cluster {name} --host <IP>")
-            return [], 2
+            return [res], None
         if name == "ssp":
             transport = SSPTransport(host, cfg["user"], password, cfg["sudo"])
         else:
@@ -11618,7 +11668,8 @@ def show_help():
     emit(f"    {_GREEN}# Reset VCFA cluster to vendor stock 9.1.1 defaults (Flux CD + stock manifests){_NC}")
     emit(f"    python3 vcf-lab-tuner.py --cluster vcfa --mode reset-defaults --dry-run\n")
     emit(f"{_BOLD}EXIT CODES:{_NC}")
-    emit(f"    0  All checks passed    1  One or more failed    2  Cannot connect")
+    emit(f"    0  Run completed (check failures are shown as red X rows)")
+    emit(f"    2  Invalid command-line arguments (run did not start)")
     sys.exit(0)
 
 
@@ -11797,27 +11848,47 @@ def main():
                  f"cluster '{args.cluster}' in v{VERSION}.", stderr=True)
             sys.exit(2)
 
-    password = get_password()
+    try:
+        password = get_password()
+    except OSError as exc:
+        res = fail("startup.credentials", "lab credentials: readable", str(exc))
+        if args.json:
+            json.dump({"tool": "vcf-lab-tuner.py", "version": VERSION,
+                       "mode": args.mode, "dry_run": args.dry_run,
+                       "checks_total": 1, "checks_failed": 1,
+                       "checks_warned": 0, "actions_taken": 0,
+                       "healthy": False, "results": [res.as_dict()]}, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        else:
+            row(res)
+            emit(f"  {_RED}RESULT: 0/1 checks passed{_NC}  "
+                 f"{_RED}1 check requires attention{_NC}")
+        sys.exit(0)
     started = datetime.now()
     all_results = []
-    exit_code = 0
 
     for name in targets:
         if args.section and args.section not in CLUSTERS[name]["sections"]:
             continue
-        results, hard = run_cluster(name, args, password)
+        try:
+            results, hard = run_cluster(name, args, password)
+        except Exception as exc:
+            res = fail(f"{name}.run", f"{name}: run completed",
+                       f"unexpected error: {exc}", cluster=name)
+            row(res)
+            results, hard = [res], None
         all_results.extend(results)
-        if hard is not None:
-            exit_code = max(exit_code, hard)
+        if hard and not any(r.state == "fail" for r in results):
+            res = fail(f"{name}.run", f"{name}: run completed",
+                       f"cluster could not complete (status {hard})", cluster=name)
+            row(res)
+            all_results.append(res)
 
     total = len(all_results)
     acted = sum(1 for r in all_results if r.action)
     failed = sum(1 for r in all_results if r.state == "fail")
     warned = sum(1 for r in all_results if r.state == "warn")
     elapsed = (datetime.now() - started).total_seconds()
-
-    if failed:
-        exit_code = max(exit_code, 1)
 
     if not args.json:
         color = _GREEN if failed == 0 else _RED
@@ -11852,7 +11923,7 @@ def main():
         }, sys.stdout, indent=2)
         sys.stdout.write("\n")
 
-    sys.exit(exit_code)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
