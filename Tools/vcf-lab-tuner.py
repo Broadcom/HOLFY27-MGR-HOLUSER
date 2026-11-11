@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.7.6 - 2026-11-11
+Version 2.7.7 - 2026-11-11
 Author: HOL Core Team
+v2.7.7: Reapply the vCenter never-expires policy after resetting an expired SSO password, even when that flag was already true, and verify both status fields.
 v2.7.6: Keep red failure rows and JSON health status, but exit zero after every completed run so findings never stop the startup pipeline.
 v2.7.5: Treat unresolved expired or failed vCenter service-account checks as failures so remediation cannot report a healthy exit while an account still needs repair.
 v2.7.4: Use SSP vsphere-config-secret as a fallback source for the operator's vCenter password when the ssp secret is unavailable.
@@ -589,7 +590,7 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.7.6"
+VERSION = "2.7.7"
 DATE    = "2026-11-11"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
@@ -6025,7 +6026,7 @@ printf '%s\n' "$listing" | awk '/^[[:space:]]*[0-9]+\\.[[:space:]]+/ {{ sub(/^[[
         continue
     fi
     changed=0
-    if printf '%s\n' "$res" | grep -Fq 'Password never expires: FALSE'; then
+    if printf '%s\n' "$res" | grep -Fq 'Password never expires: FALSE' || printf '%s\n' "$res" | grep -Fq 'Password expired: TRUE'; then
         if ! /usr/lib/vmware-vmafd/bin/dir-cli user modify --account "$acct" --password-never-expires --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} >/dev/null 2>&1; then
             echo "FAILED:$acct (update failed)"
             continue
@@ -6234,7 +6235,7 @@ def _chk_vcenter_sso_service_accounts(r, ctx):
                     else:
                         repair_errors.append(f"password reset failed (exit {reset_rc})")
 
-                if not never_expires:
+                if not never_expires or is_expired:
                     modify_rc, _ = vc_trans.exec(
                         f"/usr/lib/vmware-vmafd/bin/dir-cli user modify --account {acct} "
                         f"--password-never-expires --login administrator@{domain} "

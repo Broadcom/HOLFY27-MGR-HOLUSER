@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.58 - 2026-10-19
+# Version 6.3.60 - 2026-11-11
 # Author - Burke Azbill and HOL Core Team
-# VCF final tasks (Tanzu, VCF Automation)
+# VCF final tasks (Tanzu, VCF Automation, SSP)
+#
+# v6.3.60 Changes:
+# - Stream SSP vcf-lab-tuner.py output to labstartup.log as each line arrives,
+#   matching the existing VSP, Supervisor, and VCFA tuner calls.
+#
+# v6.3.59 Changes:
+# - Run vcf-lab-tuner.py --cluster ssp --mode remediate when an uncommented
+#   ssp-* VM entry is present under [RESOURCES] VMs in config.ini.
 #
 # v6.3.58 Changes:
 # - Task 5: Replaced hard failure on VCFA_URL_MAX_RETRIES with non-fatal failure logging
@@ -643,7 +651,7 @@ opslogs_probe_state = {
 #==============================================================================
 
 MODULE_NAME = 'VCFfinal'
-MODULE_DESCRIPTION = 'VCF final tasks (Tanzu, VCF Automation)'
+MODULE_DESCRIPTION = 'VCF final tasks (Tanzu, VCF Automation, SSP)'
 
 # VCF Automation URL check configuration
 VCFA_URL_MAX_RETRIES = 30  # Maximum attempts (30 minutes total)
@@ -748,6 +756,65 @@ def is_already_completed():
 #==============================================================================
 # HELPER FUNCTIONS
 #==============================================================================
+
+def _configured_ssp_vms(lsf):
+    """Return active SSP VM entries from config.ini [RESOURCES] VMs."""
+    return [entry for entry in lsf.get_config_list('RESOURCES', 'VMs')
+            if entry.split(':', 1)[0].strip().lower().startswith('ssp-')]
+
+
+def _run_ssp_stabilization(lsf, dry_run=False):
+    """Run the lab tuner once when SSP VMs are configured."""
+    ssp_vms = _configured_ssp_vms(lsf)
+    if not ssp_vms:
+        lsf.write_output('No active SSP VMs in [RESOURCES] VMs — skipping SSP stabilization')
+        return
+
+    tuner_script = '/home/holuser/hol/Tools/vcf-lab-tuner.py'
+    if not os.path.isfile(tuner_script):
+        lsf.write_output(f'  vcf-lab-tuner.py not found: {tuner_script} — skipping SSP stabilization')
+        return
+
+    cmd = ['python3', '-u', tuner_script, '--cluster', 'ssp', '--mode', 'remediate']
+    if dry_run:
+        cmd.append('--dry-run')
+    env = os.environ.copy()
+    env['PYTHONUNBUFFERED'] = '1'
+    lsf.write_output(f'Running SSP stabilization via vcf-lab-tuner.py ({len(ssp_vms)} configured VM entry/entries)...')
+    proc = None
+    timeout_timer = None
+    timed_out = threading.Event()
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1, env=env)
+
+        def _stop_on_timeout():
+            if proc.poll() is None:
+                timed_out.set()
+                proc.kill()
+
+        timeout_timer = threading.Timer(1800, _stop_on_timeout)
+        timeout_timer.daemon = True
+        timeout_timer.start()
+        for line in proc.stdout:
+            if line.strip():
+                lsf.write_output(f'    {line.strip()}')
+        proc.wait()
+        if timed_out.is_set():
+            lsf.write_output('  WARNING: SSP lab tuner timed out — continuing')
+        elif proc.returncode == 0:
+            lsf.write_output('SSP stabilization completed successfully')
+        else:
+            lsf.write_output(f'  WARNING: SSP lab tuner exited with code {proc.returncode} — continuing')
+    except Exception as exc:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        lsf.write_output(f'  WARNING: SSP lab tuner execution failed: {exc}')
+    finally:
+        if timeout_timer is not None:
+            timeout_timer.cancel()
+
 
 def _run_opslogs_background_probe(url, expected, lsf, dashboard=None, dry_run=False):
     """
@@ -4404,6 +4471,9 @@ echo "PROXY_CONFIGURED"
             dashboard.update_task('vcffinal', 'vcfa_k8s_health', TaskStatus.SKIPPED,
                                   'VCF Automation not configured')
             dashboard.generate_html()
+
+    # SSP runs independently of VCFA when an active SSP VM is configured.
+    _run_ssp_stabilization(lsf, dry_run=dry_run)
     
     #==========================================================================
     # TASK 5: Check VCF Automation URLs
