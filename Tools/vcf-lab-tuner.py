@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 vcf-lab-tuner.py
-Version 2.7.1 - 2026-10-30
+Version 2.7.2 - 2026-11-11
 Author: HOL Core Team
+v2.7.2: Audit every vCenter SSO service account returned by dir-cli, enforce password-never-expires, and list each account's outcome under the vCenter summary.
 v2.7.1: Update so that kubectl operations on supervisor run as full admin instead of the limited supervisor-admin
 v2.7.0: Comprehensive Multi-Cluster vCenter SSO Service Account & Secret Inspection (VSP, Supervisor, VCFA, SSP):
   - Multi-Cluster Secret & Service Account Inspection (_chk_vcenter_sso_service_accounts, _chk_supervisor_vcenter_service_accounts, _test_vcenter_auth, _harden_vcenter_sso_service_accounts):
@@ -10,7 +11,7 @@ v2.7.0: Comprehensive Multi-Cluster vCenter SSO Service Account & Secret Inspect
     * Supervisor: In chk_services, inspects the Supervisor's CSI secret (vmware-system-csi/vsphere-config-secret) and tests login against workload vCenter (wld.sso). Inspects and hardens all wcp-*-user and svc-* service accounts on vCenter SSO, enforcing --password-never-expires to prevent WCP/Supervisor 90-day expiration failures.
     * VCFA: Validates CSI secrets (kube-system/vsphere-config-secret, vsphere-cloud-secret) and vmsp-platform secrets, resetting drifted/expired accounts and setting --password-never-expires. Added "password" section to VCFA's default section pipeline.
     * SSP: Inspects CAPI/CAPV VSphereCluster identityRef secrets and namespace credentials against management vCenter SSO, realigning passwords and setting --password-never-expires.
-    * Universal Hardening: Sweeps all vCenter service accounts (svc-*, wcp-*, nsxt_*) across management and workload vCenters and sets --password-never-expires to permanently eliminate 90-day expiration outages across all lab builds.
+    * Universal Hardening: Sweeps every account returned by vCenter dir-cli svcaccount list across management and workload vCenters and sets --password-never-expires; reports each account's outcome.
 
 v2.6.1: vSphere CSI Controller Credential Recovery & SSO Expiration Hardening:
   - CSI Credential Recovery (_remediate_vsphere_csi, chk_edge): Implemented missing vSphere CSI controller credential remediation in chk_edge for VCFA and VSP clusters [KB 435491, KB 326114]. Discovers credentials from vsphere-config-secret and vsphere-cloud-secret, diagnoses authentication failures and expired SSO passwords via dir-cli on management vCenter, realigns the password, enforces --password-never-expires, clears stale leader election leases, and bounces CSI pods to restore container storage operations.
@@ -585,8 +586,8 @@ except Exception:                                    # pragma: no cover
     lsf = None
     _HAVE_LSF = False
 
-VERSION = "2.7.0"
-DATE    = "2026-10-30"
+VERSION = "2.7.2"
+DATE    = "2026-11-11"
 
 CREDS_FILE  = "/home/holuser/creds.txt"
 LOG_FILE    = "/tmp/vcf-lab-tuner.log"
@@ -1095,6 +1096,8 @@ def row(res):
     color = {"pass": _DIM, "fail": _RED, "warn": _YELLOW}[res.state]
     suffix = f"  {color}{res.detail}{_NC}" if res.detail else ""
     emit(f"  {glyph} {res.label}{suffix}")
+    for item in res.items:
+        emit(f"      - {item}")
 
 
 def row_verbose(msg, indent=6):
@@ -1129,12 +1132,14 @@ class CheckResult:
     cluster: str = ""
     residual_days: int | None = None
     action: str | None = None
+    items: list[str] = field(default_factory=list)
 
     def as_dict(self):
         return {
             "key": self.key, "label": self.label, "state": self.state,
             "detail": self.detail, "cluster": self.cluster,
             "residual_days": self.residual_days, "action": self.action,
+            "items": self.items,
         }
 
 
@@ -6001,23 +6006,42 @@ def _test_vcenter_auth(vc_host, user_upn, password):
 
 
 def _harden_vcenter_sso_service_accounts(vc_host, sso_domain, admin_pw):
-    """Audit all service accounts on vCenter and enforce password-never-expires."""
+    """Audit every account returned by dir-cli svcaccount list."""
     vc = VCenterTransport(vc_host, admin_pw)
     script = f'''
-for acct in $(/usr/lib/vmware-vmafd/bin/dir-cli svcaccount list --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} 2>/dev/null | awk -F'. ' '/^[0-9]+\\./ {{print $2}}' | grep -E '^(svc-|wcp-|nsxt_)'); do
+listing=$(/usr/lib/vmware-vmafd/bin/dir-cli svcaccount list --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} 2>&1)
+if [ $? -ne 0 ]; then
+    echo 'ERROR:service account list failed'
+    exit 1
+fi
+printf '%s\n' "$listing" | awk '/^[[:space:]]*[0-9]+\\.[[:space:]]+/ {{ sub(/^[[:space:]]*[0-9]+\\.[[:space:]]+/, ""); print }}' | while IFS= read -r acct; do
     res=$(/usr/lib/vmware-vmafd/bin/dir-cli user find-by-name --account "$acct" --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} --level 2 2>/dev/null)
-    if echo "$res" | grep -q 'Password never expires: FALSE'; then
-        /usr/lib/vmware-vmafd/bin/dir-cli user modify --account "$acct" --password-never-expires --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} >/dev/null 2>&1
-        echo "MODIFIED:$acct"
-    elif echo "$res" | grep -q 'Password expired: TRUE'; then
+    if [ $? -ne 0 ] || ! printf '%s\n' "$res" | grep -Fq 'Password never expires:'; then
+        echo "FAILED:$acct (account lookup failed)"
+        continue
+    fi
+    changed=0
+    if printf '%s\n' "$res" | grep -Fq 'Password never expires: FALSE'; then
+        if ! /usr/lib/vmware-vmafd/bin/dir-cli user modify --account "$acct" --password-never-expires --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} >/dev/null 2>&1; then
+            echo "FAILED:$acct (update failed)"
+            continue
+        fi
+        changed=1
+        res=$(/usr/lib/vmware-vmafd/bin/dir-cli user find-by-name --account "$acct" --login administrator@{sso_domain} --password {shlex.quote(admin_pw)} --level 2 2>/dev/null)
+    fi
+    if printf '%s\n' "$res" | grep -Fq 'Password expired: TRUE'; then
         echo "EXPIRED:$acct"
+    elif ! printf '%s\n' "$res" | grep -Fq 'Password never expires: TRUE'; then
+        echo "FAILED:$acct (never-expires not verified)"
+    elif [ "$changed" -eq 1 ]; then
+        echo "MODIFIED:$acct"
     else
         echo "OK:$acct"
     fi
 done
 '''
-    rc, out = vc.exec(script, timeout=60)
-    modified, expired, ok_accts = [], [], []
+    rc, out = vc.exec(script, timeout=180)
+    modified, expired, ok_accts, failed = [], [], [], []
     if out:
         for line in out.splitlines():
             line = line.strip()
@@ -6027,7 +6051,29 @@ done
                 expired.append(line.split(":", 1)[1].strip())
             elif line.startswith("OK:"):
                 ok_accts.append(line.split(":", 1)[1].strip())
-    return modified, expired, ok_accts
+            elif line.startswith(("FAILED:", "ERROR:")):
+                failed.append(line.split(":", 1)[1].strip())
+    if rc != 0 and "service account list failed" not in failed:
+        failed.append("service account audit failed")
+    if not (modified or expired or ok_accts or failed):
+        failed.append("no service accounts discovered")
+    return modified, expired, ok_accts, failed
+
+
+def _sso_audit_result(key, label, cluster, audit):
+    """Summarize and list each discovered service account with its outcome."""
+    modified, expired, up_to_date, failed = audit
+    counts = f"{len(modified)} hardened; {len(up_to_date)} up-to-date"
+    if expired:
+        counts += f"; {len(expired)} expired"
+    if failed:
+        counts += f"; {len(failed)} failed"
+    result = warn(key, label, counts, cluster=cluster) if expired or failed else ok(key, label, counts, cluster=cluster)
+    result.items = ([f"{acct}: hardened (never expires)" for acct in modified]
+                    + [f"{acct}: up-to-date (never expires)" for acct in up_to_date]
+                    + [f"{acct}: expired; password reset needed" for acct in expired]
+                    + [f"{item}: failed" for item in failed])
+    return result
 
 
 def _chk_vcenter_sso_service_accounts(r, ctx):
@@ -6190,14 +6236,9 @@ def _chk_vcenter_sso_service_accounts(r, ctx):
 
     # Universal hardening across vCenters
     for target_vc, target_dom in [(mgmt_vc, "vsphere.local"), (wld_vc, "wld.sso")]:
-        mod, exp, oks = _harden_vcenter_sso_service_accounts(target_vc, target_dom, admin_pw)
+        audit = _harden_vcenter_sso_service_accounts(target_vc, target_dom, admin_pw)
         vlabel = f"{target_vc} ({target_dom}) service accounts: password-never-expires enforced"
-        if exp:
-            out.append(warn("password.sso_audit", vlabel, f"{len(oks)} active; {len(exp)} orphaned account(s) expired: {', '.join(exp[:3])}", cluster=cl))
-        elif mod:
-            out.append(ok("password.sso_audit", vlabel, f"hardened {len(mod)} account(s); {len(oks)} up-to-date", cluster=cl))
-        else:
-            out.append(ok("password.sso_audit", vlabel, f"all {len(oks)} accounts up-to-date (never expires)", cluster=cl))
+        out.append(_sso_audit_result("password.sso_audit", vlabel, cl, audit))
 
     return out
 
@@ -6213,14 +6254,9 @@ def _chk_supervisor_vcenter_service_accounts(r, ctx):
     domain = "wld.sso" if "wld" in target_vc else "vsphere.local"
 
     # 1. Universal hardening of wcp-* and svc-* service accounts on target vCenter
-    mod, exp, oks = _harden_vcenter_sso_service_accounts(target_vc, domain, admin_pw)
+    audit = _harden_vcenter_sso_service_accounts(target_vc, domain, admin_pw)
     vlabel = f"{target_vc} ({domain}) WCP service accounts: password-never-expires enforced"
-    if exp:
-        out.append(warn("services.sso_audit", vlabel, f"{len(oks)} active; {len(exp)} expired account(s): {', '.join(exp[:3])}", cluster=cl))
-    elif mod:
-        out.append(ok("services.sso_audit", vlabel, f"hardened {len(mod)} account(s); {len(oks)} up-to-date", cluster=cl))
-    else:
-        out.append(ok("services.sso_audit", vlabel, f"all {len(oks)} accounts up-to-date (never expires)", cluster=cl))
+    out.append(_sso_audit_result("services.sso_audit", vlabel, cl, audit))
 
     # 2. Inspect vmware-system-csi/vsphere-config-secret on the Supervisor control plane
     rc, raw_conf = r.read("kubectl get secret vsphere-config-secret -n vmware-system-csi -o jsonpath='{.data.vsphere-cloud-provider\\.conf}' 2>/dev/null", 30)
