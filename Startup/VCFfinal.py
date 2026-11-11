@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # VCFfinal.py - HOLFY27 Core VCF Final Tasks Module
-# Version 6.3.60 - 2026-11-11
+# Version 6.3.61 - 2026-11-11
 # Author - Burke Azbill and HOL Core Team
 # VCF final tasks (Tanzu, VCF Automation, SSP)
+#
+# v6.3.61 Changes:
+# - Run the SSP password remediation section before full SSP remediation so
+#   expired vCenter SSO credentials are repaired before dependent pods recover.
 #
 # v6.3.60 Changes:
 # - Stream SSP vcf-lab-tuner.py output to labstartup.log as each line arrives,
@@ -764,7 +768,7 @@ def _configured_ssp_vms(lsf):
 
 
 def _run_ssp_stabilization(lsf, dry_run=False):
-    """Run the lab tuner once when SSP VMs are configured."""
+    """Repair SSP passwords before running the full stabilization pass."""
     ssp_vms = _configured_ssp_vms(lsf)
     if not ssp_vms:
         lsf.write_output('No active SSP VMs in [RESOURCES] VMs — skipping SSP stabilization')
@@ -775,45 +779,49 @@ def _run_ssp_stabilization(lsf, dry_run=False):
         lsf.write_output(f'  vcf-lab-tuner.py not found: {tuner_script} — skipping SSP stabilization')
         return
 
-    cmd = ['python3', '-u', tuner_script, '--cluster', 'ssp', '--mode', 'remediate']
-    if dry_run:
-        cmd.append('--dry-run')
+    base_cmd = ['python3', '-u', tuner_script, '--cluster', 'ssp', '--mode', 'remediate']
     env = os.environ.copy()
     env['PYTHONUNBUFFERED'] = '1'
     lsf.write_output(f'Running SSP stabilization via vcf-lab-tuner.py ({len(ssp_vms)} configured VM entry/entries)...')
-    proc = None
-    timeout_timer = None
-    timed_out = threading.Event()
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1, env=env)
+    for pass_name, extra_args in (("password remediation", ['--section', 'password']),
+                                  ("full remediation", [])):
+        cmd = base_cmd + extra_args
+        if dry_run:
+            cmd.append('--dry-run')
+        lsf.write_output(f'  Starting SSP {pass_name}...')
+        proc = None
+        timeout_timer = None
+        timed_out = threading.Event()
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1, env=env)
 
-        def _stop_on_timeout():
-            if proc.poll() is None:
-                timed_out.set()
-                proc.kill()
+            def _stop_on_timeout():
+                if proc.poll() is None:
+                    timed_out.set()
+                    proc.kill()
 
-        timeout_timer = threading.Timer(1800, _stop_on_timeout)
-        timeout_timer.daemon = True
-        timeout_timer.start()
-        for line in proc.stdout:
-            if line.strip():
-                lsf.write_output(f'    {line.strip()}')
-        proc.wait()
-        if timed_out.is_set():
-            lsf.write_output('  WARNING: SSP lab tuner timed out — continuing')
-        elif proc.returncode == 0:
-            lsf.write_output('SSP stabilization completed successfully')
-        else:
-            lsf.write_output(f'  WARNING: SSP lab tuner exited with code {proc.returncode} — continuing')
-    except Exception as exc:
-        if proc is not None and proc.poll() is None:
-            proc.kill()
+            timeout_timer = threading.Timer(1800, _stop_on_timeout)
+            timeout_timer.daemon = True
+            timeout_timer.start()
+            for line in proc.stdout:
+                if line.strip():
+                    lsf.write_output(f'    {line.strip()}')
             proc.wait()
-        lsf.write_output(f'  WARNING: SSP lab tuner execution failed: {exc}')
-    finally:
-        if timeout_timer is not None:
-            timeout_timer.cancel()
+            if timed_out.is_set():
+                lsf.write_output(f'  WARNING: SSP {pass_name} timed out — continuing')
+            elif proc.returncode == 0:
+                lsf.write_output(f'  SSP {pass_name} completed successfully')
+            else:
+                lsf.write_output(f'  WARNING: SSP {pass_name} exited with code {proc.returncode} — continuing')
+        except Exception as exc:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            lsf.write_output(f'  WARNING: SSP {pass_name} execution failed: {exc}')
+        finally:
+            if timeout_timer is not None:
+                timeout_timer.cancel()
 
 
 def _run_opslogs_background_probe(url, expected, lsf, dashboard=None, dry_run=False):
